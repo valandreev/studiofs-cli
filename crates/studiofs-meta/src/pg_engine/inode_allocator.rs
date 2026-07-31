@@ -191,58 +191,94 @@ impl PgMetaEngine {
         }
     }
 
+    fn take_from_batch<T>(
+        runtime: &mut AllocatorRuntime,
+        count: u64,
+        inode: bool,
+        build: impl FnOnce(AllocatorRecord, Range<u64>) -> MetaResult<T>,
+    ) -> MetaResult<Option<T>> {
+        let state = runtime
+            .state
+            .ok_or_else(|| MetaError::Storage("allocator namespace is unavailable".to_string()))?;
+        let (first, end) =
+            if inode {
+                let batch = &runtime.inode_batch;
+                let available = batch.end.saturating_sub(batch.start);
+                if available < count {
+                    return Ok(None);
+                }
+                let end = batch.start.checked_add(count).ok_or_else(|| {
+                    MetaError::Storage("allocator batch range overflow".to_string())
+                })?;
+                (batch.start, end)
+            } else {
+                let batch = &runtime.payload_batch;
+                let available = batch.end.saturating_sub(batch.start);
+                if available < count {
+                    return Ok(None);
+                }
+                let end = batch.start.checked_add(count).ok_or_else(|| {
+                    MetaError::Storage("allocator batch range overflow".to_string())
+                })?;
+                (batch.start, end)
+            };
+        let record = if inode { state.inode } else { state.payload };
+        let value = build(record, first..end)?;
+        if inode {
+            runtime.inode_batch.start = end;
+        } else {
+            runtime.payload_batch.start = end;
+        }
+        Ok(Some(value))
+    }
+
     fn take_ids_from_batch(
         runtime: &mut AllocatorRuntime,
         count: u64,
         inode: bool,
     ) -> MetaResult<Option<Vec<u64>>> {
-        let state = runtime
-            .state
-            .ok_or_else(|| MetaError::Storage("allocator namespace is unavailable".to_string()))?;
-        let available = if inode {
-            runtime
-                .inode_batch
-                .end
-                .saturating_sub(runtime.inode_batch.start)
-        } else {
-            runtime
-                .payload_batch
-                .end
-                .saturating_sub(runtime.payload_batch.start)
-        };
-        if available < count {
-            return Ok(None);
-        }
-        let batch = if inode {
-            &mut runtime.inode_batch
-        } else {
-            &mut runtime.payload_batch
-        };
-        let first = batch.start;
-        batch.start += count;
-        let record = if inode { state.inode } else { state.payload };
-        (first..first + count)
-            .map(|counter| {
-                record
-                    .id_at(counter)
-                    .map_err(|error| MetaError::Storage(error.to_string()))
-            })
-            .collect::<MetaResult<Vec<_>>>()
-            .map(Some)
+        Self::take_from_batch(runtime, count, inode, |record, range| {
+            range
+                .map(|counter| {
+                    record
+                        .id_at(counter)
+                        .map_err(|error| MetaError::Storage(error.to_string()))
+                })
+                .collect()
+        })
     }
 
-    fn allocate_ids(&self, count: u32, inode: bool) -> MetaResult<Vec<u64>> {
-        if count == 0 {
-            return Ok(Vec::new());
-        }
+    fn take_id_from_batch(
+        runtime: &mut AllocatorRuntime,
+        count: u64,
+        inode: bool,
+    ) -> MetaResult<Option<u64>> {
+        Self::take_from_batch(runtime, count, inode, |record, range| {
+            let Some(counter) = range.into_iter().next() else {
+                return Err(MetaError::Storage(
+                    "allocator single-ID batch is empty".to_string(),
+                ));
+            };
+            record
+                .id_at(counter)
+                .map_err(|error| MetaError::Storage(error.to_string()))
+        })
+    }
+
+    fn allocate_with<T>(
+        &self,
+        count: u32,
+        inode: bool,
+        take: fn(&mut AllocatorRuntime, u64, bool) -> MetaResult<Option<T>>,
+    ) -> MetaResult<T> {
         let count = u64::from(count);
         {
             let mut runtime = self
                 .allocator_runtime
                 .lock()
                 .map_err(|_| MetaError::Storage("allocator runtime lock poisoned".to_string()))?;
-            if let Some(ids) = Self::take_ids_from_batch(&mut runtime, count, inode)? {
-                return Ok(ids);
+            if let Some(value) = take(&mut runtime, count, inode)? {
+                return Ok(value);
             }
         }
 
@@ -255,13 +291,15 @@ impl PgMetaEngine {
                 .allocator_runtime
                 .lock()
                 .map_err(|_| MetaError::Storage("allocator runtime lock poisoned".to_string()))?;
-            if let Some(ids) = Self::take_ids_from_batch(&mut runtime, count, inode)? {
-                return Ok(ids);
+            if let Some(value) = take(&mut runtime, count, inode)? {
+                return Ok(value);
             }
             let state = runtime.state.ok_or_else(|| {
                 MetaError::Storage("allocator namespace is unavailable".to_string())
             })?;
             let record = if inode { state.inode } else { state.payload };
+            // Counter exhaustion is terminal for this mount; namespace minting stays
+            // bootstrap-only so foreground allocation never re-enters PostgreSQL.
             let (advanced, next_batch) = record.reserve(count).map_err(|error| {
                 if inode {
                     self.inode_id_headroom_available
@@ -294,9 +332,20 @@ impl PgMetaEngine {
         } else {
             runtime.payload_batch = next_batch;
         }
-        Self::take_ids_from_batch(&mut runtime, count, inode)?.ok_or_else(|| {
+        take(&mut runtime, count, inode)?.ok_or_else(|| {
             MetaError::Storage("allocator batch refill did not provide requested IDs".to_string())
         })
+    }
+
+    fn allocate_ids(&self, count: u32, inode: bool) -> MetaResult<Vec<u64>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        self.allocate_with(count, inode, Self::take_ids_from_batch)
+    }
+
+    pub(super) fn allocate_id(&self, inode: bool) -> MetaResult<u64> {
+        self.allocate_with(1, inode, Self::take_id_from_batch)
     }
 
     pub(super) fn allocate_inode_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
@@ -305,5 +354,55 @@ impl PgMetaEngine {
 
     pub(super) fn allocate_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
         self.allocate_ids(count, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_id_generation_does_not_consume_batch() {
+        let state = AllocatorStateV1::new(
+            AllocatorRecord::new(1, 0).expect("inode namespace"),
+            AllocatorRecord::new(2, 0).expect("payload namespace"),
+        )
+        .expect("allocator state");
+        let mut runtime = AllocatorRuntime {
+            state: Some(state),
+            inode_batch: crate::allocator_state::COUNTER_LIMIT
+                ..crate::allocator_state::COUNTER_LIMIT + 1,
+            payload_batch: 0..0,
+        };
+
+        let result = PgMetaEngine::take_ids_from_batch(&mut runtime, 1, true);
+
+        assert!(result.is_err(), "counter at the exclusive limit must fail");
+        assert_eq!(
+            runtime.inode_batch.start,
+            crate::allocator_state::COUNTER_LIMIT,
+            "failed ID generation must not consume the batch"
+        );
+    }
+
+    #[test]
+    fn single_id_take_returns_one_id_without_batch_vector() {
+        let state = AllocatorStateV1::new(
+            AllocatorRecord::new(3, 0).expect("inode namespace"),
+            AllocatorRecord::new(4, 0).expect("payload namespace"),
+        )
+        .expect("allocator state");
+        let mut runtime = AllocatorRuntime {
+            state: Some(state),
+            inode_batch: 0..1,
+            payload_batch: 0..0,
+        };
+
+        let result = PgMetaEngine::take_id_from_batch(&mut runtime, 1, true)
+            .expect("single ID take")
+            .expect("single ID");
+
+        assert_eq!(result, state.inode.id_at(0).expect("first inode ID"));
+        assert_eq!(runtime.inode_batch.start, 1);
     }
 }

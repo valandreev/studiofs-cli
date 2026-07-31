@@ -22,6 +22,7 @@ will remain safely read-only rather than risk reusing an ID.
 - [x] (2026-08-01 00:24Z) Ran the historical SFS-623 filter `cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1` from the repository `.env`; all three allocator acceptance tests passed.
 - [x] (2026-08-01 00:31Z) Restored lifecycle, file-lock, pending-replay, and remote rename-overwrite regression coverage; the full `studiofs-meta` library suite passed with 359 tests and 67 ignored.
 - [x] (2026-08-01) Moved durable allocator refill persistence outside the runtime mutex, added a concurrency regression test, and re-ran the metadata suite with 360 passed and 67 ignored.
+- [x] (2026-08-01) Added the single-ID allocator fast path and made batch state advance only after ID encoding succeeds; the remount-only exhaustion contract remains unchanged.
 
 ## Surprises & Discoveries
 
