@@ -99,6 +99,59 @@ fn allocator_restart_skips_the_durable_reserved_tail() {
 }
 
 #[test]
+fn allocator_refill_does_not_hold_runtime_lock_during_local_persistence() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let pg = Arc::new(pg);
+    pg.next_object_ids(1).expect("prewarm payload batch");
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let hook_release_rx = Arc::clone(&release_rx);
+    pg.local
+        .set_allocator_state_write_hook_for_test(Arc::new(move || {
+            entered_tx.send(()).expect("signal allocator persistence");
+            hook_release_rx
+                .lock()
+                .expect("release receiver lock")
+                .recv()
+                .expect("release allocator persistence");
+        }));
+
+    let refill_pg = Arc::clone(&pg);
+    let refill = std::thread::spawn(move || refill_pg.next_inode());
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("allocator refill should reach local persistence");
+
+    let fast_pg = Arc::clone(&pg);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let fast = std::thread::spawn(move || {
+        result_tx
+            .send(fast_pg.next_object_id())
+            .expect("send payload allocation result");
+    });
+    let payload_result_during_refill = result_rx.recv_timeout(Duration::from_millis(100)).ok();
+    let payload_completed_during_refill = payload_result_during_refill.is_some();
+
+    release_tx.send(()).expect("release allocator persistence");
+    fast.join()
+        .expect("payload allocation thread should not panic");
+    let payload_result = payload_result_during_refill
+        .or_else(|| result_rx.recv().ok())
+        .expect("payload allocation should report a result")
+        .expect("payload allocation should succeed");
+    refill
+        .join()
+        .expect("allocator refill thread should not panic")
+        .expect("allocator refill should succeed");
+    assert!(
+        payload_completed_during_refill,
+        "a payload allocation with a warm batch must not wait for inode persistence; got {payload_result:?}"
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");

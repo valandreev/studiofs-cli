@@ -440,6 +440,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         remote_runtime: PgRemoteRuntime::new("studiofs-pg-remote-runtime-test")
             .expect("unit test remote runtime"),
         allocator_runtime: Mutex::new(AllocatorRuntime::default()),
+        allocator_refill_lock: Mutex::new(()),
         inode_id_headroom_available: AtomicBool::new(false),
         object_id_headroom_available: AtomicBool::new(false),
         janitor_lock: Mutex::new(None),

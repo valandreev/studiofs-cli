@@ -35,6 +35,8 @@ pub struct RedbMetaEngine {
     db: Arc<RwLock<Database>>,
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
+    #[cfg(test)]
+    allocator_state_write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct RelaxedDurabilityState {
@@ -570,6 +572,8 @@ impl RedbMetaEngine {
             db,
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
+            #[cfg(test)]
+            allocator_state_write_hook: Mutex::new(None),
         };
         engine.ensure_dentry_by_inode_indexes()?;
         let _ = engine.recover_undo_logs()?;

@@ -26,6 +26,15 @@ impl RedbMetaEngine {
     }
 
     pub(crate) fn replace_allocator_state(&self, state: AllocatorStateV1) -> MetaResult<()> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .allocator_state_write_hook
+            .lock()
+            .expect("allocator state write hook lock")
+            .take()
+        {
+            hook();
+        }
         let txn = self.begin_write_txn()?;
         {
             let encoded = state.encode();
@@ -39,6 +48,17 @@ impl RedbMetaEngine {
         txn.commit()
             .map_err(|error| MetaError::Storage(error.to_string()))?;
         self.sync_local_metadata()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_allocator_state_write_hook_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .allocator_state_write_hook
+            .lock()
+            .expect("allocator state write hook lock") = Some(hook);
     }
 }
 

@@ -19,8 +19,9 @@ will remain safely read-only rather than risk reusing an ID.
 - [x] (2026-07-31 20:15Z) Added ignored two-root uniqueness and legacy-counter guard tests; the explicit fixture command now fails loudly when `STUDIOFS_TEST_PG_DSN` is absent rather than silently passing.
 - [x] (2026-07-31 20:24Z) Replaced PostgreSQL range bootstrap and allocation with paired namespace state; separated inode and payload allocation and retained client slots for replication identity.
 - [x] (2026-07-31 20:28Z) Updated the local-first contract and validation matrix; focused metadata/VFS tests, the full metadata library suite, formatting, and warnings-as-errors check pass.
-- [x] (2026-08-01 00:24Z) Ran `cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1` from the repository `.env`; all three allocator acceptance tests passed.
+- [x] (2026-08-01 00:24Z) Ran the historical SFS-623 filter `cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1` from the repository `.env`; all three allocator acceptance tests passed.
 - [x] (2026-08-01 00:31Z) Restored lifecycle, file-lock, pending-replay, and remote rename-overwrite regression coverage; the full `studiofs-meta` library suite passed with 359 tests and 67 ignored.
+- [x] (2026-08-01) Moved durable allocator refill persistence outside the runtime mutex, added a concurrency regression test, and re-ran the metadata suite with 360 passed and 67 ignored.
 
 ## Surprises & Discoveries
 
@@ -116,7 +117,7 @@ offline state, legacy read-only, and two-root uniqueness coverage.
 
 Run from `/Volumes/Storage/dev/studiofs`, one Cargo command at a time:
 
-    cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1
+    cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1  # historical SFS-623 acceptance filter
     cargo test -p studiofs-meta sfs623_allocator_state_ -- --nocapture
     cargo test -p studiofs-vfs read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open -- --nocapture
     RUSTFLAGS='-D warnings' cargo check -p studiofs-meta -p studiofs-vfs

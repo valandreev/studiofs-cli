@@ -39,6 +39,9 @@ Some rows intentionally mix `studiofs-vfs` integration tests from
 use `--test vfs_test`; library unit-test commands run as plain
 `cargo test -p <crate> <filter>`.
 
+Allocator checks retain the historical `sfs623_` test prefix because the
+SFS-623 contract defines the stable filters implemented by SFS-632.
+
 | Scenario | Contract focus | Primary checks | Focused commands |
 |---|---|---|---|
 | Accepted write durability boundaries | Same-mount reads use active writer state before the local durability boundary; `flush`, `fsync`, last-handle release, and graceful shutdown move accepted bytes into locally durable slices/cache without making them remote-ready | `sfs312_write_is_visible_from_writer_state_before_local_durability_boundary`; `sfs312_flush_materializes_local_slice_boundary_without_remote_visibility`; `sfs312_fsync_persists_local_state_without_remote_visibility`; `sfs312_last_handle_release_drains_local_durability_boundary`; `local_first_shutdown_reports_and_recovers_memory_only_writer_state` | `cargo test -p studiofs-vfs sfs312_ -- --nocapture`<br>`cargo test -p studiofs-vfs local_first_shutdown_reports_and_recovers_memory_only_writer_state -- --nocapture` |
