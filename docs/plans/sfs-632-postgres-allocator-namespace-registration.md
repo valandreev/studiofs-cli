@@ -24,6 +24,7 @@ will remain safely read-only rather than risk reusing an ID.
 - [x] (2026-08-01) Moved durable allocator refill persistence outside the runtime mutex, added a concurrency regression test, and re-ran the metadata suite with 360 passed and 67 ignored.
 - [x] (2026-08-01) Added the single-ID allocator fast path and made batch state advance only after ID encoding succeeds; the remount-only exhaustion contract remains unchanged.
 - [x] (2026-08-01) Guarded the single-ID helper against multi-ID requests and expanded legacy-volume diagnostics with the migration contract reference.
+- [x] (2026-08-01) Stopped fresh `studiofs init` volumes from seeding the legacy `next_inode` counter; dump/load acceptance now passes with namespace bootstrap enabled.
 
 ## Surprises & Discoveries
 
