@@ -1,9 +1,9 @@
 use super::PgMetaEngine;
 use crate::engine::{
-    DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaError, MetaFormat,
-    MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
-    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, NamespaceMutation,
-    PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaFormat, MetaFsOps,
+    MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication,
+    MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, NamespaceMutation, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use crate::types::*;
 use std::collections::HashSet;
@@ -36,10 +36,11 @@ impl MetaInodes for PgMetaEngine {
     }
 
     fn next_inode(&self) -> MetaResult<Ino> {
-        self.allocate_inode_object_ids(1)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| MetaError::Storage("missing allocated inode".to_string()))
+        self.allocate_id(true)
+    }
+
+    fn next_inode_ids(&self, count: u32) -> MetaResult<Vec<Ino>> {
+        self.allocate_inode_ids(count)
     }
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
@@ -217,14 +218,11 @@ impl MetaPayloadObjects for PgMetaEngine {
     }
 
     fn next_object_id(&self) -> MetaResult<u64> {
-        self.next_object_ids(1)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| MetaError::Storage("missing allocated object ID".to_string()))
+        self.allocate_id(false)
     }
 
     fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        self.allocate_inode_object_ids(count)
+        self.allocate_object_ids(count)
     }
 
     fn flush_regular_file_overlay_slices(

@@ -426,6 +426,17 @@ fn init_pg_crypto_key_insert_sql() -> &'static str {
             "#
 }
 
+fn init_pg_counter_seed_sql() -> &'static str {
+    r#"
+            INSERT INTO counters (vol, name, value)
+            VALUES
+                ($1, 'nextObjectId', 1),
+                ($1, 'used_space', 0),
+                ($1, 'total_inodes', 1)
+            ON CONFLICT (vol, name) DO NOTHING
+            "#
+}
+
 fn init_pg_schema_and_volume(
     rt: &tokio::runtime::Runtime,
     dsn: &str,
@@ -495,19 +506,8 @@ fn init_pg_schema_and_volume(
         )
         .await?;
 
-        tx.execute(
-            r#"
-            INSERT INTO counters (vol, name, value)
-            VALUES
-                ($1, 'next_inode', 2),
-                ($1, 'nextObjectId', 1),
-                ($1, 'used_space', 0),
-                ($1, 'total_inodes', 1)
-            ON CONFLICT (vol, name) DO NOTHING
-            "#,
-            &[&volume_id],
-        )
-        .await?;
+        tx.execute(init_pg_counter_seed_sql(), &[&volume_id])
+            .await?;
 
         tx.commit().await?;
         conn_task.abort();
@@ -816,6 +816,14 @@ mod tests {
 
         assert!(sql.contains("ON CONFLICT (vol, key_id) DO NOTHING"));
         assert!(!sql.contains("key_material = EXCLUDED.key_material"));
+    }
+
+    #[test]
+    fn init_fresh_pg_volume_does_not_seed_legacy_inode_counter() {
+        let sql = init_pg_counter_seed_sql();
+
+        assert!(!sql.contains("'next_inode'"));
+        assert!(sql.contains("'nextObjectId'"));
     }
 
     #[test]

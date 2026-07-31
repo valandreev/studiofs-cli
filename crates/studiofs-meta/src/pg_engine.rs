@@ -82,18 +82,14 @@ const LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER: &str = "pgInodePrefetchedWi
 const LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER: &str = "pgInodePrefetchedWindowEnd";
 const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
 const PG_NEXT_INODE_COUNTER: &str = "next_inode";
+const PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER: &str = "next_allocator_namespace";
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
-const LEGACY_PG_INODE_ID_STRIDE: u64 = 1_000_000_000;
 const FILE_LOCK_SCHEMA_ENSURE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const LEGACY_PG_INODE_RANGE_WINDOW: u64 = 1_000_000;
-const PG_INODE_WINDOW_SIZE: u64 = 250_000;
-const PG_INODE_PREFETCH_LOW_WATERMARK: u64 = 50_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StartupSnapshotImportMode {
@@ -149,9 +145,10 @@ pub struct PgMetaEngine {
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
     remote_runtime: runtime::PgRemoteRuntime,
-    inode_allocator_lock: Mutex<()>,
-    inode_window_reservation_lock: Mutex<()>,
+    allocator_runtime: Mutex<inode_allocator::AllocatorRuntime>,
+    allocator_refill_lock: Mutex<()>,
     inode_id_headroom_available: AtomicBool,
+    object_id_headroom_available: AtomicBool,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
     file_lock_schema_ensured: AtomicBool,
     file_lock_schema_ensure_lock: Mutex<()>,
@@ -260,9 +257,6 @@ mod replication_flush;
 mod runtime;
 #[path = "pg_engine/sql.rs"]
 mod sql;
-use inode_allocator::LocalIdRangeSpec;
-#[cfg(test)]
-use inode_allocator::{InodeAllocatorState, InodeWindow, LocalIdRangeState};
 use janitor::PgJanitorLock;
 #[cfg(test)]
 use remote_apply::DecodedReplayBatch;
@@ -277,15 +271,6 @@ enum MetadataSyncSource {
     Notify,
     FallbackPoll,
 }
-
-const LEGACY_INODE_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
-    next_counter: counters::NEXT_INODE,
-    active_start_counter: LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
-    active_end_counter: LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
-    reserved_end_counter: LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
-    min_value: ROOT_INO + 1,
-    slot_stride: LEGACY_PG_INODE_ID_STRIDE,
-};
 
 #[derive(Debug, Clone)]
 struct HeldFileLockLease {
@@ -355,11 +340,6 @@ impl PgMetaEngine {
         connect_timeout: Duration,
         command_timeout: Duration,
     ) -> MetaResult<()> {
-        #[cfg(test)]
-        if let Some(message) = tests::schema_ensure_test_override() {
-            return Err(MetaError::Storage(message));
-        }
-
         let postgres_url = postgres_url.to_string();
         Self::run_async_once(async move {
             Self::with_postgres_client_timeout_once(
@@ -553,14 +533,10 @@ impl PgMetaEngine {
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             remote_runtime: runtime::PgRemoteRuntime::new("studiofs-pg-remote-runtime")?,
-            inode_allocator_lock: Mutex::new(()),
-            inode_window_reservation_lock: Mutex::new(()),
-            // Optimistic: assume headroom is available until proven exhausted.
-            // This flag is degraded to `false` only when the persisted local
-            // inode/object window state is genuinely exhausted. Starting at
-            // `false` caused `allows_new_mutations()` to block every write if
-            // `prime_local_id_ranges` failed silently (via `let _ = ...`).
-            inode_id_headroom_available: AtomicBool::new(true),
+            allocator_runtime: Mutex::new(inode_allocator::AllocatorRuntime::default()),
+            allocator_refill_lock: Mutex::new(()),
+            inode_id_headroom_available: AtomicBool::new(false),
+            object_id_headroom_available: AtomicBool::new(false),
             janitor_lock: Mutex::new(None),
             file_lock_schema_ensured: AtomicBool::new(false),
             file_lock_schema_ensure_lock: Mutex::new(()),
@@ -620,7 +596,8 @@ impl PgMetaEngine {
             }
             engine.restore_pending_state_from_local_log()?;
         }
-        engine.prime_local_id_ranges(client_slot)?;
+        engine.cache_client_slot(client_slot);
+        engine.bootstrap_allocator_state();
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;
             let handle = Self::start_background_poll(

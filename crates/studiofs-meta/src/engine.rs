@@ -493,6 +493,11 @@ pub trait MetaInodes: Send + Sync {
     /// Allocate a new inode number.
     fn next_inode(&self) -> MetaResult<Ino>;
 
+    /// Allocate a contiguous batch of inode numbers.
+    fn next_inode_ids(&self, count: u32) -> MetaResult<Vec<Ino>> {
+        (0..count).map(|_| self.next_inode()).collect()
+    }
+
     /// Get inode attributes.
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>;
 

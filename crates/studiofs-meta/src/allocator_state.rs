@@ -65,6 +65,8 @@ impl AllocatorRecord {
         self,
         requested_count: u64,
     ) -> Result<(Self, Range<u64>), AllocatorStateError> {
+        // A request that crosses a warm-batch boundary may abandon that batch's
+        // tail; keeping each refill as one durable range avoids split persistence.
         let available = COUNTER_LIMIT - self.reserved_through;
         if available == 0 || requested_count > available {
             return Err(AllocatorStateError::CounterExhausted);

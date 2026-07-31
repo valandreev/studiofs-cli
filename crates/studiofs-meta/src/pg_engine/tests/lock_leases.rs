@@ -1,6 +1,71 @@
 use super::*;
 
 #[test]
+fn open_with_persisted_allocator_state_does_not_require_file_lock_schema() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&path).expect("open local redb");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "offline-reopen-sqlstate",
+            "offline-reopen-sqlstate-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set format info");
+    PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+    local
+        .replace_allocator_state(
+            AllocatorStateV1::new(
+                AllocatorRecord::new(1, 0).expect("inode namespace"),
+                AllocatorRecord::new(2, 0).expect("payload namespace"),
+            )
+            .expect("allocator state"),
+        )
+        .expect("persist allocator state");
+    drop(local);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open must not require file-lock schema before a lock operation");
+
+    let lock_error = reopened
+        .current_file_lock_lease(ROOT_INO)
+        .expect_err("file-lock operations must initialize their own schema");
+    assert!(
+        lock_error.to_string().contains("postgres"),
+        "lock schema failure should be reported at first lock use, got: {lock_error}"
+    );
+}
+
+#[test]
+fn file_lock_schema_failure_uses_backoff_before_retrying() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let first = pg
+        .current_file_lock_lease(ROOT_INO)
+        .expect_err("first lock operation should report schema ensure failure");
+    assert!(
+        first.to_string().contains("postgres"),
+        "first failure should include the schema error, got: {first}"
+    );
+
+    let second = pg
+        .current_file_lock_lease(ROOT_INO)
+        .expect_err("second lock operation should use cached schema failure");
+    let second = second.to_string();
+    assert!(
+        second.contains("recently failed"),
+        "second failure should use the backoff fast path, got: {second}"
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_file_lock_lease_blocks_peer_until_release() {
     let _guard = file_lock_test_guard();

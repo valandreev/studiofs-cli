@@ -141,7 +141,7 @@ impl StudioVfs {
             }
 
             let inos = self.observe_namespace_inode_allocation(|| {
-                self.sync_meta().next_object_ids(NAMESPACE_INODE_BATCH)
+                self.sync_meta().next_inode_ids(NAMESPACE_INODE_BATCH)
             })?;
             if inos.is_empty() {
                 return Err(VfsError::Other("allocated inode batch is empty".into()));

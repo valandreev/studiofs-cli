@@ -35,6 +35,8 @@ pub struct RedbMetaEngine {
     db: Arc<RwLock<Database>>,
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
+    #[cfg(test)]
+    allocator_state_write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct RelaxedDurabilityState {
@@ -206,6 +208,7 @@ impl MetadataWriteMetrics {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct CounterWriteTransaction<'a> {
     txn: &'a WriteTransaction,
 }
@@ -404,6 +407,7 @@ fn begin_redb_read_txn(db: &Database) -> MetaResult<ReadTransaction> {
         .map_err(|e| MetaError::Storage(e.to_string()))
 }
 
+#[cfg(test)]
 impl CounterWriteTransaction<'_> {
     pub(crate) fn set(&self, name: &str, value: u64) -> MetaResult<()> {
         let mut table = self
@@ -568,6 +572,8 @@ impl RedbMetaEngine {
             db,
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
+            #[cfg(test)]
+            allocator_state_write_hook: Mutex::new(None),
         };
         engine.ensure_dentry_by_inode_indexes()?;
         let _ = engine.recover_undo_logs()?;
@@ -613,6 +619,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn write_counters<T, F>(&self, f: F) -> MetaResult<T>
     where
         F: FnOnce(&CounterWriteTransaction<'_>) -> MetaResult<T>,

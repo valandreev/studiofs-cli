@@ -2,6 +2,40 @@ use super::*;
 use crate::redb_engine::layout::encode_xattr_key;
 
 #[test]
+fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter("nextEventSeq").expect("baseline seq");
+
+    pg.local
+        .create_dir(ROOT_INO, b"draft", 0, 0, 0o755)
+        .expect("create draft dir");
+    pg.local
+        .create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+        .expect("create draft file");
+
+    {
+        let mut state = pg.pending_state.lock().expect("pending_state");
+        *state = PendingReplicationState::default();
+    }
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending state");
+
+    let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+    let pending_events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("read pending events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
+    let backlog = pg.replication_backlog();
+    assert_eq!(backlog.pending_ops, projected.visible_ops);
+    let state = pg.pending_state.lock().expect("pending_state");
+    assert!(state.force_flush);
+    assert_eq!(state.event_start, Some(start));
+    assert_eq!(state.event_end, end);
+}
+
+#[test]
 fn test_local_overlay_conflicts_reserve_pending_xattr_and_symlink() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
