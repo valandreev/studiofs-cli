@@ -63,11 +63,12 @@ E2E validation.
   foreign state through invalidation and replay
 - crash recovery rebuilds pending local state from local metadata and
   upload/replication bookkeeping
-- each discovered client reserves one durable per-volume local inode window
-  during bootstrap/discover and later mounts reuse that persisted window state
-  instead of minting a fresh inode lease on reconnect
-- object IDs still reserve a persistent PG client slot and reuse the persisted
-  block ranges across later mounts
+- each PostgreSQL-backed root registers one durable per-volume inode namespace
+  and one payload namespace during bootstrap, then reuses the persisted paired
+  allocator state on later mounts instead of minting a fresh pair on reconnect
+- foreground inode and object IDs advance their local redb counters without
+  steady-state PostgreSQL calls; `client-slot:<slot>` remains only the
+  replication identity used for self-batch detection
 
 Core invariants:
 - local `size` and local slices may be ahead of peer-visible replicated state

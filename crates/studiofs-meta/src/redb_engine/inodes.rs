@@ -611,6 +611,10 @@ impl MetaInodes for RedbMetaEngine {
         Ok(ino)
     }
 
+    fn next_inode_ids(&self, count: u32) -> MetaResult<Vec<Ino>> {
+        self.next_object_ids(count)
+    }
+
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
         let txn = self.begin_read_txn()?;
         let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;

@@ -1,8 +1,8 @@
 use super::*;
-use crate::pg_dsn::ensure_studiofs_database;
+use crate::allocator_state::{AllocatorRecord, AllocatorStateV1};
+use crate::pg_dsn::resolve_studiofs_pg_dsns;
+use crate::pg_engine::inode_allocator::AllocatorRuntime;
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use uuid::Uuid;
 
 mod inode_allocator;
@@ -35,16 +35,16 @@ fn workspace_env_path() -> std::path::PathBuf {
 fn pg_dsn() -> Option<String> {
     let env_path = workspace_env_path();
     if env_path.is_file() {
-        let _ = dotenvy::from_path(&env_path);
+        dotenvy::from_path(&env_path).expect("failed to load workspace .env");
     } else {
         let _ = dotenvy::dotenv();
     }
     let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
         .ok()
-        .filter(|v| !v.trim().is_empty())?;
+        .filter(|value| !value.trim().is_empty())?;
     Some(
-        run_async(async { ensure_studiofs_database(&raw).await })
-            .expect("failed to ensure studiofs database")
+        resolve_studiofs_pg_dsns(&raw)
+            .expect("failed to resolve STUDIOFS_TEST_PG_DSN")
             .metadata_dsn,
     )
 }
@@ -363,67 +363,6 @@ fn seed_local(path: &std::path::Path, info: &FormatInfo) {
         .expect("seed flushed event seq");
 }
 
-thread_local! {
-    static TEST_SCHEMA_ENSURE_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
-    static TEST_INODE_WINDOW_RESERVATION_OVERRIDE: RefCell<VecDeque<Result<InodeWindow, String>>> =
-        const { RefCell::new(VecDeque::new()) };
-}
-
-struct TestSchemaEnsureOverrideGuard {
-    previous: Option<String>,
-}
-
-impl Drop for TestSchemaEnsureOverrideGuard {
-    fn drop(&mut self) {
-        TEST_SCHEMA_ENSURE_OVERRIDE.with(|override_state| {
-            *override_state.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-fn set_schema_ensure_test_override(message: &str) -> TestSchemaEnsureOverrideGuard {
-    let previous = TEST_SCHEMA_ENSURE_OVERRIDE
-        .with(|override_state| override_state.borrow_mut().replace(message.to_string()));
-    TestSchemaEnsureOverrideGuard { previous }
-}
-
-pub(super) fn schema_ensure_test_override() -> Option<String> {
-    TEST_SCHEMA_ENSURE_OVERRIDE.with(|override_state| override_state.borrow().clone())
-}
-
-pub(super) fn headroom_refresh_test_override() -> Option<bool> {
-    None
-}
-
-struct TestInodeWindowReservationOverrideGuard {
-    previous: VecDeque<Result<InodeWindow, String>>,
-}
-
-impl Drop for TestInodeWindowReservationOverrideGuard {
-    fn drop(&mut self) {
-        TEST_INODE_WINDOW_RESERVATION_OVERRIDE.with(|override_state| {
-            *override_state.borrow_mut() = std::mem::take(&mut self.previous);
-        });
-    }
-}
-
-fn set_inode_window_reservation_override(
-    windows: impl IntoIterator<Item = Result<InodeWindow, String>>,
-) -> TestInodeWindowReservationOverrideGuard {
-    let previous = TEST_INODE_WINDOW_RESERVATION_OVERRIDE.with(|override_state| {
-        std::mem::replace(
-            &mut *override_state.borrow_mut(),
-            windows.into_iter().collect(),
-        )
-    });
-    TestInodeWindowReservationOverrideGuard { previous }
-}
-
-pub(super) fn pop_inode_window_reservation_override() -> Option<Result<InodeWindow, String>> {
-    TEST_INODE_WINDOW_RESERVATION_OVERRIDE
-        .with(|override_state| override_state.borrow_mut().pop_front())
-}
-
 fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
     let mut attr = engine.get_attr(ino).expect("get file attr");
     attr.size = size;
@@ -500,9 +439,9 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         pending_state: Mutex::new(PendingReplicationState::default()),
         remote_runtime: PgRemoteRuntime::new("studiofs-pg-remote-runtime-test")
             .expect("unit test remote runtime"),
-        inode_allocator_lock: Mutex::new(()),
-        inode_window_reservation_lock: Mutex::new(()),
+        allocator_runtime: Mutex::new(AllocatorRuntime::default()),
         inode_id_headroom_available: AtomicBool::new(false),
+        object_id_headroom_available: AtomicBool::new(false),
         janitor_lock: Mutex::new(None),
         file_lock_schema_ensured: AtomicBool::new(false),
         file_lock_schema_ensure_lock: Mutex::new(()),
@@ -530,18 +469,16 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     };
 
     PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");
-    let inode_state = InodeAllocatorState {
-        current: InodeWindow {
-            start: ROOT_INO + 1,
-            next: ROOT_INO + 1,
-            end: ROOT_INO + 1 + PG_INODE_WINDOW_SIZE,
-        },
-        prefetched: InodeWindow::default(),
-    };
+    let allocator_state = AllocatorStateV1::new(
+        AllocatorRecord::new(1, 0).expect("inode namespace"),
+        AllocatorRecord::new(2, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
     engine
-        .persist_inode_allocator_state(inode_state)
-        .expect("persist unit test inode window");
-    engine.update_inode_headroom_flag(inode_state);
+        .local
+        .replace_allocator_state(allocator_state)
+        .expect("persist unit test allocator state");
+    engine.bootstrap_allocator_state();
 
     (dir, engine)
 }
@@ -784,29 +721,4 @@ fn format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo 
         encryption: EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH]),
         block_size: DEFAULT_BLOCK_SIZE,
     }
-}
-
-fn persist_inode_state(local: &RedbMetaEngine, state: InodeAllocatorState) {
-    local
-        .write_counters(|counters| {
-            PgMetaEngine::persist_inode_allocator_state_locked(counters, state)
-        })
-        .expect("persist inode allocator state");
-}
-
-fn persist_legacy_inode_range_state(local: &RedbMetaEngine, state: LocalIdRangeState) {
-    local
-        .write_counters(|counters| {
-            PgMetaEngine::persist_local_id_range_state_locked(
-                counters,
-                LEGACY_INODE_RANGE_SPEC,
-                state,
-            )
-        })
-        .expect("persist legacy inode range state");
-}
-
-fn load_inode_state(local: &RedbMetaEngine) -> InodeAllocatorState {
-    PgMetaEngine::load_persisted_inode_allocator_state(local)
-        .expect("load persisted inode allocator state")
 }

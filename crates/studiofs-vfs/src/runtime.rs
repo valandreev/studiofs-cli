@@ -239,6 +239,7 @@ impl<M: ?Sized + MetaInodes> MetaInodes for RuntimeMetaHandle<M> {
     forward_method!(fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>);
     forward_method!(fn set_counter(&self, name: &str, value: u64) -> MetaResult<()>);
     forward_method!(fn next_inode(&self) -> MetaResult<Ino>);
+    forward_method!(fn next_inode_ids(&self, count: u32) -> MetaResult<Vec<Ino>>);
     forward_method!(fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>);
     forward_method!(fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>>);
     forward_method!(fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>>);

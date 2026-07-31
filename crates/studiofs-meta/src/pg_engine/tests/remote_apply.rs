@@ -3,6 +3,62 @@ use crate::engine::MetaEngine;
 use crate::redb_engine::layout::encode_dentry_key;
 
 #[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_remote_rename_overwrite_converges_to_source_inode() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_a = dir_a.path().join("meta-a.redb");
+    let db_b = dir_b.path().join("meta-b.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-rename-overwrite");
+    let info = volume.format_info();
+    seed_local(&db_a, &info);
+    seed_local(&db_b, &info);
+
+    let a = PgMetaEngine::open(&db_a).expect("open a");
+    let b = PgMetaEngine::open(&db_b).expect("open b");
+
+    let src = create_published_small_file(&a, ROOT_INO, b"src.txt", 50_304);
+    let dst = create_published_small_file(&a, ROOT_INO, b"dst.txt", 50_305);
+    a.flush_metadata().expect("flush seed files");
+
+    assert!(wait_visible(
+        &b,
+        ROOT_INO,
+        b"src.txt",
+        Duration::from_secs(10)
+    ));
+    assert!(wait_visible(
+        &b,
+        ROOT_INO,
+        b"dst.txt",
+        Duration::from_secs(10)
+    ));
+
+    a.rename(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt")
+        .expect("rename overwrite on a");
+    a.flush_metadata().expect("flush rename overwrite");
+
+    assert!(wait_until(Duration::from_secs(10), || {
+        let _ = b.sync_metadata();
+        b.lookup(ROOT_INO, b"src.txt").is_err()
+            && b.lookup(ROOT_INO, b"dst.txt")
+                .map(|entry| entry.ino == src.ino)
+                .unwrap_or(false)
+    }));
+
+    let on_b = b.lookup(ROOT_INO, b"dst.txt").expect("lookup dst on b");
+    assert_eq!(on_b.ino, src.ino);
+    assert_ne!(on_b.ino, dst.ino);
+    assert!(b.lookup(ROOT_INO, b"src.txt").is_err());
+    assert!(
+        b.get_attr(dst.ino).is_err(),
+        "overwritten inode should be removed"
+    );
+}
+
+#[test]
 fn remote_apply_coordinator_does_not_capture_pg_engine_state() {
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

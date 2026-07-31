@@ -111,7 +111,7 @@ impl MetaReplication for PgMetaEngine {
     fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
         MetadataAuthorityStatus {
             inode_id_headroom: self.inode_id_headroom_available.load(Ordering::Acquire),
-            object_id_headroom: self.inode_id_headroom_available.load(Ordering::Acquire),
+            object_id_headroom: self.object_id_headroom_available.load(Ordering::Acquire),
         }
     }
 

@@ -24,6 +24,64 @@ fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
 }
 
 #[test]
+fn open_fails_when_pending_local_event_log_is_corrupt() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&path).expect("open local redb");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "corrupt-local-event-log",
+            "corrupt-local-event-log-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set format info");
+    PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+    local
+        .replace_allocator_state(
+            AllocatorStateV1::new(
+                AllocatorRecord::new(1, 0).expect("inode namespace"),
+                AllocatorRecord::new(2, 0).expect("payload namespace"),
+            )
+            .expect("allocator state"),
+        )
+        .expect("persist allocator state");
+
+    let event_seq = local.get_counter("nextEventSeq").expect("event start");
+    local
+        .create_file(ROOT_INO, b"pending-local-file.bin", 0, 0, 0o644)
+        .expect("create pending local file");
+    local
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, event_seq)
+        .expect("persist unflushed event start");
+    let txn = local
+        .begin_write_txn()
+        .expect("begin corruption transaction");
+    {
+        let event_log = redb::TableDefinition::<u64, &[u8]>::new("event_log");
+        let mut events = txn.open_table(event_log).expect("open event log");
+        events
+            .insert(event_seq, b"invalid-event".as_slice())
+            .expect("corrupt pending event");
+    }
+    txn.commit().expect("commit corrupted event");
+    drop(local);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    );
+
+    assert!(
+        reopened.is_err(),
+        "startup must not silently discard an unreadable pending local event"
+    );
+}
+
+#[test]
 fn startup_snapshot_preserves_local_overlay_when_local_overlay_exists() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

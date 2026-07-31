@@ -206,6 +206,7 @@ impl MetadataWriteMetrics {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct CounterWriteTransaction<'a> {
     txn: &'a WriteTransaction,
 }
@@ -404,6 +405,7 @@ fn begin_redb_read_txn(db: &Database) -> MetaResult<ReadTransaction> {
         .map_err(|e| MetaError::Storage(e.to_string()))
 }
 
+#[cfg(test)]
 impl CounterWriteTransaction<'_> {
     pub(crate) fn set(&self, name: &str, value: u64) -> MetaResult<()> {
         let mut table = self
@@ -613,6 +615,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn write_counters<T, F>(&self, f: F) -> MetaResult<T>
     where
         F: FnOnce(&CounterWriteTransaction<'_>) -> MetaResult<T>,

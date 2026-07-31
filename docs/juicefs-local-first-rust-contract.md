@@ -13,7 +13,7 @@ StudioFS implements one production mount model:
 - mounted reads and writes use a JuiceFS-equivalent chunk/slice writer,
   data-reader, and cached-store pipeline;
 - PostgreSQL is used for bootstrap, ordered metadata replication, client
-  discovery, ID-range reservation, and shared file-lock coordination;
+  discovery, allocator-namespace registration, and shared file-lock coordination;
 - object storage is used for payload replication and cold reads of known
   published objects;
 - foreground mounted IO does not wait for PostgreSQL replication or object
@@ -178,19 +178,20 @@ PostgreSQL responsibilities:
 - ordered metadata replication events;
 - peer invalidation and convergence;
 - client discovery;
-- inode and object-ID range reservation;
+- paired inode and payload allocator-namespace registration;
 - shared hard-lock coordination.
 
 Rules:
 
 - Ordinary reads and writes must not ask PostgreSQL for foreground metadata.
-- A mount reserves enough local inode/object-ID headroom to allocate foreground
-  metadata and payload IDs without steady-state PostgreSQL round trips.
-- If PostgreSQL is unavailable and local ID headroom remains, the mount may
-  continue accepting local work.
-- If PostgreSQL is unavailable and required ID headroom is exhausted, new
-  mutations fail or degrade to read-only behavior while already known readable
-  state remains readable.
+- A PostgreSQL-backed local root durably registers paired inode and payload
+  namespaces before it accepts mutations; foreground metadata and payload ID
+  allocation then advances local counters without steady-state PostgreSQL round
+  trips.
+- If PostgreSQL is unavailable and a complete paired allocator state already
+  exists, the mount may continue accepting local work. A missing, malformed,
+  or legacy range-based state remains read-only until a later reopen can
+  register a fresh pair; already known readable state remains readable.
 - Shared locks are the explicit foreground exception: lock grant/renew/release
   may talk to PostgreSQL.
 
