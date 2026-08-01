@@ -171,8 +171,48 @@ fn sfs623_recovery_exhausted_persisted_record_is_read_only() {
 }
 
 #[test]
-fn sfs623_recovery_overflow_keeps_authority_read_only_until_reopen() {
+fn sfs623_recovery_final_inode_refill_marks_authority_read_only() {
     let (_dir, pg) = temp_pg_engine_for_unit();
+    let state = AllocatorStateV1::new(
+        AllocatorRecord::new(1, COUNTER_LIMIT - 1).expect("final inode namespace"),
+        AllocatorRecord::new(2, 0).expect("available payload namespace"),
+    )
+    .expect("allocator state");
+    pg.local
+        .replace_allocator_state(state)
+        .expect("persist final inode allocator state");
+    pg.bootstrap_allocator_state();
+
+    pg.next_inode().expect("allocate final inode");
+
+    let authority = MetaReplication::metadata_authority_status(&pg);
+    assert!(!authority.inode_id_headroom);
+    assert!(authority.object_id_headroom);
+}
+
+#[test]
+fn sfs623_recovery_final_payload_refill_marks_authority_read_only() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let state = AllocatorStateV1::new(
+        AllocatorRecord::new(1, 0).expect("available inode namespace"),
+        AllocatorRecord::new(2, COUNTER_LIMIT - 1).expect("final payload namespace"),
+    )
+    .expect("allocator state");
+    pg.local
+        .replace_allocator_state(state)
+        .expect("persist final payload allocator state");
+    pg.bootstrap_allocator_state();
+
+    pg.next_object_ids(1).expect("allocate final payload ID");
+
+    let authority = MetaReplication::metadata_authority_status(&pg);
+    assert!(authority.inode_id_headroom);
+    assert!(!authority.object_id_headroom);
+}
+
+#[test]
+fn sfs623_recovery_overflow_keeps_authority_read_only_until_reopen() {
+    let (dir, pg) = temp_pg_engine_for_unit();
     let remaining = 5_000;
     let state = AllocatorStateV1::new(
         AllocatorRecord::new(1, COUNTER_LIMIT - remaining).expect("inode namespace"),
@@ -190,14 +230,41 @@ fn sfs623_recovery_overflow_keeps_authority_read_only_until_reopen() {
     );
     assert!(!MetaReplication::metadata_authority_status(&pg).inode_id_headroom);
 
-    pg.next_inode()
-        .expect("smaller allocation can consume the reserved tail");
+    drop(pg);
+    let reopened = PgMetaEngine::open_with_options(
+        dir.path().join("meta.redb"),
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("reopen engine with the surviving allocator tail");
 
-    let authority = MetaReplication::metadata_authority_status(&pg);
+    let authority = MetaReplication::metadata_authority_status(&*reopened);
     assert!(
-        !authority.inode_id_headroom,
-        "allocator recovery is limited to engine open; this mount stays read-only"
+        authority.inode_id_headroom,
+        "only engine open may restore authority from the surviving allocator tail"
     );
+}
+
+#[test]
+fn sfs623_recovery_untrustworthy_state_is_read_only_offline() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    pg.local
+        .write_invalid_allocator_state_for_test()
+        .expect("persist invalid allocator state");
+    drop(pg);
+
+    let reopened = PgMetaEngine::open_with_options(
+        dir.path().join("meta.redb"),
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open known metadata view with PostgreSQL unavailable");
+
+    let authority = MetaReplication::metadata_authority_status(&*reopened);
+    assert!(!authority.inode_id_headroom);
+    assert!(!authority.object_id_headroom);
 }
 
 #[test]
@@ -351,6 +418,34 @@ fn sfs623_pg_allocator_legacy_counter_never_mints_a_namespace() {
         engine.next_inode().is_err(),
         "legacy root must reject new IDs"
     );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn sfs623_pg_allocator_untrustworthy_state_mints_fresh_pair_online() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-allocator-untrustworthy-recovery");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    seed_local(&path, &volume.format_info());
+
+    let local = RedbMetaEngine::open(&path).expect("open local redb");
+    local
+        .write_invalid_allocator_state_for_test()
+        .expect("persist invalid allocator state");
+    drop(local);
+
+    let engine = PgMetaEngine::open(&path).expect("recover allocator state with PostgreSQL");
+    let state = engine
+        .local
+        .read_allocator_state()
+        .expect("read recovered allocator state")
+        .expect("recovered allocator state");
+    let authority = MetaReplication::metadata_authority_status(&*engine);
+
+    assert_ne!(state.inode.namespace(), state.payload.namespace());
+    assert!(authority.inode_id_headroom);
+    assert!(authority.object_id_headroom);
 }
 
 #[test]

@@ -60,6 +60,22 @@ impl RedbMetaEngine {
             .lock()
             .expect("allocator state write hook lock") = Some(hook);
     }
+
+    #[cfg(test)]
+    pub(crate) fn write_invalid_allocator_state_for_test(&self) -> MetaResult<()> {
+        let txn = self.begin_write_txn()?;
+        {
+            let mut table = txn
+                .open_table(LOCAL_ALLOCATOR_STATE_TABLE)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            table
+                .insert(LOCAL_ALLOCATOR_STATE_KEY, b"invalid".as_slice())
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        self.sync_local_metadata()
+    }
 }
 
 #[cfg(test)]

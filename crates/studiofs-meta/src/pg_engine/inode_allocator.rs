@@ -355,6 +355,21 @@ impl PgMetaEngine {
 
         self.local.replace_allocator_state(next_state)?;
 
+        let reached_counter_limit = if inode {
+            next_state.inode.reserved_through() == COUNTER_LIMIT
+        } else {
+            next_state.payload.reserved_through() == COUNTER_LIMIT
+        };
+        if reached_counter_limit {
+            if inode {
+                self.inode_id_headroom_available
+                    .store(false, Ordering::Release);
+            } else {
+                self.object_id_headroom_available
+                    .store(false, Ordering::Release);
+            }
+        }
+
         let mut runtime = self
             .allocator_runtime
             .lock()
