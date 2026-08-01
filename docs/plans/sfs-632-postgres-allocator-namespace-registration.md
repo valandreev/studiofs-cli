@@ -54,7 +54,8 @@ The range-window implementation is removed from the PostgreSQL path. PostgreSQL
 now atomically rejects a legacy `next_inode` counter or validates and commits
 `next_allocator_namespace` by two, after which redb persists the complete pair
 before allocation can proceed. The focused local proof includes the full
-`studiofs-meta` library suite and the VFS namespace timing check. The live
+`studiofs-meta` library suite and the VFS
+`sfs623_read_only_allocator_blocks_new_mutations_but_keeps_reads_open` check. The live
 PostgreSQL acceptance ran three tests against the repository `.env` and passed;
 no bridge-specific allocation branch is required.
 
@@ -123,7 +124,7 @@ Run from `/Volumes/Storage/dev/studiofs`, one Cargo command at a time:
 
     cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1  # historical SFS-623 acceptance filter
     cargo test -p studiofs-meta sfs623_allocator_state_ -- --nocapture
-    cargo test -p studiofs-vfs read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open -- --nocapture
+    cargo test -p studiofs-vfs sfs623_read_only_allocator_blocks_new_mutations_but_keeps_reads_open -- --nocapture
     RUSTFLAGS='-D warnings' cargo check -p studiofs-meta -p studiofs-vfs
 
 The first command requires the repository PostgreSQL fixture from `.env`. Keep
