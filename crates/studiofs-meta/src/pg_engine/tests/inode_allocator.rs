@@ -54,7 +54,7 @@ fn allocator_uses_separate_inode_and_payload_namespaces() {
 }
 
 #[test]
-fn allocator_restart_skips_the_durable_reserved_tail() {
+fn sfs623_recovery_trusted_state_allocates_offline_after_reopen() {
     let (dir, pg) = temp_pg_engine_for_unit();
     let first = pg.next_inode().expect("allocate first inode");
     let reserved_through = pg
@@ -152,7 +152,7 @@ fn allocator_refill_does_not_hold_runtime_lock_during_local_persistence() {
 }
 
 #[test]
-fn allocator_bootstrap_marks_exhausted_persisted_record_read_only() {
+fn sfs623_recovery_exhausted_persisted_record_is_read_only() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let state = AllocatorStateV1::new(
         AllocatorRecord::new(1, COUNTER_LIMIT).expect("exhausted inode namespace"),
@@ -171,7 +171,7 @@ fn allocator_bootstrap_marks_exhausted_persisted_record_read_only() {
 }
 
 #[test]
-fn allocator_refill_restores_headroom_after_a_large_request_fails() {
+fn sfs623_recovery_overflow_keeps_authority_read_only_until_reopen() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let remaining = 5_000;
     let state = AllocatorStateV1::new(
@@ -190,12 +190,13 @@ fn allocator_refill_restores_headroom_after_a_large_request_fails() {
     );
     assert!(!MetaReplication::metadata_authority_status(&pg).inode_id_headroom);
 
-    pg.next_inode().expect("smaller refill should succeed");
+    pg.next_inode()
+        .expect("smaller allocation can consume the reserved tail");
 
     let authority = MetaReplication::metadata_authority_status(&pg);
     assert!(
-        authority.inode_id_headroom,
-        "successful refill must restore persisted allocator headroom"
+        !authority.inode_id_headroom,
+        "allocator recovery is limited to engine open; this mount stays read-only"
     );
 }
 
