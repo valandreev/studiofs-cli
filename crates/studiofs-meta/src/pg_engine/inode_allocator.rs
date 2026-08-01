@@ -158,12 +158,22 @@ impl PgMetaEngine {
     }
 
     pub(super) fn bootstrap_allocator_state(&self) {
-        let loaded_state_result = match self.local.read_allocator_state() {
-            Ok(Some(state)) => Ok(state),
-            Ok(None) | Err(_) => self.mint_allocator_state().and_then(|state| {
-                self.local.replace_allocator_state(state)?;
-                Ok(state)
-            }),
+        let (allocator_state, loaded_state_result) = match self.local.read_allocator_state() {
+            Ok(Some(state)) => ("trusted", Ok(state)),
+            Ok(None) => (
+                "new",
+                self.mint_allocator_state().and_then(|state| {
+                    self.local.replace_allocator_state(state)?;
+                    Ok(state)
+                }),
+            ),
+            Err(_) => (
+                "untrustworthy",
+                self.mint_allocator_state().and_then(|state| {
+                    self.local.replace_allocator_state(state)?;
+                    Ok(state)
+                }),
+            ),
         };
         match loaded_state_result {
             Ok(state) => {
@@ -185,9 +195,19 @@ impl PgMetaEngine {
                 self.object_id_headroom_available
                     .store(false, Ordering::Release);
                 if error.to_string().contains("legacy next_inode") {
-                    warn!(error = %error, volume_id = self.volume_id, "id_allocator_legacy_migration_required");
+                    warn!(
+                        error = %error,
+                        volume_id = self.volume_id,
+                        allocator_state = "legacy_migration_required",
+                        "id_allocator_legacy_migration_required"
+                    );
                 } else {
-                    warn!(error = %error, volume_id = self.volume_id, "id_allocator_recovery_required");
+                    warn!(
+                        error = %error,
+                        volume_id = self.volume_id,
+                        allocator_state,
+                        "id_allocator_recovery_required"
+                    );
                 }
             }
         }
@@ -315,7 +335,13 @@ impl PgMetaEngine {
                     self.object_id_headroom_available
                         .store(false, Ordering::Release);
                 }
-                warn!(error = %error, volume_id = self.volume_id, "id_allocator_counter_exhausted");
+                warn!(
+                    error = %error,
+                    volume_id = self.volume_id,
+                    allocator = if inode { "inode" } else { "payload" },
+                    allocator_state = "counter_exhausted",
+                    "id_allocator_counter_exhausted"
+                );
                 MetaError::Storage(error.to_string())
             })?;
             let next_state = if inode {
@@ -329,16 +355,19 @@ impl PgMetaEngine {
 
         self.local.replace_allocator_state(next_state)?;
 
-        if inode {
-            self.inode_id_headroom_available.store(
-                next_state.inode.reserved_through() < COUNTER_LIMIT,
-                Ordering::Release,
-            );
+        let reached_counter_limit = if inode {
+            next_state.inode.reserved_through() == COUNTER_LIMIT
         } else {
-            self.object_id_headroom_available.store(
-                next_state.payload.reserved_through() < COUNTER_LIMIT,
-                Ordering::Release,
-            );
+            next_state.payload.reserved_through() == COUNTER_LIMIT
+        };
+        if reached_counter_limit {
+            if inode {
+                self.inode_id_headroom_available
+                    .store(false, Ordering::Release);
+            } else {
+                self.object_id_headroom_available
+                    .store(false, Ordering::Release);
+            }
         }
 
         let mut runtime = self

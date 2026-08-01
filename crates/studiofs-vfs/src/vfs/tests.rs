@@ -17730,7 +17730,7 @@ fn foreign_hard_lock_blocks_unlink_and_rename() {
 }
 
 #[test]
-fn read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open() {
+fn sfs623_read_only_allocator_blocks_new_mutations_but_keeps_reads_open() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "offline-read-only-authority");
     let attr = vfs
