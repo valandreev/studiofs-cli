@@ -708,7 +708,7 @@ const DEFAULT_PREFETCH_CONCURRENCY_MIN: usize = 1;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_READDIR_ATTR_BATCH_CHUNK: usize = 256;
 const DEFAULT_READDIR_ATTR_BATCH_MAX_INODES: usize = 4096;
-const DEFAULT_UPLOAD_DELAY_MS: u64 = 10_000;
+const DEFAULT_UPLOAD_DELAY_MS: u64 = 0;
 // Keep failed uploads circulating quickly so a single transient error does not
 // strand the whole inode in pending-overlay mode until remount.
 const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 500;
