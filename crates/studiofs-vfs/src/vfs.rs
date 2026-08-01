@@ -4648,6 +4648,7 @@ impl StudioVfs {
     /// and other maintenance tasks.
     pub fn start(self: &Arc<Self>) -> VfsResult<()> {
         self.ensure_can_start()?;
+        self.register_overlay_batch_runtime(tokio::runtime::Handle::current());
         self.state
             .namespace
             .deferred

@@ -365,6 +365,7 @@ pub(super) struct OverlayBatchState {
     inner: Mutex<OverlayBatchInner>,
     admission: Arc<tokio::sync::Semaphore>,
     space_available: tokio::sync::Notify,
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 pub(super) struct LocalDirtyState {
@@ -433,6 +434,7 @@ impl LocalDirtyState {
                     OVERLAY_BATCH_MAX_QUEUED_OPERATIONS,
                 )),
                 space_available: tokio::sync::Notify::new(),
+                runtime: std::sync::OnceLock::new(),
             },
             overlay_metadata_error: Mutex::new(None),
             overlay_metadata_degraded: AtomicBool::new(false),
@@ -451,6 +453,10 @@ impl LocalDirtyState {
 }
 
 impl StudioVfs {
+    pub(super) fn register_overlay_batch_runtime(&self, runtime: tokio::runtime::Handle) {
+        let _ = self.state.local_dirty.overlay_batch.runtime.set(runtime);
+    }
+
     /// Return the sticky background overlay failure, if the worker is degraded.
     pub(super) fn ensure_volatile_overlay_metadata_healthy(&self) -> VfsResult<()> {
         if !self
@@ -630,9 +636,15 @@ impl StudioVfs {
         if is_drainer {
             let state = Arc::clone(&self.state);
             let meta = self.meta.clone();
-            tokio::spawn(async move {
+            let runtime = state.local_dirty.overlay_batch.runtime.get().cloned();
+            let drainer = async move {
                 drain_regular_file_overlay_batches(state, meta).await;
-            });
+            };
+            if let Some(runtime) = runtime {
+                runtime.spawn(drainer);
+            } else {
+                tokio::spawn(drainer);
+            }
         }
 
         if !wait_for_completion {
