@@ -645,7 +645,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
             return Ok(());
         }
 
-        if deleted_before_publish.is_some() {
+        if deleted_before_publish.is_some() || attr.is_unpublished_empty_draft() {
             RedbMetaEngine::append_event_in_txn(
                 self.txn,
                 &crate::events::MetaEvent::RemoveRegularFileGraph { ino: attr.ino },

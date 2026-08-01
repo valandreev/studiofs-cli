@@ -232,6 +232,36 @@ fn project_local_batch_keeps_delete_before_publish_out_of_pg() {
 }
 
 #[test]
+fn project_local_batch_keeps_empty_deleted_draft_out_of_pg() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    pg.create_file(ROOT_INO, b"deleted-empty-draft.bin", 0, 0, 0o644)
+        .expect("create empty draft");
+    pg.unlink(ROOT_INO, b"deleted-empty-draft.bin")
+        .expect("unlink empty draft");
+
+    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert_eq!(
+        projected.visible_ops, 0,
+        "an empty file deleted before its first publish must not leave PG metadata work: {:?}",
+        projected.events
+    );
+    assert_eq!(
+        pg.replication_backlog().total_ops(),
+        0,
+        "canceled empty drafts must not remain in the PG backlog"
+    );
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        end,
+        "canceled empty-draft events must be retired from the local log"
+    );
+}
+
+#[test]
 fn project_local_batch_hides_brand_new_empty_regular_file_namespace() {
     let draft = InodeAttr::new_file(ROOT_INO + 11, ROOT_INO, 0, 0, 0o644);
 
