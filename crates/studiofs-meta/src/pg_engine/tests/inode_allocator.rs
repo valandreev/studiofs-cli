@@ -368,7 +368,7 @@ fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn sfs623_pg_allocator_legacy_counter_never_mints_a_namespace() {
+fn sfs623_pg_allocator_legacy_counter_does_not_block_namespace_minting() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let volume = PgTestVolume::new(&dsn, "pg-allocator-legacy");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
@@ -396,28 +396,28 @@ fn sfs623_pg_allocator_legacy_counter_never_mints_a_namespace() {
     })
     .expect("seed legacy PostgreSQL counter");
 
-    let engine = PgMetaEngine::open(&path).expect("open legacy local root read-only");
+    let engine = PgMetaEngine::open(&path).expect("open local root with legacy counter");
 
-    assert_eq!(
-        pg_counter_value(&dsn, volume_id, "next_allocator_namespace"),
-        namespace_before,
-        "legacy roots must not mint or advance an allocator namespace"
+    assert!(
+        pg_counter_value(&dsn, volume_id, "next_allocator_namespace") > namespace_before,
+        "legacy counter must not prevent namespace minting"
     );
     let authority = MetaReplication::metadata_authority_status(&*engine);
-    assert!(!authority.inode_id_headroom);
-    assert!(!authority.object_id_headroom);
+    assert!(authority.inode_id_headroom);
+    assert!(authority.object_id_headroom);
 
-    assert_eq!(
-        engine
-            .local
-            .read_allocator_state()
-            .expect("read allocator state"),
-        None
-    );
+    let state = engine
+        .local
+        .read_allocator_state()
+        .expect("read allocator state")
+        .expect("legacy counter must not prevent allocator state persistence");
     assert!(
-        engine.next_inode().is_err(),
-        "legacy root must reject new IDs"
+        state.inode.namespace() != state.payload.namespace(),
+        "allocator records must retain separate namespaces"
     );
+    engine
+        .next_inode()
+        .expect("allocate inode with legacy counter");
 }
 
 #[test]
