@@ -361,6 +361,8 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
 fn upload_progress_only_mutation_does_not_advance_cursor_past_inflight_visible_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
+    pg.create_dir(ROOT_INO, b"inflight-visible-dir", 0, 0, 0o755)
+        .expect("create visible directory");
     let file = pg
         .create_file(ROOT_INO, b"inflight-visible-create.bin", 0, 0, 0o644)
         .expect("create file");
@@ -370,7 +372,7 @@ fn upload_progress_only_mutation_does_not_advance_cursor_past_inflight_visible_b
         .expect("stage local overlay");
     let batch = pg
         .claim_pending_batch(true)
-        .expect("visible create and local overlay setup should be claimable");
+        .expect("visible directory and local overlay setup should be claimable");
     let claimed_start = batch.event_start;
     assert!(
         pg.replication_backlog().inflight_ops > 0,

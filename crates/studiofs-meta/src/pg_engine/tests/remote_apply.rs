@@ -165,11 +165,8 @@ fn project_local_batch_hides_uncommitted_regular_file_namespace() {
         "local draft namespace and payload state must not be projected to PG"
     );
     assert!(
-        projected
-            .events
-            .iter()
-            .any(|event| matches!(event, MetaEvent::SetAttr { attr } if attr.ino == draft.ino)),
-        "uploading attr metadata remains batchable while the namespace stays hidden"
+        projected.events.is_empty(),
+        "an unpublished regular file must not leave PG metadata work"
     );
 }
 
@@ -194,19 +191,43 @@ fn project_local_batch_hides_uncommitted_regular_file_namespace_from_local_log()
         "local event log projection must hide the draft dentry"
     );
 
-    let batch = pg
-        .claim_pending_batch(true)
-        .expect("claim pending draft batch");
-    let claimed_events = pg
-        .local
-        .read_events_range(batch.event_start, batch.event_end)
-        .expect("read claimed events");
-    let claimed_projected = RemoteApplyCoordinator::project_local_batch(&claimed_events);
     assert!(
-        !claimed_projected.events.iter().any(
-            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
-        ),
-        "claimed local batch projection must hide the draft dentry"
+        pg.claim_pending_batch(true).is_none(),
+        "an unpublished draft must not schedule a PG batch"
+    );
+}
+
+#[test]
+fn project_local_batch_keeps_delete_before_publish_out_of_pg() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let draft = pg
+        .create_file(ROOT_INO, b"deleted-draft.bin", 0, 0, 0o644)
+        .expect("create draft");
+    set_file_state(&pg, draft.ino, 4096, 1);
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(9004, 4096))
+        .expect("stage local-only payload");
+    pg.unlink(ROOT_INO, b"deleted-draft.bin")
+        .expect("unlink unpublished draft");
+
+    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert_eq!(
+        projected.visible_ops, 0,
+        "a file deleted before its first publish must not leave PG metadata work: {:?}",
+        projected.events
+    );
+    assert_eq!(
+        pg.replication_backlog().total_ops(),
+        0,
+        "canceled unpublished files must not remain in the PG backlog"
+    );
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        end,
+        "canceled unpublished events must be retired from the local log"
     );
 }
 

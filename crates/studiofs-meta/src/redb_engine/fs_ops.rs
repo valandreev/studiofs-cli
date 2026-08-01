@@ -645,6 +645,17 @@ impl<'a> NamespaceDeleteTxn<'a> {
             return Ok(());
         }
 
+        if deleted_before_publish.is_some() {
+            RedbMetaEngine::append_event_in_txn(
+                self.txn,
+                &crate::events::MetaEvent::RemoveRegularFileGraph { ino: attr.ino },
+            )?;
+            return RedbMetaEngine::append_event_in_txn(
+                self.txn,
+                &crate::events::MetaEvent::RemoveAttr { ino: attr.ino },
+            );
+        }
+
         RedbMetaEngine::append_event_in_txn(
             self.txn,
             &crate::events::MetaEvent::RemoveEntry {
