@@ -589,7 +589,7 @@ fn xattr_change_batches_without_pg_poll_wakeup() {
 }
 
 #[test]
-fn uploading_file_attr_change_batches_without_pg_poll_wakeup() {
+fn uploading_file_attr_change_stays_local_without_pg_poll_wakeup() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = pg
@@ -618,8 +618,8 @@ fn uploading_file_attr_change_batches_without_pg_poll_wakeup() {
 
     assert_eq!(
         pg.replication_backlog().pending_ops,
-        1,
-        "uploading attrs remain remote-visible metadata"
+        0,
+        "unpublished uploading attrs must stay out of PostgreSQL"
     );
     assert!(
         !*wakeup_lock.lock().expect("poll wakeup lock"),
