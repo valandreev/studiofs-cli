@@ -202,6 +202,39 @@ mod tests {
     }
 
     #[test]
+    fn overlay_drainer_uses_vfs_runtime_after_caller_runtime_exits() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (mount_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "overlay-runtime-owner");
+        {
+            let _guard = mount_rt.enter();
+            vfs.start().expect("start VFS");
+        }
+        let attr = vfs
+            .create(1, b"runtime-owner.bin", 0, 0, 0o644)
+            .expect("create file");
+
+        let caller_rt = Runtime::new().expect("caller runtime");
+        caller_rt.block_on(async {
+            VfsOverlayCommitter { vfs: &vfs }
+                .commit_overlay(attr.ino, Vec::new(), Some(attr.clone()), false)
+                .await
+                .expect("admit overlay from callback runtime");
+        });
+        drop(caller_rt);
+
+        mount_rt
+            .block_on(vfs.wait_for_volatile_overlay_batches())
+            .expect("mount runtime must drain admitted overlay");
+        assert_eq!(
+            meta.get_attr(attr.ino).expect("persisted attr").ino,
+            attr.ino
+        );
+        mount_rt
+            .block_on(vfs.shutdown(Duration::ZERO))
+            .expect("shutdown VFS");
+    }
+
+    #[test]
     fn first_overlay_sequence_is_above_completion_sentinel() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-first-sequence");

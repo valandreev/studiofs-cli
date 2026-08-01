@@ -189,9 +189,10 @@ Rules:
   allocation then advances local counters without steady-state PostgreSQL round
   trips.
 - If PostgreSQL is unavailable and a complete paired allocator state already
-  exists, the mount may continue accepting local work. A missing, malformed,
-  or legacy range-based state remains read-only until a later reopen can
-  register a fresh pair; already known readable state remains readable.
+  exists, the mount may continue accepting local work. A missing or malformed
+  state remains read-only until a later reopen can register a fresh pair;
+  already known readable state remains readable. When PostgreSQL is available,
+  bootstrap deletes the retired `next_inode` counter before minting that pair.
 - Shared locks are the explicit foreground exception: lock grant/renew/release
   may talk to PostgreSQL.
 

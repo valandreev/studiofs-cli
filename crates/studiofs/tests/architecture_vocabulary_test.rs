@@ -1114,6 +1114,10 @@ fn linux_adaptive_perf_gate_covers_mandatory_workloads_and_phase_checks() {
         missing.join("\n")
     );
 
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+
     let fixture =
         studiofs_test_support::workspace_target_tempdir("linux-cache-gate-report-fixture-");
     let targets = [

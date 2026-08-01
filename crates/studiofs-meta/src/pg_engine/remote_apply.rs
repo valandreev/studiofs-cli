@@ -67,26 +67,30 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     pub(super) fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
-        let mut out = Vec::with_capacity(events.len());
-        for event in events {
-            match event {
-                MetaEvent::SetRegularFileOverlaySlices { .. }
-                | MetaEvent::RemoveRegularFileGraph { .. } => {}
-                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
-                MetaEvent::CreateSnapshot { snapshot } => {
-                    let mut synced = snapshot.clone();
-                    synced.state = SnapshotState::Synced;
-                    out.push(MetaEvent::CreateSnapshot { snapshot: synced });
-                }
-                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                    let mut remote_attr = attr.clone();
-                    remote_attr.size = remote_attr.committed_size;
-                    out.push(MetaEvent::SetAttr { attr: remote_attr });
-                }
-                _ => out.push(event.clone()),
+        events
+            .iter()
+            .filter_map(Self::project_remote_event)
+            .collect()
+    }
+
+    fn project_remote_event(event: &MetaEvent) -> Option<MetaEvent> {
+        match event {
+            MetaEvent::SetRegularFileOverlaySlices { .. }
+            | MetaEvent::RemoveRegularFileGraph { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. } => None,
+            MetaEvent::CreateSnapshot { snapshot } => {
+                let mut synced = snapshot.clone();
+                synced.state = SnapshotState::Synced;
+                Some(MetaEvent::CreateSnapshot { snapshot: synced })
             }
+            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                let mut remote_attr = attr.clone();
+                remote_attr.size = remote_attr.committed_size;
+                Some(MetaEvent::SetAttr { attr: remote_attr })
+            }
+            _ => Some(event.clone()),
         }
-        out
     }
 
     pub(super) fn project_local_batch(events: &[MetaEvent]) -> ProjectedRemoteBatch {
@@ -105,12 +109,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     fn hidden_regular_inodes_for_local_events(events: &[MetaEvent]) -> HashSet<Ino> {
+        let committed_regular_inodes = events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile && attr.committed_content_epoch > 0 =>
+                {
+                    Some(attr.ino)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         let mut hidden_regular_inodes = HashSet::new();
         let mut published_regular_inodes = HashSet::new();
         for event in events {
             match event {
                 MetaEvent::SetAttr { attr }
                     if attr.kind == FileType::RegularFile
+                        && !committed_regular_inodes.contains(&attr.ino)
                         && !Self::regular_file_attr_is_ready_for_serving(attr) =>
                 {
                     hidden_regular_inodes.insert(attr.ino);
@@ -119,11 +135,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     hidden_regular_inodes.insert(attr.ino);
                 }
                 MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices }
-                    if chunk_slices.iter().any(|(_, slices)| {
-                        slices
-                            .iter()
-                            .any(|slice| slice.payload_state != PayloadRefState::Published)
-                    }) =>
+                    if !committed_regular_inodes.contains(ino)
+                        && chunk_slices.iter().any(|(_, slices)| {
+                            slices
+                                .iter()
+                                .any(|slice| slice.payload_state != PayloadRefState::Published)
+                        }) =>
                 {
                     hidden_regular_inodes.insert(*ino);
                 }
@@ -149,16 +166,27 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
     fn local_events_need_serving_replay(events: &[MetaEvent]) -> bool {
         let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
+        let deleted_hidden_regular_inodes = events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::RemoveAttr { ino } if hidden_regular_inodes.contains(ino) => Some(*ino),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         events.iter().any(|event| match event {
             MetaEvent::AddEntry { entry, .. } => {
-                entry.kind == FileType::RegularFile && hidden_regular_inodes.contains(&entry.ino)
+                entry.kind == FileType::RegularFile
+                    && hidden_regular_inodes.contains(&entry.ino)
+                    && !deleted_hidden_regular_inodes.contains(&entry.ino)
             }
-            MetaEvent::SetRegularFileOverlaySlices { chunk_slices, .. } => {
-                chunk_slices.iter().any(|(_, slices)| {
-                    slices.iter().any(|slice| {
-                        slice.payload.is_some() && slice.payload_state == PayloadRefState::LocalOnly
+            MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                !deleted_hidden_regular_inodes.contains(ino)
+                    && chunk_slices.iter().any(|(_, slices)| {
+                        slices.iter().any(|slice| {
+                            slice.payload.is_some()
+                                && slice.payload_state == PayloadRefState::LocalOnly
+                        })
                     })
-                })
             }
             _ => false,
         })
@@ -166,6 +194,22 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
     fn project_local_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
         let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
+        let hidden_regular_parent_attr_indices = events
+            .windows(2)
+            .enumerate()
+            .filter_map(|(index, pair)| match pair {
+                [
+                    MetaEvent::SetAttr { attr },
+                    MetaEvent::AddEntry { parent, entry, .. },
+                ] if attr.ino == *parent
+                    && entry.kind == FileType::RegularFile
+                    && hidden_regular_inodes.contains(&entry.ino) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         let hidden_zero_regular_add_inodes = events
             .iter()
             .filter_map(|event| match event {
@@ -178,18 +222,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-
         let mut out = Vec::with_capacity(events.len());
-        for event in Self::project_remote_events(events) {
-            match &event {
+        for (index, event) in events.iter().enumerate() {
+            match event {
                 MetaEvent::AddEntry { entry, .. }
                     if entry.kind == FileType::RegularFile
                         && hidden_regular_inodes.contains(&entry.ino) => {}
                 MetaEvent::SetAttr { attr }
-                    if hidden_zero_regular_add_inodes.contains(&attr.ino)
-                        && attr.is_unpublished_empty_draft() => {}
+                    if hidden_regular_inodes.contains(&attr.ino)
+                        || (hidden_zero_regular_add_inodes.contains(&attr.ino)
+                            && attr.is_unpublished_empty_draft()) => {}
+                MetaEvent::SetAttr { .. }
+                    if hidden_regular_parent_attr_indices.contains(&index) => {}
                 MetaEvent::RemoveAttr { ino } if hidden_regular_inodes.contains(ino) => {}
-                _ => out.push(event),
+                _ => {
+                    if let Some(event) = Self::project_remote_event(event) {
+                        out.push(event);
+                    }
+                }
             }
         }
         out

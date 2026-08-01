@@ -213,25 +213,11 @@ cargo build --release
 Checks:
 
 ```bash
-test dump_load_restores_target_volume_without_breaking_other_volumes ... 
-thread 'dump_load_restores_target_volume_without_breaking_other_volumes' (1017688) panicked at crates/studiofs/tests/dump_load_test.rs:248:14:
-create file: Storage("allocator namespace is unavailable")
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-FAILED
-test dump_load_restores_volume_and_discovery_reads_data ... 
-thread 'dump_load_restores_volume_and_discovery_reads_data' (1018023) panicked at crates/studiofs/tests/dump_load_test.rs:248:14:
-create file: Storage("allocator namespace is unavailable")
-FAILED
-
-failures:
-
-failures:
-    dump_load_restores_target_volume_without_breaking_other_volumes
-    dump_load_restores_volume_and_discovery_reads_data
-
-test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.43s
-
-error: test failed, to rerun pass `-p studiofs --test dump_load_test````
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -W missing-docs
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace
+```
 
 Workspace lint policy is inherited from the root `[workspace.lints]` tables.
 Member crates opt in with `[lints] workspace = true`; keep new shared lints

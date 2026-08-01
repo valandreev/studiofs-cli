@@ -994,8 +994,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vfs_config_default_defers_uploads_for_ten_seconds() {
-        assert_eq!(VfsConfig::default().upload_delay_ms, 10_000);
+    fn vfs_config_default_starts_uploads_without_delay() {
+        assert_eq!(VfsConfig::default().upload_delay_ms, 0);
     }
 
     #[test]
