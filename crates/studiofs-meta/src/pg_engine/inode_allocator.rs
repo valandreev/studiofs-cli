@@ -2,7 +2,7 @@
 
 use super::{
     LOCAL_PG_CLIENT_SLOT_COUNTER, PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER, PG_NEXT_CLIENT_SLOT_COUNTER,
-    PgMetaEngine,
+    PG_RETIRED_INODE_COUNTER, PgMetaEngine,
 };
 use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, COUNTER_LIMIT, MAX_NAMESPACE};
 use crate::engine::{MetaError, MetaInodes, MetaResult};
@@ -111,6 +111,12 @@ impl PgMetaEngine {
                                 Self::format_pg_error(error)
                             ))
                         })?;
+                        tx.execute(
+                            "DELETE FROM counters WHERE vol = $1 AND name = $2",
+                            &[&volume_id, &PG_RETIRED_INODE_COUNTER],
+                        )
+                        .await
+                        .map_err(|error| MetaError::Storage(format!("postgres retired allocator cleanup failed: {}", Self::format_pg_error(error))))?;
                         tx.execute(
                             "INSERT INTO counters (vol, name, value) VALUES ($1, $2, 1) ON CONFLICT (vol, name) DO NOTHING",
                             &[&volume_id, &PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER],

@@ -368,9 +368,9 @@ fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn sfs623_pg_allocator_legacy_counter_does_not_block_namespace_minting() {
+fn sfs623_pg_allocator_retired_inode_counter_is_removed_during_bootstrap() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
-    let volume = PgTestVolume::new(&dsn, "pg-allocator-legacy");
+    let volume = PgTestVolume::new(&dsn, "pg-allocator-retired-counter");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
     seed_local(&path, &volume.format_info());
@@ -390,17 +390,22 @@ fn sfs623_pg_allocator_legacy_counter_does_not_block_namespace_minting() {
                 &[&volume_id],
             )
             .await
-            .expect("seed legacy counter");
+            .expect("seed retired counter");
         task.abort();
         Ok::<(), MetaError>(())
     })
-    .expect("seed legacy PostgreSQL counter");
+    .expect("seed retired PostgreSQL counter");
 
-    let engine = PgMetaEngine::open(&path).expect("open local root with legacy counter");
+    let engine = PgMetaEngine::open(&path).expect("open local root with retired counter");
 
+    assert_eq!(
+        pg_counter_value(&dsn, volume_id, "next_inode"),
+        None,
+        "bootstrap must remove the retired counter"
+    );
     assert!(
         pg_counter_value(&dsn, volume_id, "next_allocator_namespace") > namespace_before,
-        "legacy counter must not prevent namespace minting"
+        "retired counter must not prevent namespace minting"
     );
     let authority = MetaReplication::metadata_authority_status(&*engine);
     assert!(authority.inode_id_headroom);
@@ -410,14 +415,14 @@ fn sfs623_pg_allocator_legacy_counter_does_not_block_namespace_minting() {
         .local
         .read_allocator_state()
         .expect("read allocator state")
-        .expect("legacy counter must not prevent allocator state persistence");
+        .expect("retired counter must not prevent allocator state persistence");
     assert!(
         state.inode.namespace() != state.payload.namespace(),
         "allocator records must retain separate namespaces"
     );
     engine
         .next_inode()
-        .expect("allocate inode with legacy counter");
+        .expect("allocate inode with retired counter");
 }
 
 #[test]

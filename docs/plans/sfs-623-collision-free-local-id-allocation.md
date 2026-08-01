@@ -20,8 +20,8 @@ For a PostgreSQL-backed StudioFS volume, StudioFS will allocate inode IDs and im
   Evidence: `crates/studiofs-meta/src/pg_engine/local_traits.rs` and `crates/studiofs-meta/src/redb_engine/payload_objects.rs`.
 - Observation: StudioFS already enforces a read-only metadata authority for all new mutations while preserving known reads.
   Evidence: `StudioVfs::enforce_metadata_mutation_authority` and `read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open`.
-- Observation: a retired PostgreSQL `counters.name = 'next_inode'` row can remain in a volume, but it is outside the namespace allocator protocol.
-  Evidence: `PgMetaEngine::mint_allocator_state` mints from `next_allocator_namespace` without reading `next_inode`.
+- Observation: a retired PostgreSQL `counters.name = 'next_inode'` row can remain in a volume until namespace bootstrap removes it.
+  Evidence: `PgMetaEngine::mint_allocator_state` deletes `next_inode` before minting from `next_allocator_namespace`.
 - Observation: mounted create and mkdir reserve inode batches through `MetaPayloadObjects::next_object_ids`, not `MetaInodes::next_inode`.
   Evidence: `StudioVfs::reserve_namespace_ino` in `crates/studiofs-vfs/src/vfs/namespace_ops.rs` calls `next_object_ids(NAMESPACE_INODE_BATCH)`.
 
@@ -48,8 +48,8 @@ For a PostgreSQL-backed StudioFS volume, StudioFS will allocate inode IDs and im
 - Decision: Retry untrustworthy allocator-state recovery only during the next `PgMetaEngine::open_with_options` call.
   Rationale: No existing background synchronization path owns allocator bootstrap. Requiring remount avoids an untested live writable-state transition while still restoring authority once PostgreSQL is reachable.
   Date/Author: 2026-07-30 / Codex.
-- Decision: Ignore the retired PostgreSQL `next_inode` counter during namespace bootstrap.
-  Rationale: It is not part of the namespace protocol and must not prevent a local root from receiving its paired allocator state.
+- Decision: Delete the retired PostgreSQL `next_inode` counter during namespace bootstrap.
+  Rationale: It is not part of the namespace protocol and must not remain after a local root receives its paired allocator state.
   Date/Author: 2026-07-30 / Codex.
 - Decision: Add a batched inode allocation method and route namespace creation through it.
   Rationale: A directory or file inode must consume the inode namespace and its headroom, while payload blocks must consume the payload namespace. The existing VFS batch currently uses the payload method only because both classes shared one stream.
@@ -97,7 +97,7 @@ Counter exhaustion is terminal for that allocator: return a typed allocation-ove
 
 ## Bootstrap, Recovery, and Offline Behavior
 
-At a new PostgreSQL-backed local root, namespace bootstrap runs one PostgreSQL transaction that creates or locks `next_allocator_namespace`, mints two namespaces, and commits. A retired `next_inode` counter is ignored. One redb transaction then stores the paired state before either allocator issues an ID. If PostgreSQL fails before the paired state commits, discard any minted namespace and retry later; it remains permanently unused. The product UX guarantees a local metadata root belongs to exactly one computer-volume pair. A parallel clone must create new local state and therefore gets new namespaces.
+At a new PostgreSQL-backed local root, namespace bootstrap runs one PostgreSQL transaction that deletes a retired `next_inode` counter, creates or locks `next_allocator_namespace`, mints two namespaces, and commits. One redb transaction then stores the paired state before either allocator issues an ID. If PostgreSQL fails before the paired state commits, discard any minted namespace and retry later; it remains permanently unused. The product UX guarantees a local metadata root belongs to exactly one computer-volume pair. A parallel clone must create new local state and therefore gets new namespaces.
 
 If either durable allocator record is untrustworthy, do not use either old namespace or counter. During `PgMetaEngine::open_with_options`, mint two fresh namespaces and replace both records atomically. If PostgreSQL is unavailable, open the known local metadata view for reads but set both `MetadataAuthorityStatus` headroom flags to false. Existing readable files remain readable; all new write-capable opens, writes, and namespace mutations fail through the existing `MetaError::AccessDenied { actual: ReadOnly }` path. A mounted process remains read-only: it performs no background allocator retry. After PostgreSQL returns, close and reopen the metadata engine; that next `open_with_options` call retries recovery and restores writable authority only after the paired durable record commits.
 
@@ -109,7 +109,7 @@ The operator-visible surface is deliberately small and typed at the metadata bou
 
 First add `crates/studiofs-meta/src/allocator_state.rs`, a small concrete shared allocator-state value with checked `encode`, namespace/counter validation, and the pure high-water reservation transition. Add red unit tests in the same module for encoding boundaries, separate namespace identity, crash-tail skipping, the `reserved_through == 1 << 39` endpoint, and overflow before connecting either backend.
 
-Then replace `InodeWindow` reservation in `crates/studiofs-meta/src/pg_engine/inode_allocator.rs`. Keep PostgreSQL's `counters` table and the existing `next_client_slot` counter plus the local `pgClientSlotPlusOne` record: they continue to supply the stable `client-slot:<slot>` replication identity. Introduce a separate per-volume `next_allocator_namespace` counter and mint two namespaces during bootstrap or paired-state recovery; ignore a retired `next_inode` counter.
+Then replace `InodeWindow` reservation in `crates/studiofs-meta/src/pg_engine/inode_allocator.rs`. Keep PostgreSQL's `counters` table and the existing `next_client_slot` counter plus the local `pgClientSlotPlusOne` record: they continue to supply the stable `client-slot:<slot>` replication identity. Delete a retired `next_inode` counter, introduce a separate per-volume `next_allocator_namespace` counter, and mint two namespaces during bootstrap or paired-state recovery.
 
 Add `pub(crate)` read/replace helpers for the paired `AllocatorStateV1` to the local redb metadata layer. Add `MetaInodes::next_inode_ids(count: u32) -> MetaResult<Vec<Ino>>` in `crates/studiofs-meta/src/engine.rs`, with a default implementation that repeatedly calls `next_inode`. Override it in `PgMetaEngine` so one reservation comes from the inode record; implement the direct-redb version with the current single-transaction batch behavior so its local-only semantics and performance remain unchanged. `PgMetaEngine::next_inode` and `next_object_ids` in `crates/studiofs-meta/src/pg_engine/local_traits.rs` must use their respective inode and payload records through `self.local`. Change `StudioVfs::reserve_namespace_ino` in `crates/studiofs-vfs/src/vfs/namespace_ops.rs` to call `next_inode_ids(NAMESPACE_INODE_BATCH)`. Preserve `next_inode`, `next_object_ids`, and the contiguous `Vec<u64>` payload-object result so bridges need no allocator API change.
 
@@ -123,7 +123,7 @@ Create `allocator_state.rs` and its unit tests before changing either engine. At
 
 ### Milestone 2: Move PostgreSQL-backed allocation off ranges
 
-Add PostgreSQL namespace minting and the atomic paired redb state. Keep client-slot persistence and self-batch detection intact while routing `PgMetaEngine` inode and object allocation through the two records. Prove a retired `next_inode` row does not prevent `next_allocator_namespace` from being minted. At the end of this milestone, the focused PostgreSQL tests prove two fresh roots receive four namespaces, restarted allocation skips the reserved tail, neither ID class collides with the other, and a retired counter does not make a volume read-only. Run the PostgreSQL command in Concrete Steps with the repository fixture and expect `test result: ok`.
+Add PostgreSQL namespace minting and the atomic paired redb state. Keep client-slot persistence and self-batch detection intact while routing `PgMetaEngine` inode and object allocation through the two records. Prove bootstrap removes a retired `next_inode` row while minting `next_allocator_namespace`. At the end of this milestone, the focused PostgreSQL tests prove two fresh roots receive four namespaces, restarted allocation skips the reserved tail, neither ID class collides with the other, and a retired counter does not make a volume read-only. Run the PostgreSQL command in Concrete Steps with the repository fixture and expect `test result: ok`.
 
 ### Milestone 3: Make degraded recovery observable through existing VFS behavior
 
@@ -176,7 +176,7 @@ Record `test result: ok` for each command that can run. If the host lacks macFUS
 Write each test before its production change. Place allocator unit tests beside the new state module and backend recovery tests in `crates/studiofs-meta/src/pg_engine/tests/inode_allocator.rs` or its renamed focused replacement. The required behaviors are:
 
 - the lowest and highest valid namespace/counter encode correctly; namespace zero and each overflow are rejected;
-- a PostgreSQL volume with a retired `next_inode` counter still mints `next_allocator_namespace` and remains writable;
+- a PostgreSQL volume with a retired `next_inode` counter removes it, mints `next_allocator_namespace`, and remains writable;
 - the exclusive `reserved_through == 1 << 39` endpoint is trusted, while the next request returns typed allocation overflow;
 - equal counters under the inode and payload namespaces produce different IDs;
 - a restart after a durable high-water advance skips the unconsumed tail and keeps the namespace;
