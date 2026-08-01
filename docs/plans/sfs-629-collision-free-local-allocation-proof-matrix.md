@@ -16,3 +16,23 @@ mount-smoke target. A Linux or Windows mounted smoke may run only on a host
 with its required driver and disposable mount point; otherwise record the
 missing prerequisite. No timing extension, warning suppression, or
 bridge-specific workaround substitutes for a failed proof.
+
+## SFS-634 proof transcript (2026-08-01, Windows 11)
+
+| Layer | Command | Outcome |
+| --- | --- | --- |
+| Lints | `RUSTFLAGS='-D warnings' cargo check -p studiofs-meta -p studiofs-vfs` | Passed. |
+| Pure allocator state | `cargo test -p studiofs-meta sfs623_allocator_state_ -- --nocapture` | Passed: 15 tests. |
+| Recovery and offline authority | `cargo test -p studiofs-meta sfs623_recovery_ -- --nocapture` | Passed: 6 tests. |
+| Metadata and VFS authority | `cargo test -p studiofs-vfs sfs623_read_only_allocator_ -- --nocapture` | Passed: 1 test. |
+| ID representation | `cargo test -p studiofs-data object_key -- --nocapture` | Passed: 3 tests, including composite-ID shard preservation and key parsing. |
+| Local payload layout | `cargo test -p studiofs-cache payload_shard -- --nocapture`<br>`cargo test -p studiofs-cache parse_payload_object_file_name -- --nocapture` | Passed: 3 sharding and 2 canonical-parser tests. |
+| Windows bridge library | `cargo test -p studiofs-winfsp --lib -- --nocapture` | Passed: 104 tests. |
+| PostgreSQL namespace authority | `cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1` | Not run: `STUDIOFS_TEST_PG_DSN` was unset. |
+| Windows mounted smoke | `cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1` | Not run: WinFSP was not installed, `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS` was not enabled, and no disposable mount point was configured. |
+| Linux/macOS bridge library and mounted checks | Platform commands from the matrix | Not available on this Windows host; not substituted. |
+
+The transcript confirms the direct-redb boundary and shared-VFS bridge contract
+through their local authority and Windows bridge-library checks. PostgreSQL and
+real mounted behavior remain fixture/driver-gated evidence, not inferred from
+these local results.
