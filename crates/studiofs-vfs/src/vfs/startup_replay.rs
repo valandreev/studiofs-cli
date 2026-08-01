@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use super::file_session::FileSessionOperation;
 use super::overlay::{ExtentRecordId, PendingUploadCatalog, PendingUploadKey, pending_upload_key};
 use super::{PendingUpload, StudioVfs, VfsResult, ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT};
+use studiofs_cache::local::LocalPayloadLifecycleState;
 use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, UploadState as MetaUploadState, chunk_start_offset,
@@ -140,6 +141,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
 
         if needs_finalization {
+            self.mark_uploaded_overlay_objects(ino, attr.content_epoch, graph_objects.as_slice());
             self.record_epoch_finalization(ino, attr.content_epoch, graph_objects.as_slice());
         }
     }
@@ -321,6 +323,55 @@ impl<'a> StartupReplayCoordinator<'a> {
             content_epoch,
         );
         self.restored_live_extents = self.restored_live_extents.saturating_add(1);
+    }
+
+    fn mark_uploaded_overlay_objects(
+        &mut self,
+        ino: Ino,
+        content_epoch: u64,
+        graph_objects: &[StartupGraphObject],
+    ) {
+        let uploaded_object_ids: Vec<_> = graph_objects
+            .iter()
+            .filter(|graph_object| {
+                self.vfs
+                    .local_payload_backend
+                    .lifecycle_state(graph_object.object_id)
+                    == LocalPayloadLifecycleState::Uploaded
+            })
+            .map(|graph_object| graph_object.object_id)
+            .collect();
+        if uploaded_object_ids.is_empty() {
+            return;
+        }
+
+        match self
+            .vfs
+            .sync_meta()
+            .mark_regular_file_overlay_objects_uploaded_if_match(
+                ino,
+                content_epoch,
+                uploaded_object_ids.as_slice(),
+            ) {
+            Ok(marked_object_ids) if !marked_object_ids.is_empty() => {
+                info!(
+                    ino,
+                    content_epoch,
+                    uploaded_overlay_objects = marked_object_ids.len(),
+                    "startup recovery restored uploaded overlay metadata"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.replay_failures = self.replay_failures.saturating_add(1);
+                warn!(
+                    ino,
+                    content_epoch,
+                    error = %error,
+                    "startup recovery failed to restore uploaded overlay metadata"
+                );
+            }
+        }
     }
 
     fn record_epoch_finalization(
@@ -846,7 +897,7 @@ mod tests {
     use crate::vfs::tests::{FileGraphMetaFixture, make_unstarted_test_vfs};
     use studiofs_meta::MetaGc;
     use studiofs_meta::engine::MetaInodes;
-    use studiofs_meta::schema::PayloadRef;
+    use studiofs_meta::schema::{InodeLifecycleState, PayloadRef};
 
     fn zero_size_unpublished_attr(nlink: u32) -> InodeAttr {
         let mut attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
@@ -1055,6 +1106,53 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "startup cleanup must not classify a recovered live extent as stale"
+        );
+    }
+
+    #[test]
+    fn startup_replay_promotes_uploaded_overlay_before_epoch_finalization() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "startup-replay-uploaded-overlay-promotion");
+        let created = vfs
+            .create(1, b"uploaded-overlay.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let object_id = 991_340;
+        let payload = b"uploaded payload with an unrecorded metadata completion";
+
+        vfs.local_payload_backend()
+            .put(object_id, payload, true)
+            .expect("persist uploaded local payload");
+        vfs.local_payload_backend().mark_uploaded(object_id);
+        vfs.local_payload_backend()
+            .sync_data()
+            .expect("sync uploaded local payload");
+
+        let mut attr = meta.get_attr(created.ino).expect("load test attr");
+        attr.size = payload.len() as u64;
+        attr.committed_size = 0;
+        attr.content_epoch = 1;
+        attr.committed_content_epoch = 0;
+        attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&attr).expect("persist nonfinalized attr");
+        meta.stage_payload_slice(
+            created.ino,
+            0,
+            &PayloadRef::new_partial(object_id, payload.len() as u32),
+        )
+        .expect("persist local-only payload slice");
+
+        let mut coordinator = StartupReplayCoordinator::new(&vfs, &[], false, None);
+        coordinator.process_attr(&attr);
+
+        let lifecycle = meta
+            .get_inode_lifecycle(created.ino)
+            .expect("load recovered inode lifecycle")
+            .expect("recovered inode lifecycle");
+        assert_eq!(
+            lifecycle.state,
+            InodeLifecycleState::PublishReady,
+            "an uploaded local object must make its metadata overlay publishable"
         );
     }
 }

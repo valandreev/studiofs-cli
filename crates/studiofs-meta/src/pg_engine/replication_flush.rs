@@ -88,10 +88,17 @@ impl PgMetaEngine {
         self.local.apply_replica_serving_state(&pending_events)?;
         let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
         if projected.visible_ops == 0 {
-            Self::clear_pending_state(&mut state);
             if projected.needs_local_replay {
+                let now = Instant::now();
+                state.ops = 0;
+                state.force_flush = false;
+                state.event_start = Some(event_start);
+                state.event_end = event_end;
+                state.started_at.get_or_insert(now);
+                state.last_mutation_at = Some(now);
                 return Ok(());
             }
+            Self::clear_pending_state(&mut state);
             drop(state);
             self.persist_flushed_event_seq(event_end)?;
             return Ok(());
@@ -344,14 +351,16 @@ impl PgMetaEngine {
         }
         let projected = RemoteApplyCoordinator::project_local_batch(&events);
         if projected.events.is_empty() {
-            self.persist_flushed_event_seq(batch.event_end)?;
+            if !projected.needs_local_replay {
+                self.persist_flushed_event_seq(batch.event_end)?;
+            }
+            self.restore_pending_state_from_local_log()?;
             return Ok(None);
         }
         let batch_version = self.push_projected_event_log_batch_locked(projected.events)?;
-        // Do not advance `local_version` here. The writer may have published a
-        // newer batch_version while still missing earlier foreign batches.
-        // `pull_foreign_events_locked()` must remain able to read the full gap.
-        self.persist_flushed_event_seq(batch.event_end)?;
+        // The replay pass acknowledges only the local prefix represented by the
+        // projected batch. The remaining local-only suffix must stay replayable.
+        self.restore_pending_state_from_local_log()?;
         Ok(Some(RecentFlush {
             batch_version,
             overlay: projected.overlay,

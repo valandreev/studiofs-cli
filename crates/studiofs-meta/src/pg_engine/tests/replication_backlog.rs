@@ -36,6 +36,58 @@ fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
 }
 
 #[test]
+fn restore_pending_state_keeps_unpublished_regular_file_replay_suffix() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let draft = pg
+        .create_file(ROOT_INO, b"draft-with-provenance.xattr", 0, 0, 0o644)
+        .expect("create unpublished file");
+    pg.set_xattr(draft.ino, b"user.test", b"local-only", 0)
+        .expect("set draft xattr");
+    let mut uploading = pg.get_attr(draft.ino).expect("draft attr");
+    uploading.size = 48;
+    uploading.upload_state = UploadState::Uploading;
+    pg.set_attr(&uploading).expect("set uploading draft attr");
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(77_004, 48))
+        .expect("stage draft payload");
+    let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+    let events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("read pending events");
+    let xattr_index = events
+        .iter()
+        .position(|event| matches!(event, MetaEvent::SetXattr { ino, .. } if *ino == draft.ino))
+        .expect("draft xattr event");
+    let suffix_start = start.saturating_add(xattr_index as u64 + 1);
+    pg.persist_flushed_event_seq(suffix_start)
+        .expect("ack visible xattr prefix");
+
+    {
+        let mut state = pg.pending_state.lock().expect("pending_state");
+        *state = PendingReplicationState::default();
+    }
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending state");
+
+    let pending_events = pg
+        .local
+        .read_events_range(suffix_start, end)
+        .expect("read pending events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
+    assert!(projected.needs_local_replay);
+    assert_eq!(projected.visible_ops, 0);
+
+    let state = pg.pending_state.lock().expect("pending_state");
+    assert_eq!(state.ops, 0);
+    assert!(!state.force_flush);
+    assert_eq!(state.event_start, Some(suffix_start));
+    assert_eq!(state.event_end, end);
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), suffix_start);
+}
+
+#[test]
 fn test_local_overlay_conflicts_reserve_pending_xattr_and_symlink() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

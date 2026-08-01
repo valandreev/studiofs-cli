@@ -143,6 +143,9 @@ impl PgMetaEngine {
             },
         )?;
         self.persist_replay_position(&outcome)?;
+        if outcome.flushed_event_seq.is_some() {
+            self.restore_pending_state_from_local_log()?;
+        }
         Ok(outcome.changed)
     }
 
