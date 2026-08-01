@@ -843,7 +843,7 @@ impl RedbMetaEngine {
                     Self::set_dentry_mirror_in_txn(&txn, *parent, name, entry)?;
                 }
                 crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
+                    Self::remove_dentry_overlay_in_txn(&txn, *parent, name)?;
                 }
                 crate::events::MetaEvent::RenameEntry {
                     parent,
@@ -1164,17 +1164,21 @@ impl RedbMetaEngine {
             Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-
         Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new())?;
 
         if dst_in_base {
+            let local_removed_dentries = Self::local_removed_dentries_in_txn(txn)?;
             // The base rename winner moved this logical source to the
             // destination.  Remove any serving entry still occupying the old
             // source name, even if it points at a local overlay inode; payload
             // and inode protection are handled separately from namespace
             // visibility.
             Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-            Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
+            if local_removed_dentries.contains(&encode_dentry_key(new_parent, new_name)) {
+                Self::remove_dentry_overlay_in_txn(txn, new_parent, new_name)?;
+            } else {
+                Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
+            }
         } else if src_in_base {
             Self::remove_dentry_mirror_if_matches_in_txn(txn, new_parent, new_name, entry)?;
             Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
@@ -1184,6 +1188,78 @@ impl RedbMetaEngine {
         }
 
         Ok(())
+    }
+
+    fn local_removed_dentries_in_txn(txn: &redb::WriteTransaction) -> MetaResult<HashSet<Vec<u8>>> {
+        let counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let end_seq = counters
+            .get("nextEventSeq")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| value.value())
+            .unwrap_or(1);
+        drop(counters);
+
+        let mut locally_created = HashSet::new();
+        let mut locally_renamed = HashSet::new();
+        let mut removed = HashSet::new();
+        let events = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let start_seq = events
+            .first()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|(seq, _)| seq.value())
+            .unwrap_or(end_seq);
+        if end_seq <= start_seq {
+            return Ok(removed);
+        }
+        for row in events
+            .range(start_seq..end_seq)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            match decode::<crate::events::MetaEvent>(bytes.value())? {
+                crate::events::MetaEvent::AddEntry { parent, name, .. } => {
+                    let key = encode_dentry_key(parent, &name);
+                    locally_renamed.remove(&key);
+                    removed.remove(&key);
+                    locally_created.insert(key);
+                }
+                crate::events::MetaEvent::RemoveEntry { parent, name } => {
+                    let key = encode_dentry_key(parent, &name);
+                    if locally_created.remove(&key) {
+                        removed.remove(&key);
+                    } else {
+                        locally_renamed.remove(&key);
+                        removed.insert(key);
+                    }
+                }
+                crate::events::MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    ..
+                } => {
+                    let source_key = encode_dentry_key(parent, &name);
+                    let destination_key = encode_dentry_key(new_parent, &new_name);
+                    let was_created = locally_created.remove(&source_key);
+                    locally_renamed.remove(&source_key);
+                    locally_created.remove(&destination_key);
+                    locally_renamed.remove(&destination_key);
+                    removed.remove(&destination_key);
+                    if was_created {
+                        locally_created.insert(destination_key);
+                    } else {
+                        locally_renamed.insert(destination_key);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(removed)
     }
 
     fn remove_dentry_mirror_if_matches_in_txn(

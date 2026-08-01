@@ -385,6 +385,66 @@ fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_b() {
 }
 
 #[test]
+fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
+    let source = temp_engine();
+    let entry = source
+        .create_symlink(ROOT_INO, b"source-link", b"target-v1.txt", 0, 0)
+        .unwrap();
+    let snapshot = source.export_remote_snapshot().unwrap();
+
+    let engine = temp_engine();
+    engine.import_snapshot(&snapshot).unwrap();
+    engine
+        .rename_atomic(ROOT_INO, b"source-link", ROOT_INO, b"renamed-link")
+        .expect("local rename should be accepted");
+    engine
+        .set_counter("pgLastFlushedLocalEventSeq", engine.get_counter("nextEventSeq").unwrap())
+        .unwrap();
+    engine
+        .unlink(ROOT_INO, b"renamed-link")
+        .expect("local unlink should be accepted");
+    engine
+        .set_counter("pgLastFlushedLocalEventSeq", engine.get_counter("nextEventSeq").unwrap())
+        .unwrap();
+    assert!(engine.lookup(ROOT_INO, b"renamed-link").is_err());
+
+    let pg_winner = replica_rename_event(
+        ROOT_INO,
+        b"source-link",
+        ROOT_INO,
+        b"renamed-link",
+        DirEntryValue {
+            ino: entry.ino,
+            kind: entry.kind,
+        },
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&pg_winner))
+        .unwrap();
+
+    assert!(
+        engine.lookup(ROOT_INO, b"renamed-link").is_err(),
+        "a local unlink must hide a promoted rename destination"
+    );
+    engine
+        .apply_replica_serving_state(&[MetaEvent::RemoveEntry {
+            parent: ROOT_INO,
+            name: b"renamed-link".to_vec(),
+        }])
+        .unwrap();
+    assert!(
+        engine.lookup(ROOT_INO, b"renamed-link").is_err(),
+        "serving replay of the unlink must not clear its base tombstone"
+    );
+    engine
+        .create_symlink(ROOT_INO, b"renamed-link", b"target-v2.txt", 0, 0)
+        .expect("locally unlinked destination must be reusable");
+}
+
+#[test]
 fn replica_serving_rename_removes_source_even_when_overlay_points_at_other_inode() {
     let engine = temp_engine();
     let source = DirEntryValue {
