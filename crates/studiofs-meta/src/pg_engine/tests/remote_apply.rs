@@ -171,6 +171,45 @@ fn project_local_batch_hides_uncommitted_regular_file_namespace() {
 }
 
 #[test]
+fn project_local_batch_keeps_updating_published_file_visible() {
+    let mut updating = InodeAttr::new_file(ROOT_INO + 12, ROOT_INO, 0, 0, 0o644);
+    updating.size = 8192;
+    updating.committed_size = 4096;
+    updating.content_epoch = 2;
+    updating.committed_content_epoch = 1;
+    updating.upload_state = UploadState::Updating;
+
+    let projected = RemoteApplyCoordinator::project_local_batch(&[
+        MetaEvent::SetAttr {
+            attr: updating.clone(),
+        },
+        MetaEvent::SetRegularFileOverlaySlices {
+            ino: updating.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![SliceRecord {
+                    slice_id: SliceId(1),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 4096).unwrap(),
+                    payload: Some(PayloadRef::new_partial(9005, 4096)),
+                    payload_state: PayloadRefState::LocalOnly,
+                }],
+            )],
+        },
+    ]);
+
+    assert!(
+        projected.events.iter().any(|event| {
+            matches!(event, MetaEvent::SetAttr { attr }
+                if attr.ino == updating.ino
+                    && attr.upload_state == UploadState::Updating
+                    && attr.size == updating.committed_size)
+        }),
+        "an update to an already published file must expose its committed version"
+    );
+}
+
+#[test]
 fn project_local_batch_hides_uncommitted_regular_file_namespace_from_local_log() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let draft = pg

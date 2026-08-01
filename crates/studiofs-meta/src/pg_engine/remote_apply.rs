@@ -109,12 +109,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     fn hidden_regular_inodes_for_local_events(events: &[MetaEvent]) -> HashSet<Ino> {
+        let committed_regular_inodes = events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile && attr.committed_content_epoch > 0 =>
+                {
+                    Some(attr.ino)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         let mut hidden_regular_inodes = HashSet::new();
         let mut published_regular_inodes = HashSet::new();
         for event in events {
             match event {
                 MetaEvent::SetAttr { attr }
                     if attr.kind == FileType::RegularFile
+                        && !committed_regular_inodes.contains(&attr.ino)
                         && !Self::regular_file_attr_is_ready_for_serving(attr) =>
                 {
                     hidden_regular_inodes.insert(attr.ino);
@@ -123,11 +135,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     hidden_regular_inodes.insert(attr.ino);
                 }
                 MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices }
-                    if chunk_slices.iter().any(|(_, slices)| {
-                        slices
-                            .iter()
-                            .any(|slice| slice.payload_state != PayloadRefState::Published)
-                    }) =>
+                    if !committed_regular_inodes.contains(ino)
+                        && chunk_slices.iter().any(|(_, slices)| {
+                            slices
+                                .iter()
+                                .any(|slice| slice.payload_state != PayloadRefState::Published)
+                        }) =>
                 {
                     hidden_regular_inodes.insert(*ino);
                 }
