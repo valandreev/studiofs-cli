@@ -1398,6 +1398,13 @@ impl StudioVfs {
         self.handle_table.get(fh)
     }
 
+    /// Get the last attributes retained by an open file handle.
+    pub fn get_open_file_attr(&self, fh: u64) -> Option<InodeAttr> {
+        self.handle_table
+            .get(fh)
+            .and_then(|open_file| open_file.open_attr())
+    }
+
     /// Get the number of open handles for an inode.
     pub fn open_count(&self, ino: Ino) -> u32 {
         self.handle_table.open_count(ino)

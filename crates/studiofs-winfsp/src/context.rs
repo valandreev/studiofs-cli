@@ -2111,12 +2111,18 @@ impl FileSystemContext for StudioFsContext {
             self.run_flush_callback(ctx.ino, ctx.fh)
                 .map_err(vfs_to_winfsp_err)?;
 
-            let attr = self
-                .vfs
-                .peek_dirty_attr(ctx.ino)
-                .map(Ok)
-                .unwrap_or_else(|| self.vfs.getattr(ctx.ino))
-                .map_err(vfs_to_winfsp_err)?;
+            let attr = match self.vfs.peek_dirty_attr(ctx.ino) {
+                Some(attr) => attr,
+                None => match self.vfs.getattr(ctx.ino) {
+                    Ok(attr) => attr,
+                    Err(error @ VfsError::Meta(MetaError::InodeNotFound(_))) => self
+                        .vfs
+                        .get_open_file_attr(ctx.fh)
+                        .ok_or(error)
+                        .map_err(vfs_to_winfsp_err)?,
+                    Err(error) => return Err(vfs_to_winfsp_err(error)),
+                },
+            };
             *file_info = attr_to_file_info(&attr);
             debug!(ino = ctx.ino, "flush");
         } else {
@@ -3907,6 +3913,49 @@ mod tests {
             !vfs.inode_has_local_dirty_state(attr.ino),
             "WinFSP FlushFileBuffers should drain buffered local dirty state"
         );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn flush_callback_uses_open_handle_attr_after_inode_unlink() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("flush-open-handle-unlink-file-info");
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"flush-open-handle-unlink-file-info.txt",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.fsync_fh(fh).await }
+        })
+        .expect("initial strict handle flush");
+        vfs.meta()
+            .remove_attr(attr.ino)
+            .expect("remove authoritative inode");
+        vfs.heal_dangling_entry_if_inode_missing(
+            ROOT_INO,
+            b"flush-open-handle-unlink-file-info.txt",
+        )
+        .expect("heal missing authoritative inode");
+        assert!(vfs.getattr(attr.ino).is_err(), "inode should be absent");
+
+        <StudioFsContext as FileSystemContext>::flush(&ctx, Some(&handle), &mut file_info)
+            .expect("open-handle flush must still refresh WinFSP file info");
 
         ctx.spawn_wait({
             let vfs = vfs.clone();
