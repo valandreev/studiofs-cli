@@ -789,6 +789,9 @@ impl RedbMetaEngine {
         for event in events {
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
+                    if Self::ready_regular_file_attr_is_stale_against_base_in_txn(&txn, attr)? {
+                        continue;
+                    }
                     Self::set_inode_mirror_in_txn(&txn, attr)?;
                     if Self::ready_regular_file_attr_can_follow_base_in_txn(&txn, attr)? {
                         Self::clear_regular_file_serving_overlay_in_txn(&txn, attr.ino)?;
@@ -1118,6 +1121,26 @@ impl RedbMetaEngine {
             }
             None => Ok(false),
         }
+    }
+
+    fn ready_regular_file_attr_is_stale_against_base_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<bool> {
+        if attr.kind != FileType::RegularFile || attr.upload_state != UploadState::Ready {
+            return Ok(false);
+        }
+
+        let base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let Some(base_attr) = Self::get_attr_from_opened_table(&base, attr.ino)? else {
+            return Ok(false);
+        };
+
+        Ok(base_attr.kind == FileType::RegularFile
+            && (base_attr.committed_content_epoch > attr.committed_content_epoch
+                || base_attr.committed_size > attr.committed_size))
     }
 
     fn clear_regular_file_serving_overlay_in_txn(

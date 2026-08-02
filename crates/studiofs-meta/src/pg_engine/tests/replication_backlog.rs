@@ -36,6 +36,47 @@ fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
 }
 
 #[test]
+fn restore_pending_state_does_not_replay_stale_setup_over_published_file() {
+    let (_local_dir, pg) = temp_pg_engine_for_unit();
+    let local_file = pg
+        .create_file(ROOT_INO, b"recovered-published.txt", 0, 0, 0o644)
+        .expect("create local file");
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+    let remote_file =
+        create_published_small_file(&remote, ROOT_INO, b"recovered-published.txt", 77_005);
+    assert_eq!(local_file.ino, remote_file.ino);
+
+    pg.local
+        .import_remote_snapshot_preserving_local_event_log(
+            &remote
+                .local
+                .export_remote_snapshot()
+                .expect("export remote snapshot"),
+        )
+        .expect("import remote snapshot while keeping local journal");
+    assert_eq!(
+        pg.get_attr(local_file.ino).expect("published attr").size,
+        64
+    );
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending local journal");
+
+    assert_eq!(
+        pg.get_attr(local_file.ino)
+            .expect("published attr after restore")
+            .size,
+        64,
+        "a crash-replayed setup event must not hide a newer published base"
+    );
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        pg.local.get_counter("nextEventSeq").expect("event end"),
+        "superseded setup events must not remain a PostgreSQL backlog"
+    );
+}
+
+#[test]
 fn restore_pending_state_keeps_unpublished_regular_file_replay_suffix() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.flushed_event_seq.load(Ordering::SeqCst);

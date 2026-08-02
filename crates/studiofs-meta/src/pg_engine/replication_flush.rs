@@ -5,9 +5,9 @@ use super::{
 };
 use crate::engine::{MetaError, MetaInodes, MetaPayloadObjects, MetaResult};
 use crate::events::MetaEvent;
-use crate::schema::{ChunkId, PayloadRefState, SliceRecord};
+use crate::schema::{ChunkId, PayloadRefState, SliceRecord, UploadState};
 use crate::types::{FileType, Ino, InodeAttr};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -72,8 +72,40 @@ impl PgMetaEngine {
             .ok();
     }
 
+    fn stale_published_setup_prefix_len(&self, events: &[MetaEvent]) -> MetaResult<usize> {
+        let mut stale_inodes = HashSet::new();
+        for (index, event) in events.iter().enumerate() {
+            match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.upload_state == UploadState::Ready
+                        && attr.size == 0
+                        && attr.committed_size == 0
+                        && attr.content_epoch == 0
+                        && attr.committed_content_epoch == 0
+                        && self
+                            .local
+                            .get_base_attr(attr.ino)?
+                            .is_some_and(|base_attr| {
+                                base_attr.kind == FileType::RegularFile
+                                    && (base_attr.committed_size > attr.committed_size
+                                        || base_attr.committed_content_epoch
+                                            > attr.committed_content_epoch)
+                            }) =>
+                {
+                    stale_inodes.insert(attr.ino);
+                }
+                MetaEvent::AddEntry { entry, .. }
+                    if entry.kind == FileType::RegularFile && stale_inodes.contains(&entry.ino) => {
+                }
+                _ => return Ok(index),
+            }
+        }
+        Ok(events.len())
+    }
+
     pub(super) fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
-        let event_start = self.flushed_event_seq.load(Ordering::SeqCst);
+        let mut event_start = self.flushed_event_seq.load(Ordering::SeqCst);
         let event_end = self.local.get_counter("nextEventSeq")?;
         let mut state = self
             .pending_state
@@ -85,8 +117,20 @@ impl PgMetaEngine {
         }
 
         let pending_events = self.local.read_events_range(event_start, event_end)?;
-        self.local.apply_replica_serving_state(&pending_events)?;
-        let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
+        let stale_setup_prefix_len = self.stale_published_setup_prefix_len(&pending_events)?;
+        if stale_setup_prefix_len > 0 {
+            event_start = event_start
+                .max(1)
+                .saturating_add(stale_setup_prefix_len as u64);
+            self.persist_flushed_event_seq(event_start)?;
+        }
+        let pending_events = &pending_events[stale_setup_prefix_len..];
+        if pending_events.is_empty() {
+            Self::clear_pending_state(&mut state);
+            return Ok(());
+        }
+        self.local.apply_replica_serving_state(pending_events)?;
+        let projected = RemoteApplyCoordinator::project_local_batch(pending_events);
         if projected.visible_ops == 0 {
             if projected.needs_local_replay {
                 let now = Instant::now();
