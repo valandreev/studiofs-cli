@@ -824,7 +824,7 @@ pub(in crate::scenario) fn run_postgres_outage_body(
     )?;
     driver.force_kill(&writer.name)?;
 
-    // `start_postgres` uses `docker compose up --wait`, so this includes
+    // `start_postgres` uses `docker compose start --wait`, so this includes
     // PostgreSQL healthcheck readiness before mounted convergence polling.
     let recovery_started = Instant::now();
     driver.start_postgres()?;

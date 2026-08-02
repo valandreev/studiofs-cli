@@ -314,12 +314,12 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
                 .any(|(key, value)| key == "STUDIOFS_E2E_POSTGRES_PORT" && value == "32000")
     }));
     assert!(calls.iter().any(|call| {
-        call.args.contains(&"up".to_string())
+        call.args.contains(&"start".to_string())
             && call.args.contains(&"--wait".to_string())
             && call.args.contains(&"postgres".to_string())
     }));
     assert!(calls.iter().any(|call| {
-        call.args.contains(&"up".to_string())
+        call.args.contains(&"start".to_string())
             && call.args.contains(&"--wait".to_string())
             && call.args.contains(&"postgres".to_string())
             && call
@@ -388,6 +388,31 @@ fn optional_diagnostics_preserve_stdout_when_command_fails() {
     assert_eq!(status["action"], "postgres metadata dump");
     assert_eq!(status["status"], 17);
     assert_eq!(status["collected"], false);
+}
+
+#[test]
+fn compose_service_start_preserves_both_command_output_streams_on_failure() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-start-diagnostic-failure".to_string(),
+        sandbox: temp.path().join("compose-start-diagnostic-failure"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("32300-32310".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap();
+
+    let error = stack
+        .start_service("postgres", &StartFailureExecutor)
+        .unwrap_err();
+
+    match error {
+        InfraError::CommandFailed { diagnostics, .. } => {
+            assert!(diagnostics.contains("stderr: start stderr"));
+            assert!(diagnostics.contains("stdout: start stdout"));
+        }
+        other => panic!("expected compose command failure, got {other:?}"),
+    }
 }
 
 #[test]
@@ -476,6 +501,19 @@ impl CommandExecutor for FailingDiagnosticsExecutor {
             status: 0,
             stdout: "/data/studiofs-e2e/object\n".to_string(),
             stderr: String::new(),
+        })
+    }
+}
+
+struct StartFailureExecutor;
+
+impl CommandExecutor for StartFailureExecutor {
+    fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
+        assert!(command.args.contains(&"start".to_string()));
+        Ok(CommandOutput {
+            status: 17,
+            stdout: "start stdout".to_string(),
+            stderr: "start stderr".to_string(),
         })
     }
 }

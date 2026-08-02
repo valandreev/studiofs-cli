@@ -527,14 +527,14 @@ pub enum InfraError {
         needed: usize,
     },
     /// Subprocess exited unsuccessfully.
-    #[error("{action} failed with exit status {status}: {stderr}")]
+    #[error("{action} failed with exit status {status}: {diagnostics}")]
     CommandFailed {
         /// Action description used for caller logs.
         action: String,
         /// Exit code from command.
         status: i32,
-        /// Captured stderr payload.
-        stderr: String,
+        /// Captured stdout and stderr payload.
+        diagnostics: String,
     },
     /// Underlying I/O failure.
     #[error("infra I/O failed: {0}")]
@@ -1116,8 +1116,7 @@ impl ComposeServiceControl {
     ) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.extend([
-            "up".to_string(),
-            "--detach".to_string(),
+            "start".to_string(),
             "--wait".to_string(),
             "--wait-timeout".to_string(),
             self.wait_timeout_secs.to_string(),
@@ -1125,7 +1124,7 @@ impl ComposeServiceControl {
         ]);
         run_success(
             executor,
-            &format!("docker compose up --wait {service}"),
+            &format!("docker compose start --wait {service}"),
             command,
         )?;
         Ok(())
@@ -1177,8 +1176,19 @@ fn run_success(
         Err(InfraError::CommandFailed {
             action: action.to_string(),
             status: output.status,
-            stderr: output.stderr,
+            diagnostics: command_diagnostics(&output.stdout, &output.stderr),
         })
+    }
+}
+
+fn command_diagnostics(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("stdout: {stdout}"),
+        (true, false) => format!("stderr: {stderr}"),
+        (false, false) => format!("stderr: {stderr}; stdout: {stdout}"),
     }
 }
 
