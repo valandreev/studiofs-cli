@@ -1038,13 +1038,16 @@ impl StudioVfs {
                 self.flush_local_dirty_state(ino, local_sync_policy).await?;
             }
         }
+        let mut payload_store_sync_performed = false;
         if local_sync_policy.requires_write_path_durability() {
-            self.maybe_payload_store_sync_data_async(
-                materialized_writer_stack_bytes.saturating_add(persisted_slice_bytes_before_flush)
-                    as u64,
-                local_sync_policy,
-            )
-            .await?;
+            payload_store_sync_performed |= self
+                .maybe_payload_store_sync_data_async(
+                    materialized_writer_stack_bytes
+                        .saturating_add(persisted_slice_bytes_before_flush)
+                        as u64,
+                    local_sync_policy,
+                )
+                .await?;
         }
         if local_sync_policy.requires_write_path_durability()
             && (self.state.writer_stack.has_dirty_writers(ino)
@@ -1054,11 +1057,20 @@ impl StudioVfs {
                 self.flush_local_dirty_state_until_quiescent(ino, local_sync_policy)
                     .await?,
             );
-            self.maybe_payload_store_sync_data_async(
-                materialized_writer_stack_bytes as u64,
-                local_sync_policy,
-            )
-            .await?;
+            payload_store_sync_performed |= self
+                .maybe_payload_store_sync_data_async(
+                    materialized_writer_stack_bytes as u64,
+                    local_sync_policy,
+                )
+                .await?;
+        }
+        if local_sync_policy.requires_write_path_durability()
+            && !payload_store_sync_performed
+            && self.inode_has_pending_uploads(ino)
+        {
+            // A background drain may have created the upload record after the
+            // writer-stack snapshot, without contributing to the sync group.
+            self.payload_store_sync_data_async().await?;
         }
 
         let dirty_attr = match dirty_attr_persist_policy {
@@ -1243,7 +1255,18 @@ impl StudioVfs {
             && !self.state.writer_stack.has_dirty_writers(open_file.ino)
         {
             if force_strict_metadata_sync {
-                self.sync_metadata_barrier().await?;
+                let outcome = self
+                    .local_sync_barrier_with_outcome(
+                        open_file.ino,
+                        LocalSyncPolicy::Strict,
+                        StickyErrorPolicy::Ignore,
+                        DirtyAttrPersistPolicy::Ignore,
+                    )
+                    .await?;
+                self.state.file_session.gc_if_idle(open_file.ino);
+                return Ok(ExplicitFlushOutcome {
+                    flushed_local_dirty_state: outcome.had_local_dirty_state,
+                });
             } else {
                 self.flush_metadata_barrier().await?;
             }
@@ -1299,9 +1322,20 @@ impl StudioVfs {
     }
 
     /// Drain handle-local state, then execute the shared strict metadata barrier.
+    pub async fn fsync_fh_with_outcome(&self, fh: u64) -> VfsResult<ExplicitFlushOutcome> {
+        let had_local_dirty_state = self.get_open_file(fh).is_some_and(|open_file| {
+            self.inode_has_local_dirty_state(open_file.ino)
+                || self.state.writer_stack.has_dirty_writers(open_file.ino)
+                || self.inode_has_pending_uploads(open_file.ino)
+        });
+        let outcome = self.flush_fh_with_outcome_inner(fh, true).await?;
+        Ok(ExplicitFlushOutcome {
+            flushed_local_dirty_state: had_local_dirty_state || outcome.flushed_local_dirty_state,
+        })
+    }
+
     pub async fn fsync_fh(&self, fh: u64) -> VfsResult<()> {
-        self.flush_fh_with_outcome_inner(fh, true).await?;
-        Ok(())
+        self.fsync_fh_with_outcome(fh).await.map(|_| ())
     }
 
     /// fsync implementation that reports whether file data and/or dirty attrs were persisted.

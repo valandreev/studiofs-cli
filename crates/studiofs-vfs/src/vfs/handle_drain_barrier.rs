@@ -31,6 +31,11 @@ pub trait LocalSyncBarrierPort {
     /// Returns true when the inode currently has local dirty state.
     fn inode_has_local_dirty_state(&self, ino: Ino) -> bool;
 
+    /// Returns whether an explicit flush should run for this callback.
+    fn should_run_explicit_flush(&self, request: HandleDrainRequest) -> bool {
+        self.inode_has_local_dirty_state(request.ino)
+    }
+
     /// Flushes and clears local dirty state for a specific handle request.
     fn explicit_flush(&self, request: HandleDrainRequest) -> VfsResult<ExplicitFlushOutcome>;
 }
@@ -158,7 +163,7 @@ where
     pub fn on_flush(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.observability.note_flush_callback();
         let flushed = self.flush_gate.with_flush_gate(request.ino, || {
-            if !self.local_sync.inode_has_local_dirty_state(request.ino) {
+            if !self.local_sync.should_run_explicit_flush(request) {
                 return Ok(false);
             }
             let outcome = self.local_sync.explicit_flush(request)?;

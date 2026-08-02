@@ -5868,7 +5868,7 @@ impl StudioVfs {
         &self,
         persisted_bytes: u64,
         local_sync_policy: LocalSyncPolicy,
-    ) -> VfsResult<()> {
+    ) -> VfsResult<bool> {
         if persisted_bytes > 0 {
             self.record_local_sync_unsynced_bytes(persisted_bytes);
         }
@@ -5890,7 +5890,7 @@ impl StudioVfs {
                         .payload_store_sync_data_deferred_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -5903,7 +5903,7 @@ impl StudioVfs {
                         .metrics
                         .payload_store_sync_data_deferred_calls
                         .fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         } else {
@@ -5920,12 +5920,12 @@ impl StudioVfs {
                         .payload_store_sync_data_deferred_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                return Ok(());
+                return Ok(false);
             }
 
             let bytes_to_sync = local_sync_group.pending_bytes;
             if bytes_to_sync == 0 {
-                return Ok(());
+                return Ok(false);
             }
 
             local_sync_group.pending_bytes = 0;
@@ -5942,7 +5942,7 @@ impl StudioVfs {
                     .metrics
                     .payload_store_sync_data_synced_bytes
                     .fetch_add(bytes_to_sync, Ordering::Relaxed);
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;

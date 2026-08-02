@@ -116,9 +116,10 @@ I/O buffer behavior on Windows callbacks:
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
 
 WinFSP callback barrier semantics:
-- Explicit `flush(context=Some(..))` admits dirty writer state to the shared
-  volatile local-dirty worker. It returns before the redb commit; the worker
-  commits metadata within one second.
+- Explicit `flush(context=Some(..))` is WinFSP's `FlushFileBuffers` callback.
+  It drains the handle through `fsync_fh_with_outcome()`, including the local
+  payload and redb durability barriers, before returning. It does not wait for
+  remote upload or peer publication.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default so
   read-only file caching keeps WinFSP cache-manager behavior across close/reopen

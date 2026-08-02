@@ -357,14 +357,30 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
         self.context.vfs.inode_has_local_dirty_state(ino)
     }
 
+    fn should_run_explicit_flush(&self, request: HandleDrainRequest) -> bool {
+        // WinFSP FlushFileBuffers is a strict file-handle barrier even when a
+        // background drain cleared the inode dirty bit before this callback.
+        request.fh != 0 || self.inode_has_local_dirty_state(request.ino)
+    }
+
     fn explicit_flush(
         &self,
         request: HandleDrainRequest,
     ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
         let vfs = self.context.vfs.clone();
         self.context.spawn_wait(async move {
-            vfs.flush_volatile_writeback_with_outcome(request.ino, request.fh)
-                .await
+            // WinFSP invokes this callback for Windows FlushFileBuffers. It is the
+            // caller's strict local durability boundary, not ordinary volatile
+            // writeback admission.
+            if request.fh != 0 {
+                return vfs.fsync_fh_with_outcome(request.fh).await;
+            }
+
+            let had_local_dirty_state = vfs.inode_has_local_dirty_state(request.ino);
+            vfs.fsync(request.ino, false).await?;
+            Ok(ExplicitFlushOutcome {
+                flushed_local_dirty_state: had_local_dirty_state,
+            })
         })
     }
 }
