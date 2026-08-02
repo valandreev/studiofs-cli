@@ -973,6 +973,85 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
 }
 
 #[test]
+fn replica_serving_stale_ready_attr_restores_newer_base_version() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"replica-serving-stale-ready.bin", 1000, 1000, 0o644)
+        .unwrap();
+
+    let remote_winner = PayloadRef::new_full(90_003, 227);
+    let remote_winner_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        227,
+        Some(&remote_winner),
+        PayloadRefState::Published,
+    )
+    .unwrap();
+    let mut base_attr = engine.get_attr(file.ino).unwrap();
+    base_attr.size = 227;
+    base_attr.committed_size = 227;
+    base_attr.content_epoch = 3;
+    base_attr.committed_content_epoch = 3;
+    base_attr.upload_state = UploadState::Ready;
+    engine
+        .apply_replica_events_to_base(&[
+            crate::events::MetaEvent::PublishRegularFileBaseSlices {
+                ino: file.ino,
+                chunk_slices: remote_winner_slices,
+            },
+            crate::events::MetaEvent::SetAttr {
+                attr: base_attr.clone(),
+            },
+        ])
+        .unwrap();
+
+    let mut updating_attr = base_attr.clone();
+    updating_attr.size = 446;
+    updating_attr.committed_size = 223;
+    updating_attr.content_epoch = 2;
+    updating_attr.committed_content_epoch = 1;
+    updating_attr.upload_state = UploadState::Updating;
+    let local_overlay = PayloadRef::new_full(90_004, 446);
+    let local_overlay_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        446,
+        Some(&local_overlay),
+        PayloadRefState::LocalOnly,
+    )
+    .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: local_overlay_slices,
+            },
+            crate::events::MetaEvent::SetAttr {
+                attr: updating_attr.clone(),
+            },
+        ])
+        .unwrap();
+
+    let mut stale_ready_attr = updating_attr;
+    stale_ready_attr.committed_size = 223;
+    stale_ready_attr.committed_content_epoch = 2;
+    stale_ready_attr.upload_state = UploadState::Ready;
+    engine
+        .apply_replica_serving_state(&[crate::events::MetaEvent::SetAttr {
+            attr: stale_ready_attr,
+        }])
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, 227)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(object_ids, vec![remote_winner.object_id]);
+    assert_eq!(engine.get_attr(file.ino).unwrap(), base_attr);
+}
+
+#[test]
 fn replica_serving_base_publish_replaces_stale_overlay_payload() {
     let engine = temp_engine();
     let file = engine

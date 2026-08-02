@@ -789,7 +789,17 @@ impl RedbMetaEngine {
         for event in events {
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
-                    if Self::ready_regular_file_attr_is_stale_against_base_in_txn(&txn, attr)? {
+                    if let Some(base_attr) =
+                        Self::stale_ready_regular_file_base_attr_in_txn(&txn, attr)?
+                    {
+                        let current = Self::get_attr_merged_in_write_txn(&txn, attr.ino)?;
+                        let current_is_newer = current.content_epoch > attr.content_epoch
+                            || (current.content_epoch == attr.content_epoch
+                                && current.size > attr.size);
+                        if !current_is_newer {
+                            Self::set_inode_mirror_in_txn(&txn, &base_attr)?;
+                            Self::clear_regular_file_serving_overlay_in_txn(&txn, attr.ino)?;
+                        }
                         continue;
                     }
                     Self::set_inode_mirror_in_txn(&txn, attr)?;
@@ -1123,24 +1133,25 @@ impl RedbMetaEngine {
         }
     }
 
-    fn ready_regular_file_attr_is_stale_against_base_in_txn(
+    fn stale_ready_regular_file_base_attr_in_txn(
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
-    ) -> MetaResult<bool> {
+    ) -> MetaResult<Option<InodeAttr>> {
         if attr.kind != FileType::RegularFile || attr.upload_state != UploadState::Ready {
-            return Ok(false);
+            return Ok(None);
         }
 
         let base = txn
             .open_table(BASE_INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let Some(base_attr) = Self::get_attr_from_opened_table(&base, attr.ino)? else {
-            return Ok(false);
+            return Ok(None);
         };
 
-        Ok(base_attr.kind == FileType::RegularFile
+        Ok((base_attr.kind == FileType::RegularFile
             && (base_attr.committed_content_epoch > attr.committed_content_epoch
                 || base_attr.committed_size > attr.committed_size))
+            .then_some(base_attr))
     }
 
     fn clear_regular_file_serving_overlay_in_txn(
