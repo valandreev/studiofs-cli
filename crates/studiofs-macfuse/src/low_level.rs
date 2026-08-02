@@ -650,13 +650,18 @@ impl Session {
 
     /// Request session loop shutdown.
     pub fn request_exit(&self) {
+        prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
         // SAFETY: `self.raw` is owned by this wrapper and remains live until Drop.
         unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
     }
 
     /// Build a thread-safe handle that can request session loop shutdown.
     pub fn exit_handle(&self) -> SessionExitHandle {
-        SessionExitHandle { raw: self.raw }
+        SessionExitHandle {
+            raw: self.raw,
+            invalidation_state: Arc::clone(&self.invalidation_state),
+            invalidation_queue: Arc::clone(&self.invalidation_queue),
+        }
     }
 
     /// Build a VFS kernel invalidator for this mounted session.
@@ -680,14 +685,15 @@ impl Session {
 }
 
 /// Thread-safe handle used to request low-level session shutdown.
-#[derive(Clone, Copy, Debug)]
 pub struct SessionExitHandle {
     raw: NonNull<raw::FuseSession>,
+    invalidation_state: Arc<SessionInvalidationState>,
+    invalidation_queue: Arc<SessionInvalidationQueue>,
 }
 
 // SAFETY: `SessionExitHandle` is created only from a live `Session` and is used
 // by watcher threads that are joined before the session is dropped. The handle
-// exposes only `fuse_session_exit`, macFUSE's cross-thread shutdown request.
+// only requests invalidation shutdown and `fuse_session_exit`.
 unsafe impl Send for SessionExitHandle {}
 // SAFETY: Shared access cannot mutate Rust-owned state; see `Send` invariant.
 unsafe impl Sync for SessionExitHandle {}
@@ -695,10 +701,20 @@ unsafe impl Sync for SessionExitHandle {}
 impl SessionExitHandle {
     /// Ask the session loop to exit.
     pub fn request_exit(self) {
+        prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
         // SAFETY: the handle is created from a live `Session` and used only by
         // watchers that are joined before that session is dropped.
         unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
     }
+}
+
+fn prepare_session_shutdown(
+    invalidation_state: &SessionInvalidationState,
+    invalidation_queue: &SessionInvalidationQueue,
+) -> bool {
+    invalidation_state.begin_shutdown();
+    invalidation_queue.close();
+    invalidation_state.wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -834,6 +850,7 @@ struct SessionInvalidationState {
 struct SessionInvalidationStatus {
     closed: bool,
     active: usize,
+    shutdown_deadline: Option<Instant>,
 }
 
 struct SessionInvalidationGuard<'a> {
@@ -846,6 +863,7 @@ impl SessionInvalidationState {
             status: ParkingMutex::new(SessionInvalidationStatus {
                 closed: false,
                 active: 0,
+                shutdown_deadline: None,
             }),
             idle: Condvar::new(),
         }
@@ -866,8 +884,14 @@ impl SessionInvalidationState {
 
     fn wait_for_idle(&self, timeout: Duration) -> bool {
         let mut status = self.status.lock();
-        let now = Instant::now();
-        let deadline = now.checked_add(timeout).unwrap_or(now);
+        let deadline = if let Some(deadline) = status.shutdown_deadline {
+            deadline
+        } else {
+            let now = Instant::now();
+            let deadline = now.checked_add(timeout).unwrap_or(now);
+            status.shutdown_deadline = Some(deadline);
+            deadline
+        };
         while status.active > 0 {
             if self.idle.wait_until(&mut status, deadline).timed_out() {
                 return status.active == 0;
@@ -926,12 +950,7 @@ fn notify_inode_range(
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.invalidation_state.begin_shutdown();
-        self.invalidation_queue.close();
-        if !self
-            .invalidation_state
-            .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT)
-        {
+        if !prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue) {
             warn!(
                 "macFUSE session shutdown timed out waiting for active kernel invalidation; \
                  leaking raw session handles to avoid use-after-free"
@@ -1534,6 +1553,26 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(20),
             "wait_for_idle should not return before the configured timeout"
+        );
+
+        drop(active);
+    }
+
+    #[test]
+    fn session_invalidation_state_reuses_shutdown_wait_deadline() {
+        let state = SessionInvalidationState::new();
+        let active = state
+            .begin_invalidation()
+            .expect("invalidation should start while session is active");
+        state.begin_shutdown();
+
+        assert!(!state.wait_for_idle(Duration::from_millis(20)));
+
+        let started = Instant::now();
+        assert!(!state.wait_for_idle(Duration::from_secs(1)));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a repeated shutdown wait must not extend the original deadline"
         );
 
         drop(active);
