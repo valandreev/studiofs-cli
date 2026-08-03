@@ -486,6 +486,56 @@ fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
 }
 
 #[test]
+fn self_batch_acknowledges_contextually_filtered_draft_before_visible_namespace() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    pg.create_file(ROOT_INO, b"unpublished-draft.bin", 0, 0, 0o644)
+        .expect("create unpublished draft");
+    pg.create_dir(ROOT_INO, b"visible-dir", 0, 0, 0o755)
+        .expect("create visible directory");
+    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let local_events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("read local events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&local_events);
+
+    assert_eq!(
+        RemoteApplyCoordinator::new(&pg.local)
+            .acknowledge_local_prefix_from_self_batch(&projected.events, start, end)
+            .expect("ack projected self batch"),
+        Some(end),
+        "self-ack must use the same contextual projection as publication"
+    );
+}
+
+#[test]
+fn self_batch_acknowledges_prefix_without_retiring_later_local_only_draft() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    pg.create_dir(ROOT_INO, b"visible-dir", 0, 0, 0o755)
+        .expect("create visible directory");
+    let published_end = pg.local.get_counter("nextEventSeq").expect("published end");
+    let published_events = pg
+        .local
+        .read_events_range(start, published_end)
+        .expect("read published events");
+    let self_batch = RemoteApplyCoordinator::project_local_batch(&published_events);
+
+    pg.create_file(ROOT_INO, b"later-unpublished-draft.bin", 0, 0, 0o644)
+        .expect("create later unpublished draft");
+    let current_end = pg.local.get_counter("nextEventSeq").expect("current end");
+
+    assert_eq!(
+        RemoteApplyCoordinator::new(&pg.local)
+            .acknowledge_local_prefix_from_self_batch(&self_batch.events, start, current_end)
+            .expect("ack published self batch"),
+        Some(published_end),
+        "self-ack must retain a later local-only journal suffix"
+    );
+}
+
+#[test]
 fn self_batch_namespace_mutation_advances_namespace_version_token() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);

@@ -66,6 +66,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Self { local }
     }
 
+    #[cfg(test)]
     pub(super) fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
         events
             .iter()
@@ -1292,33 +1293,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         let local_events = self.local.read_events_range(start, end)?;
-        let mut projected_prefix = Vec::with_capacity(batch_events.len());
-        let mut consumed_events = 0usize;
-        for event in &local_events {
-            consumed_events = consumed_events.saturating_add(1);
-            let projected = Self::project_remote_events(std::slice::from_ref(event));
-            projected_prefix.extend(projected);
-            if projected_prefix.len() >= batch_events.len() {
-                break;
+        for consumed_events in 1..=local_events.len() {
+            let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
+            let matches_prefix = projected_prefix.events.iter().zip(batch_events.iter()).all(
+                |(local, remote)| match (postcard::to_stdvec(local), postcard::to_stdvec(remote)) {
+                    (Ok(local), Ok(remote)) => local == remote,
+                    _ => false,
+                },
+            );
+            if projected_prefix.events.len() == batch_events.len() && matches_prefix {
+                let next_seq = start.max(1).saturating_add(consumed_events as u64);
+                return Ok(Some(next_seq));
             }
-        }
-        if projected_prefix.len() != batch_events.len() {
-            return Ok(None);
-        }
-
-        let matches_prefix =
-            projected_prefix
-                .iter()
-                .zip(batch_events.iter())
-                .all(|(local, remote)| {
-                    match (postcard::to_stdvec(local), postcard::to_stdvec(remote)) {
-                        (Ok(local), Ok(remote)) => local == remote,
-                        _ => false,
-                    }
-                });
-        if matches_prefix {
-            let next_seq = start.max(1).saturating_add(consumed_events as u64);
-            return Ok(Some(next_seq));
         }
 
         Ok(None)
@@ -1410,13 +1396,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
             Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch(&batch.events)?;
-                if let Some(next_flushed_event_seq) = self
-                    .acknowledge_local_prefix_from_self_batch(
-                        &batch.events,
-                        context.flushed_event_seq,
-                        context.next_event_seq,
-                    )?
-                {
+                let acknowledged_seq = self.acknowledge_local_prefix_from_self_batch(
+                    &batch.events,
+                    context.flushed_event_seq,
+                    context.next_event_seq,
+                )?;
+                if let Some(next_flushed_event_seq) = acknowledged_seq {
                     context.flushed_event_seq = next_flushed_event_seq;
                     acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
                     overlay_is_dirty = true;
