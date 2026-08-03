@@ -1334,6 +1334,7 @@ impl StudioVfs {
         })
     }
 
+    /// Synchronize buffered file data and metadata for a file handle.
     pub async fn fsync_fh(&self, fh: u64) -> VfsResult<()> {
         self.fsync_fh_with_outcome(fh).await.map(|_| ())
     }
