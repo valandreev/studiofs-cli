@@ -850,4 +850,43 @@ mod tests {
         );
         assert_eq!(planned[0].block_indices, vec![0]);
     }
+
+    #[test]
+    fn prefetch_burst_deduplicates_pending_inode_blocks() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-burst");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut worker = PrefetchWorker::new(Arc::clone(&vfs), rx);
+        let block_indices: Vec<_> = (0..1024).collect();
+        let batch = PrefetchBatch::new(99, block_indices.clone(), None);
+
+        tx.send(PrefetchWorkItem::Batch(batch.clone()))
+            .expect("prefetch burst should enter the worker channel");
+        tx.send(PrefetchWorkItem::Batch(batch))
+            .expect("duplicate prefetch burst should enter the worker channel");
+        while let Ok(work_item) = worker.prefetch_rx.try_recv() {
+            worker.enqueue_work_item(work_item);
+        }
+
+        assert_eq!(worker.pending_queue.len(), 1);
+        assert_eq!(worker.pending_set.len(), block_indices.len());
+        assert_eq!(
+            worker.pending_queue[0].block_indices.len(),
+            block_indices.len()
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .prefetch_queue_depth
+                .load(std::sync::atomic::Ordering::Relaxed),
+            block_indices.len() as u64
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .readahead_dropped_blocks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            block_indices.len() as u64
+        );
+    }
 }

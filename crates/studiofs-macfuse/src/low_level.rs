@@ -818,6 +818,22 @@ impl SessionInvalidationQueue {
         }
     }
 
+    #[cfg(test)]
+    fn wait_until_closed(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while !state.closed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if self.wake.wait_for(&mut state, remaining).timed_out() {
+                return state.closed;
+            }
+        }
+        true
+    }
+
     fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
@@ -1556,6 +1572,39 @@ mod tests {
         );
 
         drop(active);
+    }
+
+    #[test]
+    fn prepare_session_shutdown_closes_invalidation_before_waiting_for_idle() {
+        let state = Arc::new(SessionInvalidationState::new());
+        let queue = SessionInvalidationQueue::new();
+        let active = state
+            .begin_invalidation()
+            .expect("invalidation should start while session is active");
+        let waiter_state = Arc::clone(&state);
+        let waiter_queue = Arc::clone(&queue);
+
+        let waiter =
+            std::thread::spawn(move || prepare_session_shutdown(&waiter_state, &waiter_queue));
+
+        assert!(
+            queue.wait_until_closed(Duration::from_secs(1)),
+            "shutdown helper must close the invalidation queue promptly"
+        );
+        assert!(
+            queue.next().is_none(),
+            "shutdown must close and clear queued invalidations"
+        );
+        assert!(
+            state.begin_invalidation().is_none(),
+            "shutdown must close new invalidations before waiting for active work"
+        );
+        drop(active);
+
+        assert!(
+            waiter.join().expect("shutdown waiter should not panic"),
+            "shutdown should complete after the active invalidation guard drops"
+        );
     }
 
     #[test]

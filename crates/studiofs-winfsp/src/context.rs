@@ -4862,6 +4862,28 @@ mod tests {
     }
 
     #[test]
+    fn should_notify_deduplicates_a_large_invalidation_burst() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("notify_burst");
+        let file = vfs
+            .create(ROOT_INO, b"burst.txt", 0, 0, 0o644)
+            .expect("create burst file");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+
+        for _ in 0..4096 {
+            invalidator.inval_inode(file.ino);
+        }
+
+        let notifications = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
+            PreparedWinfspNotifications,
+        >>::should_notify(&ctx)
+        .expect("prepare burst notification");
+
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].ino, file.ino);
+        assert!(queue.lock().is_empty());
+    }
+
+    #[test]
     fn ino_to_windows_path_resolves_nested_entries() {
         let (_tmp, vfs, _ctx, _queue) = make_test_context("nested_path");
 

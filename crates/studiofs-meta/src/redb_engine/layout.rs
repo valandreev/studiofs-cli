@@ -534,4 +534,20 @@ mod tests {
                 if message.contains("invalid redb regular-file chunk key length")
         ));
     }
+
+    #[test]
+    fn legacy_meta_event_remove_attr_fixture_roundtrips() {
+        let legacy_bytes = [1_u8, 42_u8];
+        let event: crate::events::MetaEvent =
+            decode(&legacy_bytes).expect("legacy remove-attr bytes should decode");
+
+        assert!(matches!(
+            event,
+            crate::events::MetaEvent::RemoveAttr { ino: 42 }
+        ));
+        assert_eq!(
+            encode(&event).expect("legacy event should re-encode"),
+            legacy_bytes
+        );
+    }
 }

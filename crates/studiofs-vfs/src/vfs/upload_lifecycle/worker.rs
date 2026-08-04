@@ -2435,7 +2435,19 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
+    struct FakeUploadTrace {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl FakeUploadTrace {
+        fn record(&self, event: &'static str) {
+            self.events.lock().push(event);
+        }
+    }
+
+    #[derive(Clone, Default)]
     struct FakeCoordinator {
+        trace: FakeUploadTrace,
         completed: Arc<Mutex<Vec<u64>>>,
         cancelled: Arc<Mutex<Vec<u64>>>,
         requeued: Arc<Mutex<Vec<PendingUpload>>>,
@@ -2445,6 +2457,7 @@ mod tests {
 
     impl CachedStorePort for FakeCoordinator {
         fn complete_upload(&self, op: &PendingUpload) {
+            self.trace.record("queue_completion");
             self.completed.lock().push(op.object_id);
             self.pending_inodes.lock().remove(&op.ino);
         }
@@ -2470,11 +2483,13 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakeLocalPayloads {
+        trace: FakeUploadTrace,
         upload_reads: Arc<Mutex<HashMap<u64, Option<Bytes>>>>,
         removed: Arc<Mutex<Vec<u64>>>,
         upload_hot_removed: Arc<Mutex<Vec<u64>>>,
         upload_stage_removed: Arc<Mutex<Vec<u64>>>,
         uploaded: Arc<Mutex<Vec<u64>>>,
+        fail_mark_uploaded: Arc<AtomicBool>,
         failed: Arc<Mutex<Vec<u64>>>,
         deferred: Arc<Mutex<Vec<(Ino, u64)>>>,
         pending_evictions: Arc<Mutex<HashSet<u64>>>,
@@ -2515,7 +2530,11 @@ mod tests {
         }
 
         async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
+            self.trace.record("local_cleanup");
             self.uploaded.lock().push(object_id);
+            if self.fail_mark_uploaded.swap(false, Ordering::Relaxed) {
+                return Err(VfsError::Other("injected mark_uploaded failure".into()));
+            }
             Ok(())
         }
 
@@ -2547,6 +2566,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeMeta {
+        trace: FakeUploadTrace,
         attrs: Arc<Mutex<HashMap<Ino, Option<InodeAttr>>>>,
         overlay_objects: Arc<Mutex<HashMap<Ino, HashSet<u64>>>>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
@@ -2559,6 +2579,7 @@ mod tests {
     impl Default for FakeMeta {
         fn default() -> Self {
             Self {
+                trace: FakeUploadTrace::default(),
                 attrs: Arc::new(Mutex::new(HashMap::new())),
                 overlay_objects: Arc::new(Mutex::new(HashMap::new())),
                 pending_deletions: Arc::new(Mutex::new(Vec::new())),
@@ -2617,6 +2638,7 @@ mod tests {
                     .get(&ino)
                     .is_some_and(|objects| objects.contains(&object_id));
             if matches {
+                self.trace.record("local_metadata");
                 self.uploaded_overlay_objects
                     .lock()
                     .push((ino, expected_epoch, object_id));
@@ -2659,6 +2681,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeRemote {
+        trace: FakeUploadTrace,
         adaptive_penalty_ms: u64,
         visibility: Arc<Mutex<RemoteVisibility>>,
         visibility_after_upload: Arc<Mutex<Option<RemoteVisibility>>>,
@@ -2673,6 +2696,7 @@ mod tests {
     impl Default for FakeRemote {
         fn default() -> Self {
             Self {
+                trace: FakeUploadTrace::default(),
                 adaptive_penalty_ms: 0,
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
                 visibility_after_upload: Arc::new(Mutex::new(Some(RemoteVisibility::Visible))),
@@ -2724,6 +2748,7 @@ mod tests {
             _fragment_keys: &[String],
             cancel_token: &CancellationToken,
         ) -> UploadPutOutcome {
+            self.trace.record("remote_put");
             if cancel_token.is_cancelled() {
                 return UploadPutOutcome::Cancelled;
             }
@@ -2768,6 +2793,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeShutdown {
+        trace: FakeUploadTrace,
         shutdown_requested: Arc<AtomicBool>,
         deleted_inodes: Arc<Mutex<HashSet<Ino>>>,
         pending_inodes: FakePendingInodes,
@@ -2785,6 +2811,7 @@ mod tests {
     impl Default for FakeShutdown {
         fn default() -> Self {
             Self {
+                trace: FakeUploadTrace::default(),
                 shutdown_requested: Arc::new(AtomicBool::new(false)),
                 deleted_inodes: Arc::new(Mutex::new(HashSet::new())),
                 pending_inodes: Arc::new(Mutex::new(HashSet::new())),
@@ -2816,6 +2843,7 @@ mod tests {
 
         fn maybe_release_upload_cancel_token(&self, ino: Ino) {
             if !self.pending_inodes.lock().contains(&ino) {
+                self.trace.record("unpin");
                 self.released_tokens.lock().push(ino);
             }
         }
@@ -2852,6 +2880,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakePolicy {
+        trace: FakeUploadTrace,
         sticky_errors: Arc<Mutex<Vec<(Ino, String)>>>,
         quarantines: Arc<Mutex<Vec<(Ino, u64, String)>>>,
         refreshed: Arc<Mutex<Vec<Ino>>>,
@@ -2893,6 +2922,7 @@ mod tests {
         }
 
         async fn finalize_completed_upload_epoch(&self, ino: Ino, content_epoch: u64) {
+            self.trace.record("epoch_finalization");
             self.finalized_upload_epochs
                 .lock()
                 .push((ino, content_epoch));
@@ -3292,18 +3322,33 @@ mod tests {
         FakePolicy,
     ) {
         let pending_inodes = Arc::new(Mutex::new(HashSet::new()));
+        let trace = FakeUploadTrace::default();
         let coordinator = FakeCoordinator {
+            trace: trace.clone(),
             pending_inodes: pending_inodes.clone(),
             ..FakeCoordinator::default()
         };
-        let local_payloads = FakeLocalPayloads::default();
-        let meta = FakeMeta::default();
-        let remote = FakeRemote::default();
+        let local_payloads = FakeLocalPayloads {
+            trace: trace.clone(),
+            ..FakeLocalPayloads::default()
+        };
+        let meta = FakeMeta {
+            trace: trace.clone(),
+            ..FakeMeta::default()
+        };
+        let remote = FakeRemote {
+            trace: trace.clone(),
+            ..FakeRemote::default()
+        };
         let shutdown = FakeShutdown {
+            trace: trace.clone(),
             pending_inodes: pending_inodes.clone(),
             ..FakeShutdown::default()
         };
-        let policy = FakePolicy::default();
+        let policy = FakePolicy {
+            trace,
+            ..FakePolicy::default()
+        };
         let processor = UploadProcessor {
             coordinator: coordinator.clone(),
             local_payloads: local_payloads.clone(),
@@ -3727,7 +3772,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_upload_records_durable_uploaded_progress_before_local_cleanup() {
-        let (processor, coordinator, local_payloads, meta, _remote, _shutdown, policy) =
+        let (processor, coordinator, local_payloads, meta, remote, _shutdown, policy) =
             processor_fixture();
         let op = make_pending_upload();
         coordinator.pending_inodes.lock().insert(op.ino);
@@ -3750,6 +3795,47 @@ mod tests {
         assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+        assert_eq!(
+            remote.trace.events.lock().as_slice(),
+            &[
+                "remote_put",
+                "local_metadata",
+                "queue_completion",
+                "epoch_finalization",
+                "local_cleanup",
+                "unpin",
+            ],
+            "upload lifecycle ordering must remain observable across all durable stages"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "SFS-637: expected to fail until local durable acceptance precedes queue completion"]
+    #[should_panic(expected = "queue completion must follow successful local durable acceptance")]
+    async fn process_upload_does_not_complete_queue_when_local_transition_fails() {
+        let (processor, coordinator, local_payloads, meta, _remote, _shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads
+            .fail_mark_uploaded
+            .store(true, Ordering::Relaxed);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(
+            coordinator.completed.lock().is_empty(),
+            "queue completion must follow successful local durable acceptance"
+        );
+        assert_eq!(coordinator.requeued.lock().len(), 1);
+        assert_eq!(local_payloads.failed.lock().as_slice(), &[op.object_id]);
     }
 
     #[tokio::test]
