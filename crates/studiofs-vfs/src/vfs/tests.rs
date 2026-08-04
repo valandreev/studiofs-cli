@@ -1287,6 +1287,39 @@ fn runtime_stats_test_tempdir() -> TempDir {
 }
 
 #[test]
+fn volatile_flush_does_not_wait_for_deferred_namespace_metadata() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "volatile-flush-deferred-metadata");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"volatile-flush-deferred-metadata.txt",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create");
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .pending_inodes
+            .insert(attr.ino, 1);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            vfs.flush_volatile_writeback_with_outcome(attr.ino, 0),
+        )
+        .await
+        .expect("volatile flush must not wait for deferred namespace commit")
+        .expect("volatile flush should succeed");
+    });
+}
+
+#[test]
 fn read_into_fh_clamps_to_remaining_file_size() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-into-fh-clamps");

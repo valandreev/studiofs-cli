@@ -1000,11 +1000,7 @@ impl StudioVfs {
             None
         }
         .unwrap_or(ino);
-        let ((), metadata_result) = tokio::join!(
-            self.wait_for_deferred_release_inflight(target_ino),
-            self.wait_for_deferred_namespace_metadata(target_ino)
-        );
-        metadata_result?;
+        self.wait_for_deferred_release_inflight(target_ino).await;
         self.ensure_volatile_overlay_metadata_healthy()?;
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
         if self.state.writer_stack.has_dirty_writers(target_ino) {
