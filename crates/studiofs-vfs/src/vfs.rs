@@ -5157,14 +5157,8 @@ impl StudioVfs {
                 }),
             )
         };
-        let pending_incarnation_newer_than_committed = self
-            .state
-            .incarnation
-            .inode_incarnations
-            .lock()
-            .get(&ino)
-            .and_then(|state| state.pending_incarnation.as_ref())
-            .is_some_and(|pending| pending.content_epoch > committed_epoch);
+        let pending_incarnation_newer_than_committed =
+            self.has_pending_incarnation_newer_than(ino, committed_epoch);
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
         let has_newer_pending_upload =
             has_pending_uploads && self.inode_has_pending_uploads_newer_than(ino, committed_epoch);
@@ -5227,6 +5221,20 @@ impl StudioVfs {
             || has_pending_uploads
             || !live_extents.is_empty()
             || has_pending_epoch_finalization
+    }
+
+    pub(super) fn has_pending_incarnation_newer_than(
+        &self,
+        ino: Ino,
+        committed_epoch: u64,
+    ) -> bool {
+        self.state
+            .incarnation
+            .inode_incarnations
+            .lock()
+            .get(&ino)
+            .and_then(|state| state.pending_incarnation.as_ref())
+            .is_some_and(|pending| pending.content_epoch > committed_epoch)
     }
 
     fn clear_superseded_local_regular_file_state(
