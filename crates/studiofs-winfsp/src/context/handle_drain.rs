@@ -363,11 +363,18 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
     ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
         let vfs = self.context.vfs.clone();
         self.context.spawn_wait(async move {
-            // WinFSP's FlushFileBuffers callback is the platform writeback
-            // boundary. Keep it volatile; the explicit fsync API remains the
-            // strict local durability boundary.
-            vfs.flush_volatile_writeback_with_outcome(request.ino, request.fh)
-                .await
+            // WinFSP invokes this callback for Windows FlushFileBuffers. It is
+            // the caller's strict local durability boundary, not ordinary
+            // volatile writeback admission.
+            if request.fh != 0 {
+                return vfs.fsync_fh_with_outcome(request.fh).await;
+            }
+
+            let had_local_dirty_state = vfs.inode_has_local_dirty_state(request.ino);
+            vfs.fsync(request.ino, false).await?;
+            Ok(ExplicitFlushOutcome {
+                flushed_local_dirty_state: had_local_dirty_state,
+            })
         })
     }
 }
