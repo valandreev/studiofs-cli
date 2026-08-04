@@ -818,6 +818,22 @@ impl SessionInvalidationQueue {
         }
     }
 
+    #[cfg(test)]
+    fn wait_until_closed(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while !state.closed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if self.wake.wait_for(&mut state, remaining).timed_out() {
+                return state.closed;
+            }
+        }
+        true
+    }
+
     fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
@@ -1571,6 +1587,10 @@ mod tests {
         let waiter =
             std::thread::spawn(move || prepare_session_shutdown(&waiter_state, &waiter_queue));
 
+        assert!(
+            queue.wait_until_closed(Duration::from_secs(1)),
+            "shutdown helper must close the invalidation queue promptly"
+        );
         assert!(
             queue.next().is_none(),
             "shutdown must close and clear queued invalidations"
