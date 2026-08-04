@@ -134,10 +134,13 @@ impl UploadStageStore {
 
     /// Calls [`Self::remove`] for each object id in `object_ids`.
     pub fn remove_batch(&self, object_ids: &[u64]) -> Result<(), UploadStageStoreError> {
+        let mut first_error = None;
         for &object_id in object_ids {
-            self.remove(object_id)?;
+            if let Err(error) = self.remove(object_id) {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -187,5 +190,23 @@ mod tests {
 
         assert!(store.contains(0x99));
         assert_eq!(store.get(0x99).unwrap().as_ref(), b"payload");
+    }
+
+    #[test]
+    fn upload_stage_remove_batch_attempts_all_objects_after_an_error() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path());
+        layout.provision().expect("provision");
+        let payload_store = FilePayloadStore::open(layout.clone()).expect("open payload store");
+        let store = UploadStageStore::open(layout.clone()).expect("open upload stage");
+
+        payload_store.put(0x02, b"payload").expect("put payload");
+        store.link_payload(0x02).expect("link payload");
+        std::fs::create_dir_all(layout.upload_stage_object_path(0x01))
+            .expect("create failing stage path");
+
+        assert!(store.remove_batch(&[0x01, 0x02]).is_err());
+        assert!(layout.upload_stage_object_path(0x01).exists());
+        assert!(!layout.upload_stage_object_path(0x02).exists());
     }
 }

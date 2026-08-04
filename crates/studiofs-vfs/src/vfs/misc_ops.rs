@@ -1,6 +1,7 @@
 use super::{
     AccessLevel, FileType, Ino, MetaError, ROOT_INO, StudioVfs, VfsError, VfsResult, debug, warn,
 };
+use crate::runtime::run_local_cache_io_blocking;
 use std::collections::HashSet;
 
 impl StudioVfs {
@@ -154,14 +155,50 @@ impl StudioVfs {
             );
         } else {
             if let Err(error) = self.local_payload_backend.remove(object_id) {
+                self.state.upload.pending_evictions.lock().insert(object_id);
+                self.schedule_deferred_block_cache_eviction(ino, block_index, object_id);
                 warn!(
                     ino,
                     block_index,
                     object_id,
                     error = %error,
-                    "immediate block cache eviction failed"
+                    "immediate block cache eviction failed; deferred cleanup"
                 );
             }
         }
+    }
+
+    fn schedule_deferred_block_cache_eviction(&self, ino: Ino, block_index: u32, object_id: u64) {
+        let local_payload_backend = self.local_payload_backend.clone();
+        let state = self.state.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.track_background_task(handle.spawn(async move {
+            let result = run_local_cache_io_blocking(move || {
+                local_payload_backend
+                    .remove(object_id)
+                    .map_err(VfsError::LocalPayload)
+            })
+            .await;
+            match result {
+                Ok(((), _)) => {
+                    state.upload.pending_evictions.lock().remove(&object_id);
+                    debug!(
+                        ino,
+                        block_index, object_id, "deferred block cache eviction completed"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        ino,
+                        block_index,
+                        object_id,
+                        error = %error,
+                        "deferred block cache eviction failed; retaining pending cleanup"
+                    );
+                }
+            }
+        }));
     }
 }
