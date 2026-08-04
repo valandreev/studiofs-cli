@@ -2187,6 +2187,107 @@ fn startup_replay_preserves_ready_empty_file_without_landing_record() {
 }
 
 #[test]
+fn unclean_restart_removes_writer_only_empty_placeholder() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let name = b"unclean-writer-only-placeholder.bin";
+    let payload = b"writer-state-only-before-crash";
+
+    {
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "unclean-writer-placeholder");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, name, 0, 0, 0o644)
+                .expect("create unpublished file");
+            let fh = vfs
+                .open_file(created.ino, OpenFlags::RDWR, false)
+                .expect("open unpublished file");
+
+            vfs.write_fh(fh, created.ino, 0, payload)
+                .await
+                .expect("accept memory-only write");
+            let marker_attr = meta
+                .get_attr(created.ino)
+                .expect("load writer intent metadata");
+            assert_eq!(marker_attr.size, 0);
+            assert_eq!(marker_attr.committed_size, 0);
+            assert_eq!(marker_attr.content_epoch, 1);
+            assert_eq!(marker_attr.committed_content_epoch, 0);
+            assert_eq!(marker_attr.upload_state, MetaUploadState::Uploading);
+            assert_writer_state_only_boundary(
+                &vfs,
+                &meta,
+                created.ino,
+                payload.len() as u64,
+                "before simulated crash",
+            );
+            let read = vfs
+                .read(created.ino, 0, payload.len() as u32)
+                .await
+                .expect("read accepted bytes before simulated crash");
+            assert_eq!(read.as_ref(), payload);
+        });
+    }
+
+    let (_rt, _reopened, meta) = reopen_existing_test_vfs(&tmp);
+    assert!(
+        matches!(
+            meta.lookup(ROOT_INO, name),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "unclean restart must discard a writer-only empty placeholder when its unbarriered bytes were lost"
+    );
+}
+
+#[test]
+fn unclean_restart_removes_retried_writer_only_empty_placeholder() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let name = b"unclean-retried-writer-only-placeholder.bin";
+
+    {
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "unclean-retried-writer-placeholder");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, name, 0, 0, 0o644)
+                .expect("create unpublished file");
+            let fh = vfs
+                .open_file(created.ino, OpenFlags::RDWR, false)
+                .expect("open unpublished file");
+
+            vfs.write_fh(fh, created.ino, u64::MAX, b"rejected")
+                .await
+                .expect_err("the first write should fail before accepting writer bytes");
+            let restored = meta
+                .get_attr(created.ino)
+                .expect("load restored empty draft metadata");
+            assert!(restored.is_unpublished_empty_draft());
+
+            vfs.write_fh(fh, created.ino, 0, b"x")
+                .await
+                .expect("retry should accept one byte");
+            let marker_attr = meta
+                .get_attr(created.ino)
+                .expect("load retried writer intent metadata");
+            assert!(
+                marker_attr.content_epoch > 1,
+                "retry should exercise a later pending incarnation: {marker_attr:?}"
+            );
+            assert_writer_state_only_boundary(&vfs, &meta, created.ino, 1, "after retry");
+        });
+    }
+
+    let (_rt, _reopened, meta) = reopen_existing_test_vfs(&tmp);
+    assert!(
+        matches!(
+            meta.lookup(ROOT_INO, name),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "unclean restart must discard a retried writer-only empty placeholder"
+    );
+}
+
+#[test]
 fn startup_replay_removes_lost_unpublished_upload_inode_after_orphan_payload_cleanup() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-orphan");

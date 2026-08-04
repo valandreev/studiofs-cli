@@ -1940,6 +1940,9 @@ impl StudioVfs {
                 attr
             }
         };
+        let starts_writer_only_empty_draft =
+            base_attr.is_unpublished_empty_draft() && !data.is_empty();
+        let writer_only_restore_attr = starts_writer_only_empty_draft.then(|| base_attr.clone());
         let starts_payload_after_empty_local_incarnation = base_attr.is_unpublished_empty_draft()
             || (base_attr.size == 0
                 && base_attr.committed_size == 0
@@ -1958,6 +1961,15 @@ impl StudioVfs {
                 };
         }
 
+        if starts_writer_only_empty_draft {
+            self.sync_meta().set_attr(&base_attr)?;
+            let meta = self.meta.clone();
+            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.sync_local_metadata()
+            })
+            .await?;
+        }
+
         let spec = super::writer_stack::WriterWriteSpec {
             fh,
             ino,
@@ -1969,8 +1981,39 @@ impl StudioVfs {
         let accepted = match data {
             VfsWritePayload::Borrowed(data) => self.state.writer_stack.write_bytes(spec, data),
             VfsWritePayload::Owned(data) => self.state.writer_stack.write_owned_bytes(spec, data),
-        }
-        .map_err(|err| VfsError::Other(format!("writer stack write failed: {err}")))?;
+        };
+        let accepted = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if let Some(restore_attr) = writer_only_restore_attr {
+                    match self.sync_meta().set_attr(&restore_attr) {
+                        Err(restore_error) => warn!(
+                            ino,
+                            error = %restore_error,
+                            "failed to restore empty inode after writer stack rejection"
+                        ),
+                        Ok(()) => {
+                            let meta = self.meta.clone();
+                            if let Err(restore_error) =
+                                run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                                    engine.sync_local_metadata()
+                                })
+                                .await
+                            {
+                                warn!(
+                                    ino,
+                                    error = %restore_error,
+                                    "failed to persist restored empty inode after writer stack rejection"
+                                );
+                            }
+                        }
+                    }
+                }
+                return Err(VfsError::Other(format!(
+                    "writer stack write failed: {error}"
+                )));
+            }
+        };
         {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());

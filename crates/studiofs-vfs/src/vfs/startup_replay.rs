@@ -155,14 +155,24 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn should_remove_unpublished_regular_inode(&self, attr: &InodeAttr) -> bool {
+        let has_abandoned_writer_intent = Self::is_unpublished_empty_writer_intent(attr);
         Self::is_lost_unpublished_regular_upload(attr)
             || (self.recovered_after_unclean_shutdown
-                && Self::is_live_zero_size_unpublished_draft(attr)
+                && (Self::is_live_zero_size_unpublished_draft(attr) || has_abandoned_writer_intent)
                 && attr.nlink == 1
                 && self
                     .landing_recovery_inodes
                     .as_ref()
                     .is_some_and(|inodes| !inodes.contains(&attr.ino)))
+    }
+
+    fn is_unpublished_empty_writer_intent(attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state == MetaUploadState::Uploading
+            && attr.size == 0
+            && attr.committed_size == 0
+            && attr.content_epoch > attr.committed_content_epoch
+            && attr.committed_content_epoch == 0
     }
 
     fn is_live_zero_size_unpublished_draft(attr: &InodeAttr) -> bool {
