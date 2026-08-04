@@ -1338,10 +1338,9 @@ pub(in crate::scenario) fn write_local_durable_payload(
         format!("write local durable payload {}", path.display()),
         MOUNTED_WRITE_READBACK_TIMEOUT,
         move || {
-            let mut file = OpenOptions::new()
+            let mut file = mounted_write_barrier_open_options()
                 .create(true)
                 .truncate(true)
-                .write(true)
                 .open(path)?;
             file.write_all(&write_payload)?;
             file.sync_all()
