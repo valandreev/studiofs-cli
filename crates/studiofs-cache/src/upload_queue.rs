@@ -662,6 +662,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_idle_wakes_after_last_completion() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(1, 0, 100, 1);
+        let op = rx.recv().await.expect("queued upload");
+        let waiter = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.wait_for_idle(Duration::from_secs(60)).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter should still observe pending work"
+        );
+        assert!(queue.complete(&op));
+        assert!(
+            waiter.await.expect("idle waiter should not panic"),
+            "completion should wake an idle waiter before its timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_burst_keeps_count_and_inode_index_consistent() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+        const BURST: u64 = 1024;
+
+        for object_id in 0..BURST {
+            queue.submit(7, object_id * 4096, object_id + 1, 1);
+        }
+
+        assert_eq!(queue.pending_count(), BURST as usize);
+        assert_eq!(queue.snapshot_pending().len(), BURST as usize);
+        assert_eq!(queue.snapshot_pending_for_ino(7).len(), BURST as usize);
+        assert!(queue.has_pending_for_ino(7));
+
+        for _ in 0..BURST {
+            let op = rx.recv().await.expect("burst upload");
+            assert!(queue.complete(&op));
+        }
+
+        assert_eq!(queue.pending_count(), 0);
+        assert!(queue.snapshot_pending().is_empty());
+        assert!(queue.snapshot_pending_for_ino(7).is_empty());
+        assert!(!queue.has_pending_for_ino(7));
+    }
+
+    #[tokio::test]
     async fn has_pending_for_ino_tracks_inserts_and_removals() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());

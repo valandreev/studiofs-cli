@@ -1559,6 +1559,36 @@ mod tests {
     }
 
     #[test]
+    fn prepare_session_shutdown_closes_invalidation_before_waiting_for_idle() {
+        let state = Arc::new(SessionInvalidationState::new());
+        let queue = SessionInvalidationQueue::new();
+        let active = state
+            .begin_invalidation()
+            .expect("invalidation should start while session is active");
+        state.begin_shutdown();
+        let waiter_state = Arc::clone(&state);
+        let waiter_queue = Arc::clone(&queue);
+
+        let waiter =
+            std::thread::spawn(move || prepare_session_shutdown(&waiter_state, &waiter_queue));
+
+        assert!(
+            state.begin_invalidation().is_none(),
+            "shutdown must close new invalidations before waiting for active work"
+        );
+        assert!(
+            queue.next().is_none(),
+            "shutdown must close and clear queued invalidations"
+        );
+        drop(active);
+
+        assert!(
+            waiter.join().expect("shutdown waiter should not panic"),
+            "shutdown should complete after the active invalidation guard drops"
+        );
+    }
+
+    #[test]
     fn session_invalidation_state_reuses_shutdown_wait_deadline() {
         let state = SessionInvalidationState::new();
         let active = state

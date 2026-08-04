@@ -2475,6 +2475,7 @@ mod tests {
         upload_hot_removed: Arc<Mutex<Vec<u64>>>,
         upload_stage_removed: Arc<Mutex<Vec<u64>>>,
         uploaded: Arc<Mutex<Vec<u64>>>,
+        fail_mark_uploaded: Arc<AtomicBool>,
         failed: Arc<Mutex<Vec<u64>>>,
         deferred: Arc<Mutex<Vec<(Ino, u64)>>>,
         pending_evictions: Arc<Mutex<HashSet<u64>>>,
@@ -2516,6 +2517,9 @@ mod tests {
 
         async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
             self.uploaded.lock().push(object_id);
+            if self.fail_mark_uploaded.swap(false, Ordering::Relaxed) {
+                return Err(VfsError::Other("injected mark_uploaded failure".into()));
+            }
             Ok(())
         }
 
@@ -3750,6 +3754,34 @@ mod tests {
         assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    #[ignore = "SFS-637: expected to fail until local durable acceptance precedes queue completion"]
+    async fn process_upload_does_not_complete_queue_when_local_transition_fails() {
+        let (processor, coordinator, local_payloads, meta, _remote, _shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads
+            .fail_mark_uploaded
+            .store(true, Ordering::Relaxed);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(
+            coordinator.completed.lock().is_empty(),
+            "queue completion must follow successful local durable acceptance"
+        );
+        assert_eq!(coordinator.requeued.lock().len(), 1);
+        assert_eq!(local_payloads.failed.lock().as_slice(), &[op.object_id]);
     }
 
     #[tokio::test]

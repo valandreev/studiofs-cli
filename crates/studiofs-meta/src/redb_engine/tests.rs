@@ -9,6 +9,38 @@ use crate::events::MetaEvent;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+#[test]
+fn legacy_meta_event_fixture_replays_from_local_event_log() {
+    let engine = temp_engine();
+    let legacy_bytes = [1_u8, 42_u8];
+    let txn = engine
+        .begin_write_txn()
+        .expect("begin local event fixture transaction");
+    {
+        let mut events = txn
+            .open_table(EVENT_LOG_TABLE)
+            .expect("open local event log");
+        events
+            .insert(1, legacy_bytes.as_slice())
+            .expect("insert legacy event bytes");
+    }
+    {
+        let mut counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
+        counters
+            .insert("nextEventSeq", 2)
+            .expect("advance event sequence");
+    }
+    txn.commit().expect("commit local event fixture");
+
+    let events = engine
+        .read_events_range(1, 2)
+        .expect("decode legacy event from local event log");
+    assert!(matches!(
+        events.as_slice(),
+        [MetaEvent::RemoveAttr { ino: 42 }]
+    ));
+}
+
 trait FileGraphFixture {
     fn stage_payload_slice(&self, ino: Ino, block_index: u32, block: &PayloadRef)
     -> MetaResult<()>;
