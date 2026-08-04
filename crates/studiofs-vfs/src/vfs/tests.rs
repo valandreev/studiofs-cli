@@ -1054,16 +1054,28 @@ fn rmdir_waits_for_queued_child_unlink_on_parent_namespace() {
             .file_session
             .enter_op(parent.ino, FileSessionOperation::Delete)
             .await;
-        assert!(vfs.state.file_session.has_delete_inflight(parent.ino));
-        let rmdir_vfs = vfs.clone();
-        let rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"parent"));
-        tokio::time::sleep(Duration::from_millis(25)).await;
 
         let unlink_vfs = vfs.clone();
         let unlink =
             tokio::task::spawn_blocking(move || unlink_vfs.unlink(parent.ino, b"child.txt"));
-        assert!(vfs.state.file_session.has_delete_inflight(parent.ino));
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if vfs
+                    .state
+                    .file_session
+                    .debug_snapshot(parent.ino)
+                    .is_some_and(|snapshot| snapshot.queued_ops > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child unlink should queue behind the parent delete gate");
+
+        let rmdir_vfs = vfs.clone();
+        let rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"parent"));
         drop(parent_delete_gate);
 
         unlink
