@@ -611,8 +611,8 @@ impl SessionControl {
     }
 
     fn request_exit(&self) -> bool {
+        prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
         self.with_live_raw(|raw| {
-            prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
             // SAFETY: The raw pointer is protected by the control lock, which
             // Session::drop acquires before destroying the session.
             unsafe { (self.exit)(raw) };
@@ -1595,6 +1595,41 @@ mod tests {
         request.join().expect("request thread should exit");
         close.join().expect("close thread should exit");
         assert!(control.with_live_raw(|_| ()).is_none());
+    }
+
+    #[test]
+    fn session_control_close_does_not_wait_for_shutdown_preparation() {
+        let control = Arc::new(SessionControl::for_test());
+        let active = control
+            .invalidation_state
+            .begin_invalidation()
+            .expect("invalidation should start while session is live");
+        let request_control = Arc::clone(&control);
+        let request = std::thread::spawn(move || request_control.request_exit());
+
+        assert!(
+            control
+                .invalidation_queue
+                .wait_until_closed(Duration::from_secs(1)),
+            "exit request should start shutdown preparation"
+        );
+        let close_control = Arc::clone(&control);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let close = std::thread::spawn(move || {
+            close_control.close();
+            closed_tx.send(()).expect("signal session close");
+        });
+
+        closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("session close must not wait for shutdown preparation");
+        drop(active);
+
+        assert!(
+            !request.join().expect("exit request should finish"),
+            "a request superseded by session close must not reach macFUSE"
+        );
+        close.join().expect("close thread should exit");
     }
 
     #[test]
