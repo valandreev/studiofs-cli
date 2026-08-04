@@ -560,21 +560,85 @@ impl Drop for OwnedFuseArgs {
     }
 }
 
+#[cfg(test)]
+static TEST_SESSION_EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct SessionControl {
+    raw: ParkingMutex<Option<NonNull<raw::FuseSession>>>,
+    invalidation_state: Arc<SessionInvalidationState>,
+    invalidation_queue: Arc<SessionInvalidationQueue>,
+    exit: unsafe extern "C" fn(*mut raw::FuseSession),
+}
+
+// SAFETY: The raw session is accessed only while holding `raw`; `close` takes
+// the same lock before Session destroys the pointer. macFUSE supports exit
+// signaling from the watcher thread.
+unsafe impl Send for SessionControl {}
+unsafe impl Sync for SessionControl {}
+
+impl SessionControl {
+    fn new(
+        raw: NonNull<raw::FuseSession>,
+        invalidation_state: Arc<SessionInvalidationState>,
+        invalidation_queue: Arc<SessionInvalidationQueue>,
+        exit: unsafe extern "C" fn(*mut raw::FuseSession),
+    ) -> Self {
+        Self {
+            raw: ParkingMutex::new(Some(raw)),
+            invalidation_state,
+            invalidation_queue,
+            exit,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        unsafe extern "C" fn record_exit(_: *mut raw::FuseSession) {
+            TEST_SESSION_EXIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        Self::new(
+            NonNull::dangling(),
+            Arc::new(SessionInvalidationState::new()),
+            SessionInvalidationQueue::new(),
+            record_exit,
+        )
+    }
+
+    fn with_live_raw<T>(&self, operation: impl FnOnce(*mut raw::FuseSession) -> T) -> Option<T> {
+        let raw = self.raw.lock();
+        Some(operation((*raw)?.as_ptr()))
+    }
+
+    fn request_exit(&self) -> bool {
+        self.with_live_raw(|raw| {
+            prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
+            // SAFETY: The raw pointer is protected by the control lock, which
+            // Session::drop acquires before destroying the session.
+            unsafe { (self.exit)(raw) };
+        })
+        .is_some()
+    }
+
+    fn close(&self) {
+        self.raw.lock().take();
+    }
+}
+
 /// Mounted low-level macFUSE session.
 pub struct Session {
     raw: NonNull<raw::FuseSession>,
     channel: NonNull<raw::FuseChan>,
     mount_point: CString,
-    invalidation_state: Arc<SessionInvalidationState>,
-    invalidation_queue: Arc<SessionInvalidationQueue>,
+    control: Arc<SessionControl>,
 }
 
 // SAFETY: macFUSE session handles support cross-thread exit signaling, and this
-// wrapper only exposes shared access for `request_exit`. Teardown still requires
-// owning `Session`, so `Drop` cannot race active shared borrows in safe Rust.
+// wrapper only exposes shared access for `request_exit`. Teardown is serialized
+// with external exit requests by SessionControl.
 unsafe impl Send for Session {}
-// SAFETY: See the `Send` impl above; shared references expose only
-// `fuse_session_exit`, which is the intended cross-thread wakeup path.
+// SAFETY: See the `Send` impl above; shared references use SessionControl's
+// lifetime gate for the intended cross-thread wakeup path.
 unsafe impl Sync for Session {}
 
 impl Session {
@@ -634,8 +698,12 @@ impl Session {
                     raw: session,
                     channel,
                     mount_point,
-                    invalidation_state,
-                    invalidation_queue,
+                    control: Arc::new(SessionControl::new(
+                        session,
+                        invalidation_state,
+                        invalidation_queue,
+                        raw::fuse_session_exit,
+                    )),
                 })
             }
             None => {
@@ -649,25 +717,23 @@ impl Session {
     }
 
     /// Request session loop shutdown.
-    pub fn request_exit(&self) {
-        prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
-        // SAFETY: `self.raw` is owned by this wrapper and remains live until Drop.
-        unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
+    ///
+    /// Returns `false` when the session has already started closing.
+    pub fn request_exit(&self) -> bool {
+        self.control.request_exit()
     }
 
     /// Build a thread-safe handle that can request session loop shutdown.
     pub fn exit_handle(&self) -> SessionExitHandle {
         SessionExitHandle {
-            raw: self.raw,
-            invalidation_state: Arc::clone(&self.invalidation_state),
-            invalidation_queue: Arc::clone(&self.invalidation_queue),
+            control: Arc::clone(&self.control),
         }
     }
 
     /// Build a VFS kernel invalidator for this mounted session.
     pub fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
         Arc::new(MacFuseKernelInvalidator {
-            queue: Arc::clone(&self.invalidation_queue),
+            queue: Arc::clone(&self.control.invalidation_queue),
         })
     }
 
@@ -686,25 +752,15 @@ impl Session {
 
 /// Thread-safe handle used to request low-level session shutdown.
 pub struct SessionExitHandle {
-    raw: NonNull<raw::FuseSession>,
-    invalidation_state: Arc<SessionInvalidationState>,
-    invalidation_queue: Arc<SessionInvalidationQueue>,
+    control: Arc<SessionControl>,
 }
-
-// SAFETY: `SessionExitHandle` is created only from a live `Session` and is used
-// by watcher threads that are joined before the session is dropped. The handle
-// only requests invalidation shutdown and `fuse_session_exit`.
-unsafe impl Send for SessionExitHandle {}
-// SAFETY: Shared access cannot mutate Rust-owned state; see `Send` invariant.
-unsafe impl Sync for SessionExitHandle {}
 
 impl SessionExitHandle {
     /// Ask the session loop to exit.
-    pub fn request_exit(self) {
-        prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
-        // SAFETY: the handle is created from a live `Session` and used only by
-        // watchers that are joined before that session is dropped.
-        unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
+    ///
+    /// Returns `false` when the session has already started closing.
+    pub fn request_exit(&self) -> bool {
+        self.control.request_exit()
     }
 }
 
@@ -966,14 +1022,18 @@ fn notify_inode_range(
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if !prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue) {
+        self.control.close();
+        if !prepare_session_shutdown(
+            &self.control.invalidation_state,
+            &self.control.invalidation_queue,
+        ) {
             warn!(
                 "macFUSE session shutdown timed out waiting for active kernel invalidation; \
                  leaking raw session handles to avoid use-after-free"
             );
             return;
         }
-        self.invalidation_queue.join_worker();
+        self.control.invalidation_queue.join_worker();
         // SAFETY: `self.channel` was attached to `self.raw`; removing it before
         // unmount avoids leaving the session with a stale channel pointer.
         unsafe { raw::fuse_session_remove_chan(self.channel.as_ptr()) };
@@ -1474,6 +1534,68 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn session_exit_handle_repeated_request_is_forwarded_while_session_is_live() {
+        TEST_SESSION_EXIT_CALLS.store(0, Ordering::Relaxed);
+        let control = Arc::new(SessionControl::for_test());
+        let handle = SessionExitHandle {
+            control: Arc::clone(&control),
+        };
+
+        assert!(handle.request_exit());
+        assert!(handle.request_exit());
+        assert_eq!(TEST_SESSION_EXIT_CALLS.load(Ordering::Relaxed), 2);
+
+        control.close();
+        assert!(!handle.request_exit());
+    }
+
+    #[test]
+    fn session_exit_handle_repeated_request_after_session_drop_is_a_noop() {
+        let control = Arc::new(SessionControl::for_test());
+        let handle = SessionExitHandle {
+            control: Arc::clone(&control),
+        };
+        control.close();
+
+        assert!(!handle.request_exit());
+        assert!(!handle.request_exit());
+    }
+
+    #[test]
+    fn session_control_close_waits_for_an_in_flight_request() {
+        let control = Arc::new(SessionControl::for_test());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let request_control = Arc::clone(&control);
+        let request = std::thread::spawn(move || {
+            request_control.with_live_raw(|_| {
+                entered_tx.send(()).expect("signal request entry");
+                release_rx.recv().expect("wait for request release");
+            });
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("request should enter the raw-session gate");
+        let close_control = Arc::clone(&control);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let close = std::thread::spawn(move || {
+            close_control.close();
+            closed_tx.send(()).expect("signal session close");
+        });
+
+        assert!(
+            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "session close must wait for an in-flight raw-session request"
+        );
+        release_tx.send(()).expect("release raw-session request");
+
+        request.join().expect("request thread should exit");
+        close.join().expect("close thread should exit");
+        assert!(control.with_live_raw(|_| ()).is_none());
+    }
 
     #[test]
     fn session_invalidation_state_closes_future_invalidations() {
