@@ -302,8 +302,8 @@ trait CachedStorePort: Clone + Send + Sync + 'static {
 }
 
 trait UploadLocalPayloadPort: Clone + Send + Sync + 'static {
-    fn mark_uploading(&self, object_id: u64);
-    fn mark_upload_failed(&self, object_id: u64);
+    fn mark_uploading(&self, object_id: u64) -> VfsResult<()>;
+    fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()>;
     async fn prepare_local_priority_read(
         &self,
         object_id: u64,
@@ -486,7 +486,13 @@ where
                         error = %error,
                         "upload failed due to invalid regular-file graph, quarantining inode"
                     );
-                    self.local_payloads.mark_upload_failed(op.object_id);
+                    if let Err(state_error) = self.local_payloads.mark_upload_failed(op.object_id) {
+                        warn!(
+                            object_id = op.object_id,
+                            error = %state_error,
+                            "failed to persist upload failure state while quarantining inode"
+                        );
+                    }
                     self.policy
                         .quarantine_invalid_regular_file_graph(op.ino, attr_size, &error);
                     return UploadOutcome::QuarantinedInvalidRegularFileGraph;
@@ -510,7 +516,13 @@ where
                     return UploadOutcome::CancelledDeleted;
                 }
 
-                self.local_payloads.mark_upload_failed(op.object_id);
+                if let Err(state_error) = self.local_payloads.mark_upload_failed(op.object_id) {
+                    warn!(
+                        object_id = op.object_id,
+                        error = %state_error,
+                        "failed to persist upload failure state before requeue"
+                    );
+                }
                 self.policy.mark_upload_sticky_error(op.ino, &error);
 
                 let mut retry_op = op;
@@ -627,7 +639,7 @@ where
             .await?;
 
         let t0 = Instant::now();
-        self.local_payloads.mark_uploading(op.object_id);
+        self.local_payloads.mark_uploading(op.object_id)?;
         let fragment_keys = self.remote.fragment_keys(op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
@@ -836,16 +848,6 @@ where
                 .await?;
             (false, op.content_epoch)
         };
-        self.coordinator.complete_upload(op);
-
-        self.policy.refresh_incarnation_state(op.ino).await;
-        self.policy
-            .finalize_completed_upload_epoch(op.ino, finalize_content_epoch)
-            .await;
-        self.policy.clear_upload_sticky_error(op.ino);
-        self.policy
-            .debug_pending_inode_state(op.ino, "upload_completed");
-
         if self.local_payloads.clear_pending_eviction(op.object_id) {
             self.local_payloads.remove(op.object_id).await?;
         } else if keep_local_object {
@@ -857,6 +859,16 @@ where
         self.local_payloads
             .remove_upload_stage(op.object_id)
             .await?;
+
+        self.coordinator.complete_upload(op);
+
+        self.policy.refresh_incarnation_state(op.ino).await;
+        self.policy
+            .finalize_completed_upload_epoch(op.ino, finalize_content_epoch)
+            .await;
+        self.policy.clear_upload_sticky_error(op.ino);
+        self.policy
+            .debug_pending_inode_state(op.ino, "upload_completed");
 
         debug!(
             object_id = op.object_id,
@@ -1015,7 +1027,7 @@ where
             None => false,
         };
         if still_referenced {
-            self.local_payloads.mark_upload_failed(op.object_id);
+            self.local_payloads.mark_upload_failed(op.object_id)?;
             self.local_payloads.clear_pending_eviction(op.object_id);
             return Ok(());
         }
@@ -1148,12 +1160,18 @@ struct VfsUploadLocalPayloadPort {
 }
 
 impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
-    fn mark_uploading(&self, object_id: u64) {
-        self.vfs.local_payload_backend.mark_uploading(object_id);
+    fn mark_uploading(&self, object_id: u64) -> VfsResult<()> {
+        self.vfs
+            .local_payload_backend
+            .mark_uploading(object_id)
+            .map_err(|error| VfsError::Other(format!("mark upload uploading failed: {error}")))
     }
 
-    fn mark_upload_failed(&self, object_id: u64) {
-        self.vfs.local_payload_backend.mark_upload_failed(object_id);
+    fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()> {
+        self.vfs
+            .local_payload_backend
+            .mark_upload_failed(object_id)
+            .map_err(|error| VfsError::Other(format!("mark upload failed state failed: {error}")))
     }
 
     async fn prepare_local_priority_read(
@@ -2497,10 +2515,13 @@ mod tests {
     }
 
     impl UploadLocalPayloadPort for FakeLocalPayloads {
-        fn mark_uploading(&self, _object_id: u64) {}
+        fn mark_uploading(&self, _object_id: u64) -> VfsResult<()> {
+            Ok(())
+        }
 
-        fn mark_upload_failed(&self, object_id: u64) {
+        fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()> {
             self.failed.lock().push(object_id);
+            Ok(())
         }
 
         async fn prepare_local_priority_read(
@@ -3800,9 +3821,9 @@ mod tests {
             &[
                 "remote_put",
                 "local_metadata",
+                "local_cleanup",
                 "queue_completion",
                 "epoch_finalization",
-                "local_cleanup",
                 "unpin",
             ],
             "upload lifecycle ordering must remain observable across all durable stages"
@@ -3810,8 +3831,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "SFS-637: expected to fail until local durable acceptance precedes queue completion"]
-    #[should_panic(expected = "queue completion must follow successful local durable acceptance")]
     async fn process_upload_does_not_complete_queue_when_local_transition_fails() {
         let (processor, coordinator, local_payloads, meta, _remote, _shutdown, _policy) =
             processor_fixture();

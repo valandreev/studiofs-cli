@@ -5987,7 +5987,9 @@ impl StudioVfs {
     async fn payload_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
         let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.mark_uploaded(object_id);
+            payload_store.mark_uploaded(object_id).map_err(|error| {
+                VfsError::Other(format!("mark payload uploaded failed: {error}"))
+            })?;
             Ok(())
         })
         .await?;
@@ -5998,7 +6000,9 @@ impl StudioVfs {
     async fn payload_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
         let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.remove(object_id);
+            payload_store
+                .remove(object_id)
+                .map_err(|error| VfsError::Other(format!("remove payload failed: {error}")))?;
             Ok(())
         })
         .await?;
@@ -6013,7 +6017,9 @@ impl StudioVfs {
         let payload_store = self.local_payload_backend.clone();
         let object_ids = object_ids.to_vec();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.remove_batch(&object_ids);
+            payload_store.remove_batch(&object_ids).map_err(|error| {
+                VfsError::Other(format!("remove payload batch failed: {error}"))
+            })?;
             Ok(())
         })
         .await?;
@@ -6024,7 +6030,9 @@ impl StudioVfs {
     async fn upload_stage_remove_async(&self, object_id: u64) -> VfsResult<()> {
         let cached_store = self.cached_store.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            cached_store.remove_staged_upload(object_id);
+            cached_store
+                .remove_staged_upload(object_id)
+                .map_err(|error| VfsError::Other(format!("remove upload stage failed: {error}")))?;
             Ok(())
         })
         .await?;
@@ -6043,7 +6051,11 @@ impl StudioVfs {
         let cached_store = self.cached_store.clone();
         let object_ids = object_ids.to_vec();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            cached_store.remove_staged_upload_batch(&object_ids);
+            cached_store
+                .remove_staged_upload_batch(&object_ids)
+                .map_err(|error| {
+                    VfsError::Other(format!("remove upload stage batch failed: {error}"))
+                })?;
             Ok(())
         })
         .await?;

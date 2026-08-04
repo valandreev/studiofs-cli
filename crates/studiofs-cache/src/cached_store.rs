@@ -615,28 +615,43 @@ impl CachedStore {
     }
 
     /// Marks an object as currently uploading in the local payload backend.
-    pub fn mark_uploading(&self, object_id: ObjectId) {
-        self.local_payload_backend.mark_uploading(object_id);
+    pub fn mark_uploading(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.mark_uploading(object_id)
     }
 
     /// Marks an object upload as failed in the local payload backend.
-    pub fn mark_upload_failed(&self, object_id: ObjectId) {
-        self.local_payload_backend.mark_upload_failed(object_id);
+    pub fn mark_upload_failed(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.mark_upload_failed(object_id)
     }
 
     /// Marks an object as fully uploaded in the local payload backend.
-    pub fn mark_uploaded(&self, object_id: ObjectId) {
-        self.local_payload_backend.mark_uploaded(object_id);
+    pub fn mark_uploaded(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.mark_uploaded(object_id)
     }
 
     /// Removes an object from the local payload backend.
-    pub fn remove(&self, object_id: ObjectId) {
-        self.local_payload_backend.remove(object_id);
+    pub fn remove(
+        &self,
+        object_id: ObjectId,
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.remove(object_id)
     }
 
     /// Removes a batch of objects from the local payload backend.
-    pub fn remove_batch(&self, object_ids: &[ObjectId]) {
-        self.local_payload_backend.remove_batch(object_ids);
+    pub fn remove_batch(
+        &self,
+        object_ids: &[ObjectId],
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.remove_batch(object_ids)
     }
 
     /// Links a batch of staged payloads into the upload stage store.
@@ -685,15 +700,33 @@ impl CachedStore {
             })
             .collect::<Vec<_>>();
         if let Err(source) = self.local_payload_backend.put_batch(&puts) {
-            self.local_payload_backend.remove_batch(&object_ids);
+            if let Err(cleanup_error) = self.local_payload_backend.remove_batch(&object_ids) {
+                warn!(
+                    object_count = object_ids.len(),
+                    error = ?cleanup_error,
+                    "failed to clean up local payloads after staging failure"
+                );
+            }
             return Err(CachedStoreWriterError::LocalPayload {
                 object_id: first_object_id,
                 source,
             });
         }
         if let Err(source) = self.upload_stage_store.link_payload_batch(&object_ids) {
-            self.upload_stage_store.remove_batch(&object_ids);
-            self.local_payload_backend.remove_batch(&object_ids);
+            if let Err(cleanup_error) = self.upload_stage_store.remove_batch(&object_ids) {
+                warn!(
+                    object_count = object_ids.len(),
+                    error = ?cleanup_error,
+                    "failed to clean up upload stages after linking failure"
+                );
+            }
+            if let Err(cleanup_error) = self.local_payload_backend.remove_batch(&object_ids) {
+                warn!(
+                    object_count = object_ids.len(),
+                    error = ?cleanup_error,
+                    "failed to clean up local payloads after linking failure"
+                );
+            }
             return Err(CachedStoreWriterError::UploadStage {
                 object_id: first_object_id,
                 source,
@@ -724,13 +757,16 @@ impl CachedStore {
     }
 
     /// Removes a staged upload payload from the upload stage store.
-    pub fn remove_staged_upload(&self, object_id: ObjectId) {
-        self.upload_stage_store.remove(object_id);
+    pub fn remove_staged_upload(&self, object_id: ObjectId) -> Result<(), UploadStageStoreError> {
+        self.upload_stage_store.remove(object_id)
     }
 
     /// Removes a batch of staged upload payloads from the upload stage store.
-    pub fn remove_staged_upload_batch(&self, object_ids: &[ObjectId]) {
-        self.upload_stage_store.remove_batch(object_ids);
+    pub fn remove_staged_upload_batch(
+        &self,
+        object_ids: &[ObjectId],
+    ) -> Result<(), UploadStageStoreError> {
+        self.upload_stage_store.remove_batch(object_ids)
     }
 
     /// Removes an entry from the in-memory hot-upload buffer.
@@ -1727,16 +1763,25 @@ mod tests {
             self.inner.run_pressure_maintenance()
         }
 
-        fn mark_uploading(&self, object_id: u64) {
-            self.inner.mark_uploading(object_id);
+        fn mark_uploading(
+            &self,
+            object_id: u64,
+        ) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.inner.mark_uploading(object_id)
         }
 
-        fn mark_upload_failed(&self, object_id: u64) {
-            self.inner.mark_upload_failed(object_id);
+        fn mark_upload_failed(
+            &self,
+            object_id: u64,
+        ) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.inner.mark_upload_failed(object_id)
         }
 
-        fn mark_uploaded(&self, object_id: u64) {
-            self.inner.mark_uploaded(object_id);
+        fn mark_uploaded(
+            &self,
+            object_id: u64,
+        ) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.inner.mark_uploaded(object_id)
         }
 
         fn pin(&self, object_id: u64) {
@@ -1747,12 +1792,15 @@ mod tests {
             self.inner.unpin(object_id);
         }
 
-        fn remove(&self, object_id: u64) {
-            self.inner.remove(object_id);
+        fn remove(&self, object_id: u64) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.inner.remove(object_id)
         }
 
-        fn remove_batch(&self, object_ids: &[u64]) {
-            self.inner.remove_batch(object_ids);
+        fn remove_batch(
+            &self,
+            object_ids: &[u64],
+        ) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.inner.remove_batch(object_ids)
         }
 
         fn dirty_object_ids(&self) -> Vec<u64> {
@@ -2451,7 +2499,9 @@ mod tests {
             Some(&b"staged-payload"[..])
         );
 
-        cached_store.remove_staged_upload(put.object_id);
+        cached_store
+            .remove_staged_upload(put.object_id)
+            .expect("remove upload stage");
 
         assert!(cached_store.get_staged_for_upload(put.object_id).is_none());
     }

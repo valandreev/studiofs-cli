@@ -237,8 +237,22 @@ impl StudioVfs {
                 }
             }
             cached_store.remove_hot_upload_batch(&object_ids);
-            cached_store.remove_staged_upload_batch(&object_ids);
-            local_payload_backend.remove_batch(&object_ids);
+            if let Err(error) = cached_store.remove_staged_upload_batch(&object_ids) {
+                warn!(
+                    ino,
+                    object_count = object_ids.len(),
+                    error = %error,
+                    "deferred deleted inode upload-stage cleanup failed"
+                );
+            }
+            if let Err(error) = local_payload_backend.remove_batch(&object_ids) {
+                warn!(
+                    ino,
+                    object_count = object_ids.len(),
+                    error = %error,
+                    "deferred deleted inode local payload cleanup failed"
+                );
+            }
             debug!(
                 "deferred deleted inode cache eviction: ino={} evicted {} blocks, forced_pinned={}",
                 ino,

@@ -1175,28 +1175,24 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         Ok(())
     }
 
-    fn mark_uploading(&self, object_id: u64) {
-        if let Err(error) = self.index.mark_uploading(object_id) {
-            warn!(object_id, error = ?error, "local payload runtime index mark_uploading failed");
-        }
+    fn mark_uploading(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        self.index
+            .mark_uploading(object_id)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
     }
 
-    fn mark_upload_failed(&self, object_id: u64) {
-        if let Err(error) = self.index.mark_upload_failed(object_id) {
-            warn!(
-                object_id,
-                error = ?error,
-                "local payload runtime index mark_upload_failed failed"
-            );
-        }
+    fn mark_upload_failed(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        self.index
+            .mark_upload_failed(object_id)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
     }
 
-    fn mark_uploaded(&self, object_id: u64) {
-        if let Err(error) = self.index.mark_uploaded(object_id) {
-            warn!(object_id, error = ?error, "local payload runtime index mark_uploaded failed");
-        } else {
-            self.note_storage_state_change();
-        }
+    fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        self.index
+            .mark_uploaded(object_id)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        self.note_storage_state_change();
+        Ok(())
     }
 
     fn pin(&self, object_id: u64) {
@@ -1249,30 +1245,25 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         }
     }
 
-    fn remove(&self, object_id: u64) {
-        if let Err(error) = self.index.remove(object_id) {
-            warn!(object_id, error = ?error, "local payload runtime index remove failed");
-            return;
-        }
+    fn remove(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        self.index
+            .remove(object_id)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
         self.forget_runtime_pins(&[object_id]);
         self.forget_access_touches(&[object_id]);
         self.payload_store.remove(object_id);
         self.note_storage_state_change();
+        Ok(())
     }
 
-    fn remove_batch(&self, object_ids: &[u64]) {
+    fn remove_batch(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
         if object_ids.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Err(error) = self.remove_batch_internal(object_ids) {
-            warn!(
-                count = object_ids.len(),
-                error = ?error,
-                "local payload runtime index remove_batch failed"
-            );
-            return;
-        }
+        self.remove_batch_internal(object_ids)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
         self.forget_runtime_pins(object_ids);
+        Ok(())
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
@@ -1670,7 +1661,7 @@ mod tests {
         .unwrap();
         backend.put(1, b"one", false).unwrap();
         backend.put(2, b"two", false).unwrap();
-        backend.mark_uploading(2);
+        backend.mark_uploading(2).unwrap();
         backend.sync_data().unwrap();
         drop(backend);
 
@@ -1716,7 +1707,7 @@ mod tests {
         })
         .unwrap();
         existing_backend.put(7, b"legacy-pending", false).unwrap();
-        existing_backend.mark_uploading(7);
+        existing_backend.mark_uploading(7).unwrap();
         existing_backend.sync_data().unwrap();
         drop(existing_backend);
 
@@ -1915,12 +1906,12 @@ mod tests {
         backend.put(2, b"two", false).unwrap();
 
         assert_eq!(backend.dirty_object_ids(), vec![1, 2]);
-        backend.mark_uploading(1);
+        backend.mark_uploading(1).unwrap();
         assert_eq!(
             backend.lifecycle_state(1),
             LocalPayloadLifecycleState::Uploading
         );
-        backend.mark_upload_failed(1);
+        backend.mark_upload_failed(1).unwrap();
 
         assert_eq!(
             backend.lifecycle_state(1),
@@ -2062,7 +2053,7 @@ mod tests {
         )
         .unwrap();
         backend.put(10, &[0xAA; 32], false).unwrap();
-        backend.mark_uploading(10);
+        backend.mark_uploading(10).unwrap();
 
         let current_after_evict = backend.index.stats().unwrap().current_bytes;
         let target_bytes = backend
@@ -2070,7 +2061,7 @@ mod tests {
             .target_before_insert(current_after_evict, 16)
             .expect("budget pressure should require eviction before insert");
 
-        backend.mark_uploaded(10);
+        backend.mark_uploaded(10).unwrap();
 
         let current_after_retry = backend
             .retry_non_evictable_put_after_upload_drain(target_bytes, 16, current_after_evict)
@@ -2102,8 +2093,8 @@ mod tests {
         .unwrap();
         backend.put(10, &[0xAA; 32], false).unwrap();
         backend.put(11, &[0xBB; 32], false).unwrap();
-        backend.mark_uploading(10);
-        backend.mark_uploading(11);
+        backend.mark_uploading(10).unwrap();
+        backend.mark_uploading(11).unwrap();
 
         let current_after_evict = backend.index.stats().unwrap().current_bytes;
         let target_bytes = backend
@@ -2111,7 +2102,7 @@ mod tests {
             .target_before_insert(current_after_evict, 32)
             .expect("budget pressure should require eviction before insert");
 
-        backend.mark_uploaded(10);
+        backend.mark_uploaded(10).unwrap();
 
         let current_after_retry = backend
             .retry_non_evictable_put_after_upload_drain(target_bytes, 32, current_after_evict)
@@ -2143,8 +2134,8 @@ mod tests {
         )
         .unwrap();
         backend.put(10, &[0xAA; 32], false).unwrap();
-        backend.mark_uploading(10);
-        backend.mark_uploaded(10);
+        backend.mark_uploading(10).unwrap();
+        backend.mark_uploaded(10).unwrap();
 
         let current_after_evict = backend.index.stats().unwrap().current_bytes;
         let target_bytes = backend
@@ -2179,9 +2170,9 @@ mod tests {
         .unwrap();
         backend.put(10, &[0xAA; 32], false).unwrap();
         backend.put(11, &[0xBB; 32], false).unwrap();
-        backend.mark_uploading(10);
-        backend.mark_uploading(11);
-        backend.mark_uploaded(10);
+        backend.mark_uploading(10).unwrap();
+        backend.mark_uploading(11).unwrap();
+        backend.mark_uploaded(10).unwrap();
 
         let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
         let wait_started = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -2196,7 +2187,7 @@ mod tests {
         let join = std::thread::spawn(move || {
             background_ready.wait();
             background_wait_started.wait();
-            background.mark_uploaded(11);
+            background.mark_uploaded(11).unwrap();
         });
         ready.wait();
 
@@ -2232,7 +2223,7 @@ mod tests {
         )
         .unwrap();
         backend.put(10, &[0xAA; 32], false).unwrap();
-        backend.mark_uploading(10);
+        backend.mark_uploading(10).unwrap();
         let err = backend.put(11, &[0xBB; 16], false).unwrap_err();
 
         assert!(matches!(
@@ -2263,14 +2254,14 @@ mod tests {
             backend
                 .put(object_id, &[object_id as u8; 16], false)
                 .unwrap();
-            backend.mark_uploading(object_id);
+            backend.mark_uploading(object_id).unwrap();
         }
 
         let background = std::sync::Arc::clone(&backend);
         let join = std::thread::spawn(move || {
             for object_id in 10..20 {
                 std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
-                background.mark_uploaded(object_id);
+                background.mark_uploaded(object_id).unwrap();
             }
         });
         let result = backend.put(99, &[0xDD; 160], false);

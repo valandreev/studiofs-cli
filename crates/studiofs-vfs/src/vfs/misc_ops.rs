@@ -1,5 +1,5 @@
 use super::{
-    AccessLevel, FileType, Ino, MetaError, ROOT_INO, StudioVfs, VfsError, VfsResult, debug,
+    AccessLevel, FileType, Ino, MetaError, ROOT_INO, StudioVfs, VfsError, VfsResult, debug, warn,
 };
 use std::collections::HashSet;
 
@@ -153,7 +153,15 @@ impl StudioVfs {
                 object_id, ino, block_index
             );
         } else {
-            self.local_payload_backend.remove(object_id);
+            if let Err(error) = self.local_payload_backend.remove(object_id) {
+                warn!(
+                    ino,
+                    block_index,
+                    object_id,
+                    error = %error,
+                    "immediate block cache eviction failed"
+                );
+            }
         }
     }
 }

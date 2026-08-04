@@ -1964,7 +1964,9 @@ fn mark_all_overlay_objects_uploaded(
         .expect("load overlay object ids");
     let pending_uploads = vfs.pending_uploads_snapshot();
     for object_id in &object_ids {
-        vfs.local_payload_backend().mark_uploaded(*object_id);
+        vfs.local_payload_backend()
+            .mark_uploaded(*object_id)
+            .expect("mark uploaded local payload");
         for pending in pending_uploads
             .iter()
             .filter(|pending| pending.object_id == *object_id)
@@ -3536,7 +3538,9 @@ fn startup_replay_removes_unreferenced_warm_payloads_and_stage_links() {
     vfs.local_payload_backend()
         .put(object_id, b"orphan-warm-payload", true)
         .expect("persist orphan warm payload");
-    vfs.local_payload_backend().mark_uploaded(object_id);
+    vfs.local_payload_backend()
+        .mark_uploaded(object_id)
+        .expect("mark uploaded local payload");
     vfs.local_payload_backend()
         .sync_data()
         .expect("sync orphan warm payload");
@@ -3698,7 +3702,9 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
     vfs.local_payload_backend()
         .put(951, b"uploaded", true)
         .expect("persist uploaded object");
-    vfs.local_payload_backend().mark_uploaded(951);
+    vfs.local_payload_backend()
+        .mark_uploaded(951)
+        .expect("mark uploaded local payload");
     meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_partial(950, 4096))
         .expect("persist local-only block");
     let uploaded = PayloadRef::new_partial(951, 4096);

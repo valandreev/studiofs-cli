@@ -655,11 +655,25 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.vfs
             .cached_store
             .remove_hot_upload_batch(&orphan_object_ids);
-        self.vfs
+        if let Err(error) = self
+            .vfs
             .cached_store
-            .remove_staged_upload_batch(&orphan_object_ids);
+            .remove_staged_upload_batch(&orphan_object_ids)
+        {
+            warn!(
+                object_count = orphan_object_ids.len(),
+                error = %error,
+                "startup replay orphan upload-stage cleanup failed"
+            );
+        }
         for object_id in &orphan_object_ids {
-            self.vfs.local_payload_backend.remove(*object_id);
+            if let Err(error) = self.vfs.local_payload_backend.remove(*object_id) {
+                warn!(
+                    object_id,
+                    error = %error,
+                    "startup replay orphan local payload cleanup failed"
+                );
+            }
         }
         {
             let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
@@ -709,10 +723,24 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.vfs
             .cached_store
             .remove_hot_upload_batch(&stale_object_ids);
-        self.vfs
+        if let Err(error) = self
+            .vfs
             .cached_store
-            .remove_staged_upload_batch(&stale_object_ids);
-        self.vfs.cached_store.remove_batch(&stale_object_ids);
+            .remove_staged_upload_batch(&stale_object_ids)
+        {
+            warn!(
+                object_count = stale_object_ids.len(),
+                error = %error,
+                "startup replay stale upload-stage cleanup failed"
+            );
+        }
+        if let Err(error) = self.vfs.cached_store.remove_batch(&stale_object_ids) {
+            warn!(
+                object_count = stale_object_ids.len(),
+                error = %error,
+                "startup replay stale local payload cleanup failed"
+            );
+        }
         {
             let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
             for object_id in &stale_object_ids {
@@ -1063,7 +1091,9 @@ mod tests {
         vfs.local_payload_backend()
             .put(object_id, payload, true)
             .expect("persist uploaded local payload");
-        vfs.local_payload_backend().mark_uploaded(object_id);
+        vfs.local_payload_backend()
+            .mark_uploaded(object_id)
+            .expect("mark uploaded local payload");
         vfs.local_payload_backend()
             .sync_data()
             .expect("sync uploaded local payload");
@@ -1133,7 +1163,9 @@ mod tests {
         vfs.local_payload_backend()
             .put(object_id, payload, true)
             .expect("persist uploaded local payload");
-        vfs.local_payload_backend().mark_uploaded(object_id);
+        vfs.local_payload_backend()
+            .mark_uploaded(object_id)
+            .expect("mark uploaded local payload");
         vfs.local_payload_backend()
             .sync_data()
             .expect("sync uploaded local payload");

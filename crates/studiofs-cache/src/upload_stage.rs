@@ -121,26 +121,23 @@ impl UploadStageStore {
 
     /// Removes the staged payload file for `object_id` if it exists.
     ///
-    /// Non-`NotFound` errors are logged as warnings and otherwise ignored.
-    pub fn remove(&self, object_id: u64) {
+    /// Returns an error for filesystem failures other than `NotFound`.
+    pub fn remove(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
         let path = self.layout.upload_stage_object_path(object_id);
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != io::ErrorKind::NotFound
         {
-            warn!(
-                object_id,
-                path = %path.display(),
-                error = ?error,
-                "upload stage remove failed"
-            );
+            return Err(error.into());
         }
+        Ok(())
     }
 
     /// Calls [`Self::remove`] for each object id in `object_ids`.
-    pub fn remove_batch(&self, object_ids: &[u64]) {
+    pub fn remove_batch(&self, object_ids: &[u64]) -> Result<(), UploadStageStoreError> {
         for &object_id in object_ids {
-            self.remove(object_id);
+            self.remove(object_id)?;
         }
+        Ok(())
     }
 }
 
@@ -163,7 +160,7 @@ mod tests {
         assert!(store.contains(0x42));
         assert_eq!(store.get(0x42).unwrap().as_ref(), b"payload");
 
-        store.remove(0x42);
+        store.remove(0x42).expect("remove upload stage");
         assert!(!store.contains(0x42));
         assert!(store.get(0x42).is_none());
         assert!(!layout.upload_stage_object_path(0x42).exists());
