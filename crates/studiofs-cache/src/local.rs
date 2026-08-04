@@ -157,11 +157,17 @@ pub trait LocalPayloadBackend: Send + Sync {
     fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError>;
 
     /// Marks `object_id` as currently being uploaded.
-    fn mark_uploading(&self, object_id: u64);
+    ///
+    /// Returns an error if the durable lifecycle transition cannot be committed.
+    fn mark_uploading(&self, object_id: u64) -> Result<(), LocalPayloadBackendError>;
     /// Marks the upload attempt for `object_id` as failed (payload remains dirty).
-    fn mark_upload_failed(&self, object_id: u64);
+    ///
+    /// Returns an error if the durable lifecycle transition cannot be committed.
+    fn mark_upload_failed(&self, object_id: u64) -> Result<(), LocalPayloadBackendError>;
     /// Marks `object_id` as uploaded (no longer dirty).
-    fn mark_uploaded(&self, object_id: u64);
+    ///
+    /// Returns an error if the durable lifecycle transition cannot be committed.
+    fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError>;
 
     /// Pins `object_id` to prevent eviction.
     fn pin(&self, object_id: u64);
@@ -183,9 +189,13 @@ pub trait LocalPayloadBackend: Send + Sync {
     }
 
     /// Removes `object_id` from the backend.
-    fn remove(&self, object_id: u64);
+    ///
+    /// Returns an error if the durable lifecycle removal cannot be committed.
+    fn remove(&self, object_id: u64) -> Result<(), LocalPayloadBackendError>;
     /// Removes all payload objects listed in `object_ids` from the backend.
-    fn remove_batch(&self, object_ids: &[u64]);
+    ///
+    /// Returns an error if the durable lifecycle removal cannot be committed.
+    fn remove_batch(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError>;
 
     /// Returns the ordered snapshot of dirty payload object ids.
     fn dirty_object_ids(&self) -> Vec<u64>;
@@ -269,7 +279,7 @@ pub(crate) mod contract_tests {
         );
         assert_eq!(backend.dirty_object_ids(), vec![object_id]);
 
-        backend.mark_uploading(object_id);
+        backend.mark_uploading(object_id).unwrap();
         assert_eq!(
             backend.lifecycle_state(object_id),
             LocalPayloadLifecycleState::Uploading
@@ -281,15 +291,15 @@ pub(crate) mod contract_tests {
             "upload reread must return persisted bytes"
         );
 
-        backend.mark_upload_failed(object_id);
+        backend.mark_upload_failed(object_id).unwrap();
         assert_eq!(
             backend.lifecycle_state(object_id),
             LocalPayloadLifecycleState::Dirty
         );
         assert_eq!(backend.dirty_object_ids(), vec![object_id]);
 
-        backend.mark_uploading(object_id);
-        backend.mark_uploaded(object_id);
+        backend.mark_uploading(object_id).unwrap();
+        backend.mark_uploaded(object_id).unwrap();
         assert_eq!(
             backend.lifecycle_state(object_id),
             LocalPayloadLifecycleState::Uploaded
@@ -334,14 +344,14 @@ pub(crate) mod contract_tests {
         backend.put(11, b"y", false).unwrap();
         backend.sync_data().unwrap();
 
-        backend.remove(10);
+        backend.remove(10).unwrap();
         assert_eq!(
             backend.lifecycle_state(10),
             LocalPayloadLifecycleState::Missing
         );
         assert!(!backend.contains(10));
 
-        backend.remove_batch(&[11, 12]);
+        backend.remove_batch(&[11, 12]).unwrap();
         assert_eq!(
             backend.lifecycle_state(11),
             LocalPayloadLifecycleState::Missing

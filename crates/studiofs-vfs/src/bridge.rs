@@ -1,5 +1,7 @@
 use std::io::ErrorKind;
 
+use studiofs_cache::local::LocalPayloadBackendError;
+use studiofs_cache::upload_stage::UploadStageStoreError;
 use studiofs_data::store::DataError;
 use studiofs_meta::{InodeAttr, MetaError};
 
@@ -60,10 +62,24 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         VfsError::Io(io_error) => classify_io_error(io_error.kind()),
         VfsError::Join(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
         VfsError::Object(_) | VfsError::BlockNotFound(_, _) => BridgeVfsErrorKind::DataCorruption,
+        VfsError::LocalPayload(local_error) => classify_local_payload_error(local_error),
+        VfsError::UploadStage(UploadStageStoreError::Io(io_error)) => {
+            classify_io_error(io_error.kind())
+        }
         VfsError::WouldBlock | VfsError::RemoteContentPending => BridgeVfsErrorKind::Retryable,
         VfsError::InvalidName(_) => BridgeVfsErrorKind::InvalidInput,
         VfsError::Fetch(fetch_error) => classify_fetch_error(fetch_error),
         _ => BridgeVfsErrorKind::GenericFailure,
+    }
+}
+
+fn classify_local_payload_error(error: &LocalPayloadBackendError) -> BridgeVfsErrorKind {
+    match error {
+        LocalPayloadBackendError::Io(io_error) => classify_io_error(io_error.kind()),
+        LocalPayloadBackendError::CapacityExhausted { .. } => {
+            BridgeVfsErrorKind::InsufficientResources
+        }
+        LocalPayloadBackendError::Other(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
     }
 }
 
@@ -130,11 +146,14 @@ fn clamp_unix_nanos(nanos: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::ErrorKind,
         panic,
         sync::{Mutex, OnceLock},
     };
 
     use super::{BridgeAttrTimes, BridgeVfsErrorKind, classify_vfs_error, normalize_attr_times};
+    use studiofs_cache::local::LocalPayloadBackendError;
+    use studiofs_cache::upload_stage::UploadStageStoreError;
     use studiofs_data::{crypto::CryptoError, object::ObjectError, store::DataError};
     use studiofs_meta::{AccessLevel, EncryptionContractError, InodeAttr, MetaError};
 
@@ -308,6 +327,32 @@ mod tests {
         assert_eq!(
             classify_vfs_error(&join),
             BridgeVfsErrorKind::CriticalRuntimeFailure
+        );
+
+        let local_permission_denied = crate::VfsError::LocalPayload(LocalPayloadBackendError::Io(
+            std::io::Error::from(ErrorKind::PermissionDenied),
+        ));
+        assert_eq!(
+            classify_vfs_error(&local_permission_denied),
+            BridgeVfsErrorKind::PermissionDenied
+        );
+
+        let local_capacity =
+            crate::VfsError::LocalPayload(LocalPayloadBackendError::CapacityExhausted {
+                needed: 4,
+                free: 0,
+            });
+        assert_eq!(
+            classify_vfs_error(&local_capacity),
+            BridgeVfsErrorKind::InsufficientResources
+        );
+
+        let stage_timeout = crate::VfsError::UploadStage(UploadStageStoreError::Io(
+            std::io::Error::from(ErrorKind::TimedOut),
+        ));
+        assert_eq!(
+            classify_vfs_error(&stage_timeout),
+            BridgeVfsErrorKind::TimedOut
         );
     }
 

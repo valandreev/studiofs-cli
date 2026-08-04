@@ -1765,7 +1765,10 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .expect("writer local payload cache should retain plaintext bytes");
     assert_eq!(local_plaintext.as_ref(), payload);
 
-    writer_vfs.local_payload_backend().remove(object_id);
+    writer_vfs
+        .local_payload_backend()
+        .remove(object_id)
+        .expect("remove local payload before remote fetch");
     assert!(
         !writer_vfs.local_payload_backend().contains(object_id),
         "test setup should clear local plaintext cache before remote fetch"
@@ -1794,7 +1797,10 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .write(&remote_key, Bytes::from(tampered))
         .await
         .unwrap();
-    writer_vfs.local_payload_backend().remove(object_id);
+    writer_vfs
+        .local_payload_backend()
+        .remove(object_id)
+        .expect("remove local payload before tampered read");
     assert!(
         writer_vfs
             .read(attr.ino, 0, payload.len() as u32)
@@ -1808,7 +1814,10 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .write(&remote_key, remote_ciphertext.clone())
         .await
         .unwrap();
-    writer_vfs.local_payload_backend().remove(object_id);
+    writer_vfs
+        .local_payload_backend()
+        .remove(object_id)
+        .expect("remove local payload before restored read");
     assert_eq!(
         writer_vfs
             .read(attr.ino, 0, payload.len() as u32)
@@ -1853,7 +1862,10 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .write(&remote_key, swapped_ciphertext)
         .await
         .unwrap();
-    writer_vfs.local_payload_backend().remove(object_id);
+    writer_vfs
+        .local_payload_backend()
+        .remove(object_id)
+        .expect("remove local payload before swapped-key read");
     assert!(
         writer_vfs
             .read(attr.ino, 0, payload.len() as u32)
@@ -1867,7 +1879,10 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .write(&remote_key, remote_ciphertext)
         .await
         .unwrap();
-    writer_vfs.local_payload_backend().remove(object_id);
+    writer_vfs
+        .local_payload_backend()
+        .remove(object_id)
+        .expect("remove local payload before reader fetch");
 
     let reader_meta = Arc::new(RedbMetaEngine::open(&reader_db).unwrap());
     reader_meta.init_root(0, 0).unwrap();

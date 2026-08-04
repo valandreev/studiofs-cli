@@ -2245,16 +2245,25 @@ mod tests {
             self.inner.run_pressure_maintenance()
         }
 
-        fn mark_uploading(&self, object_id: u64) {
-            self.inner.mark_uploading(object_id);
+        fn mark_uploading(
+            &self,
+            object_id: u64,
+        ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
+            self.inner.mark_uploading(object_id)
         }
 
-        fn mark_upload_failed(&self, object_id: u64) {
-            self.inner.mark_upload_failed(object_id);
+        fn mark_upload_failed(
+            &self,
+            object_id: u64,
+        ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
+            self.inner.mark_upload_failed(object_id)
         }
 
-        fn mark_uploaded(&self, object_id: u64) {
-            self.inner.mark_uploaded(object_id);
+        fn mark_uploaded(
+            &self,
+            object_id: u64,
+        ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
+            self.inner.mark_uploaded(object_id)
         }
 
         fn pin(&self, object_id: u64) {
@@ -2273,12 +2282,18 @@ mod tests {
             self.inner.unpin_batch(object_ids);
         }
 
-        fn remove(&self, object_id: u64) {
-            self.inner.remove(object_id);
+        fn remove(
+            &self,
+            object_id: u64,
+        ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
+            self.inner.remove(object_id)
         }
 
-        fn remove_batch(&self, object_ids: &[u64]) {
-            self.inner.remove_batch(object_ids);
+        fn remove_batch(
+            &self,
+            object_ids: &[u64],
+        ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
+            self.inner.remove_batch(object_ids)
         }
 
         fn dirty_object_ids(&self) -> Vec<u64> {
@@ -2470,7 +2485,9 @@ mod tests {
             .get_regular_file_overlay_object_ids(ino)
             .expect("load overlay object ids");
         for object_id in &object_ids {
-            vfs.local_payload_backend().mark_uploaded(*object_id);
+            vfs.local_payload_backend()
+                .mark_uploaded(*object_id)
+                .expect("mark local payload uploaded");
             assert!(
                 meta.mark_regular_file_overlay_object_uploaded_if_matches(
                     ino,

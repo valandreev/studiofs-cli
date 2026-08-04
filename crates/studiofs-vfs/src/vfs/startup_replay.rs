@@ -639,44 +639,59 @@ impl<'a> StartupReplayCoordinator<'a> {
         if self.dirty_set.is_empty() {
             return;
         }
-        let orphan_count = self.dirty_set.len() as u64;
-        self.orphan_dirty_payloads_removed = self
-            .orphan_dirty_payloads_removed
-            .saturating_add(orphan_count);
         let orphan_object_ids: Vec<_> = self.dirty_set.iter().copied().collect();
-        self.removed_orphan_dirty_object_ids
-            .extend(orphan_object_ids.iter().copied());
+        let mut removed_count = 0_u64;
         for object_id in &orphan_object_ids {
             warn!(
                 object_id,
                 "removing orphan dirty payload object without metadata reference"
             );
-        }
-        self.vfs
-            .cached_store
-            .remove_hot_upload_batch(&orphan_object_ids);
-        self.vfs
-            .cached_store
-            .remove_staged_upload_batch(&orphan_object_ids);
-        for object_id in &orphan_object_ids {
-            self.vfs.local_payload_backend.remove(*object_id);
-        }
-        {
-            let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
-            for object_id in &orphan_object_ids {
-                pending_evictions.remove(object_id);
+            if self.remove_startup_local_payload(*object_id) {
+                self.removed_orphan_dirty_object_ids.insert(*object_id);
+                removed_count = removed_count.saturating_add(1);
             }
         }
+        self.orphan_dirty_payloads_removed = self
+            .orphan_dirty_payloads_removed
+            .saturating_add(removed_count);
         self.vfs
             .state
             .upload
             .upload_canceled_stale
-            .fetch_add(orphan_count, Ordering::Relaxed);
+            .fetch_add(removed_count, Ordering::Relaxed);
         info!(
-            orphan_dirty_payloads = orphan_object_ids.len(),
+            orphan_dirty_payloads = removed_count,
             "startup cleanup removed orphan dirty local backend entries"
         );
-        self.dirty_set.clear();
+        self.dirty_set
+            .retain(|object_id| !self.removed_orphan_dirty_object_ids.contains(object_id));
+    }
+
+    fn remove_startup_local_payload(&self, object_id: u64) -> bool {
+        if let Err(error) = self.vfs.cached_store.remove_staged_upload(object_id) {
+            warn!(
+                object_id,
+                error = %error,
+                "startup replay upload-stage cleanup failed"
+            );
+            return false;
+        }
+        if let Err(error) = self.vfs.local_payload_backend.remove(object_id) {
+            warn!(
+                object_id,
+                error = %error,
+                "startup replay local payload cleanup failed"
+            );
+            return false;
+        }
+        self.vfs.cached_store.remove_hot_upload(object_id);
+        self.vfs
+            .state
+            .upload
+            .pending_evictions
+            .lock()
+            .remove(&object_id);
+        true
     }
 
     fn cleanup_unreferenced_local_payloads(
@@ -706,31 +721,23 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
 
-        self.vfs
-            .cached_store
-            .remove_hot_upload_batch(&stale_object_ids);
-        self.vfs
-            .cached_store
-            .remove_staged_upload_batch(&stale_object_ids);
-        self.vfs.cached_store.remove_batch(&stale_object_ids);
-        {
-            let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
-            for object_id in &stale_object_ids {
-                pending_evictions.remove(object_id);
+        let mut removed_count = 0_u64;
+        for object_id in &stale_object_ids {
+            if self.remove_startup_local_payload(*object_id) {
+                removed_count = removed_count.saturating_add(1);
             }
         }
 
-        let stale_count = stale_object_ids.len() as u64;
         self.unreferenced_local_payloads_removed = self
             .unreferenced_local_payloads_removed
-            .saturating_add(stale_count);
+            .saturating_add(removed_count);
         self.vfs
             .state
             .upload
             .upload_canceled_stale
-            .fetch_add(stale_count, Ordering::Relaxed);
+            .fetch_add(removed_count, Ordering::Relaxed);
         info!(
-            unreferenced_payloads = stale_object_ids.len(),
+            unreferenced_payloads = removed_count,
             "startup cleanup removed local payload objects without metadata references"
         );
     }
@@ -1063,7 +1070,9 @@ mod tests {
         vfs.local_payload_backend()
             .put(object_id, payload, true)
             .expect("persist uploaded local payload");
-        vfs.local_payload_backend().mark_uploaded(object_id);
+        vfs.local_payload_backend()
+            .mark_uploaded(object_id)
+            .expect("mark uploaded local payload");
         vfs.local_payload_backend()
             .sync_data()
             .expect("sync uploaded local payload");
@@ -1133,7 +1142,9 @@ mod tests {
         vfs.local_payload_backend()
             .put(object_id, payload, true)
             .expect("persist uploaded local payload");
-        vfs.local_payload_backend().mark_uploaded(object_id);
+        vfs.local_payload_backend()
+            .mark_uploaded(object_id)
+            .expect("mark uploaded local payload");
         vfs.local_payload_backend()
             .sync_data()
             .expect("sync uploaded local payload");

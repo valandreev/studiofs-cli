@@ -193,6 +193,8 @@ pub struct CacheIndex {
     db_path: PathBuf,
     db: Arc<Database>,
     last_touch_access_shards: [Mutex<LruCache<u64, Instant>>; TOUCH_ACCESS_LRU_SHARDS],
+    #[cfg(test)]
+    fail_next_write: std::sync::atomic::AtomicBool,
 }
 
 fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
@@ -229,6 +231,8 @@ impl CacheIndex {
             last_touch_access_shards: array::from_fn(|_| {
                 Mutex::new(LruCache::new(touch_access_lru_cap()))
             }),
+            #[cfg(test)]
+            fail_next_write: std::sync::atomic::AtomicBool::new(false),
         };
         index.initialize_schema()?;
         Ok(index)
@@ -474,6 +478,7 @@ impl CacheIndex {
 
     /// Mark a dirty object as uploading.
     pub fn mark_uploading(&self, object_id: u64) -> Result<(), CacheIndexError> {
+        self.maybe_fail_write_for_test()?;
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
             let mut payloads = txn
@@ -515,6 +520,7 @@ impl CacheIndex {
 
     /// Mark a previously uploading object as upload-failed / pending (dirty).
     pub fn mark_upload_failed(&self, object_id: u64) -> Result<(), CacheIndexError> {
+        self.maybe_fail_write_for_test()?;
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
             let mut payloads = txn
@@ -554,6 +560,7 @@ impl CacheIndex {
 
     /// Mark an object as uploaded and eligible for eviction.
     pub fn mark_uploaded(&self, object_id: u64) -> Result<(), CacheIndexError> {
+        self.maybe_fail_write_for_test()?;
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
             let mut payloads = txn
@@ -589,6 +596,7 @@ impl CacheIndex {
 
     /// Remove a single object id from the index.
     pub fn remove(&self, object_id: u64) -> Result<(), CacheIndexError> {
+        self.maybe_fail_write_for_test()?;
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
             let mut payloads = txn
@@ -620,6 +628,7 @@ impl CacheIndex {
 
     /// Remove many objects in a single write transaction.
     pub fn remove_batch(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
+        self.maybe_fail_write_for_test()?;
         if object_ids.is_empty() {
             return Ok(());
         }
@@ -939,6 +948,23 @@ impl CacheIndex {
 }
 
 impl CacheIndex {
+    fn maybe_fail_write_for_test(&self) -> Result<(), CacheIndexError> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(CacheIndexError::Storage(RedbError::DatabaseClosed));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_for_test(&self) {
+        self.fail_next_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn mark_touch_due(&self, object_id: u64, now: Instant, min_interval: Duration) -> bool {
         let mut gate = self.last_touch_access_shards[touch_access_lru_shard(object_id)].lock();
         if let Some(last) = gate.get(&object_id)

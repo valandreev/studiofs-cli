@@ -121,26 +121,26 @@ impl UploadStageStore {
 
     /// Removes the staged payload file for `object_id` if it exists.
     ///
-    /// Non-`NotFound` errors are logged as warnings and otherwise ignored.
-    pub fn remove(&self, object_id: u64) {
+    /// Returns an error for filesystem failures other than `NotFound`.
+    pub fn remove(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
         let path = self.layout.upload_stage_object_path(object_id);
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != io::ErrorKind::NotFound
         {
-            warn!(
-                object_id,
-                path = %path.display(),
-                error = ?error,
-                "upload stage remove failed"
-            );
+            return Err(error.into());
         }
+        Ok(())
     }
 
     /// Calls [`Self::remove`] for each object id in `object_ids`.
-    pub fn remove_batch(&self, object_ids: &[u64]) {
+    pub fn remove_batch(&self, object_ids: &[u64]) -> Result<(), UploadStageStoreError> {
+        let mut first_error = None;
         for &object_id in object_ids {
-            self.remove(object_id);
+            if let Err(error) = self.remove(object_id) {
+                first_error.get_or_insert(error);
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -163,7 +163,7 @@ mod tests {
         assert!(store.contains(0x42));
         assert_eq!(store.get(0x42).unwrap().as_ref(), b"payload");
 
-        store.remove(0x42);
+        store.remove(0x42).expect("remove upload stage");
         assert!(!store.contains(0x42));
         assert!(store.get(0x42).is_none());
         assert!(!layout.upload_stage_object_path(0x42).exists());
@@ -190,5 +190,23 @@ mod tests {
 
         assert!(store.contains(0x99));
         assert_eq!(store.get(0x99).unwrap().as_ref(), b"payload");
+    }
+
+    #[test]
+    fn upload_stage_remove_batch_attempts_all_objects_after_an_error() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path());
+        layout.provision().expect("provision");
+        let payload_store = FilePayloadStore::open(layout.clone()).expect("open payload store");
+        let store = UploadStageStore::open(layout.clone()).expect("open upload stage");
+
+        payload_store.put(0x02, b"payload").expect("put payload");
+        store.link_payload(0x02).expect("link payload");
+        std::fs::create_dir_all(layout.upload_stage_object_path(0x01))
+            .expect("create failing stage path");
+
+        assert!(store.remove_batch(&[0x01, 0x02]).is_err());
+        assert!(layout.upload_stage_object_path(0x01).exists());
+        assert!(!layout.upload_stage_object_path(0x02).exists());
     }
 }

@@ -601,8 +601,8 @@ mod tests {
         backend.put(11, b"dirty", false).unwrap();
         backend.put(22, b"uploaded", true).unwrap();
         backend.sync_data().unwrap();
-        backend.mark_uploading(22);
-        backend.mark_uploaded(22);
+        backend.mark_uploading(22).unwrap();
+        backend.mark_uploaded(22).unwrap();
         drop(backend);
 
         let (inspected_path, detection, local_cache_state) =
