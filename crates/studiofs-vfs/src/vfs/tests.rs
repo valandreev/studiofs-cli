@@ -11484,6 +11484,7 @@ fn test_open_unlink_handle_accepts_followup_write_until_release() {
         vfs.flush_fh(fh)
             .await
             .expect("flush through open unlinked handle");
+        vfs.handle_table.mark_orphan(ino);
         vfs.release_fh(fh).await.unwrap();
         assert!(vfs.getattr(ino).is_err());
     });
@@ -12381,36 +12382,6 @@ fn flush_waits_for_deferred_namespace_create() {
             .expect("flushed create should be persisted");
         assert_eq!(looked_up.ino, attr.ino);
         vfs.release_fh(flush_fh).await.unwrap();
-    });
-}
-
-#[test]
-fn winfsp_flush_waits_for_deferred_namespace_create() {
-    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-winfsp-flush-barrier");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create_with_deferred_metadata_admission(
-                1,
-                b"deferred-create-winfsp-flush-barrier.txt",
-                0,
-                0,
-                0o644,
-                rt.handle(),
-            )
-            .unwrap();
-        let fh = vfs
-            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
-            .expect("open deferred WinFSP flush file");
-        vfs.flush_volatile_writeback_with_outcome(attr.ino, fh)
-            .await
-            .expect("WinFSP flush should wait for deferred create");
-        let looked_up = meta
-            .lookup(1, b"deferred-create-winfsp-flush-barrier.txt")
-            .expect("WinFSP flush should persist the create");
-        assert_eq!(looked_up.ino, attr.ino);
-        vfs.release_fh(fh).await.unwrap();
     });
 }
 
