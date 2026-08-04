@@ -717,10 +717,8 @@ impl Session {
     }
 
     /// Request session loop shutdown.
-    ///
-    /// Returns `false` when the session has already started closing.
-    pub fn request_exit(&self) -> bool {
-        self.control.request_exit()
+    pub fn request_exit(&self) {
+        self.control.request_exit();
     }
 
     /// Build a thread-safe handle that can request session loop shutdown.
