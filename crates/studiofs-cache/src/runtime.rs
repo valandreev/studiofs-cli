@@ -291,6 +291,8 @@ pub struct LocalPayloadBackendRuntime {
     storage_state_changed: Condvar,
     low_space_progress_waits: AtomicU64,
     low_space_exhausted_waits: AtomicU64,
+    #[cfg(test)]
+    low_space_wait_started: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
 }
 
 struct DirtyValidationGuard<'a> {
@@ -419,6 +421,8 @@ impl LocalPayloadBackendRuntime {
             storage_state_changed: Condvar::new(),
             low_space_progress_waits: AtomicU64::new(0),
             low_space_exhausted_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            low_space_wait_started: Mutex::new(None),
         })
     }
 
@@ -539,6 +543,10 @@ impl LocalPayloadBackendRuntime {
         let mut epoch = self.storage_state_epoch.lock();
         if *epoch != observed_epoch {
             return true;
+        }
+        #[cfg(test)]
+        if let Some(wait_started) = self.low_space_wait_started.lock().take() {
+            wait_started.wait();
         }
         self.storage_state_changed
             .wait_for(&mut epoch, LOW_SPACE_UPLOAD_DRAIN_WAIT);
@@ -2161,16 +2169,14 @@ mod tests {
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = std::sync::Arc::new(
-            LocalPayloadBackendRuntime::open_with_budget(
-                LocalPayloadBackendConfig {
-                    cache_root: temp.path().to_path_buf(),
-                    volume_uuid: [0x84; 16],
-                },
-                Some(64),
-            )
-            .unwrap(),
-        );
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x84; 16],
+            },
+            Some(64),
+        )
+        .unwrap();
         backend.put(10, &[0xAA; 32], false).unwrap();
         backend.put(11, &[0xBB; 32], false).unwrap();
         backend.mark_uploading(10);
@@ -2178,11 +2184,18 @@ mod tests {
         backend.mark_uploaded(10);
 
         let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let wait_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        backend
+            .low_space_wait_started
+            .lock()
+            .replace(std::sync::Arc::clone(&wait_started));
+        let backend = std::sync::Arc::new(backend);
         let background = std::sync::Arc::clone(&backend);
         let background_ready = std::sync::Arc::clone(&ready);
+        let background_wait_started = std::sync::Arc::clone(&wait_started);
         let join = std::thread::spawn(move || {
             background_ready.wait();
-            std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT * 2);
+            background_wait_started.wait();
             background.mark_uploaded(11);
         });
         ready.wait();
