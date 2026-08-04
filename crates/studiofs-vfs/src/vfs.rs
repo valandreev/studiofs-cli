@@ -168,11 +168,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalPayloadBackendError;
 use studiofs_cache::PreparedLocalPayloadRuntime;
-use studiofs_cache::local::{LocalPayloadBackend, LocalPayloadLifecycleState, LocalPayloadPut};
+use studiofs_cache::local::{
+    LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState, LocalPayloadPut,
+};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
 use studiofs_cache::open_local_payload_backend_with_budget_sync_and_write_mode;
 use studiofs_cache::open_prepared_local_payload_backend_with_budget_sync_and_write_mode;
 use studiofs_cache::upload_queue::PendingUpload;
+use studiofs_cache::upload_stage::UploadStageStoreError;
 use studiofs_cache::{CachedStore, CachedStoreConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
@@ -590,6 +593,14 @@ pub enum VfsError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Local payload lifecycle or storage operation failed.
+    #[error("local payload error: {0}")]
+    LocalPayload(#[from] LocalPayloadBackendError),
+
+    /// Upload-stage filesystem operation failed.
+    #[error("upload stage error: {0}")]
+    UploadStage(#[from] UploadStageStoreError),
 
     /// Generic fallback VFS error.
     #[error("{0}")]
@@ -5812,7 +5823,7 @@ impl StudioVfs {
         let ((), timing) = run_local_cache_io_blocking(move || {
             cached_store
                 .link_upload_stage_batch(&object_ids)
-                .map_err(std::io::Error::other)?;
+                .map_err(VfsError::UploadStage)?;
             Ok(())
         })
         .await?;
@@ -5823,9 +5834,9 @@ impl StudioVfs {
     async fn payload_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
         let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.run_pressure_maintenance().map_err(|error| {
-                VfsError::Other(format!("payload backend maintenance failed: {error}"))
-            })
+            payload_store
+                .run_pressure_maintenance()
+                .map_err(VfsError::LocalPayload)
         })
         .await?;
         let _ = timing;
@@ -5843,7 +5854,7 @@ impl StudioVfs {
         let ((), timing) = run_local_cache_io_blocking(move || {
             payload_store
                 .put(object_id, data.as_ref(), evictable)
-                .map_err(|error| VfsError::Other(format!("payload store put failed: {error}")))
+                .map_err(VfsError::LocalPayload)
         })
         .await?;
         self.record_local_cache_io_timing(timing);
@@ -5856,9 +5867,9 @@ impl StudioVfs {
         }
         let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.put_batch(&entries).map_err(|error| {
-                VfsError::Other(format!("payload store batch put failed: {error}"))
-            })
+            payload_store
+                .put_batch(&entries)
+                .map_err(VfsError::LocalPayload)
         })
         .await?;
         self.record_local_cache_io_timing(timing);
@@ -5965,9 +5976,7 @@ impl StudioVfs {
         let payload_store = self.local_payload_backend.clone();
         let started = Instant::now();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.sync_data().map_err(|error| {
-                VfsError::Other(format!("payload backend sync_data failed: {error}"))
-            })
+            payload_store.sync_data().map_err(VfsError::LocalPayload)
         })
         .await?;
         let _ = timing;
@@ -5987,9 +5996,9 @@ impl StudioVfs {
     async fn payload_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
         let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.mark_uploaded(object_id).map_err(|error| {
-                VfsError::Other(format!("mark payload uploaded failed: {error}"))
-            })?;
+            payload_store
+                .mark_uploaded(object_id)
+                .map_err(VfsError::LocalPayload)?;
             Ok(())
         })
         .await?;
@@ -6002,7 +6011,7 @@ impl StudioVfs {
         let ((), timing) = run_local_cache_io_blocking(move || {
             payload_store
                 .remove(object_id)
-                .map_err(|error| VfsError::Other(format!("remove payload failed: {error}")))?;
+                .map_err(VfsError::LocalPayload)?;
             Ok(())
         })
         .await?;
@@ -6017,9 +6026,9 @@ impl StudioVfs {
         let payload_store = self.local_payload_backend.clone();
         let object_ids = object_ids.to_vec();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            payload_store.remove_batch(&object_ids).map_err(|error| {
-                VfsError::Other(format!("remove payload batch failed: {error}"))
-            })?;
+            payload_store
+                .remove_batch(&object_ids)
+                .map_err(VfsError::LocalPayload)?;
             Ok(())
         })
         .await?;
@@ -6032,7 +6041,7 @@ impl StudioVfs {
         let ((), timing) = run_local_cache_io_blocking(move || {
             cached_store
                 .remove_staged_upload(object_id)
-                .map_err(|error| VfsError::Other(format!("remove upload stage failed: {error}")))?;
+                .map_err(VfsError::UploadStage)?;
             Ok(())
         })
         .await?;
@@ -6053,9 +6062,7 @@ impl StudioVfs {
         let ((), timing) = run_local_cache_io_blocking(move || {
             cached_store
                 .remove_staged_upload_batch(&object_ids)
-                .map_err(|error| {
-                    VfsError::Other(format!("remove upload stage batch failed: {error}"))
-                })?;
+                .map_err(VfsError::UploadStage)?;
             Ok(())
         })
         .await?;

@@ -3530,6 +3530,53 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
 }
 
 #[test]
+fn startup_replay_retains_orphan_when_stage_cleanup_fails() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-stage-failure");
+    let object_id = 991_339;
+
+    vfs.local_payload_backend()
+        .put(object_id, b"orphan-dirty-payload", false)
+        .expect("persist orphan dirty payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync orphan dirty payload");
+    vfs.state.upload.pending_evictions.lock().insert(object_id);
+
+    let layout = studiofs_cache::LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
+    std::fs::create_dir_all(layout.upload_stage_object_path(object_id))
+        .expect("seed failing upload-stage path");
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
+
+    assert!(vfs.local_payload_backend().contains(object_id));
+    assert!(
+        vfs.local_payload_backend()
+            .dirty_object_ids()
+            .contains(&object_id)
+    );
+    assert!(
+        vfs.state
+            .upload
+            .pending_evictions
+            .lock()
+            .contains(&object_id)
+    );
+    assert_eq!(
+        vfs.state
+            .upload
+            .upload_canceled_stale
+            .load(Ordering::Relaxed),
+        0
+    );
+    let summary = vfs
+        .zeroio_runtime_snapshot()
+        .startup_replay
+        .expect("startup replay summary should be visible");
+    assert_eq!(summary.orphan_dirty_payloads_removed, 0);
+}
+
+#[test]
 fn startup_replay_removes_unreferenced_warm_payloads_and_stage_links() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-warm-cache-cleanup");

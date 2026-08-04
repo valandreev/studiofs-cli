@@ -314,6 +314,11 @@ impl Drop for LocalPayloadBackendRuntime {
 }
 
 impl LocalPayloadBackendRuntime {
+    #[cfg(test)]
+    fn fail_next_index_write_for_test(&self) {
+        self.index.fail_next_write_for_test();
+    }
+
     /// Opens the local payload backend with default settings.
     pub fn open(config: LocalPayloadBackendConfig) -> Result<Self, LocalPayloadBackendOpenError> {
         Self::open_with_budget_and_sync_mode(config, None, LocalPayloadSyncMode::Durable)
@@ -1927,6 +1932,40 @@ mod tests {
             vec![2, 1],
             "failed uploads should be requeued to the back of dirty order"
         );
+    }
+
+    #[test]
+    fn local_backend_index_transition_failure_survives_reopen_and_replay() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let config = LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x56; 16],
+        };
+
+        let backend = LocalPayloadBackendRuntime::open(config.clone()).unwrap();
+        backend.put(1, b"one", false).unwrap();
+        backend.mark_uploading(1).unwrap();
+        backend.sync_data().unwrap();
+        backend.fail_next_index_write_for_test();
+        assert!(backend.mark_uploaded(1).is_err());
+        drop(backend);
+
+        let backend = LocalPayloadBackendRuntime::open(config.clone()).unwrap();
+        assert_eq!(
+            backend.lifecycle_state(1),
+            LocalPayloadLifecycleState::Uploading
+        );
+        backend.mark_upload_failed(1).unwrap();
+        drop(backend);
+
+        let reopened = LocalPayloadBackendRuntime::open(config).unwrap();
+        assert_eq!(
+            reopened.lifecycle_state(1),
+            LocalPayloadLifecycleState::Dirty
+        );
+        assert_eq!(reopened.get_for_upload(1).unwrap().as_ref(), b"one");
     }
 
     #[test]
