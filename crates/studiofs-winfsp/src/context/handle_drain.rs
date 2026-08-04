@@ -357,12 +357,6 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
         self.context.vfs.inode_has_local_dirty_state(ino)
     }
 
-    fn should_run_explicit_flush(&self, request: HandleDrainRequest) -> bool {
-        // WinFSP FlushFileBuffers is a strict file-handle barrier even when a
-        // background drain cleared the inode dirty bit before this callback.
-        request.fh != 0 || self.inode_has_local_dirty_state(request.ino)
-    }
-
     fn explicit_flush(
         &self,
         request: HandleDrainRequest,
