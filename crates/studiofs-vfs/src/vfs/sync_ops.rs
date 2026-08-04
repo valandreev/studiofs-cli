@@ -178,7 +178,7 @@ impl StudioVfs {
 
     fn should_linger_deferred_tail_materialization(&self, ino: Ino) -> bool {
         !self.shutdown_requested()
-            && self.handle_table.open_count(ino) > 0
+            && self.handle_table.write_open_count(ino) > 0
             && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0
     }
 
@@ -489,6 +489,33 @@ impl StudioVfs {
                     || limits_materialized
                     || dirty_after < dirty_before
                     || total_after < total_before;
+
+                if dirty_after > 0
+                    && !completed_blocks_remain
+                    && !vfs.should_linger_deferred_tail_materialization(ino)
+                {
+                    let closed_writer_materialized = match vfs
+                        .materialize_writer_stack_for_inode(ino)
+                        .await
+                    {
+                        Ok(materialized_bytes) => materialized_bytes,
+                        Err(e) => {
+                            allow_reschedule_on_exit = false;
+                            if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
+                                warn!(
+                                    ino,
+                                    error = %e,
+                                    "deferred writer-stack materialization after writer close failed; strict barrier will retry"
+                                );
+                            }
+                            break;
+                        }
+                    };
+                    if closed_writer_materialized > 0 {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
 
                 if dirty_after > 0
                     && !completed_blocks_remain

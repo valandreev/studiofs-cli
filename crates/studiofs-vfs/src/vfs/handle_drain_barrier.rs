@@ -163,7 +163,11 @@ where
     pub fn on_flush(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.observability.note_flush_callback();
         let flushed = self.flush_gate.with_flush_gate(request.ino, || {
-            if !self.local_sync.should_run_explicit_flush(request) {
+            if !self.local_sync.should_run_explicit_flush(request)
+                && !self
+                    .deferred_cleanup_hints
+                    .has_deferred_cleanup_hint(request.ino)
+            {
                 return Ok(false);
             }
             let outcome = self.local_sync.explicit_flush(request)?;
@@ -457,6 +461,23 @@ mod tests {
 
         assert!(ports.flush_calls.lock().is_empty());
         assert_eq!(ports.flush_barrier_outcomes.lock().as_slice(), &[false]);
+    }
+
+    #[test]
+    fn flush_honors_cleanup_hint_after_dirty_state_commits() {
+        let ports = Arc::new(FakePorts::default());
+        ports.mark_dirty(18);
+        let barrier = barrier(ports.clone());
+
+        barrier.on_cleanup_non_delete(HandleDrainRequest { ino: 18, fh: 9 });
+        ports.dirty.lock().remove(&18);
+
+        barrier
+            .on_flush(HandleDrainRequest { ino: 18, fh: 9 })
+            .expect("flush should honor the deferred cleanup hint");
+
+        assert_eq!(ports.flush_calls.lock().len(), 1);
+        assert!(!ports.has_deferred_cleanup_hint(18));
     }
 
     #[test]

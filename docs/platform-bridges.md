@@ -117,9 +117,10 @@ I/O buffer behavior on Windows callbacks:
 
 WinFSP callback barrier semantics:
 - Explicit `flush(context=Some(..))` is WinFSP's `FlushFileBuffers` callback.
-  It drains the handle through `fsync_fh_with_outcome()`, including the local
-  payload and redb durability barriers, before returning. It does not wait for
-  remote upload or peer publication.
+  It admits the handle through `flush_volatile_writeback_with_outcome()` and
+  may return before the bounded background local-dirty commit. The explicit
+  `fsync` API owns local payload and redb durability barriers; neither operation
+  waits for remote upload or peer publication.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default so
   read-only file caching keeps WinFSP cache-manager behavior across close/reopen

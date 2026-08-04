@@ -359,7 +359,10 @@ fn should_disable_winfsp_file_cache(
         || (file_attributes & FILE_FLAG_NO_BUFFERING_ATTRIBUTE) != 0;
     let requested_uncached =
         no_buffering_requested || (open_flags_allow_write(open_flags) && write_through_requested);
-    open_flags.contains(OpenFlags::WRONLY) || truncates_on_open || requested_uncached
+    // A read-write handle can still be the writer used by copy tools (for
+    // example Total Commander). Keep WinFSP cache writeback out of every
+    // write-capable handle so lazy writes cannot arrive after close.
+    open_flags_allow_write(open_flags) || truncates_on_open || requested_uncached
 }
 
 fn winfsp_read_cache_diagnostics_enabled() -> bool {
@@ -2561,7 +2564,7 @@ mod tests {
         for (is_dir, open_flags, truncates_on_open, create_options, file_attributes, expected) in [
             (false, OpenFlags::RDONLY, false, 0, 0, false),
             (false, OpenFlags::WRONLY, false, 0, 0, true),
-            (false, OpenFlags::RDWR, false, 0, 0, false),
+            (false, OpenFlags::RDWR, false, 0, 0, true),
             (false, OpenFlags::RDWR, true, 0, 0, true),
             (
                 false,
@@ -2626,8 +2629,8 @@ mod tests {
     }
 
     #[test]
-    fn non_truncating_readwrite_open_keeps_winfsp_file_cache() {
-        let (_tmp, vfs, ctx, _queue) = make_test_context("readwrite-open-keeps-cache");
+    fn non_truncating_readwrite_open_disables_winfsp_file_cache() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("readwrite-open-disables-cache");
         vfs.create(ROOT_INO, b"existing.txt", 0, 0, 0o644)
             .expect("create existing file");
 
@@ -2644,8 +2647,8 @@ mod tests {
 
         assert_eq!(handle.open_flags.bits(), OpenFlags::RDWR.bits());
         assert!(
-            !handle.disable_os_cache,
-            "read-write opens without overwrite/truncate must remain cache-manager eligible"
+            handle.disable_os_cache,
+            "all write-capable opens must bypass cache-manager writeback"
         );
     }
 
@@ -3861,7 +3864,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_callback_persists_buffered_write_before_return() {
+    fn explicit_flush_callback_keeps_buffered_write_volatile_without_foreground_sync_data() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_explicit_flush");
         let attr = vfs
             .create(ROOT_INO, b"buffered-write-flush.txt", 0, 0, 0o644)
@@ -3873,6 +3876,7 @@ mod tests {
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
         let sync_calls_before = sync_data_calls(&vfs);
 
         <StudioFsContext as FileSystemContext>::write(
@@ -3906,12 +3910,17 @@ mod tests {
             "explicit flush callback should own the WinFSP flush barrier"
         );
         assert!(
-            sync_calls_after > sync_calls_before,
-            "WinFSP FlushFileBuffers should sync payload data before returning"
+            sync_calls_after == sync_calls_before,
+            "WinFSP writeback flush should not call fdatasync from the dispatcher"
+        );
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_before,
+            "ordinary flush callback should not run a strict local-sync barrier"
         );
         assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "WinFSP FlushFileBuffers should drain buffered local dirty state"
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "ordinary flush should leave buffered local dirty state for the background worker"
         );
 
         ctx.spawn_wait({
@@ -3965,7 +3974,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_write_cleanup_defers_until_explicit_flush() {
+    fn buffered_write_cleanup_stays_observational_until_volatile_flush() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-buffered-cleanup-flush");
         let attr = vfs
             .create(ROOT_INO, b"sfs-285-buffered-cleanup-flush.txt", 0, 0, 0o644)
@@ -3977,6 +3986,7 @@ mod tests {
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
         let sync_calls_before = sync_data_calls(&vfs);
 
         <StudioFsContext as FileSystemContext>::write(
@@ -4030,8 +4040,8 @@ mod tests {
             "explicit flush should clear the deferred cleanup hint before returning"
         );
         assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "explicit FlushFileBuffers should drain buffered local dirty state"
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "ordinary flush should leave buffered local dirty state for the background worker"
         );
         let after_flush_barriers = winfsp_foreground_flushes(&vfs);
         let sync_calls_after = sync_data_calls(&vfs);
@@ -4040,8 +4050,13 @@ mod tests {
             "explicit flush should not lose flush barrier accounting for buffered dirty state"
         );
         assert!(
-            sync_calls_after > sync_calls_before,
-            "WinFSP FlushFileBuffers should sync payload data after buffered writes"
+            sync_calls_after == sync_calls_before,
+            "WinFSP writeback flush should not force fdatasync after buffered writes"
+        );
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_before,
+            "ordinary flush should not run a strict local-sync barrier"
         );
         assert_eq!(
             vfs.write_path_observability_snapshot()
@@ -4305,7 +4320,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_flush_drains_dirty_state_before_handle_close() {
+    fn foreground_flush_keeps_dirty_state_before_handle_close() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("foreground_flush_then_close");
         let attr = vfs
             .create(ROOT_INO, b"deferred-flush-then-close.txt", 0, 0, 0o644)
@@ -4337,8 +4352,8 @@ mod tests {
         ctx.run_flush_callback(attr.ino, fh1)
             .expect("flush callback");
         assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "FlushFileBuffers should drain dirty state before returning"
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "ordinary flush should leave dirty state for deferred materialization"
         );
         ctx.run_close_callback(attr.ino, fh1);
         assert_eq!(

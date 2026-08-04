@@ -15516,6 +15516,49 @@ fn deferred_materialization_drains_idle_tail_before_close() {
 }
 
 #[test]
+fn deferred_materialization_drains_tail_after_write_handle_closes_with_reader_open() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-reader-open");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-idle-tail-reader-open.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        let payload = vec![0xC3; vfs.block_size as usize / 3];
+
+        vfs.write_fh_with_deferred_materialize(
+            writer,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        vfs.release_fh(writer).await.unwrap();
+
+        assert_eq!(vfs.open_count(ino), 1);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle tail should drain after the writer closes with a reader open");
+
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
 fn deferred_materialization_keeps_hot_open_writer_task_for_next_full_block() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-546-hot-writer-drain");
