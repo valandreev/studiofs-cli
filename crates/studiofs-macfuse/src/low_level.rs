@@ -1565,7 +1565,6 @@ mod tests {
         let active = state
             .begin_invalidation()
             .expect("invalidation should start while session is active");
-        state.begin_shutdown();
         let waiter_state = Arc::clone(&state);
         let waiter_queue = Arc::clone(&queue);
 
@@ -1573,12 +1572,12 @@ mod tests {
             std::thread::spawn(move || prepare_session_shutdown(&waiter_state, &waiter_queue));
 
         assert!(
-            state.begin_invalidation().is_none(),
-            "shutdown must close new invalidations before waiting for active work"
-        );
-        assert!(
             queue.next().is_none(),
             "shutdown must close and clear queued invalidations"
+        );
+        assert!(
+            state.begin_invalidation().is_none(),
+            "shutdown must close new invalidations before waiting for active work"
         );
         drop(active);
 

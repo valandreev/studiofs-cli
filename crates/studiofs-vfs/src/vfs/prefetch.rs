@@ -855,13 +855,18 @@ mod tests {
     fn prefetch_burst_deduplicates_pending_inode_blocks() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-burst");
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut worker = PrefetchWorker::new(Arc::clone(&vfs), rx);
         let block_indices: Vec<_> = (0..1024).collect();
         let batch = PrefetchBatch::new(99, block_indices.clone(), None);
 
-        worker.enqueue_work_item(PrefetchWorkItem::Batch(batch.clone()));
-        worker.enqueue_work_item(PrefetchWorkItem::Batch(batch));
+        tx.send(PrefetchWorkItem::Batch(batch.clone()))
+            .expect("prefetch burst should enter the worker channel");
+        tx.send(PrefetchWorkItem::Batch(batch))
+            .expect("duplicate prefetch burst should enter the worker channel");
+        while let Ok(work_item) = worker.prefetch_rx.try_recv() {
+            worker.enqueue_work_item(work_item);
+        }
 
         assert_eq!(worker.pending_queue.len(), 1);
         assert_eq!(worker.pending_set.len(), block_indices.len());

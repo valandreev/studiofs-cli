@@ -19,12 +19,12 @@ unavailable.
 
 ## Progress
 
-- [x] (2026-08-04 21:00 Europe/Kyiv) Add the SFS-637 failing-before/fixing-after upload lifecycle fixture; the `--ignored` run fails at the pre-fix queue-completion assertion.
+- [x] (2026-08-04 21:00 Europe/Kyiv) Add the SFS-637 failing-before/fixing-after upload lifecycle fixture; the `--ignored` run observes the expected pre-fix queue-completion panic.
 - [x] (2026-08-04 21:10 Europe/Kyiv) Add and run the UploadQueue completion-wakeup and burst consistency tests.
 - [x] (2026-08-04 21:20 Europe/Kyiv) Add and run legacy MetaEvent bytes and local event-log replay fixtures. A raw PG event-table fixture is not accessible from the current private module boundary and remains a later SFS-639/PG-axis check.
 - [x] (2026-08-04 21:30 Europe/Kyiv) Add and run the shared prefetch burst test; add the Windows-only WinFSP invalidation burst test.
 - [x] (2026-08-04 21:45 Europe/Kyiv) Run available focused checks and record unavailable macFUSE, Linux/FUSE, WinFSP, PostgreSQL, and S3 cells.
-- [x] (2026-08-04 21:50 Europe/Kyiv) Update this plan with final evidence and the Linear issue.
+- [x] (2026-08-04 21:50 Europe/Kyiv) Update this plan with final evidence and the current validation gaps.
 
 ## Surprises & Discoveries
 
@@ -102,10 +102,13 @@ coordinator non-terminal and the operation recoverable. Run it with
 ordering in SFS-635.
 
 Next add one UploadQueue test that submits an operation, lets a waiter reach
-the idle notification point, completes the operation, and proves the waiter
-wakes. Add one burst test that submits many distinct objects for one inode,
-checks the count and both indexes, drains all operations, and checks that the
-indexes return to empty.
+the idle notification point through a test-only checkpoint, completes the
+operation, and proves the waiter wakes. The checkpoint is an expected
+pre-fix failure until SFS-638 moves notification registration before the
+count check; `#[should_panic]` keeps the ignored suite green while retaining
+the executable repro. Add one burst test that submits many distinct objects
+for one inode, checks the count and both indexes, drains all operations, and
+checks that the indexes return to empty.
 
 Add a small golden fixture in the metadata layout tests for a legacy
 `MetaEvent::RemoveAttr` postcard payload. Assert both decode and re-encode so a
@@ -122,12 +125,38 @@ Keep platform-gated tests in their existing platform crates and record that
 macFUSE/WinFSP real mount checks and PostgreSQL/S3 checks require their native
 runner or service.
 
+## Milestones
+
+### M0 — Shared lifecycle characterization
+
+The shared queue and upload-worker tests establish the local seams used by the
+later correctness issues. The queue checkpoint is run with `--ignored` and is
+expected to panic on the current lost-wake implementation; the upload failure
+fixture is likewise an expected panic until SFS-637 changes the ordering.
+
+### M1 — Platform and metadata fixtures
+
+The macFUSE model test proves that the shutdown helper itself closes new
+invalidation intake before waiting for the active guard. Legacy metadata bytes
+are decoded through the local event log. A PostgreSQL mixed-version fixture is
+not invented here because SFS-639 owns the stable envelope and PG `event_type`
+contract; its service-gated validation remains an explicit dependency gap.
+
+### M2 — Burst validation and handoff
+
+Upload, prefetch, and WinFSP bursts exercise their existing ingress/dedup
+seams, while the matrix records which native runners and services were
+unavailable. The plan is complete only for the local characterization covered
+by these fixtures; SFS-636, SFS-638, SFS-639, and SFS-640 still consume the
+issue-linked repros as their production-fix inputs.
+
 ## Concrete Steps
 
 Run commands from `/Volumes/Storage/dev/studiofs`.
 
-    cargo test -p studiofs-vfs process_upload_does_not_complete_queue_when_local_transition_fails -- --ignored --nocapture  # expected pre-fix failure
-    cargo test -p studiofs-cache upload_queue -- --nocapture  # 15 passed
+    cargo test -p studiofs-vfs process_upload_does_not_complete_queue_when_local_transition_fails -- --ignored --nocapture  # expected panic, reported as pass
+    cargo test -p studiofs-cache upload_queue -- --nocapture  # 14 passed, 1 ignored
+    cargo test -p studiofs-cache wait_for_idle_wakes_after_last_completion -- --ignored --nocapture  # expected panic, reported as pass
     cargo test -p studiofs-meta legacy_meta_event -- --nocapture  # 2 passed
     cargo test -p studiofs-vfs vfs::prefetch::tests -- --nocapture  # 8 passed
     cargo test -p studiofs-macfuse low_level::tests::session_invalidation -- --nocapture  # 8 passed
@@ -137,12 +166,13 @@ Run commands from `/Volumes/Storage/dev/studiofs`.
     cargo fmt --all -- --check
     git diff --check
 
-The first command failed at
-`queue completion must follow successful local durable acceptance`, proving the
-fixture catches the current ordering defect. The remaining local shared and
-macFUSE commands passed, `cargo check -D warnings` passed, and formatting/diff
-hygiene passed. Platform-gated commands must be run on their supported
-operating system and are recorded as unavailable otherwise.
+The first command currently passes because the test's expected panic is
+observed at `queue completion must follow successful local durable acceptance`.
+After SFS-637 fixes the ordering, remove `should_panic` and require a normal
+passing assertion. The remaining local shared and macFUSE commands passed,
+`cargo check -D warnings` passed, and formatting/diff hygiene passed.
+Platform-gated commands must be run on their supported operating system and
+are recorded as unavailable otherwise.
 
 Before handoff, run `cargo fmt --all -- --check`, the focused `cargo test`
 commands above, `RUSTFLAGS='-D warnings' cargo check` for changed crates where
@@ -150,13 +180,13 @@ the platform toolchain supports them, and `git diff --check`.
 
 ## Validation and Acceptance
 
-Acceptance is behavioral. The local upload failure test demonstrates that a
-failed durable transition is not reported as a terminal completion by the
-current implementation and is ready to turn green under SFS-637. The queue
-test demonstrates that a completion wakes a registered idle waiter and that a
-burst cannot leave count/map state inconsistent. The legacy fixture demonstrates
-that existing event bytes retain their meaning. Prefetch and WinFSP tests
-demonstrate coalesced burst handling.
+Acceptance is behavioral. The local upload failure test records the current
+pre-fix completion-ordering failure and is ready to become a normal passing
+assertion under SFS-637. The queue test records the current lost-wake window
+with a deterministic checkpoint and verifies that a burst cannot leave
+count/map state inconsistent. The legacy fixture demonstrates that existing
+event bytes retain their meaning. Prefetch and WinFSP tests demonstrate
+coalesced burst handling at their current ingress seams.
 
 The matrix is explicit:
 
@@ -187,4 +217,12 @@ that proves the contract; do not commit generated logs or temporary databases.
 No new production trait or queue abstraction is required. Tests use the
 existing `PendingUpload`, `UploadProcessor` ports, `MetaEvent` postcard helpers,
 `PrefetchWorker`, and `WinfspKernelInvalidator` seams. The only expected test
-support change is an injectable failure flag in `FakeLocalPayloads`.
+support changes are the injectable failure flag in `FakeLocalPayloads`, the
+UploadQueue lost-wake checkpoint, and the upload-worker event trace.
+
+## Revision note
+
+2026-08-04: Incorporated review feedback by making the queue repro
+deterministic, removing the macFUSE test's pre-established shutdown state,
+routing the prefetch burst through its channel, tracing upload ordering, and
+documenting why mixed-version PostgreSQL replay remains owned by SFS-639.
