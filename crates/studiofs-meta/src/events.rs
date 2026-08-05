@@ -3,7 +3,7 @@ use crate::types::{DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-const META_EVENT_WIRE_MAGIC: &[u8] = b"SFS-EVT";
+const META_EVENT_WIRE_MAGIC: [u8; 7] = *b"SFS-EVT";
 const META_EVENT_WIRE_VERSION: u8 = 1;
 const TAG_SET_ATTR: u8 = 1;
 const TAG_REMOVE_ATTR: u8 = 2;
@@ -277,15 +277,16 @@ impl MetaEvent {
 }
 
 pub(crate) fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
-    let payload = match event {
-        MetaEvent::SetAttr { attr } => encode_event_payload(attr)?,
-        MetaEvent::RemoveAttr { ino } => encode_event_payload(ino)?,
+    let tag = event.wire_tag();
+    match event {
+        MetaEvent::SetAttr { attr } => encode_event_envelope(tag, attr),
+        MetaEvent::RemoveAttr { ino } => encode_event_envelope(tag, ino),
         MetaEvent::AddEntry {
             parent,
             name,
             entry,
-        } => encode_event_payload(&(*parent, name, entry))?,
-        MetaEvent::RemoveEntry { parent, name } => encode_event_payload(&(*parent, name))?,
+        } => encode_event_envelope(tag, &(*parent, name, entry)),
+        MetaEvent::RemoveEntry { parent, name } => encode_event_envelope(tag, &(*parent, name)),
         MetaEvent::RenameEntry {
             parent,
             name,
@@ -297,57 +298,55 @@ pub(crate) fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
             moved_dir_attr,
             old_parent_attr,
             new_parent_attr,
-        } => encode_event_payload(&(
-            *parent,
-            name,
-            *new_parent,
-            new_name,
-            entry,
-            displaced_set_attr,
-            displaced_remove_attr_ino,
-            moved_dir_attr,
-            old_parent_attr,
-            new_parent_attr,
-        ))?,
-        MetaEvent::RemoveRegularFileGraph { ino } => encode_event_payload(ino)?,
+        } => encode_event_envelope(
+            tag,
+            &(
+                *parent,
+                name,
+                *new_parent,
+                new_name,
+                entry,
+                displaced_set_attr,
+                displaced_remove_attr_ino,
+                moved_dir_attr,
+                old_parent_attr,
+                new_parent_attr,
+            ),
+        ),
+        MetaEvent::RemoveRegularFileGraph { ino } => encode_event_envelope(tag, ino),
         MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices }
         | MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-            encode_event_payload(&(*ino, chunk_slices))?
+            encode_event_envelope(tag, &(*ino, chunk_slices))
         }
-        MetaEvent::SetSymlinkTarget { ino, target } => encode_event_payload(&(*ino, target))?,
+        MetaEvent::SetSymlinkTarget { ino, target } => encode_event_envelope(tag, &(*ino, target)),
         MetaEvent::SetXattr {
             ino,
             name,
             value,
             flags,
-        } => encode_event_payload(&(*ino, name, value, *flags))?,
-        MetaEvent::RemoveXattr { ino, name } => encode_event_payload(&(*ino, name))?,
+        } => encode_event_envelope(tag, &(*ino, name, value, *flags)),
+        MetaEvent::RemoveXattr { ino, name } => encode_event_envelope(tag, &(*ino, name)),
         MetaEvent::SetAclRule {
             ino,
             principal,
             access_level,
-        } => encode_event_payload(&(*ino, principal, *access_level))?,
-        MetaEvent::RemoveAclRule { ino, principal } => encode_event_payload(&(*ino, principal))?,
+        } => encode_event_envelope(tag, &(*ino, principal, *access_level)),
+        MetaEvent::RemoveAclRule { ino, principal } => {
+            encode_event_envelope(tag, &(*ino, principal))
+        }
         MetaEvent::AddPendingDeletion {
             object_id,
             timestamp,
-        } => encode_event_payload(&(*object_id, *timestamp))?,
-        MetaEvent::RemovePendingDeletion { object_id } => encode_event_payload(object_id)?,
-        MetaEvent::CreateSnapshot { snapshot } => encode_event_payload(snapshot)?,
-        MetaEvent::UpdateSnapshotState { id, state } => encode_event_payload(&(id, *state))?,
-    };
-
-    let mut encoded = Vec::with_capacity(META_EVENT_WIRE_MAGIC.len() + 2 + payload.len());
-    encoded.extend_from_slice(META_EVENT_WIRE_MAGIC);
-    encoded.push(META_EVENT_WIRE_VERSION);
-    encoded.push(event.wire_tag());
-    encoded.extend_from_slice(&payload);
-    Ok(encoded)
+        } => encode_event_envelope(tag, &(*object_id, *timestamp)),
+        MetaEvent::RemovePendingDeletion { object_id } => encode_event_envelope(tag, object_id),
+        MetaEvent::CreateSnapshot { snapshot } => encode_event_envelope(tag, snapshot),
+        MetaEvent::UpdateSnapshotState { id, state } => encode_event_envelope(tag, &(id, *state)),
+    }
 }
 
 pub(crate) fn decode_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
     if bytes.first() == META_EVENT_WIRE_MAGIC.first() {
-        if !bytes.starts_with(META_EVENT_WIRE_MAGIC) {
+        if !bytes.starts_with(&META_EVENT_WIRE_MAGIC) {
             return Err(MetaError::Serialization(
                 "invalid MetaEvent wire magic".to_string(),
             ));
@@ -383,9 +382,10 @@ pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResu
     Ok(event)
 }
 
-fn encode_event_payload<T: Serialize>(payload: &T) -> MetaResult<Vec<u8>> {
-    postcard::to_stdvec(payload).map_err(|error| {
-        MetaError::Serialization(format!("MetaEvent payload encode failed: {error}"))
+fn encode_event_envelope<T: Serialize>(tag: u8, payload: &T) -> MetaResult<Vec<u8>> {
+    let envelope = (META_EVENT_WIRE_MAGIC, META_EVENT_WIRE_VERSION, tag, payload);
+    postcard::to_stdvec(&envelope).map_err(|error| {
+        MetaError::Serialization(format!("MetaEvent envelope encode failed: {error}"))
     })
 }
 

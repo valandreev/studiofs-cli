@@ -22,6 +22,7 @@ The result is visible through the metadata crate tests: a raw redb row written b
 - [x] (2026-08-05) Loaded `STUDIOFS_TEST_PG_DSN` from the workspace `.env` through the existing test harness and ran `test_pg_conflicting_batch_does_not_block_later_foreign_batch`: 1 passed.
 - [x] (2026-08-05) Applied review simplification: removed the duplicate PostgreSQL event-kind allowlist; direct `MetaEvent::kind()` comparison still rejects unknown and mismatched event types.
 - [x] (2026-08-05) Addressed review findings: legacy rows now use a frozen ordinal-to-tag mapping instead of deserializing into the public enum, and all 17 event variants have independent legacy and V1 byte fixtures. A temporary tag mutation made the V1 golden test fail before the original tag was restored.
+- [x] (2026-08-06) Applied the performance review fix: postcard now serializes the fixed header tuple and variant payload into one output buffer; the independent V1 fixtures remain byte-identical.
 
 ## Surprises & Discoveries
 
@@ -38,10 +39,11 @@ The result is visible through the metadata crate tests: a raw redb row written b
 - Decision: Encode each event's fields explicitly rather than serializing `MetaEvent` inside the new envelope. Rationale: serializing the public enum again would retain the ordinal-evolution problem inside the payload. Date/Author: 2026-08-05, Codex.
 - Decision: Treat the SFS-639 migration gate as an operational minimum-reader rule instead of adding a new persisted feature flag or schema migration. Rationale: the existing schema has no capability negotiation field, and introducing one would expand the issue; all new readers dual-read legacy rows, while the architecture docs require every shared-log reader to be upgraded before a new writer is enabled. Date/Author: 2026-08-05, Codex.
 - Decision: Decode the historical postcard ordinal as `u32`, map only ordinals `0..=16` to the existing stable tags, and reject every other value. Rationale: this freezes legacy meaning without duplicating the full public enum or its payload decoder. Date/Author: 2026-08-05, Codex.
+- Decision: Serialize the V1 header as a postcard tuple containing the fixed seven-byte magic, version, tag, and payload. Rationale: postcard emits the fixed byte array without a length prefix, preserving the established wire format while avoiding a separate payload allocation and copy. Date/Author: 2026-08-06, Codex.
 
 ## Outcomes & Retrospective
 
-Implementation is complete for the local metadata and shared codec paths. The final diff is limited to the event codec, redb/PostgreSQL event-log call sites, focused tests, architecture documentation, and this plan. The metadata lib suite passes with 389 tests and 68 environment-gated PostgreSQL tests ignored; the live mixed-row PostgreSQL replay test also passes with the workspace `.env` configuration.
+Implementation is complete for the local metadata and shared codec paths. The final diff is limited to the event codec, redb/PostgreSQL event-log call sites, focused tests, architecture documentation, and this plan. The metadata lib suite passes with 389 tests and 68 environment-gated PostgreSQL tests ignored; the live mixed-row PostgreSQL replay test also passes with the workspace `.env` configuration. The V1 envelope encoder no longer allocates and copies a separate payload buffer, while all independent byte fixtures remain unchanged.
 
 ## Context and Orientation
 
@@ -114,4 +116,4 @@ The final crate-local interface is:
 
 These helpers use the already-installed `postcard`, `serde`, and `thiserror` dependencies. They do not change the public `MetaEvent` shape, the generic redb codec, the PostgreSQL table schema, or any platform bridge.
 
-Plan revision note (2026-08-05): created after inspecting the live issue and current HEAD. The plan explicitly records that `event_type` already exists and narrows the work to shared versioned payload encoding, dual-read compatibility, and validation. Updated after review to freeze the legacy ordinal mapping and replace self-roundtrip coverage with independent V0/V1 byte fixtures.
+Plan revision note (2026-08-05/06): created after inspecting the live issue and current HEAD. The plan explicitly records that `event_type` already exists and narrows the work to shared versioned payload encoding, dual-read compatibility, and validation. Updated after review to freeze the legacy ordinal mapping, replace self-roundtrip coverage with independent V0/V1 byte fixtures, and serialize the V1 envelope in one allocation.
