@@ -63,12 +63,21 @@ E2E validation.
   foreign state through invalidation and replay
 - crash recovery rebuilds pending local state from local metadata and
   upload/replication bookkeeping
+- persisted `MetaEvent` rows use a versioned, explicitly tagged envelope;
+  readers accept both the historical postcard ordinal payload and the current
+  envelope, while unknown versions and event kinds fail closed
 - each PostgreSQL-backed root registers one durable per-volume inode namespace
   and one payload namespace during bootstrap, then reuses the persisted paired
   allocator state on later mounts instead of minting a fresh pair on reconnect
 - foreground inode and object IDs advance their local redb counters without
   steady-state PostgreSQL calls; `client-slot:<slot>` remains only the
   replication identity used for self-batch detection
+
+The SFS-639 rollout gate is operational: upgrade every client that can read or
+write the shared event log to a build containing the dual-read codec before
+allowing a client with the new writer to publish events. Older writers remain
+readable during that window, but older readers cannot consume the new envelope;
+the minimum reader version for new writes is therefore the SFS-639 build.
 
 Core invariants:
 - local `size` and local slices may be ahead of peer-visible replicated state

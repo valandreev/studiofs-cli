@@ -339,7 +339,7 @@ fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
             });
             let rows = client
                 .query(
-                    "SELECT batch_version, seq_id, event_payload, client_id FROM event_log WHERE vol = $1 ORDER BY batch_version, seq_id",
+                    "SELECT batch_version, seq_id, event_type, event_payload, client_id FROM event_log WHERE vol = $1 ORDER BY batch_version, seq_id",
                     &[&volume_id],
                 )
                 .await

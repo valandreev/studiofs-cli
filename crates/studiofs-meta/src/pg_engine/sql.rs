@@ -41,7 +41,7 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
     "#;
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
-    SELECT batch_version, seq_id, event_payload, client_id
+    SELECT batch_version, seq_id, event_type, event_payload, client_id
     FROM event_log
     WHERE vol=$1 AND batch_version > $2
     ORDER BY batch_version ASC, seq_id ASC

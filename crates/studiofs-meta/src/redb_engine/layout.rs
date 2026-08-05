@@ -536,18 +536,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_meta_event_remove_attr_fixture_roundtrips() {
+    fn legacy_meta_event_remove_attr_fixture_decodes() {
         let legacy_bytes = [1_u8, 42_u8];
-        let event: crate::events::MetaEvent =
-            decode(&legacy_bytes).expect("legacy remove-attr bytes should decode");
+        let event = crate::events::decode_event(&legacy_bytes)
+            .expect("legacy remove-attr bytes should decode");
 
         assert!(matches!(
             event,
             crate::events::MetaEvent::RemoveAttr { ino: 42 }
         ));
-        assert_eq!(
-            encode(&event).expect("legacy event should re-encode"),
-            legacy_bytes
-        );
     }
 }

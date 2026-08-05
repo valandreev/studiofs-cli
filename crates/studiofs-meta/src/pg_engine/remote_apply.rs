@@ -1,5 +1,5 @@
 use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaResult};
-use crate::events::MetaEvent;
+use crate::events::{MetaEvent, decode_event_with_type, encode_event};
 use crate::redb_engine::RedbMetaEngine;
 use crate::redb_engine::layout::{encode_acl_rule_key, encode_dentry_key, encode_xattr_key};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
@@ -1072,21 +1072,20 @@ impl<'a> RemoteApplyCoordinator<'a> {
         client_id: &str,
     ) -> MetaResult<(i64, usize, Vec<MetaEvent>, bool)> {
         let batch_version: i64 = rows[start_idx].get(0);
-        let batch_client: Option<String> = rows[start_idx].get(3);
-        let is_self_batch = batch_client.as_deref() == Some(client_id);
+        let batch_client: Option<&str> = rows[start_idx].get(4);
+        let is_self_batch = batch_client == Some(client_id);
         let mut idx = start_idx;
         let mut batch_events = Vec::new();
 
         while idx < rows.len() {
             let row_batch_version: i64 = rows[idx].get(0);
-            let row_client: Option<String> = rows[idx].get(3);
+            let row_client: Option<&str> = rows[idx].get(4);
             if row_batch_version != batch_version || row_client != batch_client {
                 break;
             }
-            let payload: Vec<u8> = rows[idx].get(2);
-            let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
-                MetaError::Serialization(format!("postgres event decode failed: {e}"))
-            })?;
+            let event_type: &str = rows[idx].get(2);
+            let payload: &[u8] = rows[idx].get(3);
+            let event = decode_event_with_type(event_type, payload)?;
             batch_events.push(event);
             idx += 1;
         }
@@ -1296,7 +1295,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         for consumed_events in 1..=local_events.len() {
             let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
             let matches_prefix = projected_prefix.events.iter().zip(batch_events.iter()).all(
-                |(local, remote)| match (postcard::to_stdvec(local), postcard::to_stdvec(remote)) {
+                |(local, remote)| match (encode_event(local), encode_event(remote)) {
                     (Ok(local), Ok(remote)) => local == remote,
                     _ => false,
                 },

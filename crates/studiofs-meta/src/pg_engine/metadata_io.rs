@@ -4,7 +4,7 @@
 use super::RemoteApplyCoordinator;
 use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
 use crate::engine::{MetaError, MetaResult};
-use crate::events::MetaEvent;
+use crate::events::{MetaEvent, encode_event};
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
@@ -157,13 +157,7 @@ impl PgMetaEngine {
                             chunk.iter().map(|event| event.kind()).collect();
                         let payloads: Vec<Vec<u8>> = chunk
                             .iter()
-                            .map(|event| {
-                                postcard::to_stdvec(event).map_err(|e| {
-                                    MetaError::Serialization(format!(
-                                        "postcard encode failed: {e}"
-                                    ))
-                                })
-                            })
+                            .map(encode_event)
                             .collect::<MetaResult<Vec<_>>>()?;
                         tx.execute(
                             sql::INSERT_EVENT_LOG_BATCH,
