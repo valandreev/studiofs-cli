@@ -5,7 +5,7 @@
 //! startup replay is reconstructed from the local backend + metadata mapping.
 
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -339,18 +339,17 @@ impl UploadQueue {
 
     fn remove_pending_if_matches(&self, op: &PendingUpload) -> bool {
         let mut state = self.pending_state.lock();
-        let Some(current) = state.by_object.get(&op.object_id) else {
+        let Entry::Occupied(entry) = state.by_object.entry(op.object_id) else {
             return false;
         };
+        let current = entry.get();
         if current.ino != op.ino
             || current.offset != op.offset
             || current.content_epoch != op.content_epoch
         {
             return false;
         }
-        let Some(removed) = state.by_object.remove(&op.object_id) else {
-            return false;
-        };
+        let removed = entry.remove();
         Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
         let became_idle = state.by_object.is_empty();
         drop(state);
