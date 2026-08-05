@@ -157,9 +157,7 @@ impl PgMetaEngine {
                             chunk.iter().map(|event| event.kind()).collect();
                         let payloads: Vec<Vec<u8>> = chunk
                             .iter()
-                            .map(|event| {
-                                encode_event(event)
-                            })
+                            .map(encode_event)
                             .collect::<MetaResult<Vec<_>>>()?;
                         tx.execute(
                             sql::INSERT_EVENT_LOG_BATCH,

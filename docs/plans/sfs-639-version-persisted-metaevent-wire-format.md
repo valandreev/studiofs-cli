@@ -23,6 +23,7 @@ The result is visible through the metadata crate tests: a raw redb row written b
 - [x] (2026-08-05) Applied review simplification: removed the duplicate PostgreSQL event-kind allowlist; direct `MetaEvent::kind()` comparison still rejects unknown and mismatched event types.
 - [x] (2026-08-05) Addressed review findings: legacy rows now use a frozen ordinal-to-tag mapping instead of deserializing into the public enum, and all 17 event variants have independent legacy and V1 byte fixtures. A temporary tag mutation made the V1 golden test fail before the original tag was restored.
 - [x] (2026-08-06) Applied the performance review fix: postcard now serializes the fixed header tuple and variant payload into one output buffer; the independent V1 fixtures remain byte-identical.
+- [x] (2026-08-06) Applied the remaining valid review cleanups: PostgreSQL replay now borrows row text and payload slices instead of allocating per row, and the metadata encoder map uses the function directly. The local metadata suite and the live PostgreSQL replay test pass; one initial rerun was temporarily blocked by a network outage, then passed once connectivity returned.
 
 ## Surprises & Discoveries
 
@@ -43,7 +44,7 @@ The result is visible through the metadata crate tests: a raw redb row written b
 
 ## Outcomes & Retrospective
 
-Implementation is complete for the local metadata and shared codec paths. The final diff is limited to the event codec, redb/PostgreSQL event-log call sites, focused tests, architecture documentation, and this plan. The metadata lib suite passes with 389 tests and 68 environment-gated PostgreSQL tests ignored; the live mixed-row PostgreSQL replay test also passes with the workspace `.env` configuration. The V1 envelope encoder no longer allocates and copies a separate payload buffer, while all independent byte fixtures remain unchanged.
+Implementation is complete for the local metadata and shared codec paths. The final diff is limited to the event codec, redb/PostgreSQL event-log call sites, focused tests, architecture documentation, and this plan. The metadata lib suite passes with 389 tests and 68 environment-gated PostgreSQL tests ignored, and the live mixed-row PostgreSQL replay test passes with the workspace `.env` configuration. The V1 envelope encoder no longer allocates and copies a separate payload buffer, while all independent byte fixtures remain unchanged.
 
 ## Context and Orientation
 

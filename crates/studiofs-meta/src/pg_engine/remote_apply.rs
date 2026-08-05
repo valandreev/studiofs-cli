@@ -1072,20 +1072,20 @@ impl<'a> RemoteApplyCoordinator<'a> {
         client_id: &str,
     ) -> MetaResult<(i64, usize, Vec<MetaEvent>, bool)> {
         let batch_version: i64 = rows[start_idx].get(0);
-        let batch_client: Option<String> = rows[start_idx].get(4);
-        let is_self_batch = batch_client.as_deref() == Some(client_id);
+        let batch_client: Option<&str> = rows[start_idx].get(4);
+        let is_self_batch = batch_client == Some(client_id);
         let mut idx = start_idx;
         let mut batch_events = Vec::new();
 
         while idx < rows.len() {
             let row_batch_version: i64 = rows[idx].get(0);
-            let row_client: Option<String> = rows[idx].get(4);
+            let row_client: Option<&str> = rows[idx].get(4);
             if row_batch_version != batch_version || row_client != batch_client {
                 break;
             }
-            let event_type: String = rows[idx].get(2);
-            let payload: Vec<u8> = rows[idx].get(3);
-            let event = decode_event_with_type(&event_type, &payload)?;
+            let event_type: &str = rows[idx].get(2);
+            let payload: &[u8] = rows[idx].get(3);
+            let event = decode_event_with_type(event_type, payload)?;
             batch_events.push(event);
             idx += 1;
         }
