@@ -623,6 +623,14 @@ mod tests {
             status.is_some_and(|status| status.success()),
             "mounted macFUSE write did not complete before timeout"
         );
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("mounted VFS shutdown should succeed");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("repeated mounted VFS shutdown should succeed");
     }
 
     #[test]

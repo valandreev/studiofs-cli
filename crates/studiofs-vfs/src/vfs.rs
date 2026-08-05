@@ -160,7 +160,7 @@ use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2126,16 +2126,89 @@ impl ReadState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ShutdownError {
+    Meta(MetaError),
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    LocalPayload(ShutdownLocalPayloadError),
+    Other(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ShutdownLocalPayloadError {
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    CapacityExhausted {
+        needed: u64,
+        free: u64,
+    },
+    Other(String),
+}
+
+impl ShutdownError {
+    pub(crate) fn from_vfs_error(error: &VfsError) -> Self {
+        match error {
+            VfsError::Meta(error) => Self::Meta(error.clone()),
+            VfsError::Io(error) => Self::Io {
+                kind: error.kind(),
+                message: error.to_string(),
+            },
+            VfsError::LocalPayload(error) => Self::LocalPayload(match error {
+                LocalPayloadBackendError::Io(error) => ShutdownLocalPayloadError::Io {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                },
+                LocalPayloadBackendError::CapacityExhausted { needed, free } => {
+                    ShutdownLocalPayloadError::CapacityExhausted {
+                        needed: *needed,
+                        free: *free,
+                    }
+                }
+                LocalPayloadBackendError::Other(error) => {
+                    ShutdownLocalPayloadError::Other(error.to_string())
+                }
+            }),
+            VfsError::Other(error) => Self::Other(error.clone()),
+            error => Self::Other(error.to_string()),
+        }
+    }
+
+    pub(crate) fn into_vfs_error(self) -> VfsError {
+        match self {
+            Self::Meta(error) => VfsError::Meta(error),
+            Self::Io { kind, message } => VfsError::Io(io::Error::new(kind, message)),
+            Self::LocalPayload(error) => VfsError::LocalPayload(match error {
+                ShutdownLocalPayloadError::Io { kind, message } => {
+                    LocalPayloadBackendError::Io(io::Error::new(kind, message))
+                }
+                ShutdownLocalPayloadError::CapacityExhausted { needed, free } => {
+                    LocalPayloadBackendError::CapacityExhausted { needed, free }
+                }
+                ShutdownLocalPayloadError::Other(message) => {
+                    LocalPayloadBackendError::Other(Box::new(io::Error::other(message)))
+                }
+            }),
+            Self::Other(error) => VfsError::Other(error),
+        }
+    }
+}
+
 enum ShutdownPhase {
     Running,
     ShuttingDown,
-    Completed(Option<String>),
+    Aborted,
+    Completed(Option<ShutdownError>),
 }
 
 enum ShutdownClaim {
     Owner,
     Waiter,
-    Completed(Option<String>),
+    Completed(Option<ShutdownError>),
 }
 
 struct ShutdownState {
@@ -2176,11 +2249,21 @@ impl ShutdownState {
                 ShutdownClaim::Owner
             }
             ShutdownPhase::ShuttingDown => ShutdownClaim::Waiter,
+            ShutdownPhase::Aborted => {
+                *phase = ShutdownPhase::ShuttingDown;
+                self.shutdown_requested.store(true, Ordering::Release);
+                ShutdownClaim::Owner
+            }
             ShutdownPhase::Completed(error) => ShutdownClaim::Completed(error.clone()),
         }
     }
 
-    fn complete(&self, error: Option<String>) {
+    fn abort(&self) {
+        *self.shutdown_phase.lock() = ShutdownPhase::Aborted;
+        self.shutdown_notify.notify_waiters();
+    }
+
+    fn complete(&self, error: Option<ShutdownError>) {
         *self.shutdown_phase.lock() = ShutdownPhase::Completed(error);
         self.shutdown_notify.notify_waiters();
     }

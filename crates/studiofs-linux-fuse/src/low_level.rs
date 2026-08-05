@@ -5103,6 +5103,14 @@ mod tests {
             .expect("mounted I/O worker should complete");
         assert!(unmount_status.success());
         drop(session);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .expect("mounted VFS shutdown should succeed");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .expect("repeated mounted VFS shutdown should succeed");
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
     }

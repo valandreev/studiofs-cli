@@ -7,11 +7,10 @@ It records the narrow implementation and validation for SFS-638.
 
 Concurrent filesystem teardown callers must observe one completed shutdown
 outcome. A failed durability barrier must not be hidden by a later `Ok(())`,
-and an upload-idle waiter must not sleep after the final upload has completed.
-The result is visible through deterministic shared-core tests; the same
-`StudioVfs::shutdown` path is used by the mount session and WinFSP adapter,
-while Linux/FUSE and macFUSE use the shared VFS lifecycle through their mount
-runtime.
+an upload-idle waiter must not sleep after the final upload has completed, and
+an owner future cancelled mid-shutdown must leave a retryable phase. The result
+is visible through deterministic shared-core tests plus mounted entry-path
+checks for Linux/FUSE, macFUSE, and WinFSP.
 
 ## Progress
 
@@ -21,6 +20,9 @@ runtime.
 - [x] (2026-08-05 20:31 Europe/Kyiv) Implement queue linearization and the shutdown phase gate without changing close ordering.
 - [x] (2026-08-05 20:36 Europe/Kyiv) Run shared crate tests, integration selection, lint/check/format hygiene.
 - [x] (2026-08-05 20:37 Europe/Kyiv) Record final evidence and the unavailable native mount cells.
+- [x] (2026-08-05 21:49 Europe/Kyiv) Reproduce review findings with RED tests for local-payload error propagation, typed replay, and cancelled-owner retry.
+- [x] (2026-08-05 21:49 Europe/Kyiv) Implement replayable typed shutdown errors, the retryable `Aborted` phase, and first-error selection including local-payload sync.
+- [x] (2026-08-05 21:49 Europe/Kyiv) Add mounted double-shutdown assertions to Linux/FUSE, macFUSE, and WinFSP entry-path smoke tests.
 
 ## Surprises & Discoveries
 
@@ -31,8 +33,12 @@ runtime.
   therefore the source of the map/count observation gap; deriving the count
   from the existing guard avoids a second synchronization protocol.
 - `VfsError` is not cloneable because several variants contain I/O or task
-  errors. Completed shutdown state must store a replayable public error
-  representation for waiters while preserving the existing close order.
+  errors. Completed shutdown state stores a replayable typed representation;
+  metadata and local-payload errors retain their public variants, while other
+  shutdown errors retain their stable message.
+- A cancelled owner can leave already-quiesced state behind, so the phase gate
+  uses `Aborted` and lets the next caller claim ownership and finish the same
+  idempotent cleanup path.
 
 ## Decision Log
 
@@ -45,24 +51,32 @@ runtime.
   `pending_state.by_object.len()`. Rationale: both indexes and the count then
   share one existing mutex and the notification is tied to the same state
   transition. Date/Author: 2026-08-05 / Codex.
-- Decision: Preserve the original shutdown error for the owner and replay its
-  stable display message as `VfsError::Other` for later callers. Rationale:
-  `VfsError` cannot be cloned without broadening its API, while every caller
-  still receives the same success/error outcome and message. Date/Author:
-  2026-08-05 / Codex.
+- Decision: Store a replayable shutdown error representation and reconstruct
+  the same public error family for the owner and later callers. Rationale:
+  `VfsError` cannot be cloned directly, but converting only at the completion
+  boundary avoids changing the public error API and preserves typed metadata
+  and local-payload failures. Date/Author: 2026-08-05 / Codex.
+- Decision: Publish `Aborted` rather than `Completed` when the owner future is
+  cancelled. Rationale: a later caller must be able to claim ownership and
+  finish cleanup after a partial async shutdown. Date/Author: 2026-08-05 /
+  Codex.
 
 ## Outcomes & Retrospective
 
 - RED evidence: the queue regression timed out after 100 ms and the concurrent
-  shutdown regression observed `Ok(())` from the second caller.
+  shutdown regression observed `Ok(())` from the second caller. The review
+  regressions initially failed to compile because typed outcome helpers and
+  the `Aborted` phase were absent.
 - GREEN evidence: `cargo test -p studiofs-cache --lib` passed 164 tests and
-  `cargo test -p studiofs-vfs --lib` passed 851 tests. With the workspace
-  `.env` loaded and `--ignored`, `test_double_shutdown_does_not_panic` passed
-  against the configured S3/PG environment.
+  `cargo test -p studiofs-vfs --lib` passed 854 tests. The five named SFS-638
+  focused regressions passed individually. With the workspace `.env` loaded,
+  the ignored `test_double_shutdown_does_not_panic` integration passed 1/1.
 - Hygiene evidence: `RUSTFLAGS=-Dwarnings cargo check -p studiofs-cache -p
   studiofs-vfs`, `cargo fmt --all -- --check`, and `git diff --check` passed.
-- Native mounted macFUSE/Linux-FUSE/WinFSP smoke tests were not run in this
-  validation; no result is inferred from the shared-core or S3/PG tests.
+- Native mounted evidence: the macFUSE mounted write/close smoke passed 1/1
+  outside the sandbox, including the repeated VFS shutdown assertions. Linux
+  FUSE is unavailable on this Darwin host (`/dev/fuse` is absent), and WinFSP
+  is unavailable because this is not a Windows runner.
 
 ## Context and Orientation
 
@@ -84,10 +98,10 @@ needed for this issue.
 
 ## Plan of Work
 
-First enable the existing lost-wake test and add a VFS test that starts one
-shutdown owner with a pending queue operation, waits until shutdown admission
-is closed, and calls shutdown again. The pre-fix test must observe the first
-call's error and fail because the concurrent caller returns `Ok(())`.
+First enable the existing lost-wake test and add VFS tests that cover first
+error selection, typed replay, and a cancelled owner. The cancelled-owner test
+must abort an owner while deferred namespace drain is pending, observe
+`Aborted`, and let a later caller complete shutdown.
 
 Next make `UploadQueue::PendingState` authoritative for the pending count.
 Create the idle notification future before the state/count check, check the
@@ -95,11 +109,18 @@ guarded map, and notify only when a removal transitions the map to empty.
 Keep duplicate, stale, requeue, and sender-closed semantics unchanged.
 
 Then replace the completed/requested shutdown short-circuits with a phase gate:
-`Running`, `ShuttingDown`, or `Completed(outcome)`. The first caller becomes
-owner; later callers wait for completion. Move the existing shutdown body into
-the owner path without changing its phase ordering, publish `Completed` only
-after the result is determined, and wake waiters afterward. Keep the existing
-`shutdown_requested` flag for stopping new work and background workers.
+`Running`, `ShuttingDown`, `Aborted`, or `Completed(outcome)`. The first caller
+becomes owner; later callers wait for completion. Move the existing shutdown
+body into the owner path without changing its phase ordering, publish
+`Completed` only after the result is determined, and wake waiters afterward.
+If the owner future is cancelled, publish `Aborted` so the next caller can
+retry. Keep the existing `shutdown_requested` flag for stopping new work and
+background workers.
+
+Add the same double-shutdown assertion after mounted file-path teardown in the
+Linux/FUSE and macFUSE smoke tests, and in the shared WinFSP mount-sanity
+cleanup helper. These checks exercise the bridge entry paths without changing
+the platform-specific unmount protocol.
 
 Finally add focused checks for the changed crates, formatting, warnings, and
 diff hygiene. Run platform-gated shared/adapter tests where this host supports
@@ -110,8 +131,8 @@ them and report native mount runners separately when unavailable.
 ### M0 — RED regression tests
 
 The queue and VFS tests fail for the known reasons: a completed last upload
-does not wake the waiter, and a concurrent shutdown caller returns `Ok(())`
-instead of the owner's error.
+does not wake the waiter, a local-payload sync error becomes `Ok(())`, typed
+replay helpers are absent, and a cancelled owner leaves no retryable phase.
 
 ### M1 — Shared lifecycle fix
 
@@ -121,9 +142,10 @@ their previous semantics.
 
 ### M2 — Validation and handoff
 
-The shared crates pass focused tests and warning checks. macFUSE, Linux/FUSE,
-WinFSP, PostgreSQL, and S3 cells are recorded as pass or unavailable rather
-than inferred from a non-native host.
+The shared crates pass focused tests and warning checks. Mounted macFUSE,
+Linux/FUSE, and WinFSP cells are recorded as pass or unavailable rather than
+inferred from a non-native host; the mounted smoke code contains the same
+double-shutdown assertions on each platform.
 
 ## Concrete Steps
 
@@ -131,12 +153,26 @@ Run commands from `/Volumes/Storage/dev/studiofs`.
 
     cargo test -p studiofs-cache wait_for_idle_wakes_after_last_completion -- --nocapture
     cargo test -p studiofs-vfs concurrent_shutdown_callers_observe_first_error -- --nocapture
+    cargo test -p studiofs-vfs cancelled_shutdown_owner_can_be_retried -- --nocapture
+    cargo test -p studiofs-vfs shutdown_result_reports_local_payload_sync_failure -- --nocapture
+    cargo test -p studiofs-vfs shutdown_replay_preserves_typed_error_for_owner_and_waiter -- --nocapture
     cargo test -p studiofs-cache upload_queue -- --nocapture
     cargo test -p studiofs-vfs vfs::upload_lifecycle -- --nocapture
     cargo test -p studiofs-vfs vfs::tests -- --nocapture
     RUSTFLAGS='-D warnings' cargo check -p studiofs-cache -p studiofs-vfs
     cargo fmt --all -- --check
     git diff --check
+
+Expected focused-test transcript (one command at a time):
+
+    running 1 test
+    test ... ... ok
+    test result: ok. 1 passed; 0 failed
+
+Expected hygiene transcript:
+
+    Finished `dev` profile ...
+    (no output from `cargo fmt --all -- --check` or `git diff --check`)
 
 Use one Cargo test filter per command to avoid workspace file-lock contention.
 Do not run destructive cleanup outside the existing `target/` test helpers.
@@ -145,9 +181,11 @@ Do not run destructive cleanup outside the existing `target/` test helpers.
 
 The queue regression passes only when a waiter that has registered before the
 completion transition returns promptly and the pending map/count state is
-empty together. The shutdown regression passes only when concurrent and later
-callers receive the same first error message, while a successful shutdown
-continues to return success for all callers.
+empty together. The shutdown regressions pass only when concurrent and later
+callers receive the same typed first error, a local-payload sync failure is
+returned instead of `Ok(())`, and a later caller can finish after owner
+cancellation. A successful mounted entry-path shutdown continues to return
+success for repeated callers.
 
 The focused cache/VFS tests, `RUSTFLAGS='-D warnings' cargo check`, formatter,
 and `git diff --check` are required local evidence. Native mounted shutdown
@@ -166,7 +204,9 @@ timeout to hide the bug.
 
 Keep generated test databases and logs under `target/`. Do not commit logs,
 temporary artifacts, or platform-specific output. Update this plan with the
-final focused command results and unavailable matrix cells.
+final focused command results and unavailable matrix cells. The mounted
+macFUSE run required the host mount permission; the sandbox-only attempt was
+rejected with `Operation not permitted` before the test assertion.
 
 ## Interfaces and Dependencies
 
@@ -174,3 +214,11 @@ No new crate or public abstraction is required. The implementation uses the
 existing `parking_lot::Mutex`, Tokio `Notify`, `PendingUpload`, `VfsError`, and
 `StudioVfs` lifecycle methods. The public shutdown signature and upload queue
 API remain unchanged.
+
+## Revision Note
+
+2026-08-05: Revised after code review to preserve typed shutdown errors,
+propagate local-payload sync failures, make owner cancellation retryable, add
+mounted double-shutdown assertions for all three bridge entry paths, register
+the new named regressions in `docs/tests.md`, and record expected command
+transcripts required by `.agent/PLANS.md`.

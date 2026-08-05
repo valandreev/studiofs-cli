@@ -28,6 +28,19 @@ performance checks that should be recorded before closing the feature.
 1. Fast local/unit tests (default).
 2. Ignored integration tests with RustFS/S3 + PostgreSQL.
 
+### SFS-638 Shutdown and Upload-Idle Regressions
+
+Run these focused regressions when changing shutdown ownership, shutdown error
+replay, or the upload-idle notification protocol:
+
+```bash
+cargo test -p studiofs-cache wait_for_idle_wakes_after_last_completion -- --nocapture
+cargo test -p studiofs-vfs concurrent_shutdown_callers_observe_first_error -- --nocapture
+cargo test -p studiofs-vfs cancelled_shutdown_owner_can_be_retried -- --nocapture
+cargo test -p studiofs-vfs shutdown_result_reports_local_payload_sync_failure -- --nocapture
+cargo test -p studiofs-vfs shutdown_replay_preserves_typed_error_for_owner_and_waiter -- --nocapture
+```
+
 ## Contract/Core Harness
 
 Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,

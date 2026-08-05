@@ -712,6 +712,9 @@ where
     rt_for_shutdown
         .block_on(vfs_for_shutdown.shutdown(Duration::from_secs(1)))
         .expect("VFS shutdown should succeed");
+    rt_for_shutdown
+        .block_on(vfs_for_shutdown.shutdown(Duration::from_secs(1)))
+        .expect("repeated VFS shutdown should succeed");
 
     match result {
         Ok(value) => {
