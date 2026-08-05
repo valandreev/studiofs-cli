@@ -57,11 +57,71 @@ impl Drop for ShutdownOwnerGuard<'_> {
     }
 }
 
+struct BackgroundTaskJoinGuard<'a> {
+    state: &'a super::ShutdownState,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl<'a> BackgroundTaskJoinGuard<'a> {
+    fn new(state: &'a super::ShutdownState, handles: Vec<JoinHandle<()>>) -> Self {
+        Self { state, handles }
+    }
+}
+
+impl Drop for BackgroundTaskJoinGuard<'_> {
+    fn drop(&mut self) {
+        if !self.handles.is_empty() {
+            self.state
+                .background_tasks
+                .lock()
+                .extend(std::mem::take(&mut self.handles));
+        }
+    }
+}
+
+struct UploaderTaskJoinGuard<'a> {
+    state: &'a super::ShutdownState,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl<'a> UploaderTaskJoinGuard<'a> {
+    fn new(state: &'a super::ShutdownState, handle: JoinHandle<()>) -> Self {
+        Self {
+            state,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for UploaderTaskJoinGuard<'_> {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let mut tracked = self.state.uploader_task.lock();
+        if tracked.is_none() {
+            *tracked = Some(handle);
+        }
+    }
+}
+
 fn replay_shutdown_result(error: Option<ShutdownError>) -> VfsResult<()> {
     match error {
         Some(error) => Err(error.into_vfs_error()),
         None => Ok(()),
     }
+}
+
+fn finish_shutdown_result(
+    shutdown_owner: ShutdownOwnerGuard<'_>,
+    shutdown_result: VfsResult<()>,
+) -> VfsResult<()> {
+    let shutdown_error = shutdown_result
+        .as_ref()
+        .err()
+        .map(ShutdownError::from_vfs_error);
+    shutdown_owner.complete(shutdown_error);
+    shutdown_result
 }
 
 fn select_shutdown_result(
@@ -198,17 +258,19 @@ impl StudioVfs {
             let mut handles = self.state.shutdown.background_tasks.lock();
             std::mem::take(&mut *handles)
         };
-        Self::join_background_task_handles(handles, timeout).await;
+        let mut guard = BackgroundTaskJoinGuard::new(&self.state.shutdown, handles);
+        Self::join_background_task_handles(&mut guard.handles, timeout).await;
     }
 
-    async fn join_background_task_handles(mut handles: Vec<JoinHandle<()>>, timeout: Duration) {
+    async fn join_background_task_handles(handles: &mut Vec<JoinHandle<()>>, timeout: Duration) {
         let join_result = tokio::time::timeout(timeout, async {
-            for handle in &mut handles {
-                if let Err(e) = handle.await
+            while !handles.is_empty() {
+                if let Err(e) = (&mut handles[0]).await
                     && !e.is_cancelled()
                 {
                     warn!(error = %e, "background task join failed");
                 }
+                handles.remove(0);
             }
         })
         .await;
@@ -217,12 +279,12 @@ impl StudioVfs {
                 .iter()
                 .filter(|handle| !handle.is_finished())
                 .count();
-            for handle in handles {
-                if handle.is_finished() {
-                    continue;
+            while !handles.is_empty() {
+                if !handles[0].is_finished() {
+                    handles[0].abort();
+                    let _ = (&mut handles[0]).await;
                 }
-                handle.abort();
-                let _ = handle.await;
+                handles.remove(0);
             }
             if aborted > 0 {
                 warn!(
@@ -235,16 +297,23 @@ impl StudioVfs {
 
     async fn join_uploader_task(&self, timeout: Duration) {
         let handle = self.state.shutdown.uploader_task.lock().take();
-        let Some(mut handle) = handle else {
+        let Some(handle) = handle else {
             return;
         };
-        match tokio::time::timeout(timeout, &mut handle).await {
+        let mut guard = UploaderTaskJoinGuard::new(&self.state.shutdown, handle);
+        let join_result = tokio::time::timeout(
+            timeout,
+            guard.handle.as_mut().expect("uploader handle is present"),
+        )
+        .await;
+        match join_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) if e.is_cancelled() => {}
             Ok(Err(e)) => {
                 warn!(error = %e, "uploader task join failed");
             }
             Err(_) => {
+                let handle = guard.handle.as_mut().expect("uploader handle is present");
                 handle.abort();
                 let _ = handle.await;
                 warn!(
@@ -253,6 +322,7 @@ impl StudioVfs {
                 );
             }
         }
+        guard.handle.take();
     }
 
     pub(super) fn pending_age_stats_ms(&self, pending_uploads: &[PendingUpload]) -> (u64, u64) {
@@ -553,16 +623,12 @@ impl StudioVfs {
             metadata_barrier_error,
             local_payload_sync_result,
         );
-        let shutdown_error = shutdown_result
-            .as_ref()
-            .err()
-            .map(ShutdownError::from_vfs_error);
-        shutdown_owner.complete(shutdown_error.clone());
+        let shutdown_result = finish_shutdown_result(shutdown_owner, shutdown_result);
         info!(
             total_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: complete"
         );
-        replay_shutdown_result(shutdown_error)
+        shutdown_result
     }
 }
 
@@ -572,21 +638,22 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ShutdownError, StudioVfs, replay_shutdown_result, select_shutdown_result,
-        shutdown_recoverable_on_restart,
+        BackgroundTaskJoinGuard, ShutdownError, ShutdownOwnerGuard, StudioVfs,
+        UploaderTaskJoinGuard, finish_shutdown_result, replay_shutdown_result,
+        select_shutdown_result, shutdown_recoverable_on_restart,
     };
-    use crate::vfs::VfsError;
+    use crate::vfs::{ShutdownState, VfsError};
     use studiofs_cache::local::LocalPayloadBackendError;
     use studiofs_data::store::DataError;
     use studiofs_meta::MetaError;
 
     #[tokio::test(start_paused = true)]
     async fn background_tasks_share_one_join_deadline() {
-        let handles = (0..3).map(|_| tokio::spawn(future::pending())).collect();
+        let mut handles = (0..3).map(|_| tokio::spawn(future::pending())).collect();
         let timeout = Duration::from_secs(2);
         let started = tokio::time::Instant::now();
 
-        StudioVfs::join_background_task_handles(handles, timeout).await;
+        StudioVfs::join_background_task_handles(&mut handles, timeout).await;
 
         assert_eq!(started.elapsed(), timeout);
     }
@@ -599,12 +666,49 @@ mod tests {
             future::pending::<()>().await;
         });
 
-        StudioVfs::join_background_task_handles(vec![handle], Duration::ZERO).await;
+        let mut handles = vec![handle];
+        StudioVfs::join_background_task_handles(&mut handles, Duration::ZERO).await;
 
         assert!(matches!(
             receiver.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn dropped_background_join_guard_restores_unjoined_handles() {
+        let state = ShutdownState::new();
+        let handle = tokio::spawn(future::pending::<()>());
+
+        {
+            let _guard = BackgroundTaskJoinGuard::new(&state, vec![handle]);
+        }
+
+        let handle = state
+            .background_tasks
+            .lock()
+            .pop()
+            .expect("cancelled join must restore the task handle");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn dropped_uploader_join_guard_restores_unjoined_handle() {
+        let state = ShutdownState::new();
+        let handle = tokio::spawn(future::pending::<()>());
+
+        {
+            let _guard = UploaderTaskJoinGuard::new(&state, handle);
+        }
+
+        let handle = state
+            .uploader_task
+            .lock()
+            .take()
+            .expect("cancelled join must restore the uploader handle");
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[test]
@@ -649,5 +753,19 @@ mod tests {
 
         assert!(matches!(owner, Err(VfsError::Data(_))));
         assert!(matches!(waiter, Err(VfsError::Data(_))));
+    }
+
+    #[test]
+    fn shutdown_owner_returns_original_error_variant() {
+        let state = ShutdownState::new();
+        let owner = ShutdownOwnerGuard::new(&state);
+        let result = finish_shutdown_result(
+            owner,
+            Err(VfsError::Fetch(crate::fetch::FetchError::NotFound {
+                key: "missing".to_string(),
+            })),
+        );
+
+        assert!(matches!(result, Err(VfsError::Fetch(_))));
     }
 }
