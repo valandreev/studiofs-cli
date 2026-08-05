@@ -18,15 +18,17 @@ The result is visible through the metadata crate tests: a raw redb row written b
 - [x] (2026-08-05) Routed redb and PostgreSQL event-log writes and reads through the codec; PostgreSQL replay now validates `event_type`.
 - [x] (2026-08-05) Added stable-tag/golden fixtures for all current event kinds, legacy/unknown/trailing/type rejection tests, local restart coverage, and a mixed new/legacy PostgreSQL replay fixture.
 - [x] (2026-08-05) Documented the SFS-639 operational rollout gate and minimum reader version in `docs/architecture.md`.
-- [x] (2026-08-05) Ran final metadata verification: 388 passed, 0 failed, 68 ignored; `-D warnings` all-targets check, formatting, and `git diff --check` passed.
+- [x] (2026-08-05) Ran final metadata verification after review fixes: 389 passed, 0 failed, 68 ignored; `-D warnings` all-targets check, formatting, and `git diff --check` passed.
 - [x] (2026-08-05) Loaded `STUDIOFS_TEST_PG_DSN` from the workspace `.env` through the existing test harness and ran `test_pg_conflicting_batch_does_not_block_later_foreign_batch`: 1 passed.
 - [x] (2026-08-05) Applied review simplification: removed the duplicate PostgreSQL event-kind allowlist; direct `MetaEvent::kind()` comparison still rejects unknown and mismatched event types.
+- [x] (2026-08-05) Addressed review findings: legacy rows now use a frozen ordinal-to-tag mapping instead of deserializing into the public enum, and all 17 event variants have independent legacy and V1 byte fixtures. A temporary tag mutation made the V1 golden test fail before the original tag was restored.
 
 ## Surprises & Discoveries
 
 - The issue description says PostgreSQL currently lacks `event_type`, but the checked-out schema and insert query already contain that column. The remaining defect is that foreign-row SELECT omits it and replay ignores it; the implementation will preserve the existing column and add validation rather than introduce a duplicate migration.
 - `postcard::from_bytes` does not report unused input. The codec must use `postcard::take_from_bytes` and reject a non-empty remainder so a corrupted payload cannot be accepted as a valid prefix.
 - The generic redb `encode`/`decode` helpers are used for many unrelated persisted types. They will remain unchanged; only event-log call sites will use the new event-specific codec.
+- Deserializing legacy bytes directly into `MetaEvent` preserves the original ordinal dependency. The compatibility path must parse the historical ordinal separately and map it explicitly to the shared tagged payload decoder.
 
 ## Decision Log
 
@@ -35,10 +37,11 @@ The result is visible through the metadata crate tests: a raw redb row written b
 - Decision: Use the existing lowercase `MetaEvent::kind()` strings as PostgreSQL tags and require them to match the decoded event. Rationale: the strings are already persisted and populated by the current insert path, so this adds validation without changing the table or requiring a migration. Date/Author: 2026-08-05, Codex.
 - Decision: Encode each event's fields explicitly rather than serializing `MetaEvent` inside the new envelope. Rationale: serializing the public enum again would retain the ordinal-evolution problem inside the payload. Date/Author: 2026-08-05, Codex.
 - Decision: Treat the SFS-639 migration gate as an operational minimum-reader rule instead of adding a new persisted feature flag or schema migration. Rationale: the existing schema has no capability negotiation field, and introducing one would expand the issue; all new readers dual-read legacy rows, while the architecture docs require every shared-log reader to be upgraded before a new writer is enabled. Date/Author: 2026-08-05, Codex.
+- Decision: Decode the historical postcard ordinal as `u32`, map only ordinals `0..=16` to the existing stable tags, and reject every other value. Rationale: this freezes legacy meaning without duplicating the full public enum or its payload decoder. Date/Author: 2026-08-05, Codex.
 
 ## Outcomes & Retrospective
 
-Implementation is complete for the local metadata and shared codec paths. The final diff is limited to the event codec, redb/PostgreSQL event-log call sites, focused tests, architecture documentation, and this plan. The metadata lib suite passes with 388 tests and 68 environment-gated PostgreSQL tests ignored; the live mixed-row PostgreSQL replay test also passes with the workspace `.env` configuration.
+Implementation is complete for the local metadata and shared codec paths. The final diff is limited to the event codec, redb/PostgreSQL event-log call sites, focused tests, architecture documentation, and this plan. The metadata lib suite passes with 389 tests and 68 environment-gated PostgreSQL tests ignored; the live mixed-row PostgreSQL replay test also passes with the workspace `.env` configuration.
 
 ## Context and Orientation
 
@@ -52,7 +55,7 @@ The compatibility reader must accept the historical postcard representation, inc
 
 First add a red test in `crates/studiofs-meta/src/redb_engine/tests.rs` that calls the existing append path for `MetaEvent::RemoveAttr { ino: 42 }`, reads the raw event-log row, and asserts the new magic prefix. Run only the metadata test filter and confirm the assertion fails because the current row is the legacy ordinal payload.
 
-Then add crate-visible `encode_event` and `decode_event` helpers in `events.rs`. The encoder will map every current variant to a fixed tag and serialize only its fields into postcard. The decoder will recognize the magic envelope, reject short headers, unsupported versions, unknown tags, and trailing payload bytes, then reconstruct the public enum. Bytes without the magic will be decoded through the legacy `postcard::from_bytes::<MetaEvent>` path for backward compatibility. Add a helper that validates a PostgreSQL `event_type` string and compares it with the decoded event's stable `kind()`.
+Then add crate-visible `encode_event` and `decode_event` helpers in `events.rs`. The encoder will map every current variant to a fixed tag and serialize only its fields into postcard. The decoder will recognize the magic envelope, reject short headers, unsupported versions, unknown tags, and trailing payload bytes, then reconstruct the public enum. Bytes without the magic will decode through a frozen historical ordinal-to-tag mapping and the same tagged payload decoder, never through the evolving public enum. Add a helper that validates a PostgreSQL `event_type` string and compares it with the decoded event's stable `kind()`.
 
 Route only event-log persistence through these helpers: replace `encode(event)` in `append_event_in_txn`, replace the direct PostgreSQL postcard encoder in `push_projected_event_log_batch_locked`, and include `event_type` in `SELECT_FOREIGN_EVENT_ROWS`. Update `decode_foreign_batch` to read the shifted columns, reject unknown or mismatched event types, and decode both legacy and new payloads through the shared helper. Keep dump/load byte preservation unchanged; it copies event rows and does not need to reinterpret them.
 
@@ -87,7 +90,7 @@ Run all commands from `/Volumes/Storage/dev/studiofs`.
 Acceptance requires all of the following observable behavior:
 
 - The normal redb append path writes the new magic/version/tag envelope, and a fresh engine restart reads it back as the same event.
-- The historical ordinal fixture `[1, 42]` still replays as `RemoveAttr { ino: 42 }`.
+- Independent byte fixtures for all historical ordinals replay as their original events, including `[1, 42]` as `RemoveAttr { ino: 42 }`; unknown ordinals fail closed.
 - Every current event variant round-trips through the new codec with a stable explicit tag whose value is not derived from the public enum ordinal.
 - PostgreSQL writes the new payload and its existing `event_type`; foreign replay selects and validates both. A legacy payload with the correct type still replays.
 - Unknown envelope versions, unknown tags, unknown PostgreSQL event types, mismatched type/payload pairs, truncated headers, and trailing bytes return `MetaError::Serialization` with an actionable message and do not apply an event.
@@ -111,4 +114,4 @@ The final crate-local interface is:
 
 These helpers use the already-installed `postcard`, `serde`, and `thiserror` dependencies. They do not change the public `MetaEvent` shape, the generic redb codec, the PostgreSQL table schema, or any platform bridge.
 
-Plan revision note (2026-08-05): created after inspecting the live issue and current HEAD. The plan explicitly records that `event_type` already exists and narrows the work to shared versioned payload encoding, dual-read compatibility, and validation.
+Plan revision note (2026-08-05): created after inspecting the live issue and current HEAD. The plan explicitly records that `event_type` already exists and narrows the work to shared versioned payload encoding, dual-read compatibility, and validation. Updated after review to freeze the legacy ordinal mapping and replace self-roundtrip coverage with independent V0/V1 byte fixtures.

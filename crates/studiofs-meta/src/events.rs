@@ -369,7 +369,7 @@ pub(crate) fn decode_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
         return decode_tagged_event(tag, payload);
     }
 
-    decode_complete(bytes, "legacy MetaEvent")
+    decode_legacy_event(bytes)
 }
 
 pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResult<MetaEvent> {
@@ -403,6 +403,37 @@ fn decode_complete<T: DeserializeOwned>(bytes: &[u8], context: &str) -> MetaResu
         )));
     }
     Ok(value)
+}
+
+fn decode_legacy_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
+    let (ordinal, payload) = postcard::take_from_bytes::<u32>(bytes).map_err(|error| {
+        MetaError::Serialization(format!("legacy MetaEvent ordinal decode failed: {error}"))
+    })?;
+    let tag = match ordinal {
+        0 => TAG_SET_ATTR,
+        1 => TAG_REMOVE_ATTR,
+        2 => TAG_ADD_ENTRY,
+        3 => TAG_REMOVE_ENTRY,
+        4 => TAG_RENAME_ENTRY,
+        5 => TAG_REMOVE_REGULAR_FILE_GRAPH,
+        6 => TAG_SET_REGULAR_FILE_OVERLAY_SLICES,
+        7 => TAG_PUBLISH_REGULAR_FILE_BASE_SLICES,
+        8 => TAG_SET_SYMLINK_TARGET,
+        9 => TAG_SET_XATTR,
+        10 => TAG_REMOVE_XATTR,
+        11 => TAG_SET_ACL_RULE,
+        12 => TAG_REMOVE_ACL_RULE,
+        13 => TAG_ADD_PENDING_DELETION,
+        14 => TAG_REMOVE_PENDING_DELETION,
+        15 => TAG_CREATE_SNAPSHOT,
+        16 => TAG_UPDATE_SNAPSHOT_STATE,
+        _ => {
+            return Err(MetaError::Serialization(format!(
+                "unknown legacy MetaEvent ordinal {ordinal}"
+            )));
+        }
+    };
+    decode_tagged_event(tag, payload)
 }
 
 fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
@@ -556,29 +587,39 @@ mod tests {
         )]
     }
 
-    fn event_fixtures() -> Vec<(MetaEvent, u8)> {
+    fn event_fixtures() -> Vec<(MetaEvent, &'static [u8], &'static [u8])> {
         let attr = sample_attr(11, FileType::RegularFile);
         let entry = DirEntryValue {
             ino: 12,
             kind: FileType::Directory,
         };
         vec![
-            (MetaEvent::SetAttr { attr: attr.clone() }, TAG_SET_ATTR),
-            (MetaEvent::RemoveAttr { ino: 13 }, TAG_REMOVE_ATTR),
+            (
+                MetaEvent::SetAttr { attr: attr.clone() },
+                b"SFS-EVT\x01\x01\x0b\x00\xa4\x03\x0a\x14\x1e\x19\x01\x50\x64\x78\x02\x8c\x01\x50\x5a\x64\x02",
+                b"\x00\x0b\x00\xa4\x03\x0a\x14\x1e\x19\x01\x50\x64\x78\x02\x8c\x01\x50\x5a\x64\x02",
+            ),
+            (
+                MetaEvent::RemoveAttr { ino: 13 },
+                b"SFS-EVT\x01\x02\x0d",
+                b"\x01\x0d",
+            ),
             (
                 MetaEvent::AddEntry {
                     parent: 14,
                     name: b"child".to_vec(),
                     entry: entry.clone(),
                 },
-                TAG_ADD_ENTRY,
+                b"SFS-EVT\x01\x03\x0e\x05child\x0c\x01",
+                b"\x02\x0e\x05child\x0c\x01",
             ),
             (
                 MetaEvent::RemoveEntry {
                     parent: 15,
                     name: b"old".to_vec(),
                 },
-                TAG_REMOVE_ENTRY,
+                b"SFS-EVT\x01\x04\x0f\x03old",
+                b"\x03\x0f\x03old",
             ),
             (
                 MetaEvent::RenameEntry {
@@ -593,32 +634,51 @@ mod tests {
                     old_parent_attr: Box::new(Some(attr.clone())),
                     new_parent_attr: Box::new(Some(attr.clone())),
                 },
-                TAG_RENAME_ENTRY,
+                &[
+                    83, 70, 83, 45, 69, 86, 84, 1, 5, 16, 4, 102, 114, 111, 109, 17, 2,
+                    116, 111, 12, 1, 1, 11, 0, 164, 3, 10, 20, 30, 25, 1, 80, 100, 120, 2,
+                    140, 1, 80, 90, 100, 2, 1, 18, 1, 11, 0, 164, 3, 10, 20, 30, 25, 1, 80,
+                    100, 120, 2, 140, 1, 80, 90, 100, 2, 1, 11, 0, 164, 3, 10, 20, 30, 25, 1,
+                    80, 100, 120, 2, 140, 1, 80, 90, 100, 2, 1, 11, 0, 164, 3, 10, 20, 30,
+                    25, 1, 80, 100, 120, 2, 140, 1, 80, 90, 100, 2,
+                ],
+                &[
+                    4, 16, 4, 102, 114, 111, 109, 17, 2, 116, 111, 12, 1, 1, 11, 0, 164, 3,
+                    10, 20, 30, 25, 1, 80, 100, 120, 2, 140, 1, 80, 90, 100, 2, 1, 18, 1,
+                    11, 0, 164, 3, 10, 20, 30, 25, 1, 80, 100, 120, 2, 140, 1, 80, 90, 100,
+                    2, 1, 11, 0, 164, 3, 10, 20, 30, 25, 1, 80, 100, 120, 2, 140, 1, 80, 90,
+                    100, 2, 1, 11, 0, 164, 3, 10, 20, 30, 25, 1, 80, 100, 120, 2, 140, 1,
+                    80, 90, 100, 2,
+                ],
             ),
             (
                 MetaEvent::RemoveRegularFileGraph { ino: 19 },
-                TAG_REMOVE_REGULAR_FILE_GRAPH,
+                b"SFS-EVT\x01\x06\x13",
+                b"\x05\x13",
             ),
             (
                 MetaEvent::SetRegularFileOverlaySlices {
                     ino: 20,
                     chunk_slices: sample_slices(),
                 },
-                TAG_SET_REGULAR_FILE_OVERLAY_SLICES,
+                b"SFS-EVT\x01\x07\x14\x01\x03\x01\x04\x05\x06\x07\x01\x08\x00\x09\x02\x00",
+                b"\x06\x14\x01\x03\x01\x04\x05\x06\x07\x01\x08\x00\x09\x02\x00",
             ),
             (
                 MetaEvent::PublishRegularFileBaseSlices {
                     ino: 21,
                     chunk_slices: sample_slices(),
                 },
-                TAG_PUBLISH_REGULAR_FILE_BASE_SLICES,
+                b"SFS-EVT\x01\x08\x15\x01\x03\x01\x04\x05\x06\x07\x01\x08\x00\x09\x02\x00",
+                b"\x07\x15\x01\x03\x01\x04\x05\x06\x07\x01\x08\x00\x09\x02\x00",
             ),
             (
                 MetaEvent::SetSymlinkTarget {
                     ino: 22,
                     target: b"/target".to_vec(),
                 },
-                TAG_SET_SYMLINK_TARGET,
+                b"SFS-EVT\x01\x09\x16\x07/target",
+                b"\x08\x16\x07/target",
             ),
             (
                 MetaEvent::SetXattr {
@@ -627,14 +687,16 @@ mod tests {
                     value: b"value".to_vec(),
                     flags: 1,
                 },
-                TAG_SET_XATTR,
+                b"SFS-EVT\x01\x0a\x17\x08user.key\x05value\x01",
+                b"\x09\x17\x08user.key\x05value\x01",
             ),
             (
                 MetaEvent::RemoveXattr {
                     ino: 24,
                     name: b"user.key".to_vec(),
                 },
-                TAG_REMOVE_XATTR,
+                b"SFS-EVT\x01\x0b\x18\x08user.key",
+                b"\x0a\x18\x08user.key",
             ),
             (
                 MetaEvent::SetAclRule {
@@ -642,25 +704,29 @@ mod tests {
                     principal: "alice".to_string(),
                     access_level: AccessLevel::ReadWrite,
                 },
-                TAG_SET_ACL_RULE,
+                b"SFS-EVT\x01\x0c\x19\x05alice\x02",
+                b"\x0b\x19\x05alice\x02",
             ),
             (
                 MetaEvent::RemoveAclRule {
                     ino: 26,
                     principal: "alice".to_string(),
                 },
-                TAG_REMOVE_ACL_RULE,
+                b"SFS-EVT\x01\x0d\x1a\x05alice",
+                b"\x0c\x1a\x05alice",
             ),
             (
                 MetaEvent::AddPendingDeletion {
                     object_id: 27,
                     timestamp: 28,
                 },
-                TAG_ADD_PENDING_DELETION,
+                b"SFS-EVT\x01\x0e\x1b\x38",
+                b"\x0d\x1b\x38",
             ),
             (
                 MetaEvent::RemovePendingDeletion { object_id: 29 },
-                TAG_REMOVE_PENDING_DELETION,
+                b"SFS-EVT\x01\x0f\x1d",
+                b"\x0e\x1d",
             ),
             (
                 MetaEvent::CreateSnapshot {
@@ -673,44 +739,37 @@ mod tests {
                         snapshot_payload: b"payload".to_vec(),
                     },
                 },
-                TAG_CREATE_SNAPSHOT,
+                b"SFS-EVT\x01\x10\x08snapshot\x1e\x3e\x01\x01\x20\x07payload",
+                b"\x0f\x08snapshot\x1e\x3e\x01\x01\x20\x07payload",
             ),
             (
                 MetaEvent::UpdateSnapshotState {
                     id: "snapshot".to_string(),
                     state: SnapshotState::Failed,
                 },
-                TAG_UPDATE_SNAPSHOT_STATE,
+                b"SFS-EVT\x01\x11\x08snapshot\x02",
+                b"\x10\x08snapshot\x02",
             ),
         ]
     }
 
     #[test]
-    fn remove_attr_new_wire_fixture_is_independent_of_enum_ordinal() {
-        let event = MetaEvent::RemoveAttr { ino: 42 };
+    fn every_event_kind_matches_its_versioned_wire_fixture() {
+        for (event, expected_wire, _) in event_fixtures() {
+            let encoded = encode_event(&event).expect("encode event fixture");
+            assert_eq!(encoded, expected_wire, "fixture drift for {}", event.kind());
 
-        assert_eq!(
-            encode_event(&event).expect("encode event"),
-            b"SFS-EVT\x01\x02\x2a"
-        );
+            let decoded = decode_event(expected_wire).expect("decode event fixture");
+            assert_eq!(decoded.kind(), event.kind());
+            assert_eq!(format!("{decoded:?}"), format!("{event:?}"));
+        }
     }
 
     #[test]
-    fn every_event_kind_roundtrips_with_its_stable_wire_tag() {
-        for (event, expected_tag) in event_fixtures() {
-            let encoded = encode_event(&event).expect("encode event fixture");
-            assert_eq!(
-                encoded[..META_EVENT_WIRE_MAGIC.len()],
-                *META_EVENT_WIRE_MAGIC
-            );
-            assert_eq!(
-                encoded[META_EVENT_WIRE_MAGIC.len()],
-                META_EVENT_WIRE_VERSION
-            );
-            assert_eq!(encoded[META_EVENT_WIRE_MAGIC.len() + 1], expected_tag);
+    fn every_legacy_event_fixture_decodes_with_its_original_ordinal() {
+        for (event, _, legacy_wire) in event_fixtures() {
+            let decoded = decode_event(legacy_wire).expect("decode legacy event fixture");
 
-            let decoded = decode_event(&encoded).expect("decode event fixture");
-            assert_eq!(decoded.kind(), event.kind());
             assert_eq!(format!("{decoded:?}"), format!("{event:?}"));
         }
     }
@@ -720,6 +779,18 @@ mod tests {
         let event = decode_event(&[1_u8, 42_u8]).expect("decode legacy event");
 
         assert!(matches!(event, MetaEvent::RemoveAttr { ino: 42 }));
+    }
+
+    #[test]
+    fn unknown_legacy_ordinal_is_rejected_with_actionable_error() {
+        let error = decode_event(&[17_u8]).expect_err("unknown legacy ordinal");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown legacy MetaEvent ordinal 17"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
