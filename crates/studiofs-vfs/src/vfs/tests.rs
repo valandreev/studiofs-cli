@@ -13307,6 +13307,92 @@ fn shutdown_waits_for_an_active_empty_deferred_namespace_worker() {
 }
 
 #[test]
+fn concurrent_shutdown_callers_observe_first_error() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "concurrent-shutdown-error");
+    let _guard = rt.enter();
+
+    vfs.state
+        .namespace
+        .deferred
+        .degraded
+        .store(true, AtomicOrdering::Release);
+    vfs.cached_store
+        .submit_upload_with_payload(ROOT_INO, 0, 0, 9_900_001, 1, 1);
+
+    rt.block_on(async {
+        let owner_vfs = Arc::clone(&vfs);
+        let owner =
+            tokio::spawn(async move { owner_vfs.shutdown(Duration::from_millis(20)).await });
+
+        while !vfs.shutdown_requested() {
+            tokio::task::yield_now().await;
+        }
+
+        let concurrent = vfs
+            .shutdown(Duration::from_millis(20))
+            .await
+            .expect_err("concurrent shutdown must not hide the owner's error");
+        let owner = owner
+            .await
+            .expect("shutdown owner must not panic")
+            .expect_err("shutdown owner should report the deferred persistence error");
+        let repeated = vfs
+            .shutdown(Duration::from_millis(20))
+            .await
+            .expect_err("repeated shutdown must replay the first error");
+
+        assert_eq!(concurrent.to_string(), owner.to_string());
+        assert_eq!(repeated.to_string(), owner.to_string());
+    });
+}
+
+#[test]
+fn cancelled_shutdown_owner_can_be_retried() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "cancelled-shutdown-owner");
+    let _guard = rt.enter();
+
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(true, AtomicOrdering::Release);
+
+    rt.block_on(async {
+        let owner_vfs = Arc::clone(&vfs);
+        let owner = tokio::spawn(async move { owner_vfs.shutdown(Duration::ZERO).await });
+
+        while !vfs.shutdown_requested() {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        owner.abort();
+        assert!(
+            owner
+                .await
+                .expect_err("cancelled owner must not finish")
+                .is_cancelled()
+        );
+        assert!(matches!(
+            &*vfs.state.shutdown.shutdown_phase.lock(),
+            ShutdownPhase::Aborted
+        ));
+
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(false, AtomicOrdering::Release);
+        vfs.state.namespace.deferred.notify.notify_waiters();
+
+        vfs.shutdown(Duration::ZERO)
+            .await
+            .expect("a later caller must retry the aborted shutdown");
+    });
+}
+
+#[test]
 fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");

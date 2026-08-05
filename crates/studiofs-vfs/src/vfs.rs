@@ -160,7 +160,7 @@ use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2126,11 +2126,167 @@ impl ReadState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ShutdownError {
+    Meta(MetaError),
+    Data(String),
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    BlockNotFound(Ino, u32),
+    WouldBlock,
+    RemoteContentPending,
+    InvalidName(String),
+    QosFailure {
+        stage: String,
+        object_id: u64,
+        message: String,
+    },
+    LocalPayloadRuntimeDetection {
+        cache_root: String,
+        kind: io::ErrorKind,
+        message: String,
+    },
+    LocalPayload(ShutdownLocalPayloadError),
+    UploadStage {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    Other(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ShutdownLocalPayloadError {
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    CapacityExhausted {
+        needed: u64,
+        free: u64,
+    },
+    Other(String),
+}
+
+impl ShutdownError {
+    pub(crate) fn from_vfs_error(error: &VfsError) -> Self {
+        match error {
+            VfsError::Meta(error) => Self::Meta(error.clone()),
+            VfsError::Data(error) => Self::Data(error.to_string()),
+            VfsError::Io(error) => Self::Io {
+                kind: error.kind(),
+                message: error.to_string(),
+            },
+            VfsError::BlockNotFound(ino, block) => Self::BlockNotFound(*ino, *block),
+            VfsError::WouldBlock => Self::WouldBlock,
+            VfsError::RemoteContentPending => Self::RemoteContentPending,
+            VfsError::InvalidName(name) => Self::InvalidName(name.clone()),
+            VfsError::QosFailure {
+                stage,
+                object_id,
+                message,
+            } => Self::QosFailure {
+                stage: stage.to_string(),
+                object_id: *object_id,
+                message: message.clone(),
+            },
+            VfsError::LocalPayloadRuntimeDetection { cache_root, source } => {
+                Self::LocalPayloadRuntimeDetection {
+                    cache_root: cache_root.clone(),
+                    kind: source.kind(),
+                    message: source.to_string(),
+                }
+            }
+            VfsError::LocalPayload(error) => Self::LocalPayload(match error {
+                LocalPayloadBackendError::Io(error) => ShutdownLocalPayloadError::Io {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                },
+                LocalPayloadBackendError::CapacityExhausted { needed, free } => {
+                    ShutdownLocalPayloadError::CapacityExhausted {
+                        needed: *needed,
+                        free: *free,
+                    }
+                }
+                LocalPayloadBackendError::Other(error) => {
+                    ShutdownLocalPayloadError::Other(error.to_string())
+                }
+            }),
+            VfsError::UploadStage(error) => Self::UploadStage {
+                kind: match error {
+                    UploadStageStoreError::Io(error) => error.kind(),
+                },
+                message: error.to_string(),
+            },
+            VfsError::Other(error) => Self::Other(error.clone()),
+            error => Self::Other(error.to_string()),
+        }
+    }
+
+    pub(crate) fn into_vfs_error(self) -> VfsError {
+        match self {
+            Self::Meta(error) => VfsError::Meta(error),
+            Self::Data(message) => VfsError::Data(DataError::Storage(message)),
+            Self::Io { kind, message } => VfsError::Io(io::Error::new(kind, message)),
+            Self::BlockNotFound(ino, block) => VfsError::BlockNotFound(ino, block),
+            Self::WouldBlock => VfsError::WouldBlock,
+            Self::RemoteContentPending => VfsError::RemoteContentPending,
+            Self::InvalidName(name) => VfsError::InvalidName(name),
+            Self::QosFailure {
+                stage,
+                object_id,
+                message,
+            } => VfsError::QosFailure {
+                stage: Cow::Owned(stage),
+                object_id,
+                message,
+            },
+            Self::LocalPayloadRuntimeDetection {
+                cache_root,
+                kind,
+                message,
+            } => VfsError::LocalPayloadRuntimeDetection {
+                cache_root,
+                source: io::Error::new(kind, message),
+            },
+            Self::LocalPayload(error) => VfsError::LocalPayload(match error {
+                ShutdownLocalPayloadError::Io { kind, message } => {
+                    LocalPayloadBackendError::Io(io::Error::new(kind, message))
+                }
+                ShutdownLocalPayloadError::CapacityExhausted { needed, free } => {
+                    LocalPayloadBackendError::CapacityExhausted { needed, free }
+                }
+                ShutdownLocalPayloadError::Other(message) => {
+                    LocalPayloadBackendError::Other(Box::new(io::Error::other(message)))
+                }
+            }),
+            Self::UploadStage { kind, message } => {
+                VfsError::UploadStage(UploadStageStoreError::Io(io::Error::new(kind, message)))
+            }
+            Self::Other(error) => VfsError::Other(error),
+        }
+    }
+}
+
+enum ShutdownPhase {
+    Running,
+    ShuttingDown,
+    Aborted,
+    Completed(Option<ShutdownError>),
+}
+
+enum ShutdownClaim {
+    Owner,
+    Waiter,
+    Completed(Option<ShutdownError>),
+}
+
 struct ShutdownState {
+    shutdown_phase: Mutex<ShutdownPhase>,
     shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_final_drain_active: std::sync::atomic::AtomicBool,
     uploader_shutdown_requested: std::sync::atomic::AtomicBool,
-    shutdown_completed: std::sync::atomic::AtomicBool,
     shutdown_notify: tokio::sync::Notify,
     background_shutdown_token: CancellationToken,
     uploader_shutdown_token: CancellationToken,
@@ -2142,10 +2298,10 @@ struct ShutdownState {
 impl ShutdownState {
     fn new() -> Self {
         Self {
+            shutdown_phase: Mutex::new(ShutdownPhase::Running),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_final_drain_active: std::sync::atomic::AtomicBool::new(false),
             uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
-            shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             background_shutdown_token: CancellationToken::new(),
             uploader_shutdown_token: CancellationToken::new(),
@@ -2153,6 +2309,29 @@ impl ShutdownState {
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }
+    }
+
+    fn claim(&self) -> ShutdownClaim {
+        let mut phase = self.shutdown_phase.lock();
+        match &*phase {
+            ShutdownPhase::Running | ShutdownPhase::Aborted => {
+                *phase = ShutdownPhase::ShuttingDown;
+                self.shutdown_requested.store(true, Ordering::Release);
+                ShutdownClaim::Owner
+            }
+            ShutdownPhase::ShuttingDown => ShutdownClaim::Waiter,
+            ShutdownPhase::Completed(error) => ShutdownClaim::Completed(error.clone()),
+        }
+    }
+
+    fn abort(&self) {
+        *self.shutdown_phase.lock() = ShutdownPhase::Aborted;
+        self.shutdown_notify.notify_waiters();
+    }
+
+    fn complete(&self, error: Option<ShutdownError>) {
+        *self.shutdown_phase.lock() = ShutdownPhase::Completed(error);
+        self.shutdown_notify.notify_waiters();
     }
 }
 
@@ -4479,17 +4658,7 @@ impl StudioVfs {
     }
 
     fn ensure_can_start(&self) -> VfsResult<()> {
-        if self
-            .state
-            .shutdown
-            .shutdown_requested
-            .load(Ordering::Acquire)
-            || self
-                .state
-                .shutdown
-                .shutdown_completed
-                .load(Ordering::Acquire)
-        {
+        if self.shutdown_requested() {
             return Err(VfsError::Other(
                 "cannot start StudioVfs after shutdown has begun".to_string(),
             ));

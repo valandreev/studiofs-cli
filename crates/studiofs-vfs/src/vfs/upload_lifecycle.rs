@@ -3,7 +3,8 @@ mod worker;
 pub(super) use worker::UploadLifecycleWorker;
 
 use super::{
-    Ino, StudioVfs, VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot, info, warn,
+    Ino, ShutdownClaim, ShutdownError, ShutdownPhase, StudioVfs, VfsError, VfsIngressStats,
+    VfsResult, VfsZeroIoShutdownSnapshot, info, warn,
 };
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -27,6 +28,56 @@ impl Drop for ShutdownFinalDrainGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+struct ShutdownOwnerGuard<'a> {
+    state: &'a super::ShutdownState,
+    completed: bool,
+}
+
+impl<'a> ShutdownOwnerGuard<'a> {
+    fn new(state: &'a super::ShutdownState) -> Self {
+        Self {
+            state,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self, error: Option<ShutdownError>) {
+        self.state.complete(error);
+        self.completed = true;
+    }
+}
+
+impl Drop for ShutdownOwnerGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.abort();
+        }
+    }
+}
+
+fn replay_shutdown_result(error: Option<ShutdownError>) -> VfsResult<()> {
+    match error {
+        Some(error) => Err(error.into_vfs_error()),
+        None => Ok(()),
+    }
+}
+
+fn select_shutdown_result(
+    deferred_namespace_error: Option<VfsError>,
+    metadata_barrier_error: Option<VfsError>,
+    local_payload_sync_result: VfsResult<()>,
+) -> VfsResult<()> {
+    deferred_namespace_error
+        .or(metadata_barrier_error)
+        .or_else(|| local_payload_sync_result.err())
+        .map_or(Ok(()), Err)
+}
+
+enum ShutdownWaitResult {
+    Retry,
+    Completed(Option<ShutdownError>),
 }
 
 impl StudioVfs {
@@ -128,13 +179,7 @@ impl StudioVfs {
     /// Returns `true` if the VFS is in the process of shutting down (or has
     /// already completed shutdown).
     pub fn is_shutting_down(&self) -> bool {
-        self.shutdown_requested()
-            || self.uploader_shutdown_requested()
-            || self
-                .state
-                .shutdown
-                .shutdown_completed
-                .load(Ordering::Acquire)
+        self.shutdown_requested() || self.uploader_shutdown_requested()
     }
 
     fn request_uploader_shutdown(&self) {
@@ -272,39 +317,59 @@ impl StudioVfs {
     /// Called at shutdown so pending-upload state and local backend metadata
     /// stay consistent across remounts.
     pub async fn persist_cache(&self) -> bool {
+        self.persist_cache_result().await.is_ok()
+    }
+
+    async fn persist_cache_result(&self) -> VfsResult<()> {
         self.cached_store.shutdown().await;
         if let Err(error) = self.local_payload_backend.sync_data() {
             warn!(error = %error, "local cache backend sync failed during shutdown");
             tracing::info!(
                 "cached-store upload journal persisted, but local cache backend sync failed"
             );
-            false
+            Err(VfsError::LocalPayload(error))
         } else {
             tracing::info!("local cache backend sync persisted");
             tracing::info!("cached-store upload journal persisted");
-            true
+            Ok(())
+        }
+    }
+
+    async fn wait_for_shutdown_result(&self) -> ShutdownWaitResult {
+        loop {
+            let notified = self.state.shutdown.shutdown_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            {
+                let phase = self.state.shutdown.shutdown_phase.lock();
+                match &*phase {
+                    ShutdownPhase::Running | ShutdownPhase::Aborted => {
+                        return ShutdownWaitResult::Retry;
+                    }
+                    ShutdownPhase::ShuttingDown => {}
+                    ShutdownPhase::Completed(error) => {
+                        return ShutdownWaitResult::Completed(error.clone());
+                    }
+                }
+            }
+            notified.as_mut().await;
         }
     }
 
     /// Graceful shutdown: drain accepted local state, persist the cached-store
     /// upload journal, cancel uploader tasks, then persist upload state.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) -> VfsResult<()> {
-        if self
-            .state
-            .shutdown
-            .shutdown_completed
-            .load(Ordering::Acquire)
-        {
-            return Ok(());
-        }
-        if self
-            .state
-            .shutdown
-            .shutdown_requested
-            .swap(true, Ordering::AcqRel)
-        {
-            return Ok(());
-        }
+        let shutdown_owner = loop {
+            match self.state.shutdown.claim() {
+                ShutdownClaim::Owner => break ShutdownOwnerGuard::new(&self.state.shutdown),
+                ShutdownClaim::Waiter => match self.wait_for_shutdown_result().await {
+                    ShutdownWaitResult::Retry => continue,
+                    ShutdownWaitResult::Completed(error) => return replay_shutdown_result(error),
+                },
+                ShutdownClaim::Completed(error) => return replay_shutdown_result(error),
+            }
+        };
         let t0 = Instant::now();
         let background_join_timeout = Duration::from_secs(2);
 
@@ -443,7 +508,8 @@ impl StudioVfs {
                 "failed"
             }
         };
-        let local_payload_sync_ok = self.persist_cache().await;
+        let local_payload_sync_result = self.persist_cache_result().await;
+        let local_payload_sync_ok = local_payload_sync_result.is_ok();
         let dirty_after = self.total_pending_write_buffer_bytes();
         let pending_uploads_after = self.pending_uploads_snapshot().len();
         let recoverable_on_restart = shutdown_recoverable_on_restart(
@@ -482,21 +548,21 @@ impl StudioVfs {
         {
             self.finish_zeroio_session();
         }
-        self.state
-            .shutdown
-            .shutdown_completed
-            .store(true, Ordering::Release);
+        let shutdown_result = select_shutdown_result(
+            deferred_namespace_error,
+            metadata_barrier_error,
+            local_payload_sync_result,
+        );
+        let shutdown_error = shutdown_result
+            .as_ref()
+            .err()
+            .map(ShutdownError::from_vfs_error);
+        shutdown_owner.complete(shutdown_error.clone());
         info!(
             total_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: complete"
         );
-        if let Some(error) = deferred_namespace_error {
-            return Err(error);
-        }
-        if let Some(error) = metadata_barrier_error {
-            return Err(error);
-        }
-        Ok(())
+        replay_shutdown_result(shutdown_error)
     }
 }
 
@@ -505,7 +571,14 @@ mod tests {
     use std::future;
     use std::time::Duration;
 
-    use super::{StudioVfs, shutdown_recoverable_on_restart};
+    use super::{
+        ShutdownError, StudioVfs, replay_shutdown_result, select_shutdown_result,
+        shutdown_recoverable_on_restart,
+    };
+    use crate::vfs::VfsError;
+    use studiofs_cache::local::LocalPayloadBackendError;
+    use studiofs_data::store::DataError;
+    use studiofs_meta::MetaError;
 
     #[tokio::test(start_paused = true)]
     async fn background_tasks_share_one_join_deadline() {
@@ -541,5 +614,40 @@ mod tests {
         assert!(!shutdown_recoverable_on_restart(0, false, "success"));
         assert!(!shutdown_recoverable_on_restart(0, true, "timeout"));
         assert!(!shutdown_recoverable_on_restart(0, true, "failed"));
+    }
+
+    #[test]
+    fn shutdown_result_reports_local_payload_sync_failure() {
+        let local_payload_error = VfsError::LocalPayload(LocalPayloadBackendError::Other(
+            Box::new(std::io::Error::other("local payload sync failed")),
+        ));
+
+        let result = select_shutdown_result(None, None, Err(local_payload_error));
+
+        assert!(matches!(result, Err(VfsError::LocalPayload(_))));
+    }
+
+    #[test]
+    fn shutdown_replay_preserves_typed_error_for_owner_and_waiter() {
+        let original = VfsError::Meta(MetaError::Storage("metadata barrier failed".to_string()));
+        let stored = ShutdownError::from_vfs_error(&original);
+
+        let owner = replay_shutdown_result(Some(stored.clone()));
+        let waiter = replay_shutdown_result(Some(stored));
+
+        assert!(matches!(owner, Err(VfsError::Meta(_))));
+        assert!(matches!(waiter, Err(VfsError::Meta(_))));
+    }
+
+    #[test]
+    fn shutdown_replay_preserves_data_error_category() {
+        let original = VfsError::Data(DataError::Storage("data barrier failed".to_string()));
+        let stored = ShutdownError::from_vfs_error(&original);
+
+        let owner = replay_shutdown_result(Some(stored.clone()));
+        let waiter = replay_shutdown_result(Some(stored));
+
+        assert!(matches!(owner, Err(VfsError::Data(_))));
+        assert!(matches!(waiter, Err(VfsError::Data(_))));
     }
 }
