@@ -2129,11 +2129,30 @@ impl ReadState {
 #[derive(Clone, Debug)]
 pub(crate) enum ShutdownError {
     Meta(MetaError),
+    Data(String),
     Io {
         kind: io::ErrorKind,
         message: String,
     },
+    BlockNotFound(Ino, u32),
+    WouldBlock,
+    RemoteContentPending,
+    InvalidName(String),
+    QosFailure {
+        stage: String,
+        object_id: u64,
+        message: String,
+    },
+    LocalPayloadRuntimeDetection {
+        cache_root: String,
+        kind: io::ErrorKind,
+        message: String,
+    },
     LocalPayload(ShutdownLocalPayloadError),
+    UploadStage {
+        kind: io::ErrorKind,
+        message: String,
+    },
     Other(String),
 }
 
@@ -2154,10 +2173,31 @@ impl ShutdownError {
     pub(crate) fn from_vfs_error(error: &VfsError) -> Self {
         match error {
             VfsError::Meta(error) => Self::Meta(error.clone()),
+            VfsError::Data(error) => Self::Data(error.to_string()),
             VfsError::Io(error) => Self::Io {
                 kind: error.kind(),
                 message: error.to_string(),
             },
+            VfsError::BlockNotFound(ino, block) => Self::BlockNotFound(*ino, *block),
+            VfsError::WouldBlock => Self::WouldBlock,
+            VfsError::RemoteContentPending => Self::RemoteContentPending,
+            VfsError::InvalidName(name) => Self::InvalidName(name.clone()),
+            VfsError::QosFailure {
+                stage,
+                object_id,
+                message,
+            } => Self::QosFailure {
+                stage: stage.to_string(),
+                object_id: *object_id,
+                message: message.clone(),
+            },
+            VfsError::LocalPayloadRuntimeDetection { cache_root, source } => {
+                Self::LocalPayloadRuntimeDetection {
+                    cache_root: cache_root.clone(),
+                    kind: source.kind(),
+                    message: source.to_string(),
+                }
+            }
             VfsError::LocalPayload(error) => Self::LocalPayload(match error {
                 LocalPayloadBackendError::Io(error) => ShutdownLocalPayloadError::Io {
                     kind: error.kind(),
@@ -2173,6 +2213,12 @@ impl ShutdownError {
                     ShutdownLocalPayloadError::Other(error.to_string())
                 }
             }),
+            VfsError::UploadStage(error) => Self::UploadStage {
+                kind: match error {
+                    UploadStageStoreError::Io(error) => error.kind(),
+                },
+                message: error.to_string(),
+            },
             VfsError::Other(error) => Self::Other(error.clone()),
             error => Self::Other(error.to_string()),
         }
@@ -2181,7 +2227,29 @@ impl ShutdownError {
     pub(crate) fn into_vfs_error(self) -> VfsError {
         match self {
             Self::Meta(error) => VfsError::Meta(error),
+            Self::Data(message) => VfsError::Data(DataError::Storage(message)),
             Self::Io { kind, message } => VfsError::Io(io::Error::new(kind, message)),
+            Self::BlockNotFound(ino, block) => VfsError::BlockNotFound(ino, block),
+            Self::WouldBlock => VfsError::WouldBlock,
+            Self::RemoteContentPending => VfsError::RemoteContentPending,
+            Self::InvalidName(name) => VfsError::InvalidName(name),
+            Self::QosFailure {
+                stage,
+                object_id,
+                message,
+            } => VfsError::QosFailure {
+                stage: Cow::Owned(stage),
+                object_id,
+                message,
+            },
+            Self::LocalPayloadRuntimeDetection {
+                cache_root,
+                kind,
+                message,
+            } => VfsError::LocalPayloadRuntimeDetection {
+                cache_root,
+                source: io::Error::new(kind, message),
+            },
             Self::LocalPayload(error) => VfsError::LocalPayload(match error {
                 ShutdownLocalPayloadError::Io { kind, message } => {
                     LocalPayloadBackendError::Io(io::Error::new(kind, message))
@@ -2193,6 +2261,9 @@ impl ShutdownError {
                     LocalPayloadBackendError::Other(Box::new(io::Error::other(message)))
                 }
             }),
+            Self::UploadStage { kind, message } => {
+                VfsError::UploadStage(UploadStageStoreError::Io(io::Error::new(kind, message)))
+            }
             Self::Other(error) => VfsError::Other(error),
         }
     }
@@ -2243,17 +2314,12 @@ impl ShutdownState {
     fn claim(&self) -> ShutdownClaim {
         let mut phase = self.shutdown_phase.lock();
         match &*phase {
-            ShutdownPhase::Running => {
+            ShutdownPhase::Running | ShutdownPhase::Aborted => {
                 *phase = ShutdownPhase::ShuttingDown;
                 self.shutdown_requested.store(true, Ordering::Release);
                 ShutdownClaim::Owner
             }
             ShutdownPhase::ShuttingDown => ShutdownClaim::Waiter,
-            ShutdownPhase::Aborted => {
-                *phase = ShutdownPhase::ShuttingDown;
-                self.shutdown_requested.store(true, Ordering::Release);
-                ShutdownClaim::Owner
-            }
             ShutdownPhase::Completed(error) => ShutdownClaim::Completed(error.clone()),
         }
     }

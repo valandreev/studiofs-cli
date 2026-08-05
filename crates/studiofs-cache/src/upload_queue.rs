@@ -141,8 +141,8 @@ impl UploadQueue {
 
         match self.record_pending_or_update(op.clone()) {
             PendingSubmit::New => {
-                if self.sender.send(op.clone()).is_err() {
-                    self.remove_pending_if_matches(&op);
+                if let Err(error) = self.sender.send(op) {
+                    self.remove_pending_if_matches(&error.0);
                 }
             }
             PendingSubmit::Updated(previous) => {

@@ -577,6 +577,7 @@ mod tests {
     };
     use crate::vfs::VfsError;
     use studiofs_cache::local::LocalPayloadBackendError;
+    use studiofs_data::store::DataError;
     use studiofs_meta::MetaError;
 
     #[tokio::test(start_paused = true)]
@@ -636,5 +637,17 @@ mod tests {
 
         assert!(matches!(owner, Err(VfsError::Meta(_))));
         assert!(matches!(waiter, Err(VfsError::Meta(_))));
+    }
+
+    #[test]
+    fn shutdown_replay_preserves_data_error_category() {
+        let original = VfsError::Data(DataError::Storage("data barrier failed".to_string()));
+        let stored = ShutdownError::from_vfs_error(&original);
+
+        let owner = replay_shutdown_result(Some(stored.clone()));
+        let waiter = replay_shutdown_result(Some(stored));
+
+        assert!(matches!(owner, Err(VfsError::Data(_))));
+        assert!(matches!(waiter, Err(VfsError::Data(_))));
     }
 }
