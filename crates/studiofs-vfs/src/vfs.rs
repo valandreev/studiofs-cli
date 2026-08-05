@@ -2126,11 +2126,23 @@ impl ReadState {
     }
 }
 
+enum ShutdownPhase {
+    Running,
+    ShuttingDown,
+    Completed(Option<String>),
+}
+
+enum ShutdownClaim {
+    Owner,
+    Waiter,
+    Completed(Option<String>),
+}
+
 struct ShutdownState {
+    shutdown_phase: Mutex<ShutdownPhase>,
     shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_final_drain_active: std::sync::atomic::AtomicBool,
     uploader_shutdown_requested: std::sync::atomic::AtomicBool,
-    shutdown_completed: std::sync::atomic::AtomicBool,
     shutdown_notify: tokio::sync::Notify,
     background_shutdown_token: CancellationToken,
     uploader_shutdown_token: CancellationToken,
@@ -2142,10 +2154,10 @@ struct ShutdownState {
 impl ShutdownState {
     fn new() -> Self {
         Self {
+            shutdown_phase: Mutex::new(ShutdownPhase::Running),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_final_drain_active: std::sync::atomic::AtomicBool::new(false),
             uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
-            shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
             background_shutdown_token: CancellationToken::new(),
             uploader_shutdown_token: CancellationToken::new(),
@@ -2153,6 +2165,24 @@ impl ShutdownState {
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }
+    }
+
+    fn claim(&self) -> ShutdownClaim {
+        let mut phase = self.shutdown_phase.lock();
+        match &*phase {
+            ShutdownPhase::Running => {
+                *phase = ShutdownPhase::ShuttingDown;
+                self.shutdown_requested.store(true, Ordering::Release);
+                ShutdownClaim::Owner
+            }
+            ShutdownPhase::ShuttingDown => ShutdownClaim::Waiter,
+            ShutdownPhase::Completed(error) => ShutdownClaim::Completed(error.clone()),
+        }
+    }
+
+    fn complete(&self, error: Option<String>) {
+        *self.shutdown_phase.lock() = ShutdownPhase::Completed(error);
+        self.shutdown_notify.notify_waiters();
     }
 }
 
@@ -4479,17 +4509,7 @@ impl StudioVfs {
     }
 
     fn ensure_can_start(&self) -> VfsResult<()> {
-        if self
-            .state
-            .shutdown
-            .shutdown_requested
-            .load(Ordering::Acquire)
-            || self
-                .state
-                .shutdown
-                .shutdown_completed
-                .load(Ordering::Acquire)
-        {
+        if self.shutdown_requested() {
             return Err(VfsError::Other(
                 "cannot start StudioVfs after shutdown has begun".to_string(),
             ));

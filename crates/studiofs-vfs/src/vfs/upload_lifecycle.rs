@@ -3,7 +3,8 @@ mod worker;
 pub(super) use worker::UploadLifecycleWorker;
 
 use super::{
-    Ino, StudioVfs, VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot, info, warn,
+    Ino, ShutdownClaim, ShutdownPhase, StudioVfs, VfsError, VfsIngressStats, VfsResult,
+    VfsZeroIoShutdownSnapshot, info, warn,
 };
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -26,6 +27,41 @@ struct ShutdownFinalDrainGuard<'a>(&'a std::sync::atomic::AtomicBool);
 impl Drop for ShutdownFinalDrainGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+struct ShutdownOwnerGuard<'a> {
+    state: &'a super::ShutdownState,
+    completed: bool,
+}
+
+impl<'a> ShutdownOwnerGuard<'a> {
+    fn new(state: &'a super::ShutdownState) -> Self {
+        Self {
+            state,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self, error: Option<String>) {
+        self.state.complete(error);
+        self.completed = true;
+    }
+}
+
+impl Drop for ShutdownOwnerGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state
+                .complete(Some("shutdown owner task was cancelled".to_string()));
+        }
+    }
+}
+
+fn replay_shutdown_result(error: Option<String>) -> VfsResult<()> {
+    match error {
+        Some(error) => Err(VfsError::Other(error)),
+        None => Ok(()),
     }
 }
 
@@ -128,13 +164,7 @@ impl StudioVfs {
     /// Returns `true` if the VFS is in the process of shutting down (or has
     /// already completed shutdown).
     pub fn is_shutting_down(&self) -> bool {
-        self.shutdown_requested()
-            || self.uploader_shutdown_requested()
-            || self
-                .state
-                .shutdown
-                .shutdown_completed
-                .load(Ordering::Acquire)
+        self.shutdown_requested() || self.uploader_shutdown_requested()
     }
 
     fn request_uploader_shutdown(&self) {
@@ -286,25 +316,39 @@ impl StudioVfs {
         }
     }
 
+    async fn wait_for_shutdown_result(&self) -> VfsResult<()> {
+        loop {
+            let notified = self.state.shutdown.shutdown_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let completion = {
+                let phase = self.state.shutdown.shutdown_phase.lock();
+                match &*phase {
+                    ShutdownPhase::Running => {
+                        return Err(VfsError::Other(
+                            "shutdown state regressed while waiting for completion".to_string(),
+                        ));
+                    }
+                    ShutdownPhase::ShuttingDown => None,
+                    ShutdownPhase::Completed(error) => Some(error.clone()),
+                }
+            };
+            if let Some(error) = completion {
+                return replay_shutdown_result(error);
+            }
+            notified.as_mut().await;
+        }
+    }
+
     /// Graceful shutdown: drain accepted local state, persist the cached-store
     /// upload journal, cancel uploader tasks, then persist upload state.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) -> VfsResult<()> {
-        if self
-            .state
-            .shutdown
-            .shutdown_completed
-            .load(Ordering::Acquire)
-        {
-            return Ok(());
-        }
-        if self
-            .state
-            .shutdown
-            .shutdown_requested
-            .swap(true, Ordering::AcqRel)
-        {
-            return Ok(());
-        }
+        let shutdown_owner = match self.state.shutdown.claim() {
+            ShutdownClaim::Owner => ShutdownOwnerGuard::new(&self.state.shutdown),
+            ShutdownClaim::Waiter => return self.wait_for_shutdown_result().await,
+            ShutdownClaim::Completed(error) => return replay_shutdown_result(error),
+        };
         let t0 = Instant::now();
         let background_join_timeout = Duration::from_secs(2);
 
@@ -482,21 +526,20 @@ impl StudioVfs {
         {
             self.finish_zeroio_session();
         }
-        self.state
-            .shutdown
-            .shutdown_completed
-            .store(true, Ordering::Release);
+        let shutdown_result = if let Some(error) = deferred_namespace_error {
+            Err(error)
+        } else if let Some(error) = metadata_barrier_error {
+            Err(error)
+        } else {
+            Ok(())
+        };
+        let shutdown_error = shutdown_result.as_ref().err().map(ToString::to_string);
+        shutdown_owner.complete(shutdown_error);
         info!(
             total_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: complete"
         );
-        if let Some(error) = deferred_namespace_error {
-            return Err(error);
-        }
-        if let Some(error) = metadata_barrier_error {
-            return Err(error);
-        }
-        Ok(())
+        shutdown_result
     }
 }
 

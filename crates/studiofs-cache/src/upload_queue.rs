@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 use tracing::debug;
@@ -42,7 +42,6 @@ pub struct PendingUpload {
 /// Manages in-memory pending upload state and dispatch channel.
 pub struct UploadQueue {
     sender: mpsc::UnboundedSender<PendingUpload>,
-    pending_count: AtomicUsize,
     pending_state: Mutex<PendingState>,
     idle_notify: Arc<Notify>,
     shutdown_requested: AtomicBool,
@@ -99,7 +98,6 @@ impl UploadQueue {
 
         let queue = Arc::new(Self {
             sender: tx,
-            pending_count: AtomicUsize::new(0),
             pending_state: Mutex::new(PendingState {
                 by_object: BTreeMap::new(),
                 by_inode: BTreeMap::new(),
@@ -143,9 +141,8 @@ impl UploadQueue {
 
         match self.record_pending_or_update(op.clone()) {
             PendingSubmit::New => {
-                self.pending_count.fetch_add(1, Ordering::Release);
-                if self.sender.send(op).is_err() && self.remove_pending(object_id) {
-                    self.mark_done();
+                if self.sender.send(op.clone()).is_err() {
+                    self.remove_pending_if_matches(&op);
                 }
             }
             PendingSubmit::Updated(previous) => {
@@ -167,12 +164,7 @@ impl UploadQueue {
     /// Returns `true` when the pending entry matched and was removed; `false`
     /// means the op was already terminal or stale.
     pub fn complete(&self, op: &PendingUpload) -> bool {
-        if self.remove_pending_if_matches(op) {
-            self.mark_done();
-            true
-        } else {
-            false
-        }
+        self.remove_pending_if_matches(op)
     }
 
     /// Requeue a failed upload for retry (does not increment pending count).
@@ -214,12 +206,7 @@ impl UploadQueue {
     /// Returns `true` when the pending entry matched and was removed; `false`
     /// means the op was already terminal or stale.
     pub fn cancel(&self, op: &PendingUpload) -> bool {
-        if self.remove_pending_if_matches(op) {
-            self.mark_done();
-            true
-        } else {
-            false
-        }
+        self.remove_pending_if_matches(op)
     }
 
     /// Kept for API compatibility with older journal-backed behavior.
@@ -229,13 +216,19 @@ impl UploadQueue {
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
+            let idle_notified = self.idle_notify.notified();
+            tokio::pin!(idle_notified);
+            idle_notified.as_mut().enable();
+            let shutdown_notified = self.shutdown_notify.notified();
+            tokio::pin!(shutdown_notified);
+            shutdown_notified.as_mut().enable();
+
             if self.shutdown_requested.load(Ordering::Acquire) {
                 return false;
             }
-            // Register interest BEFORE checking the count. This prevents a
-            // TOCTOU race where mark_done() fires notify_waiters() between our
-            // load() and .notified().await.
-            if self.pending_count.load(Ordering::Acquire) == 0 {
+            // Register interest before checking the state. This prevents a
+            // TOCTOU race where completion notifies between the check and wait.
+            if self.pending_state.lock().by_object.is_empty() {
                 return true;
             }
             #[cfg(test)]
@@ -250,12 +243,11 @@ impl UploadQueue {
                 return false;
             }
             let remaining = deadline.saturating_duration_since(now);
-            let notified = self.idle_notify.notified();
             tokio::select! {
-                _ = self.shutdown_notify.notified() => return false,
-                result = tokio::time::timeout(remaining, notified) => {
+                _ = &mut shutdown_notified => return false,
+                result = tokio::time::timeout(remaining, &mut idle_notified) => {
                     if result.is_err() {
-                        return self.pending_count.load(Ordering::Acquire) == 0;
+                        return self.pending_state.lock().by_object.is_empty();
                     }
                 }
             }
@@ -269,7 +261,7 @@ impl UploadQueue {
 
     /// Current number of pending uploads.
     pub fn pending_count(&self) -> usize {
-        self.pending_count.load(Ordering::Relaxed)
+        self.pending_state.lock().by_object.len()
     }
 
     /// Snapshot all currently pending upload ops from the live in-memory index.
@@ -325,19 +317,6 @@ impl UploadQueue {
         self.shutdown_notify.notify_waiters();
     }
 
-    fn mark_done(&self) {
-        // Saturating decrement — guards against double-complete races.
-        let result = self
-            .pending_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                if v > 0 { Some(v - 1) } else { None }
-            });
-        if result == Ok(1) {
-            // Was 1, now 0 — notify idle waiters.
-            self.idle_notify.notify_waiters();
-        }
-    }
-
     fn record_pending_or_update(&self, op: PendingUpload) -> PendingSubmit {
         let mut state = self.pending_state.lock();
         if let Some(current) = state.by_object.get_mut(&op.object_id) {
@@ -358,15 +337,6 @@ impl UploadQueue {
         PendingSubmit::New
     }
 
-    fn remove_pending(&self, object_id: u64) -> bool {
-        let mut state = self.pending_state.lock();
-        if let Some(removed) = state.by_object.remove(&object_id) {
-            Self::remove_inode_index_entry(&mut state, removed.ino, object_id);
-            return true;
-        }
-        false
-    }
-
     fn remove_pending_if_matches(&self, op: &PendingUpload) -> bool {
         let mut state = self.pending_state.lock();
         let Some(current) = state.by_object.get(&op.object_id) else {
@@ -378,11 +348,16 @@ impl UploadQueue {
         {
             return false;
         }
-        if let Some(removed) = state.by_object.remove(&op.object_id) {
-            Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
-            return true;
+        let Some(removed) = state.by_object.remove(&op.object_id) else {
+            return false;
+        };
+        Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
+        let became_idle = state.by_object.is_empty();
+        drop(state);
+        if became_idle {
+            self.idle_notify.notify_waiters();
         }
-        false
+        true
     }
 
     fn update_pending_if_matches(&self, op: &PendingUpload) -> Option<PendingUpload> {
@@ -694,8 +669,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "SFS-638: expected pre-fix lost-wake failure"]
-    #[should_panic(expected = "completion notification must wake idle waiter promptly")]
     async fn wait_for_idle_wakes_after_last_completion() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
