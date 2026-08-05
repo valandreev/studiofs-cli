@@ -24,6 +24,8 @@ The result is visible through the metadata crate tests: a raw redb row written b
 - [x] (2026-08-05) Addressed review findings: legacy rows now use a frozen ordinal-to-tag mapping instead of deserializing into the public enum, and all 17 event variants have independent legacy and V1 byte fixtures. A temporary tag mutation made the V1 golden test fail before the original tag was restored.
 - [x] (2026-08-06) Applied the performance review fix: postcard now serializes the fixed header tuple and variant payload into one output buffer; the independent V1 fixtures remain byte-identical.
 - [x] (2026-08-06) Applied the remaining valid review cleanups: PostgreSQL replay now borrows row text and payload slices instead of allocating per row, and the metadata encoder map uses the function directly. The local metadata suite and the live PostgreSQL replay test pass; one initial rerun was temporarily blocked by a network outage, then passed once connectivity returned.
+- [x] (2026-08-06) Removed the eager `format!` context allocation from event payload decoding; error messages retain the tag-specific context while successful replay allocates no temporary context string. The partial-magic prefix check remains intentional because valid legacy ordinals cannot begin with `S`.
+- [x] (2026-08-06) Removed `Serialize`/`Deserialize` from the public `MetaEvent` derive and migrated the remaining in-workspace direct postcard comparisons and fixtures to `encode_event`. PostgreSQL replay now validates the stable tag before decoding variant fields, for both V1 and frozen legacy rows; the metadata suite and live replay remain green.
 
 ## Surprises & Discoveries
 

@@ -1,7 +1,7 @@
 use crate::engine::{MetaError, MetaResult};
 use crate::types::{DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 
 const META_EVENT_WIRE_MAGIC: [u8; 7] = *b"SFS-EVT";
 const META_EVENT_WIRE_VERSION: u8 = 1;
@@ -29,7 +29,7 @@ const TAG_UPDATE_SNAPSHOT_STATE: u8 = 17;
 /// Represents a single mutation to the metadata state.
 /// These events are appended to a local journal and eventually pushed to S3
 /// to achieve Event Sourcing and Eventual Consistency.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum MetaEvent {
     // ─── Core Inode Operations ───────────────────────────────────────────────
     /// Create or update an inode.
@@ -345,6 +345,47 @@ pub(crate) fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
 }
 
 pub(crate) fn decode_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
+    let (tag, payload) = decode_event_wire_parts(bytes)?;
+    decode_tagged_event(tag, payload)
+}
+
+pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResult<MetaEvent> {
+    let expected_tag = wire_tag_for_kind(event_type).ok_or_else(|| {
+        MetaError::Serialization(format!("unknown PostgreSQL MetaEvent type `{event_type}`"))
+    })?;
+    let (tag, payload) = decode_event_wire_parts(bytes)?;
+    if tag != expected_tag {
+        return Err(MetaError::Serialization(format!(
+            "PostgreSQL MetaEvent type `{event_type}` does not match decoded wire tag {tag}"
+        )));
+    }
+    decode_tagged_event(tag, payload)
+}
+
+fn wire_tag_for_kind(kind: &str) -> Option<u8> {
+    match kind {
+        "set_attr" => Some(TAG_SET_ATTR),
+        "remove_attr" => Some(TAG_REMOVE_ATTR),
+        "add_entry" => Some(TAG_ADD_ENTRY),
+        "remove_entry" => Some(TAG_REMOVE_ENTRY),
+        "rename_entry" => Some(TAG_RENAME_ENTRY),
+        "remove_regular_file_graph" => Some(TAG_REMOVE_REGULAR_FILE_GRAPH),
+        "set_regular_file_overlay_slices" => Some(TAG_SET_REGULAR_FILE_OVERLAY_SLICES),
+        "publish_regular_file_base_slices" => Some(TAG_PUBLISH_REGULAR_FILE_BASE_SLICES),
+        "set_symlink_target" => Some(TAG_SET_SYMLINK_TARGET),
+        "set_xattr" => Some(TAG_SET_XATTR),
+        "remove_xattr" => Some(TAG_REMOVE_XATTR),
+        "set_acl_rule" => Some(TAG_SET_ACL_RULE),
+        "remove_acl_rule" => Some(TAG_REMOVE_ACL_RULE),
+        "add_pending_deletion" => Some(TAG_ADD_PENDING_DELETION),
+        "remove_pending_deletion" => Some(TAG_REMOVE_PENDING_DELETION),
+        "create_snapshot" => Some(TAG_CREATE_SNAPSHOT),
+        "update_snapshot_state" => Some(TAG_UPDATE_SNAPSHOT_STATE),
+        _ => None,
+    }
+}
+
+fn decode_event_wire_parts(bytes: &[u8]) -> MetaResult<(u8, &[u8])> {
     if bytes.first() == META_EVENT_WIRE_MAGIC.first() {
         if !bytes.starts_with(&META_EVENT_WIRE_MAGIC) {
             return Err(MetaError::Serialization(
@@ -364,48 +405,9 @@ pub(crate) fn decode_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
             )));
         }
         let tag = bytes[META_EVENT_WIRE_MAGIC.len() + 1];
-        let payload = &bytes[header_len..];
-        return decode_tagged_event(tag, payload);
+        return Ok((tag, &bytes[header_len..]));
     }
 
-    decode_legacy_event(bytes)
-}
-
-pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResult<MetaEvent> {
-    let event = decode_event(bytes)?;
-    if event.kind() != event_type {
-        return Err(MetaError::Serialization(format!(
-            "PostgreSQL MetaEvent type `{event_type}` does not match decoded `{}`",
-            event.kind()
-        )));
-    }
-    Ok(event)
-}
-
-fn encode_event_envelope<T: Serialize>(tag: u8, payload: &T) -> MetaResult<Vec<u8>> {
-    let envelope = (META_EVENT_WIRE_MAGIC, META_EVENT_WIRE_VERSION, tag, payload);
-    postcard::to_stdvec(&envelope).map_err(|error| {
-        MetaError::Serialization(format!("MetaEvent envelope encode failed: {error}"))
-    })
-}
-
-fn decode_event_payload<T: DeserializeOwned>(tag: u8, payload: &[u8]) -> MetaResult<T> {
-    decode_complete(payload, &format!("MetaEvent wire tag {tag} payload"))
-}
-
-fn decode_complete<T: DeserializeOwned>(bytes: &[u8], context: &str) -> MetaResult<T> {
-    let (value, remainder) = postcard::take_from_bytes(bytes)
-        .map_err(|error| MetaError::Serialization(format!("{context} decode failed: {error}")))?;
-    if !remainder.is_empty() {
-        return Err(MetaError::Serialization(format!(
-            "{context} contains {} trailing bytes",
-            remainder.len()
-        )));
-    }
-    Ok(value)
-}
-
-fn decode_legacy_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
     let (ordinal, payload) = postcard::take_from_bytes::<u32>(bytes).map_err(|error| {
         MetaError::Serialization(format!("legacy MetaEvent ordinal decode failed: {error}"))
     })?;
@@ -433,7 +435,29 @@ fn decode_legacy_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
             )));
         }
     };
-    decode_tagged_event(tag, payload)
+    Ok((tag, payload))
+}
+
+fn encode_event_envelope<T: Serialize>(tag: u8, payload: &T) -> MetaResult<Vec<u8>> {
+    let envelope = (META_EVENT_WIRE_MAGIC, META_EVENT_WIRE_VERSION, tag, payload);
+    postcard::to_stdvec(&envelope).map_err(|error| {
+        MetaError::Serialization(format!("MetaEvent envelope encode failed: {error}"))
+    })
+}
+
+fn decode_event_payload<T: DeserializeOwned>(tag: u8, payload: &[u8]) -> MetaResult<T> {
+    let (value, remainder) = postcard::take_from_bytes(payload).map_err(|error| {
+        MetaError::Serialization(format!(
+            "MetaEvent wire tag {tag} payload decode failed: {error}"
+        ))
+    })?;
+    if !remainder.is_empty() {
+        return Err(MetaError::Serialization(format!(
+            "MetaEvent wire tag {tag} payload contains {} trailing bytes",
+            remainder.len()
+        )));
+    }
+    Ok(value)
 }
 
 fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
@@ -755,13 +779,21 @@ mod tests {
 
     #[test]
     fn every_event_kind_matches_its_versioned_wire_fixture() {
-        for (event, expected_wire, _) in event_fixtures() {
+        for (event, expected_wire, legacy_wire) in event_fixtures() {
             let encoded = encode_event(&event).expect("encode event fixture");
             assert_eq!(encoded, expected_wire, "fixture drift for {}", event.kind());
 
             let decoded = decode_event(expected_wire).expect("decode event fixture");
             assert_eq!(decoded.kind(), event.kind());
             assert_eq!(format!("{decoded:?}"), format!("{event:?}"));
+
+            let typed = decode_event_with_type(event.kind(), expected_wire)
+                .expect("decode typed event fixture");
+            assert_eq!(typed.kind(), event.kind());
+
+            let typed_legacy = decode_event_with_type(event.kind(), legacy_wire)
+                .expect("decode typed legacy event fixture");
+            assert_eq!(typed_legacy.kind(), event.kind());
         }
     }
 
@@ -831,10 +863,22 @@ mod tests {
 
         let unknown = decode_event_with_type("future_event", &encoded)
             .expect_err("unknown PostgreSQL event type");
-        assert!(unknown.to_string().contains("does not match decoded"));
+        assert!(
+            unknown
+                .to_string()
+                .contains("unknown PostgreSQL MetaEvent type")
+        );
 
         let mismatch = decode_event_with_type("set_attr", &encoded)
             .expect_err("mismatched PostgreSQL event type");
         assert!(mismatch.to_string().contains("does not match decoded"));
+
+        let legacy_mismatch = decode_event_with_type("set_attr", &[1_u8, 42_u8])
+            .expect_err("mismatched legacy PostgreSQL event type");
+        assert!(
+            legacy_mismatch
+                .to_string()
+                .contains("does not match decoded")
+        );
     }
 }

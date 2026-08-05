@@ -1,5 +1,5 @@
 use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaResult};
-use crate::events::{MetaEvent, decode_event_with_type};
+use crate::events::{MetaEvent, decode_event_with_type, encode_event};
 use crate::redb_engine::RedbMetaEngine;
 use crate::redb_engine::layout::{encode_acl_rule_key, encode_dentry_key, encode_xattr_key};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
@@ -1295,7 +1295,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         for consumed_events in 1..=local_events.len() {
             let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
             let matches_prefix = projected_prefix.events.iter().zip(batch_events.iter()).all(
-                |(local, remote)| match (postcard::to_stdvec(local), postcard::to_stdvec(remote)) {
+                |(local, remote)| match (encode_event(local), encode_event(remote)) {
                     (Ok(local), Ok(remote)) => local == remote,
                     _ => false,
                 },
