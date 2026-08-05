@@ -41,6 +41,68 @@ fn legacy_meta_event_fixture_replays_from_local_event_log() {
     ));
 }
 
+#[test]
+fn new_local_event_log_rows_use_versioned_wire_envelope() {
+    let engine = temp_engine();
+    let txn = engine
+        .begin_write_txn()
+        .expect("begin local event transaction");
+    RedbMetaEngine::append_event_in_txn(&txn, &MetaEvent::RemoveAttr { ino: 42 })
+        .expect("append local event");
+    txn.commit().expect("commit local event");
+
+    let txn = engine.begin_read_txn().expect("begin local event read");
+    let events = txn
+        .open_table(EVENT_LOG_TABLE)
+        .expect("open local event log");
+    let row = events
+        .get(1)
+        .expect("read local event row")
+        .expect("local event row");
+    assert!(
+        row.value().starts_with(b"SFS-EVT"),
+        "new event rows must use the versioned envelope"
+    );
+}
+
+#[test]
+fn versioned_event_rows_survive_local_engine_restart() {
+    let dir = studiofs_test_support::workspace_target_tempdir("event-restart-");
+    let path = dir.path().join("meta.redb");
+    let start_seq;
+    let end_seq;
+    {
+        let engine = RedbMetaEngine::open(&path).expect("open local metadata");
+        engine.init_root(1000, 1000).expect("initialize root");
+        engine
+            .set_format_info(&test_format_info("event-restart"))
+            .expect("initialize format");
+        start_seq = engine
+            .get_counter("nextEventSeq")
+            .expect("read starting event sequence");
+        let txn = engine
+            .begin_write_txn()
+            .expect("begin local event transaction");
+        RedbMetaEngine::append_event_in_txn(&txn, &MetaEvent::RemoveAttr { ino: 42 })
+            .expect("append local event");
+        txn.commit().expect("commit local event");
+        end_seq = engine
+            .get_counter("nextEventSeq")
+            .expect("read ending event sequence");
+        assert_eq!(end_seq, start_seq + 1);
+    }
+
+    let reopened = RedbMetaEngine::open(&path).expect("reopen local metadata");
+    let events = reopened
+        .read_events_range(start_seq, end_seq)
+        .expect("read event after restart");
+
+    assert!(matches!(
+        events.as_slice(),
+        [MetaEvent::RemoveAttr { ino: 42 }]
+    ));
+}
+
 trait FileGraphFixture {
     fn stage_payload_slice(&self, ino: Ino, block_index: u32, block: &PayloadRef)
     -> MetaResult<()>;

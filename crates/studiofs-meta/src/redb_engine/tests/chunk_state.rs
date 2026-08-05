@@ -511,7 +511,8 @@ fn test_regular_file_overlay_flush_emits_final_chunk_state() {
         .get(next_event_seq - 1)
         .unwrap()
         .expect("flushed event");
-    let event: MetaEvent = decode(row.value()).expect("decode flushed event");
+    let event: MetaEvent =
+        crate::events::decode_event(row.value()).expect("decode flushed event");
     let payload = match event {
         MetaEvent::SetRegularFileOverlaySlices {
             ino: event_ino,

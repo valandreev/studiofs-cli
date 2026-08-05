@@ -557,7 +557,7 @@ impl RedbMetaEngine {
         let mut events = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let data = encode(event)?;
+        let data = crate::events::encode_event(event)?;
         events
             .insert(seq_id, data.as_slice())
             .map_err(|e| MetaError::Storage(e.to_string()))?;

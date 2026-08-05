@@ -349,7 +349,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let ev: crate::events::MetaEvent = decode(bytes.value())?;
+            let ev = crate::events::decode_event(bytes.value())?;
             out.push(ev);
         }
         Ok(out)
@@ -1254,7 +1254,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            match decode::<crate::events::MetaEvent>(bytes.value())? {
+            match crate::events::decode_event(bytes.value())? {
                 crate::events::MetaEvent::AddEntry { parent, name, .. } => {
                     let key = encode_dentry_key(parent, &name);
                     locally_renamed.remove(&key);
@@ -1401,7 +1401,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            match decode::<crate::events::MetaEvent>(bytes.value())? {
+            match crate::events::decode_event(bytes.value())? {
                 crate::events::MetaEvent::AddEntry {
                     parent,
                     name,

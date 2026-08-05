@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::MetaEngine;
+use crate::events::encode_event;
 use crate::redb_engine::layout::encode_dentry_key;
 
 #[test]
@@ -3264,7 +3265,7 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
         },
     };
 
-    let conflict_payload = postcard::to_stdvec(&conflict_event).expect("encode conflict event");
+    let conflict_payload = encode_event(&conflict_event).expect("encode conflict event");
     let add_payload = postcard::to_stdvec(&add_event).expect("encode add attr event");
     let dentry_payload = postcard::to_stdvec(&dentry_event).expect("encode unrelated dentry event");
 
