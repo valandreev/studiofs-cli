@@ -1,4 +1,4 @@
-use super::PgMetaEngine;
+use super::{PgBackgroundWorker, PgMetaEngine};
 use crate::engine::{MetaEngineCore, MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
 use crate::types::*;
@@ -14,10 +14,8 @@ impl PgMetaEngine {
         }
 
         if self
-            .lock_notify_handle
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockNotify)
         {
             return Ok(());
         }
@@ -26,24 +24,23 @@ impl PgMetaEngine {
             .lock_worker_start_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg lock worker start state poisoned".to_string()))?;
+        if self
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockNotify)
+        {
+            return Ok(());
+        }
         let engine = self.self_weak.get().cloned().ok_or_else(|| {
             MetaError::Storage("pg lock worker bootstrap missing self weak ref".to_string())
         })?;
 
-        let mut notify_guard = self
-            .lock_notify_handle
-            .lock()
-            .map_err(|_| MetaError::Storage("pg lock notify handle state poisoned".to_string()))?;
-        if notify_guard.is_none() {
-            *notify_guard = Some(Self::start_lock_notify_listener(
-                engine.clone(),
-                self.poll_shutdown.clone(),
-                self.lock_notify_cancel.clone(),
-            )?);
-        }
-        drop(notify_guard);
-
-        Ok(())
+        let handle = Self::start_lock_notify_listener(
+            engine,
+            self.background_workers.poll_shutdown(),
+            self.background_workers.lock_notify_cancel(),
+        )?;
+        self.background_workers
+            .install_handle(PgBackgroundWorker::LockNotify, handle)
     }
 
     pub(super) fn ensure_lock_renew_worker_started(&self) -> MetaResult<()> {
@@ -52,10 +49,8 @@ impl PgMetaEngine {
         }
 
         if self
-            .lock_renew_handle
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockRenew)
         {
             return Ok(());
         }
@@ -64,22 +59,20 @@ impl PgMetaEngine {
             .lock_worker_start_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg lock worker start state poisoned".to_string()))?;
+        if self
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockRenew)
+        {
+            return Ok(());
+        }
         let engine = self.self_weak.get().cloned().ok_or_else(|| {
             MetaError::Storage("pg lock worker bootstrap missing self weak ref".to_string())
         })?;
 
-        let mut renew_guard = self
-            .lock_renew_handle
-            .lock()
-            .map_err(|_| MetaError::Storage("pg lock renew handle state poisoned".to_string()))?;
-        if renew_guard.is_none() {
-            *renew_guard = Some(Self::start_lock_renew_worker(
-                engine,
-                self.poll_shutdown.clone(),
-            )?);
-        }
-
-        Ok(())
+        let handle =
+            Self::start_lock_renew_worker(engine, self.background_workers.poll_shutdown())?;
+        self.background_workers
+            .install_handle(PgBackgroundWorker::LockRenew, handle)
     }
 
     pub(super) fn ensure_lock_workers_started(&self) -> MetaResult<()> {

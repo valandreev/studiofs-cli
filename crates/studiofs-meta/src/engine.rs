@@ -1058,8 +1058,10 @@ pub trait MetaReplication: Send + Sync {
 
     /// Prepare the engine for close: stop background threads and release
     /// resources so that `Database::drop()` can run cleanly before process
-    /// exit.  Default is a no-op (standalone redb needs no preparation).
-    fn prepare_for_close(&self) {}
+    /// exit. Default is a no-op (standalone redb needs no preparation).
+    fn prepare_for_close(&self) -> MetaResult<()> {
+        Ok(())
+    }
 }
 
 /// Public aggregate contract for consumers.

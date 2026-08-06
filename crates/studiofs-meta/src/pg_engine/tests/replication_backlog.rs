@@ -235,7 +235,7 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
         let mut state = pg.pending_state.lock().expect("pending_state");
         PgMetaEngine::clear_pending_state(&mut state);
     }
-    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    let (wakeup_lock, _) = &*pg.background_workers.poll_wakeup;
     {
         let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
         *wakeup = false;
@@ -542,7 +542,7 @@ fn regular_namespace_mutations_batch_without_pg_poll_wakeup() {
         PgMetaEngine::clear_pending_state(&mut state);
     }
 
-    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    let (wakeup_lock, _) = &*pg.background_workers.poll_wakeup;
     *wakeup_lock.lock().expect("poll wakeup lock") = false;
 
     pg.unlink(ROOT_INO, b"batched-delete.bin")
@@ -567,7 +567,7 @@ fn request_eager_flush_wakes_pg_poll_worker() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     pg.request_pending_flush();
-    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    let (wakeup_lock, _) = &*pg.background_workers.poll_wakeup;
     assert!(
         !*wakeup_lock.lock().expect("poll wakeup lock"),
         "regular upload-pipeline flush requests should not wake the metadata poll worker"
@@ -598,7 +598,7 @@ fn published_base_graph_wakes_pg_poll_worker() {
         "upload marker must update the local overlay"
     );
 
-    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    let (wakeup_lock, _) = &*pg.background_workers.poll_wakeup;
     {
         let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
         *wakeup = false;
@@ -629,7 +629,7 @@ fn ready_file_attr_change_wakes_pg_poll_worker() {
         PgMetaEngine::clear_pending_state(&mut state);
     }
 
-    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    let (wakeup_lock, _) = &*pg.background_workers.poll_wakeup;
     {
         let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
         *wakeup = false;
@@ -661,7 +661,7 @@ fn xattr_change_batches_without_pg_poll_wakeup() {
         PgMetaEngine::clear_pending_state(&mut state);
     }
 
-    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    let (wakeup_lock, _) = &*pg.background_workers.poll_wakeup;
     {
         let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
         *wakeup = false;
@@ -696,7 +696,7 @@ fn uploading_file_attr_change_stays_local_without_pg_poll_wakeup() {
         PgMetaEngine::clear_pending_state(&mut state);
     }
 
-    let (wakeup_lock, _) = &*pg.poll_wakeup;
+    let (wakeup_lock, _) = &*pg.background_workers.poll_wakeup;
     {
         let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
         *wakeup = false;

@@ -5,22 +5,74 @@ use crate::engine::MetaAcl;
 fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
     let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
     let (_dir, engine) = temp_pg_engine_for_unit();
-    *engine.poll_handle.lock().expect("poll_handle lock") = Some(
-        std::thread::Builder::new()
-            .name("pg-test-slow-close".into())
-            .spawn(|| {
-                std::thread::sleep(Duration::from_secs(5));
-            })
-            .expect("spawn slow background thread"),
-    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("pg-test-slow-close".into())
+        .spawn(move || {
+            started_tx.send(()).expect("signal slow worker start");
+            release_rx.recv().expect("release slow worker");
+        })
+        .expect("spawn slow background thread");
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install slow background worker");
+    started_rx.recv().expect("wait for slow worker start");
 
     let started = Instant::now();
-    engine.prepare_for_close();
+    let first_error = engine
+        .prepare_for_close()
+        .expect_err("slow worker should make close report a timeout");
 
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "prepare_for_close should respect the bounded join timeout for slow threads"
     );
+    let second_error = engine
+        .prepare_for_close()
+        .expect_err("repeated close should replay the first timeout");
+    assert_eq!(first_error.to_string(), second_error.to_string());
+    release_tx.send(()).expect("release slow background worker");
+}
+
+#[test]
+fn prepare_for_close_is_idempotent_when_no_workers_are_running() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+
+    engine
+        .prepare_for_close()
+        .expect("first close should succeed without workers");
+    engine
+        .prepare_for_close()
+        .expect("repeated close should remain successful");
+}
+
+#[test]
+fn dropping_engine_signals_background_workers_without_waiting() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let shutdown = engine.background_workers.poll_shutdown();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        while !shutdown.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        finished_tx.send(()).expect("signal worker stop");
+    });
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install worker");
+
+    let started = Instant::now();
+    drop(engine);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "dropping an engine must not wait for a background worker"
+    );
+    finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("background worker should observe drop cancellation");
 }
 
 #[test]

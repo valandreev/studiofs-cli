@@ -531,7 +531,11 @@ impl StudioVfs {
         // Stop remote metadata workers before the local durability barrier.
         // Their remote sync path takes the replication lock and must not hold
         // shutdown behind a PostgreSQL command timeout.
-        self.sync_meta().prepare_for_close();
+        let metadata_close_error = self
+            .sync_meta()
+            .prepare_for_close()
+            .err()
+            .map(VfsError::Meta);
 
         // Phase 4: persist metadata + cache checkpoint.
         info!(
@@ -546,7 +550,8 @@ impl StudioVfs {
                 meta.sync_local_metadata().map_err(VfsError::Meta)
             });
         let overlay_health_error = self.ensure_volatile_overlay_metadata_healthy().err();
-        let mut metadata_barrier_error = local_dirty_drain_error
+        let mut metadata_barrier_error = metadata_close_error
+            .or(local_dirty_drain_error)
             .or(overlay_barrier_error)
             .or(overlay_health_error);
         let metadata_flush_outcome = match metadata_flush_result {

@@ -382,6 +382,18 @@ fn init_pg_schema_sql() -> &'static str {
                 PRIMARY KEY (vol, id)
             );
 
+            CREATE TABLE IF NOT EXISTS file_lock_leases (
+                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                ino BIGINT NOT NULL,
+                kind SMALLINT NOT NULL,
+                exclusive_owner TEXT,
+                shared_owners TEXT[] NOT NULL DEFAULT '{}',
+                lease_expires_at_unix_ms BIGINT NOT NULL,
+                generation BIGINT NOT NULL DEFAULT 1,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (vol, ino)
+            );
+
             ALTER TABLE event_log
                 ADD COLUMN IF NOT EXISTS batch_version BIGINT;
             UPDATE event_log
@@ -795,6 +807,7 @@ mod tests {
     fn init_pg_schema_provisions_volume_encryption_metadata() {
         let ddl = init_pg_schema_sql();
 
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS file_lock_leases"));
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS volume_crypto_keys"));
         assert!(ddl.contains("encryption_enabled BOOLEAN NOT NULL DEFAULT TRUE"));
         assert!(ddl.contains("encryption_format_version SMALLINT NOT NULL DEFAULT 1"));

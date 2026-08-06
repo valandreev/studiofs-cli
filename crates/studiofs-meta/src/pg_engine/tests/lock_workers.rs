@@ -16,19 +16,15 @@ fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worke
 
     let engine = PgMetaEngine::open(&db).expect("open engine");
     assert!(
-        engine
-            .lock_notify_handle
-            .lock()
-            .expect("lock notify handle")
-            .is_none(),
+        !engine
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockNotify),
         "open alone should not eagerly start the pg lock notify listener"
     );
     assert!(
-        engine
-            .lock_renew_handle
-            .lock()
-            .expect("lock renew handle")
-            .is_none(),
+        !engine
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockRenew),
         "open should still defer the pg lock renew worker until a lock is held"
     );
 
@@ -37,18 +33,14 @@ fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worke
         .expect("start passive lock monitoring");
     assert!(
         engine
-            .lock_notify_handle
-            .lock()
-            .expect("lock notify handle after passive monitoring")
-            .is_some(),
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockNotify),
         "passive lock monitoring should start the pg lock notify listener"
     );
     assert!(
-        engine
-            .lock_renew_handle
-            .lock()
-            .expect("lock renew handle after passive monitoring")
-            .is_none(),
+        !engine
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockRenew),
         "passive lock monitoring should not eagerly start the pg lock renew worker"
     );
 
@@ -61,18 +53,14 @@ fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worke
     assert!(matches!(acquired, FileLockLeaseAcquireOutcome::Acquired(_)));
     assert!(
         engine
-            .lock_notify_handle
-            .lock()
-            .expect("lock notify handle after acquire")
-            .is_some(),
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockNotify),
         "first lock usage should start the pg lock notify listener"
     );
     assert!(
         engine
-            .lock_renew_handle
-            .lock()
-            .expect("lock renew handle after acquire")
-            .is_some(),
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockRenew),
         "first lock usage should start the pg lock renew worker"
     );
 }

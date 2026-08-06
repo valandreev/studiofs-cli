@@ -29,7 +29,6 @@ impl MetaEngineCore for PgMetaEngine {
         kind: HardLockKind,
         lease_ttl: Duration,
     ) -> MetaResult<FileLockLeaseAcquireOutcome> {
-        self.ensure_file_lock_lease_schema_ready()?;
         self.ensure_lock_workers_started()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
@@ -224,7 +223,6 @@ impl MetaEngineCore for PgMetaEngine {
     }
 
     fn release_file_lock_lease(&self, ino: Ino) -> MetaResult<FileLockLeaseReleaseOutcome> {
-        self.ensure_file_lock_lease_schema_ready()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
@@ -377,7 +375,6 @@ impl MetaEngineCore for PgMetaEngine {
         ino: Ino,
         lease_ttl: Duration,
     ) -> MetaResult<FileLockLeaseRenewOutcome> {
-        self.ensure_file_lock_lease_schema_ready()?;
         self.ensure_lock_workers_started()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
@@ -506,7 +503,6 @@ impl MetaEngineCore for PgMetaEngine {
     }
 
     fn current_file_lock_lease(&self, ino: Ino) -> MetaResult<Option<FileLockLease>> {
-        self.ensure_file_lock_lease_schema_ready()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
@@ -529,7 +525,6 @@ impl MetaEngineCore for PgMetaEngine {
     }
 
     fn ensure_known_file_lock_monitoring(&self) -> MetaResult<()> {
-        self.ensure_file_lock_lease_schema_ready()?;
         self.ensure_lock_notify_listener_started()
     }
 

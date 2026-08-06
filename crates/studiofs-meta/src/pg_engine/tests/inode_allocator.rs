@@ -357,7 +357,7 @@ fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
         "a batch carrying the persisted client identity must be classified as self-authored"
     );
 
-    a.prepare_for_close();
+    a.prepare_for_close().expect("close allocator test engine");
     drop(a);
     let reopened = PgMetaEngine::open(&db_a).expect("reopen a");
     assert_eq!(

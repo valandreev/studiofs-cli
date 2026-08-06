@@ -497,7 +497,7 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn replication_backlog(&self) -> MetadataReplicationBacklog);
     forward_method!(fn metadata_authority_status(&self) -> MetadataAuthorityStatus);
     forward_method!(fn remote_metadata_size(&self) -> MetaResult<Option<u64>>);
-    forward_method!(fn prepare_for_close(&self));
+    forward_method!(fn prepare_for_close(&self) -> MetaResult<()>);
 }
 
 /// Wrap a metadata principal in a local runtime handle that exposes the

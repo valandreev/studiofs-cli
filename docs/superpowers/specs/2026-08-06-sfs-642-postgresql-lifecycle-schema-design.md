@@ -45,11 +45,16 @@ After this change:
 - [x] 2026-08-06: User approved the minimal design: canonical `studiofs init`,
   startup validation, DML-only foreground lock paths, and explicit worker
   ownership.
-- [ ] Add regression tests first and observe their expected failures.
-- [ ] Implement schema ownership and startup validation.
-- [ ] Implement owned worker shutdown and update the shared close contract.
-- [ ] Run focused tests, compile/lint checks, and available infrastructure
-  validation.
+- [x] 2026-08-06: Added and observed red init-schema, missing-schema startup,
+  and foreground no-repair tests, then implemented the canonical DDL and
+  read-only startup validation.
+- [x] 2026-08-06: Added owned worker handles/cancellation, idempotent explicit
+  shutdown, non-blocking `Drop` signalling, and the result-bearing close
+  contract through VFS.
+- [x] 2026-08-06: Focused lifecycle, lock, replication-backlog, VFS shutdown,
+  full metadata unit, and all 68 available ignored PostgreSQL tests pass.
+- [ ] Run final formatting, warnings-as-errors, diff, and repository status
+  checks.
 - [ ] Record final evidence and update SFS-642 in Linear in English.
 
 ## Surprises and discoveries
@@ -78,8 +83,14 @@ The following facts were verified before implementation:
   writes to PostgreSQL.
 * The current runner is macOS with macFUSE available, but `/dev/fuse` and the
   MinGW `x86_64-w64-mingw32-gcc` compiler are unavailable. The test PostgreSQL
-  DSN is not present in the environment observed during planning. Those gaps
-  must be reported rather than treated as passing evidence.
+  DSN is not exported in the shell, but the repository test harness loads its
+  configured `.env` and the PostgreSQL integration slice is available. Those
+  platform gaps must be reported rather than treated as passing evidence.
+* Existing allocator recovery tests require local-first startup while
+  PostgreSQL is unreachable. Startup validation therefore rejects a reachable
+  PostgreSQL database with missing tables, but logs and continues when the
+  connection itself is unavailable; later remote operations still report
+  their own transport errors.
 
 ## Decision log
 
@@ -125,6 +136,11 @@ The following facts were verified before implementation:
     with the default implementation remaining successful. `StudioVfs` will
     include the result in its existing shutdown error combination while still
     attempting the local flush and other cleanup.
+11. **Preserve local-first startup during a PostgreSQL outage.** A reachable
+    database with missing required tables is a provisioning error and blocks
+    startup. A connection-refused/unreachable database cannot be schema-
+    validated, so startup continues with the existing offline behavior and
+    emits a warning; authentication, SQL, and catalog errors are not masked.
 
 ## Context and orientation
 
@@ -270,8 +286,8 @@ it green.
    change:
    `cargo test -p studiofs-vfs shutdown -- --nocapture`
 7. Run the complete metadata PostgreSQL ignored slice once the focused tests
-   pass:
-   `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1`
+   pass. The nested test modules require the broader module filter:
+   `cargo test -p studiofs-meta pg_engine::tests:: -- --ignored --nocapture --test-threads=1`
 8. Run repository checks:
    `cargo fmt --all -- --check`
 
@@ -346,6 +362,8 @@ shared close result crosses the existing metadata port.
 
 ## Outcomes and retrospective
 
-Implementation is not complete yet. Update this section after verification
-with the final changed files, commands and results, known infrastructure
-gaps, and any design deviation that was required by the current code.
+Implementation is complete pending the final repository checks. The changed
+behavior is covered by focused red/green tests, the full `studiofs-meta` unit
+suite, VFS shutdown tests, and the available PostgreSQL integration slice.
+Update this section after the final checks with exact command results, known
+infrastructure gaps, and any final design deviation.

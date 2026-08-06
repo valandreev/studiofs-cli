@@ -63,12 +63,8 @@ fn test_pg_metadata_notify_listener_wakes_remote_sync_without_poll() {
     });
     let readiness_diagnostics = b.metadata_invalidation_diagnostics();
     let (readiness_listener_started, readiness_listener_finished) = b
-        .metadata_notify_handle
-        .lock()
-        .expect("metadata notify handle")
-        .as_ref()
-        .map(|handle| (true, handle.is_finished()))
-        .unwrap_or((false, false));
+        .background_workers
+        .handle_status(PgBackgroundWorker::MetadataNotify);
     assert!(
         readiness_received,
         "metadata notify listener should receive a readiness notification before the metadata assertion; diagnostics={readiness_diagnostics:?}; listener_started={readiness_listener_started}; listener_finished={readiness_listener_finished}"
@@ -83,12 +79,8 @@ fn test_pg_metadata_notify_listener_wakes_remote_sync_without_poll() {
     });
     let diagnostics = b.metadata_invalidation_diagnostics();
     let (listener_started, listener_finished) = b
-        .metadata_notify_handle
-        .lock()
-        .expect("metadata notify handle")
-        .as_ref()
-        .map(|handle| (true, handle.is_finished()))
-        .unwrap_or((false, false));
+        .background_workers
+        .handle_status(PgBackgroundWorker::MetadataNotify);
     assert!(
         visible,
         "metadata NOTIFY should wake the remote peer without waiting for the long fallback poll; diagnostics={diagnostics:?}; listener_started={listener_started}; listener_finished={listener_finished}"
