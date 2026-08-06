@@ -24,6 +24,7 @@ filesystem.
 - [x] Replace the WinFSP `Vec<Ino>` with a bounded unique queue and report its depth/peak/coalescing metrics.
 - [x] (2026-08-06 Europe/Kyiv) Address review findings: close WinFSP ingress before host shutdown, make producer-wait tests deterministic, publish queue depth at mutation time, exercise upload bursts through `UploadLifecycleWorker`, and add macFUSE invalidation metrics.
 - [x] Run warning checks, formatting, and diff hygiene; record native-platform gaps honestly.
+- [x] (2026-08-06 Europe/Kyiv) Validate the WinFSP crate on native Windows: queue and notification tests pass, `cargo check` and Clippy pass with `-D warnings`, and test-only queue helpers no longer enter the release build.
 - [x] Update this plan and the SFS-640 Linear issue with the implementation and validation evidence.
 
 ## Surprises & Discoveries
@@ -86,6 +87,12 @@ The host warning, formatting, and diff checks pass after the review fixes.
 Native WinFSP tests are unavailable on Darwin (the package reports zero tests
 under its Windows cfg); the Windows cross-target check is blocked before Rust
 source checking by the missing MinGW C compiler needed by `ring`.
+
+Native Windows follow-up completed the WinFSP queue validation: the full crate
+test run passed 108/108 before the warning-only cleanup, and the focused queue
+and notification tests passed after it. `cargo check -p studiofs-winfsp` and
+`cargo clippy -p studiofs-winfsp --lib --tests -- -D warnings` are clean. A
+mounted WinFSP E2E run was not performed in this pass.
 
 ## Context and Orientation
 
@@ -166,13 +173,14 @@ The upload worker consumes coalesced wakeups and claims authoritative pending
 state without losing a durable transition. Prefetch ingress and pending
 blocks have finite limits, and the focused cache/VFS tests pass.
 
-### M2 — WinFSP bound and validation (implementation complete; native validation pending)
+### M2 — WinFSP bound and validation (complete; mounted E2E remains separate)
 
 WinFSP invalidation has finite unique capacity and producer backpressure. Its
 Windows-gated tests cover deterministic producer waiting, close wakeup, and
-live queue metrics before drain. They cannot execute on the current Darwin
-host; the host command reports zero tests, and cross-target checking is blocked
-by the missing MinGW C compiler.
+live queue metrics before drain. Native Windows validation passes the queue and
+notification tests plus warning-clean check and Clippy. Darwin remains unable
+to execute these tests natively, and mounted WinFSP E2E was not part of this
+pass.
 
 ## Concrete Steps
 
