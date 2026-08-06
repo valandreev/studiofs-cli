@@ -141,10 +141,27 @@ fn select_metadata_barrier_error(
     overlay_barrier_error: Option<VfsError>,
     overlay_health_error: Option<VfsError>,
 ) -> Option<VfsError> {
-    local_dirty_drain_error
-        .or(metadata_close_error)
-        .or(overlay_barrier_error)
-        .or(overlay_health_error)
+    let mut selected = None;
+    for (barrier, error) in [
+        ("local dirty drain", local_dirty_drain_error),
+        ("metadata close", metadata_close_error),
+        ("overlay barrier", overlay_barrier_error),
+        ("overlay health", overlay_health_error),
+    ] {
+        let Some(error) = error else {
+            continue;
+        };
+        if selected.is_some() {
+            warn!(
+                barrier,
+                error = %error,
+                "VFS shutdown: secondary metadata barrier error suppressed"
+            );
+        } else {
+            selected = Some(error);
+        }
+    }
+    selected
 }
 
 enum ShutdownWaitResult {

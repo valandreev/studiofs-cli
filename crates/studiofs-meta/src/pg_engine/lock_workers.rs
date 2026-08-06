@@ -1,4 +1,4 @@
-use super::{PgBackgroundWorker, PgMetaEngine};
+use super::{PgBackgroundWorker, PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaEngineCore, MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
 use crate::types::*;
@@ -120,7 +120,10 @@ impl PgMetaEngine {
                             };
                             let (client, mut connection) = connect_result
                                 .map_err(|_| {
-                                    Self::pg_timeout_error("lock notify connect", connect_timeout)
+                                    Self::pg_timeout_error(
+                                        PgTimeoutContext::Connection("lock notify connect"),
+                                        connect_timeout,
+                                    )
                                 })??;
 
                             if weak_engine.upgrade().is_none() {

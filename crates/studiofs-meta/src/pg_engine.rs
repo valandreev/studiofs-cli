@@ -275,6 +275,12 @@ enum MetadataSyncSource {
     FallbackPoll,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum PgTimeoutContext<'a> {
+    Connection(&'a str),
+    Command(&'a str),
+}
+
 #[derive(Debug, Clone)]
 struct HeldFileLockLease {
     lease_ttl: Duration,

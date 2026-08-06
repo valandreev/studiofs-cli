@@ -192,6 +192,9 @@ fn is_transport_unavailable(error: &io::Error) -> bool {
             | io::ErrorKind::UnexpectedEof
     ) || (error.kind() == io::ErrorKind::InvalidInput
         && error.to_string() == "could not resolve any addresses")
+        || error
+            .to_string()
+            .starts_with("failed to lookup address information")
 }
 
 fn parse_postgres_config(dsn: &str) -> MetaResult<tokio_postgres::Config> {
@@ -489,6 +492,14 @@ mod tests {
         assert!(is_transport_unavailable(&std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "could not resolve any addresses",
+        )));
+        assert!(is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "failed to lookup address information",
+        )));
+        assert!(!is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "certificate verify failed",
         )));
         assert!(!is_transport_unavailable(&std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,

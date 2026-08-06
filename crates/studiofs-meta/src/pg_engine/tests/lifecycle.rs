@@ -83,6 +83,45 @@ fn prepare_for_close_serializes_lazy_worker_registration() {
 }
 
 #[test]
+fn metadata_notify_start_skips_start_lock_when_already_registered() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let handle = std::thread::spawn(|| {});
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::MetadataNotify, handle)
+        .expect("register metadata notify worker");
+    let engine = std::sync::Arc::new(engine);
+    let start_guard = engine
+        .lock_worker_start_lock
+        .lock()
+        .expect("worker start lock");
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let calling_engine = engine.clone();
+    let caller = std::thread::spawn(move || {
+        result_tx
+            .send(calling_engine.ensure_metadata_notify_listener_started())
+            .expect("send metadata notify start result");
+    });
+
+    let early_result = result_rx.recv_timeout(Duration::from_millis(250));
+    let completed_without_waiting = early_result.is_ok();
+    drop(start_guard);
+    let result = match early_result {
+        Ok(result) => result,
+        Err(_) => result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("metadata notify start should finish after releasing the lock"),
+    };
+    caller.join().expect("join metadata notify start");
+
+    assert!(
+        completed_without_waiting,
+        "an already registered metadata notify worker should not wait for the start lock"
+    );
+    result.expect("already registered metadata notify worker should be a no-op");
+}
+
+#[test]
 fn postgres_unavailable_requires_a_typed_connect_error() {
     assert!(PgMetaEngine::is_postgres_unavailable(
         &MetaError::PostgresUnavailable("connection refused".to_string())
@@ -92,12 +131,15 @@ fn postgres_unavailable_requires_a_typed_connect_error() {
     )));
     assert!(PgMetaEngine::is_postgres_unavailable(
         &PgMetaEngine::pg_timeout_error(
-            "validate postgres schema connect",
+            PgTimeoutContext::Connection("validate postgres schema connect"),
             Duration::from_millis(10),
         )
     ));
     assert!(!PgMetaEngine::is_postgres_unavailable(
-        &PgMetaEngine::pg_timeout_error("validate postgres schema", Duration::from_millis(10))
+        &PgMetaEngine::pg_timeout_error(
+            PgTimeoutContext::Command("validate postgres schema"),
+            Duration::from_millis(10),
+        )
     ));
 }
 

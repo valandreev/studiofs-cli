@@ -196,7 +196,7 @@ fn join_worker_until(
                 "pg {worker} background thread did not stop before shutdown join timeout"
             )));
         }
-        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 
     handle.join().map_err(|_| {

@@ -1,4 +1,4 @@
-use super::{MetadataSyncSource, PgBackgroundWorker, PgMetaEngine};
+use super::{MetadataSyncSource, PgBackgroundWorker, PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +8,13 @@ use tokio_util::sync::CancellationToken;
 
 impl PgMetaEngine {
     pub(super) fn ensure_metadata_notify_listener_started(&self) -> MetaResult<()> {
+        if self
+            .background_workers
+            .has_handle(PgBackgroundWorker::MetadataNotify)
+        {
+            return Ok(());
+        }
+
         let _start_guard = self.lock_worker_start_lock.lock().map_err(|_| {
             MetaError::Storage("pg background worker start state poisoned".to_string())
         })?;
@@ -82,7 +89,7 @@ impl PgMetaEngine {
                             let (client, mut connection) = connect_result
                                 .map_err(|_| {
                                     Self::pg_timeout_error(
-                                        "metadata notify connect",
+                                        PgTimeoutContext::Connection("metadata notify connect"),
                                         connect_timeout,
                                     )
                                 })??;
