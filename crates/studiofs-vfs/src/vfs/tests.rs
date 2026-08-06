@@ -15518,6 +15518,35 @@ fn deferred_materialization_linger_preserves_stream_coalescing() {
 }
 
 #[test]
+fn deferred_materialization_pass_reports_idle_for_clean_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-pass-idle");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"materialize-pass-idle.bin", 0, 0, 0o644)
+            .expect("create file");
+        let (entry, guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(attr.ino)
+            .expect("test should reserve the deferred materialization gate");
+        let mut no_progress_retries = 0;
+
+        let outcome = vfs
+            .run_deferred_materialization_pass(&entry, &mut no_progress_retries)
+            .await;
+
+        assert_eq!(
+            outcome,
+            super::sync_ops::DeferredMaterializationPassOutcome::Idle
+        );
+        drop(entry);
+        drop(guard);
+    });
+}
+
+#[test]
 fn strict_flush_interrupts_deferred_materialization_linger() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) =
