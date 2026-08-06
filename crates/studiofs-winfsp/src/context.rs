@@ -2289,7 +2289,6 @@ mod tests {
         winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
         write_local_sync_policy_from_create_parameters,
     };
-    use parking_lot::Mutex;
     use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Barrier;

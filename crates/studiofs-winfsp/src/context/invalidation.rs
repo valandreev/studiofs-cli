@@ -152,6 +152,7 @@ impl WinfspInvalidationQueue {
         inodes
     }
 
+    #[cfg(test)]
     pub(crate) fn extend(&self, inodes: impl IntoIterator<Item = Ino>) {
         let mut state = self.state.lock();
         let mut changed = false;
@@ -165,6 +166,7 @@ impl WinfspInvalidationQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.state.lock().pending.is_empty()
     }
