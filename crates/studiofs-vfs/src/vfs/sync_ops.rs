@@ -44,6 +44,29 @@ impl VfsWritePayload<'_> {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum DeferredMaterializationPassOutcome {
+    Idle,
+    Reschedule,
+    Interrupted,
+    Completed { allow_reschedule: bool },
+}
+
+async fn wait_linger_or_reschedule(
+    entry: &DeferredInodeGateEntry,
+) -> DeferredMaterializationPassOutcome {
+    if entry
+        .wait_linger_or_interrupt(Duration::from_millis(
+            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+        ))
+        .await
+    {
+        DeferredMaterializationPassOutcome::Interrupted
+    } else {
+        DeferredMaterializationPassOutcome::Reschedule
+    }
+}
+
 pub(super) fn merge_write_dirty_attr(attr: &mut InodeAttr, base_attr: &InodeAttr) {
     if attr.content_epoch < base_attr.content_epoch {
         *attr = base_attr.clone();
@@ -118,6 +141,12 @@ impl StudioVfs {
     #[cfg(test)]
     pub(super) fn arm_fail_next_inline_dirty_attr_persist_for_test(&self) {
         self.fail_next_inline_dirty_attr_persist
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_fail_next_deferred_materialization_prefetch_for_test(&self) {
+        self.fail_next_deferred_materialization_prefetch
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -371,6 +400,193 @@ impl StudioVfs {
         self.start_deferred_materialization_task(entry, guard);
     }
 
+    pub(super) async fn run_deferred_materialization_pass(
+        &self,
+        entry: &DeferredInodeGateEntry,
+        no_progress_retries: &mut usize,
+    ) -> DeferredMaterializationPassOutcome {
+        let ino = entry.ino;
+        let dirty_before = self.state.writer_stack.dirty_bytes_for_inode(ino);
+        let total_before = self.total_pending_write_buffer_bytes();
+        if dirty_before == 0 {
+            if *no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
+                && self.should_linger_clean_deferred_materialization(ino)
+            {
+                *no_progress_retries += 1;
+                return wait_linger_or_reschedule(entry).await;
+            }
+            return DeferredMaterializationPassOutcome::Idle;
+        }
+
+        if let Err(error) = self
+            .prefetch_writer_stack_object_ids_for_completed_blocks(ino)
+            .await
+        {
+            if !self.suppress_deleted_inode_materialization_error(ino, &error) {
+                warn!(
+                    ino,
+                    error = %error,
+                    "deferred writer-stack object id prefetch failed; will retry at next strict barrier"
+                );
+            }
+            return DeferredMaterializationPassOutcome::Completed {
+                allow_reschedule: false,
+            };
+        }
+
+        let materialize_writer_stack_started = Instant::now();
+        let writer_stack_materialized_bytes = match self
+            .materialize_writer_stack_completed_blocks_for_inode(ino)
+            .await
+        {
+            Ok(materialized_bytes) => materialized_bytes,
+            Err(e) => {
+                if !self.suppress_deleted_inode_materialization_error(ino, &e) {
+                    warn!(
+                        ino,
+                        error = %e,
+                        "deferred writer-stack materialization failed; will retry at next strict barrier"
+                    );
+                }
+                return DeferredMaterializationPassOutcome::Completed {
+                    allow_reschedule: false,
+                };
+            }
+        };
+        self.record_vfs_write_materialize_completed(materialize_writer_stack_started.elapsed());
+
+        let materialize_for_limits_started = Instant::now();
+        let limits_materialized = match self
+            .materialize_writer_stack_completed_blocks_for_limits(ino)
+            .await
+        {
+            Ok(materialized) => materialized > 0,
+            Err(e) => {
+                if !self.suppress_deleted_inode_materialization_error(ino, &e) {
+                    warn!(
+                        ino,
+                        error = %e,
+                        "deferred writer-stack budget materialization failed; will retry at next strict barrier"
+                    );
+                    // #region debug log
+                    self.debug_write_probe(
+                        "H1",
+                        concat!(file!(), ":", line!()),
+                        "deferred writer-stack limit-pass failure",
+                        serde_json::json!({
+                            "ino": ino,
+                            "error": e.to_string(),
+                            "meta_exists": self.sync_meta().get_attr(ino).is_ok(),
+                            "deleted_marker": self.state.upload.deleted_inodes.lock().contains(&ino),
+                            "open_count": self.handle_table.open_count(ino),
+                            "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                            "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
+                        }),
+                    );
+                    // #endregion debug log
+                }
+                return DeferredMaterializationPassOutcome::Completed {
+                    allow_reschedule: false,
+                };
+            }
+        };
+        self.record_vfs_write_materialize_for_limits(materialize_for_limits_started.elapsed());
+
+        let dirty_after = self.state.writer_stack.dirty_bytes_for_inode(ino);
+        let total_after = self.total_pending_write_buffer_bytes();
+        let completed_blocks_remain = self.should_continue_deferred_materialization(ino);
+        let made_progress = writer_stack_materialized_bytes > 0
+            || limits_materialized
+            || dirty_after < dirty_before
+            || total_after < total_before;
+
+        if dirty_after > 0
+            && !completed_blocks_remain
+            && !self.should_linger_deferred_tail_materialization(ino)
+        {
+            let closed_writer_materialized = match self
+                .materialize_writer_stack_for_inode(ino)
+                .await
+            {
+                Ok(materialized_bytes) => materialized_bytes,
+                Err(e) => {
+                    if !self.suppress_deleted_inode_materialization_error(ino, &e) {
+                        warn!(
+                            ino,
+                            error = %e,
+                            "deferred writer-stack materialization after writer close failed; strict barrier will retry"
+                        );
+                    }
+                    return DeferredMaterializationPassOutcome::Completed {
+                        allow_reschedule: false,
+                    };
+                }
+            };
+            if closed_writer_materialized > 0 {
+                tokio::task::yield_now().await;
+                return DeferredMaterializationPassOutcome::Reschedule;
+            }
+        }
+
+        if dirty_after > 0
+            && !completed_blocks_remain
+            && self.should_linger_deferred_tail_materialization(ino)
+        {
+            if *no_progress_retries >= super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES {
+                let idle_tail_started = Instant::now();
+                let idle_tail_materialized = match self
+                    .materialize_writer_stack_idle_tail_for_inode(
+                        ino,
+                        Self::deferred_materialization_linger_duration(),
+                    )
+                    .await
+                {
+                    Ok(materialized_bytes) => materialized_bytes,
+                    Err(e) => {
+                        if !self.suppress_deleted_inode_materialization_error(ino, &e) {
+                            warn!(
+                                ino,
+                                error = %e,
+                                "deferred writer-stack idle-tail materialization failed; will retry at next strict barrier"
+                            );
+                        }
+                        return DeferredMaterializationPassOutcome::Completed {
+                            allow_reschedule: false,
+                        };
+                    }
+                };
+                self.record_vfs_write_materialize_completed(idle_tail_started.elapsed());
+                if idle_tail_materialized > 0 {
+                    *no_progress_retries = 0;
+                    tokio::task::yield_now().await;
+                    return DeferredMaterializationPassOutcome::Reschedule;
+                }
+            }
+
+            *no_progress_retries = no_progress_retries
+                .saturating_add(1)
+                .min(super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES);
+            return wait_linger_or_reschedule(entry).await;
+        }
+
+        if made_progress {
+            *no_progress_retries = 0;
+        } else if *no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
+            && self.should_linger_deferred_materialization(ino)
+        {
+            *no_progress_retries += 1;
+            return wait_linger_or_reschedule(entry).await;
+        }
+
+        if !made_progress || !completed_blocks_remain {
+            return DeferredMaterializationPassOutcome::Completed {
+                allow_reschedule: true,
+            };
+        }
+        tokio::task::yield_now().await;
+        DeferredMaterializationPassOutcome::Reschedule
+    }
+
     fn start_deferred_materialization_task(
         self: &Arc<Self>,
         entry: DeferredInodeGateEntry,
@@ -380,214 +596,20 @@ impl StudioVfs {
         self.track_background_task(tokio::spawn(async move {
             let _guard = guard;
             let ino = entry.ino;
-            let mut allow_reschedule_on_exit = true;
-            let mut linger_interrupted = false;
             let mut no_progress_retries = 0usize;
-            loop {
-                let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
-                let dirty_before = writer_stack_dirty_before;
-                let total_before = vfs.total_pending_write_buffer_bytes();
-                if dirty_before == 0 {
-                    if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
-                        && vfs.should_linger_clean_deferred_materialization(ino)
-                    {
-                        no_progress_retries += 1;
-                        if entry
-                            .wait_linger_or_interrupt(Duration::from_millis(
-                                super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                            ))
-                            .await
-                        {
-                            linger_interrupted = true;
-                            break;
-                        }
-                        continue;
-                    }
-                    break;
-                }
-
-                if let Err(error) = vfs
-                    .prefetch_writer_stack_object_ids_for_completed_blocks(ino)
+            let (mut allow_reschedule_on_exit, linger_interrupted) = loop {
+                match vfs
+                    .run_deferred_materialization_pass(&entry, &mut no_progress_retries)
                     .await
                 {
-                    allow_reschedule_on_exit = false;
-                    if !vfs.suppress_deleted_inode_materialization_error(ino, &error) {
-                        warn!(
-                            ino,
-                            error = %error,
-                            "deferred writer-stack object id prefetch failed; will retry at next strict barrier"
-                        );
-                    }
-                    break;
-                }
-
-                let materialize_writer_stack_started = Instant::now();
-                let writer_stack_materialized_bytes =
-                    match vfs
-                        .materialize_writer_stack_completed_blocks_for_inode(ino)
-                        .await
-                    {
-                    Ok(materialized_bytes) => materialized_bytes,
-                    Err(e) => {
-                        allow_reschedule_on_exit = false;
-                        if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
-                            warn!(
-                                ino,
-                                error = %e,
-                                "deferred writer-stack materialization failed; will retry at next strict barrier"
-                            );
-                        }
-                        break;
-                    }
-                };
-                vfs.record_vfs_write_materialize_completed(
-                    materialize_writer_stack_started.elapsed(),
-                );
-
-                let materialize_for_limits_started = Instant::now();
-                let limits_materialized = match vfs
-                    .materialize_writer_stack_completed_blocks_for_limits(ino)
-                    .await
-                {
-                    Ok(materialized) => materialized > 0,
-                    Err(e) => {
-                        allow_reschedule_on_exit = false;
-                        if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
-                            warn!(
-                                ino,
-                                error = %e,
-                                "deferred writer-stack budget materialization failed; will retry at next strict barrier"
-                            );
-                            // #region debug log
-                            vfs.debug_write_probe(
-                                "H1",
-                                concat!(file!(), ":", line!()),
-                                "deferred writer-stack limit-pass failure",
-                                serde_json::json!({
-                                    "ino": ino,
-                                    "error": e.to_string(),
-                                    "meta_exists": vfs.sync_meta().get_attr(ino).is_ok(),
-                                    "deleted_marker": vfs.state.upload.deleted_inodes.lock().contains(&ino),
-                                    "open_count": vfs.handle_table.open_count(ino),
-                                    "per_inode_dirty_bytes": vfs.state.writer_stack.dirty_bytes_for_inode(ino),
-                                    "total_dirty_bytes": vfs.state.writer_stack.total_dirty_bytes(),
-                                }),
-                            );
-                            // #endregion debug log
-                        }
-                        break;
-                    }
-                };
-                vfs.record_vfs_write_materialize_for_limits(
-                    materialize_for_limits_started.elapsed(),
-                );
-
-                let dirty_after = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
-                let total_after = vfs.total_pending_write_buffer_bytes();
-                let completed_blocks_remain = vfs.should_continue_deferred_materialization(ino);
-                let made_progress = writer_stack_materialized_bytes > 0
-                    || limits_materialized
-                    || dirty_after < dirty_before
-                    || total_after < total_before;
-
-                if dirty_after > 0
-                    && !completed_blocks_remain
-                    && !vfs.should_linger_deferred_tail_materialization(ino)
-                {
-                    let closed_writer_materialized = match vfs
-                        .materialize_writer_stack_for_inode(ino)
-                        .await
-                    {
-                        Ok(materialized_bytes) => materialized_bytes,
-                        Err(e) => {
-                            allow_reschedule_on_exit = false;
-                            if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
-                                warn!(
-                                    ino,
-                                    error = %e,
-                                    "deferred writer-stack materialization after writer close failed; strict barrier will retry"
-                                );
-                            }
-                            break;
-                        }
-                    };
-                    if closed_writer_materialized > 0 {
-                        tokio::task::yield_now().await;
-                        continue;
+                    DeferredMaterializationPassOutcome::Reschedule => continue,
+                    DeferredMaterializationPassOutcome::Idle => break (true, false),
+                    DeferredMaterializationPassOutcome::Interrupted => break (true, true),
+                    DeferredMaterializationPassOutcome::Completed { allow_reschedule } => {
+                        break (allow_reschedule, false);
                     }
                 }
-
-                if dirty_after > 0
-                    && !completed_blocks_remain
-                    && vfs.should_linger_deferred_tail_materialization(ino)
-                {
-                    if no_progress_retries >= super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES {
-                        let idle_tail_started = Instant::now();
-                        let idle_tail_materialized = match vfs
-                            .materialize_writer_stack_idle_tail_for_inode(
-                                ino,
-                                Self::deferred_materialization_linger_duration(),
-                            )
-                            .await
-                        {
-                            Ok(materialized_bytes) => materialized_bytes,
-                            Err(e) => {
-                                allow_reschedule_on_exit = false;
-                                if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
-                                    warn!(
-                                        ino,
-                                        error = %e,
-                                        "deferred writer-stack idle-tail materialization failed; will retry at next strict barrier"
-                                    );
-                                }
-                                break;
-                            }
-                        };
-                        vfs.record_vfs_write_materialize_completed(idle_tail_started.elapsed());
-                        if idle_tail_materialized > 0 {
-                            no_progress_retries = 0;
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                    }
-
-                    no_progress_retries = no_progress_retries
-                        .saturating_add(1)
-                        .min(super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES);
-                    if entry
-                        .wait_linger_or_interrupt(Duration::from_millis(
-                            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                        ))
-                        .await
-                    {
-                        linger_interrupted = true;
-                        break;
-                    }
-                    continue;
-                }
-
-                if made_progress {
-                    no_progress_retries = 0;
-                } else if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
-                    && vfs.should_linger_deferred_materialization(ino)
-                {
-                    no_progress_retries += 1;
-                    if entry
-                        .wait_linger_or_interrupt(Duration::from_millis(
-                            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                        ))
-                        .await
-                    {
-                        linger_interrupted = true;
-                        break;
-                    }
-                    continue;
-                }
-                if !made_progress || !completed_blocks_remain {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            };
 
             if linger_interrupted && vfs.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
                 let interrupted_materialize_started = Instant::now();
@@ -2075,6 +2097,16 @@ impl StudioVfs {
         &self,
         ino: Ino,
     ) -> VfsResult<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_deferred_materialization_prefetch
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(VfsError::Other(
+                "simulated deferred materialization prefetch failure".into(),
+            ));
+        }
+
         let object_count = self
             .state
             .writer_stack
