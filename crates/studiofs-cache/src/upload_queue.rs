@@ -278,6 +278,15 @@ impl UploadQueue {
         claimed
     }
 
+    /// Returns whether `op` still matches the authoritative pending operation.
+    pub fn is_current(&self, op: &PendingUpload) -> bool {
+        self.pending_state
+            .lock()
+            .by_object
+            .get(&op.object_id)
+            .is_some_and(|current| current == op)
+    }
+
     /// Return current upload wakeup ingress metrics.
     pub fn ingress_snapshot(&self) -> UploadQueueIngressSnapshot {
         let state = self.pending_state.lock();
@@ -564,6 +573,8 @@ mod tests {
         assert_eq!(queue.pending_count(), 1);
         let updated = recv_one(&queue, &mut rx).await;
         assert_eq!(updated.content_epoch, 3);
+        assert!(!queue.is_current(&stale));
+        assert!(queue.is_current(&updated));
         assert!(
             !queue.cancel(&stale),
             "stale worker op must not cancel newer state"

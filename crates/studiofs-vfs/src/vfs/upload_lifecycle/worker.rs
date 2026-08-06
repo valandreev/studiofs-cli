@@ -2120,6 +2120,10 @@ impl UploadLifecycleWorker {
                     drop(permit);
                     break;
                 };
+                if !self.vfs.cached_store.is_pending_upload_current(&op) {
+                    drop(permit);
+                    continue;
+                }
                 if self.queued_upload_deleted_before_dispatch(op.ino) {
                     self.cancel_deleted_queued_upload(op);
                     drop(permit);

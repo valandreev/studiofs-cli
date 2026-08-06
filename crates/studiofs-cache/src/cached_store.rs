@@ -958,6 +958,11 @@ impl CachedStore {
         self.upload_queue.claim_pending()
     }
 
+    /// Returns whether `op` still matches the authoritative pending upload.
+    pub fn is_pending_upload_current(&self, op: &PendingUpload) -> bool {
+        self.upload_queue.is_current(op)
+    }
+
     /// Waits until the upload queue becomes idle or `timeout` elapses.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
         self.upload_queue.wait_for_idle(timeout).await
