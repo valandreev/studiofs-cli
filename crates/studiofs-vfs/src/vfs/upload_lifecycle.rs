@@ -560,11 +560,7 @@ impl StudioVfs {
         // Stop remote metadata workers before the local durability barrier.
         // Their remote sync path takes the replication lock and must not hold
         // shutdown behind a PostgreSQL command timeout.
-        let metadata_close_error = self
-            .sync_meta()
-            .prepare_for_close()
-            .err()
-            .map(VfsError::Meta);
+        let metadata_close_error = self.meta.run(|meta| meta.prepare_for_close()).await.err();
 
         // Phase 4: persist metadata + cache checkpoint.
         info!(

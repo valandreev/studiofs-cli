@@ -49,6 +49,7 @@ schema validation, or foreground lock schema behavior:
 ```bash
 cargo test -p studiofs-meta prepare_for_close_does_not_block_forever_on_slow_background_thread -- --nocapture
 cargo test -p studiofs-meta prepare_for_close_serializes_lazy_worker_registration -- --nocapture
+cargo test -p studiofs-meta shutdown_releases_worker_state_before_joining_workers -- --nocapture
 cargo test -p studiofs-meta metadata_notify_start_skips_start_lock_when_already_registered -- --nocapture
 cargo test -p studiofs-meta prepare_for_close_is_idempotent_when_no_workers_are_running -- --nocapture
 cargo test -p studiofs-meta dropping_engine_signals_background_workers_without_waiting -- --nocapture

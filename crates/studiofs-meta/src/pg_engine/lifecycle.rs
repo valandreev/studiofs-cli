@@ -103,36 +103,52 @@ impl PgBackgroundWorkers {
     }
 
     pub(super) fn shutdown(&self, timeout: Duration) -> MetaResult<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg background worker state poisoned".to_string()))?;
-        if state.shutdown_complete {
-            return match &state.shutdown_error {
-                Some(error) => Err(error.clone()),
-                None => Ok(()),
-            };
-        }
+        let handles = {
+            let mut state = self.state.lock().map_err(|_| {
+                MetaError::Storage("pg background worker state poisoned".to_string())
+            })?;
+            if state.shutdown_complete {
+                return match &state.shutdown_error {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(()),
+                };
+            }
 
-        self.signal_stop();
+            self.signal_stop();
+            state.shutdown_complete = true;
+            [
+                (PgBackgroundWorker::Poll, state.poll_handle.take()),
+                (
+                    PgBackgroundWorker::MetadataNotify,
+                    state.metadata_notify_handle.take(),
+                ),
+                (
+                    PgBackgroundWorker::LockNotify,
+                    state.lock_notify_handle.take(),
+                ),
+                (
+                    PgBackgroundWorker::LockRenew,
+                    state.lock_renew_handle.take(),
+                ),
+            ]
+        };
+
         let deadline = Instant::now() + timeout;
         let mut first_error = None;
-        for worker in [
-            PgBackgroundWorker::Poll,
-            PgBackgroundWorker::MetadataNotify,
-            PgBackgroundWorker::LockNotify,
-            PgBackgroundWorker::LockRenew,
-        ] {
-            let result = worker_slot_mut(&mut state, worker)
-                .take()
-                .and_then(|handle| join_worker_until(handle, deadline, worker).err());
+        for (worker, handle) in handles {
+            let result =
+                handle.and_then(|handle| join_worker_until(handle, deadline, worker).err());
             if first_error.is_none() {
                 first_error = result;
             }
         }
 
-        state.shutdown_complete = true;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg background worker state poisoned".to_string()))?;
         state.shutdown_error = first_error.clone();
+        drop(state);
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),

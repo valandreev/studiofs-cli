@@ -83,6 +83,63 @@ fn prepare_for_close_serializes_lazy_worker_registration() {
 }
 
 #[test]
+fn shutdown_releases_worker_state_before_joining_workers() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        release_rx.recv().expect("release slow background worker");
+    });
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install slow background worker");
+
+    let closing_engine = engine.clone();
+    let close_thread = std::thread::spawn(move || {
+        closing_engine
+            .background_workers
+            .shutdown(Duration::from_secs(30))
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let observed_shutdown_start = loop {
+        match engine.background_workers.state.try_lock() {
+            Ok(state) if state.shutdown_complete => break true,
+            Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("background worker state lock poisoned")
+            }
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+
+    if !observed_shutdown_start {
+        release_tx.send(()).expect("release slow background worker");
+        let _ = close_thread.join().expect("join close thread");
+        panic!("shutdown should publish its terminal state before joining workers");
+    }
+
+    let handle = std::thread::spawn(|| {});
+    let install_result = engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::MetadataNotify, handle);
+    assert!(
+        install_result.is_err(),
+        "registration after shutdown must be rejected without waiting for join"
+    );
+
+    release_tx.send(()).expect("release slow background worker");
+    close_thread
+        .join()
+        .expect("join close thread")
+        .expect("shutdown should join the released worker");
+}
+
+#[test]
 fn metadata_notify_start_skips_start_lock_when_already_registered() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     let handle = std::thread::spawn(|| {});
