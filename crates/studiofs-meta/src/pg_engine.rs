@@ -378,14 +378,7 @@ impl PgMetaEngine {
     }
 
     fn is_postgres_unavailable(error: &MetaError) -> bool {
-        matches!(
-            error,
-            MetaError::Storage(message)
-                if message.starts_with("postgres connect failed:")
-                    && (message.contains("error connecting to server")
-                        || message.contains("connection refused")
-                        || message.contains("timed out"))
-        )
+        matches!(error, MetaError::PostgresUnavailable(_))
     }
 
     /// Open the PostgreSQL-backed metadata engine using default startup options.

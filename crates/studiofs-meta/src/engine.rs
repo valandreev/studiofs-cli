@@ -109,6 +109,10 @@ pub enum MetaError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// PostgreSQL could not be reached during an operation that permits local-first fallback.
+    #[error("postgres unavailable: {0}")]
+    PostgresUnavailable(String),
+
     /// Serialization or deserialization failure for persisted metadata.
     #[error("serialization error: {0}")]
     Serialization(String),

@@ -135,6 +135,18 @@ fn select_shutdown_result(
         .map_or(Ok(()), Err)
 }
 
+fn select_metadata_barrier_error(
+    local_dirty_drain_error: Option<VfsError>,
+    metadata_close_error: Option<VfsError>,
+    overlay_barrier_error: Option<VfsError>,
+    overlay_health_error: Option<VfsError>,
+) -> Option<VfsError> {
+    local_dirty_drain_error
+        .or(metadata_close_error)
+        .or(overlay_barrier_error)
+        .or(overlay_health_error)
+}
+
 enum ShutdownWaitResult {
     Retry,
     Completed(Option<ShutdownError>),
@@ -550,10 +562,12 @@ impl StudioVfs {
                 meta.sync_local_metadata().map_err(VfsError::Meta)
             });
         let overlay_health_error = self.ensure_volatile_overlay_metadata_healthy().err();
-        let mut metadata_barrier_error = metadata_close_error
-            .or(local_dirty_drain_error)
-            .or(overlay_barrier_error)
-            .or(overlay_health_error);
+        let mut metadata_barrier_error = select_metadata_barrier_error(
+            local_dirty_drain_error,
+            metadata_close_error,
+            overlay_barrier_error,
+            overlay_health_error,
+        );
         let metadata_flush_outcome = match metadata_flush_result {
             Ok(Some(()))
                 if deferred_namespace_error.is_none() && metadata_barrier_error.is_none() =>
@@ -645,7 +659,7 @@ mod tests {
     use super::{
         BackgroundTaskJoinGuard, ShutdownError, ShutdownOwnerGuard, StudioVfs,
         UploaderTaskJoinGuard, finish_shutdown_result, replay_shutdown_result,
-        select_shutdown_result, shutdown_recoverable_on_restart,
+        select_metadata_barrier_error, select_shutdown_result, shutdown_recoverable_on_restart,
     };
     use crate::vfs::{ShutdownState, VfsError};
     use studiofs_cache::local::LocalPayloadBackendError;
@@ -734,6 +748,22 @@ mod tests {
         let result = select_shutdown_result(None, None, Err(local_payload_error));
 
         assert!(matches!(result, Err(VfsError::LocalPayload(_))));
+    }
+
+    #[test]
+    fn metadata_barrier_preserves_local_dirty_drain_error() {
+        let local_error = VfsError::Other("local dirty drain failed".to_string());
+        let metadata_error = VfsError::Meta(MetaError::Storage(
+            "postgres worker close timed out".to_string(),
+        ));
+
+        let result =
+            select_metadata_barrier_error(Some(local_error), Some(metadata_error), None, None);
+
+        assert!(matches!(
+            result,
+            Some(VfsError::Other(message)) if message == "local dirty drain failed"
+        ));
     }
 
     #[test]

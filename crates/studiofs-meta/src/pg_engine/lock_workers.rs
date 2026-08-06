@@ -123,9 +123,9 @@ impl PgMetaEngine {
                                     Self::pg_timeout_error("lock notify connect", connect_timeout)
                                 })??;
 
-                            let Some(engine_arc) = weak_engine.upgrade() else {
+                            if weak_engine.upgrade().is_none() {
                                 return Ok(());
-                            };
+                            }
 
                             let listen_cmd = format!("LISTEN {channel}");
                             tokio::select! {
@@ -152,6 +152,9 @@ impl PgMetaEngine {
                                 match message {
                                     Ok(Some(Ok(tokio_postgres::AsyncMessage::Notification(notification)))) => {
                                         if let Some(ino) = Self::parse_file_lock_notify_payload(notification.payload()) {
+                                            let Some(engine_arc) = weak_engine.upgrade() else {
+                                                return Ok(());
+                                            };
                                             tokio::select! {
                                                 biased;
                                                 _ = cancel_for_task.cancelled() => break,
@@ -170,12 +173,18 @@ impl PgMetaEngine {
                                     Ok(None) => return Ok(()),
                                     Err(_) => {
                                         if Instant::now() >= next_safety_refresh {
-                                            let cached_inos: Vec<Ino> = engine_arc
-                                                .file_lock_cache
-                                                .lock()
-                                                .map(|cache| cache.keys().copied().collect())
-                                                .unwrap_or_default();
+                                            let cached_inos: Vec<Ino> = match weak_engine.upgrade() {
+                                                Some(engine_arc) => engine_arc
+                                                    .file_lock_cache
+                                                    .lock()
+                                                    .map(|cache| cache.keys().copied().collect())
+                                                    .unwrap_or_default(),
+                                                None => return Ok(()),
+                                            };
                                             for ino in cached_inos {
+                                                let Some(engine_arc) = weak_engine.upgrade() else {
+                                                    return Ok(());
+                                                };
                                                 tokio::select! {
                                                     biased;
                                                     _ = cancel_for_task.cancelled() => return Ok(()),

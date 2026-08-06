@@ -380,10 +380,15 @@ impl PgMetaEngine {
     }
 
     pub(super) fn pg_timeout_error(context: &str, timeout: Duration) -> MetaError {
-        MetaError::Storage(format!(
+        let message = format!(
             "postgres {context} timed out after {} ms",
             timeout.as_millis()
-        ))
+        );
+        if context == "connect" || context.ends_with(" connect") {
+            MetaError::PostgresUnavailable(message)
+        } else {
+            MetaError::Storage(message)
+        }
     }
 
     pub(super) fn run_async_once<T, F>(fut: F) -> MetaResult<T>

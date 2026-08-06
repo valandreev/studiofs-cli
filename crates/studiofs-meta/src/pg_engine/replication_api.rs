@@ -159,6 +159,9 @@ impl MetaReplication for PgMetaEngine {
 
     fn prepare_for_close(&self) -> MetaResult<()> {
         self.local.seal_relaxed_durability_for_close();
+        let _start_guard = self.lock_worker_start_lock.lock().map_err(|_| {
+            MetaError::Storage("pg background worker start state poisoned".to_string())
+        })?;
         let join_timeout = Self::default_prepare_for_close_join_timeout();
         self.background_workers.shutdown(join_timeout)
     }

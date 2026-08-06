@@ -41,6 +41,22 @@ cargo test -p studiofs-vfs shutdown_result_reports_local_payload_sync_failure --
 cargo test -p studiofs-vfs shutdown_replay_preserves_typed_error_for_owner_and_waiter -- --nocapture
 ```
 
+### SFS-642 PostgreSQL Lifecycle and Schema Regressions
+
+Run these focused checks when changing PostgreSQL worker ownership, startup
+schema validation, or foreground lock schema behavior:
+
+```bash
+cargo test -p studiofs-meta prepare_for_close_does_not_block_forever_on_slow_background_thread -- --nocapture
+cargo test -p studiofs-meta prepare_for_close_serializes_lazy_worker_registration -- --nocapture
+cargo test -p studiofs-meta prepare_for_close_is_idempotent_when_no_workers_are_running -- --nocapture
+cargo test -p studiofs-meta dropping_engine_signals_background_workers_without_waiting -- --nocapture
+cargo test -p studiofs-meta postgres_unavailable_requires_a_typed_connect_error -- --nocapture
+cargo test -p studiofs-meta test_pg_foreground_file_lock_does_not_repair_missing_schema -- --ignored --nocapture
+cargo test -p studiofs-meta test_pg_lock_notify_listener_releases_engine_after_drop -- --ignored --nocapture
+cargo test -p studiofs init_pg_schema_provisions_volume_encryption_metadata -- --nocapture
+```
+
 ## Contract/Core Harness
 
 Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,

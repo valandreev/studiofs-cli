@@ -37,6 +37,71 @@ fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
 }
 
 #[test]
+fn prepare_for_close_serializes_lazy_worker_registration() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let start_guard = engine
+        .lock_worker_start_lock
+        .lock()
+        .expect("worker start lock");
+    let state_guard = engine
+        .background_workers
+        .state
+        .lock()
+        .expect("background worker state lock");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let closing_engine = engine.clone();
+    let close_thread = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal close start");
+        result_tx
+            .send(closing_engine.prepare_for_close())
+            .expect("send close result");
+    });
+    started_rx.recv().expect("wait for close start");
+
+    let handle = std::thread::spawn(|| {});
+    drop(state_guard);
+
+    if result_rx.recv_timeout(Duration::from_millis(250)).is_ok() {
+        drop(start_guard);
+        close_thread.join().expect("join close thread");
+        panic!("close completed before the spawned worker was registered");
+    }
+
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("register worker before releasing the start lock");
+    drop(start_guard);
+
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close should finish after worker registration")
+        .expect("close should join the registered worker");
+    close_thread.join().expect("join close thread");
+}
+
+#[test]
+fn postgres_unavailable_requires_a_typed_connect_error() {
+    assert!(PgMetaEngine::is_postgres_unavailable(
+        &MetaError::PostgresUnavailable("connection refused".to_string())
+    ));
+    assert!(!PgMetaEngine::is_postgres_unavailable(&MetaError::Storage(
+        "postgres connect failed: error connecting to server".to_string()
+    )));
+    assert!(PgMetaEngine::is_postgres_unavailable(
+        &PgMetaEngine::pg_timeout_error(
+            "validate postgres schema connect",
+            Duration::from_millis(10),
+        )
+    ));
+    assert!(!PgMetaEngine::is_postgres_unavailable(
+        &PgMetaEngine::pg_timeout_error("validate postgres schema", Duration::from_millis(10))
+    ));
+}
+
+#[test]
 fn prepare_for_close_is_idempotent_when_no_workers_are_running() {
     let (_dir, engine) = temp_pg_engine_for_unit();
 
