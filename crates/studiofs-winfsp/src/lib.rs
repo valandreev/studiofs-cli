@@ -11,7 +11,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-pub use context::{StudioFsContext, WinfspKernelInvalidator};
+pub use context::{StudioFsContext, WinfspInvalidationQueue, WinfspKernelInvalidator};
 use thiserror::Error;
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
@@ -711,7 +711,6 @@ fn winfsp_host_drop_timeout() -> std::time::Duration {
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
 /// external process (`studiofs umount`) can signal a graceful shutdown.
 pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
-    use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
     use crate::context::PreparedWinfspNotifications;
@@ -748,7 +747,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
 
     // Shared invalidation state: metadata refresh events enqueue inode IDs for
     // WinFSP notifications.
-    let invalidation_queue = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Ino>::new()));
+    let invalidation_queue = WinfspInvalidationQueue::new();
 
     let context = StudioFsContext::new(
         vfs.clone(),

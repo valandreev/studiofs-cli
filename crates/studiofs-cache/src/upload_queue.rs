@@ -17,7 +17,7 @@ use tracing::debug;
 pub type Ino = u64;
 
 /// A pending upload operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingUpload {
     /// Inode that owns this payload object.
     pub ino: Ino,
@@ -41,7 +41,7 @@ pub struct PendingUpload {
 
 /// Manages in-memory pending upload state and dispatch channel.
 pub struct UploadQueue {
-    sender: mpsc::UnboundedSender<PendingUpload>,
+    sender: mpsc::Sender<()>,
     pending_state: Mutex<PendingState>,
     idle_notify: Arc<Notify>,
     shutdown_requested: AtomicBool,
@@ -74,7 +74,22 @@ impl Default for WaitForIdleHook {
 struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,
     by_inode: BTreeMap<Ino, BTreeSet<u64>>,
+    dispatched: BTreeMap<u64, PendingUpload>,
+    wakeup_coalesced: u64,
 }
+
+/// Runtime ingress state for the upload worker wakeup channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadQueueIngressSnapshot {
+    /// Number of wakeups currently buffered for the worker.
+    pub depth: usize,
+    /// Maximum number of wakeups buffered by the queue.
+    pub capacity: usize,
+    /// Number of submissions coalesced while the wakeup was already buffered.
+    pub coalesced: u64,
+}
+
+const UPLOAD_WAKEUP_CAPACITY: usize = 1;
 
 enum PendingSubmit {
     New,
@@ -85,15 +100,14 @@ enum PendingSubmit {
 impl UploadQueue {
     /// Create a new upload queue.
     ///
-    /// Returns `(queue, receiver)`. The receiver yields [`PendingUpload`]
-    /// items for the VFS upload worker.
+    /// Returns `(queue, receiver)`. The receiver yields coalesced wakeups for
+    /// the VFS upload worker; the authoritative operations remain in this
+    /// queue's pending state.
     ///
     /// `cache_dir` is accepted for API compatibility with older call sites,
     /// but queue state is no longer persisted on disk.
-    pub fn new(
-        _cache_dir: impl AsRef<Path>,
-    ) -> (Arc<Self>, mpsc::UnboundedReceiver<PendingUpload>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn new(_cache_dir: impl AsRef<Path>) -> (Arc<Self>, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel(UPLOAD_WAKEUP_CAPACITY);
         let idle_notify = Arc::new(Notify::new());
 
         let queue = Arc::new(Self {
@@ -101,6 +115,8 @@ impl UploadQueue {
             pending_state: Mutex::new(PendingState {
                 by_object: BTreeMap::new(),
                 by_inode: BTreeMap::new(),
+                dispatched: BTreeMap::new(),
+                wakeup_coalesced: 0,
             }),
             idle_notify,
             shutdown_requested: AtomicBool::new(false),
@@ -141,14 +157,10 @@ impl UploadQueue {
 
         match self.record_pending_or_update(op.clone()) {
             PendingSubmit::New => {
-                if let Err(error) = self.sender.send(op) {
-                    self.remove_pending_if_matches(&error.0);
-                }
+                self.dispatch_wakeup(&op, None);
             }
             PendingSubmit::Updated(previous) => {
-                if self.sender.send(op.clone()).is_err() {
-                    self.restore_pending_if_current_matches(&op, previous);
-                }
+                self.dispatch_wakeup(&op, Some(previous));
             }
             PendingSubmit::Ignored => {
                 debug!(
@@ -176,12 +188,7 @@ impl UploadQueue {
         let Some(previous) = self.update_pending_if_matches(&op) else {
             return false;
         };
-        if self.sender.send(op.clone()).is_ok() {
-            true
-        } else {
-            self.restore_pending_if_current_matches(&op, previous);
-            false
-        }
+        self.dispatch_wakeup(&op, Some(previous))
     }
 
     /// Requeue an upload after metadata rebased it onto a different content epoch.
@@ -192,13 +199,7 @@ impl UploadQueue {
         let Some(previous) = self.update_pending_if_matches_to(current, &rebased) else {
             return false;
         };
-        if let Err(tokio::sync::mpsc::error::SendError(failed_rebased)) = self.sender.send(rebased)
-        {
-            self.restore_pending_if_current_matches(&failed_rebased, previous);
-            false
-        } else {
-            true
-        }
+        self.dispatch_wakeup(&rebased, Some(previous))
     }
 
     /// Cancel a pending upload and decrement pending count.
@@ -262,6 +263,44 @@ impl UploadQueue {
     /// Current number of pending uploads.
     pub fn pending_count(&self) -> usize {
         self.pending_state.lock().by_object.len()
+    }
+
+    /// Claim current pending uploads after a worker wakeup.
+    pub fn claim_pending(&self) -> Vec<PendingUpload> {
+        let mut state = self.pending_state.lock();
+        let claimed: Vec<_> = state
+            .by_object
+            .iter()
+            .filter(|(object_id, op)| {
+                state
+                    .dispatched
+                    .get(object_id)
+                    .is_none_or(|dispatched| dispatched != *op)
+            })
+            .map(|(_, op)| op.clone())
+            .collect();
+        for op in &claimed {
+            state.dispatched.insert(op.object_id, op.clone());
+        }
+        claimed
+    }
+
+    /// Return current upload wakeup ingress metrics.
+    pub fn ingress_snapshot(&self) -> UploadQueueIngressSnapshot {
+        let state = self.pending_state.lock();
+        UploadQueueIngressSnapshot {
+            depth: self
+                .sender
+                .max_capacity()
+                .saturating_sub(self.sender.capacity()),
+            capacity: UPLOAD_WAKEUP_CAPACITY,
+            coalesced: state.wakeup_coalesced,
+        }
+    }
+
+    /// Reset cumulative upload wakeup counters while preserving live depth.
+    pub(crate) fn reset_ingress_metrics(&self) {
+        self.pending_state.lock().wakeup_coalesced = 0;
     }
 
     /// Snapshot all currently pending upload ops from the live in-memory index.
@@ -337,6 +376,30 @@ impl UploadQueue {
         PendingSubmit::New
     }
 
+    fn dispatch_wakeup(&self, op: &PendingUpload, previous: Option<PendingUpload>) -> bool {
+        let closed = {
+            let mut state = self.pending_state.lock();
+            match self.sender.try_send(()) {
+                Ok(()) => false,
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    state.wakeup_coalesced = state.wakeup_coalesced.saturating_add(1);
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => true,
+            }
+        };
+        if closed {
+            if let Some(previous) = previous {
+                self.restore_pending_if_current_matches(op, previous);
+            } else {
+                self.remove_pending_if_matches(op);
+            }
+            false
+        } else {
+            true
+        }
+    }
+
     fn remove_pending_if_matches(&self, op: &PendingUpload) -> bool {
         let mut state = self.pending_state.lock();
         let Entry::Occupied(entry) = state.by_object.entry(op.object_id) else {
@@ -351,6 +414,7 @@ impl UploadQueue {
         }
         let removed = entry.remove();
         Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
+        state.dispatched.remove(&op.object_id);
         let became_idle = state.by_object.is_empty();
         drop(state);
         if became_idle {
@@ -370,6 +434,7 @@ impl UploadQueue {
         }
         let previous = current.clone();
         *current = op.clone();
+        state.dispatched.remove(&op.object_id);
         Some(previous)
     }
 
@@ -391,6 +456,7 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, replacement.clone());
+        state.dispatched.remove(&expected.object_id);
         Some(previous)
     }
 
@@ -435,6 +501,19 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    async fn recv_claimed(queue: &UploadQueue, rx: &mut mpsc::Receiver<()>) -> Vec<PendingUpload> {
+        rx.recv().await.expect("upload wakeup");
+        queue.claim_pending()
+    }
+
+    async fn recv_one(queue: &UploadQueue, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
+        recv_claimed(queue, rx)
+            .await
+            .into_iter()
+            .next()
+            .expect("claimed upload")
+    }
+
     #[tokio::test]
     async fn submit_complete_roundtrip() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
@@ -443,7 +522,7 @@ mod tests {
         queue.submit(100, 0, 42, 7);
         assert_eq!(queue.pending_count(), 1);
 
-        let op = rx.recv().await.unwrap();
+        let op = recv_one(&queue, &mut rx).await;
         assert_eq!(op.object_id, 42);
         assert_eq!(op.ino, 100);
         assert_eq!(op.content_epoch, 7);
@@ -473,7 +552,7 @@ mod tests {
         queue.submit(1, 0, 77, 1);
 
         assert_eq!(queue.pending_count(), 1);
-        let op = rx.recv().await.unwrap();
+        let op = recv_one(&queue, &mut rx).await;
         assert_eq!(op.object_id, 77);
         assert!(rx.try_recv().is_err());
     }
@@ -484,17 +563,15 @@ mod tests {
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(1, 1_048_569, 77, 2);
+        let stale = recv_one(&queue, &mut rx).await;
         queue.submit(1, 1_048_569, 77, 3);
 
         assert_eq!(queue.pending_count(), 1);
-        let stale = rx.recv().await.unwrap();
-        assert_eq!(stale.content_epoch, 2);
-        let updated = rx.recv().await.unwrap();
+        let updated = recv_one(&queue, &mut rx).await;
         assert_eq!(updated.content_epoch, 3);
-
         assert!(
             !queue.cancel(&stale),
-            "stale worker op must not cancel the newer pending upload"
+            "stale worker op must not cancel newer state"
         );
         assert_eq!(queue.pending_count(), 1);
 
@@ -525,7 +602,8 @@ mod tests {
             vec![100, 102]
         );
 
-        let first = rx.recv().await.unwrap();
+        let mut claimed = recv_claimed(&queue, &mut rx).await;
+        let first = claimed.remove(0);
         assert!(queue.complete(&first));
         assert_eq!(
             queue
@@ -547,8 +625,9 @@ mod tests {
         queue.submit(11, 0, 101, 1);
         assert_eq!(queue.pending_count(), 2);
 
-        let first = rx.recv().await.unwrap();
-        let second = rx.recv().await.unwrap();
+        let mut claimed = recv_claimed(&queue, &mut rx).await;
+        let first = claimed.remove(0);
+        let second = claimed.remove(0);
 
         queue.complete(&first);
         assert_eq!(queue.pending_count(), 1);
@@ -567,7 +646,7 @@ mod tests {
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(10, 0, 100, 1);
-        let stale = rx.recv().await.unwrap();
+        let stale = recv_one(&queue, &mut rx).await;
         queue.cancel(&stale);
         assert_eq!(queue.pending_count(), 0);
 
@@ -587,7 +666,7 @@ mod tests {
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(10, 0, 100, 1);
-        let mut retry = rx.recv().await.unwrap();
+        let mut retry = recv_one(&queue, &mut rx).await;
         retry.retry_count = 2;
         retry.not_before_unix_ms = now_unix_ms().saturating_add(1_000);
 
@@ -606,14 +685,14 @@ mod tests {
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit_with_payload(10, 0, 0, 100, 1, 4096);
-        let current = rx.recv().await.unwrap();
+        let current = recv_one(&queue, &mut rx).await;
         let mut rebased = current.clone();
         rebased.offset = 4096;
         rebased.object_file_offset = 4096;
         rebased.content_epoch = 2;
 
         assert!(queue.requeue_rebased(&current, rebased.clone()));
-        let queued = rx.recv().await.unwrap();
+        let queued = recv_one(&queue, &mut rx).await;
         assert_eq!(queued.offset, 4096);
         assert_eq!(queued.object_file_offset, 4096);
         assert_eq!(queued.content_epoch, 2);
@@ -632,7 +711,7 @@ mod tests {
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(10, 0, 100, 1);
-        let mut retry = rx.recv().await.unwrap();
+        let mut retry = recv_one(&queue, &mut rx).await;
         drop(rx);
         retry.retry_count = 2;
         retry.not_before_unix_ms = now_unix_ms().saturating_add(1_000);
@@ -673,7 +752,7 @@ mod tests {
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
         queue.submit(1, 0, 100, 1);
-        let op = rx.recv().await.expect("queued upload");
+        let op = recv_one(&queue, &mut rx).await;
         let hook = Arc::new(WaitForIdleHook::default());
         queue.set_wait_for_idle_hook(Arc::clone(&hook));
         let waiter = tokio::spawn({
@@ -707,8 +786,7 @@ mod tests {
         assert_eq!(queue.snapshot_pending_for_ino(7).len(), BURST as usize);
         assert!(queue.has_pending_for_ino(7));
 
-        for _ in 0..BURST {
-            let op = rx.recv().await.expect("burst upload");
+        for op in recv_claimed(&queue, &mut rx).await {
             assert!(queue.complete(&op));
         }
 
@@ -736,19 +814,58 @@ mod tests {
         assert!(!queue.has_pending_for_ino(3));
 
         // Complete one of the two payload objects for ino 1.
-        let op = rx.recv().await.unwrap();
+        let mut claimed = recv_claimed(&queue, &mut rx).await;
+        let op = claimed.remove(0);
         assert_eq!(op.ino, 1);
         queue.complete(&op);
 
         // ino 1 still has the second payload object pending.
         assert!(queue.has_pending_for_ino(1));
 
-        // Drain remaining ops.
-        while let Ok(next) = rx.try_recv() {
+        // Complete the remaining authoritative ops.
+        for next in claimed {
             queue.complete(&next);
         }
 
         assert!(!queue.has_pending_for_ino(1));
         assert!(!queue.has_pending_for_ino(2));
+    }
+
+    #[tokio::test]
+    async fn wakeup_burst_coalesces_without_losing_authoritative_pending_state() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        for object_id in 1..=4 {
+            queue.submit(7, object_id * 4096, object_id, 1);
+        }
+
+        let ingress = queue.ingress_snapshot();
+        assert_eq!(ingress.capacity, 1);
+        assert_eq!(ingress.depth, 1);
+        assert_eq!(ingress.coalesced, 3);
+        assert_eq!(queue.pending_count(), 4);
+
+        rx.recv().await.expect("coalesced wakeup");
+        let claimed = queue.claim_pending();
+        assert_eq!(claimed.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn wakeup_claim_returns_newest_updated_upload_once() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(7, 0, 41, 1);
+        rx.recv().await.expect("initial wakeup");
+        let first = queue.claim_pending().pop().expect("initial claim");
+
+        queue.submit(7, 0, 41, 2);
+        rx.recv().await.expect("updated wakeup");
+        let updated = queue.claim_pending().pop().expect("updated claim");
+
+        assert_eq!(first.content_epoch, 1);
+        assert_eq!(updated.content_epoch, 2);
+        assert!(queue.claim_pending().is_empty());
     }
 }

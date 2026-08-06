@@ -16,13 +16,13 @@ use buffers::{SendConstBuffer, SendMutBuffer};
 use futures::FutureExt;
 use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
 pub(crate) use invalidation::PreparedWinfspNotifications;
-pub use invalidation::WinfspKernelInvalidator;
 #[cfg(test)]
 use invalidation::{
     FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
     build_notify_info, ino_to_windows_path, notify_filter_for_kind,
 };
+pub use invalidation::{WinfspInvalidationQueue, WinfspKernelInvalidator};
 use parking_lot::Mutex;
 use plans::{CreateCallbackPlan, RenameCallbackPlan};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
@@ -917,7 +917,7 @@ pub struct StudioFsContext {
     /// Pending kernel cache invalidation queue (shared with
     /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
-    invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    invalidation_queue: Arc<WinfspInvalidationQueue>,
     /// Per-handle EOF extensions that Windows may read while closing cached
     /// writer handles. The newly exposed range is defined to read as zeros.
     handle_zero_fill_ranges: Mutex<HashMap<u64, HandleZeroFillRange>>,
@@ -936,7 +936,7 @@ impl StudioFsContext {
     pub fn new(
         vfs: Arc<StudioVfs>,
         rt: Handle,
-        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+        invalidation_queue: Arc<WinfspInvalidationQueue>,
     ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
@@ -960,7 +960,7 @@ impl StudioFsContext {
     pub fn new_for_tests(
         vfs: Arc<StudioVfs>,
         rt: Arc<tokio::runtime::Runtime>,
-        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+        invalidation_queue: Arc<WinfspInvalidationQueue>,
     ) -> Self {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
@@ -2279,14 +2279,14 @@ mod tests {
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PreparedWinfspNotifications,
         READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE,
         STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
-        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspKernelInvalidator,
-        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
-        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
-        is_runtime_stats_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
-        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
-        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
-        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
-        write_local_sync_policy_from_create_options,
+        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspInvalidationQueue,
+        WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
+        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
+        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
+        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
+        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
+        winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
         write_local_sync_policy_from_create_parameters,
     };
     use parking_lot::Mutex;
@@ -2379,10 +2379,10 @@ mod tests {
         TempDir,
         Arc<StudioVfs>,
         StudioFsContext,
-        Arc<Mutex<Vec<u64>>>,
+        Arc<WinfspInvalidationQueue>,
     ) {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-        let queue = Arc::new(Mutex::new(Vec::new()));
+        let queue = WinfspInvalidationQueue::new();
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
         let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone());
@@ -2687,7 +2687,7 @@ mod tests {
 
         assert!(!ctx.should_disable_os_cache_for_handle(&read_handle, false, 0, 0));
         assert!(!ctx.should_disable_os_cache_for_handle(&dir_handle, false, 0, 0));
-        queue.lock().push(attr.ino);
+        queue.push(attr.ino);
 
         let notifications = ctx.should_notify().expect("pending WinFSP notification");
         assert!(
@@ -2715,7 +2715,7 @@ mod tests {
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
 
         invalidator.inval_inode(attr.ino);
-        assert_eq!(*queue.lock(), vec![attr.ino]);
+        assert_eq!(queue.drain(), vec![attr.ino]);
     }
 
     #[test]
@@ -4786,13 +4786,48 @@ mod tests {
 
     #[test]
     fn winfsp_invalidator_enqueues_inode_numbers() {
-        let queue = Arc::new(Mutex::new(Vec::new()));
+        let queue = WinfspInvalidationQueue::new();
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
 
         invalidator.inval_inode(42);
         invalidator.inval_inode(7);
 
-        assert_eq!(*queue.lock(), vec![42, 7]);
+        assert_eq!(queue.drain(), vec![7, 42]);
+    }
+
+    #[test]
+    fn winfsp_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
+        let queue = super::invalidation::WinfspInvalidationQueue::new();
+        let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
+        for ino in 0..capacity as u64 {
+            queue.push(ino);
+        }
+
+        let producer_queue = Arc::clone(&queue);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            started_tx.send(()).expect("test producer started");
+            producer_queue.push(capacity as u64);
+            finished_tx.send(()).expect("test producer finished");
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("test producer should start");
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a distinct inode must wait while the bounded queue is full"
+        );
+
+        assert_eq!(queue.drain().len(), capacity);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("draining the queue should release the producer");
+        producer.join().expect("test producer should join");
+        assert_eq!(queue.drain(), vec![capacity as u64]);
     }
 
     #[test]
@@ -4804,9 +4839,7 @@ mod tests {
         let beta = vfs
             .create(ROOT_INO, b"beta.txt", 0, 0, 0o644)
             .expect("create beta");
-        queue
-            .lock()
-            .extend([beta.ino, alpha.ino, beta.ino, alpha.ino]);
+        queue.extend([beta.ino, alpha.ino, beta.ino, alpha.ino]);
 
         let first = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
             PreparedWinfspNotifications,
@@ -4820,45 +4853,18 @@ mod tests {
             vec![alpha.ino, beta.ino]
         );
         assert!(
-            queue.lock().is_empty(),
+            queue.is_empty(),
             "queue should be drained after should_notify"
         );
+        let invalidation_metrics = vfs.write_path_observability_snapshot().fuse_invalidation;
+        assert_eq!(invalidation_metrics.queue_depth, 0);
+        assert_eq!(invalidation_metrics.queue_peak, 2);
+        assert_eq!(invalidation_metrics.coalesced, 2);
 
         let second = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
             PreparedWinfspNotifications,
         >>::should_notify(&ctx);
         assert!(second.is_none());
-    }
-
-    #[test]
-    fn should_notify_preserves_queue_capacity_after_drain() {
-        let (_tmp, vfs, ctx, queue) = make_test_context("notify_capacity");
-        let file = vfs
-            .create(ROOT_INO, b"capacity.txt", 0, 0, 0o644)
-            .expect("create file");
-        {
-            let mut queue = queue.lock();
-            queue.reserve(32);
-            queue.extend([file.ino, file.ino]);
-        }
-        let capacity_before = queue.lock().capacity();
-
-        let drained = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
-            PreparedWinfspNotifications,
-        >>::should_notify(&ctx)
-        .expect("prepared notifications");
-
-        assert_eq!(
-            drained
-                .iter()
-                .map(|notification| notification.ino)
-                .collect::<Vec<_>>(),
-            vec![file.ino]
-        );
-        assert!(
-            queue.lock().capacity() >= capacity_before,
-            "draining should preserve the queue allocation for future invalidations"
-        );
     }
 
     #[test]
@@ -4880,7 +4886,7 @@ mod tests {
 
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].ino, file.ino);
-        assert!(queue.lock().is_empty());
+        assert!(queue.is_empty());
     }
 
     #[test]

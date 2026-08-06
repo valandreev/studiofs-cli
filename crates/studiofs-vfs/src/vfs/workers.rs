@@ -846,10 +846,7 @@ impl StudioVfs {
         }
     }
 
-    pub(super) async fn background_uploader(
-        self: Arc<Self>,
-        rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
-    ) {
+    pub(super) async fn background_uploader(self: Arc<Self>, rx: tokio::sync::mpsc::Receiver<()>) {
         UploadLifecycleWorker::new(self).run(rx).await;
     }
 

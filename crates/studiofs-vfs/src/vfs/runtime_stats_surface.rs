@@ -575,6 +575,30 @@ impl StudioVfs {
         );
         insert_gauge(
             &mut snapshot.cache,
+            "prefetch_ingress_depth",
+            "count",
+            ingress.prefetch_ingress_depth,
+        );
+        insert_gauge(
+            &mut snapshot.cache,
+            "prefetch_ingress_capacity",
+            "count",
+            ingress.prefetch_ingress_capacity,
+        );
+        insert_counter(
+            &mut snapshot.cache,
+            "prefetch_ingress_dropped_hints",
+            "count",
+            ingress.prefetch_ingress_dropped_hints,
+        );
+        insert_counter(
+            &mut snapshot.cache,
+            "prefetch_ingress_coalesced_hints",
+            "count",
+            ingress.prefetch_ingress_coalesced_hints,
+        );
+        insert_gauge(
+            &mut snapshot.cache,
             "resident_bytes",
             "bytes",
             cache.transit_memory.used_bytes as u64,
@@ -644,6 +668,18 @@ impl StudioVfs {
         );
         insert_gauge(
             &mut snapshot.upload_queue,
+            "ingress_depth",
+            "count",
+            upload.upload_ingress_depth as u64,
+        );
+        insert_gauge(
+            &mut snapshot.upload_queue,
+            "ingress_capacity",
+            "count",
+            upload.upload_ingress_capacity as u64,
+        );
+        insert_gauge(
+            &mut snapshot.upload_queue,
             "pending_bytes",
             "bytes",
             upload.pending_upload_bytes,
@@ -691,6 +727,12 @@ impl StudioVfs {
             "snapshot_pending_calls",
             "count",
             upload.pending_upload_snapshot_calls,
+        );
+        insert_counter(
+            &mut snapshot.upload_queue,
+            "ingress_coalesced",
+            "count",
+            upload.upload_ingress_coalesced,
         );
         insert_counter(
             &mut snapshot.object_io,

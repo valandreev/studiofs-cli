@@ -2086,7 +2086,7 @@ impl UploadLifecycleWorker {
         Self { vfs, processor }
     }
 
-    pub(crate) async fn run(self, mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>) {
+    pub(crate) async fn run(self, mut rx: tokio::sync::mpsc::Receiver<()>) {
         debug!("background uploader started");
         let worker_count = self
             .vfs
@@ -2180,12 +2180,16 @@ impl UploadLifecycleWorker {
                 }
                 inbound = rx.recv(), if !inbound_closed => {
                     match inbound {
-                        Some(op) => Self::enqueue_pending_upload(
-                            &mut ready,
-                            &mut delayed,
-                            op,
-                            self.vfs.upload_delay,
-                        ),
+                        Some(()) => {
+                            for op in self.vfs.cached_store.claim_pending_uploads() {
+                                Self::enqueue_pending_upload(
+                                    &mut ready,
+                                    &mut delayed,
+                                    op,
+                                    self.vfs.upload_delay,
+                                );
+                            }
+                        }
                         None => inbound_closed = true,
                     }
                 }
