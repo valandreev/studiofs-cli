@@ -28,7 +28,7 @@
 - Consumes the planned `super::sync_ops::DeferredMaterializationPassOutcome` enum and `StudioVfs::run_deferred_materialization_pass` method.
 - Produces a regression test proving a clean inode returns the explicit `Idle` outcome from the shared pass.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add this test before `strict_flush_interrupts_deferred_materialization_linger`:
 
@@ -61,7 +61,7 @@ Add this test before `strict_flush_interrupts_deferred_materialization_linger`:
         });
     }
 
-- [ ] **Step 2: Run the red test**
+- [x] **Step 2: Run the red test**
 
 Run:
 
@@ -69,7 +69,7 @@ Run:
 
 Expected result before the implementation: compilation fails because the new pass and outcome type do not exist. This is the intended feature-missing red state; if the compiler reports an unrelated import or test-fixture error, correct that test error before proceeding.
 
-- [ ] **Step 3: Commit the red test**
+- [x] **Step 3: Commit the red test**
 
 Run:
 
@@ -85,7 +85,7 @@ Run:
 - Consumes existing `StudioVfs` materialization helpers and `DeferredInodeGateEntry::wait_linger_or_interrupt`.
 - Produces `DeferredMaterializationPassOutcome` and `StudioVfs::run_deferred_materialization_pass` for the outer task and the focused test.
 
-- [ ] **Step 1: Define the private outcome contract**
+- [x] **Step 1: Define the private outcome contract**
 
 Add the smallest enum needed by the state machine:
 
@@ -99,7 +99,7 @@ Add the smallest enum needed by the state machine:
 
 `Idle` is the clean terminal branch. `Reschedule` means the outer task must immediately run another pass. `Interrupted` is returned only when the linger wait is externally interrupted. `Completed { allow_reschedule }` is the terminal branch for normal completion or a materialization failure; failures carry `false` so the finalizer preserves strict-barrier retry semantics.
 
-- [ ] **Step 2: Implement the pass around the existing branches**
+- [x] **Step 2: Implement the pass around the existing branches**
 
 Add this method signature and move the current per-iteration logic into it without changing helper calls or branch order:
 
@@ -115,7 +115,7 @@ The method must return `Reschedule` at each former `continue` point after preser
 
 Do not move the semaphore permit, task spawn, interrupted final materialization, local metadata flush, or gate finalizer into this method.
 
-- [ ] **Step 3: Run the focused red test again**
+- [x] **Step 3: Run the focused red test again**
 
 Run:
 
@@ -132,7 +132,7 @@ Expected result: the test passes and reports one passing test. If compilation ex
 - Consumes `run_deferred_materialization_pass` and its outcome enum.
 - Produces the same task lifecycle and finalizer behavior as the pre-refactor implementation.
 
-- [ ] **Step 1: Replace the old loop with the lifecycle wrapper**
+- [x] **Step 1: Replace the old loop with the lifecycle wrapper**
 
 Keep the existing `Arc` clone, `tokio::spawn`, `_guard`, and `track_background_task`. Replace the old materialization loop with this orchestration shape:
 
@@ -152,7 +152,7 @@ Keep the existing `Arc` clone, `tokio::spawn`, `_guard`, and `track_background_t
 
 Retain the existing post-loop interrupted materialization, error handling, metadata flush, and `finish_deferred_materialization_task` blocks byte-for-byte in behavior. If the interrupted final materialization fails, it must still set `allow_reschedule_on_exit = false`; metadata flush must still run after interrupted cleanup and before finalization.
 
-- [ ] **Step 2: Run the focused green tests**
+- [x] **Step 2: Run the focused green tests**
 
 Run each command separately:
 
@@ -164,7 +164,7 @@ Run each command separately:
 
 Expected result: every command exits zero with no failed tests. The interruption tests prove `Interrupted`; the in-flight reschedule test proves finalizer behavior; the clean test proves `Idle`; existing full-block/tail tests cover `Reschedule` and normal `Completed` behavior.
 
-- [ ] **Step 3: Commit the implementation**
+- [x] **Step 3: Commit the implementation**
 
 Run:
 
@@ -181,7 +181,7 @@ Run:
 - Consumes the implementation and focused test results.
 - Produces a verifiable handoff with no unrecorded runner gaps.
 
-- [ ] **Step 1: Review the diff for contract preservation**
+- [x] **Step 1: Review the diff for contract preservation**
 
 Run:
 
@@ -189,7 +189,7 @@ Run:
 
 Confirm the outer task owns only lifecycle orchestration, the pass is platform-neutral, all existing warnings and error suppression remain, and no public API or timer changed.
 
-- [ ] **Step 2: Run formatting, warnings, and diff hygiene**
+- [x] **Step 2: Run formatting, warnings, and diff hygiene**
 
 Run:
 
@@ -199,6 +199,8 @@ Run:
 
 Expected result: all commands exit zero. If a platform mounted runner is available, run the smallest shared materialization scenario for each bridge; otherwise record the unavailable macFUSE/FUSE/WinFSP runner as a validation gap.
 
-- [ ] **Step 3: Update Linear and finish the living plan**
+- [x] **Step 3: Update Linear and finish the living plan**
 
 Record the exact test/build output and platform validation status in the two plan files. Update Linear SFS-641 in English with the implementation summary and validation evidence, then set it to the appropriate completed state only after all acceptance checks pass.
+
+Execution evidence: `cargo test -p studiofs-vfs deferred_materialization -- --nocapture` passed 14 tests; the macFUSE adapter scheduling test passed 1 test; `cargo fmt --all -- --check`, `RUSTFLAGS='-D warnings' cargo check -p studiofs-vfs`, and `git diff --check` passed. Mounted Linux/FUSE, macFUSE, and WinFSP sequences were unavailable, so SFS-641 is `In Review` rather than `Done`.

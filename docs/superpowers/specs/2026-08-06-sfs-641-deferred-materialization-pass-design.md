@@ -14,16 +14,17 @@ This change makes the shared deferred materialization state machine easier to re
 - [x] (2026-08-06 20:15 Europe/Kyiv) Chose a private async pass plus a small outcome enum; the user approved this design.
 - [x] (2026-08-06 20:20 Europe/Kyiv) Wrote and self-reviewed this design/ExecPlan.
 - [x] (2026-08-06 20:25 Europe/Kyiv) User reviewed the written spec and authorized implementation.
-- [ ] Add the outcome-focused red test and the interruption/reschedule regression coverage.
-- [ ] Extract the pass with no scheduling or durability behavior changes.
-- [ ] Run focused tests, formatting, lint, and repository hygiene checks.
-- [ ] Record final evidence in this plan and update Linear SFS-641.
+- [x] (2026-08-06 20:32 Europe/Kyiv) Added the red idle-outcome test, observed the expected missing-symbol failure, and committed it as `cb6e7982`.
+- [x] (2026-08-06 20:45 Europe/Kyiv) Extracted the pass and outcome enum while preserving scheduling and durability behavior; committed as `ec220561`.
+- [x] (2026-08-06 20:55 Europe/Kyiv) Ran 14 deferred-materialization VFS tests, one macFUSE adapter materialization test, formatting, `-D warnings` check, and diff hygiene successfully.
+- [x] (2026-08-06 20:58 Europe/Kyiv) Recorded final evidence in Linear SFS-641 and moved it to `In Review`; mounted Linux/FUSE, macFUSE, and WinFSP validation remains a documented environment gap.
 
 ## Surprises & Discoveries
 
 - The scheduler entry point has four independent callers (`background_aggressive_materialization`, `flush_volatile_writeback_with_outcome`, `maybe_pre_drain_sustained_write_buffer`, and `write_fh_payload_with_deferred_materialize`), so the extraction must remain in the shared VFS layer rather than in a platform adapter.
 - The current task combines three different terminal concerns: materialization progress, linger interruption, and whether the in-flight gate may reschedule. The outcome must preserve all three without moving `finish_deferred_materialization_task` into the pass.
 - Existing tests already cover interruption and in-flight rescheduling behavior. The new focused checks should name the outcomes explicitly while retaining those behavioral tests unchanged in meaning.
+- The shared VFS filter passed all 14 matching tests after the extraction, and the macFUSE adapter scheduling test also passed. No mounted bridge runner was available for the full OS matrix.
 
 ## Decision Log
 
@@ -45,7 +46,7 @@ This change makes the shared deferred materialization state machine easier to re
 
 ## Outcomes & Retrospective
 
-At completion, compare the final diff and test evidence against the purpose above. Record whether the outer task became a short lifecycle wrapper, whether all current behavior tests passed, and whether any runner gap prevented a mounted validation. No platform-specific scheduler branch is expected.
+The outer task is now a short lifecycle wrapper around the pass outcome loop, while interrupted cleanup, metadata flush, and gate finalization remain outside the pass. The shared VFS deferred-materialization filter passed 14/14 tests, and the macFUSE adapter scheduling test passed 1/1. Formatting, `RUSTFLAGS='-D warnings' cargo check -p studiofs-vfs`, and `git diff --check` passed. No platform-specific scheduler branch was introduced. Mounted Linux/FUSE, macFUSE, and WinFSP scenarios were not run because those runners were unavailable in this environment; Linear remains `In Review` pending that matrix.
 
 ## Context and Orientation
 
@@ -128,3 +129,5 @@ The pass uses existing `StudioVfs` helpers only: writer-stack dirty-byte and com
 ## Change Note
 
 2026-08-06: Created after the user approved the outcome-based extraction design. The plan deliberately keeps task lifecycle and gate finalization outside the pass to protect cancellation and rescheduling semantics.
+
+2026-08-06: Implementation completed in `cb6e7982` and `ec220561`; focused core and macFUSE adapter validation passed. The issue was moved to `In Review` because mounted validation for Linux/FUSE, macFUSE, and WinFSP was not available.
