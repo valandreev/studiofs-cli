@@ -284,7 +284,11 @@ impl UploadQueue {
             .lock()
             .by_object
             .get(&op.object_id)
-            .is_some_and(|current| current == op)
+            .is_some_and(|current| {
+                current.ino == op.ino
+                    && current.offset == op.offset
+                    && current.content_epoch == op.content_epoch
+            })
     }
 
     /// Return current upload wakeup ingress metrics.
@@ -591,6 +595,19 @@ mod tests {
 
         assert!(queue.complete(&updated));
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn current_upload_ignores_worker_scheduling_state() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(1, 0, 77, 1);
+        let mut dispatched = recv_one(&queue, &mut rx).await;
+        dispatched.not_before_unix_ms = now_unix_ms().saturating_add(1_000);
+        dispatched.retry_count = 1;
+
+        assert!(queue.is_current(&dispatched));
     }
 
     #[tokio::test]
