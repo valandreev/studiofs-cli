@@ -13,6 +13,7 @@ This change makes the shared deferred materialization state machine easier to re
 - [x] (2026-08-06 20:10 Europe/Kyiv) Reviewed the existing interruption, linger, tail, and reschedule tests in `crates/studiofs-vfs/src/vfs/tests.rs`.
 - [x] (2026-08-06 20:15 Europe/Kyiv) Chose a private async pass plus a small outcome enum; the user approved this design.
 - [x] (2026-08-06 20:20 Europe/Kyiv) Wrote and self-reviewed this design/ExecPlan.
+- [x] (2026-08-06 20:25 Europe/Kyiv) User reviewed the written spec and authorized implementation.
 - [ ] Add the outcome-focused red test and the interruption/reschedule regression coverage.
 - [ ] Extract the pass with no scheduling or durability behavior changes.
 - [ ] Run focused tests, formatting, lint, and repository hygiene checks.
