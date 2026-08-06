@@ -123,7 +123,9 @@ impl PgBackgroundWorkers {
             PgBackgroundWorker::LockNotify,
             PgBackgroundWorker::LockRenew,
         ] {
-            let result = join_worker_slot(&mut state, worker, deadline);
+            let result = worker_slot_mut(&mut state, worker)
+                .take()
+                .and_then(|handle| join_worker_until(handle, deadline, worker).err());
             if first_error.is_none() {
                 first_error = result;
             }
@@ -175,16 +177,6 @@ fn worker_name(worker: PgBackgroundWorker) -> &'static str {
         PgBackgroundWorker::LockNotify => "notify",
         PgBackgroundWorker::LockRenew => "renew",
     }
-}
-
-fn join_worker_slot(
-    state: &mut PgBackgroundWorkerState,
-    worker: PgBackgroundWorker,
-    deadline: Instant,
-) -> Option<MetaError> {
-    worker_slot_mut(state, worker)
-        .take()
-        .and_then(|handle| join_worker_until(handle, deadline, worker).err())
 }
 
 fn join_worker_until(
