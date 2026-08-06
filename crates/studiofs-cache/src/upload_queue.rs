@@ -74,7 +74,7 @@ impl Default for WaitForIdleHook {
 struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,
     by_inode: BTreeMap<Ino, BTreeSet<u64>>,
-    dispatched: BTreeMap<u64, PendingUpload>,
+    dirty_objects: BTreeSet<u64>,
     wakeup_coalesced: u64,
 }
 
@@ -115,7 +115,7 @@ impl UploadQueue {
             pending_state: Mutex::new(PendingState {
                 by_object: BTreeMap::new(),
                 by_inode: BTreeMap::new(),
-                dispatched: BTreeMap::new(),
+                dirty_objects: BTreeSet::new(),
                 wakeup_coalesced: 0,
             }),
             idle_notify,
@@ -268,19 +268,11 @@ impl UploadQueue {
     /// Claim current pending uploads after a worker wakeup.
     pub fn claim_pending(&self) -> Vec<PendingUpload> {
         let mut state = self.pending_state.lock();
-        let PendingState {
-            by_object,
-            dispatched,
-            ..
-        } = &mut *state;
-        let mut claimed = Vec::new();
-        for (&object_id, op) in by_object.iter() {
-            if dispatched
-                .get(&object_id)
-                .is_none_or(|dispatched_op| dispatched_op != op)
-            {
+        let dirty_objects = std::mem::take(&mut state.dirty_objects);
+        let mut claimed = Vec::with_capacity(dirty_objects.len());
+        for object_id in dirty_objects {
+            if let Some(op) = state.by_object.get(&object_id) {
                 claimed.push(op.clone());
-                dispatched.insert(object_id, op.clone());
             }
         }
         claimed
@@ -366,6 +358,7 @@ impl UploadQueue {
             {
                 let previous = current.clone();
                 *current = op.clone();
+                state.dirty_objects.insert(op.object_id);
                 return PendingSubmit::Updated(previous);
             }
             return PendingSubmit::Ignored;
@@ -374,6 +367,7 @@ impl UploadQueue {
         let ino = op.ino;
         state.by_object.insert(op.object_id, op.clone());
         state.by_inode.entry(ino).or_default().insert(op.object_id);
+        state.dirty_objects.insert(op.object_id);
         PendingSubmit::New
     }
 
@@ -415,7 +409,7 @@ impl UploadQueue {
         }
         let removed = entry.remove();
         Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
-        state.dispatched.remove(&op.object_id);
+        state.dirty_objects.remove(&op.object_id);
         let became_idle = state.by_object.is_empty();
         drop(state);
         if became_idle {
@@ -435,7 +429,7 @@ impl UploadQueue {
         }
         let previous = current.clone();
         *current = op.clone();
-        state.dispatched.remove(&op.object_id);
+        state.dirty_objects.insert(op.object_id);
         Some(previous)
     }
 
@@ -457,7 +451,7 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, replacement.clone());
-        state.dispatched.remove(&expected.object_id);
+        state.dirty_objects.insert(expected.object_id);
         Some(previous)
     }
 
@@ -868,5 +862,26 @@ mod tests {
         assert_eq!(first.content_epoch, 1);
         assert_eq!(updated.content_epoch, 2);
         assert!(queue.claim_pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wakeup_claim_only_returns_objects_changed_since_last_claim() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(7, 0, 41, 1);
+        queue.submit(7, 8, 42, 1);
+        queue.submit(7, 16, 43, 1);
+        rx.recv().await.expect("initial wakeup");
+
+        assert_eq!(queue.claim_pending().len(), 3);
+
+        queue.submit(7, 8, 42, 2);
+        rx.recv().await.expect("updated wakeup");
+        let updated = queue.claim_pending();
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].object_id, 42);
+        assert_eq!(updated[0].content_epoch, 2);
     }
 }

@@ -953,6 +953,12 @@ impl SessionInvalidationQueue {
         self.record_metrics(snapshot);
     }
 
+    pub(crate) fn reset_metrics(&self) {
+        let mut state = self.state.lock();
+        state.queue_peak = 0;
+        state.coalesced = 0;
+    }
+
     #[cfg(test)]
     fn metrics_snapshot(&self) -> VfsFuseInvalidationSnapshot {
         let state = self.state.lock();
@@ -1078,6 +1084,10 @@ impl KernelInvalidator for MacFuseKernelInvalidator {
 
     fn inval_inode_attrs(&self, ino: u64) {
         self.queue.enqueue(ino, false);
+    }
+
+    fn reset_diagnostics(&self) {
+        self.queue.reset_metrics();
     }
 }
 
@@ -1903,6 +1913,26 @@ mod tests {
         assert_eq!(metrics.queue_depth, 2);
         assert_eq!(metrics.queue_peak, 2);
         assert_eq!(metrics.coalesced, 1);
+    }
+
+    #[test]
+    fn session_invalidation_queue_resets_peak_and_coalescing_metrics() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+
+        invalidator.inval_inode_attrs(7);
+        invalidator.inval_inode(7);
+        invalidator.inval_inode_attrs(8);
+
+        invalidator.reset_diagnostics();
+        invalidator.inval_inode_attrs(9);
+
+        let metrics = queue.metrics_snapshot();
+        assert_eq!(metrics.queue_depth, 3);
+        assert_eq!(metrics.queue_peak, 3);
+        assert_eq!(metrics.coalesced, 0);
     }
 
     #[test]

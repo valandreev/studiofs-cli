@@ -1142,6 +1142,7 @@ async fn epoch_finalizer_shutdown_cancels_in_flight_work() {
 struct RecordingKernelInvalidator {
     data_seen: parking_lot::Mutex<Vec<Ino>>,
     attr_seen: parking_lot::Mutex<Vec<Ino>>,
+    reset_requested: AtomicBool,
 }
 
 impl RecordingKernelInvalidator {
@@ -1161,6 +1162,10 @@ impl KernelInvalidator for RecordingKernelInvalidator {
 
     fn inval_inode_attrs(&self, ino: Ino) {
         self.attr_seen.lock().push(ino);
+    }
+
+    fn reset_diagnostics(&self) {
+        self.reset_requested.store(true, AtomicOrdering::Release);
     }
 }
 
@@ -17443,6 +17448,18 @@ fn reset_diagnostics_observability_clears_winfsp_write_policy_breakdown() {
     assert_eq!(after.winfsp_write_path.write_through_bytes, 0);
     assert_eq!(after.winfsp_write_path.opportunistic_calls, 0);
     assert_eq!(after.winfsp_write_path.opportunistic_bytes, 0);
+}
+
+#[test]
+fn reset_diagnostics_observability_notifies_kernel_invalidator() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-kernel-invalidator-diagnostics");
+    let invalidator = Arc::new(RecordingKernelInvalidator::default());
+    vfs.set_kernel_invalidator(invalidator.clone());
+
+    vfs.reset_diagnostics_observability();
+
+    assert!(invalidator.reset_requested.load(AtomicOrdering::Acquire));
 }
 
 #[test]

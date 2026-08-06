@@ -106,7 +106,11 @@ impl WinfspInvalidationQueue {
         }
     }
 
-    fn push_locked(&self, state: &mut WinfspInvalidationQueueState, ino: Ino) -> bool {
+    fn push_locked(
+        &self,
+        state: &mut parking_lot::MutexGuard<'_, WinfspInvalidationQueueState>,
+        ino: Ino,
+    ) -> bool {
         loop {
             if state.closed {
                 return false;
@@ -126,7 +130,7 @@ impl WinfspInvalidationQueue {
                 state.waiting_producers = state.waiting_producers.saturating_add(1);
                 self.not_full.notify_all();
             }
-            self.not_full.wait(&mut state);
+            self.not_full.wait(state);
             #[cfg(test)]
             {
                 state.waiting_producers = state.waiting_producers.saturating_sub(1);
@@ -172,6 +176,12 @@ impl WinfspInvalidationQueue {
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
         self.record_metrics(snapshot);
+    }
+
+    pub(crate) fn reset_metrics(&self) {
+        let mut state = self.state.lock();
+        state.queue_peak = 0;
+        state.coalesced = 0;
     }
 
     #[cfg(test)]
@@ -234,6 +244,10 @@ impl WinfspKernelInvalidator {
 impl KernelInvalidator for WinfspKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
         self.queue.push(ino);
+    }
+
+    fn reset_diagnostics(&self) {
+        self.queue.reset_metrics();
     }
 }
 

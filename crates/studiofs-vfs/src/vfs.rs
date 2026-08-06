@@ -4596,6 +4596,10 @@ impl StudioVfs {
 
     /// Reset diagnostics counters and event history for fresh observability baselines.
     pub fn reset_diagnostics_observability(&self) {
+        let kernel_invalidator = self.kernel_invalidator.read().clone();
+        if let Some(kernel_invalidator) = kernel_invalidator {
+            kernel_invalidator.reset_diagnostics();
+        }
         self.state.metrics.reset_diagnostics_observability();
         self.state.write_admission_governor.lock().reset_stats();
         self.state

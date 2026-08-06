@@ -4902,6 +4902,24 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_invalidation_queue_resets_peak_and_coalescing_metrics() {
+        let (_tmp, vfs, _ctx, queue) = make_test_context("invalidation-metrics-reset");
+        vfs.set_kernel_invalidator(Arc::new(WinfspKernelInvalidator::new(queue.clone())));
+
+        queue.push(7);
+        queue.push(7);
+        queue.push(8);
+
+        vfs.reset_diagnostics_observability();
+        queue.push(9);
+
+        let metrics = vfs.write_path_observability_snapshot().fuse_invalidation;
+        assert_eq!(metrics.queue_depth, 3);
+        assert_eq!(metrics.queue_peak, 3);
+        assert_eq!(metrics.coalesced, 0);
+    }
+
+    #[test]
     fn should_notify_deduplicates_a_large_invalidation_burst() {
         let (_tmp, vfs, ctx, queue) = make_test_context("notify_burst");
         let file = vfs
