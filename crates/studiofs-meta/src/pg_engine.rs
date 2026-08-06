@@ -121,6 +121,7 @@ struct PgBackgroundWorkers {
     lock_notify_cancel: CancellationToken,
     metadata_notify_cancel: CancellationToken,
     state: Mutex<PgBackgroundWorkerState>,
+    state_changed: Condvar,
 }
 
 struct PgBackgroundWorkerState {
@@ -129,6 +130,7 @@ struct PgBackgroundWorkerState {
     lock_notify_handle: Option<std::thread::JoinHandle<()>>,
     lock_renew_handle: Option<std::thread::JoinHandle<()>>,
     shutdown_complete: bool,
+    shutdown_in_progress: bool,
     shutdown_error: Option<MetaError>,
 }
 

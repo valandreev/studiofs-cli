@@ -140,6 +140,90 @@ fn shutdown_releases_worker_state_before_joining_workers() {
 }
 
 #[test]
+fn concurrent_shutdown_callers_wait_for_terminal_result() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        release_rx.recv().expect("release slow background worker");
+    });
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install slow background worker");
+
+    let (first_result_tx, first_result_rx) = std::sync::mpsc::channel();
+    let first_engine = engine.clone();
+    let first = std::thread::spawn(move || {
+        first_result_tx
+            .send(
+                first_engine
+                    .background_workers
+                    .shutdown(Duration::from_secs(5)),
+            )
+            .expect("send first shutdown result");
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let observed_shutdown_start = loop {
+        match engine.background_workers.state.try_lock() {
+            Ok(state) if state.shutdown_complete => break true,
+            Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("background worker state lock poisoned")
+            }
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+
+    if !observed_shutdown_start {
+        release_tx.send(()).expect("release slow background worker");
+        first.join().expect("join first shutdown thread");
+        panic!("first shutdown should publish its state before joining workers");
+    }
+
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_engine = engine.clone();
+    let second = std::thread::spawn(move || {
+        second_result_tx
+            .send(
+                second_engine
+                    .background_workers
+                    .shutdown(Duration::from_secs(5)),
+            )
+            .expect("send second shutdown result");
+    });
+
+    let second_early_result = second_result_rx
+        .recv_timeout(Duration::from_millis(100))
+        .ok();
+    let second_returned_early = second_early_result.is_some();
+    release_tx.send(()).expect("release slow background worker");
+    first_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first shutdown should finish")
+        .expect("first shutdown should succeed");
+    if let Some(result) = second_early_result {
+        result.expect("second shutdown should succeed");
+    } else {
+        second_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second shutdown should finish after the first")
+            .expect("second shutdown should replay the terminal result");
+    }
+    first.join().expect("join first shutdown thread");
+    second.join().expect("join second shutdown thread");
+
+    assert!(
+        !second_returned_early,
+        "a concurrent shutdown caller must wait for the terminal result"
+    );
+}
+
+#[test]
 fn metadata_notify_start_skips_start_lock_when_already_registered() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     let handle = std::thread::spawn(|| {});

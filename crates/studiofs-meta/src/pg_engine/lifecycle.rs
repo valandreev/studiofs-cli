@@ -21,8 +21,10 @@ impl PgBackgroundWorkers {
                 lock_notify_handle: None,
                 lock_renew_handle: None,
                 shutdown_complete: false,
+                shutdown_in_progress: false,
                 shutdown_error: None,
             }),
+            state_changed: Condvar::new(),
         }
     }
 
@@ -108,6 +110,11 @@ impl PgBackgroundWorkers {
                 MetaError::Storage("pg background worker state poisoned".to_string())
             })?;
             if state.shutdown_complete {
+                while state.shutdown_in_progress {
+                    state = self.state_changed.wait(state).map_err(|_| {
+                        MetaError::Storage("pg background worker state poisoned".to_string())
+                    })?;
+                }
                 return match &state.shutdown_error {
                     Some(error) => Err(error.clone()),
                     None => Ok(()),
@@ -116,6 +123,7 @@ impl PgBackgroundWorkers {
 
             self.signal_stop();
             state.shutdown_complete = true;
+            state.shutdown_in_progress = true;
             [
                 (PgBackgroundWorker::Poll, state.poll_handle.take()),
                 (
@@ -147,7 +155,9 @@ impl PgBackgroundWorkers {
             .state
             .lock()
             .map_err(|_| MetaError::Storage("pg background worker state poisoned".to_string()))?;
+        state.shutdown_in_progress = false;
         state.shutdown_error = first_error.clone();
+        self.state_changed.notify_all();
         drop(state);
         match first_error {
             Some(error) => Err(error),
