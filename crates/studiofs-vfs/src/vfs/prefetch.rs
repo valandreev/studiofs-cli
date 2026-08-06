@@ -9,7 +9,7 @@ use tokio::sync::mpsc::Receiver;
 use tracing::info;
 
 pub(super) const PREFETCH_INGRESS_CAPACITY: usize = 256;
-pub(super) const MAX_PREFETCH_PENDING_BLOCKS: usize = 8192;
+pub(super) const MAX_PREFETCH_PENDING_HINTS: usize = 8192;
 
 #[derive(Debug, Clone)]
 pub(super) enum PrefetchWorkItem {
@@ -410,7 +410,7 @@ impl PrefetchWorker {
                 if self.pending_set.contains(&key) {
                     return false;
                 }
-                if self.pending_set.len() >= MAX_PREFETCH_PENDING_BLOCKS {
+                if self.pending_set.len() >= MAX_PREFETCH_PENDING_HINTS {
                     overflow_blocks = overflow_blocks.saturating_add(1);
                     return false;
                 }
@@ -613,7 +613,7 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use super::{MAX_PREFETCH_PENDING_BLOCKS, PREFETCH_INGRESS_CAPACITY};
+    use super::{MAX_PREFETCH_PENDING_HINTS, PREFETCH_INGRESS_CAPACITY};
     use std::sync::Arc;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
@@ -937,12 +937,12 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_pending_blocks_are_bounded_and_overflow_is_observable() {
+    fn prefetch_pending_hints_are_bounded_and_overflow_is_observable() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-bounded");
         let (_tx, rx) = tokio::sync::mpsc::channel(PREFETCH_INGRESS_CAPACITY);
         let mut worker = PrefetchWorker::new(Arc::clone(&vfs), rx);
-        let block_indices: Vec<_> = (0..(MAX_PREFETCH_PENDING_BLOCKS as u32 + 3)).collect();
+        let block_indices: Vec<_> = (0..(MAX_PREFETCH_PENDING_HINTS as u32 + 3)).collect();
 
         worker.enqueue_work_item(PrefetchWorkItem::Batch(PrefetchBatch::new(
             99,
@@ -950,7 +950,7 @@ mod tests {
             None,
         )));
 
-        assert_eq!(worker.pending_set.len(), MAX_PREFETCH_PENDING_BLOCKS);
+        assert_eq!(worker.pending_set.len(), MAX_PREFETCH_PENDING_HINTS);
         assert_eq!(
             vfs.state
                 .metrics
