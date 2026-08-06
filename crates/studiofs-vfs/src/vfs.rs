@@ -3695,6 +3695,8 @@ pub struct StudioVfs {
     fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_size_change_truncate_after_first_removed_block: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_deferred_materialization_prefetch: std::sync::atomic::AtomicBool,
 }
 
 fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {

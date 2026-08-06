@@ -15547,6 +15547,45 @@ fn deferred_materialization_pass_reports_idle_for_clean_inode() {
 }
 
 #[test]
+fn deferred_materialization_pass_disallows_reschedule_after_error() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-pass-error");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"materialize-pass-error.bin", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open file");
+        let payload = vec![0xD4; vfs.block_size as usize];
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &payload)
+            .await
+            .expect("buffer payload");
+        vfs.arm_fail_next_deferred_materialization_prefetch_for_test();
+        let (entry, guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(attr.ino)
+            .expect("test should reserve the deferred materialization gate");
+        let mut no_progress_retries = 0;
+
+        let outcome = vfs
+            .run_deferred_materialization_pass(&entry, &mut no_progress_retries)
+            .await;
+
+        assert_eq!(
+            outcome,
+            super::sync_ops::DeferredMaterializationPassOutcome::Completed {
+                allow_reschedule: false,
+            }
+        );
+        drop(entry);
+        drop(guard);
+    });
+}
+
+#[test]
 fn strict_flush_interrupts_deferred_materialization_linger() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) =

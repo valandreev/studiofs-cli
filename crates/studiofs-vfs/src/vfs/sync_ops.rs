@@ -145,6 +145,12 @@ impl StudioVfs {
     }
 
     #[cfg(test)]
+    pub(super) fn arm_fail_next_deferred_materialization_prefetch_for_test(&self) {
+        self.fail_next_deferred_materialization_prefetch
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     fn fail_inline_dirty_attr_persist_for_test(&self) -> VfsResult<()> {
         if self
             .fail_next_inline_dirty_attr_persist
@@ -2091,6 +2097,16 @@ impl StudioVfs {
         &self,
         ino: Ino,
     ) -> VfsResult<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_deferred_materialization_prefetch
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(VfsError::Other(
+                "simulated deferred materialization prefetch failure".into(),
+            ));
+        }
+
         let object_count = self
             .state
             .writer_stack
