@@ -785,7 +785,7 @@ struct SessionInvalidationQueue {
     state: ParkingMutex<SessionInvalidationQueueState>,
     wake: Condvar,
     worker: ParkingMutex<Option<std::thread::JoinHandle<()>>>,
-    metrics_vfs: ParkingMutex<Weak<StudioVfs>>,
+    metrics_vfs: OnceLock<Weak<StudioVfs>>,
 }
 
 struct SessionInvalidationQueueState {
@@ -823,13 +823,17 @@ impl SessionInvalidationQueue {
             }),
             wake: Condvar::new(),
             worker: ParkingMutex::new(None),
-            metrics_vfs: ParkingMutex::new(Weak::new()),
+            metrics_vfs: OnceLock::new(),
         })
     }
 
     fn attach_metrics(&self, vfs: &Arc<StudioVfs>) {
-        *self.metrics_vfs.lock() = Arc::downgrade(vfs);
-        self.publish_metrics();
+        let _ = self.metrics_vfs.set(Arc::downgrade(vfs));
+        let snapshot = {
+            let mut state = self.state.lock();
+            Self::next_metrics_snapshot(&mut state)
+        };
+        self.record_metrics(snapshot);
     }
 
     fn start(
@@ -887,8 +891,9 @@ impl SessionInvalidationQueue {
                 state.waiting_producers = state.waiting_producers.saturating_sub(1);
             }
         }
+        let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
-        self.publish_metrics();
+        self.record_metrics(snapshot);
     }
 
     fn next(&self) -> Option<InodeInvalidation> {
@@ -896,9 +901,10 @@ impl SessionInvalidationQueue {
         loop {
             if let Some(ino) = state.pending.pop_front() {
                 let data = state.kinds.remove(&ino).unwrap_or(false);
-                self.wake.notify_all();
+                self.wake.notify_one();
+                let snapshot = Self::next_metrics_snapshot(&mut state);
                 drop(state);
-                self.publish_metrics();
+                self.record_metrics(snapshot);
                 return Some(InodeInvalidation { ino, data });
             }
             if state.closed {
@@ -942,8 +948,9 @@ impl SessionInvalidationQueue {
         state.pending.clear();
         state.kinds.clear();
         self.wake.notify_all();
+        let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
-        self.publish_metrics();
+        self.record_metrics(snapshot);
     }
 
     #[cfg(test)]
@@ -964,13 +971,17 @@ impl SessionInvalidationQueue {
         }
     }
 
-    fn publish_metrics(&self) {
-        let snapshot = {
-            let mut state = self.state.lock();
-            state.snapshot_generation = state.snapshot_generation.saturating_add(1);
-            Self::metrics_snapshot_from_state(&state)
-        };
-        if let Some(vfs) = self.metrics_vfs.lock().upgrade() {
+    fn next_metrics_snapshot(
+        state: &mut SessionInvalidationQueueState,
+    ) -> VfsFuseInvalidationSnapshot {
+        state.snapshot_generation = state.snapshot_generation.saturating_add(1);
+        Self::metrics_snapshot_from_state(state)
+    }
+
+    fn record_metrics(&self, snapshot: VfsFuseInvalidationSnapshot) {
+        if let Some(metrics_vfs) = self.metrics_vfs.get()
+            && let Some(vfs) = metrics_vfs.upgrade()
+        {
             vfs.record_fuse_invalidation_snapshot(snapshot);
         }
     }

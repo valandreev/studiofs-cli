@@ -84,25 +84,42 @@ impl WinfspInvalidationQueue {
             not_full: Condvar::new(),
             metrics_vfs: Arc::downgrade(vfs),
         });
-        queue.publish_metrics();
+        let snapshot = {
+            let mut state = queue.state.lock();
+            Self::next_metrics_snapshot(&mut state)
+        };
+        queue.record_metrics(snapshot);
         queue
     }
 
     pub(crate) fn push(&self, ino: Ino) {
-        let mut state = self.state.lock();
+        let snapshot = {
+            let mut state = self.state.lock();
+            if self.push_locked(&mut state, ino) {
+                Some(Self::next_metrics_snapshot(&mut state))
+            } else {
+                None
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            self.record_metrics(snapshot);
+        }
+    }
+
+    fn push_locked(&self, state: &mut WinfspInvalidationQueueState, ino: Ino) -> bool {
         loop {
             if state.closed {
-                return;
+                return false;
             }
             if state.pending.contains(&ino) {
                 state.coalesced = state.coalesced.saturating_add(1);
-                break;
+                return true;
             }
             if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
                 state.pending.insert(ino);
                 state.order.push_back(ino);
                 state.queue_peak = state.queue_peak.max(state.pending.len());
-                break;
+                return true;
             }
             #[cfg(test)]
             {
@@ -115,8 +132,6 @@ impl WinfspInvalidationQueue {
                 state.waiting_producers = state.waiting_producers.saturating_sub(1);
             }
         }
-        drop(state);
-        self.publish_metrics();
     }
 
     pub(crate) fn drain(&self) -> Vec<Ino> {
@@ -124,17 +139,25 @@ impl WinfspInvalidationQueue {
         let mut inodes: Vec<_> = state.order.drain(..).collect();
         state.pending.clear();
         self.not_full.notify_all();
-        inodes.sort_unstable();
+        let snapshot = (!inodes.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
-        if !inodes.is_empty() {
-            self.publish_metrics();
+        inodes.sort_unstable();
+        if let Some(snapshot) = snapshot {
+            self.record_metrics(snapshot);
         }
         inodes
     }
 
     pub(crate) fn extend(&self, inodes: impl IntoIterator<Item = Ino>) {
+        let mut state = self.state.lock();
+        let mut changed = false;
         for ino in inodes {
-            self.push(ino);
+            changed |= self.push_locked(&mut state, ino);
+        }
+        let snapshot = changed.then(|| Self::next_metrics_snapshot(&mut state));
+        drop(state);
+        if let Some(snapshot) = snapshot {
+            self.record_metrics(snapshot);
         }
     }
 
@@ -146,8 +169,9 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         state.closed = true;
         self.not_full.notify_all();
+        let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
-        self.publish_metrics();
+        self.record_metrics(snapshot);
     }
 
     #[cfg(test)]
@@ -162,18 +186,20 @@ impl WinfspInvalidationQueue {
         true
     }
 
-    fn publish_metrics(&self) {
-        let snapshot = {
-            let mut state = self.state.lock();
-            state.snapshot_generation = state.snapshot_generation.saturating_add(1);
-            VfsFuseInvalidationSnapshot {
-                snapshot_generation: state.snapshot_generation,
-                queue_depth: state.pending.len(),
-                queue_peak: state.queue_peak,
-                coalesced: state.coalesced,
-                ..VfsFuseInvalidationSnapshot::default()
-            }
-        };
+    fn next_metrics_snapshot(
+        state: &mut WinfspInvalidationQueueState,
+    ) -> VfsFuseInvalidationSnapshot {
+        state.snapshot_generation = state.snapshot_generation.saturating_add(1);
+        VfsFuseInvalidationSnapshot {
+            snapshot_generation: state.snapshot_generation,
+            queue_depth: state.pending.len(),
+            queue_peak: state.queue_peak,
+            coalesced: state.coalesced,
+            ..VfsFuseInvalidationSnapshot::default()
+        }
+    }
+
+    fn record_metrics(&self, snapshot: VfsFuseInvalidationSnapshot) {
         if let Some(vfs) = self.metrics_vfs.upgrade() {
             vfs.record_fuse_invalidation_snapshot(snapshot);
         }

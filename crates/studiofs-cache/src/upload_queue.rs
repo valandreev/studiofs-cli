@@ -268,19 +268,20 @@ impl UploadQueue {
     /// Claim current pending uploads after a worker wakeup.
     pub fn claim_pending(&self) -> Vec<PendingUpload> {
         let mut state = self.pending_state.lock();
-        let claimed: Vec<_> = state
-            .by_object
-            .iter()
-            .filter(|(object_id, op)| {
-                state
-                    .dispatched
-                    .get(object_id)
-                    .is_none_or(|dispatched| dispatched != *op)
-            })
-            .map(|(_, op)| op.clone())
-            .collect();
-        for op in &claimed {
-            state.dispatched.insert(op.object_id, op.clone());
+        let PendingState {
+            by_object,
+            dispatched,
+            ..
+        } = &mut *state;
+        let mut claimed = Vec::new();
+        for (&object_id, op) in by_object.iter() {
+            if dispatched
+                .get(&object_id)
+                .is_none_or(|dispatched_op| dispatched_op != op)
+            {
+                claimed.push(op.clone());
+                dispatched.insert(object_id, op.clone());
+            }
         }
         claimed
     }

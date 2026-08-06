@@ -2363,6 +2363,7 @@ struct MetricsState {
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
     prefetch_ingress_dropped_hints: AtomicU64,
+    prefetch_ingress_dropped_blocks: AtomicU64,
     prefetch_ingress_coalesced_hints: AtomicU64,
     readahead_scheduled_blocks: AtomicU64,
     readahead_dropped_blocks: AtomicU64,
@@ -2563,6 +2564,7 @@ impl MetricsState {
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
             prefetch_ingress_dropped_hints: AtomicU64::new(0),
+            prefetch_ingress_dropped_blocks: AtomicU64::new(0),
             prefetch_ingress_coalesced_hints: AtomicU64::new(0),
             readahead_scheduled_blocks: AtomicU64::new(0),
             readahead_dropped_blocks: AtomicU64::new(0),
@@ -2774,6 +2776,7 @@ impl MetricsState {
         self.prefetched_object_remaining_bytes.lock().clear();
         reset_atomic!(
             prefetch_ingress_dropped_hints,
+            prefetch_ingress_dropped_blocks,
             prefetch_ingress_coalesced_hints,
             readahead_scheduled_blocks,
             readahead_dropped_blocks,
@@ -6807,6 +6810,11 @@ impl StudioVfs {
                 .metrics
                 .prefetch_ingress_dropped_hints
                 .load(Ordering::Relaxed),
+            prefetch_ingress_dropped_blocks: self
+                .state
+                .metrics
+                .prefetch_ingress_dropped_blocks
+                .load(Ordering::Relaxed),
             prefetch_ingress_coalesced_hints: self
                 .state
                 .metrics
@@ -8496,6 +8504,11 @@ impl StudioVfs {
             .metrics
             .prefetch_ingress_dropped_hints
             .load(Ordering::Relaxed);
+        let prefetch_ingress_dropped_blocks = self
+            .state
+            .metrics
+            .prefetch_ingress_dropped_blocks
+            .load(Ordering::Relaxed);
         let prefetch_ingress_coalesced_hints = self
             .state
             .metrics
@@ -9133,6 +9146,7 @@ impl StudioVfs {
                 prefetch_ingress_depth,
                 prefetch_ingress_capacity: prefetch::PREFETCH_INGRESS_CAPACITY as u64,
                 prefetch_ingress_dropped_hints,
+                prefetch_ingress_dropped_blocks,
                 prefetch_ingress_coalesced_hints,
                 readahead_used_bytes,
                 local_cache_io_calls: fetch_local_cache_io_calls,

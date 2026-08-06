@@ -684,9 +684,12 @@ pub struct VfsIngressStats {
     /// Maximum buffered prefetch ingress depth.
     #[serde(default)]
     pub prefetch_ingress_capacity: u64,
-    /// Optional prefetch hints or pending blocks dropped at ingress bounds.
+    /// Optional prefetch hints dropped when buffered ingress is full.
     #[serde(default)]
     pub prefetch_ingress_dropped_hints: u64,
+    /// Pending prefetch blocks dropped at the worker pending-state bound.
+    #[serde(default)]
+    pub prefetch_ingress_dropped_blocks: u64,
     /// Optional prefetch hints coalesced by duplicate suppression.
     #[serde(default)]
     pub prefetch_ingress_coalesced_hints: u64,
@@ -1559,9 +1562,12 @@ pub struct VfsFetchStats {
     /// Maximum buffered prefetch ingress depth.
     #[serde(default)]
     pub prefetch_ingress_capacity: u64,
-    /// Optional prefetch hints or pending blocks dropped at ingress bounds.
+    /// Optional prefetch hints dropped when buffered ingress is full.
     #[serde(default)]
     pub prefetch_ingress_dropped_hints: u64,
+    /// Pending prefetch blocks dropped at the worker pending-state bound.
+    #[serde(default)]
+    pub prefetch_ingress_dropped_blocks: u64,
     /// Optional prefetch hints coalesced by duplicate suppression.
     #[serde(default)]
     pub prefetch_ingress_coalesced_hints: u64,

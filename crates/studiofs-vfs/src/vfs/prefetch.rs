@@ -417,14 +417,18 @@ impl PrefetchWorker {
                 self.pending_set.insert(key)
             });
             let queued_blocks = batch.block_indices.len() as u64;
-            self.vfs.state.metrics.readahead_dropped_blocks.fetch_add(
-                original_blocks.saturating_sub(queued_blocks),
-                Ordering::Relaxed,
-            );
+            let suppressed_blocks = original_blocks
+                .saturating_sub(queued_blocks)
+                .saturating_sub(overflow_blocks);
             self.vfs
                 .state
                 .metrics
-                .prefetch_ingress_dropped_hints
+                .readahead_dropped_blocks
+                .fetch_add(suppressed_blocks, Ordering::Relaxed);
+            self.vfs
+                .state
+                .metrics
+                .prefetch_ingress_dropped_blocks
                 .fetch_add(overflow_blocks, Ordering::Relaxed);
             if !batch.is_empty() {
                 self.vfs
@@ -952,7 +956,15 @@ mod tests {
                 .metrics
                 .prefetch_ingress_dropped_hints
                 .load(Ordering::Relaxed),
-            3
+            0
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .prefetch_ingress_dropped_blocks
+                .load(Ordering::Relaxed),
+            3,
+            "overflow blocks should have a block-count metric"
         );
     }
 
@@ -976,6 +988,13 @@ mod tests {
                 .prefetch_ingress_dropped_hints
                 .load(Ordering::Relaxed),
             1
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .prefetch_ingress_dropped_blocks
+                .load(Ordering::Relaxed),
+            0
         );
     }
 }

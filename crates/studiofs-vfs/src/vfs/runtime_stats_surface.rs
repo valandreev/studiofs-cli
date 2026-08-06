@@ -593,6 +593,12 @@ impl StudioVfs {
         );
         insert_counter(
             &mut snapshot.cache,
+            "prefetch_ingress_dropped_blocks",
+            "count",
+            ingress.prefetch_ingress_dropped_blocks,
+        );
+        insert_counter(
+            &mut snapshot.cache,
             "prefetch_ingress_coalesced_hints",
             "count",
             ingress.prefetch_ingress_coalesced_hints,
