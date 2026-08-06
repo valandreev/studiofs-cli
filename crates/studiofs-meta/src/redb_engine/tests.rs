@@ -216,7 +216,7 @@ fn prepare_for_close_makes_later_relaxed_writes_immediate() {
     engine
         .sync_local_metadata()
         .expect("initial schema writes must be durable before close preparation");
-    engine.prepare_for_close();
+    engine.prepare_for_close().expect("close redb test engine");
     engine.set_counter("after-close-preparation", 1).unwrap();
 
     assert!(

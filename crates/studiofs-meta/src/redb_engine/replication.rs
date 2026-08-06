@@ -1470,8 +1470,9 @@ impl RedbMetaEngine {
 }
 
 impl MetaReplication for RedbMetaEngine {
-    fn prepare_for_close(&self) {
+    fn prepare_for_close(&self) -> MetaResult<()> {
         self.seal_relaxed_durability_for_close();
+        Ok(())
     }
 
     fn check_consistency(&self) -> MetaResult<()> {

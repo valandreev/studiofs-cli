@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 const INITIAL_METADATA_STATE_VERSION: i64 = 0;
 const ACTIVE_CRYPTO_KEY_STATE: &str = "active";
+const INIT_SCHEMA_ADVISORY_LOCK: i64 = 902_202_603;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -289,6 +290,28 @@ fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> an
     })
 }
 
+fn provision_pg_schema(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Result<()> {
+    rt.block_on(async {
+        let (mut client, connection) = connect_studiofs_postgres(dsn).await?;
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection task ended: {e}");
+            }
+        });
+
+        let tx = client.transaction().await?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&INIT_SCHEMA_ADVISORY_LOCK],
+        )
+        .await?;
+        tx.batch_execute(init_pg_schema_sql()).await?;
+        tx.commit().await?;
+        conn_task.abort();
+        Ok(())
+    })
+}
+
 struct ActiveCryptoKeyRow<'a> {
     algorithm: &'static str,
     key_material: &'a [u8],
@@ -380,6 +403,18 @@ fn init_pg_schema_sql() -> &'static str {
                 snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (vol, id)
+            );
+
+            CREATE TABLE IF NOT EXISTS file_lock_leases (
+                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                ino BIGINT NOT NULL,
+                kind SMALLINT NOT NULL,
+                exclusive_owner TEXT,
+                shared_owners TEXT[] NOT NULL DEFAULT '{}',
+                lease_expires_at_unix_ms BIGINT NOT NULL,
+                generation BIGINT NOT NULL DEFAULT 1,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (vol, ino)
             );
 
             ALTER TABLE event_log
@@ -474,8 +509,11 @@ fn init_pg_schema_and_volume(
         let tx = client.transaction().await?;
 
         // Serialize DDL across concurrent initializers to avoid sequence-name races.
-        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
-            .await?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&INIT_SCHEMA_ADVISORY_LOCK],
+        )
+        .await?;
 
         tx.batch_execute(init_pg_schema_sql()).await?;
 
@@ -578,6 +616,8 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
     check_postgres_accessible(&rt, &postgres_dsn)?;
     println!("✓ PostgreSQL connectivity check passed.");
     println!();
+
+    provision_pg_schema(&rt, &postgres_dsn)?;
 
     if volume_name_exists(&rt, &postgres_dsn, &name)? {
         return Err(anyhow::anyhow!(
@@ -795,11 +835,85 @@ mod tests {
     fn init_pg_schema_provisions_volume_encryption_metadata() {
         let ddl = init_pg_schema_sql();
 
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS file_lock_leases"));
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS volume_crypto_keys"));
         assert!(ddl.contains("encryption_enabled BOOLEAN NOT NULL DEFAULT TRUE"));
         assert!(ddl.contains("encryption_format_version SMALLINT NOT NULL DEFAULT 1"));
         assert!(ddl.contains("active_crypto_key_id INTEGER NOT NULL DEFAULT 1"));
         assert!(ddl.contains("PRIMARY KEY (vol, key_id)"));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN"]
+    fn init_repairs_existing_schema_before_volume_guard() {
+        let dsn = std::env::var("STUDIOFS_TEST_PG_DSN")
+            .expect("set STUDIOFS_TEST_PG_DSN to run PostgreSQL init tests");
+        let rt = tokio::runtime::Runtime::new().expect("create test runtime");
+        let name = format!("sfs642-schema-upgrade-{}", Uuid::new_v4());
+        let uuid = Uuid::new_v4().to_string();
+
+        rt.block_on(async {
+            let (mut client, connection) = connect_studiofs_postgres(&dsn)
+                .await
+                .expect("connect to test PostgreSQL");
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let tx = client.transaction().await.expect("start setup transaction");
+            tx.batch_execute(init_pg_schema_sql())
+                .await
+                .expect("create test schema");
+            tx.execute(
+                "INSERT INTO volumes (name, uuid, block_size) VALUES ($1, $2, $3)",
+                &[&name, &uuid, &8192_i32],
+            )
+            .await
+            .expect("insert pre-existing volume");
+            tx.batch_execute("DROP TABLE file_lock_leases")
+                .await
+                .expect("remove the new schema table from the legacy fixture");
+            tx.commit().await.expect("commit legacy fixture");
+            conn_task.abort();
+        });
+
+        let schema_result = provision_pg_schema(&rt, &dsn);
+        let volume_result = volume_name_exists(&rt, &dsn, &name);
+        let lock_table_result = rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(&dsn).await?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let row = client
+                .query_one(
+                    "SELECT to_regclass('public.file_lock_leases') IS NOT NULL",
+                    &[],
+                )
+                .await?;
+            conn_task.abort();
+            Ok::<bool, anyhow::Error>(row.get(0))
+        });
+        let cleanup_result = rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(&dsn).await?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .execute("DELETE FROM volumes WHERE name = $1", &[&name])
+                .await?;
+            conn_task.abort();
+            Ok::<(), anyhow::Error>(())
+        });
+
+        cleanup_result.expect("remove test volume");
+        schema_result.expect("init should repair the legacy PostgreSQL schema");
+        assert!(
+            volume_result.expect("look up the pre-existing volume"),
+            "schema repair must happen before the existing-volume guard"
+        );
+        assert!(
+            lock_table_result.expect("check repaired schema"),
+            "schema repair must recreate file_lock_leases"
+        );
     }
 
     #[test]

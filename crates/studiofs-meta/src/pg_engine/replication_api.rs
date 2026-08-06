@@ -157,41 +157,12 @@ impl MetaReplication for PgMetaEngine {
         Ok(Some(size))
     }
 
-    fn prepare_for_close(&self) {
+    fn prepare_for_close(&self) -> MetaResult<()> {
         self.local.seal_relaxed_durability_for_close();
-        // Signal the background poll thread to exit and wait for it.
-        // This ensures the thread's `Arc<PgMetaEngine>` (from Weak::upgrade)
-        // is dropped before the caller proceeds with process exit, so that
-        // `RedbMetaEngine` / `redb::Database` can run their Drop impls
-        // cleanly — preventing "Database repair aborted" on next mount.
-        //
-        // Cancel the notify listener token first so any in-flight postgres
-        // awaits (e.g. `refresh_known_file_lock_lease_with_client`) are
-        // interrupted immediately rather than waiting up to command_timeout.
-        self.lock_notify_cancel.cancel();
-        self.metadata_notify_cancel.cancel();
-        self.poll_shutdown.store(true, Ordering::Release);
-        self.signal_poll_wakeup();
+        let _start_guard = self.lock_worker_start_lock.lock().map_err(|_| {
+            MetaError::Storage("pg background worker start state poisoned".to_string())
+        })?;
         let join_timeout = Self::default_prepare_for_close_join_timeout();
-        if let Ok(mut guard) = self.poll_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "poll");
-        }
-        if let Ok(mut guard) = self.metadata_notify_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "metadata-notify");
-        }
-        if let Ok(mut guard) = self.lock_notify_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "notify");
-        }
-        if let Ok(mut guard) = self.lock_renew_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "renew");
-        }
+        self.background_workers.shutdown(join_timeout)
     }
 }

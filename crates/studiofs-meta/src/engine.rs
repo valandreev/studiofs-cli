@@ -109,6 +109,10 @@ pub enum MetaError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// PostgreSQL could not be reached during an operation that permits local-first fallback.
+    #[error("postgres unavailable: {0}")]
+    PostgresUnavailable(String),
+
     /// Serialization or deserialization failure for persisted metadata.
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -1058,8 +1062,10 @@ pub trait MetaReplication: Send + Sync {
 
     /// Prepare the engine for close: stop background threads and release
     /// resources so that `Database::drop()` can run cleanly before process
-    /// exit.  Default is a no-op (standalone redb needs no preparation).
-    fn prepare_for_close(&self) {}
+    /// exit. Default is a no-op (standalone redb needs no preparation).
+    fn prepare_for_close(&self) -> MetaResult<()> {
+        Ok(())
+    }
 }
 
 /// Public aggregate contract for consumers.

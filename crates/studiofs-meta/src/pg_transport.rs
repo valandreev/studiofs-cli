@@ -164,11 +164,37 @@ pub async fn connect_studiofs_postgres(
     let policy = inspect_postgres_transport_policy(&config);
     log_postgres_transport_policy(&policy);
     config.connect(StudioPgTls::new()?).await.map_err(|error| {
-        MetaError::Storage(format!(
-            "postgres connect failed: {}",
-            format_pg_error(error)
-        ))
+        let unavailable = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .is_some_and(is_transport_unavailable);
+        let message = format_pg_error(error);
+        if unavailable {
+            MetaError::PostgresUnavailable(message)
+        } else {
+            MetaError::Storage(format!("postgres connect failed: {message}"))
+        }
     })
+}
+
+fn is_transport_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    ) || (error.kind() == io::ErrorKind::InvalidInput
+        && error.to_string() == "could not resolve any addresses")
+        || error
+            .to_string()
+            .starts_with("failed to lookup address information")
 }
 
 fn parse_postgres_config(dsn: &str) -> MetaResult<tokio_postgres::Config> {
@@ -323,7 +349,7 @@ fn format_pg_error(error: tokio_postgres::Error) -> String {
 mod tests {
     use super::{
         PgTargetClass, PgTransportPolicy, classify_host, connect_studiofs_postgres,
-        inspect_postgres_transport_policy, parse_postgres_config,
+        inspect_postgres_transport_policy, is_transport_unavailable, parse_postgres_config,
     };
     use crate::resolve_studiofs_pg_dsns;
     use std::sync::OnceLock;
@@ -451,6 +477,34 @@ mod tests {
             assert_eq!(policy.target_class, PgTargetClass::Local);
             assert_eq!(policy.sslmode, SslMode::Disable);
         }
+    }
+
+    #[test]
+    fn transport_unavailability_excludes_reachable_session_mismatch() {
+        assert!(is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        )));
+        assert!(is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connection timed out",
+        )));
+        assert!(is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "could not resolve any addresses",
+        )));
+        assert!(is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "failed to lookup address information",
+        )));
+        assert!(!is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "certificate verify failed",
+        )));
+        assert!(!is_transport_unavailable(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "database does not allow writes",
+        )));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

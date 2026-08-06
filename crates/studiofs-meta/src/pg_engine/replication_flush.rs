@@ -305,12 +305,7 @@ impl PgMetaEngine {
     }
 
     pub(super) fn signal_poll_wakeup(&self) {
-        let (wakeup_lock, wakeup_cv) = &*self.poll_wakeup;
-        let mut wakeup_guard = wakeup_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *wakeup_guard = true;
-        wakeup_cv.notify_one();
+        self.background_workers.signal_poll_wakeup();
     }
 
     pub(super) fn should_flush_due_interval(

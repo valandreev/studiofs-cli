@@ -5,22 +5,322 @@ use crate::engine::MetaAcl;
 fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
     let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
     let (_dir, engine) = temp_pg_engine_for_unit();
-    *engine.poll_handle.lock().expect("poll_handle lock") = Some(
-        std::thread::Builder::new()
-            .name("pg-test-slow-close".into())
-            .spawn(|| {
-                std::thread::sleep(Duration::from_secs(5));
-            })
-            .expect("spawn slow background thread"),
-    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("pg-test-slow-close".into())
+        .spawn(move || {
+            started_tx.send(()).expect("signal slow worker start");
+            release_rx.recv().expect("release slow worker");
+        })
+        .expect("spawn slow background thread");
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install slow background worker");
+    started_rx.recv().expect("wait for slow worker start");
 
     let started = Instant::now();
-    engine.prepare_for_close();
+    let first_error = engine
+        .prepare_for_close()
+        .expect_err("slow worker should make close report a timeout");
 
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "prepare_for_close should respect the bounded join timeout for slow threads"
     );
+    let second_error = engine
+        .prepare_for_close()
+        .expect_err("repeated close should replay the first timeout");
+    assert_eq!(first_error.to_string(), second_error.to_string());
+    release_tx.send(()).expect("release slow background worker");
+}
+
+#[test]
+fn prepare_for_close_serializes_lazy_worker_registration() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let start_guard = engine
+        .lock_worker_start_lock
+        .lock()
+        .expect("worker start lock");
+    let state_guard = engine
+        .background_workers
+        .state
+        .lock()
+        .expect("background worker state lock");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let closing_engine = engine.clone();
+    let close_thread = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal close start");
+        result_tx
+            .send(closing_engine.prepare_for_close())
+            .expect("send close result");
+    });
+    started_rx.recv().expect("wait for close start");
+
+    let handle = std::thread::spawn(|| {});
+    drop(state_guard);
+
+    if result_rx.recv_timeout(Duration::from_millis(250)).is_ok() {
+        drop(start_guard);
+        close_thread.join().expect("join close thread");
+        panic!("close completed before the spawned worker was registered");
+    }
+
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("register worker before releasing the start lock");
+    drop(start_guard);
+
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close should finish after worker registration")
+        .expect("close should join the registered worker");
+    close_thread.join().expect("join close thread");
+}
+
+#[test]
+fn shutdown_releases_worker_state_before_joining_workers() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        release_rx.recv().expect("release slow background worker");
+    });
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install slow background worker");
+
+    let closing_engine = engine.clone();
+    let close_thread = std::thread::spawn(move || {
+        closing_engine
+            .background_workers
+            .shutdown(Duration::from_secs(30))
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let observed_shutdown_start = loop {
+        match engine.background_workers.state.try_lock() {
+            Ok(state) if state.shutdown_complete => break true,
+            Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("background worker state lock poisoned")
+            }
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+
+    if !observed_shutdown_start {
+        release_tx.send(()).expect("release slow background worker");
+        let _ = close_thread.join().expect("join close thread");
+        panic!("shutdown should publish its terminal state before joining workers");
+    }
+
+    let handle = std::thread::spawn(|| {});
+    let install_result = engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::MetadataNotify, handle);
+    assert!(
+        install_result.is_err(),
+        "registration after shutdown must be rejected without waiting for join"
+    );
+
+    release_tx.send(()).expect("release slow background worker");
+    close_thread
+        .join()
+        .expect("join close thread")
+        .expect("shutdown should join the released worker");
+}
+
+#[test]
+fn concurrent_shutdown_callers_wait_for_terminal_result() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        release_rx.recv().expect("release slow background worker");
+    });
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install slow background worker");
+
+    let (first_result_tx, first_result_rx) = std::sync::mpsc::channel();
+    let first_engine = engine.clone();
+    let first = std::thread::spawn(move || {
+        first_result_tx
+            .send(
+                first_engine
+                    .background_workers
+                    .shutdown(Duration::from_secs(5)),
+            )
+            .expect("send first shutdown result");
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let observed_shutdown_start = loop {
+        match engine.background_workers.state.try_lock() {
+            Ok(state) if state.shutdown_complete => break true,
+            Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("background worker state lock poisoned")
+            }
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+
+    if !observed_shutdown_start {
+        release_tx.send(()).expect("release slow background worker");
+        first.join().expect("join first shutdown thread");
+        panic!("first shutdown should publish its state before joining workers");
+    }
+
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_engine = engine.clone();
+    let second = std::thread::spawn(move || {
+        second_result_tx
+            .send(
+                second_engine
+                    .background_workers
+                    .shutdown(Duration::from_secs(5)),
+            )
+            .expect("send second shutdown result");
+    });
+
+    let second_early_result = second_result_rx
+        .recv_timeout(Duration::from_millis(100))
+        .ok();
+    let second_returned_early = second_early_result.is_some();
+    release_tx.send(()).expect("release slow background worker");
+    first_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first shutdown should finish")
+        .expect("first shutdown should succeed");
+    if let Some(result) = second_early_result {
+        result.expect("second shutdown should succeed");
+    } else {
+        second_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second shutdown should finish after the first")
+            .expect("second shutdown should replay the terminal result");
+    }
+    first.join().expect("join first shutdown thread");
+    second.join().expect("join second shutdown thread");
+
+    assert!(
+        !second_returned_early,
+        "a concurrent shutdown caller must wait for the terminal result"
+    );
+}
+
+#[test]
+fn metadata_notify_start_skips_start_lock_when_already_registered() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let handle = std::thread::spawn(|| {});
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::MetadataNotify, handle)
+        .expect("register metadata notify worker");
+    let engine = std::sync::Arc::new(engine);
+    let start_guard = engine
+        .lock_worker_start_lock
+        .lock()
+        .expect("worker start lock");
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let calling_engine = engine.clone();
+    let caller = std::thread::spawn(move || {
+        result_tx
+            .send(calling_engine.ensure_metadata_notify_listener_started())
+            .expect("send metadata notify start result");
+    });
+
+    let early_result = result_rx.recv_timeout(Duration::from_millis(250));
+    let completed_without_waiting = early_result.is_ok();
+    drop(start_guard);
+    let result = match early_result {
+        Ok(result) => result,
+        Err(_) => result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("metadata notify start should finish after releasing the lock"),
+    };
+    caller.join().expect("join metadata notify start");
+
+    assert!(
+        completed_without_waiting,
+        "an already registered metadata notify worker should not wait for the start lock"
+    );
+    result.expect("already registered metadata notify worker should be a no-op");
+}
+
+#[test]
+fn postgres_unavailable_requires_a_typed_connect_error() {
+    assert!(PgMetaEngine::is_postgres_unavailable(
+        &MetaError::PostgresUnavailable("connection refused".to_string())
+    ));
+    assert!(!PgMetaEngine::is_postgres_unavailable(&MetaError::Storage(
+        "postgres connect failed: error connecting to server".to_string()
+    )));
+    assert!(PgMetaEngine::is_postgres_unavailable(
+        &PgMetaEngine::pg_timeout_error(
+            PgTimeoutContext::Connection("validate postgres schema connect"),
+            Duration::from_millis(10),
+        )
+    ));
+    assert!(!PgMetaEngine::is_postgres_unavailable(
+        &PgMetaEngine::pg_timeout_error(
+            PgTimeoutContext::Command("validate postgres schema"),
+            Duration::from_millis(10),
+        )
+    ));
+}
+
+#[test]
+fn prepare_for_close_is_idempotent_when_no_workers_are_running() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+
+    engine
+        .prepare_for_close()
+        .expect("first close should succeed without workers");
+    engine
+        .prepare_for_close()
+        .expect("repeated close should remain successful");
+}
+
+#[test]
+fn dropping_engine_signals_background_workers_without_waiting() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let shutdown = engine.background_workers.poll_shutdown();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        while !shutdown.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        finished_tx.send(()).expect("signal worker stop");
+    });
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Poll, handle)
+        .expect("install worker");
+
+    let started = Instant::now();
+    drop(engine);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "dropping an engine must not wait for a background worker"
+    );
+    finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("background worker should observe drop cancellation");
 }
 
 #[test]

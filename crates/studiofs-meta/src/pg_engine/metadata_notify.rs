@@ -1,4 +1,4 @@
-use super::{MetadataSyncSource, PgMetaEngine};
+use super::{MetadataSyncSource, PgBackgroundWorker, PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,10 +9,18 @@ use tokio_util::sync::CancellationToken;
 impl PgMetaEngine {
     pub(super) fn ensure_metadata_notify_listener_started(&self) -> MetaResult<()> {
         if self
-            .metadata_notify_handle
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+            .background_workers
+            .has_handle(PgBackgroundWorker::MetadataNotify)
+        {
+            return Ok(());
+        }
+
+        let _start_guard = self.lock_worker_start_lock.lock().map_err(|_| {
+            MetaError::Storage("pg background worker start state poisoned".to_string())
+        })?;
+        if self
+            .background_workers
+            .has_handle(PgBackgroundWorker::MetadataNotify)
         {
             return Ok(());
         }
@@ -21,18 +29,13 @@ impl PgMetaEngine {
             MetaError::Storage("pg metadata notify bootstrap missing self weak ref".to_string())
         })?;
 
-        let mut notify_guard = self.metadata_notify_handle.lock().map_err(|_| {
-            MetaError::Storage("pg metadata notify handle state poisoned".to_string())
-        })?;
-        if notify_guard.is_none() {
-            *notify_guard = Some(Self::start_metadata_notify_listener(
-                engine,
-                self.poll_shutdown.clone(),
-                self.metadata_notify_cancel.clone(),
-            )?);
-        }
-
-        Ok(())
+        let handle = Self::start_metadata_notify_listener(
+            engine,
+            self.background_workers.poll_shutdown(),
+            self.background_workers.metadata_notify_cancel(),
+        )?;
+        self.background_workers
+            .install_handle(PgBackgroundWorker::MetadataNotify, handle)
     }
 
     fn start_metadata_notify_listener(
@@ -86,7 +89,7 @@ impl PgMetaEngine {
                             let (client, mut connection) = connect_result
                                 .map_err(|_| {
                                     Self::pg_timeout_error(
-                                        "metadata notify connect",
+                                        PgTimeoutContext::Connection("metadata notify connect"),
                                         connect_timeout,
                                     )
                                 })??;

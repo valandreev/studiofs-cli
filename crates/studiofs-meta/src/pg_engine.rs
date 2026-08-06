@@ -89,7 +89,6 @@ const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
-const FILE_LOCK_SCHEMA_ENSURE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StartupSnapshotImportMode {
@@ -113,6 +112,34 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
             | LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER
             | LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER
     )
+}
+
+/// Owns PostgreSQL worker cancellation state and handles.
+struct PgBackgroundWorkers {
+    poll_shutdown: Arc<AtomicBool>,
+    poll_wakeup: Arc<(Mutex<bool>, Condvar)>,
+    lock_notify_cancel: CancellationToken,
+    metadata_notify_cancel: CancellationToken,
+    state: Mutex<PgBackgroundWorkerState>,
+    state_changed: Condvar,
+}
+
+struct PgBackgroundWorkerState {
+    poll_handle: Option<std::thread::JoinHandle<()>>,
+    metadata_notify_handle: Option<std::thread::JoinHandle<()>>,
+    lock_notify_handle: Option<std::thread::JoinHandle<()>>,
+    lock_renew_handle: Option<std::thread::JoinHandle<()>>,
+    shutdown_complete: bool,
+    shutdown_in_progress: bool,
+    shutdown_error: Option<MetaError>,
+}
+
+#[derive(Clone, Copy)]
+enum PgBackgroundWorker {
+    Poll,
+    MetadataNotify,
+    LockNotify,
+    LockRenew,
 }
 
 /// PostgreSQL-backed metadata engine.
@@ -150,42 +177,20 @@ pub struct PgMetaEngine {
     inode_id_headroom_available: AtomicBool,
     object_id_headroom_available: AtomicBool,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
-    file_lock_schema_ensured: AtomicBool,
-    file_lock_schema_ensure_lock: Mutex<()>,
-    file_lock_schema_last_failure: Mutex<Option<FileLockSchemaEnsureFailure>>,
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
     active_open_inodes: Mutex<HashMap<Ino, u32>>,
     self_weak: OnceLock<Weak<Self>>,
     lock_workers_enabled: bool,
     lock_worker_start_lock: Mutex<()>,
-    /// Signals the background poll thread to exit.
-    poll_shutdown: Arc<AtomicBool>,
-    /// Wakes the background poll thread before the regular polling interval.
-    poll_wakeup: Arc<(Mutex<bool>, Condvar)>,
-    /// Cancels the lock-notify listener async future immediately, even mid-await.
-    lock_notify_cancel: CancellationToken,
+    background_workers: PgBackgroundWorkers,
     /// Wakes VFS metadata invalidation after PG metadata NOTIFY syncs local state.
     metadata_invalidation_notify: Arc<tokio::sync::Notify>,
-    /// Cancels the metadata-notify listener async future immediately.
-    metadata_notify_cancel: CancellationToken,
     metadata_notify_received: AtomicU64,
     metadata_notify_reconnects: AtomicU64,
     metadata_fallback_poll_discoveries: AtomicU64,
     metadata_sync_errors: AtomicU64,
     metadata_last_successful_sync_unix_ms: AtomicI64,
-    /// Handle to the background poll thread, used by `prepare_for_close()`
-    /// to join the thread so `Database::drop()` runs before process exit.
-    poll_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-    metadata_notify_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-    lock_notify_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-    lock_renew_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-#[derive(Debug, Clone)]
-struct FileLockSchemaEnsureFailure {
-    failed_at: Instant,
-    message: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -272,6 +277,12 @@ enum MetadataSyncSource {
     FallbackPoll,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum PgTimeoutContext<'a> {
+    Connection(&'a str),
+    Command(&'a str),
+}
+
 #[derive(Debug, Clone)]
 struct HeldFileLockLease {
     lease_ttl: Duration,
@@ -279,26 +290,6 @@ struct HeldFileLockLease {
 }
 
 impl PgMetaEngine {
-    const FILE_LOCK_LEASES_SCHEMA_SQL: &str = r#"
-        CREATE TABLE IF NOT EXISTS counters (
-            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            value BIGINT NOT NULL,
-            PRIMARY KEY (vol, name)
-        );
-
-        CREATE TABLE IF NOT EXISTS file_lock_leases (
-            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-            ino BIGINT NOT NULL,
-            kind SMALLINT NOT NULL,
-            exclusive_owner TEXT,
-            shared_owners TEXT[] NOT NULL DEFAULT '{}',
-            lease_expires_at_unix_ms BIGINT NOT NULL,
-            generation BIGINT NOT NULL DEFAULT 1,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (vol, ino)
-        );
-    "#;
     const LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
     const LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS: u64 = 30_000;
     const METADATA_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
@@ -335,7 +326,7 @@ impl PgMetaEngine {
         )
     }
 
-    fn ensure_file_lock_lease_schema(
+    fn validate_postgres_schema(
         postgres_url: &str,
         connect_timeout: Duration,
         command_timeout: Duration,
@@ -346,26 +337,47 @@ impl PgMetaEngine {
                 postgres_url,
                 connect_timeout,
                 command_timeout,
-                "ensure file lock lease schema",
+                "validate postgres schema",
                 move |client| async move {
-                    client
-                        .batch_execute("SET client_min_messages TO WARNING")
+                    let rows = client
+                        .query(
+                            r#"
+                            SELECT required.name
+                            FROM (
+                                VALUES
+                                    ('volumes'::TEXT),
+                                    ('counters'::TEXT),
+                                    ('event_log'::TEXT),
+                                    ('metadata_state'::TEXT),
+                                    ('acl_rules'::TEXT),
+                                    ('snapshots'::TEXT),
+                                    ('file_lock_leases'::TEXT)
+                            ) AS required(name)
+                            LEFT JOIN information_schema.tables AS table_info
+                                ON table_info.table_schema = current_schema()
+                                AND table_info.table_name = required.name
+                            WHERE table_info.table_name IS NULL
+                            ORDER BY required.name
+                            "#,
+                            &[],
+                        )
                         .await
                         .map_err(|e| {
                             MetaError::Storage(format!(
-                                "postgres file lock lease schema notice suppression failed: {}",
+                                "postgres schema validation failed: {}",
                                 Self::format_pg_error(e)
                             ))
                         })?;
-                    client
-                        .batch_execute(Self::FILE_LOCK_LEASES_SCHEMA_SQL)
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock lease schema ensure failed: {}",
-                                Self::format_pg_error(e)
-                            ))
-                        })?;
+                    if !rows.is_empty() {
+                        let missing = rows
+                            .into_iter()
+                            .map(|row| row.get::<_, String>(0))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(MetaError::Storage(format!(
+                            "postgres schema is missing required table(s): {missing}; run `studiofs init`"
+                        )));
+                    }
                     Ok(())
                 },
             )
@@ -373,63 +385,8 @@ impl PgMetaEngine {
         })
     }
 
-    fn ensure_file_lock_lease_schema_ready(&self) -> MetaResult<()> {
-        if self
-            .file_lock_schema_ensured
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(());
-        }
-
-        let _guard = self
-            .file_lock_schema_ensure_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self
-            .file_lock_schema_ensured
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(());
-        }
-
-        if let Some(failure) = self
-            .file_lock_schema_last_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .filter(|failure| failure.failed_at.elapsed() < FILE_LOCK_SCHEMA_ENSURE_RETRY_BACKOFF)
-            .cloned()
-        {
-            return Err(MetaError::Storage(format!(
-                "postgres file lock lease schema ensure recently failed: {}; retrying after {:?}",
-                failure.message,
-                FILE_LOCK_SCHEMA_ENSURE_RETRY_BACKOFF.saturating_sub(failure.failed_at.elapsed())
-            )));
-        }
-
-        if let Err(error) = Self::ensure_file_lock_lease_schema(
-            &self.postgres_url,
-            self.connect_timeout,
-            self.command_timeout,
-        ) {
-            let message = error.to_string();
-            *self
-                .file_lock_schema_last_failure
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(FileLockSchemaEnsureFailure {
-                    failed_at: Instant::now(),
-                    message,
-                });
-            return Err(error);
-        }
-        self.file_lock_schema_ensured
-            .store(true, std::sync::atomic::Ordering::Release);
-        *self
-            .file_lock_schema_last_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        Ok(())
+    fn is_postgres_unavailable(error: &MetaError) -> bool {
+        matches!(error, MetaError::PostgresUnavailable(_))
     }
 
     /// Open the PostgreSQL-backed metadata engine using default startup options.
@@ -491,6 +448,18 @@ impl PgMetaEngine {
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
+        if let Err(error) =
+            Self::validate_postgres_schema(&pg.url, connect_timeout, command_timeout)
+        {
+            if Self::is_postgres_unavailable(&error) {
+                warn!(
+                    error = %error,
+                    "postgres schema validation unavailable; continuing with local-first startup"
+                );
+            } else {
+                return Err(error);
+            }
+        }
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
         let client_slot = match persisted_client_slot {
@@ -506,8 +475,6 @@ impl PgMetaEngine {
             } else {
                 restored_flushed_event_seq
             };
-        let poll_shutdown = Arc::new(AtomicBool::new(false));
-        let poll_wakeup = Arc::new((Mutex::new(false), Condvar::new()));
         let engine = Arc::new(Self {
             local,
             postgres_url: pg.url.clone(),
@@ -538,29 +505,19 @@ impl PgMetaEngine {
             inode_id_headroom_available: AtomicBool::new(false),
             object_id_headroom_available: AtomicBool::new(false),
             janitor_lock: Mutex::new(None),
-            file_lock_schema_ensured: AtomicBool::new(false),
-            file_lock_schema_ensure_lock: Mutex::new(()),
-            file_lock_schema_last_failure: Mutex::new(None),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
             active_open_inodes: Mutex::new(HashMap::new()),
             self_weak: OnceLock::new(),
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
-            poll_shutdown: poll_shutdown.clone(),
-            poll_wakeup: poll_wakeup.clone(),
-            lock_notify_cancel: CancellationToken::new(),
+            background_workers: PgBackgroundWorkers::new(),
             metadata_invalidation_notify: Arc::new(tokio::sync::Notify::new()),
-            metadata_notify_cancel: CancellationToken::new(),
             metadata_notify_received: AtomicU64::new(0),
             metadata_notify_reconnects: AtomicU64::new(0),
             metadata_fallback_poll_discoveries: AtomicU64::new(0),
             metadata_sync_errors: AtomicU64::new(0),
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
-            poll_handle: Mutex::new(None),
-            metadata_notify_handle: Mutex::new(None),
-            lock_notify_handle: Mutex::new(None),
-            lock_renew_handle: Mutex::new(None),
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 
@@ -603,10 +560,12 @@ impl PgMetaEngine {
             let handle = Self::start_background_poll(
                 Arc::downgrade(&engine),
                 engine.poll_interval,
-                poll_shutdown,
-                poll_wakeup,
+                engine.background_workers.poll_shutdown(),
+                engine.background_workers.poll_wakeup(),
             )?;
-            *engine.poll_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+            engine
+                .background_workers
+                .install_handle(PgBackgroundWorker::Poll, handle)?;
         }
         Ok(engine)
     }

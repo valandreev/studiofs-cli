@@ -1,4 +1,4 @@
-use super::{PG_JANITOR_LOCK_SALT, PgMetaEngine};
+use super::{PG_JANITOR_LOCK_SALT, PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
 use std::collections::HashSet;
@@ -32,7 +32,12 @@ impl PgMetaEngine {
         let connect = connect_studiofs_postgres(&self.postgres_url);
         let (client, connection) = runtime
             .block_on(async { tokio::time::timeout(self.connect_timeout, connect).await })
-            .map_err(|_| Self::pg_timeout_error("janitor lock connect", self.connect_timeout))??;
+            .map_err(|_| {
+                Self::pg_timeout_error(
+                    PgTimeoutContext::Connection("janitor lock connect"),
+                    self.connect_timeout,
+                )
+            })??;
 
         let connection_task = runtime.spawn(async move {
             let _ = connection.await;
@@ -45,7 +50,12 @@ impl PgMetaEngine {
                 )
                 .await
             })
-            .map_err(|_| Self::pg_timeout_error("janitor lock acquire", self.command_timeout))?
+            .map_err(|_| {
+                Self::pg_timeout_error(
+                    PgTimeoutContext::Command("janitor lock acquire"),
+                    self.command_timeout,
+                )
+            })?
             .map_err(|e| {
                 MetaError::Storage(format!(
                     "postgres janitor lock acquire failed: {}",
