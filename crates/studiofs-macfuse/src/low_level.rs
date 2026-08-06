@@ -13,14 +13,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{
-    Arc, OnceLock,
+    Arc, OnceLock, Weak,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use parking_lot::{Condvar, Mutex as ParkingMutex};
-use studiofs_vfs::KernelInvalidator;
+use studiofs_vfs::{KernelInvalidator, StudioVfs, VfsFuseInvalidationSnapshot};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -735,6 +735,10 @@ impl Session {
         })
     }
 
+    pub(crate) fn attach_invalidation_metrics(&self, vfs: &Arc<StudioVfs>) {
+        self.control.invalidation_queue.attach_metrics(vfs);
+    }
+
     /// Run the low-level session loop on the current thread.
     pub fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live session owned by this wrapper for the
@@ -781,12 +785,18 @@ struct SessionInvalidationQueue {
     state: ParkingMutex<SessionInvalidationQueueState>,
     wake: Condvar,
     worker: ParkingMutex<Option<std::thread::JoinHandle<()>>>,
+    metrics_vfs: ParkingMutex<Weak<StudioVfs>>,
 }
 
 struct SessionInvalidationQueueState {
     closed: bool,
     pending: VecDeque<u64>,
     kinds: HashMap<u64, bool>,
+    queue_peak: usize,
+    coalesced: u64,
+    snapshot_generation: u64,
+    #[cfg(test)]
+    waiting_producers: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -805,10 +815,21 @@ impl SessionInvalidationQueue {
                 closed: false,
                 pending: VecDeque::new(),
                 kinds: HashMap::new(),
+                queue_peak: 0,
+                coalesced: 0,
+                snapshot_generation: 0,
+                #[cfg(test)]
+                waiting_producers: 0,
             }),
             wake: Condvar::new(),
             worker: ParkingMutex::new(None),
+            metrics_vfs: ParkingMutex::new(Weak::new()),
         })
+    }
+
+    fn attach_metrics(&self, vfs: &Arc<StudioVfs>) {
+        *self.metrics_vfs.lock() = Arc::downgrade(vfs);
+        self.publish_metrics();
     }
 
     fn start(
@@ -843,18 +864,31 @@ impl SessionInvalidationQueue {
             }
             if let Some(kind) = state.kinds.get_mut(&ino) {
                 *kind |= data;
-                return;
+                state.coalesced = state.coalesced.saturating_add(1);
+                break;
             }
             if state.pending.len() < MACFUSE_INVALIDATION_QUEUE_CAPACITY {
                 state.kinds.insert(ino, data);
                 state.pending.push_back(ino);
+                state.queue_peak = state.queue_peak.max(state.pending.len());
                 self.wake.notify_one();
-                return;
+                break;
             }
             // Preserve every invalidation while bounding memory: producers
             // wait for the dedicated worker to make queue capacity available.
+            #[cfg(test)]
+            {
+                state.waiting_producers = state.waiting_producers.saturating_add(1);
+                self.wake.notify_all();
+            }
             self.wake.wait(&mut state);
+            #[cfg(test)]
+            {
+                state.waiting_producers = state.waiting_producers.saturating_sub(1);
+            }
         }
+        drop(state);
+        self.publish_metrics();
     }
 
     fn next(&self) -> Option<InodeInvalidation> {
@@ -863,6 +897,8 @@ impl SessionInvalidationQueue {
             if let Some(ino) = state.pending.pop_front() {
                 let data = state.kinds.remove(&ino).unwrap_or(false);
                 self.wake.notify_all();
+                drop(state);
+                self.publish_metrics();
                 return Some(InodeInvalidation { ino, data });
             }
             if state.closed {
@@ -888,12 +924,55 @@ impl SessionInvalidationQueue {
         true
     }
 
+    #[cfg(test)]
+    fn wait_until_producer_blocked(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while state.waiting_producers == 0 {
+            if self.wake.wait_until(&mut state, deadline).timed_out() {
+                return state.waiting_producers > 0;
+            }
+        }
+        true
+    }
+
     fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
         state.pending.clear();
         state.kinds.clear();
         self.wake.notify_all();
+        drop(state);
+        self.publish_metrics();
+    }
+
+    #[cfg(test)]
+    fn metrics_snapshot(&self) -> VfsFuseInvalidationSnapshot {
+        let state = self.state.lock();
+        Self::metrics_snapshot_from_state(&state)
+    }
+
+    fn metrics_snapshot_from_state(
+        state: &SessionInvalidationQueueState,
+    ) -> VfsFuseInvalidationSnapshot {
+        VfsFuseInvalidationSnapshot {
+            snapshot_generation: state.snapshot_generation,
+            queue_depth: state.pending.len(),
+            queue_peak: state.queue_peak,
+            coalesced: state.coalesced,
+            ..VfsFuseInvalidationSnapshot::default()
+        }
+    }
+
+    fn publish_metrics(&self) {
+        let snapshot = {
+            let mut state = self.state.lock();
+            state.snapshot_generation = state.snapshot_generation.saturating_add(1);
+            Self::metrics_snapshot_from_state(&state)
+        };
+        if let Some(vfs) = self.metrics_vfs.lock().upgrade() {
+            vfs.record_fuse_invalidation_snapshot(snapshot);
+        }
     }
 
     fn join_worker(&self) {
@@ -1802,6 +1881,20 @@ mod tests {
     }
 
     #[test]
+    fn session_invalidation_queue_reports_depth_peak_and_coalescing() {
+        let queue = SessionInvalidationQueue::new();
+
+        queue.enqueue(7, false);
+        queue.enqueue(7, true);
+        queue.enqueue(8, false);
+
+        let metrics = queue.metrics_snapshot();
+        assert_eq!(metrics.queue_depth, 2);
+        assert_eq!(metrics.queue_peak, 2);
+        assert_eq!(metrics.coalesced, 1);
+    }
+
+    #[test]
     fn session_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
         let queue = SessionInvalidationQueue::new();
         for ino in 0..MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64 {
@@ -1814,18 +1907,17 @@ mod tests {
         }
 
         let producer_queue = Arc::clone(&queue);
-        let (started_tx, started_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
         let producer = std::thread::spawn(move || {
-            started_tx.send(()).expect("signal blocked producer start");
             producer_queue.enqueue(MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64, false);
             finished_tx
                 .send(())
                 .expect("signal blocked producer finish");
         });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("start blocked producer");
+        assert!(
+            queue.wait_until_producer_blocked(Duration::from_secs(1)),
+            "producer should enter the full-queue wait"
+        );
         assert!(
             finished_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "a full queue must apply producer backpressure"

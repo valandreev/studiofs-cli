@@ -2382,9 +2382,9 @@ mod tests {
         Arc<WinfspInvalidationQueue>,
     ) {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-        let queue = WinfspInvalidationQueue::new();
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
+        let queue = WinfspInvalidationQueue::new(&vfs);
         let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone());
         (tmp, vfs, ctx, queue)
     }
@@ -4786,7 +4786,7 @@ mod tests {
 
     #[test]
     fn winfsp_invalidator_enqueues_inode_numbers() {
-        let queue = WinfspInvalidationQueue::new();
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidator-enqueue");
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
 
         invalidator.inval_inode(42);
@@ -4797,24 +4797,23 @@ mod tests {
 
     #[test]
     fn winfsp_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
-        let queue = super::invalidation::WinfspInvalidationQueue::new();
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-backpressure");
         let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
         for ino in 0..capacity as u64 {
             queue.push(ino);
         }
 
         let producer_queue = Arc::clone(&queue);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
-            started_tx.send(()).expect("test producer started");
             producer_queue.push(capacity as u64);
             finished_tx.send(()).expect("test producer finished");
         });
 
-        started_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .expect("test producer should start");
+        assert!(
+            queue.wait_until_producer_blocked(std::time::Duration::from_secs(1)),
+            "producer should enter the full-queue wait"
+        );
         assert!(
             finished_rx
                 .recv_timeout(std::time::Duration::from_millis(50))
@@ -4831,6 +4830,37 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_invalidation_queue_close_wakes_blocked_producer() {
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-close");
+        let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
+        for ino in 0..capacity as u64 {
+            queue.push(ino);
+        }
+
+        let producer_queue = Arc::clone(&queue);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            producer_queue.push(capacity as u64);
+            finished_tx.send(()).expect("test producer finished");
+        });
+        assert!(
+            queue.wait_until_producer_blocked(std::time::Duration::from_secs(1)),
+            "producer should enter the full-queue wait"
+        );
+
+        queue.close();
+
+        let finished = finished_rx.recv_timeout(std::time::Duration::from_secs(1));
+        if finished.is_err() {
+            queue.drain();
+        }
+        producer
+            .join()
+            .expect("closed queue should release producer");
+        finished.expect("closed queue should wake blocked producer");
+    }
+
+    #[test]
     fn should_notify_drains_and_deduplicates_queue() {
         let (_tmp, vfs, ctx, queue) = make_test_context("notify_dedup");
         let alpha = vfs
@@ -4840,6 +4870,10 @@ mod tests {
             .create(ROOT_INO, b"beta.txt", 0, 0, 0o644)
             .expect("create beta");
         queue.extend([beta.ino, alpha.ino, beta.ino, alpha.ino]);
+        let queued_metrics = vfs.write_path_observability_snapshot().fuse_invalidation;
+        assert_eq!(queued_metrics.queue_depth, 2);
+        assert_eq!(queued_metrics.queue_peak, 2);
+        assert_eq!(queued_metrics.coalesced, 2);
 
         let first = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
             PreparedWinfspNotifications,

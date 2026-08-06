@@ -22,15 +22,17 @@ filesystem.
 - [x] Replace the upload operation channel with bounded coalesced wakeups backed by authoritative pending state.
 - [x] Bound prefetch ingress and pending blocks, preserve authoritative hint behavior, and expose dropped/coalesced metrics.
 - [x] Replace the WinFSP `Vec<Ino>` with a bounded unique queue and report its depth/peak/coalescing metrics.
+- [x] (2026-08-06 Europe/Kyiv) Address review findings: close WinFSP ingress before host shutdown, make producer-wait tests deterministic, publish queue depth at mutation time, exercise upload bursts through `UploadLifecycleWorker`, and add macFUSE invalidation metrics.
 - [x] Run warning checks, formatting, and diff hygiene; record native-platform gaps honestly.
 - [x] Update this plan and the SFS-640 Linear issue with the implementation and validation evidence.
 
 ## Surprises & Discoveries
 
 - macFUSE already uses a finite unique queue and blocks producers when its
-  8192-inode budget is full. Linux/FUSE already uses a bounded coalescing
-  queue with producer backpressure and queue metrics. Those paths should be
-  preserved rather than replaced with a new shared abstraction.
+  8192-inode budget is full, but it did not publish queue metrics. Linux/FUSE
+  already uses a bounded coalescing queue with producer backpressure and queue
+  metrics. The bridge-local implementations can be preserved without a new
+  shared abstraction while macFUSE adds the missing diagnostics.
 - UploadQueue's pending maps already hold the durable upload intent in memory,
   while the unbounded channel only carries worker dispatch events. This makes
   a bounded wakeup channel safe only if the worker claims the current pending
@@ -73,14 +75,17 @@ ingress is bounded to 256 work items and the worker retains at most 8192
 distinct pending blocks; optional overflow and duplicate suppression are
 reported. WinFSP retains at most 8192 distinct inode invalidations, coalesces
 duplicates, blocks producers at capacity, and exports queue depth/peak/
-coalescing through the existing invalidation diagnostics snapshot.
+coalescing through the existing invalidation diagnostics snapshot. Closing the
+queue wakes blocked producers before the WinFSP host and timer stop. macFUSE
+publishes the same depth/peak/coalescing snapshot from its existing bounded
+queue.
 
-The focused suites passed: cache 166/166 and VFS 860/860. The host warning,
-format, and diff checks passed. macFUSE/Linux existing bounded queue paths were
-left unchanged. Native WinFSP tests are unavailable on Darwin (the package
-reports zero tests under its Windows cfg); the Windows cross-target check is
-blocked before Rust source checking by the missing MinGW C compiler needed by
-`ring`.
+The focused upload-worker and macFUSE queue tests pass. Earlier full cache and
+VFS suites passed 166/166 and 860/860 before the review coverage was added.
+The host warning, formatting, and diff checks pass after the review fixes.
+Native WinFSP tests are unavailable on Darwin (the package reports zero tests
+under its Windows cfg); the Windows cross-target check is blocked before Rust
+source checking by the missing MinGW C compiler needed by `ring`.
 
 ## Context and Orientation
 
@@ -164,8 +169,10 @@ blocks have finite limits, and the focused cache/VFS tests pass.
 ### M2 — WinFSP bound and validation (implementation complete; native validation pending)
 
 WinFSP invalidation has finite unique capacity and producer backpressure. Its
-burst tests pass, diagnostics expose queue depth/peak/coalescing, and the
-focused cross-crate checks plus hygiene commands are green.
+Windows-gated tests cover deterministic producer waiting, close wakeup, and
+live queue metrics before drain. They cannot execute on the current Darwin
+host; the host command reports zero tests, and cross-target checking is blocked
+by the missing MinGW C compiler.
 
 ## Concrete Steps
 
@@ -173,12 +180,14 @@ Run commands from `/Volumes/Storage/dev/studiofs`, one Cargo test filter per
 command to avoid workspace file-lock contention.
 
     cargo test -p studiofs-cache upload_queue --lib -- --nocapture
+    cargo test -p studiofs-vfs upload_worker_drains_coalesced_wakeup_burst_without_losing_pending_ops --lib -- --nocapture
     cargo test -p studiofs-vfs prefetch_burst --lib -- --nocapture
+    cargo test -p studiofs-macfuse session_invalidation_queue_ --lib -- --nocapture
     cargo test -p studiofs-winfsp should_notify --lib -- --nocapture
     cargo test -p studiofs-cache --lib
     cargo test -p studiofs-vfs --lib
     cargo test -p studiofs-winfsp --lib
-    RUSTFLAGS='-D warnings' cargo check -p studiofs-cache -p studiofs-vfs -p studiofs-winfsp
+    RUSTFLAGS='-D warnings' cargo check -p studiofs-cache -p studiofs-vfs -p studiofs-macfuse -p studiofs-winfsp
     cargo fmt --all -- --check
     git diff --check
 
@@ -202,15 +211,17 @@ state.
 
 WinFSP acceptance is behavioral: the distinct queue never exceeds its explicit
 capacity, repeated inode invalidations coalesce, a producer waits rather than
-allocating beyond the limit, and draining wakes the producer. Queue depth,
+allocating beyond the limit, and draining or closing wakes the producer. Queue
+depth is published when the queue changes rather than only after drain; depth,
 peak, and coalesced values are visible through the existing invalidation
 diagnostics snapshot.
 
 The existing macFUSE and Linux/FUSE bounded/backpressure tests remain part of
-the cross-platform audit. macFUSE model tests may run on this host; Linux/FUSE
-mounted validation requires `/dev/fuse`, and WinFSP native validation requires
-a Windows runner. An unavailable native cell is reported as unavailable, not
-as a passing product validation.
+the cross-platform audit. macFUSE also publishes depth/peak/coalescing through
+the shared runtime invalidation snapshot. macFUSE model tests may run on this
+host; Linux/FUSE mounted validation requires `/dev/fuse`, and WinFSP native
+validation requires a Windows runner. An unavailable native cell is reported
+as unavailable, not as a passing product validation.
 
 ## Idempotence and Recovery
 
@@ -239,3 +250,8 @@ and local-first durability contracts remain unchanged.
 2026-08-06: Initial plan created after verifying SFS-639 is complete and
 auditing the existing shared, macFUSE, Linux/FUSE, prefetch, upload, and WinFSP
 ingress implementations.
+
+2026-08-06: Revised after code review to record WinFSP close-before-host-stop,
+mutation-time metrics, deterministic producer-wait tests, upload worker-path
+coverage, macFUSE runtime metrics, and the still-unavailable native Windows
+validation cell.

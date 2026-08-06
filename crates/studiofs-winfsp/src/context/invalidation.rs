@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::{Condvar, Mutex};
 use studiofs_meta::{FileType, Ino};
@@ -57,10 +57,14 @@ pub(crate) type PreparedWinfspNotifications = Vec<PreparedWinfspNotify>;
 
 #[derive(Debug, Default)]
 struct WinfspInvalidationQueueState {
+    closed: bool,
     order: VecDeque<Ino>,
     pending: HashSet<Ino>,
     queue_peak: usize,
     coalesced: u64,
+    snapshot_generation: u64,
+    #[cfg(test)]
+    waiting_producers: usize,
 }
 
 /// Bounded, coalescing queue shared by WinFSP invalidation producers and the
@@ -69,39 +73,50 @@ struct WinfspInvalidationQueueState {
 pub struct WinfspInvalidationQueue {
     state: Mutex<WinfspInvalidationQueueState>,
     not_full: Condvar,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WinfspInvalidationQueueSnapshot {
-    queue_depth: usize,
-    queue_peak: usize,
-    coalesced: u64,
+    metrics_vfs: Weak<StudioVfs>,
 }
 
 impl WinfspInvalidationQueue {
     /// Creates an empty bounded invalidation queue.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(vfs: &Arc<StudioVfs>) -> Arc<Self> {
+        let queue = Arc::new(Self {
             state: Mutex::new(WinfspInvalidationQueueState::default()),
             not_full: Condvar::new(),
-        })
+            metrics_vfs: Arc::downgrade(vfs),
+        });
+        queue.publish_metrics();
+        queue
     }
 
     pub(crate) fn push(&self, ino: Ino) {
         let mut state = self.state.lock();
         loop {
+            if state.closed {
+                return;
+            }
             if state.pending.contains(&ino) {
                 state.coalesced = state.coalesced.saturating_add(1);
-                return;
+                break;
             }
             if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
                 state.pending.insert(ino);
                 state.order.push_back(ino);
                 state.queue_peak = state.queue_peak.max(state.pending.len());
-                return;
+                break;
+            }
+            #[cfg(test)]
+            {
+                state.waiting_producers = state.waiting_producers.saturating_add(1);
+                self.not_full.notify_all();
             }
             self.not_full.wait(&mut state);
+            #[cfg(test)]
+            {
+                state.waiting_producers = state.waiting_producers.saturating_sub(1);
+            }
         }
+        drop(state);
+        self.publish_metrics();
     }
 
     pub(crate) fn drain(&self) -> Vec<Ino> {
@@ -110,6 +125,10 @@ impl WinfspInvalidationQueue {
         state.pending.clear();
         self.not_full.notify_all();
         inodes.sort_unstable();
+        drop(state);
+        if !inodes.is_empty() {
+            self.publish_metrics();
+        }
         inodes
     }
 
@@ -123,12 +142,40 @@ impl WinfspInvalidationQueue {
         self.state.lock().pending.is_empty()
     }
 
-    fn snapshot(&self) -> WinfspInvalidationQueueSnapshot {
-        let state = self.state.lock();
-        WinfspInvalidationQueueSnapshot {
-            queue_depth: state.pending.len(),
-            queue_peak: state.queue_peak,
-            coalesced: state.coalesced,
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        self.not_full.notify_all();
+        drop(state);
+        self.publish_metrics();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_until_producer_blocked(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while state.waiting_producers == 0 {
+            if self.not_full.wait_until(&mut state, deadline).timed_out() {
+                return state.waiting_producers > 0;
+            }
+        }
+        true
+    }
+
+    fn publish_metrics(&self) {
+        let snapshot = {
+            let mut state = self.state.lock();
+            state.snapshot_generation = state.snapshot_generation.saturating_add(1);
+            VfsFuseInvalidationSnapshot {
+                snapshot_generation: state.snapshot_generation,
+                queue_depth: state.pending.len(),
+                queue_peak: state.queue_peak,
+                coalesced: state.coalesced,
+                ..VfsFuseInvalidationSnapshot::default()
+            }
+        };
+        if let Some(vfs) = self.metrics_vfs.upgrade() {
+            vfs.record_fuse_invalidation_snapshot(snapshot);
         }
     }
 }
@@ -170,16 +217,6 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
         if inodes.is_empty() {
             return None;
         }
-        let queue_snapshot = self.invalidation_queue.snapshot();
-        let mut diagnostics = self
-            .vfs
-            .write_path_observability_snapshot()
-            .fuse_invalidation;
-        diagnostics.snapshot_generation = diagnostics.snapshot_generation.saturating_add(1);
-        diagnostics.queue_depth = queue_snapshot.queue_depth;
-        diagnostics.queue_peak = queue_snapshot.queue_peak;
-        diagnostics.coalesced = queue_snapshot.coalesced;
-        self.vfs.record_fuse_invalidation_snapshot(diagnostics);
 
         let meta = self.vfs.meta();
         let mut notifications = Vec::with_capacity(inodes.len());

@@ -747,7 +747,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
 
     // Shared invalidation state: metadata refresh events enqueue inode IDs for
     // WinFSP notifications.
-    let invalidation_queue = WinfspInvalidationQueue::new();
+    let invalidation_queue = WinfspInvalidationQueue::new(&vfs);
 
     let context = StudioFsContext::new(
         vfs.clone(),
@@ -780,7 +780,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
 
     // Register the kernel cache invalidator with the VFS so metadata updates
     // can proactively enqueue inodes for WinFSP notification.
-    let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(invalidation_queue));
+    let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(invalidation_queue.clone()));
     vfs.set_kernel_invalidator(invalidator);
 
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
@@ -861,6 +861,8 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
+    vfs.clear_kernel_invalidator();
+    invalidation_queue.close();
     // Graceful shutdown: first drain VFS background work so
     // metadata engines (pg/redb) can stop their threads and be closed cleanly
     // before the kernel unmounts the filesystem. Use the same env var as the

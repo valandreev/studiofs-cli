@@ -4034,6 +4034,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn upload_worker_drains_coalesced_wakeup_burst_without_losing_pending_ops() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "coalesced-worker-burst");
+        let ino = 7_001;
+        for object_id in 1..=4 {
+            vfs.cached_store()
+                .submit_upload(ino, object_id * 4096, object_id, 1);
+        }
+        vfs.mark_inode_deleted_for_uploads(ino);
+        let metrics = vfs.cached_store().cache_pipeline_metrics();
+        assert_eq!(metrics.upload_queue.ingress_depth, 1);
+        assert_eq!(metrics.upload_queue.ingress_coalesced, 3);
+
+        let channels = vfs
+            .startup
+            .claim_channels_for_start()
+            .expect("claim startup channels")
+            .expect("unstarted VFS should retain startup channels");
+        drop(channels.prefetch_rx);
+
+        rt.block_on(async {
+            let worker =
+                tokio::spawn(UploadLifecycleWorker::new(vfs.clone()).run(channels.upload_rx));
+            assert!(
+                vfs.wait_for_uploads_idle(Duration::from_secs(2)).await,
+                "worker should terminally cancel every coalesced pending upload"
+            );
+            vfs.request_uploader_shutdown();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .expect("upload worker should stop")
+                .expect("upload worker task should not panic");
+        });
+
+        assert_eq!(vfs.cached_store().pending_upload_count(), 0);
+    }
+
     #[tokio::test]
     async fn process_upload_marks_fragmented_overlay_object_uploaded_before_local_cleanup() {
         let (processor, coordinator, local_payloads, meta, _remote, _shutdown, policy) =
