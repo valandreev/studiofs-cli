@@ -185,6 +185,12 @@ pub struct UploadQueueStatsSnapshot {
     pub canceled: u64,
     /// Number of full pending-upload snapshots requested.
     pub snapshot_pending_calls: u64,
+    /// Current buffered upload wakeup depth.
+    pub ingress_depth: usize,
+    /// Maximum buffered upload wakeup depth.
+    pub ingress_capacity: usize,
+    /// Number of submissions coalesced into an existing wakeup.
+    pub ingress_coalesced: u64,
 }
 
 /// Thread-safe counters for upload queue activity in the cache pipeline.
@@ -238,6 +244,9 @@ impl UploadQueueStats {
             requeued: self.requeued.load(Ordering::Relaxed),
             canceled: self.canceled.load(Ordering::Relaxed),
             snapshot_pending_calls: self.snapshot_pending_calls.load(Ordering::Relaxed),
+            ingress_depth: 0,
+            ingress_capacity: 0,
+            ingress_coalesced: 0,
         }
     }
 

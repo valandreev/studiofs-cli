@@ -2086,7 +2086,7 @@ impl UploadLifecycleWorker {
         Self { vfs, processor }
     }
 
-    pub(crate) async fn run(self, mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>) {
+    pub(crate) async fn run(self, mut rx: tokio::sync::mpsc::Receiver<()>) {
         debug!("background uploader started");
         let worker_count = self
             .vfs
@@ -2120,6 +2120,10 @@ impl UploadLifecycleWorker {
                     drop(permit);
                     break;
                 };
+                if !self.vfs.cached_store.is_pending_upload_current(&op) {
+                    drop(permit);
+                    continue;
+                }
                 if self.queued_upload_deleted_before_dispatch(op.ino) {
                     self.cancel_deleted_queued_upload(op);
                     drop(permit);
@@ -2180,12 +2184,16 @@ impl UploadLifecycleWorker {
                 }
                 inbound = rx.recv(), if !inbound_closed => {
                     match inbound {
-                        Some(op) => Self::enqueue_pending_upload(
-                            &mut ready,
-                            &mut delayed,
-                            op,
-                            self.vfs.upload_delay,
-                        ),
+                        Some(()) => {
+                            for op in self.vfs.cached_store.claim_pending_uploads() {
+                                Self::enqueue_pending_upload(
+                                    &mut ready,
+                                    &mut delayed,
+                                    op,
+                                    self.vfs.upload_delay,
+                                );
+                            }
+                        }
                         None => inbound_closed = true,
                     }
                 }
@@ -4028,6 +4036,44 @@ mod tests {
             vec![(ino, content_epoch)],
             "the final pending upload should enqueue epoch finalization"
         );
+    }
+
+    #[test]
+    fn upload_worker_drains_coalesced_wakeup_burst_without_losing_pending_ops() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "coalesced-worker-burst");
+        let ino = 7_001;
+        for object_id in 1..=4 {
+            vfs.cached_store()
+                .submit_upload(ino, object_id * 4096, object_id, 1);
+        }
+        vfs.mark_inode_deleted_for_uploads(ino);
+        let metrics = vfs.cached_store().cache_pipeline_metrics();
+        assert_eq!(metrics.upload_queue.ingress_depth, 1);
+        assert_eq!(metrics.upload_queue.ingress_coalesced, 3);
+
+        let channels = vfs
+            .startup
+            .claim_channels_for_start()
+            .expect("claim startup channels")
+            .expect("unstarted VFS should retain startup channels");
+        drop(channels.prefetch_rx);
+
+        rt.block_on(async {
+            let worker =
+                tokio::spawn(UploadLifecycleWorker::new(vfs.clone()).run(channels.upload_rx));
+            assert!(
+                vfs.wait_for_uploads_idle(Duration::from_secs(2)).await,
+                "worker should terminally cancel every coalesced pending upload"
+            );
+            vfs.request_uploader_shutdown();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .expect("upload worker should stop")
+                .expect("upload worker task should not panic");
+        });
+
+        assert_eq!(vfs.cached_store().pending_upload_count(), 0);
     }
 
     #[tokio::test]

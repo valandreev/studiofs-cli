@@ -386,6 +386,10 @@ impl KernelInvalidator for LiveKernelInvalidator {
         self.kernel_inode_liveness
             .notify_if_observed(ino, || self.inner.inval_inode_attrs(ino));
     }
+
+    fn reset_diagnostics(&self) {
+        self.inner.reset_diagnostics();
+    }
 }
 
 impl KernelInvalidator for OpenCacheKernelInvalidator {
@@ -411,6 +415,10 @@ impl KernelInvalidator for OpenCacheKernelInvalidator {
             return;
         }
         self.inner.inval_inode_attrs(ino);
+    }
+
+    fn reset_diagnostics(&self) {
+        self.inner.reset_diagnostics();
     }
 }
 

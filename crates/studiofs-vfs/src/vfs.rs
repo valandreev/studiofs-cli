@@ -2362,6 +2362,9 @@ struct MetricsState {
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
+    prefetch_ingress_dropped_hints: AtomicU64,
+    prefetch_ingress_dropped_blocks: AtomicU64,
+    prefetch_ingress_coalesced_hints: AtomicU64,
     readahead_scheduled_blocks: AtomicU64,
     readahead_dropped_blocks: AtomicU64,
     readahead_used_bytes: AtomicU64,
@@ -2560,6 +2563,9 @@ impl MetricsState {
             ignored_entries: OrderedMutex::new(IgnoredEntryRegistry::default(), LockTier::Metrics),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
+            prefetch_ingress_dropped_hints: AtomicU64::new(0),
+            prefetch_ingress_dropped_blocks: AtomicU64::new(0),
+            prefetch_ingress_coalesced_hints: AtomicU64::new(0),
             readahead_scheduled_blocks: AtomicU64::new(0),
             readahead_dropped_blocks: AtomicU64::new(0),
             readahead_used_bytes: AtomicU64::new(0),
@@ -2769,6 +2775,9 @@ impl MetricsState {
         self.prefetched_object_ids.clear();
         self.prefetched_object_remaining_bytes.lock().clear();
         reset_atomic!(
+            prefetch_ingress_dropped_hints,
+            prefetch_ingress_dropped_blocks,
+            prefetch_ingress_coalesced_hints,
             readahead_scheduled_blocks,
             readahead_dropped_blocks,
             readahead_used_bytes,
@@ -3626,7 +3635,7 @@ pub struct StudioVfs {
     dir_prefetch: Arc<DirAccessTracker>,
     /// Channel sender for background prefetch planning and execution.
     /// The receiver lives in a spawned task that has an `Arc<Self>`.
-    prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
+    prefetch_tx: tokio::sync::mpsc::Sender<PrefetchWorkItem>,
     /// One-time startup state used by `start()` to spawn background workers.
     startup: StartupState,
     /// Maximum total bytes allowed in the dirty-write memory buffer before
@@ -4587,6 +4596,10 @@ impl StudioVfs {
 
     /// Reset diagnostics counters and event history for fresh observability baselines.
     pub fn reset_diagnostics_observability(&self) {
+        let kernel_invalidator = self.kernel_invalidator.read().clone();
+        if let Some(kernel_invalidator) = kernel_invalidator {
+            kernel_invalidator.reset_diagnostics();
+        }
         self.state.metrics.reset_diagnostics_observability();
         self.state.write_admission_governor.lock().reset_stats();
         self.state
@@ -4730,7 +4743,7 @@ impl StudioVfs {
 
     fn spawn_prefetch_worker(
         self: &Arc<Self>,
-        prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
+        prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchWorkItem>,
     ) {
         let vfs = self.clone();
         self.track_background_task(tokio::spawn(async move {
@@ -4762,10 +4775,7 @@ impl StudioVfs {
         }));
     }
 
-    fn spawn_uploader_worker(
-        self: &Arc<Self>,
-        upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
-    ) {
+    fn spawn_uploader_worker(self: &Arc<Self>, upload_rx: tokio::sync::mpsc::Receiver<()>) {
         let vfs = self.clone();
         self.set_uploader_task(tokio::spawn(async move {
             vfs.background_uploader(upload_rx).await;
@@ -6331,6 +6341,9 @@ impl StudioVfs {
                 .upload_canceled_stale_after_put_bytes
                 .load(Ordering::Relaxed),
             pending_upload_snapshot_calls: cache_metrics.upload_queue.snapshot_pending_calls,
+            upload_ingress_depth: cache_metrics.upload_queue.ingress_depth,
+            upload_ingress_capacity: cache_metrics.upload_queue.ingress_capacity,
+            upload_ingress_coalesced: cache_metrics.upload_queue.ingress_coalesced,
         }
     }
 
@@ -6793,6 +6806,23 @@ impl StudioVfs {
                 .state
                 .metrics
                 .prefetch_queue_depth
+                .load(Ordering::Relaxed),
+            prefetch_ingress_depth: self.prefetch_ingress_depth(),
+            prefetch_ingress_capacity: prefetch::PREFETCH_INGRESS_CAPACITY as u64,
+            prefetch_ingress_dropped_hints: self
+                .state
+                .metrics
+                .prefetch_ingress_dropped_hints
+                .load(Ordering::Relaxed),
+            prefetch_ingress_dropped_blocks: self
+                .state
+                .metrics
+                .prefetch_ingress_dropped_blocks
+                .load(Ordering::Relaxed),
+            prefetch_ingress_coalesced_hints: self
+                .state
+                .metrics
+                .prefetch_ingress_coalesced_hints
                 .load(Ordering::Relaxed),
         }
     }
@@ -8472,6 +8502,22 @@ impl StudioVfs {
             .metrics
             .readahead_dropped_blocks
             .load(Ordering::Relaxed);
+        let prefetch_ingress_depth = self.prefetch_ingress_depth();
+        let prefetch_ingress_dropped_hints = self
+            .state
+            .metrics
+            .prefetch_ingress_dropped_hints
+            .load(Ordering::Relaxed);
+        let prefetch_ingress_dropped_blocks = self
+            .state
+            .metrics
+            .prefetch_ingress_dropped_blocks
+            .load(Ordering::Relaxed);
+        let prefetch_ingress_coalesced_hints = self
+            .state
+            .metrics
+            .prefetch_ingress_coalesced_hints
+            .load(Ordering::Relaxed);
         let readahead_used_bytes = self
             .state
             .metrics
@@ -9101,6 +9147,11 @@ impl StudioVfs {
                 prefetch_skips: fetch_prefetch_skips,
                 readahead_scheduled_blocks,
                 readahead_dropped_blocks,
+                prefetch_ingress_depth,
+                prefetch_ingress_capacity: prefetch::PREFETCH_INGRESS_CAPACITY as u64,
+                prefetch_ingress_dropped_hints,
+                prefetch_ingress_dropped_blocks,
+                prefetch_ingress_coalesced_hints,
                 readahead_used_bytes,
                 local_cache_io_calls: fetch_local_cache_io_calls,
                 local_cache_handoff_total_ms: fetch_local_cache_handoff_total_ns as f64
@@ -9446,7 +9497,7 @@ impl StudioVfs {
                 return true;
             };
             let read_context = self.prefetch_read_context_from_attr(open_file.ino, &attr);
-            let _ = self.prefetch_tx.send(PrefetchWorkItem::Batch(
+            let _ = self.try_enqueue_prefetch_work_item(PrefetchWorkItem::Batch(
                 PrefetchBatch::single(open_file.ino, 0, Some(read_context))
                     .with_owner_token(Some(owner_token)),
             ));
@@ -9640,7 +9691,7 @@ impl StudioVfs {
             && read_ahead_owner == ReadAheadOwner::Vfs
         {
             let owner_token = open_file.vfs_read_ahead_token();
-            let _ = self.prefetch_tx.send(PrefetchWorkItem::Batch(
+            let _ = self.try_enqueue_prefetch_work_item(PrefetchWorkItem::Batch(
                 PrefetchBatch::single(ino, 0, Some(read_context.prefetch_context()))
                     .with_owner_token(owner_token),
             ));

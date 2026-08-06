@@ -1,12 +1,12 @@
 use parking_lot::{Condvar, Mutex};
 use std::time::Duration;
 
-use super::{PendingUpload, PrefetchWorkItem, VfsError, VfsResult};
+use super::{PrefetchWorkItem, VfsError, VfsResult};
 
 #[derive(Debug)]
 pub(super) struct StartupChannels {
-    pub(super) prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
-    pub(super) upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
+    pub(super) prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchWorkItem>,
+    pub(super) upload_rx: tokio::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +30,8 @@ pub(super) struct StartupState {
 
 impl StartupState {
     pub(super) fn new(
-        prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
-        upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
+        prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchWorkItem>,
+        upload_rx: tokio::sync::mpsc::Receiver<()>,
         metadata_invalidation_sync_interval: Duration,
     ) -> Self {
         Self {
@@ -150,9 +150,8 @@ mod tests {
 
     #[test]
     fn startup_state_claim_channels_transitions_to_starting_and_consumes_channels() {
-        let (_prefetch_tx, prefetch_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
-        let (_upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<PendingUpload>();
+        let (_prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel::<PrefetchWorkItem>(1);
+        let (_upload_tx, upload_rx) = tokio::sync::mpsc::channel::<()>(1);
         let startup = StartupState::new(prefetch_rx, upload_rx, Duration::from_secs(5));
 
         let claimed = startup
@@ -174,9 +173,8 @@ mod tests {
 
     #[test]
     fn startup_state_claim_channels_marks_failed_when_channels_are_missing() {
-        let (_prefetch_tx, prefetch_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
-        let (_upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<PendingUpload>();
+        let (_prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel::<PrefetchWorkItem>(1);
+        let (_upload_tx, upload_rx) = tokio::sync::mpsc::channel::<()>(1);
         let startup = StartupState::new(prefetch_rx, upload_rx, Duration::from_secs(5));
         startup.lifecycle.lock().channels = None;
 

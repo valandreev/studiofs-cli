@@ -1347,9 +1347,7 @@ mod tests {
         LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState, LocalPayloadPut,
         LocalPayloadStorageStats,
     };
-    use studiofs_cache::{
-        CachedStoreConfig, open_local_payload_backend, upload_queue::PendingUpload,
-    };
+    use studiofs_cache::{CachedStoreConfig, open_local_payload_backend};
     use tokio::sync::mpsc;
 
     struct SlowPutBackend {
@@ -1608,11 +1606,7 @@ mod tests {
     fn temp_stack(
         chunk_size: u32,
         block_size: u32,
-    ) -> (
-        tempfile::TempDir,
-        MountedWriterStack,
-        mpsc::UnboundedReceiver<PendingUpload>,
-    ) {
+    ) -> (tempfile::TempDir, MountedWriterStack, mpsc::Receiver<()>) {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
@@ -1635,11 +1629,7 @@ mod tests {
 
     fn temp_stack_with_config(
         config: WriterStackConfig,
-    ) -> (
-        tempfile::TempDir,
-        MountedWriterStack,
-        mpsc::UnboundedReceiver<PendingUpload>,
-    ) {
+    ) -> (tempfile::TempDir, MountedWriterStack, mpsc::Receiver<()>) {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")

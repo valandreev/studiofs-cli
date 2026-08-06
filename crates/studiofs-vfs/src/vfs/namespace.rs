@@ -975,6 +975,9 @@ pub trait KernelInvalidator: Send + Sync {
     fn inval_inode_attrs(&self, ino: u64) {
         self.inval_inode(ino);
     }
+
+    /// Reset bridge-local diagnostics counters for a fresh observability interval.
+    fn reset_diagnostics(&self) {}
 }
 
 /// Holds namespace-scoped caches and generation counters used for coherence.

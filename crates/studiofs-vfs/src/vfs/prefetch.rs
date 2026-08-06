@@ -5,8 +5,11 @@ use super::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tracing::info;
+
+pub(super) const PREFETCH_INGRESS_CAPACITY: usize = 256;
+pub(super) const MAX_PREFETCH_PENDING_BLOCKS: usize = 8192;
 
 #[derive(Debug, Clone)]
 pub(super) enum PrefetchWorkItem {
@@ -268,7 +271,7 @@ impl PrefetchBatch {
 
 pub(super) struct PrefetchWorker {
     vfs: Arc<StudioVfs>,
-    prefetch_rx: UnboundedReceiver<PrefetchWorkItem>,
+    prefetch_rx: Receiver<PrefetchWorkItem>,
     prefetch_sem: Arc<Semaphore>,
     pending_queue: VecDeque<PrefetchBatch>,
     pending_set: HashSet<(Ino, u32)>,
@@ -276,10 +279,7 @@ pub(super) struct PrefetchWorker {
 }
 
 impl PrefetchWorker {
-    pub(super) fn new(
-        vfs: Arc<StudioVfs>,
-        prefetch_rx: UnboundedReceiver<PrefetchWorkItem>,
-    ) -> Self {
+    pub(super) fn new(vfs: Arc<StudioVfs>, prefetch_rx: Receiver<PrefetchWorkItem>) -> Self {
         let prefetch_limit = vfs.prefetch_concurrency.max(1);
         Self {
             vfs,
@@ -404,14 +404,32 @@ impl PrefetchWorker {
         for mut batch in planned {
             let ino = batch.ino;
             let original_blocks = batch.block_indices.len() as u64;
-            batch
-                .block_indices
-                .retain(|object_idx| self.pending_set.insert((ino, *object_idx)));
+            let mut overflow_blocks = 0u64;
+            batch.block_indices.retain(|object_idx| {
+                let key = (ino, *object_idx);
+                if self.pending_set.contains(&key) {
+                    return false;
+                }
+                if self.pending_set.len() >= MAX_PREFETCH_PENDING_BLOCKS {
+                    overflow_blocks = overflow_blocks.saturating_add(1);
+                    return false;
+                }
+                self.pending_set.insert(key)
+            });
             let queued_blocks = batch.block_indices.len() as u64;
-            self.vfs.state.metrics.readahead_dropped_blocks.fetch_add(
-                original_blocks.saturating_sub(queued_blocks),
-                Ordering::Relaxed,
-            );
+            let suppressed_blocks = original_blocks
+                .saturating_sub(queued_blocks)
+                .saturating_sub(overflow_blocks);
+            self.vfs
+                .state
+                .metrics
+                .readahead_dropped_blocks
+                .fetch_add(suppressed_blocks, Ordering::Relaxed);
+            self.vfs
+                .state
+                .metrics
+                .prefetch_ingress_dropped_blocks
+                .fetch_add(overflow_blocks, Ordering::Relaxed);
             if !batch.is_empty() {
                 self.vfs
                     .state
@@ -448,6 +466,26 @@ impl PrefetchWorker {
 }
 
 impl StudioVfs {
+    pub(super) fn try_enqueue_prefetch_work_item(&self, work_item: PrefetchWorkItem) -> bool {
+        match self.prefetch_tx.try_send(work_item) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.state
+                    .metrics
+                    .prefetch_ingress_dropped_hints
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    pub(super) fn prefetch_ingress_depth(&self) -> u64 {
+        self.prefetch_tx
+            .max_capacity()
+            .saturating_sub(self.prefetch_tx.capacity()) as u64
+    }
+
     pub(super) fn prefetch_read_context_from_attr(
         &self,
         ino: Ino,
@@ -503,7 +541,7 @@ impl StudioVfs {
             .read
             .record_prefetch_hint_range(ino, stream_id, range);
         if let Some(path) = self.debug_pending_target_path(ino) {
-            let (effective_first_block, effective_last_block, suppressed) = match update {
+            let (effective_first_block, effective_last_block, suppressed) = match &update {
                 PrefetchHintUpdate::Suppress => (range.first_block, range.last_block, true),
                 PrefetchHintUpdate::Store(stored) => (stored.first_block, stored.last_block, false),
             };
@@ -522,12 +560,16 @@ impl StudioVfs {
             );
         }
         let PrefetchHintUpdate::Store(_) = update else {
+            self.state
+                .metrics
+                .prefetch_ingress_coalesced_hints
+                .fetch_add(1, Ordering::Relaxed);
             return;
         };
         // The stored range is only for duplicate suppression. Feed the actual
         // current read range to readahead so the sequential detector sees
         // forward progress instead of a repeatedly merged historical span.
-        let _ = self.prefetch_tx.send(PrefetchWorkItem::ReadHint {
+        let admitted = self.try_enqueue_prefetch_work_item(PrefetchWorkItem::ReadHint {
             ino,
             stream_id,
             first_block: range.first_block,
@@ -535,6 +577,9 @@ impl StudioVfs {
             policy,
             owner_token,
         });
+        if !admitted {
+            self.state.read.clear_prefetch_hint(ino, stream_id);
+        }
     }
 
     pub(super) fn plan_prefetch_batches_from_hint_with_owner(
@@ -568,6 +613,7 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use super::{MAX_PREFETCH_PENDING_BLOCKS, PREFETCH_INGRESS_CAPACITY};
     use std::sync::Arc;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
@@ -693,7 +739,7 @@ mod tests {
         };
         assert!(vfs.set_read_ahead_owner(fh, ReadAheadOwner::Kernel));
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(PREFETCH_INGRESS_CAPACITY);
         let mut worker = PrefetchWorker::new(Arc::clone(&vfs), rx);
         worker.enqueue_work_item(PrefetchWorkItem::ReadHint {
             ino: attr.ino,
@@ -855,14 +901,14 @@ mod tests {
     fn prefetch_burst_deduplicates_pending_inode_blocks() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-burst");
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(PREFETCH_INGRESS_CAPACITY);
         let mut worker = PrefetchWorker::new(Arc::clone(&vfs), rx);
         let block_indices: Vec<_> = (0..1024).collect();
         let batch = PrefetchBatch::new(99, block_indices.clone(), None);
 
-        tx.send(PrefetchWorkItem::Batch(batch.clone()))
+        tx.try_send(PrefetchWorkItem::Batch(batch.clone()))
             .expect("prefetch burst should enter the worker channel");
-        tx.send(PrefetchWorkItem::Batch(batch))
+        tx.try_send(PrefetchWorkItem::Batch(batch))
             .expect("duplicate prefetch burst should enter the worker channel");
         while let Ok(work_item) = worker.prefetch_rx.try_recv() {
             worker.enqueue_work_item(work_item);
@@ -887,6 +933,68 @@ mod tests {
                 .readahead_dropped_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
             block_indices.len() as u64
+        );
+    }
+
+    #[test]
+    fn prefetch_pending_blocks_are_bounded_and_overflow_is_observable() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-bounded");
+        let (_tx, rx) = tokio::sync::mpsc::channel(PREFETCH_INGRESS_CAPACITY);
+        let mut worker = PrefetchWorker::new(Arc::clone(&vfs), rx);
+        let block_indices: Vec<_> = (0..(MAX_PREFETCH_PENDING_BLOCKS as u32 + 3)).collect();
+
+        worker.enqueue_work_item(PrefetchWorkItem::Batch(PrefetchBatch::new(
+            99,
+            block_indices,
+            None,
+        )));
+
+        assert_eq!(worker.pending_set.len(), MAX_PREFETCH_PENDING_BLOCKS);
+        assert_eq!(
+            vfs.state
+                .metrics
+                .prefetch_ingress_dropped_hints
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .prefetch_ingress_dropped_blocks
+                .load(Ordering::Relaxed),
+            3,
+            "overflow blocks should have a block-count metric"
+        );
+    }
+
+    #[test]
+    fn prefetch_ingress_drops_optional_work_when_channel_is_full() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-ingress-bounded");
+        let work_item = || PrefetchWorkItem::Batch(PrefetchBatch::single(99, 0, None));
+
+        for _ in 0..PREFETCH_INGRESS_CAPACITY {
+            assert!(vfs.try_enqueue_prefetch_work_item(work_item()));
+        }
+        assert!(!vfs.try_enqueue_prefetch_work_item(work_item()));
+        assert_eq!(
+            vfs.prefetch_ingress_depth(),
+            PREFETCH_INGRESS_CAPACITY as u64
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .prefetch_ingress_dropped_hints
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .prefetch_ingress_dropped_blocks
+                .load(Ordering::Relaxed),
+            0
         );
     }
 }

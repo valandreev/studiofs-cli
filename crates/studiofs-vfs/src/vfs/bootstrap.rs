@@ -262,7 +262,7 @@ struct VfsBootstrapResources {
     cached_store: Arc<CachedStore>,
     readahead: Arc<ReadAheadTracker>,
     dir_prefetch: Arc<DirAccessTracker>,
-    prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
+    prefetch_tx: tokio::sync::mpsc::Sender<PrefetchWorkItem>,
     startup_channels: startup::StartupChannels,
     data_write: Arc<DataStore>,
     qos: Arc<QosController>,
@@ -332,7 +332,9 @@ impl VfsBootstrapResources {
             plan.readahead_min_prefetch,
         ));
         let dir_prefetch = Arc::new(DirAccessTracker::new(2));
-        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
+        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel::<PrefetchWorkItem>(
+            super::prefetch::PREFETCH_INGRESS_CAPACITY,
+        );
 
         let data_read = Arc::new(
             DataStore::with_profile(data_config, IoProfile::Read)

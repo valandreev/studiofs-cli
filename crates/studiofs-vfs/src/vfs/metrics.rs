@@ -678,6 +678,21 @@ pub struct VfsIngressStats {
     pub fast_backpressure_stall_max_ms: u64,
     /// Current prefetch queue depth.
     pub prefetch_queue_depth: u64,
+    /// Current buffered prefetch ingress depth.
+    #[serde(default)]
+    pub prefetch_ingress_depth: u64,
+    /// Maximum buffered prefetch ingress depth.
+    #[serde(default)]
+    pub prefetch_ingress_capacity: u64,
+    /// Optional prefetch hints dropped when buffered ingress is full.
+    #[serde(default)]
+    pub prefetch_ingress_dropped_hints: u64,
+    /// Pending prefetch blocks dropped at the worker pending-state bound.
+    #[serde(default)]
+    pub prefetch_ingress_dropped_blocks: u64,
+    /// Optional prefetch hints coalesced by duplicate suppression.
+    #[serde(default)]
+    pub prefetch_ingress_coalesced_hints: u64,
 }
 
 /// Write-path latency quantile measurements in milliseconds.
@@ -1541,6 +1556,21 @@ pub struct VfsFetchStats {
     /// Readahead blocks dropped by duplicate suppression or stale queue pruning.
     #[serde(default)]
     pub readahead_dropped_blocks: u64,
+    /// Current buffered prefetch ingress depth.
+    #[serde(default)]
+    pub prefetch_ingress_depth: u64,
+    /// Maximum buffered prefetch ingress depth.
+    #[serde(default)]
+    pub prefetch_ingress_capacity: u64,
+    /// Optional prefetch hints dropped when buffered ingress is full.
+    #[serde(default)]
+    pub prefetch_ingress_dropped_hints: u64,
+    /// Pending prefetch blocks dropped at the worker pending-state bound.
+    #[serde(default)]
+    pub prefetch_ingress_dropped_blocks: u64,
+    /// Optional prefetch hints coalesced by duplicate suppression.
+    #[serde(default)]
+    pub prefetch_ingress_coalesced_hints: u64,
     /// Bytes later served from objects populated by readahead.
     #[serde(default)]
     pub readahead_used_bytes: u64,
@@ -1846,6 +1876,12 @@ pub struct VfsUploadStats {
     pub canceled_stale_after_put_bytes: u64,
     /// Full pending-upload snapshots requested by hot paths and diagnostics.
     pub pending_upload_snapshot_calls: u64,
+    /// Current buffered upload wakeup depth.
+    pub upload_ingress_depth: usize,
+    /// Maximum buffered upload wakeup depth.
+    pub upload_ingress_capacity: usize,
+    /// Upload submissions coalesced into an existing wakeup.
+    pub upload_ingress_coalesced: u64,
 }
 
 /// Zero-IO cache byte accounting snapshot.

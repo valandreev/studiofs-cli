@@ -485,7 +485,7 @@ impl CachedStore {
     pub fn open(
         config: CachedStoreConfig,
         local_payload_backend: Arc<dyn LocalPayloadBackend>,
-    ) -> io::Result<(Arc<Self>, mpsc::UnboundedReceiver<PendingUpload>)> {
+    ) -> io::Result<(Arc<Self>, mpsc::Receiver<()>)> {
         std::fs::create_dir_all(&config.cache_dir)?;
         let upload_hot_bytes = config.upload_hot_bytes;
         let upload_stage_store =
@@ -953,6 +953,16 @@ impl CachedStore {
         self.upload_queue.pending_count()
     }
 
+    /// Claims current pending uploads after the upload worker consumes a wakeup.
+    pub fn claim_pending_uploads(&self) -> Vec<PendingUpload> {
+        self.upload_queue.claim_pending()
+    }
+
+    /// Returns whether `op` still matches the authoritative pending upload.
+    pub fn is_pending_upload_current(&self, op: &PendingUpload) -> bool {
+        self.upload_queue.is_current(op)
+    }
+
     /// Waits until the upload queue becomes idle or `timeout` elapses.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
         self.upload_queue.wait_for_idle(timeout).await
@@ -993,12 +1003,18 @@ impl CachedStore {
 
     /// Returns a snapshot of cache pipeline metrics.
     pub fn cache_pipeline_metrics(&self) -> CachePipelineMetricsSnapshot {
-        self.metrics.snapshot(self.upload_queue.pending_count())
+        let mut snapshot = self.metrics.snapshot(self.upload_queue.pending_count());
+        let ingress = self.upload_queue.ingress_snapshot();
+        snapshot.upload_queue.ingress_depth = ingress.depth;
+        snapshot.upload_queue.ingress_capacity = ingress.capacity;
+        snapshot.upload_queue.ingress_coalesced = ingress.coalesced;
+        snapshot
     }
 
     /// Resets cache pipeline diagnostics metrics.
     pub fn reset_diagnostics_metrics(&self) {
         self.metrics.reset();
+        self.upload_queue.reset_ingress_metrics();
     }
 
     /// Requests upload queue shutdown and flushes any remaining journal state.
@@ -1621,9 +1637,7 @@ mod tests {
     use super::*;
     use crate::{open_local_payload_backend, open_local_payload_backend_with_budget};
 
-    fn temp_cached_store(
-        dir: &tempfile::TempDir,
-    ) -> (Arc<CachedStore>, mpsc::UnboundedReceiver<PendingUpload>) {
+    fn temp_cached_store(dir: &tempfile::TempDir) -> (Arc<CachedStore>, mpsc::Receiver<()>) {
         let backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
                 .expect("open backend")
@@ -1634,7 +1648,7 @@ mod tests {
     fn temp_cached_store_with_budget(
         dir: &tempfile::TempDir,
         budget_bytes: u64,
-    ) -> (Arc<CachedStore>, mpsc::UnboundedReceiver<PendingUpload>) {
+    ) -> (Arc<CachedStore>, mpsc::Receiver<()>) {
         let backend = open_local_payload_backend_with_budget(
             dir.path(),
             "00000000-0000-0000-0000-000000000001",
@@ -1643,6 +1657,24 @@ mod tests {
         .expect("open budgeted backend")
         .backend;
         CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open cached store")
+    }
+
+    async fn recv_one(store: &CachedStore, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
+        rx.recv().await.expect("upload wakeup");
+        store
+            .claim_pending_uploads()
+            .into_iter()
+            .next()
+            .expect("claimed upload")
+    }
+
+    fn try_recv_one(store: &CachedStore, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
+        rx.try_recv().expect("upload wakeup");
+        store
+            .claim_pending_uploads()
+            .into_iter()
+            .next()
+            .expect("claimed upload")
     }
 
     fn writer_config() -> CachedStoreWriterConfig {
@@ -1936,7 +1968,7 @@ mod tests {
                 .as_ref(),
             b"abcdefgh"
         );
-        let op = rx.recv().await.expect("pending upload");
+        let op = recv_one(&cached_store, &mut rx).await;
         assert_eq!(op.object_id, staged[0].object_id);
         assert_eq!(op.ino, 7);
         assert_eq!(op.offset, 0);
@@ -1984,7 +2016,7 @@ mod tests {
         assert_eq!(counters.staged_bytes, 8);
         assert_eq!(counters.staged_slices, 1);
         assert_eq!(counters.pending_upload_bytes, 8);
-        let op = rx.try_recv().expect("pending upload");
+        let op = try_recv_one(&cached_store, &mut rx);
         assert_eq!(op.object_id, 10_000);
     }
 
@@ -2407,7 +2439,7 @@ mod tests {
         let (cached_store, mut rx) = temp_cached_store(&dir);
 
         cached_store.submit_upload(1, 0, 101, 1);
-        let op = rx.recv().await.expect("queued upload");
+        let op = recv_one(&cached_store, &mut rx).await;
 
         assert!(cached_store.is_pinned(101));
         assert_eq!(cached_store.pending_upload_count(), 1);
@@ -2424,7 +2456,7 @@ mod tests {
         let (cached_store, mut rx) = temp_cached_store(&dir);
 
         cached_store.submit_upload(7, 4096, 202, 3);
-        let op = rx.recv().await.expect("queued upload");
+        let op = recv_one(&cached_store, &mut rx).await;
         cached_store.cancel_upload(&op);
 
         assert!(!cached_store.is_pinned(202));
@@ -2438,9 +2470,9 @@ mod tests {
         let (cached_store, mut rx) = temp_cached_store(&dir);
 
         cached_store.submit_upload(9, 8192, 303, 4);
-        let op = rx.recv().await.expect("queued upload");
+        let op = recv_one(&cached_store, &mut rx).await;
         assert!(cached_store.requeue_upload(op.clone()));
-        let requeued = rx.recv().await.expect("requeued upload");
+        let requeued = recv_one(&cached_store, &mut rx).await;
 
         assert_eq!(requeued.object_id, 303);
         assert_eq!(cached_store.pending_upload_count(), 1);
@@ -2468,7 +2500,7 @@ mod tests {
             3,
             put.data.len() as u64,
         )]);
-        let op = rx.recv().await.expect("queued upload");
+        let op = recv_one(&cached_store, &mut rx).await;
 
         assert_eq!(op.object_id, put.object_id);
         assert_eq!(

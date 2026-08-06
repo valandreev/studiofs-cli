@@ -270,6 +270,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let _signal_watcher =
         spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
+    session.attach_invalidation_metrics(&vfs);
     vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
     let result = session.run();
     vfs.clear_kernel_invalidator();
