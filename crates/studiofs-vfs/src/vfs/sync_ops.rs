@@ -52,6 +52,21 @@ pub(super) enum DeferredMaterializationPassOutcome {
     Completed { allow_reschedule: bool },
 }
 
+async fn wait_linger_or_reschedule(
+    entry: &DeferredInodeGateEntry,
+) -> DeferredMaterializationPassOutcome {
+    if entry
+        .wait_linger_or_interrupt(Duration::from_millis(
+            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+        ))
+        .await
+    {
+        DeferredMaterializationPassOutcome::Interrupted
+    } else {
+        DeferredMaterializationPassOutcome::Reschedule
+    }
+}
+
 pub(super) fn merge_write_dirty_attr(attr: &mut InodeAttr, base_attr: &InodeAttr) {
     if attr.content_epoch < base_attr.content_epoch {
         *attr = base_attr.clone();
@@ -392,16 +407,7 @@ impl StudioVfs {
                 && self.should_linger_clean_deferred_materialization(ino)
             {
                 *no_progress_retries += 1;
-                return if entry
-                    .wait_linger_or_interrupt(Duration::from_millis(
-                        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                    ))
-                    .await
-                {
-                    DeferredMaterializationPassOutcome::Interrupted
-                } else {
-                    DeferredMaterializationPassOutcome::Reschedule
-                };
+                return wait_linger_or_reschedule(entry).await;
             }
             return DeferredMaterializationPassOutcome::Idle;
         }
@@ -554,16 +560,7 @@ impl StudioVfs {
             *no_progress_retries = no_progress_retries
                 .saturating_add(1)
                 .min(super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES);
-            return if entry
-                .wait_linger_or_interrupt(Duration::from_millis(
-                    super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                ))
-                .await
-            {
-                DeferredMaterializationPassOutcome::Interrupted
-            } else {
-                DeferredMaterializationPassOutcome::Reschedule
-            };
+            return wait_linger_or_reschedule(entry).await;
         }
 
         if made_progress {
@@ -572,16 +569,7 @@ impl StudioVfs {
             && self.should_linger_deferred_materialization(ino)
         {
             *no_progress_retries += 1;
-            return if entry
-                .wait_linger_or_interrupt(Duration::from_millis(
-                    super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
-                ))
-                .await
-            {
-                DeferredMaterializationPassOutcome::Interrupted
-            } else {
-                DeferredMaterializationPassOutcome::Reschedule
-            };
+            return wait_linger_or_reschedule(entry).await;
         }
 
         if !made_progress || !completed_blocks_remain {
