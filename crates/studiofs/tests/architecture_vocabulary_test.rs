@@ -1405,6 +1405,8 @@ fn macos_native_bridge_split_note_covers_sfs475_boundary() {
         "StudioVfs",
         "CLI/Backend Routing",
         "Fallback Behavior",
+        "Historical Validation Sequence",
+        "Current mounted and unit checks are post-rollout regression validation",
         "Validation Sequence",
         "First Implementation Issues",
     ];
@@ -1653,6 +1655,9 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
         "macOS native bridge readiness and default rollout",
         "STUDIOFS_MOUNT_BACKEND=macfuse",
         "The current decision is default: macFUSE is the normal macOS mount path",
+        "Recorded Decision",
+        "post-rollout regression validation",
+        "these reports do not gate whether macFUSE is the default",
         "read/write/truncate/xattr/Finder-focused scenarios",
         "current fuser baseline",
         "callback count",

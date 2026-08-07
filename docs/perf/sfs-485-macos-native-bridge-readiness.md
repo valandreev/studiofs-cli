@@ -9,24 +9,26 @@ The legacy selector remains accepted by existing scripts:
 STUDIOFS_MOUNT_BACKEND=macfuse studiofs mount myvolume /mnt/studio
 ```
 
-## Decision Gate
+## Recorded Decision
 
-The issue records the default rollout outcome:
+The issue records the completed default rollout outcome:
 
-- `default`: macFUSE becomes the normal macOS mount path.
+- `default`: macFUSE is the normal macOS mount path.
 - `opt-in`: macFUSE remains behind `STUDIOFS_MOUNT_BACKEND=macfuse` for rollback
   planning only.
 - `reject`: macFUSE is rejected for this rollout in favor of another strategy,
   such as a StudioFS userspace hot read cache.
 
-Throughput alone is not enough for `default`. The decision needs correctness,
-callback count, callback bytes, VFS read count, S3 GET count, local payload read
-bytes, kernel-cache interpretation, and throughput evidence.
+The original decision required more than throughput: correctness, callback count,
+callback bytes, VFS read count, S3 GET count, local payload read bytes,
+kernel-cache interpretation, and throughput evidence. This evidence is retained
+for post-rollout regression validation; these reports do not gate whether macFUSE
+is the default.
 
 ## Focused Matrix
 
-Run the macOS native bridge matrix after read, write, compatibility, and
-cache-policy work is complete:
+Run the macOS native bridge matrix as post-rollout regression validation after
+read, write, compatibility, and cache-policy work is complete:
 
 - read/write/truncate/xattr/Finder-focused scenarios;
 - repeated-read performance compared against the current fuser baseline;
@@ -55,7 +57,8 @@ cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_fio_multi_job_smo
 
 Capture mounted benchmark reports for the macFUSE candidate and fuser baseline
 under `target/sfs-485/` with the same workload shape, profile settings, and
-hardware before making the bridge-readiness decision.
+hardware as post-rollout regression evidence for the recorded macFUSE-default
+decision; these reports do not gate whether macFUSE is the default.
 
 The full workspace suite remains an operator choice outside the local agent
 loop for SFS-485.

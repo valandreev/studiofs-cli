@@ -110,20 +110,25 @@ Temporary developer escape hatches, if needed, must be opt-in, named as
 experimental, and excluded from the default mount path. They should not change
 Linux or Windows behavior.
 
-## Validation Sequence
+## Historical Validation Sequence
 
-1. Keep this SFS-475 design note and focused docs test green.
-2. Add the `studiofs-macfuse` crate shell with no default routing change.
-3. Add the public `MacFuseMountRequest` and `pub async fn mount_and_serve`
+The sequence below records the completed pre-rollout implementation and
+validation work. Current mounted and unit checks are post-rollout regression
+validation, not a prerequisite for the default.
+
+1. Kept this SFS-475 design note and focused docs test green.
+2. Added the `studiofs-macfuse` crate shell with no default routing change.
+3. Added the public `MacFuseMountRequest` and `pub async fn mount_and_serve`
    entry point with unit-level request validation.
-4. Port the minimal mount lifecycle and callback adapter path behind macOS-only
+4. Ported the minimal mount lifecycle and callback adapter path behind macOS-only
    compilation.
-5. Add fast non-mounted tests for macOS-specific name, xattr, and resource-fork
+5. Added fast non-mounted tests for macOS-specific name, xattr, and resource-fork
    behavior at the bridge boundary.
-6. Add opt-in mounted smoke tests for mount, write, read, readdir, xattr, and
+6. Added opt-in mounted smoke tests for mount, write, read, readdir, xattr, and
    unmount.
-7. Switch CLI/backend routing on macOS only after the native bridge passes the
-   focused validation gate.
+7. Switched CLI/backend routing on macOS to the native bridge by default after
+   the focused validation gate; current reruns are post-rollout regression
+   validation.
 
 ## First Implementation Issues
 
