@@ -28,6 +28,8 @@ session tests and the existing x86/x64/arm64 resolver mapping test.
 - [x] (2026-08-07) Routed CLI WinFSP preload through `studiofs-winfsp` and removed the duplicate x64 registry loader.
 - [x] (2026-08-07) Ran focused tests, checks, Clippy, formatting, and diff hygiene validation.
 - [x] (2026-08-07) Added the production guard cleanup-failure regression and preserved full later-error chains in logs.
+- [x] (2026-08-07) Added panic-time critical PID, snapshot, and lock cleanup with a backend-panic regression.
+- [x] (2026-08-07) Restored actionable WinFSP installation guidance and removed the redundant diagnostics-host take.
 - [x] (2026-08-07) Updated canonical WinFSP documentation and this completed plan after review.
 - [x] (2026-08-07) Ran focused native WinFSP mount/unmount smoke; Linux/FUSE and macFUSE native runners are unavailable on this Windows host.
 - [x] (2026-08-07) Recorded final evidence and remaining unavailable validation in this plan.
@@ -77,9 +79,11 @@ session tests and the existing x86/x64/arm64 resolver mapping test.
 Implemented and validated on the Windows host. Foreground mount teardown now
 uses one local guard that attempts diagnostics, VFS, runtime, PID, lock, and
 snapshot cleanup even when an earlier step fails. The first mount error is
-preserved and later cleanup errors are attached or logged. The CLI now calls
-the public architecture-aware `studiofs-winfsp` loader; the duplicate registry
-lookup is gone.
+preserved and later cleanup errors are attached or logged. If unwinding starts
+before normal cleanup completes, the guard's `Drop` fallback removes the
+critical PID/snapshot artifacts and releases the lock without attempting a
+second async shutdown. The CLI now calls the public architecture-aware
+`studiofs-winfsp` loader; the duplicate registry lookup is gone.
 
 Passed checks:
 
@@ -87,6 +91,7 @@ Passed checks:
 - `cargo test -p studiofs prepared_mount_launch -- --nocapture`: 5 passed.
 - `cargo test -p studiofs foreground_shutdown_releases_vfs_handles_before_runtime_shutdown -- --nocapture`: 1 passed.
 - `cargo test -p studiofs mount_runtime_guard_continues_after_mount_record_cleanup_failure -- --nocapture`: 1 passed.
+- `cargo test -p studiofs mount_runtime_guard_removes_critical_artifacts_when_backend_panics -- --nocapture`: 1 passed; the expected panic was caught.
 - `cargo test -p studiofs-winfsp winfsp_dll_stem_matches_supported_architectures --lib -- --nocapture`: 1 passed.
 - `cargo test -p studiofs-winfsp graceful_shutdown_unmounts_winfsp_host_when_vfs_shutdown_panics --lib -- --nocapture`: 1 passed; the expected panic was caught by the test.
 - `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_unmount_smoke -- --ignored --nocapture --test-threads=1`: 1 passed.
@@ -111,9 +116,11 @@ Operator follow-up commands for the unavailable native cells are:
 ### Revision Note — 2026-08-07
 
 After review, later cleanup warnings now log the complete `anyhow` chain, the
-cleanup regression drives the production `MountRuntimeGuard`, the WinFSP
-requirements describe x86/x64/ARM64 shared resolution, and this plan reflects
-the implemented guard/shared-loader state and native validation evidence.
+cleanup regressions drive the production `MountRuntimeGuard` on both error and
+panic paths, the guard has a critical-artifact `Drop` fallback, WinFSP startup
+errors include installation guidance, the requirements describe x86/x64/ARM64
+shared resolution, and this plan reflects the implemented state and native
+validation evidence.
 
 ## Context and Orientation
 
@@ -131,7 +138,10 @@ VFS-retaining owners before shutting down Tokio, and then removes the PID
 record, lifecycle lock, and temporary snapshot database. Each fallible cleanup
 step is attempted; the first cleanup error is returned while later errors are
 logged with their complete cause chains. `MountLockGuard::drop` only unlocks
-the lock file; it does not remove the JSON record.
+the lock file; it does not remove the JSON record. If normal cleanup is
+interrupted by panic unwinding, `MountRuntimeGuard::drop` performs only the
+critical PID/snapshot/lock recovery and leaves full VFS shutdown to the normal
+path.
 
 `crates/studiofs-winfsp/src/lib.rs` is compiled only on Windows. Its public
 cached loader derives `winfsp-x64.dll`, `winfsp-x86.dll`, or `winfsp-a64.dll`
@@ -225,6 +235,9 @@ The cleanup acceptance test must show that a backend failure still returns
 `FakeBackend error: boom`, the JSON PID record is gone, and the snapshot DB is
 gone. The cleanup-order regression must show that the first cleanup error is
 the returned cleanup error and that later cleanup steps executed after it.
+The panic regression must catch a backend panic and show that the JSON PID
+record, snapshot DB, and lifecycle lock are removed without running a second
+full VFS shutdown.
 The existing `foreground_shutdown_releases_vfs_handles_before_runtime_shutdown`
 test must continue to pass, proving all VFS `Arc` owners are dropped before the
 Tokio runtime shutdown boundary.
@@ -253,14 +266,15 @@ leave them untouched and scope the final diff to the SFS-645 changes.
 Expected implementation artifacts:
 
 - `crates/studiofs/src/cli/mount/session.rs`: guard-owned foreground cleanup,
-  error collection, full-chain cleanup logging, and production-sequence
-  regression coverage.
+  error collection, full-chain cleanup logging, panic fallback, and
+  production-sequence regression coverage.
 - `docs/platform-bridges.md`: architecture-aware WinFSP resolver requirements
   for x86, x86_64, and ARM64.
 - `crates/studiofs/src/main.rs`: no duplicate WinFSP registry/DLL resolver;
   one call to the library loader under `cfg(windows)`.
 - `crates/studiofs-winfsp/src/lib.rs`: public cached preload entry point and
-  architecture mapping tests retained or narrowly extended.
+  architecture mapping tests retained or narrowly extended, with actionable
+  missing-runtime guidance.
 - `docs/superpowers/plans/2026-08-07-sfs-645-mount-cleanup-and-winfsp-resolver.md`:
   this living plan with final evidence.
 
@@ -277,6 +291,9 @@ Validation evidence from 2026-08-07:
 
     cargo test -p studiofs mount_runtime_guard_continues_after_mount_record_cleanup_failure -- --nocapture
     test result: ok. 1 passed; 0 failed
+
+    cargo test -p studiofs mount_runtime_guard_removes_critical_artifacts_when_backend_panics -- --nocapture
+    test result: ok. 1 passed; expected panic caught
 
     cargo test -p studiofs-winfsp winfsp_dll_stem_matches_supported_architectures --lib -- --nocapture
     test result: ok. 1 passed; 0 failed

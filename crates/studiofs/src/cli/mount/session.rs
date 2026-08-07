@@ -1231,6 +1231,7 @@ impl PreparedMount {
 struct MountRuntimeGuard {
     prepared: PreparedMount,
     diagnostics_host: Option<LocalDiagnosticsHost>,
+    cleanup_completed: bool,
 }
 
 impl MountRuntimeGuard {
@@ -1238,6 +1239,7 @@ impl MountRuntimeGuard {
         Self {
             prepared,
             diagnostics_host: None,
+            cleanup_completed: false,
         }
     }
 
@@ -1369,7 +1371,6 @@ impl MountRuntimeGuard {
             }
         }
 
-        drop(self.diagnostics_host.take());
         record_cleanup_error(
             &mut first_error,
             "mount record removal",
@@ -1383,7 +1384,22 @@ impl MountRuntimeGuard {
             remove_snapshot_mount_db(snapshot_db_path.as_deref()),
         );
 
+        self.cleanup_completed = true;
         first_error
+    }
+}
+
+impl Drop for MountRuntimeGuard {
+    fn drop(&mut self) {
+        if self.cleanup_completed {
+            return;
+        }
+
+        let _ = utils::remove_pid_file(&self.prepared.plan.actual_mount_path);
+        if let Some(snapshot_db_path) = self.prepared.snapshot_mount_db_path.take() {
+            let _ = remove_snapshot_mount_db(Some(&snapshot_db_path));
+        }
+        drop(self.prepared.mount_lock.take());
     }
 }
 
@@ -1942,6 +1958,18 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct PanicBackend;
+
+    impl MountBackend for PanicBackend {
+        fn name(&self) -> &'static str {
+            "PanicBackend"
+        }
+
+        fn serve(&self, _launch: BackendLaunch) -> io::Result<()> {
+            panic!("simulated mount backend panic");
         }
     }
 
@@ -2845,6 +2873,48 @@ mod tests {
         assert!(
             utils::read_pid_file(&actual_mount_path).is_err(),
             "backend failure should remove pid file"
+        );
+    }
+
+    #[test]
+    fn mount_runtime_guard_removes_critical_artifacts_when_backend_panics() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+        let mount_point = startup_mount_point(&temp);
+        let mut prepared = MountPlan::resolve(MountRequest {
+            command: mount_command(
+                "demo",
+                &meta_dir,
+                Some(mount_point.to_string()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| Box::new(PanicBackend))
+        .expect("prepare mount");
+        let actual_mount_path = prepared.plan.actual_mount_path.clone();
+        let snapshot_path = temp.path().join("panic-snapshot.db");
+        std::fs::write(&snapshot_path, b"snapshot").expect("create snapshot placeholder");
+        prepared.snapshot_mount_db_path = Some(snapshot_path.clone());
+
+        let panic_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepared.launch()));
+
+        assert!(panic_result.is_err(), "backend panic should propagate");
+        assert!(
+            utils::read_pid_file(&actual_mount_path).is_err(),
+            "panic cleanup should remove the mount record"
+        );
+        assert!(
+            !snapshot_path.exists(),
+            "panic cleanup should remove the snapshot database"
+        );
+        assert!(
+            !utils::mount_is_active(&actual_mount_path).expect("check mount lock"),
+            "panic cleanup should release the mount lock"
         );
     }
 

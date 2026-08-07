@@ -166,7 +166,7 @@ fn load_winfsp_runtime_dll() -> Result<(), String> {
         .map(|err| format!(" Last LoadLibraryW error: {err}."))
         .unwrap_or_default();
     Err(format!(
-        "failed to preload WinFSP runtime DLL '{dll_name}'. Searched: [{searched_paths}]. Install WinFSP or add its bin directory to PATH.{suffix}"
+        "failed to preload WinFSP runtime DLL '{dll_name}'. Searched: [{searched_paths}]. Install WinFSP from https://winfsp.dev/ or place the architecture-matching DLL in the executable directory or WinFSP bin directory.{suffix}"
     ))
 }
 
