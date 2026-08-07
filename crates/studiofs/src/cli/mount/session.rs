@@ -1416,6 +1416,7 @@ impl Drop for MountRuntimeGuard {
                 "failed to remove mount record during mount runtime guard drop"
             );
         }
+        drop(self.prepared.foreground.take());
         cleanup_snapshot_mount_db(self.prepared.snapshot_mount_db_path.as_deref());
         drop(self.prepared.mount_lock.take());
     }
