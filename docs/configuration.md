@@ -37,11 +37,10 @@ should primarily use:
 
 Metadata-cache defaults and most runtime heuristics remain internal.
 
-On macOS, the native macFUSE bridge is not the default while SFS-485 is still
-pending. It remains an explicit readiness opt-in through
-`STUDIOFS_MOUNT_BACKEND=macfuse`; see
-[SFS-485 macOS Native Bridge Readiness](./perf/sfs-485-macos-native-bridge-readiness.md)
-for the decision gate and validation commands.
+On macOS, the native macFUSE bridge is the default mount backend. The legacy
+`STUDIOFS_MOUNT_BACKEND=macfuse` selector is still accepted for compatibility;
+see [SFS-485 macOS Native Bridge Readiness](./perf/sfs-485-macos-native-bridge-readiness.md)
+for validation commands and rollout notes.
 
 Priority for each setting:
 

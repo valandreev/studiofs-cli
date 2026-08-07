@@ -33,8 +33,8 @@ writer continues to produce completed blocks. Partial tails stay buffered until
 idle time or an explicit local barrier.
 
 Backpressure stays bounded by existing dirty-byte and materialization knobs:
-`max_dirty_bytes`, eager flush threshold/chunk bytes, `max_drain_batch`, upload
-worker count, and cached-store pending upload pressure. Upload backlog alone
+`max_dirty_bytes`, eager flush threshold/chunk bytes, upload worker count, and
+cached-store pending upload pressure. Upload backlog alone
 must not force ordinary writes into synchronous upload/publication.
 
 Observability must expose the active tuning knobs and the pressure that matters:

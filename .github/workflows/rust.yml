@@ -56,8 +56,8 @@ jobs:
         run: cargo test --workspace --all-targets --exclude studiofs-macfuse -- --nocapture
 
       - name: cargo test (studiofs-macfuse — macOS paths)
-        # Sole runner for the macOS native bridge stub while it remains
-        # opt-in and separate from the Linux FUSE bridge.
+        # Sole runner for the macOS native bridge; macFUSE is the default macOS mount backend.
+        # Keep it separate from the Linux FUSE bridge.
         run: cargo test -p studiofs-macfuse --lib -- --nocapture
 
   # ─── Windows Verification ──────────────────────────────────────────

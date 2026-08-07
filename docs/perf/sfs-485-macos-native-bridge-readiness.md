@@ -1,33 +1,34 @@
 # SFS-485 macOS Native Bridge Readiness
 
 SFS-485 tracks macOS native bridge readiness and default rollout. The current
-decision is pending: Do not make the native bridge default before this issue
-reaches a decision.
+decision is default: macFUSE is the normal macOS mount path.
 
-The macOS bridge remains an explicit development opt-in:
+The legacy selector remains accepted by existing scripts:
 
 ```bash
 STUDIOFS_MOUNT_BACKEND=macfuse studiofs mount myvolume /mnt/studio
 ```
 
-## Decision Gate
+## Recorded Decision
 
-The issue must record one clear outcome before docs or CLI help describe the
-native bridge as default:
+The issue records the completed default rollout outcome:
 
-- `default`: macFUSE becomes the normal macOS mount path.
-- `opt-in`: macFUSE remains behind `STUDIOFS_MOUNT_BACKEND=macfuse`.
+- `default`: macFUSE is the normal macOS mount path.
+- `opt-in`: macFUSE remains behind `STUDIOFS_MOUNT_BACKEND=macfuse` for rollback
+  planning only.
 - `reject`: macFUSE is rejected for this rollout in favor of another strategy,
   such as a StudioFS userspace hot read cache.
 
-Throughput alone is not enough for `default`. The decision needs correctness,
-callback count, callback bytes, VFS read count, S3 GET count, local payload read
-bytes, kernel-cache interpretation, and throughput evidence.
+The original decision required more than throughput: correctness, callback count,
+callback bytes, VFS read count, S3 GET count, local payload read bytes,
+kernel-cache interpretation, and throughput evidence. This evidence is retained
+for post-rollout regression validation; these reports do not gate whether macFUSE
+is the default.
 
 ## Focused Matrix
 
-Run the macOS native bridge matrix after read, write, compatibility, and
-cache-policy work is complete:
+Run the macOS native bridge matrix as post-rollout regression validation after
+read, write, compatibility, and cache-policy work is complete:
 
 - read/write/truncate/xattr/Finder-focused scenarios;
 - repeated-read performance compared against the current fuser baseline;
@@ -50,13 +51,14 @@ locally as a full-suite substitute:
 cargo test -p studiofs --test architecture_vocabulary_test macos_native_bridge_readiness_report_covers_sfs485_decision_gate -- --nocapture
 cargo test -p studiofs-macfuse -- --nocapture
 STUDIOFS_MOUNT_BACKEND=macfuse cargo test -p studiofs-macfuse --test mount_sanity macos_native_mounted_smoke -- --ignored --exact --nocapture
-cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_default_sync -- --ignored --exact --nocapture
+STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_fio_multi_job_smoke -- --ignored --exact --nocapture
 ```
 
 Capture mounted benchmark reports for the macFUSE candidate and fuser baseline
 under `target/sfs-485/` with the same workload shape, profile settings, and
-hardware before making the bridge-readiness decision.
+hardware as post-rollout regression evidence for the recorded macFUSE-default
+decision; these reports do not gate whether macFUSE is the default.
 
 The full workspace suite remains an operator choice outside the local agent
 loop for SFS-485.

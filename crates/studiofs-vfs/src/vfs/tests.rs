@@ -8672,7 +8672,6 @@ fn vfs_config_raw_validate_clamps_and_normalizes() {
     let validated = VfsConfigRaw {
         janitor_interval_secs: Some(0),
         prefetch_concurrency: Some(0),
-        slab_flush_interval_ms: Some(0),
         upload_worker_count: Some(0),
         principal: Some("   ".to_string()),
         ..Default::default()
@@ -8685,7 +8684,6 @@ fn vfs_config_raw_validate_clamps_and_normalizes() {
         validated.prefetch_concurrency,
         DEFAULT_PREFETCH_CONCURRENCY_MIN
     );
-    assert_eq!(validated.slab_flush_interval_ms, 1);
     assert_eq!(validated.upload_worker_count, DEFAULT_UPLOAD_WORKER_COUNT);
     assert_eq!(validated.principal, "*");
 }

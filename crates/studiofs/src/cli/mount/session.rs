@@ -278,13 +278,6 @@ where
     parse_env_usize_with(read_var, key).and_then(|value| u32::try_from(value).ok())
 }
 
-fn parse_env_u8_with<F>(read_var: &F, key: &str) -> Option<u8>
-where
-    F: Fn(&str) -> Result<String, std::env::VarError>,
-{
-    parse_env_usize_with(read_var, key).and_then(|value| u8::try_from(value).ok())
-}
-
 fn parse_env_u64_with<F>(read_var: &F, key: &str) -> Option<u64>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
@@ -696,12 +689,6 @@ where
     if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_READAHEAD_MIN_PREFETCH") {
         config.readahead_min_prefetch = Some(value);
     }
-    if let Some(value) = parse_env_u8_with(&read_var, "STUDIOFS_READAHEAD_SEQ_STEP") {
-        config.readahead_seq_step = Some(value);
-    }
-    if let Some(value) = parse_env_u8_with(&read_var, "STUDIOFS_READAHEAD_RANDOM_PENALTY") {
-        config.readahead_random_penalty = Some(value);
-    }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
     set_usize!(
         "STUDIOFS_READDIR_ATTR_BATCH_CHUNK",
@@ -715,12 +702,10 @@ where
         "STUDIOFS_PREFETCH_FOREGROUND_RESERVE",
         prefetch_foreground_reserve
     );
-    set_usize!("STUDIOFS_PREFETCH_MAX_PER_CYCLE", prefetch_max_per_cycle);
     set_u64!(
         "STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS",
         prefetch_pause_on_neterr_ms
     );
-    set_usize!("STUDIOFS_MAX_DRAIN_BATCH", max_drain_batch);
     set_u64!("STUDIOFS_LOCK_TTL_SECS", lock_ttl_secs);
     set_u64!("STUDIOFS_LOCK_RETRY_BASE_MS", lock_retry_base_ms);
     set_u64!("STUDIOFS_LOCK_RETRY_MAX_MS", lock_retry_max_ms);
