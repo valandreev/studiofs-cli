@@ -170,7 +170,13 @@ fn load_winfsp_runtime_dll() -> Result<(), String> {
     ))
 }
 
-pub(crate) fn ensure_winfsp_runtime_loaded() -> std::io::Result<()> {
+/// Preloads the WinFSP runtime DLL selected for the current Windows architecture.
+///
+/// # Errors
+///
+/// Returns an error when the architecture is unsupported, no candidate DLL is
+/// available, or Windows rejects every load attempt.
+pub fn ensure_winfsp_runtime_loaded() -> std::io::Result<()> {
     WINFSP_RUNTIME_DLL_LOAD
         .get_or_init(load_winfsp_runtime_dll)
         .as_ref()
