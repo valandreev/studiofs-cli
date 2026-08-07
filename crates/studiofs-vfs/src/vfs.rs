@@ -29,7 +29,6 @@ mod commit;
 mod config;
 mod deletion_cleanup;
 mod file_session;
-mod handle_drain_barrier;
 mod handle_table;
 mod ignored_entries;
 mod io_ops;
@@ -62,12 +61,6 @@ pub use config::{
 pub use file_session::ReadAheadOwner;
 /// File session primitives returned by open operations and reported by diagnostics.
 pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
-/// Public handle-drain barrier types and ports.
-pub use handle_drain_barrier::{
-    BarrierObservabilityPort, DeferredCleanupHintPort, DeleteCleanupPort, FlushGatePort,
-    HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest, HandleReleasePort,
-    LocalSyncBarrierPort,
-};
 /// Re-exported lock kind used by the public locking API.
 pub use locking::LockKind;
 /// Re-exported VFS observability snapshot and metrics types.
