@@ -70,24 +70,22 @@ impl<'a> WinfspHandleDrainFacade<'a> {
                 if !self.requires_flush_barrier(ino) {
                     return Ok(false);
                 }
-                self.flush_local_dirty_state(ino, fh)
+                let flushed = self.flush_local_dirty_state(ino, fh)?;
+                self.context
+                    .callback_barrier_state
+                    .clear_deferred_cleanup_hint(ino);
+                Ok(flushed)
             })?
         } else {
             false
         };
         self.context.vfs.note_winfsp_flush_barrier_outcome(flushed);
-        self.context
-            .callback_barrier_state
-            .clear_deferred_cleanup_hint(ino);
         Ok(())
     }
 
     pub(super) fn close(&self, ino: Ino, fh: u64) {
         self.context.vfs.note_winfsp_close_callback();
         if fh == 0 {
-            self.context
-                .callback_barrier_state
-                .clear_deferred_cleanup_hint(ino);
             return;
         }
 
@@ -185,9 +183,8 @@ impl<'a> WinfspHandleDrainFacade<'a> {
             .context
             .callback_barrier_state
             .flush_gate_for_inode(ino);
-        let gate_for_release = gate.clone();
         let _gate_release =
-            FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate_for_release);
+            FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate.clone());
         let _flush_guard = gate.lock();
         op()
     }
@@ -720,6 +717,39 @@ mod tests {
             !ctx.has_deferred_cleanup_hint(attr.ino),
             "fh==0 close should not retain deferred-cleanup state"
         );
+    }
+
+    #[test]
+    fn fh_zero_close_does_not_clear_another_handle_hint() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("fh_zero_close_preserves_hint");
+        let attr = vfs
+            .create(ROOT_INO, b"fh-zero-close-preserves-hint.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let facade = WinfspHandleDrainFacade::new(&ctx);
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+        facade.cleanup_non_delete(attr.ino, fh);
+        assert!(ctx.has_deferred_cleanup_hint(attr.ino));
+
+        facade.close(attr.ino, 0);
+        assert!(
+            ctx.has_deferred_cleanup_hint(attr.ino),
+            "fh==0 close must not clear a hint owned by a real handle"
+        );
+
+        facade.flush(attr.ino, fh).expect("flush callback");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
     }
 
     #[test]
