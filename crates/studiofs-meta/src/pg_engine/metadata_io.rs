@@ -28,9 +28,10 @@ impl PgMetaEngine {
                             .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
                             .await
                             .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres snapshot version select failed: {e}"
-                                ))
+                                Self::classify_pg_error(
+                                    "postgres snapshot version select failed",
+                                    e,
+                                )
                             })?;
 
                         let Some(version_row) = version_row else {
@@ -45,9 +46,10 @@ impl PgMetaEngine {
                             .query_one(sql::SELECT_METADATA_SNAPSHOT, &[&volume_id])
                             .await
                             .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres snapshot payload select failed: {e}"
-                                ))
+                                Self::classify_pg_error(
+                                    "postgres snapshot payload select failed",
+                                    e,
+                                )
                             })?;
 
                         Ok(Some(row))
@@ -101,9 +103,10 @@ impl PgMetaEngine {
                             .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
                             .await
                             .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres metadata head version select failed: {e}"
-                                ))
+                                Self::classify_pg_error(
+                                    "postgres metadata head version select failed",
+                                    e,
+                                )
                             })?;
                         Ok(row.map(|row| row.get(0)).unwrap_or(0))
                     })
@@ -140,15 +143,16 @@ impl PgMetaEngine {
                 command_timeout,
                 "push event log batch",
                 move |client| Box::pin(async move {
-                    let tx = client.transaction().await.map_err(|e| {
-                        MetaError::Storage(format!("postgres begin tx failed: {e}"))
-                    })?;
+                    let tx = client
+                        .transaction()
+                        .await
+                        .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
                     let batch_version: i64 = tx
                         .query_one(sql::BUMP_METADATA_VERSION, &[&volume_id])
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!("postgres metadata_state bump failed: {e}"))
+                            Self::classify_pg_error("postgres metadata_state bump failed", e)
                         })?
                         .get(0);
 
@@ -172,9 +176,7 @@ impl PgMetaEngine {
                         )
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres event_log batch insert failed: {e}"
-                            ))
+                            Self::classify_pg_error("postgres event_log batch insert failed", e)
                         })?;
                     }
 
@@ -197,9 +199,7 @@ impl PgMetaEngine {
                                 )
                                 .await
                                 .map_err(|e| {
-                                    MetaError::Storage(format!(
-                                        "postgres acl_rules upsert failed: {e}"
-                                    ))
+                                    Self::classify_pg_error("postgres acl_rules upsert failed", e)
                                 })?;
                             }
                             MetaEvent::RemoveAclRule { ino, principal } => {
@@ -209,9 +209,7 @@ impl PgMetaEngine {
                                 )
                                 .await
                                 .map_err(|e| {
-                                    MetaError::Storage(format!(
-                                        "postgres acl_rules delete failed: {e}"
-                                    ))
+                                    Self::classify_pg_error("postgres acl_rules delete failed", e)
                                 })?;
                             }
                             MetaEvent::CreateSnapshot { snapshot } => {
@@ -259,9 +257,7 @@ impl PgMetaEngine {
                                 )
                                 .await
                                 .map_err(|e| {
-                                    MetaError::Storage(format!(
-                                        "postgres snapshots upsert failed: {e}"
-                                    ))
+                                    Self::classify_pg_error("postgres snapshots upsert failed", e)
                                 })?;
                             }
                             MetaEvent::UpdateSnapshotState { id, state } => {
@@ -276,9 +272,7 @@ impl PgMetaEngine {
                                 )
                                 .await
                                 .map_err(|e| {
-                                    MetaError::Storage(format!(
-                                        "postgres snapshots state update failed: {e}"
-                                    ))
+                                    Self::classify_pg_error("postgres snapshots state update failed", e)
                                 })?;
                             }
                             _ => {}
@@ -295,7 +289,7 @@ impl PgMetaEngine {
 
                     tx.commit()
                         .await
-                        .map_err(|e| MetaError::Storage(format!("postgres commit failed: {e}")))?;
+                        .map_err(|e| Self::classify_pg_error("postgres commit failed", e))?;
                     Ok(batch_version)
                 }),
             )
@@ -314,12 +308,7 @@ impl PgMetaEngine {
         client
             .query(sql::SELECT_FOREIGN_EVENT_ROWS, &[&volume_id, &last_seq])
             .await
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres event_log select failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })
+            .map_err(|e| Self::classify_pg_error("postgres event_log select failed", e))
     }
 
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
@@ -345,9 +334,7 @@ impl PgMetaEngine {
                             )
                             .await
                             .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres checkpoint upsert failed: {e}"
-                                ))
+                                Self::classify_pg_error("postgres checkpoint upsert failed", e)
                             })?;
 
                         Ok(())

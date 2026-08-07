@@ -56,12 +56,7 @@ impl PgMetaEngine {
                     self.command_timeout,
                 )
             })?
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres janitor lock acquire failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?
+            .map_err(|e| Self::classify_pg_error("postgres janitor lock acquire failed", e))?
             .get::<usize, bool>(0);
 
         if !acquired {
@@ -107,10 +102,10 @@ impl PgMetaEngine {
                             )
                             .await
                             .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres janitor snapshot pin query failed: {}",
-                                    Self::format_pg_error(e)
-                                ))
+                                Self::classify_pg_error(
+                                    "postgres janitor snapshot pin query failed",
+                                    e,
+                                )
                             })
                     })
                 },

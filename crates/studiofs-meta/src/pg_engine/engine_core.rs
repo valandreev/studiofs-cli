@@ -41,10 +41,7 @@ impl MetaEngineCore for PgMetaEngine {
                 "acquire file lock lease",
                 move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres file lock acquire begin tx failed: {}",
-                            Self::format_pg_error(e)
-                        ))
+                        Self::classify_pg_error("postgres file lock acquire begin tx failed", e)
                     })?;
                     let now_ms = Self::now_millis();
                     let lease_expires_at_unix_ms = now_ms
@@ -69,10 +66,7 @@ impl MetaEngineCore for PgMetaEngine {
                     )
                     .await
                     .map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres file lock acquire ensure row failed: {}",
-                            Self::format_pg_error(e)
-                        ))
+                        Self::classify_pg_error("postgres file lock acquire ensure row failed", e)
                     })?;
                     let row = tx
                         .query_one(
@@ -86,10 +80,7 @@ impl MetaEngineCore for PgMetaEngine {
                         )
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock acquire select failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock acquire select failed", e)
                         })?;
                     let current = Self::current_file_lock_lease_from_row(row, now_ms)?;
 
@@ -173,10 +164,7 @@ impl MetaEngineCore for PgMetaEngine {
                         )
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock acquire update failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock acquire update failed", e)
                         })?;
                         let channel = Self::lock_notify_channel(volume_id);
                         let payload =
@@ -185,18 +173,12 @@ impl MetaEngineCore for PgMetaEngine {
                             .execute("SELECT pg_notify($1, $2)", &[&channel, &payload])
                             .await;
                         tx.commit().await.map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock acquire commit failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock acquire commit failed", e)
                         })?;
                         FileLockLeaseAcquireOutcome::Acquired(next)
                     } else {
                         tx.rollback().await.map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock acquire rollback failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock acquire rollback failed", e)
                         })?;
                         FileLockLeaseAcquireOutcome::Blocked(current.ok_or_else(|| {
                             MetaError::Storage(
@@ -234,10 +216,7 @@ impl MetaEngineCore for PgMetaEngine {
                 "release file lock lease",
                 move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres file lock release begin tx failed: {}",
-                            Self::format_pg_error(e)
-                        ))
+                        Self::classify_pg_error("postgres file lock release begin tx failed", e)
                     })?;
                     let now_ms = Self::now_millis();
                     let row = tx
@@ -252,10 +231,7 @@ impl MetaEngineCore for PgMetaEngine {
                         )
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock release select failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock release select failed", e)
                         })?;
                     let current = match row {
                         Some(row) => Self::current_file_lock_lease_from_row(row, now_ms)?,
@@ -263,10 +239,7 @@ impl MetaEngineCore for PgMetaEngine {
                     };
                     let Some(current) = current else {
                         tx.rollback().await.map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock release rollback failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock release rollback failed", e)
                         })?;
                         return Ok(FileLockLeaseReleaseOutcome::NotHeld(None));
                     };
@@ -276,10 +249,7 @@ impl MetaEngineCore for PgMetaEngine {
                     let is_self_shared = current.shared_owners.contains(client_id.as_str());
                     if !is_self_exclusive && !is_self_shared {
                         tx.rollback().await.map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock release rollback failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock release rollback failed", e)
                         })?;
                         return Ok(FileLockLeaseReleaseOutcome::NotHeld(Some(current)));
                     }
@@ -323,10 +293,7 @@ impl MetaEngineCore for PgMetaEngine {
                         )
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock release update failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock release update failed", e)
                         })?;
                     } else {
                         tx.execute(
@@ -335,10 +302,7 @@ impl MetaEngineCore for PgMetaEngine {
                         )
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock release delete failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock release delete failed", e)
                         })?;
                     }
                     let generation = next.as_ref().map(|lease| lease.generation).unwrap_or_else(|| {
@@ -350,10 +314,7 @@ impl MetaEngineCore for PgMetaEngine {
                         .execute("SELECT pg_notify($1, $2)", &[&channel, &payload])
                         .await;
                     tx.commit().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres file lock release commit failed: {}",
-                            Self::format_pg_error(e)
-                        ))
+                        Self::classify_pg_error("postgres file lock release commit failed", e)
                     })?;
                     Ok(FileLockLeaseReleaseOutcome::Released(next))
                 }),
@@ -387,10 +348,7 @@ impl MetaEngineCore for PgMetaEngine {
                 "renew file lock lease",
                 move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres file lock renew begin tx failed: {}",
-                            Self::format_pg_error(e)
-                        ))
+                        Self::classify_pg_error("postgres file lock renew begin tx failed", e)
                     })?;
                     let now_ms = Self::now_millis();
                     let lease_expires_at_unix_ms = now_ms
@@ -408,10 +366,7 @@ impl MetaEngineCore for PgMetaEngine {
                         )
                         .await
                         .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock renew select failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock renew select failed", e)
                         })?;
                     let current = match row {
                         Some(row) => Self::current_file_lock_lease_from_row(row, now_ms)?,
@@ -419,10 +374,7 @@ impl MetaEngineCore for PgMetaEngine {
                     };
                     let Some(mut current) = current else {
                         tx.rollback().await.map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock renew rollback failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock renew rollback failed", e)
                         })?;
                         return Ok(FileLockLeaseRenewOutcome::Lost(None));
                     };
@@ -432,10 +384,7 @@ impl MetaEngineCore for PgMetaEngine {
                     let is_self_shared = current.shared_owners.contains(client_id.as_str());
                     if !is_self_exclusive && !is_self_shared {
                         tx.rollback().await.map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock renew rollback failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                            Self::classify_pg_error("postgres file lock renew rollback failed", e)
                         })?;
                         return Ok(FileLockLeaseRenewOutcome::Lost(Some(current)));
                     }
@@ -467,10 +416,7 @@ impl MetaEngineCore for PgMetaEngine {
                     )
                     .await
                     .map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres file lock renew update failed: {}",
-                            Self::format_pg_error(e)
-                        ))
+                        Self::classify_pg_error("postgres file lock renew update failed", e)
                     })?;
                     let channel = Self::lock_notify_channel(volume_id);
                     let payload =
@@ -479,10 +425,7 @@ impl MetaEngineCore for PgMetaEngine {
                         .execute("SELECT pg_notify($1, $2)", &[&channel, &payload])
                         .await;
                     tx.commit().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres file lock renew commit failed: {}",
-                            Self::format_pg_error(e)
-                        ))
+                        Self::classify_pg_error("postgres file lock renew commit failed", e)
                     })?;
                     Ok(FileLockLeaseRenewOutcome::Renewed(current))
                 }),

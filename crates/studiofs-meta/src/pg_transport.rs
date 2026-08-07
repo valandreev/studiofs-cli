@@ -1,6 +1,7 @@
 use crate::{MetaError, MetaResult};
 use rustls::pki_types::ServerName;
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -163,26 +164,71 @@ pub async fn connect_studiofs_postgres(
     let config = parse_postgres_config(dsn)?;
     let policy = inspect_postgres_transport_policy(&config);
     log_postgres_transport_policy(&policy);
-    config.connect(StudioPgTls::new()?).await.map_err(|error| {
-        let unavailable = std::error::Error::source(&error)
-            .and_then(|source| source.downcast_ref::<io::Error>())
-            .is_some_and(is_transport_unavailable);
-        let message = format_pg_error(error);
-        if unavailable {
-            MetaError::PostgresUnavailable(message)
-        } else {
-            MetaError::Storage(format!("postgres connect failed: {message}"))
+    config
+        .connect(StudioPgTls::new()?)
+        .await
+        .map_err(|error| classify_postgres_error("postgres connect failed", error))
+}
+
+pub(crate) fn classify_postgres_error(
+    context: impl Display,
+    error: tokio_postgres::Error,
+) -> MetaError {
+    let source = postgres_io_source(&error);
+    let timed_out = source.is_some_and(is_transport_timeout);
+    let unavailable = error.is_closed() || source.is_some_and(is_transport_unavailable);
+    let message = format_pg_error(error);
+    if timed_out {
+        MetaError::Timeout(format!("{context}: {message}"))
+    } else if unavailable {
+        MetaError::RemoteUnavailable(format!("{context}: {message}"))
+    } else {
+        MetaError::Storage(format!("{context}: {message}"))
+    }
+}
+
+fn postgres_io_source(error: &tokio_postgres::Error) -> Option<&io::Error> {
+    let mut source = std::error::Error::source(error);
+    while let Some(candidate) = source {
+        if let Some(io_error) = candidate.downcast_ref::<io::Error>() {
+            return Some(io_error);
         }
-    })
+        source = candidate.source();
+    }
+    None
 }
 
 fn is_transport_unavailable(error: &io::Error) -> bool {
+    if is_transport_unavailable_kind(error.kind()) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(11001..=11004)) {
+        // WSAHOST_NOT_FOUND, WSATRY_AGAIN, WSANO_RECOVERY, WSANO_DATA.
+        return true;
+    }
+
+    // tokio-postgres hardcodes the first message, while std::net::lookup_host
+    // exposes Unix resolver failures as the second form without a typed DNS error.
+    let message = error.to_string();
+    (error.kind() == io::ErrorKind::InvalidInput && message == "could not resolve any addresses")
+        || message.starts_with("failed to lookup address information")
+}
+
+fn is_transport_timeout(error: &io::Error) -> bool {
+    is_transport_timeout_kind(error.kind())
+}
+
+fn is_transport_timeout_kind(kind: io::ErrorKind) -> bool {
+    kind == io::ErrorKind::TimedOut
+}
+
+fn is_transport_unavailable_kind(kind: io::ErrorKind) -> bool {
     matches!(
-        error.kind(),
+        kind,
         io::ErrorKind::ConnectionRefused
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::TimedOut
             | io::ErrorKind::NotFound
             | io::ErrorKind::AddrNotAvailable
             | io::ErrorKind::NetworkUnreachable
@@ -190,16 +236,12 @@ fn is_transport_unavailable(error: &io::Error) -> bool {
             | io::ErrorKind::NotConnected
             | io::ErrorKind::BrokenPipe
             | io::ErrorKind::UnexpectedEof
-    ) || (error.kind() == io::ErrorKind::InvalidInput
-        && error.to_string() == "could not resolve any addresses")
-        || error
-            .to_string()
-            .starts_with("failed to lookup address information")
+    )
 }
 
 fn parse_postgres_config(dsn: &str) -> MetaResult<tokio_postgres::Config> {
     tokio_postgres::Config::from_str(dsn)
-        .map_err(|error| MetaError::Storage(format!("invalid postgres DSN: {error}")))
+        .map_err(|_| MetaError::Storage("invalid postgres DSN".to_string()))
 }
 
 fn log_postgres_transport_policy(policy: &PgTransportPolicy) {
@@ -349,7 +391,8 @@ fn format_pg_error(error: tokio_postgres::Error) -> String {
 mod tests {
     use super::{
         PgTargetClass, PgTransportPolicy, classify_host, connect_studiofs_postgres,
-        inspect_postgres_transport_policy, is_transport_unavailable, parse_postgres_config,
+        inspect_postgres_transport_policy, is_transport_timeout, is_transport_unavailable,
+        parse_postgres_config,
     };
     use crate::resolve_studiofs_pg_dsns;
     use std::sync::OnceLock;
@@ -485,10 +528,9 @@ mod tests {
             std::io::ErrorKind::ConnectionRefused,
             "connection refused",
         )));
-        assert!(is_transport_unavailable(&std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "connection timed out",
-        )));
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out");
+        assert!(is_transport_timeout(&timeout));
+        assert!(!is_transport_unavailable(&timeout));
         assert!(is_transport_unavailable(&std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "could not resolve any addresses",
@@ -497,6 +539,12 @@ mod tests {
             std::io::ErrorKind::Other,
             "failed to lookup address information",
         )));
+        #[cfg(windows)]
+        for code in [11001, 11002, 11003, 11004] {
+            assert!(is_transport_unavailable(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
         assert!(!is_transport_unavailable(&std::io::Error::new(
             std::io::ErrorKind::Other,
             "certificate verify failed",

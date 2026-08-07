@@ -92,6 +92,8 @@ pub fn vfs_err_to_errno(error: &VfsError) -> i32 {
         BridgeVfsErrorKind::PermissionDenied => libc::EACCES,
         BridgeVfsErrorKind::Retryable => libc::EAGAIN,
         BridgeVfsErrorKind::TimedOut => libc::ETIMEDOUT,
+        BridgeVfsErrorKind::RepairRequired => libc::ENOTRECOVERABLE,
+        BridgeVfsErrorKind::RemoteUnavailable => libc::EHOSTUNREACH,
         BridgeVfsErrorKind::InsufficientResources => libc::ENOMEM,
         BridgeVfsErrorKind::DataCorruption
         | BridgeVfsErrorKind::CriticalRuntimeFailure
@@ -159,6 +161,17 @@ mod tests {
             limit: 16,
         });
         assert_eq!(vfs_err_to_errno(&xattr_too_big), libc::E2BIG);
+    }
+
+    #[test]
+    fn explicit_metadata_categories_map_to_distinct_errno_codes() {
+        let repair = VfsError::Meta(MetaError::RepairRequired("repair".into()));
+        let unavailable = VfsError::Meta(MetaError::RemoteUnavailable("offline".into()));
+        let timeout = VfsError::Meta(MetaError::Timeout("timeout".into()));
+
+        assert_eq!(vfs_err_to_errno(&repair), libc::ENOTRECOVERABLE);
+        assert_eq!(vfs_err_to_errno(&unavailable), libc::EHOSTUNREACH);
+        assert_eq!(vfs_err_to_errno(&timeout), libc::ETIMEDOUT);
     }
 
     #[test]

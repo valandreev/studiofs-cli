@@ -108,10 +108,12 @@ impl PgMetaEngine {
                                     biased;
                                     _ = cancel_for_task.cancelled() => return Ok(()),
                                     r = &mut listen => {
-                                        r.map_err(|e| MetaError::Storage(format!(
-                                            "postgres LISTEN {channel} failed: {}",
-                                            Self::format_pg_error(e)
-                                        )))?;
+                                        r.map_err(|e| {
+                                            Self::classify_pg_error(
+                                                format!("postgres LISTEN {channel} failed"),
+                                                e,
+                                            )
+                                        })?;
                                         break;
                                     }
                                     msg = message => {
@@ -119,10 +121,10 @@ impl PgMetaEngine {
                                             Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
                                             Ok(Some(Ok(_))) => {}
                                             Ok(Some(Err(err))) => {
-                                                return Err(MetaError::Storage(format!(
-                                                    "postgres metadata notify LISTEN poll failed: {}",
-                                                    Self::format_pg_error(err)
-                                                )));
+                                                return Err(Self::classify_pg_error(
+                                                    "postgres metadata notify LISTEN poll failed",
+                                                    err,
+                                                ));
                                             }
                                             Ok(None) => return Ok(()),
                                             Err(_) => {}
@@ -170,10 +172,10 @@ impl PgMetaEngine {
                                     Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
                                     Ok(Some(Ok(_))) => {}
                                     Ok(Some(Err(err))) => {
-                                        return Err(MetaError::Storage(format!(
-                                            "postgres metadata notify poll failed: {}",
-                                            Self::format_pg_error(err)
-                                        )));
+                                        return Err(Self::classify_pg_error(
+                                            "postgres metadata notify poll failed",
+                                            err,
+                                        ));
                                     }
                                     Ok(None) => return Ok(()),
                                     Err(_) => {

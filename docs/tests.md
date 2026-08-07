@@ -54,11 +54,28 @@ cargo test -p studiofs-meta concurrent_shutdown_callers_wait_for_terminal_result
 cargo test -p studiofs-meta metadata_notify_start_skips_start_lock_when_already_registered -- --nocapture
 cargo test -p studiofs-meta prepare_for_close_is_idempotent_when_no_workers_are_running -- --nocapture
 cargo test -p studiofs-meta dropping_engine_signals_background_workers_without_waiting -- --nocapture
-cargo test -p studiofs-meta postgres_unavailable_requires_a_typed_connect_error -- --nocapture
+cargo test -p studiofs-meta postgres_startup_fallback_keeps_timeout_typed -- --nocapture
 cargo test -p studiofs-meta test_pg_foreground_file_lock_does_not_repair_missing_schema -- --ignored --nocapture
 cargo test -p studiofs-meta test_pg_lock_notify_listener_releases_engine_after_drop -- --ignored --nocapture
 cargo test -p studiofs init_pg_schema_provisions_volume_encryption_metadata -- --nocapture
 cargo test -p studiofs init_repairs_existing_schema_before_volume_guard -- --ignored --nocapture
+```
+
+### SFS-647 Secret Redaction and Error Category Regressions
+
+Run these focused checks when changing persisted-config diagnostics, PostgreSQL
+startup timeout classification, or metadata error mappings:
+
+```powershell
+cargo test -p studiofs-meta studio_pg_dsns_debug_omits_credentials_and_full_dsns -- --nocapture
+cargo test -p studiofs-meta invalid_dsn_errors_omit_the_original_dsn -- --nocapture
+cargo test -p studiofs-meta credential_bearing_format_debug_omits_all_secret_values -- --nocapture
+cargo test -p studiofs-meta postgres_startup_fallback_keeps_timeout_typed -- --nocapture
+cargo test -p studiofs-meta transport_unavailability_excludes_reachable_session_mismatch -- --nocapture
+cargo test -p studiofs-vfs classify_vfs_error_preserves_repair_category -- --nocapture
+cargo test -p studiofs-vfs classify_vfs_error_preserves_remote_unavailable_category -- --nocapture
+cargo test -p studiofs-vfs classify_vfs_error_preserves_timeout_category -- --nocapture
+cargo test -p studiofs-bridge explicit_metadata_categories_map_to_distinct_errno_codes -- --nocapture
 ```
 
 ## Contract/Core Harness

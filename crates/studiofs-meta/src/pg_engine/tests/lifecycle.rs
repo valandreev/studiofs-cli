@@ -263,25 +263,26 @@ fn metadata_notify_start_skips_start_lock_when_already_registered() {
 }
 
 #[test]
-fn postgres_unavailable_requires_a_typed_connect_error() {
+fn postgres_startup_fallback_keeps_timeout_typed() {
     assert!(PgMetaEngine::is_postgres_unavailable(
-        &MetaError::PostgresUnavailable("connection refused".to_string())
+        &MetaError::RemoteUnavailable("connection refused".to_string())
     ));
     assert!(!PgMetaEngine::is_postgres_unavailable(&MetaError::Storage(
         "postgres connect failed: error connecting to server".to_string()
     )));
-    assert!(PgMetaEngine::is_postgres_unavailable(
-        &PgMetaEngine::pg_timeout_error(
-            PgTimeoutContext::Connection("validate postgres schema connect"),
-            Duration::from_millis(10),
-        )
-    ));
-    assert!(!PgMetaEngine::is_postgres_unavailable(
-        &PgMetaEngine::pg_timeout_error(
-            PgTimeoutContext::Command("validate postgres schema"),
-            Duration::from_millis(10),
-        )
-    ));
+    let connection_timeout = PgMetaEngine::pg_timeout_error(
+        PgTimeoutContext::Connection("validate postgres schema connect"),
+        Duration::from_millis(10),
+    );
+    assert!(!PgMetaEngine::is_postgres_unavailable(&connection_timeout));
+    assert!(matches!(connection_timeout, MetaError::Timeout(_)));
+
+    let command_timeout = PgMetaEngine::pg_timeout_error(
+        PgTimeoutContext::Command("validate postgres schema"),
+        Duration::from_millis(10),
+    );
+    assert!(!PgMetaEngine::is_postgres_unavailable(&command_timeout));
+    assert!(matches!(command_timeout, MetaError::Timeout(_)));
 }
 
 #[test]
@@ -1047,7 +1048,9 @@ fn command_pool_discards_client_after_application_error() {
                     client
                         .batch_execute("SELECT * FROM studiofs_missing_pool_test_table")
                         .await
-                        .map_err(|e| MetaError::Storage(PgMetaEngine::format_pg_error(e)))?;
+                        .map_err(|e| {
+                            PgMetaEngine::classify_pg_error("intentional application error", e)
+                        })?;
                     Ok(())
                 })
             },

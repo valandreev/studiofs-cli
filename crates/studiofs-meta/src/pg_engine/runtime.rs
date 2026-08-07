@@ -1,6 +1,7 @@
 use super::{PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
-use crate::pg_transport::connect_studiofs_postgres;
+use crate::pg_transport::{classify_postgres_error, connect_studiofs_postgres};
+use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -376,28 +377,22 @@ fn shared_once_runtime() -> MetaResult<&'static PgRemoteRuntime> {
 }
 
 impl PgMetaEngine {
-    pub(super) fn format_pg_error(e: tokio_postgres::Error) -> String {
-        if let Some(db) = e.as_db_error() {
-            format!("{} (sqlstate={})", db.message(), db.code().code())
-        } else {
-            e.to_string()
-        }
+    pub(super) fn classify_pg_error(
+        context: impl Display,
+        error: tokio_postgres::Error,
+    ) -> MetaError {
+        classify_postgres_error(context, error)
     }
 
     pub(super) fn pg_timeout_error(context: PgTimeoutContext<'_>, timeout: Duration) -> MetaError {
-        let (context, unavailable) = match context {
-            PgTimeoutContext::Connection(context) => (context, true),
-            PgTimeoutContext::Command(context) => (context, false),
+        let context = match context {
+            PgTimeoutContext::Connection(context) | PgTimeoutContext::Command(context) => context,
         };
         let message = format!(
             "postgres {context} timed out after {} ms",
             timeout.as_millis()
         );
-        if unavailable {
-            MetaError::PostgresUnavailable(message)
-        } else {
-            MetaError::Storage(message)
-        }
+        MetaError::Timeout(message)
     }
 
     pub(super) fn run_async_once<T, F>(fut: F) -> MetaResult<T>
