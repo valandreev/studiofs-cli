@@ -135,8 +135,24 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         file_name: Option<&U16CStr>,
         flags: u32,
     ) {
-        let action = self.resolve_cleanup_callback_action(context, file_name, flags);
-        self.execute_cleanup_callback_action(action);
+        if flags & FSP_CLEANUP_DELETE == 0 {
+            let _ = self.cleanup_non_delete(context.ino, context.fh);
+            return;
+        }
+
+        if let Some(file_name) = file_name
+            && let Ok((parent_ino, name)) = resolve_parent(&self.context.vfs, file_name)
+        {
+            self.cleanup_delete(context.ino, parent_ino, name, context.is_dir);
+            return;
+        }
+
+        self.context.vfs.note_winfsp_cleanup_callback();
+        debug!(
+            ino = context.ino,
+            is_dir = context.is_dir,
+            "cleanup delete skipped: no path provided"
+        );
     }
 
     #[cfg(test)]
@@ -191,56 +207,6 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         let _gate_release =
             FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate_for_release);
         op()
-    }
-
-    fn resolve_cleanup_callback_action(
-        &self,
-        context: &StudioFileHandle,
-        file_name: Option<&U16CStr>,
-        flags: u32,
-    ) -> CleanupCallbackAction {
-        if flags & FSP_CLEANUP_DELETE == 0 {
-            return CleanupCallbackAction::NonDelete {
-                ino: context.ino,
-                fh: context.fh,
-            };
-        }
-
-        if let Some(file_name) = file_name
-            && let Ok((parent_ino, name)) = resolve_parent(&self.context.vfs, file_name)
-        {
-            return CleanupCallbackAction::Delete {
-                ino: context.ino,
-                parent_ino,
-                name,
-                is_dir: context.is_dir,
-            };
-        }
-
-        CleanupCallbackAction::SkipDeletePath {
-            ino: context.ino,
-            is_dir: context.is_dir,
-        }
-    }
-
-    fn execute_cleanup_callback_action(&self, action: CleanupCallbackAction) {
-        match action {
-            CleanupCallbackAction::Delete {
-                ino,
-                parent_ino,
-                name,
-                is_dir,
-            } => {
-                self.cleanup_delete(ino, parent_ino, name, is_dir);
-            }
-            CleanupCallbackAction::SkipDeletePath { ino, is_dir } => {
-                self.context.vfs.note_winfsp_cleanup_callback();
-                debug!(ino, is_dir, "cleanup delete skipped: no path provided");
-            }
-            CleanupCallbackAction::NonDelete { ino, fh } => {
-                let _ = self.cleanup_non_delete(ino, fh);
-            }
-        }
     }
 
     fn cleanup_delete(&self, ino: Ino, parent_ino: Ino, name: Vec<u8>, is_dir: bool) {
@@ -374,23 +340,6 @@ impl Drop for FlushGateRelease<'_> {
     fn drop(&mut self) {
         self.state.maybe_release_flush_gate(self.ino, &self.gate);
     }
-}
-
-enum CleanupCallbackAction {
-    Delete {
-        ino: Ino,
-        parent_ino: Ino,
-        name: Vec<u8>,
-        is_dir: bool,
-    },
-    SkipDeletePath {
-        ino: Ino,
-        is_dir: bool,
-    },
-    NonDelete {
-        ino: Ino,
-        fh: u64,
-    },
 }
 
 #[cfg(test)]
