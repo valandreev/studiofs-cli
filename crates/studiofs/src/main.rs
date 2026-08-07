@@ -123,79 +123,13 @@ pub(crate) fn ensure_test_diagnostics_log_filter() {
     let _ = TEST_DIAGNOSTICS_LOG_LEVEL.get_or_init(|| Mutex::new(Some("info".to_string())));
 }
 
-/// On Windows, locate WinFSP via the registry and pre-load `winfsp-x64.dll`
-/// so that the delay-load resolver can find it.
-#[cfg(windows)]
-fn init_winfsp_dll_path() {
-    use std::os::windows::ffi::OsStrExt;
-
-    // SAFETY: This declaration uses the platform ABI for WinFSP's
-    // delay-load entry point; it is only invoked with a trusted native
-    // symbol signature and checked null-terminated UTF-16 arguments.
-    unsafe extern "system" {
-        fn LoadLibraryW(lpLibFileName: *const u16) -> *mut core::ffi::c_void;
-    }
-
-    // Read SxsDir from HKLM\SOFTWARE\WOW6432Node\WinFsp (or HKLM\SOFTWARE\WinFsp)
-    let dll_path = (|| -> Option<PathBuf> {
-        let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-
-        let key = hklm
-            .open_subkey("SOFTWARE\\WOW6432Node\\WinFsp")
-            .or_else(|_| hklm.open_subkey("SOFTWARE\\WinFsp"))
-            .ok()?;
-
-        // Try SxsDir first (side-by-side installation)
-        if let Ok(sxs_dir) = key.get_value::<String, _>("SxsDir") {
-            let dll = PathBuf::from(&sxs_dir).join("bin").join("winfsp-x64.dll");
-            if dll.exists() {
-                return Some(dll);
-            }
-        }
-
-        // Fallback: InstallDir
-        if let Ok(install_dir) = key.get_value::<String, _>("InstallDir") {
-            let dll = PathBuf::from(&install_dir)
-                .join("bin")
-                .join("winfsp-x64.dll");
-            if dll.exists() {
-                return Some(dll);
-            }
-        }
-
-        None
-    })();
-
-    if let Some(path) = dll_path {
-        // Convert to null-terminated UTF-16 for LoadLibraryW
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        // SAFETY: LoadLibraryW with a valid, null-terminated UTF-16 path.
-        // Pre-loading the DLL means the delay-load resolver will find it
-        // already in memory without needing to search PATH.
-        // SAFETY: `wide` is a null-terminated UTF-16 buffer that lives across
-        // the FFI call, and `LoadLibraryW` is invoked with the documented Win32 ABI.
-        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
-        if handle.is_null() {
-            eprintln!("warning: failed to load winfsp-x64.dll from {:?}", path);
-        }
-    } else {
-        eprintln!(
-            "warning: WinFSP not found in registry. \
-             Install WinFSP from https://winfsp.dev/ or add winfsp-x64.dll to PATH."
-        );
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     use clap::Parser;
 
     #[cfg(windows)]
-    init_winfsp_dll_path();
+    if let Err(error) = studiofs_winfsp::ensure_winfsp_runtime_loaded() {
+        eprintln!("warning: {error}");
+    }
 
     let cli = cli::Cli::parse();
     let _daemon_log_guard = init_tracing(&cli.log_level)?;

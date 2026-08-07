@@ -882,28 +882,73 @@ fn runtime_shutdown_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn record_cleanup_error(
+    first_error: &mut Option<anyhow::Error>,
+    step: &str,
+    result: anyhow::Result<()>,
+) {
+    let Err(error) = result else {
+        return;
+    };
+
+    let error = error.context(format!("mount cleanup step '{step}' failed"));
+    if first_error.is_none() {
+        *first_error = Some(error);
+    } else {
+        warn!(error = ?error, "additional mount cleanup step failed");
+    }
+}
+
+fn finish_mount_result(
+    mount_result: anyhow::Result<()>,
+    cleanup_error: Option<anyhow::Error>,
+) -> anyhow::Result<()> {
+    match (mount_result, cleanup_error) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(error)) => Err(error),
+        (Err(error), None) => Err(error),
+        (Err(error), Some(cleanup_error)) => {
+            Err(error.context(format!("mount cleanup also failed: {cleanup_error:#}")))
+        }
+    }
+}
+
 fn run_mount_vfs_shutdown(
     runtime: Runtime,
     vfs: Arc<StudioVfs>,
     upload_drain_timeout: Duration,
-) -> anyhow::Result<Runtime> {
+) -> anyhow::Result<(Runtime, anyhow::Result<()>)> {
     if tokio::runtime::Handle::try_current().is_ok() {
         let shutdown = std::thread::spawn(move || {
-            runtime
-                .block_on(vfs.shutdown(upload_drain_timeout))
-                .map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}"))?;
-            Ok::<_, anyhow::Error>(runtime)
+            block_on_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)
         });
-        let shutdown = shutdown.join().map_err(|_| {
+        return shutdown.join().map_err(|_| {
             anyhow::anyhow!("mount VFS shutdown runtime thread panicked during unmount")
-        })?;
-        return shutdown;
+        });
     }
 
-    runtime
-        .block_on(vfs.shutdown(upload_drain_timeout))
-        .map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}"))?;
-    Ok(runtime)
+    Ok(block_on_mount_vfs_shutdown(
+        runtime,
+        vfs,
+        upload_drain_timeout,
+    ))
+}
+
+fn block_on_mount_vfs_shutdown(
+    runtime: Runtime,
+    vfs: Arc<StudioVfs>,
+    upload_drain_timeout: Duration,
+) -> (Runtime, anyhow::Result<()>) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(vfs.shutdown(upload_drain_timeout))
+    }));
+    let result = match result {
+        Ok(result) => result.map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "mount VFS shutdown panicked during unmount"
+        )),
+    };
+    (runtime, result)
 }
 
 fn stop_mount_diagnostics_host(
@@ -1146,9 +1191,7 @@ impl PreparedMount {
             return result;
         }
 
-        self.write_pid_file()?;
-        self.print_ready()?;
-        self.launch_foreground()
+        MountRuntimeGuard::new(self).launch()
     }
 
     fn print_ready(&self) -> anyhow::Result<()> {
@@ -1198,17 +1241,97 @@ impl PreparedMount {
         }
         Ok(())
     }
+}
 
-    fn launch_foreground(mut self) -> anyhow::Result<()> {
-        let format_info = self.format_info.as_ref().context(
-            "foreground mount session is missing format metadata before foreground launch",
-        )?;
-        let prepared = self.foreground.take().context(
-            "foreground mount session is missing prepared runtime before foreground launch",
-        )?;
-        let PreparedForegroundRuntime {
-            cache_path: _,
-            cache_path_str: _,
+struct MountRuntimeGuard {
+    prepared: PreparedMount,
+    diagnostics_host: Option<LocalDiagnosticsHost>,
+    cleanup_completed: bool,
+}
+
+impl MountRuntimeGuard {
+    fn new(prepared: PreparedMount) -> Self {
+        Self {
+            prepared,
+            diagnostics_host: None,
+            cleanup_completed: false,
+        }
+    }
+
+    fn launch(mut self) -> anyhow::Result<()> {
+        let mount_result = self.launch_mount();
+        let cleanup_error = self.cleanup();
+        finish_mount_result(mount_result, cleanup_error)
+    }
+
+    fn launch_mount(&mut self) -> anyhow::Result<()> {
+        self.prepared.write_pid_file()?;
+        self.prepared.print_ready()?;
+        self.serve_foreground()
+    }
+
+    fn serve_foreground(&mut self) -> anyhow::Result<()> {
+        let format_info_name = self
+            .prepared
+            .format_info
+            .as_ref()
+            .context(
+                "foreground mount session is missing format metadata before foreground launch",
+            )?
+            .name
+            .clone();
+        let actual_mount_path = self.prepared.plan.actual_mount_path.clone();
+        let read_only_mount = self.prepared.plan.read_only_mount;
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let run_in_foreground = self.prepared.plan.run_in_foreground;
+        let (backend_name, runtime_handle, vfs, diagnostics_source, profiling_backend) = {
+            let foreground = self.prepared.foreground.as_ref().context(
+                "foreground mount session is missing prepared runtime before foreground launch",
+            )?;
+            (
+                foreground.backend.name(),
+                foreground.runtime.handle().clone(),
+                foreground.vfs.clone(),
+                foreground.diagnostics_source.clone(),
+                foreground.profiling_backend.clone(),
+            )
+        };
+
+        debug!(
+            backend = backend_name,
+            mount_point = %actual_mount_path,
+            "starting mount backend"
+        );
+        self.diagnostics_host = LocalDiagnosticsHost::start_best_effort(
+            &runtime_handle,
+            &actual_mount_path,
+            diagnostics_source,
+            profiling_backend,
+        );
+        let serve_result = self
+            .prepared
+            .foreground
+            .as_ref()
+            .expect("foreground runtime checked above")
+            .backend
+            .serve(BackendLaunch {
+                vfs,
+                runtime_handle,
+                mount_point: actual_mount_path,
+                volume_name: format_info_name,
+                read_only: read_only_mount,
+                #[cfg(all(unix, not(target_os = "linux")))]
+                run_in_foreground,
+            });
+
+        serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))
+    }
+
+    fn cleanup(&mut self) -> Option<anyhow::Error> {
+        let mut first_error = None;
+        let foreground = self.prepared.foreground.take();
+
+        if let Some(PreparedForegroundRuntime {
             backend,
             vfs,
             runtime,
@@ -1216,69 +1339,107 @@ impl PreparedMount {
             profiling_backend,
             mut profiling,
             mut write_path_observability_publisher,
-        } = prepared;
-        let backend_name = backend.name();
-        debug!(
-            backend = backend_name,
-            mount_point = %self.plan.actual_mount_path,
-            "starting mount backend"
-        );
-        let diagnostics_host = LocalDiagnosticsHost::start_best_effort(
-            runtime.handle(),
-            &self.plan.actual_mount_path,
-            diagnostics_source.clone(),
-            profiling_backend.clone(),
-        );
-        let serve_result = backend.serve(BackendLaunch {
-            vfs: vfs.clone(),
-            runtime_handle: runtime.handle().clone(),
-            mount_point: self.plan.actual_mount_path.clone(),
-            volume_name: format_info.name.clone(),
-            read_only: self.plan.read_only_mount,
-            #[cfg(all(unix, not(target_os = "linux")))]
-            run_in_foreground: self.plan.run_in_foreground,
-        });
-        write_path_observability_publisher.stop_and_join();
-        let upload_drain_timeout = shutdown_upload_drain_timeout();
-        let runtime_shutdown_timeout = runtime_shutdown_timeout();
-        let runtime = run_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)?;
-        if let Some(diagnostics_host) = diagnostics_host {
-            stop_mount_diagnostics_host(&runtime, diagnostics_host)?;
-        }
-        if let Some(mut finish_profiling) = profiling.take() {
-            finish_profiling();
-        }
-        // Release every foreground owner that can retain StudioVfs metadata
-        // before shutting the runtime down, so redb observes a deterministic
-        // final drop instead of being left to process teardown ordering.
-        drop(diagnostics_source);
-        drop(profiling_backend);
-        drop(write_path_observability_publisher);
-        drop(backend);
-        info!("mount metadata engine closed cleanly");
-        let _ = utils::remove_pid_file(&self.plan.actual_mount_path);
-        drop(self.mount_lock.take());
-        cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
-        shutdown_mount_runtime(runtime, runtime_shutdown_timeout)?;
+            ..
+        }) = foreground
+        {
+            write_path_observability_publisher.stop_and_join();
 
-        serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))?;
-        Ok(())
+            if let Some(diagnostics_host) = self.diagnostics_host.take() {
+                record_cleanup_error(
+                    &mut first_error,
+                    "diagnostics host shutdown",
+                    stop_mount_diagnostics_host(&runtime, diagnostics_host),
+                );
+            }
+
+            let runtime =
+                match run_mount_vfs_shutdown(runtime, vfs, shutdown_upload_drain_timeout()) {
+                    Ok((runtime, result)) => {
+                        record_cleanup_error(&mut first_error, "VFS shutdown", result);
+                        Some(runtime)
+                    }
+                    Err(error) => {
+                        record_cleanup_error(&mut first_error, "VFS shutdown", Err(error));
+                        None
+                    }
+                };
+
+            if let Some(mut finish_profiling) = profiling.take() {
+                finish_profiling();
+            }
+
+            // Release every foreground owner that can retain StudioVfs metadata
+            // before shutting the runtime down, so redb observes a deterministic
+            // final drop instead of being left to process teardown ordering.
+            drop(diagnostics_source);
+            drop(profiling_backend);
+            drop(write_path_observability_publisher);
+            drop(backend);
+            info!("mount foreground owners released");
+
+            if let Some(runtime) = runtime {
+                record_cleanup_error(
+                    &mut first_error,
+                    "Tokio runtime shutdown",
+                    shutdown_mount_runtime(runtime, runtime_shutdown_timeout()),
+                );
+            }
+        }
+
+        record_cleanup_error(
+            &mut first_error,
+            "mount record removal",
+            utils::remove_pid_file(&self.prepared.plan.actual_mount_path),
+        );
+        drop(self.prepared.mount_lock.take());
+        let snapshot_db_path = self.prepared.snapshot_mount_db_path.take();
+        record_cleanup_error(
+            &mut first_error,
+            "snapshot database removal",
+            remove_snapshot_mount_db(snapshot_db_path.as_deref()),
+        );
+
+        self.cleanup_completed = true;
+        first_error
+    }
+}
+
+impl Drop for MountRuntimeGuard {
+    fn drop(&mut self) {
+        if self.cleanup_completed {
+            return;
+        }
+
+        if let Err(error) = utils::remove_pid_file(&self.prepared.plan.actual_mount_path) {
+            warn!(
+                error = ?error,
+                "failed to remove mount record during mount runtime guard drop"
+            );
+        }
+        drop(self.prepared.foreground.take());
+        cleanup_snapshot_mount_db(self.prepared.snapshot_mount_db_path.as_deref());
+        drop(self.prepared.mount_lock.take());
     }
 }
 
 fn cleanup_snapshot_mount_db(snapshot_db_path: Option<&Path>) {
+    if let Err(error) = remove_snapshot_mount_db(snapshot_db_path) {
+        warn!(error = ?error, "failed to remove snapshot mount database");
+    }
+}
+
+fn remove_snapshot_mount_db(snapshot_db_path: Option<&Path>) -> anyhow::Result<()> {
     let Some(snapshot_db_path) = snapshot_db_path else {
-        return;
+        return Ok(());
     };
 
     match std::fs::remove_file(snapshot_db_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => warn!(
-            path = %snapshot_db_path.display(),
-            error = %error,
-            "failed to remove snapshot mount database"
-        ),
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to remove snapshot mount database '{}': {error}",
+            snapshot_db_path.display()
+        )),
     }
 }
 
@@ -1816,6 +1977,18 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct PanicBackend;
+
+    impl MountBackend for PanicBackend {
+        fn name(&self) -> &'static str {
+            "PanicBackend"
+        }
+
+        fn serve(&self, _launch: BackendLaunch) -> io::Result<()> {
+            panic!("simulated mount backend panic");
         }
     }
 
@@ -2720,6 +2893,153 @@ mod tests {
             utils::read_pid_file(&actual_mount_path).is_err(),
             "backend failure should remove pid file"
         );
+    }
+
+    #[test]
+    fn mount_runtime_guard_removes_critical_artifacts_when_backend_panics() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+        let mount_point = startup_mount_point(&temp);
+        let mut prepared = MountPlan::resolve(MountRequest {
+            command: mount_command(
+                "demo",
+                &meta_dir,
+                Some(mount_point.to_string()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| Box::new(PanicBackend))
+        .expect("prepare mount");
+        let actual_mount_path = prepared.plan.actual_mount_path.clone();
+        let snapshot_path = temp.path().join("panic-snapshot.db");
+        std::fs::write(&snapshot_path, b"snapshot").expect("create snapshot placeholder");
+        prepared.snapshot_mount_db_path = Some(snapshot_path.clone());
+
+        let panic_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepared.launch()));
+
+        assert!(panic_result.is_err(), "backend panic should propagate");
+        assert!(
+            utils::read_pid_file(&actual_mount_path).is_err(),
+            "panic cleanup should remove the mount record"
+        );
+        assert!(
+            !snapshot_path.exists(),
+            "panic cleanup should remove the snapshot database"
+        );
+        assert!(
+            !utils::mount_is_active(&actual_mount_path).expect("check mount lock"),
+            "panic cleanup should release the mount lock"
+        );
+    }
+
+    #[test]
+    fn mount_runtime_guard_continues_after_mount_record_cleanup_failure() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+        let mount_point = startup_mount_point(&temp);
+        let prepared = MountPlan::resolve(MountRequest {
+            command: mount_command(
+                "demo",
+                &meta_dir,
+                Some(mount_point.to_string()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+                inspect: None,
+            })
+        })
+        .expect("prepare mount");
+        let actual_mount_path = prepared.plan.actual_mount_path.clone();
+        let pid_path = utils::pid_file_path(&actual_mount_path).expect("pid path");
+        let snapshot_path = temp.path().join("snapshot.db");
+        std::fs::write(&snapshot_path, b"snapshot").expect("create snapshot placeholder");
+        let mut guard = MountRuntimeGuard::new(prepared);
+        guard.prepared.snapshot_mount_db_path = Some(snapshot_path.clone());
+        guard
+            .prepared
+            .write_pid_file()
+            .expect("persist mount record");
+
+        std::fs::remove_file(&pid_path).expect("remove mount record before fault injection");
+        std::fs::create_dir(&pid_path).expect("replace mount record with directory");
+
+        let cleanup_error = guard
+            .cleanup()
+            .expect("mount record cleanup failure should be returned");
+        let snapshot_removed = !snapshot_path.exists();
+        let pid_path_removed = std::fs::remove_dir(&pid_path).is_ok();
+
+        assert!(
+            cleanup_error.to_string().contains("mount record removal"),
+            "unexpected cleanup error: {cleanup_error:#}"
+        );
+        assert!(snapshot_removed, "later snapshot cleanup must still run");
+        assert!(
+            pid_path_removed,
+            "test fault-injection directory must be removed"
+        );
+    }
+
+    #[test]
+    fn cleanup_errors_keep_first_and_run_later_steps() {
+        let mut first_error = None;
+        let mut events = Vec::new();
+
+        events.push("first");
+        record_cleanup_error(
+            &mut first_error,
+            "first cleanup",
+            Err(anyhow::anyhow!("first failure")),
+        );
+        events.push("second");
+        record_cleanup_error(
+            &mut first_error,
+            "second cleanup",
+            Err(anyhow::anyhow!("second failure")),
+        );
+
+        assert_eq!(events, ["first", "second"]);
+        let error = first_error.expect("first cleanup error");
+        assert!(error.to_string().contains("first cleanup"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "first failure")
+        );
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.to_string() == "second failure")
+        );
+    }
+
+    #[test]
+    fn cleanup_error_does_not_replace_original_mount_error() {
+        let error = finish_mount_result(
+            Err(anyhow::anyhow!("backend failure")),
+            Some(anyhow::anyhow!("VFS shutdown failure")),
+        )
+        .expect_err("backend error should remain an error");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "backend failure")
+        );
+        assert!(error.to_string().contains("VFS shutdown failure"));
     }
 
     #[test]

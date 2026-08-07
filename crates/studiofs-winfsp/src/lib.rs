@@ -166,11 +166,17 @@ fn load_winfsp_runtime_dll() -> Result<(), String> {
         .map(|err| format!(" Last LoadLibraryW error: {err}."))
         .unwrap_or_default();
     Err(format!(
-        "failed to preload WinFSP runtime DLL '{dll_name}'. Searched: [{searched_paths}]. Install WinFSP or add its bin directory to PATH.{suffix}"
+        "failed to preload WinFSP runtime DLL '{dll_name}'. Searched: [{searched_paths}]. Install WinFSP from https://winfsp.dev/ or place the architecture-matching DLL in the executable directory or WinFSP bin directory.{suffix}"
     ))
 }
 
-pub(crate) fn ensure_winfsp_runtime_loaded() -> std::io::Result<()> {
+/// Preloads the WinFSP runtime DLL selected for the current Windows architecture.
+///
+/// # Errors
+///
+/// Returns an error when the architecture is unsupported, no candidate DLL is
+/// available, or Windows rejects every load attempt.
+pub fn ensure_winfsp_runtime_loaded() -> std::io::Result<()> {
     WINFSP_RUNTIME_DLL_LOAD
         .get_or_init(load_winfsp_runtime_dll)
         .as_ref()
