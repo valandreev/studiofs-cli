@@ -535,8 +535,7 @@ mod tests {
             std::io::ErrorKind::InvalidInput,
             "could not resolve any addresses",
         )));
-        assert!(is_transport_unavailable(&std::io::Error::new(
-            std::io::ErrorKind::Other,
+        assert!(is_transport_unavailable(&std::io::Error::other(
             "failed to lookup address information",
         )));
         #[cfg(windows)]
@@ -545,8 +544,7 @@ mod tests {
                 &std::io::Error::from_raw_os_error(code)
             ));
         }
-        assert!(!is_transport_unavailable(&std::io::Error::new(
-            std::io::ErrorKind::Other,
+        assert!(!is_transport_unavailable(&std::io::Error::other(
             "certificate verify failed",
         )));
         assert!(!is_transport_unavailable(&std::io::Error::new(
