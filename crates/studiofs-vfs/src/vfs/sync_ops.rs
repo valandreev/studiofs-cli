@@ -290,59 +290,18 @@ impl StudioVfs {
         if !admission.pre_drain {
             return Ok(0);
         }
-        let pressure_after_write = self.total_pending_write_buffer_bytes().saturating_add(len);
-        let pacing_threshold = self
-            .max_dirty_bytes()
-            .saturating_div(2)
-            .max(self.write_eager_flush_drain_chunk_bytes);
         // Sustained-stream detection is a pre-drain signal only. Adaptive
         // admission already owns pacing from measured pressure and drain rate;
         // adding a second time-based sleep here produces periodic callback stalls.
-        let delay_ms = 0;
-
-        // #region debug log
-        self.debug_write_probe(
-            "H2",
-            concat!(file!(), ":", line!()),
-            "sustained write pre-drain",
-            serde_json::json!({
-                "ino": ino,
-                "offset": offset,
-                "len": len,
-                "duration_ms": admission.duration_ms,
-                "delay_ms": delay_ms,
-                "raw_delay_ms": admission.delay_ms,
-                "pacing_threshold_bytes": pacing_threshold,
-                "pressure_after_write": pressure_after_write,
-                "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-            }),
-        );
-        // #endregion debug log
-
         self.spawn_deferred_materialization_if_needed(ino).await;
-        Ok(delay_ms)
+        Ok(0)
     }
 
-    fn record_deferred_write_hard_backpressure(&self, ino: Ino, hard_threshold_bytes: usize) {
+    fn record_deferred_write_hard_backpressure(&self) {
         self.state
             .local_dirty
             .hard_backpressure_events
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // #region debug log
-        self.debug_write_probe(
-            "H2",
-            concat!(file!(), ":", line!()),
-            "hard backpressure observed on deferred write",
-            serde_json::json!({
-                "ino": ino,
-                "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
-                "hard_threshold_bytes": hard_threshold_bytes,
-                "max_dirty_bytes": self.max_dirty_bytes(),
-            }),
-        );
-        // #endregion debug log
     }
 
     /// Spawn a background deferred-materialization task for `ino` when needed.
@@ -369,34 +328,8 @@ impl StudioVfs {
                 }
             })
         else {
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                concat!(file!(), ":", line!()),
-                "deferred materialization already inflight",
-                serde_json::json!({
-                    "ino": ino,
-                    "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                    "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-                    "open_count": self.handle_table.open_count(ino),
-                }),
-            );
-            // #endregion debug log
             return;
         };
-        // #region debug log
-        self.debug_write_probe(
-            "H2",
-            concat!(file!(), ":", line!()),
-            "deferred materialization scheduled",
-            serde_json::json!({
-                "ino": ino,
-                "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-                "open_count": self.handle_table.open_count(ino),
-            }),
-        );
-        // #endregion debug log
         self.start_deferred_materialization_task(entry, guard);
     }
 
@@ -468,22 +401,6 @@ impl StudioVfs {
                         error = %e,
                         "deferred writer-stack budget materialization failed; will retry at next strict barrier"
                     );
-                    // #region debug log
-                    self.debug_write_probe(
-                        "H1",
-                        concat!(file!(), ":", line!()),
-                        "deferred writer-stack limit-pass failure",
-                        serde_json::json!({
-                            "ino": ino,
-                            "error": e.to_string(),
-                            "meta_exists": self.sync_meta().get_attr(ino).is_ok(),
-                            "deleted_marker": self.state.upload.deleted_inodes.lock().contains(&ino),
-                            "open_count": self.handle_table.open_count(ino),
-                            "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                            "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-                        }),
-                    );
-                    // #endregion debug log
                 }
                 return DeferredMaterializationPassOutcome::Completed {
                     allow_reschedule: false,
@@ -1714,7 +1631,7 @@ impl StudioVfs {
         let hard_backpressure_threshold =
             super::hard_backpressure_threshold_bytes(self.max_dirty_bytes());
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
-            self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
+            self.record_deferred_write_hard_backpressure();
             if local_sync_policy.requires_write_path_durability() {
                 // Slow-path durability backpressure may copy owned payloads;
                 // keeping memory bounded wins over preserving zero-copy here.
@@ -1758,7 +1675,7 @@ impl StudioVfs {
             self.access_tracker,
         );
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
-            self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
+            self.record_deferred_write_hard_backpressure();
             if local_sync_policy.requires_write_path_durability() {
                 drop(session);
                 self.state.file_session.gc_if_idle(ino);

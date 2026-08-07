@@ -10,21 +10,21 @@ use crate::vfs::{
     DEFAULT_FETCH_MIN_WINDOW, DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS,
     DEFAULT_FETCH_PREFETCH_RESERVE, DEFAULT_FETCH_REQUEST_TIMEOUT_SECS,
     DEFAULT_FETCH_RETRY_BASE_MS, DEFAULT_FETCH_RETRY_MAX_MS, DEFAULT_JANITOR_INTERVAL,
-    DEFAULT_JANITOR_LEASE_TTL, DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
-    DEFAULT_JANITOR_SKIP_NEWER_THAN, DEFAULT_LOCK_LEASE_TTL, DEFAULT_LOCK_RETRY_BASE_MS,
-    DEFAULT_LOCK_RETRY_MAX_MS, DEFAULT_MAX_DIRTY_BYTES, DEFAULT_MAX_DRAIN_BATCH,
-    DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS, DEFAULT_PATH_SHORTCUT_CACHE_BYTES,
-    DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY, DEFAULT_PREFETCH_CONCURRENCY,
-    DEFAULT_PREFETCH_CONCURRENCY_MIN, DEFAULT_PREFETCH_FETCH_MAX_ATTEMPTS,
-    DEFAULT_PREFETCH_FOREGROUND_RESERVE, DEFAULT_PREFETCH_MAX_PER_CYCLE,
-    DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS, DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS,
-    DEFAULT_QOS_ACCEPT_SLOTS, DEFAULT_QOS_COMMIT_SLOTS, DEFAULT_QOS_FETCH_SLOTS,
-    DEFAULT_QOS_MATERIALIZE_SLOTS, DEFAULT_READ_BUFFER_MB, DEFAULT_READAHEAD_MIN_PREFETCH,
-    DEFAULT_READAHEAD_RANDOM_PENALTY, DEFAULT_READAHEAD_SEQ_STEP, DEFAULT_READAHEAD_WIDTH,
-    DEFAULT_READDIR_ATTR_BATCH_CHUNK, DEFAULT_READDIR_ATTR_BATCH_MAX_INODES,
-    DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS, DEFAULT_SLAB_FLUSH_INTERVAL_MS,
-    DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES, DEFAULT_UPLOAD_CACHE_IO_SLOTS,
-    DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS, DEFAULT_UPLOAD_DECREASE_FACTOR, DEFAULT_UPLOAD_DELAY_MS,
+    DEFAULT_JANITOR_MAX_DELETES_PER_RUN, DEFAULT_JANITOR_SKIP_NEWER_THAN, DEFAULT_LOCK_LEASE_TTL,
+    DEFAULT_LOCK_RETRY_BASE_MS, DEFAULT_LOCK_RETRY_MAX_MS, DEFAULT_MAX_DIRTY_BYTES,
+    DEFAULT_MAX_DRAIN_BATCH, DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS,
+    DEFAULT_PATH_SHORTCUT_CACHE_BYTES, DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY,
+    DEFAULT_PREFETCH_CONCURRENCY, DEFAULT_PREFETCH_CONCURRENCY_MIN,
+    DEFAULT_PREFETCH_FETCH_MAX_ATTEMPTS, DEFAULT_PREFETCH_FOREGROUND_RESERVE,
+    DEFAULT_PREFETCH_MAX_PER_CYCLE, DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS,
+    DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS, DEFAULT_QOS_ACCEPT_SLOTS, DEFAULT_QOS_COMMIT_SLOTS,
+    DEFAULT_QOS_FETCH_SLOTS, DEFAULT_QOS_MATERIALIZE_SLOTS, DEFAULT_READ_BUFFER_MB,
+    DEFAULT_READAHEAD_MIN_PREFETCH, DEFAULT_READAHEAD_RANDOM_PENALTY, DEFAULT_READAHEAD_SEQ_STEP,
+    DEFAULT_READAHEAD_WIDTH, DEFAULT_READDIR_ATTR_BATCH_CHUNK,
+    DEFAULT_READDIR_ATTR_BATCH_MAX_INODES, DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
+    DEFAULT_SLAB_FLUSH_INTERVAL_MS, DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
+    DEFAULT_UPLOAD_CACHE_IO_SLOTS, DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS,
+    DEFAULT_UPLOAD_DECREASE_FACTOR, DEFAULT_UPLOAD_DELAY_MS,
     DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS, DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
     DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS, DEFAULT_UPLOAD_IDLE_RESET_SECS,
     DEFAULT_UPLOAD_INCREASE_STEP, DEFAULT_UPLOAD_INITIAL_WINDOW, DEFAULT_UPLOAD_MAX_ATTEMPTS,
@@ -223,8 +223,6 @@ pub struct VfsConfig {
     pub janitor_skip_newer_secs: u64,
     /// Max janitor deletes per cycle.
     pub janitor_max_deletes: u64,
-    /// Janitor lease TTL in metadata store.
-    pub janitor_lease_ttl_secs: u64,
     /// Sync interval for metadata invalidation watcher.
     pub metadata_invalidation_sync_interval_ms: u64,
     /// Read buffer size used to derive fetch/prefetch defaults.
@@ -408,8 +406,6 @@ pub struct VfsConfigRaw {
     pub janitor_skip_newer_secs: Option<u64>,
     /// Optional override for maximum janitor deletes per cycle.
     pub janitor_max_deletes: Option<u64>,
-    /// Optional override for janitor lease TTL in seconds.
-    pub janitor_lease_ttl_secs: Option<u64>,
     /// Optional override for metadata invalidation sync interval in milliseconds.
     pub metadata_invalidation_sync_interval_ms: Option<u64>,
     /// Optional override for read buffer size in megabytes.
@@ -644,7 +640,6 @@ impl VfsConfigRaw {
             janitor_interval_secs,
             janitor_skip_newer_secs,
             janitor_max_deletes,
-            janitor_lease_ttl_secs,
             metadata_invalidation_sync_interval_ms,
             read_buffer_mb,
             prefetch_concurrency,
@@ -737,7 +732,6 @@ fn normalize_vfs_config(
 ) -> VfsResult<VfsConfigValidated> {
     cfg.janitor_interval_secs = cfg.janitor_interval_secs.max(1);
     cfg.janitor_max_deletes = cfg.janitor_max_deletes.max(1);
-    cfg.janitor_lease_ttl_secs = cfg.janitor_lease_ttl_secs.max(1);
     cfg.metadata_invalidation_sync_interval_ms = cfg.metadata_invalidation_sync_interval_ms.max(1);
     cfg.read_buffer_mb = cfg.read_buffer_mb.max(1);
     cfg.prefetch_concurrency = cfg
@@ -822,7 +816,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             janitor_interval_secs: Some(cfg.janitor_interval_secs),
             janitor_skip_newer_secs: Some(cfg.janitor_skip_newer_secs),
             janitor_max_deletes: Some(cfg.janitor_max_deletes),
-            janitor_lease_ttl_secs: Some(cfg.janitor_lease_ttl_secs),
             metadata_invalidation_sync_interval_ms: Some(
                 cfg.metadata_invalidation_sync_interval_ms,
             ),
@@ -909,7 +902,6 @@ impl Default for VfsConfig {
             janitor_interval_secs: DEFAULT_JANITOR_INTERVAL.as_secs(),
             janitor_skip_newer_secs: DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs(),
             janitor_max_deletes: DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
-            janitor_lease_ttl_secs: DEFAULT_JANITOR_LEASE_TTL.as_secs(),
             metadata_invalidation_sync_interval_ms: DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS,
             read_buffer_mb: DEFAULT_READ_BUFFER_MB,
             prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY

@@ -991,11 +991,6 @@ impl CachedStore {
             .has_pending_for_ino_newer_than(ino, content_epoch)
     }
 
-    /// Flushes the upload queue journal to disk.
-    pub async fn flush_upload_journal(&self) {
-        self.upload_queue.flush_journal().await;
-    }
-
     /// Returns the configured cache directory.
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
@@ -1017,10 +1012,9 @@ impl CachedStore {
         self.upload_queue.reset_ingress_metrics();
     }
 
-    /// Requests upload queue shutdown and flushes any remaining journal state.
+    /// Requests upload queue shutdown.
     pub async fn shutdown(&self) {
         self.upload_queue.shutdown();
-        self.flush_upload_journal().await;
     }
 
     fn submit_staged_upload(

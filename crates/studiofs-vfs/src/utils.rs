@@ -143,13 +143,6 @@ pub fn parse_size_bytes(raw: &str) -> Option<u64> {
     u64::try_from(bytes).ok()
 }
 
-pub(crate) fn now_unix_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 pub(crate) fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

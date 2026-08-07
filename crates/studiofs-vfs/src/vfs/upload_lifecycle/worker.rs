@@ -162,31 +162,6 @@ enum UploadPutOutcome {
     Failed(VfsError),
 }
 
-fn upload_reread_idle_wait_window(
-    foreground_active: bool,
-    adaptive_penalty: Duration,
-    idle_grace: Duration,
-) -> Duration {
-    if !foreground_active || adaptive_penalty.is_zero() {
-        Duration::ZERO
-    } else {
-        adaptive_penalty.max(idle_grace)
-    }
-}
-
-fn upload_disk_reread_defer_delay(
-    foreground_active: bool,
-    hot_payload_available: bool,
-    adaptive_penalty: Duration,
-    idle_grace: Duration,
-) -> Option<Duration> {
-    if hot_payload_available {
-        return None;
-    }
-    let wait = upload_reread_idle_wait_window(foreground_active, adaptive_penalty, idle_grace);
-    (!wait.is_zero()).then_some(wait)
-}
-
 fn foreground_upload_reread_slot_cost(
     foreground_active: bool,
     foreground_cost: u32,
@@ -304,11 +279,7 @@ trait CachedStorePort: Clone + Send + Sync + 'static {
 trait UploadLocalPayloadPort: Clone + Send + Sync + 'static {
     fn mark_uploading(&self, object_id: u64) -> VfsResult<()>;
     fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()>;
-    async fn prepare_local_priority_read(
-        &self,
-        object_id: u64,
-        adaptive_penalty: Duration,
-    ) -> VfsResult<()>;
+    async fn prepare_local_priority_read(&self, object_id: u64) -> VfsResult<()>;
     async fn read_for_upload(&self, object_id: u64, payload_len: u64) -> VfsResult<Option<Bytes>>;
     async fn remove(&self, object_id: u64) -> VfsResult<()>;
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()>;
@@ -638,7 +609,7 @@ where
         }
 
         self.local_payloads
-            .prepare_local_priority_read(op.object_id, adaptive_penalty)
+            .prepare_local_priority_read(op.object_id)
             .await?;
 
         let t0 = Instant::now();
@@ -1195,11 +1166,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .map_err(VfsError::LocalPayload)
     }
 
-    async fn prepare_local_priority_read(
-        &self,
-        object_id: u64,
-        adaptive_penalty: Duration,
-    ) -> VfsResult<()> {
+    async fn prepare_local_priority_read(&self, object_id: u64) -> VfsResult<()> {
         if self.vfs.upload_hot_get(object_id).is_some() {
             return Ok(());
         }
@@ -1212,54 +1179,10 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .await
         {
             Ok(()) if self.vfs.upload_stage_contains_async(object_id).await? => {
-                self.vfs.debug_write_probe(
-                    "H5",
-                    concat!(file!(), ":", line!()),
-                    "upload stage hardlink restored before local-priority reread fallback",
-                    serde_json::json!({
-                        "object_id": object_id,
-                    }),
-                );
                 return Ok(());
             }
             Ok(()) => {}
-            Err(error) => {
-                self.vfs.debug_write_probe(
-                    "H5",
-                    concat!(file!(), ":", line!()),
-                    "upload stage hardlink restore failed; falling back to bounded reread",
-                    serde_json::json!({
-                        "object_id": object_id,
-                        "error": error.to_string(),
-                    }),
-                );
-            }
-        }
-        let foreground_active = self
-            .vfs
-            .state
-            .read
-            .foreground_io_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
-        let defer_delay = upload_disk_reread_defer_delay(
-            foreground_active,
-            false,
-            adaptive_penalty,
-            self.vfs.upload_user_idle_grace,
-        );
-        if let Some(delay) = defer_delay {
-            // #region debug log
-            self.vfs.debug_write_probe(
-                "H5",
-                concat!(file!(), ":", line!()),
-                "upload stage unavailable; skipping local-priority defer and using bounded reread",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "adaptive_penalty_ms": adaptive_penalty.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "would_defer_delay_ms": delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
-                }),
-            );
-            // #endregion debug log
+            Err(_) => {}
         }
         Ok(())
     }
@@ -1286,15 +1209,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .upload
                 .upload_hot_payload_read_bytes
                 .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
-            self.vfs.debug_write_probe(
-                "H5",
-                concat!(file!(), ":", line!()),
-                "upload read served from hot upload buffer",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "buffer_bytes": hot_payload.len(),
-                }),
-            );
             return Ok(Some(hot_payload));
         }
         let _ = self
@@ -1323,17 +1237,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
         let pacing_delay =
             foreground_upload_reread_pacing_delay(foreground_active, payload_len as usize);
         if !pacing_delay.is_zero() {
-            self.vfs.debug_write_probe(
-                "H5",
-                concat!(file!(), ":", line!()),
-                "upload reread paced before local payload read",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "payload_len": payload_len,
-                    "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "slot_cost": upload_io_cost,
-                }),
-            );
             tokio::time::sleep(pacing_delay).await;
         }
         let wait_started = Instant::now();
@@ -1372,15 +1275,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .upload
                 .upload_staged_payload_read_bytes
                 .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
-            self.vfs.debug_write_probe(
-                "H5",
-                concat!(file!(), ":", line!()),
-                "upload read served from upload hardlink",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "buffer_bytes": staged_payload.len(),
-                }),
-            );
             return Ok(Some(staged_payload));
         }
         let read_started = Instant::now();
@@ -2560,11 +2454,7 @@ mod tests {
             Ok(())
         }
 
-        async fn prepare_local_priority_read(
-            &self,
-            _object_id: u64,
-            _adaptive_penalty: Duration,
-        ) -> VfsResult<()> {
+        async fn prepare_local_priority_read(&self, _object_id: u64) -> VfsResult<()> {
             Ok(())
         }
 
@@ -4524,72 +4414,6 @@ mod tests {
         assert_eq!(retained_op.object_id, retained.object_id);
         assert!(ready.is_empty());
         assert!(delayed.is_empty());
-    }
-
-    #[test]
-    fn upload_reread_idle_wait_window_requires_penalty_and_foreground_pressure() {
-        assert_eq!(
-            upload_reread_idle_wait_window(
-                false,
-                Duration::from_millis(200),
-                Duration::from_millis(50),
-            ),
-            Duration::ZERO
-        );
-        assert_eq!(
-            upload_reread_idle_wait_window(true, Duration::ZERO, Duration::from_millis(50)),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn upload_reread_idle_wait_window_uses_idle_grace_as_floor() {
-        assert_eq!(
-            upload_reread_idle_wait_window(
-                true,
-                Duration::from_millis(20),
-                Duration::from_millis(50),
-            ),
-            Duration::from_millis(50)
-        );
-    }
-
-    #[test]
-    fn upload_reread_idle_wait_window_uses_penalty_when_larger() {
-        assert_eq!(
-            upload_reread_idle_wait_window(
-                true,
-                Duration::from_millis(240),
-                Duration::from_millis(50),
-            ),
-            Duration::from_millis(240)
-        );
-    }
-
-    #[test]
-    fn upload_disk_reread_defer_delay_skips_hot_payloads() {
-        assert_eq!(
-            upload_disk_reread_defer_delay(
-                true,
-                true,
-                Duration::from_millis(240),
-                Duration::from_millis(500),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn upload_disk_reread_defer_delay_uses_idle_window_for_disk_miss() {
-        assert_eq!(
-            upload_disk_reread_defer_delay(
-                true,
-                false,
-                Duration::from_millis(240),
-                Duration::from_millis(500),
-            ),
-            Some(Duration::from_millis(500))
-        );
     }
 
     #[test]
