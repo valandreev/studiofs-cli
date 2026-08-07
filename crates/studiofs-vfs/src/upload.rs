@@ -448,6 +448,7 @@ mod tests {
             secret_key: "secret".into(),
             region: "us-east-1".into(),
             volume_name: "unit-volume".into(),
+            data_prefix: "unit-volume/objects/".into(),
             volume_uuid: "scheduler-upload-test-volume".into(),
             crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x51; 32])),
         }

@@ -82,6 +82,7 @@ impl InitRunRequest {
                 secret_key: args.secret_key,
                 region,
                 volume_name: String::new(),
+                data_prefix: String::new(),
                 volume_uuid: "init-storage-probe".into(),
                 crypto: DataStoreCryptoConfig::from(EncryptionConfig::new(
                     [0; ENCRYPTION_KEY_LENGTH],

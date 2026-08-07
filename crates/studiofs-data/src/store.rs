@@ -111,6 +111,8 @@ pub struct DataStoreConfig {
     pub region: String,
     /// Stable namespace used as the object key prefix (often a volume name).
     pub volume_name: String,
+    /// Persisted prefix for remote data objects; empty uses `{volume_name}/objects/`.
+    pub data_prefix: String,
     /// Immutable volume UUID authenticated into every encrypted remote payload.
     pub volume_uuid: String,
     /// Transparent remote-object encryption settings.
@@ -177,6 +179,7 @@ impl fmt::Debug for DataStoreConfig {
             .field("secret_key", &"<redacted>")
             .field("region", &self.region)
             .field("volume_name", &self.volume_name)
+            .field("data_prefix", &self.data_prefix)
             .field("volume_uuid", &self.volume_uuid)
             .field("crypto", &self.crypto)
             .finish()
@@ -208,6 +211,7 @@ impl From<&FormatInfo> for DataStoreConfig {
             secret_key: info.secret_key.clone(),
             region: info.region.clone(),
             volume_name: info.name.clone(),
+            data_prefix: info.data_prefix.clone(),
             volume_uuid: info.uuid.clone(),
             crypto: DataStoreCryptoConfig::from(&info.encryption),
         }
@@ -673,7 +677,7 @@ impl DataStore {
         &self,
         prefix: &str,
     ) -> DataResult<impl Stream<Item = DataResult<DataStoreObjectEntry>>> {
-        self.validate_volume_key(prefix)?;
+        self.validate_volume_prefix(prefix)?;
         let lister = self.op.lister_with(prefix).recursive(true).await?;
 
         Ok(lister.filter_map(|entry| async move {
@@ -714,11 +718,24 @@ impl DataStore {
     }
 
     fn validate_volume_key(&self, key: &str) -> DataResult<()> {
-        let volume_prefix = format!("{}/", self.volume_name);
+        self.validate_volume_path(key, false)
+    }
+
+    fn validate_volume_prefix(&self, prefix: &str) -> DataResult<()> {
+        self.validate_volume_path(prefix, true)
+    }
+
+    fn validate_volume_path(&self, key: &str, allow_prefix: bool) -> DataResult<()> {
+        let configured_prefix = self.config.data_prefix.trim_end_matches('/');
+        let volume_prefix = if configured_prefix.is_empty() {
+            format!("{}/objects/", self.volume_name)
+        } else {
+            format!("{configured_prefix}/")
+        };
         let Some(relative_key) = key.strip_prefix(&volume_prefix) else {
             return Err(DataError::InvalidObjectKey(key.to_owned()));
         };
-        if relative_key.is_empty()
+        if (!allow_prefix && relative_key.is_empty())
             || key.contains('\\')
             || relative_key
                 .split('/')
@@ -790,6 +807,7 @@ mod tests {
             secret_key: "secret".into(),
             region: "us-east-1".into(),
             volume_name: "unit-volume".into(),
+            data_prefix: "unit-volume/objects/".into(),
             volume_uuid: "1a4c0fe2-8550-4892-952c-5ec26c0e0d8d".into(),
             crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x42; 32])),
         }
@@ -1075,6 +1093,86 @@ mod tests {
                 "unit-volume/objects/cc/dd/0000000000000002".to_string(),
             ]
         );
+    }
+
+    #[derive(Debug)]
+    struct FailingListService;
+
+    #[derive(Debug)]
+    struct FailingLister;
+
+    impl opendal::raw::oio::List for FailingLister {
+        async fn next(&mut self) -> opendal::Result<Option<opendal::raw::oio::Entry>> {
+            Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "forced listing failure",
+            ))
+        }
+    }
+
+    impl opendal::raw::Access for FailingListService {
+        type Reader = opendal::raw::oio::Reader;
+        type Writer = opendal::raw::oio::Writer;
+        type Lister = opendal::raw::oio::Lister;
+        type Deleter = opendal::raw::oio::Deleter;
+
+        fn info(&self) -> std::sync::Arc<opendal::raw::AccessorInfo> {
+            let info = opendal::raw::AccessorInfo::default();
+            info.set_native_capability(opendal::Capability {
+                list: true,
+                ..Default::default()
+            });
+            info.into()
+        }
+
+        async fn list(
+            &self,
+            _path: &str,
+            _args: opendal::raw::OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            Ok((opendal::raw::RpList::default(), Box::new(FailingLister)))
+        }
+    }
+
+    #[tokio::test]
+    async fn list_object_entries_preserves_provider_error_kind() {
+        let raw = Operator::from_inner(std::sync::Arc::new(FailingListService));
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let mut entries = Box::pin(
+            store
+                .list_object_entries("unit-volume/objects/")
+                .await
+                .unwrap(),
+        );
+
+        let error = entries.next().await.unwrap().unwrap_err();
+        match error {
+            DataError::OpenDal(error) => {
+                assert_eq!(error.kind(), opendal::ErrorKind::Unexpected)
+            }
+            error => panic!("provider failure was misclassified: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_operations_use_configured_data_prefix() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let mut config = encrypted_test_config();
+        config.data_prefix = "tenant/demo".into();
+        let store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
+        let key = "tenant/demo/objects/aa/bb/custom-prefix-object";
+
+        store
+            .put_by_key(key, Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let mut entries = Box::pin(store.list_object_entries("tenant/demo/").await.unwrap());
+        assert_eq!(entries.next().await.unwrap().unwrap().key, key);
+        assert!(entries.next().await.is_none());
+
+        store.delete_by_key(key).await.unwrap();
+        assert!(!raw.exists(key).await.unwrap());
     }
 
     #[tokio::test]

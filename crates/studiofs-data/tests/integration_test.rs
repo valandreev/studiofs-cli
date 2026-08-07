@@ -66,6 +66,7 @@ fn test_config() -> DataStoreConfig {
         secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
         region: "us-east-1".into(),
         volume_name: "integration-test".into(),
+        data_prefix: "integration-test/objects/".into(),
         volume_uuid: "d34f3c2a-c3a4-4b01-b626-fb46de61118a".into(),
         crypto: DataStoreCryptoConfig::from(studiofs_meta::EncryptionConfig::new(
             [0x42; studiofs_meta::ENCRYPTION_KEY_LENGTH],

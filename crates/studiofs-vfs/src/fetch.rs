@@ -1475,6 +1475,7 @@ mod tests {
             secret_key: "secret".into(),
             region: "us-east-1".into(),
             volume_name: volume_name.clone(),
+            data_prefix: format!("{volume_name}/objects/"),
             volume_uuid: format!("fetch-encrypted-uuid-{volume_suffix}"),
             crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x35; 32])),
         };
