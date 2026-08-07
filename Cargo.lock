@@ -4860,6 +4860,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "dotenvy",
+ "futures",
  "hkdf",
  "opendal",
  "sha2",

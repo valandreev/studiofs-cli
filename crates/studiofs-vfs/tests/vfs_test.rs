@@ -1338,6 +1338,20 @@ async fn ensure_bucket_ready() -> bool {
         .is_ok()
 }
 
+fn raw_operator_for(config: &DataStoreConfig) -> opendal::Operator {
+    use opendal::{Operator, services::S3};
+
+    let builder = S3::default()
+        .endpoint(&config.endpoint)
+        .bucket(&config.bucket)
+        .access_key_id(&config.access_key)
+        .secret_access_key(&config.secret_key)
+        .region(&config.region);
+    Operator::new(builder)
+        .expect("raw test operator should build")
+        .finish()
+}
+
 /// Ensure the test bucket exists.
 async fn ensure_bucket() {
     let _ = ensure_bucket_ready().await;
@@ -1704,6 +1718,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
     let format_info = make_format_info(&volume_suffix);
     let data_config = DataStoreConfig::from(&format_info);
     let data_store = DataStore::new(&data_config).unwrap();
+    let raw_operator = raw_operator_for(&data_config);
     let _remote_cleanup = RemoteVolumeCleanup::new(&data_config);
     let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
     writer_meta.init_root(0, 0).unwrap();
@@ -1746,12 +1761,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         "encrypted E2E write should publish before remote inspection"
     );
 
-    let remote_ciphertext = data_store
-        .operator()
-        .read(&remote_key)
-        .await
-        .unwrap()
-        .to_bytes();
+    let remote_ciphertext = raw_operator.read(&remote_key).await.unwrap().to_bytes();
     assert!(remote_ciphertext.starts_with(SFEC_MAGIC));
     assert!(!remote_ciphertext.starts_with(STFS_MAGIC));
     assert!(
@@ -1792,8 +1802,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .last_mut()
         .expect("SFEC ciphertext should not be empty");
     *last ^= 0x01;
-    data_store
-        .operator()
+    raw_operator
         .write(&remote_key, Bytes::from(tampered))
         .await
         .unwrap();
@@ -1809,8 +1818,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         "tampered encrypted remote bytes must not read as valid plaintext"
     );
 
-    data_store
-        .operator()
+    raw_operator
         .write(&remote_key, remote_ciphertext.clone())
         .await
         .unwrap();
@@ -1851,14 +1859,8 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .await,
         "swap source should upload remote object {swap_object_id}"
     );
-    let swapped_ciphertext = data_store
-        .operator()
-        .read(&swap_key)
-        .await
-        .unwrap()
-        .to_bytes();
-    data_store
-        .operator()
+    let swapped_ciphertext = raw_operator.read(&swap_key).await.unwrap().to_bytes();
+    raw_operator
         .write(&remote_key, swapped_ciphertext)
         .await
         .unwrap();
@@ -1874,8 +1876,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         "ciphertext copied to the wrong object key must fail storage-key AAD validation"
     );
 
-    data_store
-        .operator()
+    raw_operator
         .write(&remote_key, remote_ciphertext)
         .await
         .unwrap();
@@ -2272,8 +2273,7 @@ async fn test_background_janitor_removes_orphan_object() {
     for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
         let key = format_object_fragment_key(&info.data_prefix, orphan_id, fragment_index as u8);
         if let Err(err) = ds
-            .operator()
-            .write(&key, Bytes::from_static(b"orphan-object"))
+            .put_by_key(&key, Bytes::from_static(b"orphan-object"))
             .await
         {
             if err.to_string().contains("NoSuchBucket") {

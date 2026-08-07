@@ -219,6 +219,7 @@ fn make_datastore(env: &TestEnv, name: &str) -> DataStore {
         secret_key: env.s3_secret_key.clone(),
         region: env.s3_region.clone(),
         volume_name: name.to_string(),
+        data_prefix: format!("{name}/objects/"),
         volume_uuid: Uuid::new_v4().to_string(),
         crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH])),
     };

@@ -11,7 +11,6 @@ workspace = true
 [dependencies]
 studiofs-vfs.workspace = true
 studiofs-meta.workspace = true
-studiofs-data.workspace = true
 tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
@@ -19,6 +18,7 @@ thiserror.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
+studiofs-data.workspace = true
 tempfile.workspace = true
 dotenvy.workspace = true
 studiofs-test-support.workspace = true

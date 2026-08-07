@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 studiofs-meta.workspace = true
 opendal.workspace = true
+futures.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true

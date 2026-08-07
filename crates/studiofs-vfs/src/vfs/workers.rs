@@ -1512,13 +1512,7 @@ impl StudioVfs {
                     }
                 };
 
-            let mut lister = match self
-                .data_write
-                .operator()
-                .lister_with(&self.data_prefix)
-                .recursive(true)
-                .await
-            {
+            let lister = match self.data_write.list_object_entries(&self.data_prefix).await {
                 Ok(v) => v,
                 Err(e) => {
                     let meta = self.meta.clone();
@@ -1535,6 +1529,7 @@ impl StudioVfs {
                     continue;
                 }
             };
+            let mut lister = std::pin::pin!(lister);
 
             let now = SystemTime::now();
             let now_unix = now
@@ -1560,11 +1555,8 @@ impl StudioVfs {
                         break;
                     }
                 };
-                if entry.metadata().mode() != EntryMode::FILE {
-                    continue;
-                }
                 scanned = scanned.saturating_add(1);
-                let path = entry.path();
+                let path = entry.key.as_str();
                 let object_id = match parse_object_id_from_key(path) {
                     Ok(id) => id,
                     Err(_) => {
@@ -1593,8 +1585,7 @@ impl StudioVfs {
                     if age >= self.janitor_skip_newer_than.as_secs() {
                         is_old_enough = true;
                     }
-                } else if let Some(last_modified) = entry.metadata().last_modified() {
-                    let last_modified_st: SystemTime = last_modified.into();
+                } else if let Some(last_modified_st) = entry.last_modified {
                     let age = now
                         .duration_since(last_modified_st)
                         .unwrap_or_else(|_| Duration::from_secs(0));
@@ -1612,8 +1603,9 @@ impl StudioVfs {
 
                 let mut delete_failed = false;
                 for key in format_object_fragment_keys(&self.data_prefix, object_id) {
-                    if let Err(e) = self.data_write.operator().delete(&key).await {
-                        if e.kind() == ErrorKind::NotFound {
+                    if let Err(e) = self.data_write.delete_by_key(&key).await {
+                        if matches!(&e, DataError::OpenDal(oe) if oe.kind() == ErrorKind::NotFound)
+                        {
                             continue;
                         }
                         delete_failed = true;
