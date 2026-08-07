@@ -584,14 +584,16 @@ impl DataStore {
     }
 
     /// Get the S3 object key for a generic object (content-addressable).
-    /// Format: `{volume}/objects/{ab}/{cd}/{id}`
+    ///
+    /// Format: `{configured_data_prefix}{ab}/{cd}/{id}` for IDs with at least
+    /// four characters, or `{configured_data_prefix}{id}` for shorter IDs.
     pub fn object_key(&self, object_id: &str) -> String {
+        let configured_prefix = self.config.data_prefix.trim_end_matches('/');
         if object_id.len() < 4 {
-            return format!("{}/objects/{}", self.volume_name, object_id);
+            return format!("{configured_prefix}/{object_id}");
         }
         format!(
-            "{}/objects/{}/{}/{}",
-            self.volume_name,
+            "{configured_prefix}/{}/{}/{}",
             &object_id[0..2],
             &object_id[2..4],
             object_id
@@ -1195,6 +1197,26 @@ mod tests {
 
         store.delete_by_key(key).await.unwrap();
         assert!(!raw.exists(key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn generic_object_lifecycle_uses_configured_data_prefix() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let mut config = encrypted_test_config();
+        config.data_prefix = "tenant/demo".into();
+        let store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
+        let object_id = "aabbccdd";
+        let key = store.object_key(object_id);
+
+        assert_eq!(key, "tenant/demo/aa/bb/aabbccdd");
+        store
+            .put_object(object_id, Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        assert!(raw.exists(&key).await.unwrap());
+
+        store.delete_object(object_id).await.unwrap();
+        assert!(!raw.exists(&key).await.unwrap());
     }
 
     #[tokio::test]

@@ -150,7 +150,7 @@ async fn put_and_get_by_key() {
 
     let data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
     let payload = Bytes::from(data.clone());
-    let key = format!("integration-test/raw/{}", unique_object_id());
+    let key = format!("integration-test/objects/raw/{}", unique_object_id());
 
     store.put_by_key(&key, payload).await.unwrap();
     let got = store.get_by_key(&key).await.unwrap().to_bytes();
@@ -235,7 +235,7 @@ async fn https_endpoint_fixture_put_get_when_configured() {
     ensure_bucket_for(&cfg).await;
     let store = DataStore::new(&cfg).expect("HTTPS S3 endpoint should build");
 
-    let key = format!("integration-test/https/{}", unique_object_id());
+    let key = format!("integration-test/objects/https/{}", unique_object_id());
     let payload = Bytes::from_static(b"studiofs https transport fixture");
 
     let put_res = store.put_by_key(&key, payload.clone()).await;
