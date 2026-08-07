@@ -920,20 +920,35 @@ fn run_mount_vfs_shutdown(
 ) -> anyhow::Result<(Runtime, anyhow::Result<()>)> {
     if tokio::runtime::Handle::try_current().is_ok() {
         let shutdown = std::thread::spawn(move || {
-            let result = runtime
-                .block_on(vfs.shutdown(upload_drain_timeout))
-                .map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}"));
-            (runtime, result)
+            block_on_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)
         });
         return shutdown.join().map_err(|_| {
             anyhow::anyhow!("mount VFS shutdown runtime thread panicked during unmount")
         });
     }
 
-    let result = runtime
-        .block_on(vfs.shutdown(upload_drain_timeout))
-        .map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}"));
-    Ok((runtime, result))
+    Ok(block_on_mount_vfs_shutdown(
+        runtime,
+        vfs,
+        upload_drain_timeout,
+    ))
+}
+
+fn block_on_mount_vfs_shutdown(
+    runtime: Runtime,
+    vfs: Arc<StudioVfs>,
+    upload_drain_timeout: Duration,
+) -> (Runtime, anyhow::Result<()>) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(vfs.shutdown(upload_drain_timeout))
+    }));
+    let result = match result {
+        Ok(result) => result.map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "mount VFS shutdown panicked during unmount"
+        )),
+    };
+    (runtime, result)
 }
 
 fn stop_mount_diagnostics_host(
@@ -1395,9 +1410,19 @@ impl Drop for MountRuntimeGuard {
             return;
         }
 
-        let _ = utils::remove_pid_file(&self.prepared.plan.actual_mount_path);
-        if let Some(snapshot_db_path) = self.prepared.snapshot_mount_db_path.take() {
-            let _ = remove_snapshot_mount_db(Some(&snapshot_db_path));
+        if let Err(error) = utils::remove_pid_file(&self.prepared.plan.actual_mount_path) {
+            warn!(
+                error = ?error,
+                "failed to remove mount record during mount runtime guard drop"
+            );
+        }
+        if let Some(snapshot_db_path) = self.prepared.snapshot_mount_db_path.take()
+            && let Err(error) = remove_snapshot_mount_db(Some(&snapshot_db_path))
+        {
+            warn!(
+                error = ?error,
+                "failed to remove snapshot mount database during mount runtime guard drop"
+            );
         }
         drop(self.prepared.mount_lock.take());
     }

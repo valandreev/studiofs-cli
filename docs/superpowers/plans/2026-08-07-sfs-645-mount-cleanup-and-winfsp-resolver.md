@@ -33,6 +33,8 @@ session tests and the existing x86/x64/arm64 resolver mapping test.
 - [x] (2026-08-07) Updated canonical WinFSP documentation and this completed plan after review.
 - [x] (2026-08-07) Ran focused native WinFSP mount/unmount smoke; Linux/FUSE and macFUSE native runners are unavailable on this Windows host.
 - [x] (2026-08-07) Recorded final evidence and remaining unavailable validation in this plan.
+- [x] (2026-08-07) Made VFS shutdown panic-safe so the mount guard retains the runtime for bounded shutdown.
+- [x] (2026-08-07) Logged full cleanup errors from the guard's panic-time `Drop`; retained idiomatic `unwrap_or_default()` for the optional WinFSP error suffix.
 
 ## Surprises & Discoveries
 
@@ -82,8 +84,11 @@ snapshot cleanup even when an earlier step fails. The first mount error is
 preserved and later cleanup errors are attached or logged. If unwinding starts
 before normal cleanup completes, the guard's `Drop` fallback removes the
 critical PID/snapshot artifacts and releases the lock without attempting a
-second async shutdown. The CLI now calls the public architecture-aware
-`studiofs-winfsp` loader; the duplicate registry lookup is gone.
+second async shutdown, logging any fallback failures with their full cause
+chains. A panic from VFS shutdown is converted into a cleanup error while the
+recovered runtime remains available for bounded `shutdown_mount_runtime`.
+The CLI now calls the public architecture-aware `studiofs-winfsp` loader; the
+duplicate registry lookup is gone.
 
 Passed checks:
 
@@ -115,12 +120,14 @@ Operator follow-up commands for the unavailable native cells are:
 
 ### Revision Note — 2026-08-07
 
-After review, later cleanup warnings now log the complete `anyhow` chain, the
-cleanup regressions drive the production `MountRuntimeGuard` on both error and
-panic paths, the guard has a critical-artifact `Drop` fallback, WinFSP startup
+After review, later cleanup warnings and panic-time `Drop` warnings now log the
+complete `anyhow` chain. The guard catches a panic from VFS shutdown and keeps
+the recovered runtime available for bounded shutdown, while the production
+cleanup regressions still cover error and backend-panic paths. WinFSP startup
 errors include installation guidance, the requirements describe x86/x64/ARM64
-shared resolution, and this plan reflects the implemented state and native
-validation evidence.
+shared resolution, `unwrap_or_default()` remains the idiomatic optional-string
+fallback, and this plan reflects the implemented state and native validation
+evidence.
 
 ## Context and Orientation
 
@@ -179,8 +186,9 @@ database. A small `record_cleanup_error` helper will keep the first cleanup
 error and log later cleanup errors. The final result will return the original
 mount/backend error when one exists; otherwise it will return the first cleanup
 error with the cleanup step named. Any helper whose current return type loses
-the Tokio runtime when VFS shutdown fails will be adjusted only enough to keep
-the runtime available for the later shutdown step.
+the Tokio runtime when VFS shutdown fails will catch a panic around `block_on`
+and return the runtime alongside the shutdown error so the later bounded
+shutdown step still runs.
 
 Finally make `studiofs_winfsp::ensure_winfsp_runtime_loaded` public with a
 short API comment, delete `init_winfsp_dll_path` and its unsafe registry/FFI
@@ -237,7 +245,8 @@ gone. The cleanup-order regression must show that the first cleanup error is
 the returned cleanup error and that later cleanup steps executed after it.
 The panic regression must catch a backend panic and show that the JSON PID
 record, snapshot DB, and lifecycle lock are removed without running a second
-full VFS shutdown.
+full VFS shutdown. A panic from VFS shutdown must become a cleanup error while
+leaving the runtime available for the bounded runtime-shutdown step.
 The existing `foreground_shutdown_releases_vfs_handles_before_runtime_shutdown`
 test must continue to pass, proving all VFS `Arc` owners are dropped before the
 Tokio runtime shutdown boundary.
@@ -266,8 +275,8 @@ leave them untouched and scope the final diff to the SFS-645 changes.
 Expected implementation artifacts:
 
 - `crates/studiofs/src/cli/mount/session.rs`: guard-owned foreground cleanup,
-  error collection, full-chain cleanup logging, panic fallback, and
-  production-sequence regression coverage.
+  error collection, panic-safe VFS runtime recovery, full-chain cleanup
+  logging, panic fallback, and production-sequence regression coverage.
 - `docs/platform-bridges.md`: architecture-aware WinFSP resolver requirements
   for x86, x86_64, and ARM64.
 - `crates/studiofs/src/main.rs`: no duplicate WinFSP registry/DLL resolver;
