@@ -69,7 +69,7 @@ impl DataError {
 pub type DataResult<T> = Result<T, DataError>;
 
 /// A file returned by a provider listing without exposing provider-specific types.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DataStoreObjectEntry {
     /// Full storage key for the listed file.
     pub key: String,
@@ -676,22 +676,16 @@ impl DataStore {
         self.validate_volume_key(prefix)?;
         let lister = self.op.lister_with(prefix).recursive(true).await?;
 
-        Ok(futures::stream::unfold(lister, |mut lister| async move {
-            loop {
-                let entry = lister.next().await?;
-                match entry {
-                    Ok(entry) if entry.metadata().mode() == EntryMode::FILE => {
-                        return Some((
-                            Ok(DataStoreObjectEntry {
-                                key: entry.path().to_owned(),
-                                last_modified: entry.metadata().last_modified().map(Into::into),
-                            }),
-                            lister,
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(error) => return Some((Err(DataError::from(error)), lister)),
+        Ok(lister.filter_map(|entry| async move {
+            match entry {
+                Ok(entry) if entry.metadata().mode() == EntryMode::FILE => {
+                    Some(Ok(DataStoreObjectEntry {
+                        key: entry.path().to_owned(),
+                        last_modified: entry.metadata().last_modified().map(Into::into),
+                    }))
                 }
+                Ok(_) => None,
+                Err(error) => Some(Err(DataError::from(error))),
             }
         }))
     }

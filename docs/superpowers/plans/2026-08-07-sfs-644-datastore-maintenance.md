@@ -58,7 +58,7 @@ The janitor's raw listing and fragment deletes now use `list_object_entries` and
 
 Evidence:
 
-- `cargo test -p studiofs-data --lib`: 49 passed.
+- `cargo test -p studiofs-data --lib`: 50 passed.
 - `cargo check -p studiofs-vfs --test vfs_test`: passed.
 - `cargo check -p studiofs-winfsp --tests`: passed.
 - `cargo clippy -p studiofs-data -p studiofs-vfs -p studiofs-winfsp --all-targets -- -D warnings`: passed.
@@ -99,7 +99,7 @@ Files:
 
 Add this public data-layer value and accessors:
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub struct DataStoreObjectEntry {
         pub key: String,
         pub last_modified: Option<SystemTime>,
@@ -114,7 +114,7 @@ Implement the listing signature:
         prefix: &str,
     ) -> DataResult<impl futures::Stream<Item = DataResult<DataStoreObjectEntry>>>
 
-Create the OpenDAL lister with `self.op.lister_with(prefix).recursive(true).await?`. Wrap it with `futures::stream::unfold`; use `StreamExt::next` to skip non-file entries, return each file's path and `metadata().last_modified().map(Into::into)`, and map each provider error with `DataError::from`. Do not expose `opendal::Lister` or `opendal::Entry` in the signature. Remove the public `operator` method. Route `delete_object` through the validated `delete_by_key` method so object deletes receive the same scope check.
+Create the OpenDAL lister with `self.op.lister_with(prefix).recursive(true).await?`. Wrap it with `StreamExt::filter_map` to skip non-file entries, return each file's path and `metadata().last_modified().map(Into::into)`, and map each provider error with `DataError::from`. Do not expose `opendal::Lister` or `opendal::Entry` in the signature. Remove the public `operator` method. Route `delete_object` through the validated `delete_by_key` method so object deletes receive the same scope check.
 
 Run:
 
@@ -176,7 +176,6 @@ Run from `E:\dev\studiofs-cli`:
     cargo test -p studiofs-data --lib
     cargo check -p studiofs-winfsp --tests
     cargo clippy -p studiofs-data -p studiofs-vfs -p studiofs-winfsp --all-targets -- -D warnings
-    cargo metadata --no-deps --format-version 1 | ConvertFrom-Json | ...
     rg -n "\.operator\(\)|pub fn operator" crates Cargo.toml
     git diff --check
 
