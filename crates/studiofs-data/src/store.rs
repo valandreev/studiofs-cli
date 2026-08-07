@@ -219,6 +219,9 @@ impl From<&FormatInfo> for DataStoreConfig {
 }
 
 fn normalize_data_prefix(volume_name: &str, data_prefix: &str) -> String {
+    if data_prefix == "/" {
+        return data_prefix.to_owned();
+    }
     let configured_prefix = data_prefix.trim_end_matches('/');
     if configured_prefix.is_empty() {
         format!("{volume_name}/objects/")
@@ -830,6 +833,7 @@ mod tests {
             normalize_data_prefix("unit-volume", "tenant/demo///"),
             "tenant/demo/"
         );
+        assert_eq!(normalize_data_prefix("unit-volume", "/"), "/");
     }
 
     fn assert_send<T: Send>() {}
