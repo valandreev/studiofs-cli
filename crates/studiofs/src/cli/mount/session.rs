@@ -1416,21 +1416,14 @@ impl Drop for MountRuntimeGuard {
                 "failed to remove mount record during mount runtime guard drop"
             );
         }
-        if let Some(snapshot_db_path) = self.prepared.snapshot_mount_db_path.take()
-            && let Err(error) = remove_snapshot_mount_db(Some(&snapshot_db_path))
-        {
-            warn!(
-                error = ?error,
-                "failed to remove snapshot mount database during mount runtime guard drop"
-            );
-        }
+        cleanup_snapshot_mount_db(self.prepared.snapshot_mount_db_path.as_deref());
         drop(self.prepared.mount_lock.take());
     }
 }
 
 fn cleanup_snapshot_mount_db(snapshot_db_path: Option<&Path>) {
     if let Err(error) = remove_snapshot_mount_db(snapshot_db_path) {
-        warn!(error = %error, "failed to remove snapshot mount database");
+        warn!(error = ?error, "failed to remove snapshot mount database");
     }
 }
 
