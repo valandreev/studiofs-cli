@@ -1482,7 +1482,7 @@ fn configuration_contracts_match_executable_defaults() {
             contains_doc_term(
                 &mount_backend,
                 &normalized_mount_backend,
-                "Box::new(LinuxFuseMountBackend)",
+                "pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> { Box::new(LinuxFuseMountBackend) }",
             ),
         ),
         (
@@ -1506,7 +1506,7 @@ fn configuration_contracts_match_executable_defaults() {
             contains_doc_term(
                 &mount_backend,
                 &normalized_mount_backend,
-                "Box::new(WinfspMountBackend)",
+                "pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> { Box::new(WinfspMountBackend) }",
             ),
         ),
         (
@@ -1615,6 +1615,7 @@ fn removed_configuration_knobs_have_no_active_surface() {
         "crates/studiofs-vfs/src/vfs.rs",
         "crates/studiofs-vfs/src/vfs/tests.rs",
         "crates/studiofs-vfs/tests/vfs_test.rs",
+        "crates/studiofs/src/cli/settings.rs",
         "docs/agents-coding-guide.md",
         "docs/configuration.md",
         "docs/superpowers/specs/2026-07-02-sfs-595-juicefs-writer-pipeline-design.md",
