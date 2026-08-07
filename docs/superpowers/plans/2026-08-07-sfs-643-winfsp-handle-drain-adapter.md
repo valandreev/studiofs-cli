@@ -17,6 +17,7 @@ The observable result is unchanged: WinFSP non-delete cleanup is observational, 
 - [x] (2026-08-07) Removed the VFS-only barrier module, ports, generic exports, and their tests.
 - [x] (2026-08-07) Ran focused Windows tests, Windows package checks, Clippy, formatting, and diff validation.
 - [x] (2026-08-07) Committed the pre-review implementation as `e594aaa4`; completed the review follow-up in the current working tree.
+- [x] (2026-08-07) Fixed the review-identified flush-gate TOCTOU, removed the test-only bypass, and simplified infallible cleanup dispatch.
 
 ## Surprises & Discoveries
 
@@ -131,7 +132,7 @@ The refactor is source-only and can be retried by reverting only the uncommitted
 
 ## Artifacts and Notes
 
-The pre-plan implementation diff reported 143 insertions and 924 deletions across the four tracked source changes; the deleted barrier module accounts for 619 lines. The current review-follow-up diff relative to merge base is 341 insertions and 959 deletions across five files: 199 source insertions plus 142 plan insertions, with the deleted barrier still accounting for 619 lines. The focused `handle_drain` filter now covers 7 tests; the prior focused context and bridge checks remain recorded above. The initial implementation commit was `e594aaa4`; the review follow-up is currently uncommitted.
+The pre-plan implementation diff reported 143 insertions and 924 deletions across the four tracked source changes; the deleted barrier module accounts for 619 lines. The current review-follow-up diff relative to merge base is 355 insertions and 1,023 deletions across six files: 210 source insertions plus 145 plan insertions, with the deleted barrier still accounting for 619 lines. The focused `handle_drain` filter covers 7 tests and the focused clean-callback filter covers 21 tests; the prior focused context and bridge checks remain recorded above. The initial implementation commit was `e594aaa4`; the review follow-up is currently uncommitted.
 
 ## Interfaces and Dependencies
 
@@ -140,3 +141,5 @@ The final shared VFS interface is the existing concrete API on `StudioVfs`: `ino
 Revision note (2026-08-07): Created after inspecting SFS-643, the current VFS barrier module, the WinFSP facade, bridge mappings, and existing focused tests. The initial implementation deliberately excludes macFUSE/Linux source edits because their code does not depend on the deleted port surface.
 
 Revision note (2026-08-07, review follow-up): Added `concurrent_dirty_flush_callbacks_preserve_volatile_barrier_contract` in the WinFSP adapter. Verification showed that the deleted fake-port coalescing expectation does not match the real volatile VFS contract: ordinary flush reports each accepted dirty callback, leaves dirty state for background materialization, and does not increment the strict local barrier metric. Updated the plan to record the final test count, target-gated Windows checks, and the exact missing native/mounted prerequisites.
+
+Revision note (2026-08-07, second review follow-up): Moved the clean flush fast path out of `with_flush_gate`, which now always owns the per-inode lock before rechecking state and dispatching the barrier. Removed the test-only duplicate callback path, changed the infallible non-delete cleanup callback to return unit, and expressed orphan-healing fallback with `unwrap_or_else`.
