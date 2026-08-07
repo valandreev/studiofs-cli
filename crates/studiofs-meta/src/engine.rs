@@ -5,7 +5,7 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Aggregate latency for one metadata storage stage.
@@ -109,9 +109,17 @@ pub enum MetaError {
     #[error("storage error: {0}")]
     Storage(String),
 
-    /// PostgreSQL could not be reached during an operation that permits local-first fallback.
-    #[error("postgres unavailable: {0}")]
-    PostgresUnavailable(String),
+    /// The metadata backend or remote service could not be reached.
+    #[error("remote unavailable: {0}")]
+    RemoteUnavailable(String),
+
+    /// The metadata store requires repair before it can be used.
+    #[error("metadata repair required: {0}")]
+    RepairRequired(String),
+
+    /// An operation exceeded its configured deadline.
+    #[error("operation timed out: {0}")]
+    Timeout(String),
 
     /// Serialization or deserialization failure for persisted metadata.
     #[error("serialization error: {0}")]
@@ -196,14 +204,7 @@ impl MetaError {
     /// probe could not service the open.  Callers can retry with a writable
     /// `Database::create()` which auto-recovers.
     pub fn is_redb_repair_needed(&self) -> bool {
-        if let MetaError::Storage(msg) = self {
-            // redb 3.x: `DatabaseError::RepairAborted` stringifies as
-            // "Database repair aborted" which our read_format_info_readonly
-            // wraps in "failed to open redb read-only: …".
-            msg.contains("repair") || msg.contains("RepairAborted")
-        } else {
-            false
-        }
+        matches!(self, MetaError::RepairRequired(_))
     }
 }
 
@@ -688,22 +689,10 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     /// Allocate a new sequential object ID.
     fn next_object_id(&self) -> MetaResult<u64>;
 
-    /// Allocate `count` consecutive object IDs in a single transaction.
+    /// Allocate `count` consecutive object IDs in one backend transaction.
     ///
     /// Returns `count` IDs starting from the current counter value.
-    /// Default implementation calls `next_object_id()` repeatedly.
-    fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        let count = usize::try_from(count).map_err(|_| {
-            MetaError::Storage(
-                "requested object allocation count exceeds platform limits".to_string(),
-            )
-        })?;
-        let mut ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            ids.push(self.next_object_id()?);
-        }
-        Ok(ids)
-    }
+    fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>>;
 
     /// Flush new local overlay slices for a regular file.
     ///
@@ -719,26 +708,13 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     ///
     /// This is used by epoch finalization to avoid publishing while local
     /// overlay metadata is still pending promotion to committed/base state.
-    fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool> {
-        let _ = ino;
-        Ok(false)
-    }
+    fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool>;
 
     /// Collect object ids currently referenced by local regular-file overlay.
     ///
-    /// Backends with a dedicated overlay graph should override this to read from
-    /// overlay metadata directly. The default resolves the current regular-file
-    /// slice graph and deduplicates referenced objects.
-    fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        let mut ids = HashSet::new();
-        let attr = self.get_attr(ino)?;
-        for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-            if let Some(block) = span.payload {
-                ids.insert(block.object_id);
-            }
-        }
-        Ok(ids.into_iter().collect())
-    }
+    /// Backends must read the dedicated local overlay graph so shadowed and
+    /// unpublished payload references are not lost during upload/GC decisions.
+    fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>>;
 
     /// Collect all object ids currently referenced anywhere in the inode's
     /// regular-file graph, together with their deduplicated physical byte
@@ -747,20 +723,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     /// The returned byte count is the maximum observed `offset + length` for
     /// each `object_id`, so a staged object referenced by multiple slices is
     /// counted once.
-    fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
-        let mut usage: HashMap<u64, u64> = HashMap::new();
-        let attr = self.get_attr(ino)?;
-        for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-            if let Some(block) = span.payload {
-                let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
-                usage
-                    .entry(block.object_id)
-                    .and_modify(|existing| *existing = (*existing).max(object_bytes))
-                    .or_insert(object_bytes);
-            }
-        }
-        Ok(usage.into_iter().collect())
-    }
+    fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>>;
 
     /// Return `true` when `object_id` is still referenced by the inode's local
     /// regular-file overlay for `expected_epoch`.
@@ -775,10 +738,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         ino: Ino,
         expected_epoch: u64,
         object_id: u64,
-    ) -> MetaResult<bool> {
-        let _ = (ino, expected_epoch, object_id);
-        Ok(false)
-    }
+    ) -> MetaResult<bool>;
 
     /// Mark a still-referenced overlay object as remote-visible for the current
     /// unpublished epoch, even when its logical block is represented by
@@ -793,10 +753,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         ino: Ino,
         expected_epoch: u64,
         object_id: u64,
-    ) -> MetaResult<bool> {
-        let _ = (ino, expected_epoch, object_id);
-        Ok(false)
-    }
+    ) -> MetaResult<bool>;
 
     /// Batch form of [`mark_regular_file_overlay_object_uploaded_if_matches`].
     ///
@@ -999,30 +956,24 @@ pub trait MetaReplication: Send + Sync {
 
     /// Advance the local metadata durability group-commit policy without waiting
     /// for peer publication.
-    fn flush_local_metadata(&self) -> MetaResult<()> {
-        self.flush_metadata()
-    }
+    fn flush_local_metadata(&self) -> MetaResult<()>;
 
     /// Force metadata synchronization from remote source (if applicable).
     fn sync_metadata(&self) -> MetaResult<()>;
 
     /// Execute the strict local metadata durability barrier without waiting for
     /// peer publication.
-    fn sync_local_metadata(&self) -> MetaResult<()> {
-        self.sync_metadata()
-    }
+    fn sync_local_metadata(&self) -> MetaResult<()>;
 
     /// Record a VFS-local open handle that should keep its inode binding alive
     /// while remote metadata is applied.
-    fn note_active_open_inode(&self, _ino: Ino) {}
+    fn note_active_open_inode(&self, ino: Ino);
 
     /// Release a previously recorded VFS-local open handle.
-    fn note_inactive_open_inode(&self, _ino: Ino) {}
+    fn note_inactive_open_inode(&self, ino: Ino);
 
     /// Force metadata synchronization from the periodic invalidation fallback poll.
-    fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()> {
-        self.sync_metadata()
-    }
+    fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()>;
 
     /// Stable identifier used for invalidation self-echo suppression.
     fn invalidation_sender_id(&self) -> Option<String>;
@@ -1044,18 +995,14 @@ pub trait MetaReplication: Send + Sync {
     fn metadata_version_token(&self) -> Option<String>;
 
     /// Best-effort namespace-only version token for dentry/path invalidation.
-    fn namespace_version_token(&self) -> Option<String> {
-        self.metadata_version_token()
-    }
+    fn namespace_version_token(&self) -> Option<String>;
 
     /// Best-effort count of local metadata mutations not yet durably pushed to remote.
     fn replication_backlog(&self) -> MetadataReplicationBacklog;
 
     /// Best-effort local metadata authority status for deciding whether new
     /// mutations should still be accepted.
-    fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
-        MetadataAuthorityStatus::writable()
-    }
+    fn metadata_authority_status(&self) -> MetadataAuthorityStatus;
 
     /// Return the estimated size of remote metadata in bytes, if applicable.
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
@@ -1100,21 +1047,12 @@ pub trait MetaEngine:
     /// as `upload_state` inside the commit transaction using information only
     /// they can observe (e.g. whether a committed remote base graph already exists).
     ///
-    /// Backends should override this to make the operation atomic if possible.
+    /// Concrete backends must commit the slice and attribute mutations in one
+    /// backend transaction when both are provided.
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<Option<InodeAttr>> {
-        self.flush_regular_file_overlay_slices(ino, chunk_slices)?;
-        if let Some(attr) = attr {
-            // `set_attr` normalises `upload_state` (including the
-            // `has_committed_graph` check) before writing, so we must
-            // re-read the stored value to return the accurate committed form.
-            self.set_attr(attr)?;
-            return Ok(Some(self.get_attr(ino)?));
-        }
-        Ok(None)
-    }
+    ) -> MetaResult<Option<InodeAttr>>;
 }

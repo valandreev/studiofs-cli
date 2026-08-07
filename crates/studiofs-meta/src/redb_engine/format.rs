@@ -30,6 +30,11 @@ impl RedbMetaEngine {
             {
                 return Err(MetaError::NotFormatted);
             }
+            Err(redb::DatabaseError::RepairAborted) => {
+                return Err(MetaError::RepairRequired(
+                    "redb database requires repair".to_string(),
+                ));
+            }
             Err(e) => {
                 return Err(MetaError::Storage(format!(
                     "failed to open redb read-only: {e}"

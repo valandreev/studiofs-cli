@@ -224,4 +224,13 @@ mod tests {
             "repair reset must keep the stable client identity for self-batch detection"
         );
     }
+
+    #[test]
+    fn storage_repair_text_is_not_treated_as_a_typed_repair_error() {
+        assert!(!MetaError::Storage("Database repair aborted".to_string()).is_redb_repair_needed());
+        assert!(
+            MetaError::RepairRequired("redb database requires repair".to_string())
+                .is_redb_repair_needed()
+        );
+    }
 }

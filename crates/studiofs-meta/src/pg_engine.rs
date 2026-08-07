@@ -386,7 +386,7 @@ impl PgMetaEngine {
     }
 
     fn is_postgres_unavailable(error: &MetaError) -> bool {
-        matches!(error, MetaError::PostgresUnavailable(_))
+        matches!(error, MetaError::RemoteUnavailable(_))
     }
 
     /// Open the PostgreSQL-backed metadata engine using default startup options.

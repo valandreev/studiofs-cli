@@ -1495,6 +1495,14 @@ impl MetaReplication for RedbMetaEngine {
         RedbMetaEngine::sync_local_metadata(self)
     }
 
+    fn note_active_open_inode(&self, _ino: Ino) {}
+
+    fn note_inactive_open_inode(&self, _ino: Ino) {}
+
+    fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
     fn invalidation_sender_id(&self) -> Option<String> {
         None
     }

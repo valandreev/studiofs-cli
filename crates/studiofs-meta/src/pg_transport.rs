@@ -169,7 +169,7 @@ pub async fn connect_studiofs_postgres(
             .is_some_and(is_transport_unavailable);
         let message = format_pg_error(error);
         if unavailable {
-            MetaError::PostgresUnavailable(message)
+            MetaError::RemoteUnavailable(message)
         } else {
             MetaError::Storage(format!("postgres connect failed: {message}"))
         }
@@ -199,7 +199,7 @@ fn is_transport_unavailable(error: &io::Error) -> bool {
 
 fn parse_postgres_config(dsn: &str) -> MetaResult<tokio_postgres::Config> {
     tokio_postgres::Config::from_str(dsn)
-        .map_err(|error| MetaError::Storage(format!("invalid postgres DSN: {error}")))
+        .map_err(|_| MetaError::Storage("invalid postgres DSN".to_string()))
 }
 
 fn log_postgres_transport_policy(policy: &PgTransportPolicy) {

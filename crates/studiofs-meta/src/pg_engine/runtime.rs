@@ -394,9 +394,9 @@ impl PgMetaEngine {
             timeout.as_millis()
         );
         if unavailable {
-            MetaError::PostgresUnavailable(message)
+            MetaError::RemoteUnavailable(message)
         } else {
-            MetaError::Storage(message)
+            MetaError::Timeout(message)
         }
     }
 

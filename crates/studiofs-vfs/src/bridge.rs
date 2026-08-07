@@ -32,6 +32,10 @@ pub enum BridgeVfsErrorKind {
     Retryable,
     /// The operation exceeded a timeout.
     TimedOut,
+    /// Metadata storage requires repair before requests can proceed.
+    RepairRequired,
+    /// The authoritative remote metadata service is unavailable.
+    RemoteUnavailable,
     /// Insufficient resources are available to satisfy the request.
     InsufficientResources,
     /// Persistent corruption was detected in metadata, data, or payload.
@@ -103,6 +107,9 @@ fn classify_meta_error(error: &MetaError) -> BridgeVfsErrorKind {
         MetaError::IsADirectory(_) => BridgeVfsErrorKind::IsDirectory,
         MetaError::DirNotEmpty(_) => BridgeVfsErrorKind::DirectoryNotEmpty,
         MetaError::NotFormatted => BridgeVfsErrorKind::UnrecognizedVolume,
+        MetaError::RepairRequired(_) => BridgeVfsErrorKind::RepairRequired,
+        MetaError::RemoteUnavailable(_) => BridgeVfsErrorKind::RemoteUnavailable,
+        MetaError::Timeout(_) => BridgeVfsErrorKind::TimedOut,
         MetaError::NonContiguousRegularFileGraph { .. } => BridgeVfsErrorKind::DataCorruption,
         MetaError::XattrValueTooLarge { .. } => BridgeVfsErrorKind::XattrValueTooLarge,
         MetaError::AccessDenied { .. } => BridgeVfsErrorKind::PermissionDenied,
@@ -354,6 +361,34 @@ mod tests {
             classify_vfs_error(&stage_timeout),
             BridgeVfsErrorKind::TimedOut
         );
+    }
+
+    #[test]
+    fn classify_vfs_error_preserves_repair_category() {
+        let error = crate::VfsError::Meta(MetaError::RepairRequired("redb repair".into()));
+
+        assert_eq!(
+            classify_vfs_error(&error),
+            BridgeVfsErrorKind::RepairRequired
+        );
+    }
+
+    #[test]
+    fn classify_vfs_error_preserves_remote_unavailable_category() {
+        let error =
+            crate::VfsError::Meta(MetaError::RemoteUnavailable("connection refused".into()));
+
+        assert_eq!(
+            classify_vfs_error(&error),
+            BridgeVfsErrorKind::RemoteUnavailable
+        );
+    }
+
+    #[test]
+    fn classify_vfs_error_preserves_timeout_category() {
+        let error = crate::VfsError::Meta(MetaError::Timeout("metadata command".into()));
+
+        assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::TimedOut);
     }
 
     #[test]

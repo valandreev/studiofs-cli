@@ -1,17 +1,27 @@
 use crate::{MetaError, MetaResult, connect_studiofs_postgres};
+use std::fmt;
 use std::str::FromStr;
 
 /// Canonical PostgreSQL database name used for StudioFS metadata.
 pub const STUDIOFS_METADATA_DB: &str = "studiofs";
 const PG_ADMIN_DB: &str = "postgres";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// Pair of DSNs used to provision and then connect to the StudioFS metadata DB.
 pub struct StudioPgDsns {
     /// DSN that targets an administrative database such as `postgres`.
     pub admin_dsn: String,
     /// DSN that targets the `studiofs` metadata database itself.
     pub metadata_dsn: String,
+}
+
+impl fmt::Debug for StudioPgDsns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StudioPgDsns")
+            .field("admin_dsn", &"***")
+            .field("metadata_dsn", &"***")
+            .finish()
+    }
 }
 
 /// Resolve an input PostgreSQL DSN into admin and StudioFS metadata DSNs.
@@ -78,7 +88,7 @@ pub async fn ensure_studiofs_database(input: &str) -> MetaResult<StudioPgDsns> {
 
 fn rewrite_url_dsn(input: &str, db_name: &str) -> MetaResult<String> {
     let mut url = url::Url::parse(input)
-        .map_err(|e| MetaError::Storage(format!("invalid postgres URL: {e}")))?;
+        .map_err(|_| MetaError::Storage("invalid postgres URL".to_string()))?;
     match url.scheme() {
         "postgres" | "postgresql" => {}
         other => {
@@ -93,7 +103,7 @@ fn rewrite_url_dsn(input: &str, db_name: &str) -> MetaResult<String> {
 
 fn rewrite_keyword_dsn(input: &str, db_name: &str) -> MetaResult<String> {
     tokio_postgres::Config::from_str(input)
-        .map_err(|e| MetaError::Storage(format!("invalid postgres DSN: {e}")))?;
+        .map_err(|_| MetaError::Storage("invalid postgres DSN".to_string()))?;
 
     let mut tokens = split_keyword_dsn(input);
     let mut replaced = false;
@@ -209,5 +219,37 @@ mod tests {
         .expect("resolve keyword dsn");
         assert!(!dsns.metadata_dsn.contains("dbname=otherdb"));
         assert!(dsns.metadata_dsn.contains("dbname=studiofs"));
+    }
+
+    #[test]
+    fn studio_pg_dsns_debug_omits_credentials_and_full_dsns() {
+        let dsns = resolve_studiofs_pg_dsns(
+            "postgres://user:dsn-password-sentinel@db.example.com/original",
+        )
+        .expect("resolve DSNs");
+
+        let debug = format!("{dsns:?}");
+
+        assert!(!debug.contains("dsn-password-sentinel"));
+        assert!(!debug.contains(&dsns.admin_dsn));
+        assert!(!debug.contains(&dsns.metadata_dsn));
+        assert!(debug.contains("***"));
+    }
+
+    #[test]
+    fn invalid_dsn_errors_omit_the_original_dsn() {
+        let input = "postgres://user:dsn-error-password-sentinel@[";
+        let error = resolve_studiofs_pg_dsns(input).expect_err("invalid DSN");
+        let rendered = format!("{error:?} {error}");
+
+        assert!(!rendered.contains("dsn-error-password-sentinel"));
+        assert!(!rendered.contains(input));
+
+        let input = "host=db.example.com port=not-a-port password=dsn-error-password-sentinel";
+        let error = resolve_studiofs_pg_dsns(input).expect_err("invalid keyword DSN");
+        let rendered = format!("{error:?} {error}");
+
+        assert!(!rendered.contains("dsn-error-password-sentinel"));
+        assert!(!rendered.contains(input));
     }
 }

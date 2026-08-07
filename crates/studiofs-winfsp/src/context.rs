@@ -83,6 +83,8 @@ const STATUS_NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103_u32 as i32);
 const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
 const STATUS_UNRECOGNIZED_VOLUME: NTSTATUS = NTSTATUS(0xC000_014F_u32 as i32);
 const STATUS_DATA_ERROR: NTSTATUS = NTSTATUS(0xC000_003E_u32 as i32);
+const STATUS_DISK_CORRUPT_ERROR: NTSTATUS = NTSTATUS(0xC000_0032_u32 as i32);
+const STATUS_BAD_NETWORK_PATH: NTSTATUS = NTSTATUS(0xC000_00BE_u32 as i32);
 const STATUS_IO_TIMEOUT: NTSTATUS = NTSTATUS(0xC000_00B5_u32 as i32);
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = NTSTATUS(0xC000_009A_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
@@ -817,6 +819,8 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
         BridgeVfsErrorKind::InvalidInput => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
         BridgeVfsErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
         BridgeVfsErrorKind::TimedOut => winfsp::FspError::from(STATUS_IO_TIMEOUT),
+        BridgeVfsErrorKind::RepairRequired => winfsp::FspError::from(STATUS_DISK_CORRUPT_ERROR),
+        BridgeVfsErrorKind::RemoteUnavailable => winfsp::FspError::from(STATUS_BAD_NETWORK_PATH),
         BridgeVfsErrorKind::InsufficientResources => {
             winfsp::FspError::from(STATUS_INSUFFICIENT_RESOURCES)
         }
@@ -2268,16 +2272,17 @@ mod tests {
         FILE_NOTIFY_CHANGE_SIZE, FILE_OVERWRITE_IF_DISPOSITION, FILE_READ_ATTRIBUTES_ACCESS,
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PreparedWinfspNotifications,
-        READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE,
-        STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
-        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspInvalidationQueue,
-        WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
-        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
-        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
-        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
-        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
-        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
-        winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
+        READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR,
+        STATUS_DISK_CORRUPT_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
+        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
+        StudioFsContext, WinfspInvalidationQueue, WinfspKernelInvalidator, attr_to_file_info,
+        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
+        hidden_platform_root_path_component, ino_to_windows_path, is_runtime_stats_windows_path,
+        maybe_hide_platform_root_entry, notify_filter_for_kind, open_flags_from_access,
+        resolve_create_callback_kind, resolve_file_size_callback_action,
+        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
+        write_local_sync_policy_from_create_options,
         write_local_sync_policy_from_create_parameters,
     };
     use std::collections::BTreeSet;
@@ -3313,6 +3318,18 @@ mod tests {
             source: studiofs_data::store::DataError::Storage("timeout".into()),
         });
         let status = vfs_to_winfsp_err(exhausted).to_ntstatus();
+        assert_eq!(status, STATUS_IO_TIMEOUT.0);
+
+        let repair = VfsError::Meta(MetaError::RepairRequired("repair".into()));
+        let status = vfs_to_winfsp_err(repair).to_ntstatus();
+        assert_eq!(status, STATUS_DISK_CORRUPT_ERROR.0);
+
+        let unavailable = VfsError::Meta(MetaError::RemoteUnavailable("offline".into()));
+        let status = vfs_to_winfsp_err(unavailable).to_ntstatus();
+        assert_eq!(status, STATUS_BAD_NETWORK_PATH.0);
+
+        let timeout = VfsError::Meta(MetaError::Timeout("timeout".into()));
+        let status = vfs_to_winfsp_err(timeout).to_ntstatus();
         assert_eq!(status, STATUS_IO_TIMEOUT.0);
     }
 

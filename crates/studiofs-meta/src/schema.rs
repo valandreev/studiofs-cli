@@ -1495,7 +1495,7 @@ pub fn resolve_chunk_slice_spans(
 /// Volume format information - stored in FORMAT_INFO table.
 ///
 /// Created at volume initialization, immutable thereafter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormatInfo {
     /// Schema format version for compatibility checks.
@@ -1524,6 +1524,25 @@ pub struct FormatInfo {
     pub encryption: EncryptionConfig,
     /// Block size in bytes (configurable at init, default 16MB).
     pub block_size: u32,
+}
+
+impl fmt::Debug for FormatInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FormatInfo")
+            .field("format_version", &self.format_version)
+            .field("name", &self.name)
+            .field("uuid", &self.uuid)
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"***")
+            .field("secret_key", &"***")
+            .field("region", &self.region)
+            .field("data_prefix", &self.data_prefix)
+            .field("metadata", &self.metadata)
+            .field("encryption", &self.encryption)
+            .field("block_size", &self.block_size)
+            .finish()
+    }
 }
 
 /// Supported transparent remote-object encryption algorithm.
@@ -1692,7 +1711,7 @@ pub enum MetadataBackend {
 }
 
 /// Connection details for remote metadata object store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteStoreConfig {
     /// Metadata object-store endpoint URL.
@@ -1708,6 +1727,19 @@ pub struct RemoteStoreConfig {
     #[serde(default = "default_metadata_prefix")]
     /// Prefix under which metadata objects are stored.
     pub prefix: String,
+}
+
+impl fmt::Debug for RemoteStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteStoreConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"***")
+            .field("secret_key", &"***")
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 /// Metadata runtime settings.
@@ -1726,7 +1758,7 @@ pub struct MetadataConfig {
 }
 
 /// Connection details for PostgreSQL metadata backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresConfig {
     /// PostgreSQL server DSN (e.g. postgres://user:pass@host:5432).
@@ -1734,6 +1766,15 @@ pub struct PostgresConfig {
     pub url: String,
     /// Logical volume id in shared PG schema.
     pub volume_id: i64,
+}
+
+impl fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("url", &"***")
+            .field("volume_id", &self.volume_id)
+            .finish()
+    }
 }
 
 fn default_metadata_prefix() -> String {
@@ -2218,5 +2259,44 @@ mod tests {
 
         attr.kind = FileType::Directory;
         assert!(!attr.is_upload_pending());
+    }
+
+    #[test]
+    fn credential_bearing_format_debug_omits_all_secret_values() {
+        let access_key = "access-key-sentinel";
+        let secret_key = "secret-key-sentinel";
+        let dsn = "postgres://user:dsn-password-sentinel@db.example.com/studiofs";
+        let mut info = FormatInfo::new(
+            "volume".to_string(),
+            "volume-uuid".to_string(),
+            FormatInfoDataStore {
+                endpoint: "https://s3.example.com".to_string(),
+                bucket: "bucket".to_string(),
+                access_key: access_key.to_string(),
+                secret_key: secret_key.to_string(),
+                region: "region".to_string(),
+            },
+            16,
+        )
+        .expect("build format info");
+        info.metadata.remote = Some(RemoteStoreConfig {
+            endpoint: "https://metadata.example.com".to_string(),
+            bucket: "metadata".to_string(),
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            region: "region".to_string(),
+            prefix: "metadata/".to_string(),
+        });
+        info.metadata.postgres = Some(PostgresConfig {
+            url: dsn.to_string(),
+            volume_id: 7,
+        });
+
+        let debug = format!("{info:?}");
+
+        assert!(!debug.contains(access_key));
+        assert!(!debug.contains(secret_key));
+        assert!(!debug.contains(dsn));
+        assert!(debug.contains("***"));
     }
 }
