@@ -136,19 +136,29 @@ impl<'a> WinfspHandleDrainFacade<'a> {
             return;
         }
 
-        if let Some(file_name) = file_name
-            && let Ok((parent_ino, name)) = resolve_parent(&self.context.vfs, file_name)
-        {
-            self.cleanup_delete(context.ino, parent_ino, name, context.is_dir);
+        let Some(file_name) = file_name else {
+            self.context.vfs.note_winfsp_cleanup_callback();
+            debug!(
+                ino = context.ino,
+                is_dir = context.is_dir,
+                "cleanup delete skipped: no path provided"
+            );
             return;
-        }
-
-        self.context.vfs.note_winfsp_cleanup_callback();
-        debug!(
-            ino = context.ino,
-            is_dir = context.is_dir,
-            "cleanup delete skipped: no path provided"
-        );
+        };
+        let (parent_ino, name) = match resolve_parent(&self.context.vfs, file_name) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.context.vfs.note_winfsp_cleanup_callback();
+                warn!(
+                    ino = context.ino,
+                    is_dir = context.is_dir,
+                    error = ?error,
+                    "cleanup delete skipped: failed to resolve parent"
+                );
+                return;
+            }
+        };
+        self.cleanup_delete(context.ino, parent_ino, name, context.is_dir);
     }
 
     fn flush_local_dirty_state(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<bool> {
@@ -183,6 +193,8 @@ impl<'a> WinfspHandleDrainFacade<'a> {
             .context
             .callback_barrier_state
             .flush_gate_for_inode(ino);
+        // Keep this guard before `_flush_guard`: reverse declaration drop order
+        // unlocks the mutex before registry cleanup can remove this gate.
         let _gate_release =
             FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate.clone());
         let _flush_guard = gate.lock();

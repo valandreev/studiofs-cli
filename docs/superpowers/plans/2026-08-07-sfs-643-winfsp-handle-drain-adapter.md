@@ -19,6 +19,7 @@ The observable result is unchanged: WinFSP non-delete cleanup is observational, 
 - [x] (2026-08-07) Committed the pre-review implementation as `e594aaa4`; completed the review follow-up in the current working tree.
 - [x] (2026-08-07) Fixed the review-identified flush-gate TOCTOU, removed the test-only bypass, and simplified infallible cleanup dispatch.
 - [x] (2026-08-07) Moved hint clearing under the flush gate, made `fh == 0` close a no-op for inode hints, and added the regression test.
+- [x] (2026-08-07) Logged parent-resolution failures distinctly, documented flush-gate guard drop order, and revalidated the Rust 1.95 syntax/toolchain assumptions.
 
 ## Surprises & Discoveries
 
@@ -133,7 +134,7 @@ The refactor is source-only and can be retried by reverting only the uncommitted
 
 ## Artifacts and Notes
 
-The pre-plan implementation diff reported 143 insertions and 924 deletions across the four tracked source changes; the deleted barrier module accounts for 619 lines. The current review-follow-up diff relative to merge base is 391 insertions and 1,026 deletions across six files: 243 source insertions plus 148 plan insertions, with the deleted barrier still accounting for 619 lines. The focused `handle_drain` filter covers 8 tests and the focused clean-callback filter covers 21 tests; the prior focused context and bridge checks remain recorded above. The initial implementation commit was `e594aaa4`; the review follow-up is currently uncommitted.
+The pre-plan implementation diff reported 143 insertions and 924 deletions across the four tracked source changes; the deleted barrier module accounts for 619 lines. The current review-follow-up diff relative to merge base is 406 insertions and 1,026 deletions across six files: 255 source insertions plus 151 plan insertions, with the deleted barrier still accounting for 619 lines. The focused `handle_drain` filter covers 8 tests and the focused clean-callback filter covers 21 tests; the focused delete-cleanup filter covers 4 tests. The prior focused context and bridge checks remain recorded above. The initial implementation commit was `e594aaa4`; the review follow-up is currently uncommitted.
 
 ## Interfaces and Dependencies
 
@@ -146,3 +147,5 @@ Revision note (2026-08-07, review follow-up): Added `concurrent_dirty_flush_call
 Revision note (2026-08-07, second review follow-up): Moved the clean flush fast path out of `with_flush_gate`, which now always owns the per-inode lock before rechecking state and dispatching the barrier. Removed the test-only duplicate callback path, changed the infallible non-delete cleanup callback to return unit, and expressed orphan-healing fallback with `unwrap_or_else`.
 
 Revision note (2026-08-07, third review follow-up): Clear the deferred cleanup hint only inside the per-inode flush gate after the volatile flush succeeds, so a concurrent callback cannot observe stale hint state or erase a newly installed hint after the gate. `fh == 0` closes now leave inode-level hints untouched because those contexts do not own VFS handles.
+
+Revision note (2026-08-07, fourth review follow-up): Split missing-path and parent-resolution-error cleanup logging. The existing outcome metrics intentionally count successful barriers and clean skips only; no error counter was added without a defined observability contract. The workspace declares Rust 1.95, so the existing stable `let_chains` syntax remains valid.
