@@ -16,7 +16,7 @@ The observable result is unchanged: WinFSP non-delete cleanup is observational, 
 - [x] (2026-08-07) Moved the orchestration methods into the WinFSP handle-drain facade.
 - [x] (2026-08-07) Removed the VFS-only barrier module, ports, generic exports, and their tests.
 - [x] (2026-08-07) Ran focused Windows tests, cross-platform checks, Clippy, formatting, and diff validation.
-- [x] (2026-08-07) Committed the complete change set as `fd13dfcd`.
+- [x] (2026-08-07) Committed the complete change set as `b629e8f7`.
 
 ## Surprises & Discoveries
 
@@ -122,7 +122,7 @@ The refactor is source-only and can be retried by reverting only the uncommitted
 
 ## Artifacts and Notes
 
-The pre-plan commit diff reported 143 insertions and 924 deletions across the four tracked source changes; the deleted barrier module accounts for 619 lines. The committed change set includes the 131-line ExecPlan, for 274 insertions and 924 deletions across five files. The focused suite passed 11 tests total (6 handle-drain tests and 5 exact context tests). Four package checks, Clippy with warnings denied, formatting, and diff validation passed. Commit: `fd13dfcd`.
+The pre-plan commit diff reported 143 insertions and 924 deletions across the four tracked source changes; the deleted barrier module accounts for 619 lines. The committed change set includes the 131-line ExecPlan, for 274 insertions and 924 deletions across five files. The focused suite passed 11 tests total (6 handle-drain tests and 5 exact context tests). Four package checks, Clippy with warnings denied, formatting, and diff validation passed. Implementation commit: `b629e8f7`.
 
 ## Interfaces and Dependencies
 
