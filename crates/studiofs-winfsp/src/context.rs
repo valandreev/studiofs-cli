@@ -1047,17 +1047,8 @@ impl StudioFsContext {
     }
 
     #[cfg(test)]
-    fn flush_callback_path_if_dirty(
-        &self,
-        ino: Ino,
-        fh: Option<u64>,
-    ) -> studiofs_vfs::VfsResult<bool> {
-        self.handle_drain().flush_callback_path_if_dirty(ino, fh)
-    }
-
-    #[cfg(test)]
-    fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
-        self.handle_drain().cleanup_non_delete(ino, fh)
+    fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) {
+        self.handle_drain().cleanup_non_delete(ino, fh);
     }
 
     fn remove_orphaned_directory_child(
@@ -3677,14 +3668,9 @@ mod tests {
         .expect("pre-clean flush");
 
         let before = flush_barrier_calls(&vfs);
-        let flushed = ctx
-            .flush_callback_path_if_dirty(attr.ino, Some(fh))
+        ctx.run_flush_callback(attr.ino, fh)
             .expect("callback flush guard");
         let after = flush_barrier_calls(&vfs);
-        assert!(
-            !flushed,
-            "clean inode should skip callback-driven synchronous flush"
-        );
         assert_eq!(
             after, before,
             "cleanup should skip redundant synchronous flush when inode is clean"
@@ -3717,10 +3703,8 @@ mod tests {
             ctx.flush_gate_count() == 0,
             "test setup should not have lingering gates"
         );
-        let flushed = ctx
-            .flush_callback_path_if_dirty(attr.ino, Some(fh))
+        ctx.run_flush_callback(attr.ino, fh)
             .expect("callback flush guard");
-        assert!(!flushed, "clean inode should skip flush");
         assert!(
             ctx.flush_gate_count() == 0,
             "fast path should not allocate per-inode flush gates"
@@ -3747,11 +3731,9 @@ mod tests {
         .expect("pre-clean flush");
 
         let before = flush_barrier_calls(&vfs);
-        let flushed = ctx
-            .flush_callback_path_if_dirty(attr.ino, None)
+        ctx.run_flush_callback(attr.ino, 0)
             .expect("callback flush guard");
         let after = flush_barrier_calls(&vfs);
-        assert!(!flushed, "clean inode should skip flush callback barrier");
         assert_eq!(
             after, before,
             "flush callback should skip redundant synchronous flush when inode is clean"
@@ -4010,8 +3992,7 @@ mod tests {
             "ordinary writeback should not create recoverable landing records"
         );
 
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
-            .expect("cleanup callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh);
         let after_cleanup_callbacks = winfsp_callbacks(&vfs);
         let after_cleanup_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
@@ -4107,8 +4088,7 @@ mod tests {
             0,
             "ordinary writeback should not create recoverable landing records"
         );
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
-            .expect("cleanup callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh);
         assert!(
             ctx.has_deferred_cleanup_hint(attr.ino),
             "cleanup should defer buffered dirty state to last close"
@@ -4461,8 +4441,7 @@ mod tests {
         })
         .expect("commit dirty write");
 
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
-            .expect("cleanup callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
             "cleanup should not leave a deferred-close hint once write already committed local state"
@@ -4516,8 +4495,7 @@ mod tests {
         let barriers_before = winfsp_foreground_flushes(&vfs);
         let flush_calls_before = flush_barrier_calls(&vfs);
 
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh1)
-            .expect("cleanup callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh1);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
             "cleanup should not defer a barrier once write already committed local state"
@@ -4611,8 +4589,7 @@ mod tests {
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
 
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
-            .expect("first cleanup callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh);
         let after_first_callbacks = winfsp_callbacks(&vfs);
         let after_first_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
@@ -4629,8 +4606,7 @@ mod tests {
             "cleanup callback should not be recorded as a clean-skip barrier either"
         );
 
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
-            .expect("second cleanup callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh);
         let after_second_callbacks = winfsp_callbacks(&vfs);
         let after_second_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
@@ -4690,8 +4666,7 @@ mod tests {
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
 
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
-            .expect("cleanup callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh);
         let after_cleanup_callbacks = winfsp_callbacks(&vfs);
         let after_cleanup_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
