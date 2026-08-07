@@ -88,7 +88,7 @@ pub async fn ensure_studiofs_database(input: &str) -> MetaResult<StudioPgDsns> {
 
 fn rewrite_url_dsn(input: &str, db_name: &str) -> MetaResult<String> {
     let mut url = url::Url::parse(input)
-        .map_err(|_| MetaError::Storage("invalid postgres URL".to_string()))?;
+        .map_err(|error| MetaError::Storage(format!("invalid postgres URL: {error}")))?;
     match url.scheme() {
         "postgres" | "postgresql" => {}
         other => {
