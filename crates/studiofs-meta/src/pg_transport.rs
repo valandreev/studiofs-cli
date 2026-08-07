@@ -202,6 +202,14 @@ fn is_transport_unavailable(error: &io::Error) -> bool {
     if is_transport_unavailable_kind(error.kind()) {
         return true;
     }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(11001..=11004)) {
+        // WSAHOST_NOT_FOUND, WSATRY_AGAIN, WSANO_RECOVERY, WSANO_DATA.
+        return true;
+    }
+
+    // tokio-postgres hardcodes the first message, while std::net::lookup_host
+    // exposes Unix resolver failures as the second form without a typed DNS error.
     let message = error.to_string();
     (error.kind() == io::ErrorKind::InvalidInput && message == "could not resolve any addresses")
         || message.starts_with("failed to lookup address information")
@@ -531,6 +539,12 @@ mod tests {
             std::io::ErrorKind::Other,
             "failed to lookup address information",
         )));
+        #[cfg(windows)]
+        for code in [11001, 11002, 11003, 11004] {
+            assert!(is_transport_unavailable(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
         assert!(!is_transport_unavailable(&std::io::Error::new(
             std::io::ErrorKind::Other,
             "certificate verify failed",
