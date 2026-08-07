@@ -152,6 +152,9 @@ WinFSP callback barrier semantics:
 - `EntryExists` → `STATUS_OBJECT_NAME_COLLISION`
 - `DirNotEmpty` → `STATUS_DIRECTORY_NOT_EMPTY`
 - `IsADirectory` → `STATUS_FILE_IS_A_DIRECTORY`
+- `RepairRequired` → `STATUS_DISK_CORRUPT_ERROR`
+- `RemoteUnavailable` → `STATUS_BAD_NETWORK_PATH`
+- `Timeout` → `STATUS_IO_TIMEOUT`
 - Other errors → `STATUS_UNEXPECTED_IO_ERROR`
 
 ### Mount Lifecycle

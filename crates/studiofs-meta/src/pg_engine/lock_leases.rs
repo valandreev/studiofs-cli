@@ -121,12 +121,7 @@ impl PgMetaEngine {
         let row = client
             .query_opt(sql::SELECT_FILE_LOCK_LEASE, &[&volume_id, &(ino as i64)])
             .await
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres file lock read failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?;
+            .map_err(|e| Self::classify_pg_error("postgres file lock read failed", e))?;
         match row {
             Some(row) => Self::current_file_lock_lease_from_row(row, now_ms),
             None => Ok(None),

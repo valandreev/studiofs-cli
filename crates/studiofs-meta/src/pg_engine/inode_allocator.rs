@@ -53,25 +53,22 @@ impl PgMetaEngine {
                 move |mut client| {
                     Box::pin(async move {
                         let tx = client.transaction().await.map_err(|error| {
-                            MetaError::Storage(format!(
-                                "postgres client-slot transaction failed: {}",
-                                Self::format_pg_error(error)
-                            ))
+                            Self::classify_pg_error("postgres client-slot transaction failed", error)
                         })?;
                         tx.execute(
                             "INSERT INTO counters (vol, name, value) VALUES ($1, $2, 0) ON CONFLICT (vol, name) DO NOTHING",
                             &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
                         )
                         .await
-                        .map_err(|error| MetaError::Storage(format!("postgres client-slot seed failed: {}", Self::format_pg_error(error))))?;
+                        .map_err(|error| Self::classify_pg_error("postgres client-slot seed failed", error))?;
                         let row = tx
                             .query_one(
                                 "UPDATE counters SET value = value + 1 WHERE vol = $1 AND name = $2 RETURNING value - 1",
                                 &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
                             )
                             .await
-                            .map_err(|error| MetaError::Storage(format!("postgres client-slot reservation failed: {}", Self::format_pg_error(error))))?;
-                        tx.commit().await.map_err(|error| MetaError::Storage(format!("postgres client-slot commit failed: {}", Self::format_pg_error(error))))?;
+                            .map_err(|error| Self::classify_pg_error("postgres client-slot reservation failed", error))?;
+                        tx.commit().await.map_err(|error| Self::classify_pg_error("postgres client-slot commit failed", error))?;
                         let slot: i64 = row.get(0);
                         u64::try_from(slot).map_err(|_| MetaError::Storage(format!("invalid negative pg client slot: {slot}")))
                     })
@@ -106,30 +103,27 @@ impl PgMetaEngine {
                 move |client| {
                     Box::pin(async move {
                         let tx = client.transaction().await.map_err(|error| {
-                            MetaError::Storage(format!(
-                                "postgres allocator transaction failed: {}",
-                                Self::format_pg_error(error)
-                            ))
+                            Self::classify_pg_error("postgres allocator transaction failed", error)
                         })?;
                         tx.execute(
                             "DELETE FROM counters WHERE vol = $1 AND name = $2",
                             &[&volume_id, &PG_RETIRED_INODE_COUNTER],
                         )
                         .await
-                        .map_err(|error| MetaError::Storage(format!("postgres retired allocator cleanup failed: {}", Self::format_pg_error(error))))?;
+                        .map_err(|error| Self::classify_pg_error("postgres retired allocator cleanup failed", error))?;
                         tx.execute(
                             "INSERT INTO counters (vol, name, value) VALUES ($1, $2, 1) ON CONFLICT (vol, name) DO NOTHING",
                             &[&volume_id, &PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER],
                         )
                         .await
-                        .map_err(|error| MetaError::Storage(format!("postgres allocator namespace seed failed: {}", Self::format_pg_error(error))))?;
+                        .map_err(|error| Self::classify_pg_error("postgres allocator namespace seed failed", error))?;
                         let row = tx
                             .query_one(
                                 "UPDATE counters SET value = value + 2 WHERE vol = $1 AND name = $2 RETURNING value - 2, value - 1",
                                 &[&volume_id, &PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER],
                             )
                             .await
-                            .map_err(|error| MetaError::Storage(format!("postgres allocator namespace reservation failed: {}", Self::format_pg_error(error))))?;
+                            .map_err(|error| Self::classify_pg_error("postgres allocator namespace reservation failed", error))?;
                         let inode: i64 = row.get(0);
                         let payload: i64 = row.get(1);
                         let inode = u32::try_from(inode).map_err(|_| MetaError::Storage("invalid allocator inode namespace".to_string()))?;
@@ -142,7 +136,7 @@ impl PgMetaEngine {
                             AllocatorRecord::new(payload, 0).map_err(|error| MetaError::Storage(error.to_string()))?,
                         )
                         .map_err(|error| MetaError::Storage(error.to_string()))?;
-                        tx.commit().await.map_err(|error| MetaError::Storage(format!("postgres allocator namespace commit failed: {}", Self::format_pg_error(error))))?;
+                        tx.commit().await.map_err(|error| Self::classify_pg_error("postgres allocator namespace commit failed", error))?;
                         Ok(state)
                     })
                 },

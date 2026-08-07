@@ -142,10 +142,7 @@ impl MetaReplication for PgMetaEngine {
                             .query_one(sql::SELECT_REMOTE_METADATA_SIZE, &[&volume_id])
                             .await
                             .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres metadata size query failed: {}",
-                                    Self::format_pg_error(e)
-                                ))
+                                Self::classify_pg_error("postgres metadata size query failed", e)
                             })?;
                         let bytes: i64 = row.get(0);
                         Ok(bytes.max(0) as u64)

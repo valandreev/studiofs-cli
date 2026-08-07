@@ -6,6 +6,7 @@ use crate::engine::{
 use crate::engine::{MetaError, MetaFormat, MetaInodes, MetaResult};
 #[cfg(test)]
 use crate::events::MetaEvent;
+use crate::pg_transport::connect_studiofs_postgres;
 use crate::redb_engine::RedbMetaEngine;
 #[cfg(test)]
 use crate::redb_engine::RedbSnapshot;
@@ -283,6 +284,11 @@ pub(super) enum PgTimeoutContext<'a> {
     Command(&'a str),
 }
 
+enum StartupSchemaValidation {
+    Available,
+    Fallback(MetaError),
+}
+
 #[derive(Debug, Clone)]
 struct HeldFileLockLease {
     lease_ttl: Duration,
@@ -330,15 +336,36 @@ impl PgMetaEngine {
         postgres_url: &str,
         connect_timeout: Duration,
         command_timeout: Duration,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<StartupSchemaValidation> {
         let postgres_url = postgres_url.to_string();
         Self::run_async_once(async move {
-            Self::with_postgres_client_timeout_once(
-                postgres_url,
+            let (client, connection) = match tokio::time::timeout(
                 connect_timeout,
+                connect_studiofs_postgres(&postgres_url),
+            )
+            .await
+            {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error))
+                    if Self::is_postgres_unavailable(&error)
+                        || matches!(&error, MetaError::Timeout(_)) =>
+                {
+                    return Ok(StartupSchemaValidation::Fallback(error));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Ok(StartupSchemaValidation::Fallback(Self::pg_timeout_error(
+                        PgTimeoutContext::Connection("validate postgres schema connect"),
+                        connect_timeout,
+                    )));
+                }
+            };
+            let connection_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let result = tokio::time::timeout(
                 command_timeout,
-                "validate postgres schema",
-                move |client| async move {
+                async move {
                     let rows = client
                         .query(
                             r#"
@@ -362,11 +389,8 @@ impl PgMetaEngine {
                             &[],
                         )
                         .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres schema validation failed: {}",
-                                Self::format_pg_error(e)
-                            ))
+                        .map_err(|error| {
+                            Self::classify_pg_error("postgres schema validation failed", error)
                         })?;
                     if !rows.is_empty() {
                         let missing = rows
@@ -382,6 +406,15 @@ impl PgMetaEngine {
                 },
             )
             .await
+            .map_err(|_| {
+                Self::pg_timeout_error(
+                    PgTimeoutContext::Command("validate postgres schema"),
+                    command_timeout,
+                )
+            });
+            connection_task.abort();
+            let () = result??;
+            Ok(StartupSchemaValidation::Available)
         })
     }
 
@@ -448,17 +481,15 @@ impl PgMetaEngine {
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
-        if let Err(error) =
-            Self::validate_postgres_schema(&pg.url, connect_timeout, command_timeout)
-        {
-            if Self::is_postgres_unavailable(&error) {
+        match Self::validate_postgres_schema(&pg.url, connect_timeout, command_timeout) {
+            Ok(StartupSchemaValidation::Available) => {}
+            Ok(StartupSchemaValidation::Fallback(error)) => {
                 warn!(
                     error = %error,
                     "postgres schema validation unavailable; continuing with local-first startup"
                 );
-            } else {
-                return Err(error);
             }
+            Err(error) => return Err(error),
         }
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
@@ -589,10 +620,7 @@ impl PgMetaEngine {
                             .query_opt("SELECT uuid FROM volumes WHERE vol = $1", &[&volume_id])
                             .await
                             .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres volume uuid query failed: {}",
-                                    Self::format_pg_error(e)
-                                ))
+                                Self::classify_pg_error("postgres volume uuid query failed", e)
                             })?;
                         let row = row.ok_or_else(|| {
                             MetaError::Storage(format!(

@@ -135,10 +135,12 @@ impl PgMetaEngine {
                                 biased;
                                 _ = cancel_for_task.cancelled() => return Ok(()),
                                 r = client.batch_execute(&listen_cmd) => {
-                                    r.map_err(|e| MetaError::Storage(format!(
-                                        "postgres LISTEN {channel} failed: {}",
-                                        Self::format_pg_error(e)
-                                    )))?;
+                                    r.map_err(|e| {
+                                        Self::classify_pg_error(
+                                            format!("postgres LISTEN {channel} failed"),
+                                            e,
+                                        )
+                                    })?;
                                 }
                             }
 
@@ -168,10 +170,10 @@ impl PgMetaEngine {
                                     Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
                                     Ok(Some(Ok(_))) => {}
                                     Ok(Some(Err(err))) => {
-                                        return Err(MetaError::Storage(format!(
-                                            "postgres lock notify poll failed: {}",
-                                            Self::format_pg_error(err)
-                                        )));
+                                        return Err(Self::classify_pg_error(
+                                            "postgres lock notify poll failed",
+                                            err,
+                                        ));
                                     }
                                     Ok(None) => return Ok(()),
                                     Err(_) => {
