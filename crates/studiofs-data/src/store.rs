@@ -211,10 +211,19 @@ impl From<&FormatInfo> for DataStoreConfig {
             secret_key: info.secret_key.clone(),
             region: info.region.clone(),
             volume_name: info.name.clone(),
-            data_prefix: info.data_prefix.clone(),
+            data_prefix: normalize_data_prefix(&info.name, &info.data_prefix),
             volume_uuid: info.uuid.clone(),
             crypto: DataStoreCryptoConfig::from(&info.encryption),
         }
+    }
+}
+
+fn normalize_data_prefix(volume_name: &str, data_prefix: &str) -> String {
+    let configured_prefix = data_prefix.trim_end_matches('/');
+    if configured_prefix.is_empty() {
+        format!("{volume_name}/objects/")
+    } else {
+        format!("{configured_prefix}/")
     }
 }
 
@@ -404,6 +413,7 @@ impl DataStore {
     ) -> DataResult<Self> {
         let mut config = config.clone();
         config.endpoint = normalize_s3_endpoint_transport(&config.endpoint)?;
+        config.data_prefix = normalize_data_prefix(&config.volume_name, &config.data_prefix);
 
         let mut builder = S3::default()
             .endpoint(&config.endpoint)
@@ -533,12 +543,14 @@ impl DataStore {
     /// Create a DataStore around an already-built operator for focused tests.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_operator_for_test(config: &DataStoreConfig, op: Operator) -> DataResult<Self> {
+        let mut config = config.clone();
+        config.data_prefix = normalize_data_prefix(&config.volume_name, &config.data_prefix);
         Ok(Self {
             op,
             volume_name: config.volume_name.clone(),
             volume_uuid: Arc::from(config.volume_uuid.as_str()),
             crypto: config.crypto.to_runtime()?,
-            config: config.clone(),
+            config,
             profile: IoProfile::Default,
         })
     }
@@ -680,8 +692,8 @@ impl DataStore {
         self.validate_volume_prefix(prefix)?;
         let lister = self.op.lister_with(prefix).recursive(true).await?;
 
-        Ok(lister.filter_map(|entry| async move {
-            match entry {
+        Ok(lister.filter_map(|entry| {
+            std::future::ready(match entry {
                 Ok(entry) if entry.metadata().mode() == EntryMode::FILE => {
                     Some(Ok(DataStoreObjectEntry {
                         key: entry.path().to_owned(),
@@ -690,7 +702,7 @@ impl DataStore {
                 }
                 Ok(_) => None,
                 Err(error) => Some(Err(DataError::from(error))),
-            }
+            })
         }))
     }
 
@@ -726,13 +738,8 @@ impl DataStore {
     }
 
     fn validate_volume_path(&self, key: &str, allow_prefix: bool) -> DataResult<()> {
-        let configured_prefix = self.config.data_prefix.trim_end_matches('/');
-        let volume_prefix = if configured_prefix.is_empty() {
-            format!("{}/objects/", self.volume_name)
-        } else {
-            format!("{configured_prefix}/")
-        };
-        let Some(relative_key) = key.strip_prefix(&volume_prefix) else {
+        let volume_prefix = &self.config.data_prefix;
+        let Some(relative_key) = key.strip_prefix(volume_prefix.as_str()) else {
             return Err(DataError::InvalidObjectKey(key.to_owned()));
         };
         if (!allow_prefix && relative_key.is_empty())
@@ -811,6 +818,18 @@ mod tests {
             volume_uuid: "1a4c0fe2-8550-4892-952c-5ec26c0e0d8d".into(),
             crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x42; 32])),
         }
+    }
+
+    #[test]
+    fn data_prefix_normalization_defaults_and_removes_trailing_slashes() {
+        assert_eq!(
+            normalize_data_prefix("unit-volume", ""),
+            "unit-volume/objects/"
+        );
+        assert_eq!(
+            normalize_data_prefix("unit-volume", "tenant/demo///"),
+            "tenant/demo/"
+        );
     }
 
     fn assert_send<T: Send>() {}
@@ -1074,12 +1093,11 @@ mod tests {
                 .unwrap();
         }
 
-        let mut entries = Box::pin(
-            store
-                .list_object_entries("unit-volume/objects/")
-                .await
-                .unwrap(),
-        );
+        let entries = store
+            .list_object_entries("unit-volume/objects/")
+            .await
+            .unwrap();
+        let mut entries = std::pin::pin!(entries);
         let mut keys = Vec::new();
         while let Some(entry) = entries.next().await {
             keys.push(entry.unwrap().key);
@@ -1138,12 +1156,11 @@ mod tests {
     async fn list_object_entries_preserves_provider_error_kind() {
         let raw = Operator::from_inner(std::sync::Arc::new(FailingListService));
         let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
-        let mut entries = Box::pin(
-            store
-                .list_object_entries("unit-volume/objects/")
-                .await
-                .unwrap(),
-        );
+        let entries = store
+            .list_object_entries("unit-volume/objects/")
+            .await
+            .unwrap();
+        let mut entries = std::pin::pin!(entries);
 
         let error = entries.next().await.unwrap().unwrap_err();
         match error {
@@ -1167,7 +1184,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut entries = Box::pin(store.list_object_entries("tenant/demo/").await.unwrap());
+        let entries = store.list_object_entries("tenant/demo/").await.unwrap();
+        let mut entries = std::pin::pin!(entries);
         assert_eq!(entries.next().await.unwrap().unwrap().key, key);
         assert!(entries.next().await.is_none());
 

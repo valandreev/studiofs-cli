@@ -1512,8 +1512,8 @@ impl StudioVfs {
                     }
                 };
 
-            let mut lister = match self.data_write.list_object_entries(&self.data_prefix).await {
-                Ok(v) => Box::pin(v),
+            let lister = match self.data_write.list_object_entries(&self.data_prefix).await {
+                Ok(v) => v,
                 Err(e) => {
                     let meta = self.meta.clone();
                     let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1529,6 +1529,7 @@ impl StudioVfs {
                     continue;
                 }
             };
+            let mut lister = std::pin::pin!(lister);
 
             let now = SystemTime::now();
             let now_unix = now
