@@ -210,9 +210,6 @@ impl UploadQueue {
         self.remove_pending_if_matches(op)
     }
 
-    /// Kept for API compatibility with older journal-backed behavior.
-    pub async fn flush_journal(&self) {}
-
     /// Wait until all currently pending uploads complete or `timeout` elapses.
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;

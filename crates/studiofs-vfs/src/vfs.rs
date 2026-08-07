@@ -141,14 +141,12 @@ use crate::runtime::{
     LocalCacheIoTiming, MetaExecutor, VfsMeta, cache_io_execution_model, into_vfs_meta,
     run_local_cache_io, run_local_cache_io_blocking, run_meta,
 };
-use crate::utils::{now_unix_millis, now_unix_secs};
+use crate::utils::now_unix_millis;
 use crate::vfs::local_dirty::LocalDirtyState;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use dashmap::DashSet;
 use futures::FutureExt;
 use lru::LruCache;
-use opendal::options::WriteOptions;
-use opendal::{ErrorKind, Operator};
 use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::borrow::Cow;
@@ -230,8 +228,6 @@ const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DELAY_START_MS: u64 = 1_500;
-const SUSTAINED_WRITE_DELAY_STEP_MS: u64 = 1_500;
-const SUSTAINED_WRITE_MAX_DELAY_MS: u64 = 8;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const FOREGROUND_READ_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
@@ -241,7 +237,6 @@ struct WriteAdmissionPressure {
     writer_stack_dirty_bytes: usize,
     pending_local_dirty_bytes: usize,
     pending_persisted_slice_bytes: usize,
-    pending_upload_bytes: usize,
 }
 
 impl WriteAdmissionPressure {
@@ -299,13 +294,6 @@ struct SustainedWriteState {
     last_end_offset: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct SustainedWriteAdmission {
-    duration_ms: u64,
-    delay_ms: u64,
-    pre_drain: bool,
-}
-
 impl SustainedWriteState {
     fn observe(
         &mut self,
@@ -314,7 +302,7 @@ impl SustainedWriteState {
         len: usize,
         drain_chunk_bytes: usize,
         dirty_bytes_after_write: usize,
-    ) -> SustainedWriteAdmission {
+    ) -> bool {
         let end_offset = offset.saturating_add(len as u64);
         let idle_gap_ms = now_ms.saturating_sub(self.last_write_ms);
         let sequential = self.last_write_ms == 0 || offset == self.last_end_offset;
@@ -324,13 +312,8 @@ impl SustainedWriteState {
         self.last_write_ms = now_ms;
         self.last_end_offset = end_offset;
 
-        let duration_ms = now_ms.saturating_sub(self.streak_start_ms);
-        SustainedWriteAdmission {
-            duration_ms,
-            delay_ms: sustained_write_delay_ms(duration_ms),
-            pre_drain: duration_ms >= SUSTAINED_WRITE_DELAY_START_MS
-                && dirty_bytes_after_write > drain_chunk_bytes,
-        }
+        now_ms.saturating_sub(self.streak_start_ms) >= SUSTAINED_WRITE_DELAY_START_MS
+            && dirty_bytes_after_write > drain_chunk_bytes
     }
 }
 
@@ -503,17 +486,6 @@ impl WriteAdmissionGovernor {
         let divisor = u128::from(WRITE_ADMISSION_EWMA_OLD_WEIGHT.saturating_add(1));
         (weighted / divisor).min(u128::from(u64::MAX)) as u64
     }
-}
-
-fn sustained_write_delay_ms(duration_ms: u64) -> u64 {
-    if duration_ms < SUSTAINED_WRITE_DELAY_START_MS {
-        return 0;
-    }
-    duration_ms
-        .saturating_sub(SUSTAINED_WRITE_DELAY_START_MS)
-        .saturating_div(SUSTAINED_WRITE_DELAY_STEP_MS)
-        .saturating_add(1)
-        .min(SUSTAINED_WRITE_MAX_DELAY_MS)
 }
 
 // =============================================================================
@@ -695,7 +667,6 @@ const ATTR_CACHE_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
-const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
 // JuiceFS-like high-level read/write buffering defaults:
 // - buffer-size: 300M
 const DEFAULT_READ_BUFFER_MB: u64 = 300;
@@ -3367,13 +3338,6 @@ impl Drop for DeferredInodeGateEntry {
     }
 }
 
-#[derive(Clone)]
-struct JanitorLease {
-    op: Operator,
-    lock_path: String,
-    owner_id: String,
-}
-
 fn normalize_data_prefix(format_info: &FormatInfo) -> String {
     if format_info.data_prefix.trim().is_empty() {
         format!("{}/objects/", format_info.name)
@@ -3654,12 +3618,9 @@ pub struct StudioVfs {
     handle_table: HandleTable,
     /// Bounded generation snapshots and active writer participation.
     os_cache: Arc<Mutex<OsCacheState>>,
-    /// Optional distributed lease for janitor leader election.
-    janitor_lease: Option<JanitorLease>,
     janitor_interval: Duration,
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,
-    janitor_lease_ttl: Duration,
     prefetch_concurrency: usize,
     dir_prefetch_max_batch: usize,
     readdir_attr_batch_chunk: usize,
@@ -3723,44 +3684,6 @@ fn map_open_local_payload_backend_error(
 }
 
 impl StudioVfs {
-    // #region debug log
-    fn debug_write_probe(
-        &self,
-        hypothesis_id: &'static str,
-        location: &'static str,
-        message: &'static str,
-        data: serde_json::Value,
-    ) {
-        const DEBUG_SESSION_ID: &str = "5ee5eb";
-        const DEBUG_LOG_PATH: &str =
-            r"C:\Users\valen\AppData\Local\Temp\debug-agent\debug-5ee5eb.log";
-        if std::env::var_os("STUDIOFS_WRITE_DEBUG").is_none() {
-            return;
-        }
-        let payload = serde_json::json!({
-            "sessionId": DEBUG_SESSION_ID,
-            "runId": std::env::var("STUDIOFS_DEBUG_RUN_ID").unwrap_or_else(|_| "run1".to_string()),
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": now_unix_millis(),
-        });
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(DEBUG_LOG_PATH)
-        {
-            let _ = writeln!(file, "{payload}");
-        }
-    }
-
-    fn write_debug_enabled(&self) -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("STUDIOFS_WRITE_DEBUG").is_some())
-    }
-    // #endregion debug log
-
     fn aggressive_materialization_should_run(&self) -> bool {
         if self.disable_background_slab_flush {
             return false;
@@ -4964,26 +4887,6 @@ impl StudioVfs {
         } else {
             current_penalty_ms.saturating_sub(UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS)
         };
-        // #region debug log
-        if current_penalty_ms != next_penalty_ms && (current_penalty_ms > 0 || next_penalty_ms > 0)
-        {
-            self.debug_write_probe(
-                "H5",
-                concat!(file!(), ":", line!()),
-                "upload scheduler adaptive penalty changed",
-                serde_json::json!({
-                    "current_penalty_ms": current_penalty_ms,
-                    "next_penalty_ms": next_penalty_ms,
-                    "foreground_active": foreground_active,
-                    "congested": congested,
-                    "p90_latency_ns": p90_latency_ns,
-                    "threshold_ns": threshold_ns,
-                    "io_cost": io_cost,
-                    "upload_pressure_boost": upload_pressure_boost,
-                }),
-            );
-        }
-        // #endregion debug log
         self.upload_scheduler
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
     }
@@ -6496,119 +6399,6 @@ impl StudioVfs {
             .min(self.block_size as u64) as usize
     }
 
-    fn encode_lease_record(owner_id: &str, lease_until_unix: i64, fencing_token: u64) -> Vec<u8> {
-        format!("{owner_id}\n{lease_until_unix}\n{fencing_token}\n").into_bytes()
-    }
-
-    fn decode_lease_record(bytes: &[u8]) -> Option<(String, i64, u64)> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let mut lines = text.lines();
-        let owner = lines.next()?.to_string();
-        let lease_until = lines.next()?.parse::<i64>().ok()?;
-        let fencing = lines.next()?.parse::<u64>().ok()?;
-        Some((owner, lease_until, fencing))
-    }
-
-    async fn acquire_janitor_lease(&self, lease: &JanitorLease) -> bool {
-        let now = now_unix_secs();
-        let lease_until = now.saturating_add(self.janitor_lease_ttl.as_secs() as i64);
-
-        let create_payload = Self::encode_lease_record(&lease.owner_id, lease_until, 1);
-        let create_opts = WriteOptions {
-            if_not_exists: true,
-            ..WriteOptions::default()
-        };
-        match lease
-            .op
-            .write_options(&lease.lock_path, create_payload, create_opts)
-            .await
-        {
-            Ok(_) => {
-                debug!(
-                    lock_path = lease.lock_path,
-                    owner_id = lease.owner_id,
-                    "janitor lease acquired via create"
-                );
-                return true;
-            }
-            Err(err) if err.kind() == ErrorKind::ConditionNotMatch => {}
-            Err(err) => {
-                warn!("janitor lease create failed: {}", err);
-                return false;
-            }
-        }
-
-        let stat = match lease.op.stat(&lease.lock_path).await {
-            Ok(v) => v,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                // Lock disappeared between create attempt and stat; next cycle will retry.
-                return false;
-            }
-            Err(err) => {
-                warn!("janitor lease stat failed: {}", err);
-                return false;
-            }
-        };
-        let etag = stat.etag().map(ToString::to_string);
-        let current_raw = match lease.op.read(&lease.lock_path).await {
-            Ok(v) => v,
-            Err(err) => {
-                warn!("janitor lease read failed: {}", err);
-                return false;
-            }
-        };
-        let decoded_lease = {
-            let raw_chunk = current_raw.chunk();
-            if raw_chunk.len() == current_raw.remaining() {
-                Self::decode_lease_record(raw_chunk)
-            } else {
-                let current_raw = current_raw.to_bytes();
-                Self::decode_lease_record(&current_raw)
-            }
-        };
-        let (owner, current_until, fencing) = match decoded_lease {
-            Some(v) => v,
-            None => ("".to_string(), 0, 0),
-        };
-
-        if current_until > now && owner != lease.owner_id {
-            debug!(
-                lock_path = lease.lock_path,
-                lock_owner = owner,
-                lock_until = current_until,
-                now,
-                "janitor lease is held by another client"
-            );
-            return false;
-        }
-
-        let mut update_opts = WriteOptions::default();
-        if let Some(v) = etag {
-            update_opts.if_match = Some(v);
-        }
-        let update_payload =
-            Self::encode_lease_record(&lease.owner_id, lease_until, fencing.saturating_add(1));
-        match lease
-            .op
-            .write_options(&lease.lock_path, update_payload, update_opts)
-            .await
-        {
-            Ok(_) => {
-                debug!(
-                    lock_path = lease.lock_path,
-                    owner_id = lease.owner_id,
-                    "janitor lease acquired/renewed via CAS"
-                );
-                true
-            }
-            Err(err) if err.kind() == ErrorKind::ConditionNotMatch => false,
-            Err(err) => {
-                warn!("janitor lease CAS update failed: {}", err);
-                false
-            }
-        }
-    }
-
     /// Obtain the synchronous metadata engine handle backing this VFS.
     ///
     /// Prefer caching this once per function (`let meta = self.sync_meta();`) if
@@ -6828,15 +6618,10 @@ impl StudioVfs {
     }
 
     fn write_admission_pressure(&self) -> WriteAdmissionPressure {
-        let cached_store_writer_counters = self.cached_store.snapshot_writer_counters();
         WriteAdmissionPressure {
             writer_stack_dirty_bytes: self.state.writer_stack.total_dirty_bytes(),
             pending_local_dirty_bytes: self.total_pending_local_dirty_bytes(),
             pending_persisted_slice_bytes: self.total_pending_persisted_local_dirty_slice_bytes(),
-            pending_upload_bytes: usize::try_from(
-                cached_store_writer_counters.pending_upload_bytes,
-            )
-            .unwrap_or(usize::MAX),
         }
     }
 
@@ -6906,7 +6691,7 @@ impl StudioVfs {
             .fetch_max(waited_ms, Ordering::Relaxed);
     }
 
-    async fn maybe_throttle_write_admission(&self, next_bytes: usize, sustained_delay_ms: u64) {
+    async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
         if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
@@ -6921,24 +6706,6 @@ impl StudioVfs {
         let mut hard_wait_started = None;
         while writer_stack_pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
             hard_wait_started.get_or_insert_with(Instant::now);
-            // #region debug log
-            if self.write_debug_enabled() {
-                self.debug_write_probe(
-                    "H1",
-                    concat!(file!(), ":", line!()),
-                    "write admission buffer hard pacing",
-                    serde_json::json!({
-                        "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
-                        "writer_stack_dirty_bytes": writer_stack_pressure_bytes,
-                        "pressure_bytes": pressure_bytes,
-                        "pending_upload_bytes": pressure.pending_upload_bytes,
-                        "buffer_budget_bytes": buffer_budget_bytes,
-                        "hard_window_bytes": hard_window_bytes,
-                        "next_bytes": next_bytes,
-                    }),
-                );
-            }
-            // #endregion debug log
 
             tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
             let pressure = self.write_admission_pressure();
@@ -6969,7 +6736,6 @@ impl StudioVfs {
                 decision.runway_ms,
             );
         }
-        let _ = sustained_delay_ms;
     }
 
     fn write_admission_governor_stats(&self) -> WriteAdmissionGovernorStats {

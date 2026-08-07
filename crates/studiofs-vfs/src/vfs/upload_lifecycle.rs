@@ -423,13 +423,11 @@ impl StudioVfs {
         self.cached_store.shutdown().await;
         if let Err(error) = self.local_payload_backend.sync_data() {
             warn!(error = %error, "local cache backend sync failed during shutdown");
-            tracing::info!(
-                "cached-store upload journal persisted, but local cache backend sync failed"
-            );
+            tracing::info!("upload queue stopped, but local cache backend sync failed");
             Err(VfsError::LocalPayload(error))
         } else {
             tracing::info!("local cache backend sync persisted");
-            tracing::info!("cached-store upload journal persisted");
+            tracing::info!("upload queue stopped and local cache backend sync persisted");
             Ok(())
         }
     }
@@ -456,8 +454,8 @@ impl StudioVfs {
         }
     }
 
-    /// Graceful shutdown: drain accepted local state, persist the cached-store
-    /// upload journal, cancel uploader tasks, then persist upload state.
+    /// Graceful shutdown: drain accepted local state, stop the cached-store
+    /// upload queue, cancel uploader tasks, then persist upload state.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) -> VfsResult<()> {
         let shutdown_owner = loop {
             match self.state.shutdown.claim() {

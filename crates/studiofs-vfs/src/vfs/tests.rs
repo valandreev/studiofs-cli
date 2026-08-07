@@ -8074,51 +8074,6 @@ fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
 }
 
 #[test]
-fn write_admission_pressure_total_excludes_pending_upload_backlog() {
-    let pressure = WriteAdmissionPressure {
-        writer_stack_dirty_bytes: 10,
-        pending_local_dirty_bytes: 20,
-        pending_persisted_slice_bytes: 30,
-        pending_upload_bytes: 40,
-    };
-
-    assert_eq!(pressure.pending_upload_bytes, 40);
-    assert_eq!(pressure.total_bytes(), 60);
-}
-
-#[test]
-fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
-    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-pending-upload");
-    let mut writer = vfs
-        .cached_store()
-        .open_writer_slice(CachedStoreWriterConfig {
-            ino: 7,
-            base_offset: 0,
-            first_object_id: 10_000,
-            content_epoch: 1,
-            block_size: 8,
-            page_size: 4,
-            dirty_byte_limit: None,
-            max_buffer_bytes: None,
-            submit_upload: true,
-        });
-
-    writer.write_at(0, b"abcdefgh").expect("write full block");
-    let detached = writer
-        .detach_completed_blocks(1)
-        .expect("detach completed block");
-    vfs.cached_store()
-        .persist_detached_staged_slices(detached)
-        .expect("persist pending upload");
-
-    let pressure = vfs.write_admission_pressure();
-
-    assert_eq!(pressure.pending_upload_bytes, 8);
-    assert_eq!(pressure.total_bytes(), 0);
-}
-
-#[test]
 fn write_admission_first_sample_below_budget_without_pacing() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-admits-buffer-window");
@@ -8148,7 +8103,7 @@ fn write_admission_first_sample_below_budget_without_pacing() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(1, 0),
+            vfs.maybe_throttle_write_admission(1),
         )
         .await
         .expect("first adaptive admission sample should not sleep below budget");
@@ -8202,7 +8157,7 @@ fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10, 0),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10),
         )
         .await
         .expect("soft pressure below the hard window must not delay a local-first write");
@@ -8231,7 +8186,7 @@ fn write_admission_admits_oversized_write_when_pressure_is_empty() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
-            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1, 0),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1),
         )
         .await
         .expect("empty pressure should admit a single oversized write");
@@ -8269,15 +8224,15 @@ fn write_admission_ignores_pending_upload_backlog_for_hard_window() {
         vfs.cached_store()
             .persist_detached_staged_slices(detached)
             .expect("persist pending upload backlog");
-        assert!(
-            vfs.write_admission_pressure().pending_upload_bytes
-                > buffer_budget_bytes * HARD_BACKPRESSURE_DIRTY_MULTIPLIER,
-            "test should seed upload backlog above the hard window"
+        assert_eq!(
+            vfs.write_admission_pressure().total_bytes(),
+            0,
+            "upload backlog is not local write pressure"
         );
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(1, 0),
+            vfs.maybe_throttle_write_admission(1),
         )
         .await
         .expect("pending upload backlog must not trigger hard admission wait");
@@ -8313,7 +8268,7 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
 
         let admission_vfs = Arc::clone(&vfs);
         let wait_task =
-            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1, 0).await });
+            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
         tokio::time::sleep(Duration::from_millis(
             WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 3 + 10,
         ))
@@ -8387,18 +8342,11 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
             .try_register(ino)
             .expect("test should reserve deferred materialization gate");
 
-        let delay_ms = vfs
-            .maybe_pre_drain_sustained_write_buffer(
-                ino,
-                seeded_len as u64,
-                1,
-                LocalSyncPolicy::Opportunistic,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            delay_ms, 0,
-            "sustained pre-drain should not add a second foreground pacing delay"
+        vfs.maybe_pre_drain_sustained_write_buffer(
+            ino,
+            seeded_len as u64,
+            1,
+            LocalSyncPolicy::Opportunistic,
         );
 
         assert!(
@@ -8461,18 +8409,11 @@ fn sustained_pre_drain_schedules_without_pacing_when_dirty_runway_is_long() {
             .try_register(ino)
             .expect("test should reserve deferred materialization gate");
 
-        let delay_ms = vfs
-            .maybe_pre_drain_sustained_write_buffer(
-                ino,
-                seeded_len as u64,
-                1,
-                LocalSyncPolicy::Opportunistic,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            delay_ms, 0,
-            "sustained pre-drain should schedule materialization without sleeping while dirty runway is long"
+        vfs.maybe_pre_drain_sustained_write_buffer(
+            ino,
+            seeded_len as u64,
+            1,
+            LocalSyncPolicy::Opportunistic,
         );
 
         assert!(
@@ -8493,31 +8434,6 @@ fn sustained_pre_drain_schedules_without_pacing_when_dirty_runway_is_long() {
 }
 
 #[test]
-fn sustained_write_delay_ramps_to_stable_plateau_for_long_streams() {
-    let drain = 32 * 1024 * 1024;
-    let mut state = SustainedWriteState::default();
-
-    let first = state.observe(1_000, 0, 4, drain, 4);
-    assert_eq!(first.delay_ms, 0);
-    assert!(!first.pre_drain);
-
-    let one = state.observe(2_500, 4, 4, drain, drain + 1);
-    assert_eq!(one.delay_ms, 1);
-    assert!(one.pre_drain);
-
-    let two = state.observe(4_000, 8, 4, drain, drain + 1);
-    assert_eq!(two.delay_ms, 2);
-    assert!(two.pre_drain);
-
-    let mut plateau = two;
-    for step in 3..=SUSTAINED_WRITE_MAX_DELAY_MS {
-        plateau = state.observe(2_500 + (step - 1) * 1_500, step * 4, 4, drain, drain + 1);
-    }
-    assert_eq!(plateau.delay_ms, SUSTAINED_WRITE_MAX_DELAY_MS);
-    assert!(plateau.pre_drain);
-}
-
-#[test]
 fn sustained_write_window_resets_after_idle_or_seek() {
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
@@ -8532,14 +8448,10 @@ fn sustained_write_window_resets_after_idle_or_seek() {
         drain,
         drain + 1,
     );
-    assert_eq!(after_idle.duration_ms, 0);
-    assert_eq!(after_idle.delay_ms, 0);
-    assert!(!after_idle.pre_drain);
+    assert!(!after_idle);
 
     let after_seek = state.observe(4_000, 128, 4, drain, drain + 1);
-    assert_eq!(after_seek.duration_ms, 0);
-    assert_eq!(after_seek.delay_ms, 0);
-    assert!(!after_seek.pre_drain);
+    assert!(!after_seek);
 }
 
 #[test]

@@ -139,22 +139,6 @@ impl StudioVfs {
         removed_ids: Vec<u64>,
     ) -> usize {
         let removed_ids_len = removed_ids.len();
-        // #region debug log
-        self.debug_write_probe(
-            "H1",
-            "crates/studiofs-vfs/src/vfs/deletion_cleanup.rs:101",
-            "finalizing deleted inode runtime cleanup",
-            serde_json::json!({
-                "ino": ino,
-                "removed_ids_len": removed_ids_len,
-                "open_count": self.handle_table.open_count(ino),
-                "deleted_marker": self.state.upload.deleted_inodes.lock().contains(&ino),
-                "writer_stack_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                "has_pending_local_dirty_payloads": self.has_pending_local_dirty_payloads_for_inode(ino),
-                "has_inflight_materialization": self.state.deferred_materialize_inflight.contains(ino),
-            }),
-        );
-        // #endregion debug log
 
         // Deleted inodes should never retain staged writes, even if no committed
         // payload slice refs existed yet. Preserve the old immediate-unlink contract by

@@ -509,9 +509,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(count) = parse_env_u64("STUDIOFS_JANITOR_MAX_DELETES") {
         config.janitor_max_deletes = Some(count);
     }
-    if let Some(secs) = parse_env_u64("STUDIOFS_JANITOR_LEASE_TTL_SECS") {
-        config.janitor_lease_ttl_secs = Some(secs);
-    }
     if let Some(ms) = parse_env_u64("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS") {
         config.metadata_invalidation_sync_interval_ms = Some(ms);
     }
@@ -852,7 +849,6 @@ fn fast_janitor_vfs_config() -> VfsConfigValidated {
     config.janitor_interval_secs = 2;
     config.janitor_skip_newer_secs = 0;
     config.janitor_max_deletes = 50;
-    config.janitor_lease_ttl_secs = 10;
     VfsConfigValidated::try_from(config).expect("valid fast janitor test config")
 }
 
@@ -3107,7 +3103,7 @@ fn full_block_write_flush_recovers_pending_upload_after_restart() {
             assert_eq!(
                 vfs.pending_uploads_for_inode(inode).len(),
                 1,
-                "restart should recover the flushed upload journal entry"
+                "restart should recover the pending upload entry"
             );
             let attr_after = vfs.getattr(inode).unwrap();
             assert_eq!(attr_after.size, payload.len() as u64);
@@ -4770,7 +4766,6 @@ impl ScopedTestEnv {
             "STUDIOFS_JANITOR_INTERVAL_SECS",
             "STUDIOFS_JANITOR_SKIP_NEWER_SECS",
             "STUDIOFS_JANITOR_MAX_DELETES",
-            "STUDIOFS_JANITOR_LEASE_TTL_SECS",
             "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS",
             "STUDIOFS_DENTRY_CACHE_CAPACITY",
             "STUDIOFS_DENTRY_CACHE_BYTES",
@@ -6587,7 +6582,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
                             .unwrap_or(false)
                 })
                 .await,
-                "crash setup should leave one recovered upload journal entry for the new file"
+                "crash setup should leave one recovered pending upload entry for the new file"
             );
         });
         rt.shutdown_background();
@@ -6877,7 +6872,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
 
         assert!(
             vfs.pending_uploads_for_inode(ino).is_empty(),
-            "recovery setup should keep the restart path free of upload journal entries"
+            "recovery setup should keep the restart path free of pending upload entries"
         );
 
         tokio::time::sleep(Duration::from_secs(2)).await;

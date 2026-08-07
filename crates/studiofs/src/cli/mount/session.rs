@@ -746,7 +746,6 @@ where
         config.janitor_skip_newer_secs = Some(value);
     }
     set_u64!("STUDIOFS_JANITOR_MAX_DELETES", janitor_max_deletes);
-    set_u64!("STUDIOFS_JANITOR_LEASE_TTL_SECS", janitor_lease_ttl_secs);
     set_u64!(
         "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
         upload_user_idle_grace_ms

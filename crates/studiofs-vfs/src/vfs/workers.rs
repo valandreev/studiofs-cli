@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use opendal::ErrorKind;
 use std::sync::Arc;
 use tokio::time::MissedTickBehavior;
 
@@ -184,24 +185,11 @@ impl StudioVfs {
             }
 
             let dirty_inodes = self.state.writer_stack.snapshot_dirty_inodes_by_bytes();
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                "crates/studiofs-vfs/src/vfs/workers.rs:17",
-                "aggressive materialization tick",
-                serde_json::json!({
-                    "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-                    "threshold_bytes": super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes()),
-                    "hard_threshold_bytes": super::hard_backpressure_threshold_bytes(self.max_dirty_bytes()),
-                    "dirty_inode_count": dirty_inodes.len(),
-                }),
-            );
-            // #endregion debug log
             for ino in dirty_inodes {
                 if self.shutdown_requested() {
                     break;
                 }
-                self.spawn_deferred_materialization_if_needed(ino).await;
+                self.spawn_deferred_materialization_if_needed(ino);
             }
         }
     }
@@ -974,30 +962,6 @@ impl StudioVfs {
                         }),
                     );
                 }
-                // #region debug log
-                self.debug_write_probe(
-                    "H3",
-                    "crates/studiofs-vfs/src/vfs/workers.rs:389",
-                    "upload pipeline summary tick",
-                    serde_json::json!({
-                        "pending_uploads": pending,
-                        "pending_upload_bytes": pending_upload_bytes,
-                        "active_uploads": active_uploads,
-                        "active_upload_workers": active_upload_workers,
-                        "pending_metadata_ops": pending_metadata_ops,
-                        "inflight_metadata_ops": metadata_backlog.inflight_ops,
-                        "local_backend_dirty_count": local_backend_dirty_count,
-                        "writer_stack_total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-                        "pending_epoch_finalizations": self.state.upload.pending_epoch_finalizations.lock().len(),
-                        "upload_scheduler_penalty_ms": self.upload_scheduler.adaptive_penalty_ms(),
-                        "dirty_mem_bytes": ingress.dirty_mem_bytes,
-                        "write_backpressure_events": ingress.write_backpressure_events,
-                        "write_backpressure_wait_ms": ingress.write_backpressure_wait_ms,
-                        "transit_used_bytes": transit_memory.used_bytes,
-                        "transit_budget_bytes": transit_memory.budget_bytes,
-                    }),
-                );
-                // #endregion debug log
                 info!(
                     pending_uploads = %pending_uploads_human,
                     active_uploads,
@@ -1383,17 +1347,6 @@ impl StudioVfs {
             }
             if self.shutdown_requested() {
                 break;
-            }
-
-            if let Some(lease) = &self.janitor_lease
-                && !self.acquire_janitor_lease(lease).await
-            {
-                debug!(
-                    cycle,
-                    lock_path = lease.lock_path,
-                    "janitor cycle skipped: lease not acquired"
-                );
-                continue;
             }
 
             let meta = self.meta.clone();
