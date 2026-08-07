@@ -199,12 +199,12 @@ fn postgres_io_source(error: &tokio_postgres::Error) -> Option<&io::Error> {
 }
 
 fn is_transport_unavailable(error: &io::Error) -> bool {
-    is_transport_unavailable_kind(error.kind())
-        || (error.kind() == io::ErrorKind::InvalidInput
-            && error.to_string() == "could not resolve any addresses")
-        || error
-            .to_string()
-            .starts_with("failed to lookup address information")
+    if is_transport_unavailable_kind(error.kind()) {
+        return true;
+    }
+    let message = error.to_string();
+    (error.kind() == io::ErrorKind::InvalidInput && message == "could not resolve any addresses")
+        || message.starts_with("failed to lookup address information")
 }
 
 fn is_transport_timeout(error: &io::Error) -> bool {
