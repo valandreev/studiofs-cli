@@ -32,8 +32,12 @@ Path walks are centralized in VFS `NamespaceResolver`:
 
 ### Requirements
 
-- [WinFSP](https://winfsp.dev/) installed (detected via Windows registry)
-- `winfsp-x64.dll` loaded at startup by the CLI
+- [WinFSP](https://winfsp.dev/) installed with the architecture-matching
+  runtime DLL available to StudioFS.
+- The CLI and WinFSP bridge share one startup resolver. It preloads
+  `winfsp-x64.dll` on x86_64, `winfsp-x86.dll` on x86, or `winfsp-a64.dll` on
+  ARM64 from the executable directory or the standard WinFSP `bin` directory
+  under `%ProgramFiles(x86)%` / `%ProgramFiles%`.
 
 ### Mount Configuration
 

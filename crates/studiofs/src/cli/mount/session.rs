@@ -895,7 +895,7 @@ fn record_cleanup_error(
     if first_error.is_none() {
         *first_error = Some(error);
     } else {
-        warn!(error = %error, "additional mount cleanup step failed");
+        warn!(error = ?error, "additional mount cleanup step failed");
     }
 }
 
@@ -2845,6 +2845,62 @@ mod tests {
         assert!(
             utils::read_pid_file(&actual_mount_path).is_err(),
             "backend failure should remove pid file"
+        );
+    }
+
+    #[test]
+    fn mount_runtime_guard_continues_after_mount_record_cleanup_failure() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+        let mount_point = startup_mount_point(&temp);
+        let prepared = MountPlan::resolve(MountRequest {
+            command: mount_command(
+                "demo",
+                &meta_dir,
+                Some(mount_point.to_string()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+                inspect: None,
+            })
+        })
+        .expect("prepare mount");
+        let actual_mount_path = prepared.plan.actual_mount_path.clone();
+        let pid_path = utils::pid_file_path(&actual_mount_path).expect("pid path");
+        let snapshot_path = temp.path().join("snapshot.db");
+        std::fs::write(&snapshot_path, b"snapshot").expect("create snapshot placeholder");
+        let mut guard = MountRuntimeGuard::new(prepared);
+        guard.prepared.snapshot_mount_db_path = Some(snapshot_path.clone());
+        guard
+            .prepared
+            .write_pid_file()
+            .expect("persist mount record");
+
+        std::fs::remove_file(&pid_path).expect("remove mount record before fault injection");
+        std::fs::create_dir(&pid_path).expect("replace mount record with directory");
+
+        let cleanup_error = guard
+            .cleanup()
+            .expect("mount record cleanup failure should be returned");
+        let snapshot_removed = !snapshot_path.exists();
+        let pid_path_removed = std::fs::remove_dir(&pid_path).is_ok();
+
+        assert!(
+            cleanup_error.to_string().contains("mount record removal"),
+            "unexpected cleanup error: {cleanup_error:#}"
+        );
+        assert!(snapshot_removed, "later snapshot cleanup must still run");
+        assert!(
+            pid_path_removed,
+            "test fault-injection directory must be removed"
         );
     }
 

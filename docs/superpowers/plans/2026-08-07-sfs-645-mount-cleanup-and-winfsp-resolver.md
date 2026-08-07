@@ -20,13 +20,16 @@ session tests and the existing x86/x64/arm64 resolver mapping test.
 ## Progress
 
 - [x] (2026-08-07) Read Linear issue SFS-645, confirmed it is assigned and `In Progress`.
-- [x] (2026-08-07) Traced `MountSession::launch` → `PreparedMount::launch` → `launch_foreground` with codebase-memory MCP.
-- [x] (2026-08-07) Confirmed the existing `studiofs-winfsp` resolver maps x86, x86_64, and aarch64 DLL stems, while `studiofs/src/main.rs` still hard-codes x64 registry paths.
+- [x] (2026-08-07) Traced `MountSession::launch` → `PreparedMount::launch` → `MountRuntimeGuard::launch` with codebase-memory MCP.
+- [x] (2026-08-07) Confirmed the existing `studiofs-winfsp` resolver maps x86, x86_64, and aarch64 DLL stems and is now the CLI's single preload path.
 - [x] (2026-08-07) Checked Tokio `Runtime::shutdown_timeout` semantics with Context7; it bounds waiting for blocking work but does not cancel already-running blocking tasks.
 - [x] (2026-08-07) Added cleanup-order/error-preservation regressions and routed foreground launch through `MountRuntimeGuard`.
 - [x] (2026-08-07) Made foreground teardown continue after individual cleanup errors and preserve VFS-owner drop ordering.
 - [x] (2026-08-07) Routed CLI WinFSP preload through `studiofs-winfsp` and removed the duplicate x64 registry loader.
 - [x] (2026-08-07) Ran focused tests, checks, Clippy, formatting, and diff hygiene validation.
+- [x] (2026-08-07) Added the production guard cleanup-failure regression and preserved full later-error chains in logs.
+- [x] (2026-08-07) Updated canonical WinFSP documentation and this completed plan after review.
+- [x] (2026-08-07) Ran focused native WinFSP mount/unmount smoke; Linux/FUSE and macFUSE native runners are unavailable on this Windows host.
 - [x] (2026-08-07) Recorded final evidence and remaining unavailable validation in this plan.
 
 ## Surprises & Discoveries
@@ -35,13 +38,12 @@ session tests and the existing x86/x64/arm64 resolver mapping test.
   returned and that the PID/snapshot artifacts are removed when VFS shutdown
   succeeds. They do not cover a failure from an earlier `?` in teardown or
   prove that a later cleanup step runs after a cleanup error.
-- `PreparedMount::launch_foreground` starts cleanup only after
-  `backend.serve` returns, but `run_mount_vfs_shutdown(...) ?` and
-  `stop_mount_diagnostics_host(...) ?` can exit before PID removal, lock release,
-  snapshot removal, and runtime shutdown.
-- `studiofs-winfsp` already owns the real DLL search and architecture mapping;
-  its `ensure_winfsp_runtime_loaded` function is only `pub(crate)`, which is
-  the smallest seam to expose to the CLI.
+- Before the guard, foreground teardown used `?` after `backend.serve`, so
+  VFS or diagnostics failures could skip PID removal, lock release, snapshot
+  removal, and runtime shutdown. `MountRuntimeGuard::cleanup` now records each
+  failure and continues through the complete sequence.
+- `studiofs-winfsp` owns the architecture-aware DLL search and mapping; the CLI
+  now calls its public `ensure_winfsp_runtime_loaded` entry point.
 - Cleanup must stop the diagnostics host before VFS shutdown so a VFS shutdown
   error cannot skip diagnostics teardown; the guard then retains the runtime
   long enough to attempt its own bounded shutdown.
@@ -81,19 +83,37 @@ lookup is gone.
 
 Passed checks:
 
-- `cargo test -p studiofs cleanup_ -- --nocapture`: 11 passed.
+- `cargo test -p studiofs cleanup_ -- --nocapture`: 12 passed.
 - `cargo test -p studiofs prepared_mount_launch -- --nocapture`: 5 passed.
 - `cargo test -p studiofs foreground_shutdown_releases_vfs_handles_before_runtime_shutdown -- --nocapture`: 1 passed.
+- `cargo test -p studiofs mount_runtime_guard_continues_after_mount_record_cleanup_failure -- --nocapture`: 1 passed.
 - `cargo test -p studiofs-winfsp winfsp_dll_stem_matches_supported_architectures --lib -- --nocapture`: 1 passed.
+- `cargo test -p studiofs-winfsp graceful_shutdown_unmounts_winfsp_host_when_vfs_shutdown_panics --lib -- --nocapture`: 1 passed; the expected panic was caught by the test.
+- `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_unmount_smoke -- --ignored --nocapture --test-threads=1`: 1 passed.
+- `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1`: 1 passed.
+- `cargo test -p studiofs --test architecture_vocabulary_test -- --nocapture`: 46 passed.
 - `cargo check -p studiofs`, `cargo check -p studiofs-winfsp`, and
   `cargo clippy -p studiofs --all-targets -- -D warnings`: passed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed. The latter
   reports only the checkout's expected LF-to-CRLF warnings.
 
-Not run: a real mounted macFUSE, Linux/FUSE, or WinFSP driver smoke test and
-the workspace-wide test suites. The WinFSP unit mapping test does not require
-the driver. Tokio's existing timeout limitation remains: running blocking
-tasks are not cancelled when the bounded shutdown wait expires.
+The real mounted macFUSE and Linux/FUSE smoke tests were not run because this
+is a Windows host. The WinFSP minimal and full lifecycle smoke tests passed
+with the installed driver. The workspace-wide test suites remain intentionally
+unrun. Tokio's existing timeout limitation remains: running blocking tasks are
+not cancelled when the bounded shutdown wait expires.
+
+Operator follow-up commands for the unavailable native cells are:
+
+- Linux/FUSE: `cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1` with `/dev/fuse` and `fusermount3` available.
+- macFUSE: `cargo test -p studiofs-macfuse --lib -- --nocapture` with the macFUSE system extension loaded.
+
+### Revision Note — 2026-08-07
+
+After review, later cleanup warnings now log the complete `anyhow` chain, the
+cleanup regression drives the production `MountRuntimeGuard`, the WinFSP
+requirements describe x86/x64/ARM64 shared resolution, and this plan reflects
+the implemented guard/shared-loader state and native validation evidence.
 
 ## Context and Orientation
 
@@ -104,19 +124,21 @@ foreground mount owns a `MountLockGuard`, an optional temporary snapshot redb
 database, a VFS `Arc`, a Tokio `Runtime`, a diagnostics host, profiling state,
 and a write-path observability publisher.
 
-The current `PreparedMount::launch_foreground` implementation calls the
-backend, stops the publisher, shuts down VFS, stops diagnostics, drops owners,
-removes the PID file, unlocks, removes the snapshot database, and shuts down
-Tokio. Several of those calls use `?`, so an early failure skips the remaining
-steps. `MountLockGuard::drop` only unlocks the lock file; it does not remove the
-JSON record.
+`PreparedMount::launch` transfers foreground ownership to
+`MountRuntimeGuard::launch`. The guard calls the selected `MountBackend`, stops
+the publisher and diagnostics host, shuts down VFS, finishes profiling, drops
+VFS-retaining owners before shutting down Tokio, and then removes the PID
+record, lifecycle lock, and temporary snapshot database. Each fallible cleanup
+step is attempted; the first cleanup error is returned while later errors are
+logged with their complete cause chains. `MountLockGuard::drop` only unlocks
+the lock file; it does not remove the JSON record.
 
-`crates/studiofs-winfsp/src/lib.rs` is compiled only on Windows. Its private
-loader derives the DLL name from `std::env::consts::ARCH`, searches the current
-executable directory and WinFSP Program Files directories, and caches the
-result in a `OnceLock`. `crates/studiofs/src/main.rs` currently performs a
-separate registry lookup and always asks for `winfsp-x64.dll`. The CLI already
-depends on `studiofs-winfsp` on Windows, so no new dependency is needed.
+`crates/studiofs-winfsp/src/lib.rs` is compiled only on Windows. Its public
+cached loader derives `winfsp-x64.dll`, `winfsp-x86.dll`, or `winfsp-a64.dll`
+from `std::env::consts::ARCH`, searches the executable directory and standard
+WinFSP Program Files directories, and is called by both the CLI startup path
+and the WinFSP bridge. No second registry-based DLL resolver exists in
+`crates/studiofs/src/main.rs`.
 
 The platform bridges are unchanged in this issue: Linux uses
 `studiofs-linux-fuse`, macOS uses `studiofs-macfuse`, and Windows uses
@@ -213,9 +235,9 @@ rejected. `cargo check` must prove the CLI can call the public loader without
 reintroducing a second registry implementation. Formatting and
 `git diff --check` must be clean.
 
-This task does not claim a real mounted FUSE/WinFSP smoke pass unless the host
-has the required driver/runtime and the focused smoke command is explicitly
-run. Full workspace suites remain intentionally unrun.
+This task claims only the explicitly run Windows WinFSP smoke tests listed
+above. macFUSE and Linux/FUSE native smoke remain unavailable on this Windows
+host. Full workspace suites remain intentionally unrun.
 
 ## Idempotence and Recovery
 
@@ -231,7 +253,10 @@ leave them untouched and scope the final diff to the SFS-645 changes.
 Expected implementation artifacts:
 
 - `crates/studiofs/src/cli/mount/session.rs`: guard-owned foreground cleanup,
-  error collection, and focused regression coverage.
+  error collection, full-chain cleanup logging, and production-sequence
+  regression coverage.
+- `docs/platform-bridges.md`: architecture-aware WinFSP resolver requirements
+  for x86, x86_64, and ARM64.
 - `crates/studiofs/src/main.rs`: no duplicate WinFSP registry/DLL resolver;
   one call to the library loader under `cfg(windows)`.
 - `crates/studiofs-winfsp/src/lib.rs`: public cached preload entry point and
@@ -245,12 +270,24 @@ Validation evidence from 2026-08-07:
     test result: ok. 5 passed; 0 failed
 
     cargo test -p studiofs cleanup_ -- --nocapture
-    test result: ok. 11 passed; 0 failed
+    test result: ok. 12 passed; 0 failed
 
     cargo test -p studiofs foreground_shutdown_releases_vfs_handles_before_runtime_shutdown -- --nocapture
     test result: ok. 1 passed; 0 failed
 
+    cargo test -p studiofs mount_runtime_guard_continues_after_mount_record_cleanup_failure -- --nocapture
+    test result: ok. 1 passed; 0 failed
+
     cargo test -p studiofs-winfsp winfsp_dll_stem_matches_supported_architectures --lib -- --nocapture
+    test result: ok. 1 passed; 0 failed
+
+    cargo test -p studiofs --test architecture_vocabulary_test -- --nocapture
+    test result: ok. 46 passed; 0 failed
+
+    $env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_unmount_smoke -- --ignored --nocapture --test-threads=1
+    test result: ok. 1 passed; 0 failed
+
+    $env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1
     test result: ok. 1 passed; 0 failed
 
     cargo check -p studiofs
