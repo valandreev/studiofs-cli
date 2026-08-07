@@ -148,7 +148,7 @@ use dashmap::DashSet;
 use futures::FutureExt;
 use lru::LruCache;
 use opendal::options::WriteOptions;
-use opendal::{EntryMode, ErrorKind, Operator};
+use opendal::{ErrorKind, Operator};
 use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::borrow::Cow;

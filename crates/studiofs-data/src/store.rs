@@ -1,13 +1,14 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
 use crate::crypto::{self, ObjectEncryptionContext, VolumeMasterKey};
+use futures::{Stream, StreamExt};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
-use opendal::{Buffer, Operator, services::S3};
+use opendal::{Buffer, EntryMode, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv6Addr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use studiofs_meta::{EncryptionConfig, FormatInfo};
 use thiserror::Error;
 use tokio::task;
@@ -36,6 +37,10 @@ pub enum DataError {
     #[error("crypto error: {0}")]
     Crypto(#[from] crypto::CryptoError),
 
+    /// A maintenance key is outside the configured volume or contains path-like segments.
+    #[error("invalid object key: {0}")]
+    InvalidObjectKey(String),
+
     /// Dedicated crypto worker failed before returning an encryption result.
     #[error("crypto worker join error: {0}")]
     CryptoWorkerJoin(#[from] task::JoinError),
@@ -54,6 +59,7 @@ impl DataError {
             Self::InvalidEndpoint(_)
             | Self::InvalidCryptoConfig(_)
             | Self::Crypto(_)
+            | Self::InvalidObjectKey(_)
             | Self::CryptoWorkerJoin(_) => false,
         }
     }
@@ -61,6 +67,15 @@ impl DataError {
 
 /// Result type for all datastore operations.
 pub type DataResult<T> = Result<T, DataError>;
+
+/// A file returned by a provider listing without exposing provider-specific types.
+#[derive(Debug, Clone)]
+pub struct DataStoreObjectEntry {
+    /// Full storage key for the listed file.
+    pub key: String,
+    /// Provider-reported modification time, when available.
+    pub last_modified: Option<SystemTime>,
+}
 
 /// Byte accounting for an encrypted remote write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,15 +654,46 @@ impl DataStore {
     pub async fn delete_object(&self, object_id: &str) -> DataResult<()> {
         let key = self.object_key(object_id);
         debug!("deleting object: {key}");
-        self.op.delete(&key).await?;
-        Ok(())
+        self.delete_by_key(&key).await
     }
 
     /// Delete an object by an already-formatted storage key.
     pub async fn delete_by_key(&self, key: &str) -> DataResult<()> {
+        self.validate_volume_key(key)?;
         debug!("deleting by key: {key}");
         self.op.delete(key).await?;
         Ok(())
+    }
+
+    /// Stream files below a validated storage prefix.
+    ///
+    /// Directory entries are skipped. Provider failures are yielded as
+    /// [`DataError::OpenDal`] values and the stream then ends.
+    pub async fn list_object_entries(
+        &self,
+        prefix: &str,
+    ) -> DataResult<impl Stream<Item = DataResult<DataStoreObjectEntry>>> {
+        self.validate_volume_key(prefix)?;
+        let lister = self.op.lister_with(prefix).recursive(true).await?;
+
+        Ok(futures::stream::unfold(lister, |mut lister| async move {
+            loop {
+                let entry = lister.next().await?;
+                match entry {
+                    Ok(entry) if entry.metadata().mode() == EntryMode::FILE => {
+                        return Some((
+                            Ok(DataStoreObjectEntry {
+                                key: entry.path().to_owned(),
+                                last_modified: entry.metadata().last_modified().map(Into::into),
+                            }),
+                            lister,
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Some((Err(DataError::from(error)), lister)),
+                }
+            }
+        }))
     }
 
     /// Check if the storage backend is accessible and the bucket exists.
@@ -673,9 +719,20 @@ impl DataStore {
         Ok(())
     }
 
-    /// Get the underlying operator (for advanced use).
-    pub fn operator(&self) -> &Operator {
-        &self.op
+    fn validate_volume_key(&self, key: &str) -> DataResult<()> {
+        let volume_prefix = format!("{}/", self.volume_name);
+        let Some(relative_key) = key.strip_prefix(&volume_prefix) else {
+            return Err(DataError::InvalidObjectKey(key.to_owned()));
+        };
+        if relative_key.is_empty()
+            || key.contains('\\')
+            || relative_key
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."))
+        {
+            return Err(DataError::InvalidObjectKey(key.to_owned()));
+        }
+        Ok(())
     }
 
     async fn encrypt_payload(&self, key: &str, plaintext: Buffer) -> DataResult<Buffer> {
@@ -726,6 +783,7 @@ mod tests {
     use crate::envelope::SFEC_MAGIC;
     use crate::object::{MAGIC as STFS_MAGIC, create_object_buffer, read_object};
     use bytes::Bytes;
+    use futures::StreamExt;
     use opendal::services::Memory;
     use std::thread;
     use studiofs_meta::EncryptionConfig;
@@ -986,5 +1044,86 @@ mod tests {
         assert_eq!(downloaded.to_bytes(), plaintext);
         assert_eq!(read_stats.encrypted_bytes, remote_bytes.len() as u64);
         assert_eq!(read_stats.plaintext_bytes, write_stats.plaintext_bytes);
+    }
+
+    #[tokio::test]
+    async fn list_object_entries_streams_file_keys() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+
+        for key in [
+            "unit-volume/objects/aa/bb/0000000000000001",
+            "unit-volume/objects/cc/dd/0000000000000002",
+        ] {
+            store
+                .put_by_key(key, Bytes::from_static(b"payload"))
+                .await
+                .unwrap();
+        }
+
+        let mut entries = Box::pin(
+            store
+                .list_object_entries("unit-volume/objects/")
+                .await
+                .unwrap(),
+        );
+        let mut keys = Vec::new();
+        while let Some(entry) = entries.next().await {
+            keys.push(entry.unwrap().key);
+        }
+        keys.sort();
+
+        assert_eq!(
+            keys,
+            vec![
+                "unit-volume/objects/aa/bb/0000000000000001".to_string(),
+                "unit-volume/objects/cc/dd/0000000000000002".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_by_key_rejects_key_outside_volume_scope() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+
+        let error = store
+            .delete_by_key("other-volume/object")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DataError::InvalidObjectKey(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_by_key_rejects_path_segments() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+
+        for key in [
+            "unit-volume/../other-volume/object",
+            "unit-volume\\objects\\object",
+        ] {
+            let error = store.delete_by_key(key).await.unwrap_err();
+
+            assert!(matches!(error, DataError::InvalidObjectKey(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_object_entries_rejects_prefix_outside_volume_scope() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+
+        let error = match store.list_object_entries("other-volume/objects/").await {
+            Ok(_) => panic!("invalid list prefix must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, DataError::InvalidObjectKey(_)));
     }
 }

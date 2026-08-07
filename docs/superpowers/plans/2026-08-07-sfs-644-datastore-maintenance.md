@@ -23,11 +23,11 @@ The janitor currently reaches through `DataStore::operator()` to list and delete
 - [x] (2026-08-07 10:50 +03:00) Confirmed current WinFSP direct dependency is normal in Cargo metadata and `studiofs-vfs` remains the runtime transitive owner.
 - [x] (2026-08-07 10:50 +03:00) Design accepted by the user; spec saved at `docs/superpowers/specs/2026-08-07-sfs-644-datastore-maintenance-design.md`.
 - [x] (2026-08-07 10:50 +03:00) Implementation plan saved; implementation commits remain.
-- [ ] Add failing DataStore tests for listing and invalid delete keys.
-- [ ] Implement the provider-neutral listing stream, error variant, key validation, and remove `operator`.
-- [ ] Migrate VFS workers and tests; move the WinFSP dependency.
-- [ ] Run focused tests/checks, formatting, diff checks, and metadata verification.
-- [ ] Update this plan with evidence and commit the implementation.
+- [x] (2026-08-07) Add failing DataStore tests for listing and invalid delete keys; the expected compile failures were observed before implementation.
+- [x] (2026-08-07) Implement the provider-neutral listing stream, error variant, key validation, and remove `operator`.
+- [x] (2026-08-07) Migrate VFS workers and tests; move the WinFSP dependency.
+- [x] (2026-08-07) Run focused tests/checks, formatting, diff checks, and metadata verification.
+- [x] (2026-08-07) Update this plan with evidence and commit the implementation.
 
 ## Surprises & Discoveries
 
@@ -37,6 +37,8 @@ The janitor currently reaches through `DataStore::operator()` to list and delete
   Evidence: `cargo tree -p studiofs-winfsp --edges normal` lists both the direct edge and `studiofs-vfs -> studiofs-data`.
 - Observation: OpenDAL's asynchronous lister is streaming and stops after yielding a provider error.
   Evidence: OpenDAL 0.55 source and current worker behavior; the new wrapper will preserve streaming and map the error to `DataError::OpenDal`.
+- Observation: The provider-neutral stream is not `Unpin` because it owns an async `unfold` state machine.
+  Evidence: Focused compilation required `Box::pin` at the DataStore test and janitor call sites; no provider type leaked through the API.
 
 ## Decision Log
 
@@ -52,7 +54,19 @@ The janitor currently reaches through `DataStore::operator()` to list and delete
 
 ## Outcomes & Retrospective
 
-This section will be completed after focused validation. It must state which callers were migrated, which checks passed, and any prerequisite that prevented a mounted/integration run.
+The janitor's raw listing and fragment deletes now use `list_object_entries` and validated `delete_by_key`. VFS encryption tests use a test-local raw OpenDAL operator only for ciphertext inspection, and the orphan fixture uses `put_by_key`. `studiofs-winfsp` now has a dev-only direct `studiofs-data` dependency; `studiofs-data` remains a runtime transitive dependency through `studiofs-vfs` as intended.
+
+Evidence:
+
+- `cargo test -p studiofs-data --lib`: 49 passed.
+- `cargo check -p studiofs-vfs --test vfs_test`: passed.
+- `cargo check -p studiofs-winfsp --tests`: passed.
+- `cargo clippy -p studiofs-data -p studiofs-vfs -p studiofs-winfsp --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Cargo metadata reports `studiofs-data` for `studiofs-winfsp` with `kind dev`.
+- `rg -n "\.operator\(\)|pub fn operator" crates Cargo.toml`: no matches.
+
+Ignored live S3 tests and the full workspace suite were not run; the repository requires live `STUDIOFS_S3_*` infrastructure for the former, and full suites are outside this focused validation.
 
 ## Context and Orientation
 
@@ -123,7 +137,7 @@ with `self.data_write.list_object_entries(&self.data_prefix).await`. Keep the ex
 
 Run:
 
-    cargo check -p studiofs-vfs
+    cargo check -p studiofs-vfs --test vfs_test
 
 Expected result: the worker compiles without any `DataStore::operator` call. `background_gc` continues to use the now-validated `delete_by_key`.
 
@@ -158,11 +172,11 @@ Expected metadata output has `name studiofs-data` and `kind dev`. The package ma
 
 Run from `E:\dev\studiofs-cli`:
 
-    cargo fmt -- --check
+    cargo fmt --all -- --check
     cargo test -p studiofs-data --lib
-    cargo check -p studiofs-data -p studiofs-vfs -p studiofs-winfsp
+    cargo check -p studiofs-winfsp --tests
     cargo clippy -p studiofs-data -p studiofs-vfs -p studiofs-winfsp --all-targets -- -D warnings
-    cargo metadata --no-deps --format-version 1 > target/sfs-644-metadata.json
+    cargo metadata --no-deps --format-version 1 | ConvertFrom-Json | ...
     rg -n "\.operator\(\)|pub fn operator" crates Cargo.toml
     git diff --check
 
@@ -204,4 +218,4 @@ At completion, `crates/studiofs-data/src/store.rs` must provide:
 
 ## Revision Note
 
-Initial plan created after user approval of the SFS-644 design on 2026-08-07. The plan deliberately keeps `delete_by_key` as the one existing delete API and adds only the provider-neutral listing operation.
+Initial plan created after user approval of the SFS-644 design on 2026-08-07. Implementation completed on 2026-08-07 in the current feature branch. The plan deliberately keeps `delete_by_key` as the one existing delete API and adds only the provider-neutral listing operation.
