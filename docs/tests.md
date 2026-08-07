@@ -385,8 +385,8 @@ cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reus
 ## Platform-Gated Unit Tests
 
 `studiofs-winfsp` contains unit tests that are only meaningful on Windows.
-macOS bridge tests belong to `studiofs-macfuse`. Linux has no bridge crate
-after SFS-600.
+macOS bridge tests belong to `studiofs-macfuse`. Linux libfuse3 bridge tests
+belong to `studiofs-linux-fuse`.
 
 ### Rules for writing platform-gated unit tests
 

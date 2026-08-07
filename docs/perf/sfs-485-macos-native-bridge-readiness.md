@@ -49,7 +49,7 @@ locally as a full-suite substitute:
 cargo test -p studiofs --test architecture_vocabulary_test macos_native_bridge_readiness_report_covers_sfs485_decision_gate -- --nocapture
 cargo test -p studiofs-macfuse -- --nocapture
 STUDIOFS_MOUNT_BACKEND=macfuse cargo test -p studiofs-macfuse --test mount_sanity macos_native_mounted_smoke -- --ignored --exact --nocapture
-cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_default_sync -- --ignored --exact --nocapture
+STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_fio_multi_job_smoke -- --ignored --exact --nocapture
 ```
 

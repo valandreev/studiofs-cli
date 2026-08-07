@@ -1424,21 +1424,42 @@ fn macos_native_bridge_split_note_covers_sfs475_boundary() {
 
 #[test]
 fn configuration_contracts_match_executable_defaults() {
-    let macos_backend = read_workspace_file("crates/studiofs/src/cli/mount/backend.rs");
+    let mount_backend = read_workspace_file("crates/studiofs/src/cli/mount/backend.rs");
     let winfsp = read_workspace_file("crates/studiofs-winfsp/src/lib.rs");
+    let studiofs_manifest = read_workspace_file("crates/studiofs/Cargo.toml");
+    let cli_help = read_workspace_file("crates/studiofs/src/cli/mod.rs");
     let configuration = read_workspace_file("docs/configuration.md");
     let coding_guide = read_workspace_file("docs/agents-coding-guide.md");
     let platform_bridges = read_workspace_file("docs/platform-bridges.md");
     let macos_split = read_workspace_file("docs/macos-native-bridge-split.md");
+    let tests_guide = read_workspace_file("docs/tests.md");
+    let workflow = read_workspace_file(".github/workflows/rust.yml");
+    let normalized_mount_backend = normalize_doc_whitespace(&mount_backend);
+    let normalized_winfsp = normalize_doc_whitespace(&winfsp);
+    let normalized_studiofs_manifest = normalize_doc_whitespace(&studiofs_manifest);
     let normalized_configuration = normalize_doc_whitespace(&configuration);
     let normalized_coding_guide = normalize_doc_whitespace(&coding_guide);
     let normalized_platform_bridges = normalize_doc_whitespace(&platform_bridges);
     let normalized_macos_split = normalize_doc_whitespace(&macos_split);
+    let normalized_tests_guide = normalize_doc_whitespace(&tests_guide);
+    let normalized_workflow = normalize_doc_whitespace(&workflow);
 
     let required_contracts = [
         (
             "macOS executable default",
-            macos_backend.contains("None => Box::new(MacFuseMountBackend)"),
+            contains_doc_term(
+                &mount_backend,
+                &normalized_mount_backend,
+                "None => Box::new(MacFuseMountBackend)",
+            ),
+        ),
+        (
+            "macOS selector compatibility",
+            contains_doc_term(
+                &mount_backend,
+                &normalized_mount_backend,
+                "Some(value) if value.eq_ignore_ascii_case(\"macfuse\") => Box::new(MacFuseMountBackend)",
+            ),
         ),
         (
             "macOS configuration default",
@@ -1458,7 +1479,11 @@ fn configuration_contracts_match_executable_defaults() {
         ),
         (
             "Linux executable default",
-            macos_backend.contains("Box::new(LinuxFuseMountBackend)"),
+            contains_doc_term(
+                &mount_backend,
+                &normalized_mount_backend,
+                "Box::new(LinuxFuseMountBackend)",
+            ),
         ),
         (
             "Linux configuration default",
@@ -1477,8 +1502,52 @@ fn configuration_contracts_match_executable_defaults() {
             ),
         ),
         (
+            "Windows executable default",
+            contains_doc_term(
+                &mount_backend,
+                &normalized_mount_backend,
+                "Box::new(WinfspMountBackend)",
+            ),
+        ),
+        (
+            "macOS target dependency",
+            contains_doc_term(
+                &studiofs_manifest,
+                &normalized_studiofs_manifest,
+                "[target.'cfg(target_os = \"macos\")'.dependencies] studiofs-macfuse.workspace = true",
+            ),
+        ),
+        (
+            "Linux target dependency",
+            contains_doc_term(
+                &studiofs_manifest,
+                &normalized_studiofs_manifest,
+                "[target.'cfg(target_os = \"linux\")'.dependencies] studiofs-linux-fuse.workspace = true",
+            ),
+        ),
+        (
+            "Windows target dependency",
+            contains_doc_term(
+                &studiofs_manifest,
+                &normalized_studiofs_manifest,
+                "[target.'cfg(windows)'.dependencies] studiofs-winfsp.workspace = true",
+            ),
+        ),
+        (
             "WinFSP executable default",
-            winfsp.contains("const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;"),
+            contains_doc_term(
+                &winfsp,
+                &normalized_winfsp,
+                "const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;",
+            ),
+        ),
+        (
+            "WinFSP cleanup override",
+            contains_doc_term(
+                &winfsp,
+                &normalized_winfsp,
+                "let flush_and_purge_on_cleanup = parse_bool_env( \"STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP\", DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, );",
+            ),
         ),
         (
             "WinFSP coding-guide default",
@@ -1502,6 +1571,26 @@ fn configuration_contracts_match_executable_defaults() {
                 &configuration,
                 &normalized_configuration,
                 "On Windows, WinFSP `FlushAndPurgeOnCleanup` is disabled by default",
+            ),
+        ),
+        (
+            "CLI Linux platform help",
+            cli_help.contains("• Linux    (via libfuse3)"),
+        ),
+        (
+            "platform test guide Linux bridge",
+            contains_doc_term(
+                &tests_guide,
+                &normalized_tests_guide,
+                "Linux libfuse3 bridge tests belong to `studiofs-linux-fuse`.",
+            ),
+        ),
+        (
+            "workflow macOS default",
+            contains_doc_term(
+                &workflow,
+                &normalized_workflow,
+                "macFUSE is the default macOS mount backend",
             ),
         ),
     ];
@@ -1574,7 +1663,7 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
         "operator should run, but the agent should not run locally",
         "cargo test -p studiofs --test architecture_vocabulary_test macos_native_bridge_readiness_report_covers_sfs485_decision_gate -- --nocapture",
         "cargo test -p studiofs-macfuse",
-        "cargo test -p studiofs-fuse --test mount_sanity",
+        "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1",
         "cargo test -p studiofs-winfsp --test mount_sanity",
         "Capture mounted benchmark reports for the macFUSE candidate and fuser baseline",
         "docs/configuration.md",
