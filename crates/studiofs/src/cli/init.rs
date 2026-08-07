@@ -845,10 +845,33 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires STUDIOFS_TEST_PG_DSN"]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN in the process environment or workspace .env"]
     fn init_repairs_existing_schema_before_volume_guard() {
         let dsn = std::env::var("STUDIOFS_TEST_PG_DSN")
-            .expect("set STUDIOFS_TEST_PG_DSN to run PostgreSQL init tests");
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                let env_path = studiofs_test_support::workspace_root().join(".env");
+                if !env_path.is_file() {
+                    return None;
+                }
+                dotenvy::from_path_iter(env_path)
+                    .unwrap_or_else(|error| {
+                        panic!("failed to load workspace .env for PostgreSQL init tests: {error}")
+                    })
+                    .map(|entry| {
+                        entry.unwrap_or_else(|error| {
+                            panic!(
+                                "failed to parse workspace .env for PostgreSQL init tests: {error}"
+                            )
+                        })
+                    })
+                    .find_map(|(key, value)| (key == "STUDIOFS_TEST_PG_DSN").then_some(value))
+            })
+            .filter(|value| !value.trim().is_empty())
+            .expect(
+                "set STUDIOFS_TEST_PG_DSN or add it to workspace .env to run PostgreSQL init tests",
+            );
         let rt = tokio::runtime::Runtime::new().expect("create test runtime");
         let name = format!("sfs642-schema-upgrade-{}", Uuid::new_v4());
         let uuid = Uuid::new_v4().to_string();
