@@ -252,14 +252,9 @@ impl StudioVfs {
         (entry, guard)
     }
 
-    fn observe_sustained_write_admission(
-        &self,
-        ino: Ino,
-        offset: u64,
-        len: usize,
-    ) -> super::SustainedWriteAdmission {
+    fn observe_sustained_write_admission(&self, ino: Ino, offset: u64, len: usize) -> bool {
         if len == 0 {
-            return super::SustainedWriteAdmission::default();
+            return false;
         }
         let dirty_bytes_after_write = self
             .state
@@ -276,25 +271,23 @@ impl StudioVfs {
         )
     }
 
-    pub(super) async fn maybe_pre_drain_sustained_write_buffer(
+    pub(super) fn maybe_pre_drain_sustained_write_buffer(
         self: &Arc<Self>,
         ino: Ino,
         offset: u64,
         len: usize,
         local_sync_policy: LocalSyncPolicy,
-    ) -> VfsResult<u64> {
+    ) {
         if !local_sync_policy.is_opportunistic() || len == 0 {
-            return Ok(0);
+            return;
         }
-        let admission = self.observe_sustained_write_admission(ino, offset, len);
-        if !admission.pre_drain {
-            return Ok(0);
+        if !self.observe_sustained_write_admission(ino, offset, len) {
+            return;
         }
         // Sustained-stream detection is a pre-drain signal only. Adaptive
         // admission already owns pacing from measured pressure and drain rate;
         // adding a second time-based sleep here produces periodic callback stalls.
-        self.spawn_deferred_materialization_if_needed(ino).await;
-        Ok(0)
+        self.spawn_deferred_materialization_if_needed(ino);
     }
 
     fn record_deferred_write_hard_backpressure(&self) {
@@ -308,7 +301,7 @@ impl StudioVfs {
     ///
     /// Deferred materialization drains buffered writer-stack data into the local dirty-state
     /// persistence path in the background, while the inode still has open handles.
-    pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
+    pub(super) fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
         if self.disable_background_slab_flush {
             return;
         }
@@ -943,8 +936,7 @@ impl StudioVfs {
         self.ensure_volatile_overlay_metadata_healthy()?;
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
         if self.state.writer_stack.has_dirty_writers(target_ino) {
-            self.spawn_deferred_materialization_if_needed(target_ino)
-                .await;
+            self.spawn_deferred_materialization_if_needed(target_ino);
         }
         Ok(ExplicitFlushOutcome {
             flushed_local_dirty_state: had_local_dirty_state,
@@ -1648,13 +1640,10 @@ impl StudioVfs {
         }
         if local_sync_policy.is_opportunistic() {
             let pre_drain_started = Instant::now();
-            let sustained_delay_ms = self
-                .maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
-                .await?;
+            self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy);
             self.record_vfs_write_pre_drain(pre_drain_started.elapsed());
             let admission_throttle_started = Instant::now();
-            self.maybe_throttle_write_admission(data.len(), sustained_delay_ms)
-                .await;
+            self.maybe_throttle_write_admission(data.len()).await;
             self.record_vfs_write_admission_throttle(admission_throttle_started.elapsed());
         }
         // ── Acquire per-inode write gate ─────────────────────────────────
@@ -1739,7 +1728,7 @@ impl StudioVfs {
         match (&result, local_sync_policy) {
             (Ok(written), LocalSyncPolicy::Opportunistic) if *written > 0 => {
                 let spawn_started = Instant::now();
-                self.spawn_deferred_materialization_if_needed(ino).await;
+                self.spawn_deferred_materialization_if_needed(ino);
                 self.record_vfs_write_spawn_deferred_materialization(spawn_started.elapsed());
             }
             (Ok(_), policy) if policy.requires_write_path_durability() => {

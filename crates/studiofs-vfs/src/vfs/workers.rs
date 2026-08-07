@@ -189,7 +189,7 @@ impl StudioVfs {
                 if self.shutdown_requested() {
                     break;
                 }
-                self.spawn_deferred_materialization_if_needed(ino).await;
+                self.spawn_deferred_materialization_if_needed(ino);
             }
         }
     }

@@ -8103,7 +8103,7 @@ fn write_admission_first_sample_below_budget_without_pacing() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(1, 0),
+            vfs.maybe_throttle_write_admission(1),
         )
         .await
         .expect("first adaptive admission sample should not sleep below budget");
@@ -8157,7 +8157,7 @@ fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10, 0),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10),
         )
         .await
         .expect("soft pressure below the hard window must not delay a local-first write");
@@ -8186,7 +8186,7 @@ fn write_admission_admits_oversized_write_when_pressure_is_empty() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
-            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1, 0),
+            vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1),
         )
         .await
         .expect("empty pressure should admit a single oversized write");
@@ -8232,7 +8232,7 @@ fn write_admission_ignores_pending_upload_backlog_for_hard_window() {
 
         tokio::time::timeout(
             Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
-            vfs.maybe_throttle_write_admission(1, 0),
+            vfs.maybe_throttle_write_admission(1),
         )
         .await
         .expect("pending upload backlog must not trigger hard admission wait");
@@ -8268,7 +8268,7 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
 
         let admission_vfs = Arc::clone(&vfs);
         let wait_task =
-            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1, 0).await });
+            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
         tokio::time::sleep(Duration::from_millis(
             WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 3 + 10,
         ))
@@ -8342,18 +8342,11 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
             .try_register(ino)
             .expect("test should reserve deferred materialization gate");
 
-        let delay_ms = vfs
-            .maybe_pre_drain_sustained_write_buffer(
-                ino,
-                seeded_len as u64,
-                1,
-                LocalSyncPolicy::Opportunistic,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            delay_ms, 0,
-            "sustained pre-drain should not add a second foreground pacing delay"
+        vfs.maybe_pre_drain_sustained_write_buffer(
+            ino,
+            seeded_len as u64,
+            1,
+            LocalSyncPolicy::Opportunistic,
         );
 
         assert!(
@@ -8416,18 +8409,11 @@ fn sustained_pre_drain_schedules_without_pacing_when_dirty_runway_is_long() {
             .try_register(ino)
             .expect("test should reserve deferred materialization gate");
 
-        let delay_ms = vfs
-            .maybe_pre_drain_sustained_write_buffer(
-                ino,
-                seeded_len as u64,
-                1,
-                LocalSyncPolicy::Opportunistic,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            delay_ms, 0,
-            "sustained pre-drain should schedule materialization without sleeping while dirty runway is long"
+        vfs.maybe_pre_drain_sustained_write_buffer(
+            ino,
+            seeded_len as u64,
+            1,
+            LocalSyncPolicy::Opportunistic,
         );
 
         assert!(
@@ -8462,10 +8448,10 @@ fn sustained_write_window_resets_after_idle_or_seek() {
         drain,
         drain + 1,
     );
-    assert!(!after_idle.pre_drain);
+    assert!(!after_idle);
 
     let after_seek = state.observe(4_000, 128, 4, drain, drain + 1);
-    assert!(!after_seek.pre_drain);
+    assert!(!after_seek);
 }
 
 #[test]

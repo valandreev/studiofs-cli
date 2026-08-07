@@ -294,11 +294,6 @@ struct SustainedWriteState {
     last_end_offset: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct SustainedWriteAdmission {
-    pre_drain: bool,
-}
-
 impl SustainedWriteState {
     fn observe(
         &mut self,
@@ -307,7 +302,7 @@ impl SustainedWriteState {
         len: usize,
         drain_chunk_bytes: usize,
         dirty_bytes_after_write: usize,
-    ) -> SustainedWriteAdmission {
+    ) -> bool {
         let end_offset = offset.saturating_add(len as u64);
         let idle_gap_ms = now_ms.saturating_sub(self.last_write_ms);
         let sequential = self.last_write_ms == 0 || offset == self.last_end_offset;
@@ -317,11 +312,8 @@ impl SustainedWriteState {
         self.last_write_ms = now_ms;
         self.last_end_offset = end_offset;
 
-        SustainedWriteAdmission {
-            pre_drain: now_ms.saturating_sub(self.streak_start_ms)
-                >= SUSTAINED_WRITE_DELAY_START_MS
-                && dirty_bytes_after_write > drain_chunk_bytes,
-        }
+        now_ms.saturating_sub(self.streak_start_ms) >= SUSTAINED_WRITE_DELAY_START_MS
+            && dirty_bytes_after_write > drain_chunk_bytes
     }
 }
 
@@ -6699,7 +6691,7 @@ impl StudioVfs {
             .fetch_max(waited_ms, Ordering::Relaxed);
     }
 
-    async fn maybe_throttle_write_admission(&self, next_bytes: usize, sustained_delay_ms: u64) {
+    async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
         if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
@@ -6744,7 +6736,6 @@ impl StudioVfs {
                 decision.runway_ms,
             );
         }
-        let _ = sustained_delay_ms;
     }
 
     fn write_admission_governor_stats(&self) -> WriteAdmissionGovernorStats {
