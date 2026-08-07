@@ -508,6 +508,78 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_dirty_flush_callbacks_preserve_volatile_barrier_contract() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("flush_coalesce_dirty");
+        let attr = vfs
+            .create(ROOT_INO, b"flush-coalesce-dirty.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
+        let ctx = Arc::new(ctx);
+        let start = Arc::new(Barrier::new(3));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let ctx = Arc::clone(&ctx);
+            let start = Arc::clone(&start);
+            let ino = attr.ino;
+            joins.push(std::thread::spawn(move || {
+                start.wait();
+                WinfspHandleDrainFacade::new(ctx.as_ref())
+                    .flush(ino, fh)
+                    .expect("concurrent flush callback");
+            }));
+        }
+        start.wait();
+        for join in joins {
+            join.join().expect("flush thread join");
+        }
+
+        let callbacks_after = winfsp_callbacks(&vfs);
+        let barriers_after = winfsp_foreground_flushes(&vfs);
+        assert_eq!(
+            callbacks_after.flush,
+            callbacks_before.flush + 2,
+            "both concurrent flush callbacks should still be observable"
+        );
+        assert_eq!(
+            barriers_after.flush,
+            barriers_before.flush + 2,
+            "both dirty callbacks should be recorded as volatile flush outcomes"
+        );
+        assert_eq!(
+            barriers_after.flush_skipped_clean, barriers_before.flush_skipped_clean,
+            "dirty volatile callbacks should not be recorded as clean skips"
+        );
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_before,
+            "volatile callbacks should not trigger a strict local barrier"
+        );
+        assert_eq!(
+            ctx.flush_gate_count(),
+            0,
+            "concurrent callbacks should release the per-inode gate"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
     fn cleanup_then_flush_then_close_stays_clean_after_write_commit() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_flush_close_clean_skip");
         let attr = vfs
