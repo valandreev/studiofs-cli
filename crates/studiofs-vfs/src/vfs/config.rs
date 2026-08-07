@@ -12,19 +12,16 @@ use crate::vfs::{
     DEFAULT_FETCH_RETRY_BASE_MS, DEFAULT_FETCH_RETRY_MAX_MS, DEFAULT_JANITOR_INTERVAL,
     DEFAULT_JANITOR_MAX_DELETES_PER_RUN, DEFAULT_JANITOR_SKIP_NEWER_THAN, DEFAULT_LOCK_LEASE_TTL,
     DEFAULT_LOCK_RETRY_BASE_MS, DEFAULT_LOCK_RETRY_MAX_MS, DEFAULT_MAX_DIRTY_BYTES,
-    DEFAULT_MAX_DRAIN_BATCH, DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS,
-    DEFAULT_PATH_SHORTCUT_CACHE_BYTES, DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY,
-    DEFAULT_PREFETCH_CONCURRENCY, DEFAULT_PREFETCH_CONCURRENCY_MIN,
-    DEFAULT_PREFETCH_FETCH_MAX_ATTEMPTS, DEFAULT_PREFETCH_FOREGROUND_RESERVE,
-    DEFAULT_PREFETCH_MAX_PER_CYCLE, DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS,
+    DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS, DEFAULT_PATH_SHORTCUT_CACHE_BYTES,
+    DEFAULT_PATH_SHORTCUT_CACHE_CAPACITY, DEFAULT_PREFETCH_CONCURRENCY,
+    DEFAULT_PREFETCH_CONCURRENCY_MIN, DEFAULT_PREFETCH_FETCH_MAX_ATTEMPTS,
+    DEFAULT_PREFETCH_FOREGROUND_RESERVE, DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS,
     DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS, DEFAULT_QOS_ACCEPT_SLOTS, DEFAULT_QOS_COMMIT_SLOTS,
     DEFAULT_QOS_FETCH_SLOTS, DEFAULT_QOS_MATERIALIZE_SLOTS, DEFAULT_READ_BUFFER_MB,
-    DEFAULT_READAHEAD_MIN_PREFETCH, DEFAULT_READAHEAD_RANDOM_PENALTY, DEFAULT_READAHEAD_SEQ_STEP,
-    DEFAULT_READAHEAD_WIDTH, DEFAULT_READDIR_ATTR_BATCH_CHUNK,
+    DEFAULT_READAHEAD_MIN_PREFETCH, DEFAULT_READAHEAD_WIDTH, DEFAULT_READDIR_ATTR_BATCH_CHUNK,
     DEFAULT_READDIR_ATTR_BATCH_MAX_INODES, DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
-    DEFAULT_SLAB_FLUSH_INTERVAL_MS, DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
-    DEFAULT_UPLOAD_CACHE_IO_SLOTS, DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS,
-    DEFAULT_UPLOAD_DECREASE_FACTOR, DEFAULT_UPLOAD_DELAY_MS,
+    DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES, DEFAULT_UPLOAD_CACHE_IO_SLOTS,
+    DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS, DEFAULT_UPLOAD_DECREASE_FACTOR, DEFAULT_UPLOAD_DELAY_MS,
     DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS, DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
     DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS, DEFAULT_UPLOAD_IDLE_RESET_SECS,
     DEFAULT_UPLOAD_INCREASE_STEP, DEFAULT_UPLOAD_INITIAL_WINDOW, DEFAULT_UPLOAD_MAX_ATTEMPTS,
@@ -233,10 +230,6 @@ pub struct VfsConfig {
     pub readahead_width: u32,
     /// Minimum prefetch count for sequential patterns.
     pub readahead_min_prefetch: u32,
-    /// Sequential step size.
-    pub readahead_seq_step: u8,
-    /// Random access penalty.
-    pub readahead_random_penalty: u8,
     /// Directory prefetch batch size.
     pub dir_prefetch_max_batch: usize,
     /// Readdir attr hydration chunk size.
@@ -245,8 +238,6 @@ pub struct VfsConfig {
     pub readdir_attr_batch_max_inodes: usize,
     /// Foreground reserve for prefetch scheduling.
     pub prefetch_foreground_reserve: usize,
-    /// Max prefetches per cycle.
-    pub prefetch_max_per_cycle: usize,
     /// Pause between prefetch retries on network errors.
     pub prefetch_pause_on_neterr_ms: u64,
     /// Lock lease TTL.
@@ -332,8 +323,6 @@ pub struct VfsConfig {
     pub upload_requeue_max_ms: u64,
     /// Upload metrics log interval.
     pub upload_stats_interval_secs: u64,
-    /// Background slab flusher wake interval.
-    pub slab_flush_interval_ms: u64,
     /// Whether to skip the background slab flush worker.
     pub disable_background_slab_flush: bool,
     /// Upload local-cache I/O slots.
@@ -375,8 +364,6 @@ pub struct VfsConfig {
     pub fetch_prefetch_reserve: usize,
     /// Prefetch acquire wait.
     pub fetch_prefetch_acquire_wait_ms: u64,
-    /// Materializer batch limit for each drain cycle.
-    pub max_drain_batch: usize,
     /// Time to wait for remote visibility before publishing a base graph.
     pub publish_visibility_timeout_secs: u64,
     /// Metadata flush timeout during shutdown.
@@ -416,10 +403,6 @@ pub struct VfsConfigRaw {
     pub readahead_width: Option<u32>,
     /// Optional override for minimum readahead prefetch count.
     pub readahead_min_prefetch: Option<u32>,
-    /// Optional override for readahead sequence step.
-    pub readahead_seq_step: Option<u8>,
-    /// Optional override for random read penalty.
-    pub readahead_random_penalty: Option<u8>,
     /// Optional override for max directory prefetch batch size.
     pub dir_prefetch_max_batch: Option<usize>,
     /// Optional override for readdir attr batch chunk size.
@@ -428,8 +411,6 @@ pub struct VfsConfigRaw {
     pub readdir_attr_batch_max_inodes: Option<usize>,
     /// Optional override for prefetch foreground reserve.
     pub prefetch_foreground_reserve: Option<usize>,
-    /// Optional override for max prefetches per cycle.
-    pub prefetch_max_per_cycle: Option<usize>,
     /// Optional override for prefetch network-error pause (ms).
     pub prefetch_pause_on_neterr_ms: Option<u64>,
     /// Optional override for lock lease TTL.
@@ -499,8 +480,6 @@ pub struct VfsConfigRaw {
     pub upload_requeue_max_ms: Option<u64>,
     /// Optional override for upload stats interval (seconds).
     pub upload_stats_interval_secs: Option<u64>,
-    /// Optional override for slab flush interval (ms).
-    pub slab_flush_interval_ms: Option<u64>,
     /// Optional override for disabling the background slab flush worker.
     pub disable_background_slab_flush: Option<bool>,
     /// Optional override for upload cache I/O slots.
@@ -539,8 +518,6 @@ pub struct VfsConfigRaw {
     pub fetch_prefetch_reserve: Option<usize>,
     /// Optional override for fetch prefetch acquire wait (ms).
     pub fetch_prefetch_acquire_wait_ms: Option<u64>,
-    /// Optional override for maximum drain batch size.
-    pub max_drain_batch: Option<usize>,
     /// Optional override for publish visibility timeout seconds.
     pub publish_visibility_timeout_secs: Option<u64>,
     /// Optional override for shutdown metadata flush timeout seconds.
@@ -645,13 +622,10 @@ impl VfsConfigRaw {
             prefetch_concurrency,
             readahead_width,
             readahead_min_prefetch,
-            readahead_seq_step,
-            readahead_random_penalty,
             dir_prefetch_max_batch,
             readdir_attr_batch_chunk,
             readdir_attr_batch_max_inodes,
             prefetch_foreground_reserve,
-            prefetch_max_per_cycle,
             prefetch_pause_on_neterr_ms,
             lock_ttl_secs,
             lock_retry_base_ms,
@@ -685,7 +659,6 @@ impl VfsConfigRaw {
             upload_requeue_base_ms,
             upload_requeue_max_ms,
             upload_stats_interval_secs,
-            slab_flush_interval_ms,
             disable_background_slab_flush,
             upload_cache_io_slots,
             transit_memory_budget_bytes,
@@ -705,7 +678,6 @@ impl VfsConfigRaw {
             fetch_retry_max_ms,
             fetch_prefetch_reserve,
             fetch_prefetch_acquire_wait_ms,
-            max_drain_batch,
             publish_visibility_timeout_secs,
             shutdown_metadata_flush_timeout_secs,
             qos_accept_slots,
@@ -740,13 +712,10 @@ fn normalize_vfs_config(
     // Zero explicitly disables VFS readahead for platforms whose file cache
     // already performs sequential read-ahead.
     cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
-    cfg.readahead_seq_step = cfg.readahead_seq_step.max(1);
-    cfg.readahead_random_penalty = cfg.readahead_random_penalty.max(1);
     cfg.dir_prefetch_max_batch = cfg.dir_prefetch_max_batch.max(1);
     cfg.readdir_attr_batch_chunk = cfg.readdir_attr_batch_chunk.max(1);
     cfg.readdir_attr_batch_max_inodes = cfg.readdir_attr_batch_max_inodes.max(1);
     cfg.prefetch_foreground_reserve = cfg.prefetch_foreground_reserve.max(1);
-    cfg.prefetch_max_per_cycle = cfg.prefetch_max_per_cycle.max(1);
     cfg.lock_ttl_secs = cfg.lock_ttl_secs.max(1);
     cfg.lock_retry_base_ms = cfg.lock_retry_base_ms.max(1);
     cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
@@ -771,12 +740,10 @@ fn normalize_vfs_config(
     cfg.upload_requeue_base_ms = cfg.upload_requeue_base_ms.max(1);
     cfg.upload_requeue_max_ms = cfg.upload_requeue_max_ms.max(cfg.upload_requeue_base_ms);
     cfg.upload_stats_interval_secs = cfg.upload_stats_interval_secs.max(1);
-    cfg.slab_flush_interval_ms = cfg.slab_flush_interval_ms.max(1);
     cfg.upload_cache_io_slots = cfg.upload_cache_io_slots.max(1);
     cfg.upload_fg_read_latency_target_ms = cfg.upload_fg_read_latency_target_ms.max(1);
     cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
     cfg.upload_fg_read_latency_sticky_windows = cfg.upload_fg_read_latency_sticky_windows.max(1);
-    cfg.max_drain_batch = cfg.max_drain_batch.max(1);
     cfg.publish_visibility_timeout_secs = cfg.publish_visibility_timeout_secs.max(1);
     cfg.shutdown_metadata_flush_timeout_secs = cfg.shutdown_metadata_flush_timeout_secs.max(1);
     cfg.qos_accept_slots = cfg.qos_accept_slots.max(1);
@@ -823,13 +790,10 @@ impl From<VfsConfig> for VfsConfigRaw {
             prefetch_concurrency: Some(cfg.prefetch_concurrency),
             readahead_width: Some(cfg.readahead_width),
             readahead_min_prefetch: Some(cfg.readahead_min_prefetch),
-            readahead_seq_step: Some(cfg.readahead_seq_step),
-            readahead_random_penalty: Some(cfg.readahead_random_penalty),
             dir_prefetch_max_batch: Some(cfg.dir_prefetch_max_batch),
             readdir_attr_batch_chunk: Some(cfg.readdir_attr_batch_chunk),
             readdir_attr_batch_max_inodes: Some(cfg.readdir_attr_batch_max_inodes),
             prefetch_foreground_reserve: Some(cfg.prefetch_foreground_reserve),
-            prefetch_max_per_cycle: Some(cfg.prefetch_max_per_cycle),
             prefetch_pause_on_neterr_ms: Some(cfg.prefetch_pause_on_neterr_ms),
             lock_ttl_secs: Some(cfg.lock_ttl_secs),
             lock_retry_base_ms: Some(cfg.lock_retry_base_ms),
@@ -864,7 +828,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             upload_requeue_base_ms: Some(cfg.upload_requeue_base_ms),
             upload_requeue_max_ms: Some(cfg.upload_requeue_max_ms),
             upload_stats_interval_secs: Some(cfg.upload_stats_interval_secs),
-            slab_flush_interval_ms: Some(cfg.slab_flush_interval_ms),
             disable_background_slab_flush: Some(cfg.disable_background_slab_flush),
             upload_cache_io_slots: Some(cfg.upload_cache_io_slots),
             transit_memory_budget_bytes: Some(cfg.transit_memory_budget_bytes),
@@ -884,7 +847,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             fetch_retry_max_ms: Some(cfg.fetch_retry_max_ms),
             fetch_prefetch_reserve: Some(cfg.fetch_prefetch_reserve),
             fetch_prefetch_acquire_wait_ms: Some(cfg.fetch_prefetch_acquire_wait_ms),
-            max_drain_batch: Some(cfg.max_drain_batch),
             publish_visibility_timeout_secs: Some(cfg.publish_visibility_timeout_secs),
             shutdown_metadata_flush_timeout_secs: Some(cfg.shutdown_metadata_flush_timeout_secs),
             qos_accept_slots: Some(cfg.qos_accept_slots),
@@ -908,13 +870,10 @@ impl Default for VfsConfig {
                 .max(DEFAULT_PREFETCH_CONCURRENCY_MIN),
             readahead_width: DEFAULT_READAHEAD_WIDTH,
             readahead_min_prefetch: DEFAULT_READAHEAD_MIN_PREFETCH,
-            readahead_seq_step: DEFAULT_READAHEAD_SEQ_STEP,
-            readahead_random_penalty: DEFAULT_READAHEAD_RANDOM_PENALTY,
             dir_prefetch_max_batch: DEFAULT_DIR_PREFETCH_MAX_BATCH,
             readdir_attr_batch_chunk: DEFAULT_READDIR_ATTR_BATCH_CHUNK,
             readdir_attr_batch_max_inodes: DEFAULT_READDIR_ATTR_BATCH_MAX_INODES,
             prefetch_foreground_reserve: DEFAULT_PREFETCH_FOREGROUND_RESERVE,
-            prefetch_max_per_cycle: DEFAULT_PREFETCH_MAX_PER_CYCLE,
             prefetch_pause_on_neterr_ms: DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS,
             lock_ttl_secs: DEFAULT_LOCK_LEASE_TTL.as_secs(),
             lock_retry_base_ms: DEFAULT_LOCK_RETRY_BASE_MS,
@@ -949,7 +908,6 @@ impl Default for VfsConfig {
             upload_requeue_base_ms: DEFAULT_UPLOAD_REQUEUE_BASE_MS,
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
-            slab_flush_interval_ms: DEFAULT_SLAB_FLUSH_INTERVAL_MS,
             disable_background_slab_flush: false,
             upload_cache_io_slots: DEFAULT_UPLOAD_CACHE_IO_SLOTS,
             transit_memory_budget_bytes: DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
@@ -969,7 +927,6 @@ impl Default for VfsConfig {
             fetch_retry_max_ms: DEFAULT_FETCH_RETRY_MAX_MS,
             fetch_prefetch_reserve: DEFAULT_FETCH_PREFETCH_RESERVE,
             fetch_prefetch_acquire_wait_ms: DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS,
-            max_drain_batch: DEFAULT_MAX_DRAIN_BATCH,
             publish_visibility_timeout_secs: DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS,
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
             qos_accept_slots: DEFAULT_QOS_ACCEPT_SLOTS,

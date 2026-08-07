@@ -1,10 +1,9 @@
 # SFS-485 macOS Native Bridge Readiness
 
 SFS-485 tracks macOS native bridge readiness and default rollout. The current
-decision is pending: Do not make the native bridge default before this issue
-reaches a decision.
+decision is default: macFUSE is the normal macOS mount path.
 
-The macOS bridge remains an explicit development opt-in:
+The legacy selector remains accepted by existing scripts:
 
 ```bash
 STUDIOFS_MOUNT_BACKEND=macfuse studiofs mount myvolume /mnt/studio
@@ -12,11 +11,11 @@ STUDIOFS_MOUNT_BACKEND=macfuse studiofs mount myvolume /mnt/studio
 
 ## Decision Gate
 
-The issue must record one clear outcome before docs or CLI help describe the
-native bridge as default:
+The issue records the default rollout outcome:
 
 - `default`: macFUSE becomes the normal macOS mount path.
-- `opt-in`: macFUSE remains behind `STUDIOFS_MOUNT_BACKEND=macfuse`.
+- `opt-in`: macFUSE remains behind `STUDIOFS_MOUNT_BACKEND=macfuse` for rollback
+  planning only.
 - `reject`: macFUSE is rejected for this rollout in favor of another strategy,
   such as a StudioFS userspace hot read cache.
 

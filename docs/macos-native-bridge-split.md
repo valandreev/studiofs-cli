@@ -95,17 +95,16 @@ The first routing change should be compile-time gated with `cfg(target_os =
 arguments should keep their current public CLI shape until the macOS bridge has
 its own validated options.
 
-The initial CLI routing keeps the macOS native bridge behind
-`STUDIOFS_MOUNT_BACKEND=macfuse`. Without that selector, macOS uses the explicit
-unsupported backend so the incomplete native bridge does not become the
-unconditional default.
+The CLI now routes macOS mounts to `studiofs_macfuse` by default. The legacy
+`STUDIOFS_MOUNT_BACKEND=macfuse` selector remains accepted for compatibility
+with existing scripts.
 
 ## Fallback Behavior
 
-Before `studiofs-macfuse` is production-ready, macOS should not silently fall
-back to the Linux FUSE backend. A missing or disabled native bridge should fail
-with an explicit diagnostic that points to the macOS bridge issue chain and
-states that the old fuser notifier-store path was rejected by SFS-474.
+macOS must not silently fall back to the Linux FUSE backend. A missing or
+disabled native bridge should fail with an explicit diagnostic that points to
+the macOS bridge issue chain and states that the old fuser notifier-store path
+was rejected by SFS-474.
 
 Temporary developer escape hatches, if needed, must be opt-in, named as
 experimental, and excluded from the default mount path. They should not change

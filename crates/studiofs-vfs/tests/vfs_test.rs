@@ -485,9 +485,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     {
         config.write_eager_flush_batch_bytes = Some(bytes);
     }
-    if let Some(ms) = parse_env_u64("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
-        config.slab_flush_interval_ms = Some(ms);
-    }
     if locked_env_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").is_some() {
         config.disable_background_slab_flush = Some(true);
     }
@@ -524,12 +521,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_MIN_PREFETCH") {
         config.readahead_min_prefetch = Some(value as u32);
     }
-    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_SEQ_STEP") {
-        config.readahead_seq_step = Some(value as u8);
-    }
-    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_RANDOM_PENALTY") {
-        config.readahead_random_penalty = Some(value as u8);
-    }
     if let Some(value) = parse_env_usize("STUDIOFS_DIR_PREFETCH_MAX_BATCH") {
         config.dir_prefetch_max_batch = Some(value);
     }
@@ -542,14 +533,8 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_FOREGROUND_RESERVE") {
         config.prefetch_foreground_reserve = Some(value);
     }
-    if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_MAX_PER_CYCLE") {
-        config.prefetch_max_per_cycle = Some(value);
-    }
     if let Some(ms) = parse_env_u64("STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS") {
         config.prefetch_pause_on_neterr_ms = Some(ms);
-    }
-    if let Some(value) = parse_env_usize("STUDIOFS_MAX_DRAIN_BATCH") {
-        config.max_drain_batch = Some(value);
     }
     if let Some(secs) = parse_env_u64("STUDIOFS_LOCK_TTL_SECS") {
         config.lock_ttl_secs = Some(secs);
@@ -4713,7 +4698,6 @@ impl ScopedTestEnv {
             "STUDIOFS_MAX_DIRTY_BYTES",
             "STUDIOFS_MAX_SPILL_BYTES",
             "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
-            "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
             "STUDIOFS_FOREGROUND_DRAIN_ASSIST",
             "STUDIOFS_UPLOAD_DELAY_MS",
             "STUDIOFS_UPLOAD_REQUEUE_BASE_MS",
@@ -4754,15 +4738,11 @@ impl ScopedTestEnv {
             "STUDIOFS_PREFETCH_CONCURRENCY",
             "STUDIOFS_READAHEAD_WIDTH",
             "STUDIOFS_READAHEAD_MIN_PREFETCH",
-            "STUDIOFS_READAHEAD_SEQ_STEP",
-            "STUDIOFS_READAHEAD_RANDOM_PENALTY",
             "STUDIOFS_DIR_PREFETCH_MAX_BATCH",
             "STUDIOFS_READDIR_ATTR_BATCH_CHUNK",
             "STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES",
             "STUDIOFS_PREFETCH_FOREGROUND_RESERVE",
-            "STUDIOFS_PREFETCH_MAX_PER_CYCLE",
             "STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS",
-            "STUDIOFS_MAX_DRAIN_BATCH",
             "STUDIOFS_JANITOR_INTERVAL_SECS",
             "STUDIOFS_JANITOR_SKIP_NEWER_SECS",
             "STUDIOFS_JANITOR_MAX_DELETES",
@@ -8293,11 +8273,9 @@ fn test_ingress_pressure_reflects_buffered_partial_write_until_flush() {
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
     let _restore_assist = EnvRestore::capture("STUDIOFS_FOREGROUND_DRAIN_ASSIST");
     set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "512KB");
-    set_test_env("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "200");
     set_test_env("STUDIOFS_FOREGROUND_DRAIN_ASSIST", "0");
 
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
@@ -8375,12 +8353,10 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
     let _env = ScopedTestEnv::new();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_flush_interval = ScopedEnvVar::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "512KB");
-    set_test_env("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "250");
 
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = tmp.path().join("meta.redb");
@@ -8471,8 +8447,7 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
             ensure_bucket().await;
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(4 * 256 * 1024),
-                slab_flush_interval_ms: Some(5000),
-            ..VfsConfigRaw::default()
+                ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
             meta,
@@ -8542,7 +8517,6 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                slab_flush_interval_ms: Some(5000),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(

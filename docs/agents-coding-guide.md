@@ -128,7 +128,7 @@ Higher priority (lower tier number) must be acquired first:
   wait for a redb durability barrier.
 - `fsync` is the strict caller-requested local sync API and must not imply remote publication.
 - WinFSP `cleanup`:
-  - WinFSP `FlushAndPurgeOnCleanup` is enabled by default; write-capable
+  - WinFSP `FlushAndPurgeOnCleanup` is disabled by default; write-capable
     handles use `Create.Opened.DisableCache` so writes bypass the OS file cache.
     Read-only handles normally keep WinFSP cache-manager behavior. Remote
     same-inode content changes advance the WinFSP file identity via committed
