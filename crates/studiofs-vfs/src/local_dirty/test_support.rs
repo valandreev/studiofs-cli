@@ -1524,6 +1524,57 @@ mod tests {
     }
 
     #[test]
+    fn drain_core_keeps_payload_for_stale_metadata_attr() {
+        let ino = 13;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(
+            events.clone(),
+            false,
+            false,
+            None,
+            uploads.clone(),
+            observed_inodes.clone(),
+        );
+        let (mut pending, blocks) = single_block_fixture(ino, 0, b"stale", None);
+        let mut fresh_object_ids = std::collections::VecDeque::from([333]);
+        let persisted_blocks = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
+            .expect("prepare persisted payloads");
+        let mut stale_attr = InodeAttr::new_file(ino, 1, 1000, 1000, 0o644);
+        stale_attr.content_epoch = 5;
+        stale_attr.size = 4096;
+
+        futures::executor::block_on(drain.execute_drain(
+            ino,
+            persisted_blocks,
+            std::collections::BTreeMap::new(),
+            5,
+            Some(stale_attr),
+            PayloadPersistConfig {
+                put_concurrency: 4,
+                local_sync_policy: LocalSyncPolicy::Opportunistic,
+            },
+        ))
+        .expect("stale metadata must not discard a durable payload");
+
+        assert_eq!(
+            events.snapshot(),
+            vec![
+                "payload".to_string(),
+                "metadata:wait".to_string(),
+                "observer".to_string(),
+                "upload".to_string(),
+            ]
+        );
+        assert_eq!(
+            *uploads.lock().expect("uploads lock"),
+            vec![(ino, 0, 333, 5)]
+        );
+    }
+
+    #[test]
     fn drain_core_cleans_up_after_metadata_failure() {
         let ino = 12;
         let events = EventLog::default();

@@ -490,10 +490,18 @@ where
             }
         };
         if had_attr_to_persist && committed_attr.is_none() {
-            self.local_payloads
-                .cleanup_uncommitted(ino, &persisted_blocks, "metadata-stale")
-                .await;
-            return Ok(DrainOutcome { persisted_blocks });
+            // The metadata snapshot can be stale because a remote Ready
+            // publication won the race after this payload was materialized.
+            // Keep durable payloads in the upload pipeline: the uploader can
+            // reattach an uncovered range against the newer authoritative
+            // graph and rebase the local epoch. Dropping them here loses a
+            // valid write even though payload persistence succeeded.
+            if persisted_blocks.is_empty() {
+                self.local_payloads
+                    .cleanup_uncommitted(ino, &persisted_blocks, "metadata-stale")
+                    .await;
+                return Ok(DrainOutcome { persisted_blocks });
+            }
         }
 
         self.observer
