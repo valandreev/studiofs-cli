@@ -148,6 +148,8 @@ unsafe extern "C" {
         len: off_t,
     ) -> c_int;
     fn studiofs_linux_fuse_dir_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
+    #[cfg(test)]
+    fn studiofs_linux_fuse_dir_file_info_cache_readdir_after_init() -> c_int;
     fn studiofs_linux_fuse_file_info_init(
         info: *mut raw::FuseFileInfo,
         fh: u64,
@@ -3400,6 +3402,18 @@ mod tests {
 
     fn default_connection_config() -> super::LinuxFuseConnectionConfig {
         super::LinuxFuseConnectionConfig::default()
+    }
+
+    #[test]
+    fn directory_replies_do_not_enable_kernel_readdir_cache() {
+        // Remote namespace changes are delivered through inode invalidation;
+        // keeping a kernel-side readdir snapshot would retain stale dirents.
+        let cache_readdir =
+            unsafe { super::studiofs_linux_fuse_dir_file_info_cache_readdir_after_init() };
+        assert_eq!(
+            cache_readdir, 0,
+            "Linux directory replies must force fresh readdir callbacks after peer namespace changes"
+        );
     }
 
     #[test]

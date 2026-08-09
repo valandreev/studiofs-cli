@@ -237,6 +237,11 @@ rollback.
 The bridge installs a bounded, coalescing invalidation worker through libfuse3
 low-level inode notifications. Successful entry/create replies and `forget`
 maintain lookup liveness, while open handles independently keep an inode live.
+Directory replies intentionally leave libfuse3's `cache_readdir` disabled:
+remote namespace changes currently arrive through inode invalidation rather than
+individual dirent notifications, so caching a kernel-side directory snapshot
+could hide a peer-created entry. This does not disable the separate regular-file
+`keep_cache` decisions described above.
 Callback dispatch runs through libfuse3's multithreaded low-level loop while
 the connection init callback caps the kernel background queue
 (`max_background=128`, `congestion_threshold=96`) so heavy callback workloads

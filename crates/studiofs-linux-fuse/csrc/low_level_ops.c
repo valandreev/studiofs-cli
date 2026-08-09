@@ -228,7 +228,16 @@ int studiofs_linux_fuse_notify_inval_inode(struct fuse_session *session,
 void studiofs_linux_fuse_dir_file_info_init(struct fuse_file_info *info, uint64_t fh) {
     info->fh = fh;
     info->keep_cache = 1;
-    info->cache_readdir = 1;
+    // Directory contents can change on another StudioFS client. The bridge
+    // currently invalidates inode data/attributes, not individual FUSE
+    // dirents, so a kernel readdir snapshot would retain stale namespace.
+    info->cache_readdir = 0;
+}
+
+int studiofs_linux_fuse_dir_file_info_cache_readdir_after_init(void) {
+    struct fuse_file_info info = {0};
+    studiofs_linux_fuse_dir_file_info_init(&info, 7);
+    return info.cache_readdir ? 1 : 0;
 }
 
 void studiofs_linux_fuse_file_info_init(struct fuse_file_info *info,
