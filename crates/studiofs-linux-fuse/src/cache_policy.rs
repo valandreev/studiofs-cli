@@ -119,22 +119,21 @@ pub(crate) fn decide_open_cache(
     let generation = generation.into();
     let stable_generation = generation.disposition == OsCacheDisposition::Reuse
         && generation.reason == OsCacheReason::StableGeneration;
-    let safe_clean_generation = matches!(
-        generation.reason,
-        OsCacheReason::FirstObservation
-            | OsCacheReason::GenerationChanged
-            | OsCacheReason::StableGeneration
-    );
 
     match policy {
         LinuxFuseCachePolicy::Direct => LinuxOpenCacheDecision::direct(false),
-        LinuxFuseCachePolicy::Adaptive if write_capable || !safe_clean_generation => {
-            LinuxOpenCacheDecision::direct(false)
-        }
+        LinuxFuseCachePolicy::Adaptive if write_capable => LinuxOpenCacheDecision::direct(false),
         LinuxFuseCachePolicy::Adaptive
             if available_memory.is_some_and(|available| file_size > available) =>
         {
             LinuxOpenCacheDecision::direct(true)
+        }
+        LinuxFuseCachePolicy::Adaptive if !stable_generation => {
+            // A new generation must be read through VFS before the kernel may
+            // retain pages for reuse. This closes the race where an open
+            // arrives before the asynchronous inode invalidation reaches the
+            // kernel page cache.
+            LinuxOpenCacheDecision::direct(false)
         }
         LinuxFuseCachePolicy::Adaptive => LinuxOpenCacheDecision::kernel(stable_generation, false),
         LinuxFuseCachePolicy::Kernel => {
@@ -420,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_clean_generation_uses_kernel_cache_and_reuses_only_stable_pages() {
+    fn adaptive_clean_generation_uses_vfs_until_generation_is_stable() {
         let first = decide_open_cache(
             LinuxFuseCachePolicy::Adaptive,
             false,
@@ -428,9 +427,9 @@ mod tests {
             64,
             Some(1024),
         );
-        assert!(!first.direct_io);
+        assert!(first.direct_io);
         assert!(!first.keep_cache);
-        assert_eq!(first.readahead, ReadAheadIntent::Kernel);
+        assert_eq!(first.readahead, ReadAheadIntent::Vfs);
 
         let changed = decide_open_cache(
             LinuxFuseCachePolicy::Adaptive,
@@ -442,7 +441,9 @@ mod tests {
             64,
             Some(1024),
         );
+        assert!(changed.direct_io);
         assert!(!changed.keep_cache);
+        assert_eq!(changed.readahead, ReadAheadIntent::Vfs);
 
         let stable = decide_open_cache(
             LinuxFuseCachePolicy::Adaptive,
@@ -471,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_memory_measurement_failure_keeps_clean_first_read_cached() {
+    fn adaptive_memory_measurement_failure_uses_vfs_for_first_read() {
         let decision = decide_open_cache(
             LinuxFuseCachePolicy::Adaptive,
             false,
@@ -480,9 +481,9 @@ mod tests {
             None,
         );
 
-        assert!(!decision.direct_io);
+        assert!(decision.direct_io);
         assert!(!decision.keep_cache);
-        assert_eq!(decision.readahead, ReadAheadIntent::Kernel);
+        assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
         assert!(!decision.memory_bypassed);
     }
 
