@@ -836,10 +836,13 @@ where
 
         self.coordinator.complete_upload(op);
 
-        self.policy.refresh_incarnation_state(op.ino).await;
+        // Publication must be queued before the best-effort incarnation refresh:
+        // the refresh runs through the metadata executor and must not delay the
+        // peer-visible transition after the upload has left the pending queue.
         self.policy
             .finalize_completed_upload_epoch(op.ino, finalize_content_epoch)
             .await;
+        self.policy.refresh_incarnation_state(op.ino).await;
         self.policy.clear_upload_sticky_error(op.ino);
         self.policy
             .debug_pending_inode_state(op.ino, "upload_completed");
@@ -1916,12 +1919,21 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
 
     async fn refresh_incarnation_state(&self, ino: Ino) {
         let meta = self.vfs.meta.clone();
-        if let Ok(attr) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await
-        {
-            self.vfs
-                .refresh_inode_incarnation_state_from_attr(ino, &attr);
-        } else {
-            self.vfs.clear_inode_incarnation(ino);
+        match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await {
+            Ok(attr) => {
+                self.vfs
+                    .refresh_inode_incarnation_state_from_attr(ino, &attr);
+            }
+            Err(error) if StudioVfs::is_inode_not_found_error(&error, ino) => {
+                self.vfs.clear_inode_incarnation(ino);
+            }
+            Err(error) => {
+                warn!(
+                    ino,
+                    error = %error,
+                    "failed to refresh inode incarnation state after upload; retaining pending finalization"
+                );
+            }
         }
     }
 
@@ -2876,6 +2888,7 @@ mod tests {
         }
 
         async fn refresh_incarnation_state(&self, ino: Ino) {
+            self.trace.record("refresh_incarnation");
             self.refreshed.lock().push(ino);
         }
 
@@ -3800,6 +3813,7 @@ mod tests {
                 "local_cleanup",
                 "queue_completion",
                 "epoch_finalization",
+                "refresh_incarnation",
                 "unpin",
             ],
             "upload lifecycle ordering must remain observable across all durable stages"
@@ -3880,6 +3894,36 @@ mod tests {
             *policy.finalized_upload_epochs.lock(),
             vec![(op.ino, op.content_epoch)],
             "completed uploads must immediately drive epoch finalization so crash-replayed data becomes peer-visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_upload_queues_epoch_finalization_before_refreshing_incarnation() {
+        let (processor, _coordinator, _local_payloads, meta, remote, _shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        let events = remote.trace.events.lock();
+        let refresh_index = events
+            .iter()
+            .position(|event| *event == "refresh_incarnation")
+            .expect("upload completion should refresh incarnation state");
+        let finalization_index = events
+            .iter()
+            .position(|event| *event == "epoch_finalization")
+            .expect("upload completion should queue epoch finalization");
+        assert!(
+            finalization_index < refresh_index,
+            "epoch finalization must be queued before metadata refresh can delay it: {events:?}"
         );
     }
 
