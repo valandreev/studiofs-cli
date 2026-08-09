@@ -1926,7 +1926,15 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
     }
 
     async fn finalize_completed_upload_epoch(&self, ino: Ino, content_epoch: u64) {
-        if self.vfs.shutdown_requested() || self.vfs.inode_has_pending_uploads(ino) {
+        if self.vfs.shutdown_requested() {
+            return;
+        }
+        if self.vfs.inode_has_pending_uploads(ino) {
+            // Keep a non-verified ticket alive while sibling uploads are pending. The
+            // finalizer may have consumed the previous ticket before returning
+            // WaitingForUploads; the last upload completion will mark this same ticket
+            // as remote-visibility verified.
+            self.vfs.queue_epoch_finalization(ino, content_epoch);
             return;
         }
         self.vfs
@@ -3876,7 +3884,7 @@ mod tests {
     }
 
     #[test]
-    fn vfs_policy_queues_finalization_only_after_last_pending_inode_upload() {
+    fn vfs_policy_keeps_finalization_queued_until_last_pending_inode_upload() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "finalize-last-pending");
         let ino = vfs
@@ -3909,8 +3917,16 @@ mod tests {
                 .upload
                 .pending_epoch_finalizations
                 .lock()
-                .is_empty(),
-            "finalization should wait until all pending uploads for the inode complete"
+                .contains(&(ino, content_epoch)),
+            "a completion while another upload is pending must keep an unverified finalization queued"
+        );
+        assert!(
+            !vfs.state
+                .upload
+                .verified_remote_epoch_finalizations
+                .lock()
+                .contains(&(ino, content_epoch)),
+            "finalization must not skip the remote-visibility check while another upload is pending"
         );
 
         vfs.cached_store().complete_upload(&second);
@@ -3925,6 +3941,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(ino, content_epoch)],
             "the final pending upload should enqueue epoch finalization"
+        );
+        assert!(
+            vfs.state
+                .upload
+                .verified_remote_epoch_finalizations
+                .lock()
+                .contains(&(ino, content_epoch)),
+            "the last upload completion should mark the queued finalization as remotely verified"
         );
     }
 
