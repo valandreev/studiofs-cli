@@ -9176,7 +9176,14 @@ impl StudioVfs {
                         return OsCacheOpenDecision::replace(OsCacheReason::ActiveWriter);
                     }
                 }
-                if self.inode_has_local_dirty_state(ino) {
+                // A deferred writer can already have materialized its bytes
+                // into the local overlay and cleared the in-memory dirty
+                // state while the upload/publication is still pending. That
+                // overlay is not a stable generation for the kernel page
+                // cache, so keep the read on the VFS path until publication.
+                if self.inode_has_local_dirty_state(ino)
+                    || self.inode_has_unmaterialized_overlay_for_finalize(ino)
+                {
                     self.os_cache.lock().clear_generation(ino);
                     return OsCacheOpenDecision::replace(OsCacheReason::LocalDirty);
                 }

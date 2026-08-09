@@ -41,7 +41,7 @@ pub enum OsCacheReason {
     UnknownHandle,
     /// The inode is not a regular file.
     NonRegular,
-    /// The inode has locally dirty content that is not safe to cache.
+    /// The inode has locally dirty or unpublished local content that is not safe to cache.
     LocalDirty,
     /// Another open handle can currently modify the inode.
     ActiveWriter,

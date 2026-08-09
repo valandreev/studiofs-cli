@@ -475,6 +475,46 @@ fn os_cache_reports_write_non_regular_dirty_and_unknown_reasons() {
 }
 
 #[test]
+fn os_cache_bypasses_pending_local_overlay_after_writer_release() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "os-cache-pending-overlay");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"os-cache-pending-overlay.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            writer,
+            ino,
+            0,
+            b"locally materialized but not yet published",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write local overlay");
+        vfs.flush_fh(writer).await.expect("materialize local overlay");
+        assert!(!vfs.inode_has_local_dirty_state(ino));
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup must leave a locally materialized overlay pending upload"
+        );
+
+        vfs.release_fh(writer).await.expect("release writer");
+
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert_eq!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::LocalDirty),
+            "a read-only reopen must bypass the kernel page cache while local overlay bytes are pending upload"
+        );
+        vfs.release_fh(reader).await.expect("release reader");
+    });
+}
+
+#[test]
 fn os_cache_writer_never_enrolls_as_foreground_read_handle() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-writer-foreground");
