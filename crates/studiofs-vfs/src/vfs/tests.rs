@@ -515,6 +515,73 @@ fn os_cache_bypasses_pending_local_overlay_after_writer_release() {
 }
 
 #[test]
+fn os_cache_bypasses_pending_upload_after_local_base_publication() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "os-cache-pending-base-upload");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"os-cache-pending-base-upload.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            writer,
+            ino,
+            0,
+            b"locally published but upload still pending",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write local overlay");
+        vfs.flush_fh(writer)
+            .await
+            .expect("materialize local overlay");
+
+        let pending = vfs.pending_uploads_snapshot_for_inode(ino);
+        assert_eq!(pending.len(), 1, "setup should queue one payload upload");
+        let pending_attr = meta.get_attr(ino).expect("load pending attr");
+        for upload in &pending {
+            vfs.local_payload_backend()
+                .mark_uploaded(upload.object_id)
+                .expect("mark payload locally uploaded");
+            assert!(
+                meta.mark_regular_file_overlay_object_uploaded_if_matches(
+                    ino,
+                    pending_attr.content_epoch,
+                    upload.object_id,
+                )
+                .expect("mark metadata payload uploaded")
+            );
+        }
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, pending_attr.content_epoch)
+                .expect("publish local base graph")
+        );
+        assert!(
+            !meta
+                .has_local_regular_file_overlay(ino)
+                .expect("query local overlay")
+        );
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "the runtime upload must remain pending for this regression"
+        );
+
+        vfs.release_fh(writer).await.expect("release writer");
+
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert_eq!(
+            vfs.prepare_os_cache_open(reader, OsCacheParticipation::Enabled),
+            OsCacheOpenDecision::replace(OsCacheReason::LocalDirty),
+            "a read-only reopen must bypass the kernel page cache while an inode upload is pending"
+        );
+        vfs.release_fh(reader).await.expect("release reader");
+    });
+}
+
+#[test]
 fn os_cache_writer_never_enrolls_as_foreground_read_handle() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "os-cache-writer-foreground");
