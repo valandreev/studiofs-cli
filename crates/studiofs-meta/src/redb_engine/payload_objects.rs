@@ -650,6 +650,17 @@ impl RedbMetaEngine {
                 Ok(current) if current.content_epoch > attr.content_epoch => {
                     return Ok((None, false));
                 }
+                Ok(current)
+                    if Self::is_fully_published_regular_file(&current)
+                        && current.content_epoch == attr.content_epoch
+                        && !Self::is_fully_published_regular_file(attr) =>
+                {
+                    // A flush can carry an attr snapshot that was taken before the
+                    // background publisher committed this epoch. Do not let that
+                    // snapshot roll a Ready inode back to Uploading after the
+                    // publication ticket has already been consumed.
+                    return Ok((None, false));
+                }
                 Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
                 Err(error) => return Err(error),
             }
@@ -794,6 +805,13 @@ impl RedbMetaEngine {
         }
 
         Ok((normalized_attr, true))
+    }
+
+    fn is_fully_published_regular_file(attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state == UploadState::Ready
+            && attr.content_epoch == attr.committed_content_epoch
+            && attr.size == attr.committed_size
     }
 
     fn flush_regular_file_overlay_slices_with_attr_txn(

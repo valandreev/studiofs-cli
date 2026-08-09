@@ -969,6 +969,36 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
 }
 
 #[test]
+fn regular_file_overlay_batch_does_not_regress_ready_attr_same_epoch() {
+    let engine = temp_engine();
+    let mut published = engine
+        .create_file(ROOT_INO, b"overlay-ready-regression.bin", 1000, 1000, 0o644)
+        .unwrap();
+    published.size = 4096;
+    published.committed_size = 4096;
+    published.content_epoch = 1;
+    published.committed_content_epoch = 1;
+    published.upload_state = UploadState::Ready;
+    engine.set_attr(&published).unwrap();
+
+    let mut stale = published.clone();
+    stale.committed_size = 0;
+    stale.committed_content_epoch = 0;
+    stale.upload_state = UploadState::Uploading;
+    let result = engine
+        .apply_regular_file_overlay_batch(&[crate::RegularFileOverlayMutation {
+            ino: stale.ino,
+            chunk_slices: vec![(ChunkId(0), vec![local_payload_slice(200_003)])],
+            attr: Some(stale),
+        }])
+        .unwrap();
+
+    assert_eq!(result, vec![None]);
+    assert_eq!(engine.get_attr(published.ino).unwrap(), published);
+    assert!(!engine.has_local_regular_file_overlay(published.ino).unwrap());
+}
+
+#[test]
 fn test_local_slice_batch_commits_with_attr_and_resolves_holes() {
     let engine = temp_engine();
     let mut attr = engine
