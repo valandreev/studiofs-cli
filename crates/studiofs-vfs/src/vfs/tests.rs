@@ -7644,7 +7644,7 @@ fn writer_stack_object_reservation_counts_only_current_write() {
 }
 
 #[test]
-fn epoch_finalizer_waits_for_pending_upload_completion_without_retrying() {
+fn epoch_finalizer_reports_pending_uploads_to_the_background_worker() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-waiting-uploads");
     let _guard = rt.enter();
@@ -7679,7 +7679,7 @@ fn epoch_finalizer_waits_for_pending_upload_completion_without_retrying() {
                 status,
                 super::commit::EpochFinalizeStatus::WaitingForUploads
             ),
-            "pending uploads should not use the timed deferred retry path"
+            "the coordinator should report pending uploads as a normal wait state"
         );
     });
 }

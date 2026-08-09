@@ -118,6 +118,18 @@ fn upload_trouble_delta_indicates_remote_problem(delta: UploadTroubleCounters) -
         || (delta.uploads_err != 0 && delta.uploads_ok == 0)
 }
 
+fn epoch_finalization_retry_delay(
+    status: &commit::EpochFinalizeStatus,
+    upload_requeue_base: Duration,
+) -> Option<Duration> {
+    match status {
+        commit::EpochFinalizeStatus::WaitingForUploads | commit::EpochFinalizeStatus::Deferred => {
+            Some(upload_requeue_base.max(Duration::from_millis(25)))
+        }
+        commit::EpochFinalizeStatus::Published | commit::EpochFinalizeStatus::Skipped => None,
+    }
+}
+
 fn should_run_invalidation_poll_sync(
     wake_reason: MetadataInvalidationWakeReason,
     last_namespace_token: &Option<String>,
@@ -323,12 +335,19 @@ impl StudioVfs {
                             "published",
                         );
                     }
-                    Ok(commit::EpochFinalizeStatus::WaitingForUploads) => {
+                    Ok(status @ commit::EpochFinalizeStatus::WaitingForUploads) => {
                         self.state.file_session.note_background_transition(
                             ino,
                             FileSessionOperation::Finalize,
                             "waiting_uploads",
                         );
+                        // Upload completion normally requeues the epoch, but a concurrent
+                        // finalizer/upload transition can otherwise lose that notification.
+                        if let Some(retry_delay) =
+                            epoch_finalization_retry_delay(&status, self.upload_requeue_base)
+                        {
+                            self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                        }
                     }
                     Ok(commit::EpochFinalizeStatus::Skipped) => {
                         self.state.file_session.note_background_transition(
@@ -337,14 +356,17 @@ impl StudioVfs {
                             "skipped",
                         );
                     }
-                    Ok(commit::EpochFinalizeStatus::Deferred) => {
+                    Ok(status @ commit::EpochFinalizeStatus::Deferred) => {
                         self.state.file_session.note_background_transition(
                             ino,
                             FileSessionOperation::Finalize,
                             "deferred",
                         );
-                        let retry_delay = self.upload_requeue_base.max(Duration::from_millis(25));
-                        self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                        if let Some(retry_delay) =
+                            epoch_finalization_retry_delay(&status, self.upload_requeue_base)
+                        {
+                            self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                        }
                     }
                     Err(err) => {
                         self.state
@@ -1743,6 +1765,38 @@ mod tests {
         assert!(
             read_cache_inodes.contains(&10),
             "attr invalidations must keep clearing read-plan cache entries"
+        );
+    }
+
+    #[test]
+    fn epoch_finalizer_retries_after_waiting_for_uploads() {
+        let retry_base = Duration::from_millis(100);
+
+        assert_eq!(
+            epoch_finalization_retry_delay(
+                &commit::EpochFinalizeStatus::WaitingForUploads,
+                retry_base,
+            ),
+            Some(retry_base)
+        );
+        assert_eq!(
+            epoch_finalization_retry_delay(&commit::EpochFinalizeStatus::Deferred, retry_base),
+            Some(retry_base)
+        );
+        assert_eq!(
+            epoch_finalization_retry_delay(
+                &commit::EpochFinalizeStatus::WaitingForUploads,
+                Duration::ZERO,
+            ),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(
+            epoch_finalization_retry_delay(&commit::EpochFinalizeStatus::Published, retry_base),
+            None
+        );
+        assert_eq!(
+            epoch_finalization_retry_delay(&commit::EpochFinalizeStatus::Skipped, retry_base),
+            None
         );
     }
 }
