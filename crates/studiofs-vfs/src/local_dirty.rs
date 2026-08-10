@@ -1120,6 +1120,16 @@ impl<'a> LocalDirtyFlushSession<'a> {
         Ok(attr)
     }
 
+    fn replace_dirty_attr_if_matches(&self, expected: &InodeAttr, replacement: &InodeAttr) {
+        let mut dirty_attrs = self.vfs.state.namespace.dirty_attrs.lock();
+        if dirty_attrs
+            .get(&self.ino)
+            .is_some_and(|current| current == expected)
+        {
+            dirty_attrs.insert(self.ino, replacement.clone());
+        }
+    }
+
     async fn commit_pending_slice_snapshot(
         &self,
         pending_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
@@ -1132,6 +1142,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
 
         let mut content_epoch = content_epoch;
         let mut attr_to_persist = attr_to_persist;
+        let mut rebased_dirty_attr = None;
         match self.vfs.sync_meta().get_attr(self.ino) {
             Ok(current_attr)
                 if current_attr.content_epoch == content_epoch
@@ -1150,6 +1161,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 let rebased_epoch = current_attr.content_epoch.saturating_add(1);
                 content_epoch = rebased_epoch;
                 if let Some(attr) = attr_to_persist.as_mut() {
+                    rebased_dirty_attr = Some(attr.clone());
                     attr.size = attr.size.max(current_attr.size);
                     attr.content_epoch = rebased_epoch;
                     attr.committed_size = current_attr.committed_size;
@@ -1334,6 +1346,11 @@ impl<'a> LocalDirtyFlushSession<'a> {
 
         self.vfs
             .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+        if let (Some(expected), Some(replacement)) =
+            (rebased_dirty_attr.as_ref(), attr_to_clear.as_ref())
+        {
+            self.replace_dirty_attr_if_matches(expected, replacement);
+        }
         if let Some(attr) = attr_to_clear.as_ref() {
             self.vfs
                 .clear_matching_dirty_attr_if_committed(self.ino, attr);

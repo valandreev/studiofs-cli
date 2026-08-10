@@ -6483,6 +6483,10 @@ fn pending_sparse_slice_commit_rebases_when_same_epoch_ready_publication_wins() 
             ready_attr.content_epoch.saturating_add(1),
             "same-epoch Ready publication must not discard the local sparse tail"
         );
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "same-epoch sparse rebase must replace and then clear the stale cached dirty attr"
+        );
 
         vfs.release_fh(fh).await.expect("release tail writer");
     });
