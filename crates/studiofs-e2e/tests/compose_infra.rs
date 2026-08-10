@@ -30,6 +30,10 @@ fn compose_file_defines_required_services_healthchecks_and_project_ports() {
         "postgres healthcheck must use pg_isready"
     );
     assert!(
+        compose.contains("grep -qx postgres /proc/1/comm"),
+        "postgres healthcheck must wait for the post-init server process"
+    );
+    assert!(
         compose.contains("http://localhost:9000/health"),
         "rustfs healthcheck must probe the S3 service health endpoint"
     );
