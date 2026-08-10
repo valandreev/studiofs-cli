@@ -463,9 +463,13 @@ regressions:
   - `sfs312_flush_materializes_local_slice_boundary_without_remote_visibility`
   - `sfs312_fsync_persists_local_state_without_remote_visibility`
   - `sfs312_last_handle_release_drains_local_durability_boundary`
+  - `strict_flush_interrupts_deferred_materialization_linger`
+  - `strict_flush_interrupts_clean_deferred_materialization_linger`
+  - `strict_flush_interrupts_materializer_before_file_session_gate`
   - `pending_sparse_slice_commit_preserves_tail_during_newer_inflight_metadata`
   - `pending_sparse_slice_commit_rebases_when_same_epoch_ready_publication_wins`
   - `pending_sparse_slice_commit_preserves_larger_same_epoch_ready_eof`
+  - `vfs_upload_meta_reattaches_materialized_sparse_upload_over_uncovered_tail`
   - `pending_slice_commit_returns_retryable_error_after_metadata_retry_exhaustion`
 
 - Recovery and replay
@@ -510,6 +514,10 @@ cargo test -p studiofs-vfs --test vfs_test background_epoch_finalizer_keeps_non_
 cargo test -p studiofs-vfs pending_sparse_slice_commit_preserves_tail_during_newer_inflight_metadata -- --nocapture
 cargo test -p studiofs-vfs pending_sparse_slice_commit_rebases_when_same_epoch_ready_publication_wins -- --nocapture
 cargo test -p studiofs-vfs pending_sparse_slice_commit_preserves_larger_same_epoch_ready_eof -- --nocapture
+cargo test -p studiofs-vfs strict_flush_interrupts_deferred_materialization_linger -- --nocapture
+cargo test -p studiofs-vfs strict_flush_interrupts_clean_deferred_materialization_linger -- --nocapture
+cargo test -p studiofs-vfs strict_flush_interrupts_materializer_before_file_session_gate -- --nocapture
+cargo test -p studiofs-vfs vfs_upload_meta_reattaches_materialized_sparse_upload_over_uncovered_tail -- --nocapture
 cargo test -p studiofs-vfs pending_slice_commit_returns_retryable_error_after_metadata_retry_exhaustion -- --nocapture
 ```
 

@@ -3052,9 +3052,7 @@ mod tests {
 
         let mut published_attr = created;
         published_attr.size = u64::from(prefix_len);
-        published_attr.committed_size = published_attr.size;
         published_attr.content_epoch = 1;
-        published_attr.committed_content_epoch = 1;
         published_attr.upload_state = UploadState::Updating;
         meta.set_attr(&published_attr)
             .expect("seed prefix attr before publish");
