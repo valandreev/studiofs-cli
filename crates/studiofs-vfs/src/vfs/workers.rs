@@ -172,11 +172,18 @@ fn metadata_token_changes(
     )
 }
 
-fn initial_metadata_invalidation_tokens(
-    initial_namespace_token: Option<String>,
-    initial_metadata_token: Option<String>,
-) -> (Option<String>, Option<String>) {
-    (initial_namespace_token, initial_metadata_token)
+fn metadata_namespace_changed(
+    token_namespace_changed: bool,
+    previous_snapshot: Option<&HashSet<Ino>>,
+    current_snapshot: &HashSet<Ino>,
+) -> bool {
+    token_namespace_changed || previous_snapshot.is_none_or(|previous| previous != current_snapshot)
+}
+
+fn metadata_invalidation_fallback_timer(interval: Duration) -> tokio::time::Interval {
+    let mut timer = tokio::time::interval(interval);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    timer
 }
 
 impl StudioVfs {
@@ -724,12 +731,14 @@ impl StudioVfs {
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
         let meta = self.sync_meta();
         let metadata_notifier = meta.metadata_invalidation_notifier();
-        let initial_namespace_token = meta.namespace_version_token();
-        let initial_metadata_token = meta.metadata_version_token();
-        let (mut last_namespace_token, mut last_metadata_token) =
-            initial_metadata_invalidation_tokens(initial_namespace_token, initial_metadata_token);
+        // Do not mark startup metadata as already invalidated. The PG listener
+        // can advance local metadata before this task reaches its first wait;
+        // the first wake must still clear VFS and kernel caches for that state.
+        let mut last_namespace_token = None;
+        let mut last_metadata_token = None;
         let mut last_snapshot: Option<HashSet<Ino>> = None;
         let mut last_payload_snapshot: Option<HashMap<Ino, Vec<u64>>> = None;
+        let mut fallback_timer = metadata_invalidation_fallback_timer(interval);
 
         loop {
             let wake_reason = tokio::select! {
@@ -737,7 +746,7 @@ impl StudioVfs {
                 _ = Self::wait_for_metadata_invalidation_notify(metadata_notifier.as_ref()) => {
                     MetadataInvalidationWakeReason::BackendNotify
                 },
-                _ = tokio::time::sleep(interval) => MetadataInvalidationWakeReason::FallbackPoll,
+                _ = fallback_timer.tick() => MetadataInvalidationWakeReason::FallbackPoll,
             };
             if self.shutdown_requested() {
                 break;
@@ -777,27 +786,38 @@ impl StudioVfs {
                 continue;
             };
 
-            let (namespace_changed, metadata_changed) = metadata_token_changes(
+            let (token_namespace_changed, metadata_changed) = metadata_token_changes(
                 &last_namespace_token,
                 &last_metadata_token,
                 &after_namespace_token,
                 &after_metadata_token,
             );
-            last_namespace_token = after_namespace_token.clone();
-            last_metadata_token = after_metadata_token.clone();
 
-            if !namespace_changed && !metadata_changed {
+            if !token_namespace_changed && !metadata_changed {
                 continue;
             }
 
             let meta = self.meta.clone();
-            let Ok(current_snapshot) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            let current_snapshot = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                 Self::collect_metadata_snapshot(engine.as_ref())
             })
             .await
-            else {
-                continue;
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    warn!(
+                        ?wake_reason,
+                        error = %error,
+                        "metadata invalidation snapshot failed; retrying on the next wake"
+                    );
+                    continue;
+                }
             };
+            let namespace_changed = metadata_namespace_changed(
+                token_namespace_changed,
+                last_snapshot.as_ref(),
+                &current_snapshot.inodes,
+            );
 
             let changed_payload_inodes = match &last_payload_snapshot {
                 Some(last_payload_snapshot) => Self::changed_metadata_payload_inodes(
@@ -853,6 +873,8 @@ impl StudioVfs {
             }
             last_snapshot = Some(current_snapshot.inodes);
             last_payload_snapshot = Some(current_snapshot.payloads);
+            last_namespace_token = after_namespace_token;
+            last_metadata_token = after_metadata_token;
         }
     }
 
@@ -1698,27 +1720,43 @@ mod tests {
     }
 
     #[test]
-    fn startup_metadata_tokens_are_primed_without_forcing_full_invalidation() {
-        let (last_namespace_token, last_metadata_token) =
-            initial_metadata_invalidation_tokens(token("7"), token("9"));
-        let (namespace_changed, metadata_changed) = metadata_token_changes(
-            &last_namespace_token,
-            &last_metadata_token,
-            &token("7"),
-            &token("9"),
-        );
-
-        assert!(!namespace_changed);
-        assert!(!metadata_changed);
-    }
-
-    #[test]
     fn matching_metadata_tokens_do_not_invalidate_after_first_wake() {
         let (namespace_changed, metadata_changed) =
             metadata_token_changes(&token("7"), &token("9"), &token("7"), &token("9"));
 
         assert!(!namespace_changed);
         assert!(!metadata_changed);
+    }
+
+    #[test]
+    fn metadata_snapshot_change_forces_namespace_invalidation_when_token_is_stale() {
+        let previous = HashSet::from([ROOT_INO, 10]);
+        let current = HashSet::from([ROOT_INO, 10, 20]);
+
+        assert!(metadata_namespace_changed(false, Some(&previous), &current));
+    }
+
+    #[test]
+    fn unchanged_metadata_snapshot_does_not_force_namespace_invalidation() {
+        let snapshot = HashSet::from([ROOT_INO, 10]);
+
+        assert!(!metadata_namespace_changed(
+            false,
+            Some(&snapshot),
+            &snapshot
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_invalidation_fallback_timer_ticks_immediately() {
+        let mut timer = metadata_invalidation_fallback_timer(Duration::from_secs(60));
+
+        assert!(
+            tokio::time::timeout(Duration::ZERO, timer.tick())
+                .await
+                .is_ok(),
+            "the first fallback poll must establish the startup invalidation baseline"
+        );
     }
 
     #[test]
