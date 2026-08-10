@@ -5552,16 +5552,14 @@ impl StudioVfs {
         remote_visibility_confirmed: bool,
     ) {
         let key = (ino, content_epoch);
-        let inserted = {
+        let (inserted, verified_changed) = {
             let mut verified = self.state.upload.verified_remote_epoch_finalizations.lock();
             let mut pending = self.state.upload.pending_epoch_finalizations.lock();
             let inserted = pending.insert(key);
-            if remote_visibility_confirmed {
-                verified.insert(key);
-            }
-            inserted
+            let verified_changed = remote_visibility_confirmed && verified.insert(key);
+            (inserted, verified_changed)
         };
-        if inserted {
+        if inserted || verified_changed {
             self.state.file_session.note_background_transition(
                 ino,
                 FileSessionOperation::Finalize,

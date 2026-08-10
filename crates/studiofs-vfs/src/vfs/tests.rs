@@ -7049,6 +7049,41 @@ fn stale_ready_attr_refresh_keeps_uploaded_overlay_finalization_queued() {
 }
 
 #[test]
+fn verified_epoch_finalization_upgrade_wakes_existing_ticket() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "verified-finalization-wakeup");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let ino = vfs
+            .create(1, b"verified-finalization-wakeup.bin", 0, 0, 0o644)
+            .expect("create test file")
+            .ino;
+        let content_epoch = 1;
+
+        let first_notification = vfs
+            .state
+            .upload
+            .pending_epoch_finalizations_notify
+            .notified();
+        vfs.queue_epoch_finalization(ino, content_epoch);
+        tokio::time::timeout(Duration::from_secs(1), first_notification)
+            .await
+            .expect("initial finalization ticket should wake the worker");
+
+        let verified_notification = vfs
+            .state
+            .upload
+            .pending_epoch_finalizations_notify
+            .notified();
+        vfs.queue_epoch_finalization_after_verified_upload(ino, content_epoch);
+        tokio::time::timeout(Duration::from_secs(1), verified_notification)
+            .await
+            .expect("remote-visible completion should wake an existing ticket");
+    });
+}
+
+#[test]
 fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-requeues-retained");
