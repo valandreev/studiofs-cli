@@ -1098,6 +1098,38 @@ impl<'a> LocalDirtyFlushSession<'a> {
         }
     }
 
+    fn rebase_pending_slice_commit_attr(
+        &self,
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        content_epoch: u64,
+        current_attr: InodeAttr,
+    ) -> VfsResult<Option<InodeAttr>> {
+        let rebased_epoch = current_attr
+            .content_epoch
+            .saturating_add(1)
+            .max(content_epoch.saturating_add(1));
+        let mut attr =
+            self.attr_for_pending_slice_commit(pending_slices, rebased_epoch, Some(current_attr))?;
+        if let Some(attr) = attr.as_mut() {
+            attr.upload_state = if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
+                MetaUploadState::Updating
+            } else {
+                MetaUploadState::Uploading
+            };
+        }
+        Ok(attr)
+    }
+
+    fn replace_dirty_attr_if_matches(&self, expected: &InodeAttr, replacement: &InodeAttr) {
+        let mut dirty_attrs = self.vfs.state.namespace.dirty_attrs.lock();
+        if dirty_attrs
+            .get(&self.ino)
+            .is_some_and(|current| current == expected)
+        {
+            dirty_attrs.insert(self.ino, replacement.clone());
+        }
+    }
+
     async fn commit_pending_slice_snapshot(
         &self,
         pending_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
@@ -1110,10 +1142,49 @@ impl<'a> LocalDirtyFlushSession<'a> {
 
         let mut content_epoch = content_epoch;
         let mut attr_to_persist = attr_to_persist;
+        let mut rebased_dirty_attr = None;
         match self.vfs.sync_meta().get_attr(self.ino) {
+            Ok(current_attr)
+                if current_attr.content_epoch == content_epoch
+                    && current_attr.upload_state == MetaUploadState::Ready
+                    && current_attr.committed_content_epoch == current_attr.content_epoch
+                    && current_attr.committed_size == current_attr.size
+                    && attr_to_persist
+                        .as_ref()
+                        .is_some_and(|attr| attr.upload_state != MetaUploadState::Ready) =>
+            {
+                // Content epochs are allocated independently by each client.
+                // A peer can therefore publish the same numeric epoch while
+                // this client still owns an accepted payload for that epoch.
+                // Rebase the local overlay so the Ready peer snapshot cannot
+                // make the pending payload look stale and discard it.
+                let rebased_epoch = current_attr.content_epoch.saturating_add(1);
+                content_epoch = rebased_epoch;
+                if let Some(attr) = attr_to_persist.as_mut() {
+                    rebased_dirty_attr = Some(attr.clone());
+                    attr.size = attr.size.max(current_attr.size);
+                    attr.content_epoch = rebased_epoch;
+                    attr.committed_size = current_attr.committed_size;
+                    attr.committed_content_epoch = current_attr.committed_content_epoch;
+                    attr.upload_state = if current_attr.committed_size > 0
+                        || current_attr.committed_content_epoch > 0
+                    {
+                        MetaUploadState::Updating
+                    } else {
+                        MetaUploadState::Uploading
+                    };
+                }
+            }
             Ok(current_attr) if current_attr.content_epoch > content_epoch => {
                 let visible_end = Self::pending_slices_visible_end(&pending_slices);
-                if visible_end > 0 && current_attr.size >= visible_end {
+                if visible_end > 0
+                    && (current_attr.size >= visible_end
+                        || current_attr.upload_state == MetaUploadState::Updating)
+                {
+                    // An in-flight update of an already-published file may have
+                    // temporarily reduced the visible EOF. A locally accepted
+                    // sparse write beyond that EOF still belongs to the newer
+                    // local view and must be rebased instead of discarded.
                     content_epoch = current_attr.content_epoch;
                     attr_to_persist = Some(current_attr);
                 } else {
@@ -1138,25 +1209,66 @@ impl<'a> LocalDirtyFlushSession<'a> {
         let chunk_slices =
             self.drain
                 .build_overlay_slice_records(self.ino, &[], pending_slices.clone())?;
-        let attr_to_persist =
+        let mut attr_to_clear =
             self.attr_for_pending_slice_commit(&pending_slices, content_epoch, attr_to_persist)?;
-        let attr_to_clear = attr_to_persist.clone();
         // These slices are submitted for upload below, so redb must commit first.
-        let committed_attr = self
+        let mut committed_attr = self
             .drain
             .commit_meta
-            .commit_overlay(self.ino, chunk_slices, attr_to_persist, true)
+            .commit_overlay(self.ino, chunk_slices.clone(), attr_to_clear.clone(), true)
             .await?;
+
+        if attr_to_clear.is_some() && committed_attr.is_none() {
+            // The metadata snapshot can become stale after the precheck but
+            // before the overlay transaction starts. Rebase the same local
+            // payloads onto the current inode view and retry so a concurrent
+            // publication cannot make an accepted sparse write disappear.
+            for _ in 0..3 {
+                let current_attr = match self.vfs.sync_meta().get_attr(self.ino) {
+                    Ok(attr) => attr,
+                    Err(studiofs_meta::MetaError::InodeNotFound(_)) => {
+                        self.cleanup_stale_pending_slice_objects(
+                            &pending_slices,
+                            "metadata-retry-inode-missing",
+                        )
+                        .await;
+                        self.vfs
+                            .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(VfsError::Meta(error)),
+                };
+                attr_to_clear = self.rebase_pending_slice_commit_attr(
+                    &pending_slices,
+                    content_epoch,
+                    current_attr,
+                )?;
+                content_epoch = attr_to_clear
+                    .as_ref()
+                    .map(|attr| attr.content_epoch)
+                    .unwrap_or(content_epoch);
+                committed_attr = self
+                    .drain
+                    .commit_meta
+                    .commit_overlay(self.ino, chunk_slices.clone(), attr_to_clear.clone(), true)
+                    .await?;
+                if committed_attr.is_some() {
+                    break;
+                }
+            }
+        }
         let skipped_stale_commit = attr_to_clear.is_some() && committed_attr.is_none();
         self.drain
             .observer
             .on_metadata_committed(self.ino, committed_attr.as_ref());
         if skipped_stale_commit {
-            self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-stale")
-                .await;
-            self.vfs
-                .commit_pending_local_dirty_slices(self.ino, &pending_slices);
-            return Ok(());
+            // Keep the payload and pending-slice entry for a later flush if a
+            // concurrent metadata writer wins all bounded retry attempts.
+            warn!(
+                ino = self.ino,
+                "local-dirty pending-slice metadata remained stale after retries; retaining payload"
+            );
+            return Err(VfsError::WouldBlock);
         }
 
         let mut upload_ops_by_object = std::collections::BTreeMap::<u64, (u64, u64, u64)>::new();
@@ -1234,6 +1346,11 @@ impl<'a> LocalDirtyFlushSession<'a> {
 
         self.vfs
             .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+        if let (Some(expected), Some(replacement)) =
+            (rebased_dirty_attr.as_ref(), attr_to_clear.as_ref())
+        {
+            self.replace_dirty_attr_if_matches(expected, replacement);
+        }
         if let Some(attr) = attr_to_clear.as_ref() {
             self.vfs
                 .clear_matching_dirty_attr_if_committed(self.ino, attr);

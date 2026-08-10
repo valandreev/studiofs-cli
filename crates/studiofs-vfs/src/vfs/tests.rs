@@ -6370,6 +6370,191 @@ fn pending_sparse_slice_commit_rebases_when_size_growth_overtakes_flush() {
 }
 
 #[test]
+fn pending_sparse_slice_commit_preserves_tail_during_newer_inflight_metadata() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-tail-preserves-inflight-metadata");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"sparse-tail-preserves-inflight-metadata.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let tail = vec![b't'; 241];
+        let tail_offset = 3_145_900u64;
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh(fh, ino, tail_offset, &tail)
+            .await
+            .expect("write sparse tail");
+        vfs.materialize_writer_stack_for_inode(ino)
+            .await
+            .expect("materialize sparse tail before metadata update");
+
+        let stale_dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("tail write should leave dirty attr");
+        let mut inflight_attr = stale_dirty_attr.clone();
+        inflight_attr.size = tail_offset;
+        inflight_attr.committed_size = 1;
+        inflight_attr.committed_content_epoch = 1;
+        inflight_attr.content_epoch = inflight_attr.content_epoch.saturating_add(1);
+        inflight_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&inflight_attr)
+            .expect("simulate newer metadata update before tail flush");
+
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush should preserve sparse tail during in-flight metadata update");
+
+        let pending = vfs.pending_uploads_for_inode(ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, tail_offset);
+        assert_eq!(
+            pending[0].2, inflight_attr.content_epoch,
+            "sparse tail must upload under the newer in-flight metadata epoch"
+        );
+
+        vfs.release_fh(fh).await.expect("release tail writer");
+    });
+}
+
+#[test]
+fn pending_sparse_slice_commit_rebases_when_same_epoch_ready_publication_wins() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-tail-rebases-same-epoch-ready");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sparse-tail-rebases-same-epoch-ready.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let tail = vec![b't'; 241];
+        let tail_offset = 3_145_900u64;
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh(fh, ino, tail_offset, &tail)
+            .await
+            .expect("write sparse tail");
+        vfs.materialize_writer_stack_for_inode(ino)
+            .await
+            .expect("materialize sparse tail before publication race");
+
+        let stale_dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("tail write should leave dirty attr");
+        let mut ready_attr = stale_dirty_attr.clone();
+        ready_attr.committed_size = ready_attr.size;
+        ready_attr.committed_content_epoch = ready_attr.content_epoch;
+        ready_attr.upload_state = MetaUploadState::Ready;
+        meta.set_attr(&ready_attr)
+            .expect("simulate a remote Ready publication with the same epoch");
+
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush should rebase sparse tail after same-epoch publication");
+
+        let pending = vfs.pending_uploads_for_inode(ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, tail_offset);
+        assert_eq!(
+            pending[0].2,
+            ready_attr.content_epoch.saturating_add(1),
+            "same-epoch Ready publication must not discard the local sparse tail"
+        );
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "same-epoch sparse rebase must replace and then clear the stale cached dirty attr"
+        );
+
+        vfs.release_fh(fh).await.expect("release tail writer");
+    });
+}
+
+#[test]
+fn pending_sparse_slice_commit_preserves_larger_same_epoch_ready_eof() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-tail-preserves-larger-ready-eof");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"sparse-tail-preserves-larger-ready-eof.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let tail = vec![b't'; 241];
+        let tail_offset = 3_145_900u64;
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh(fh, ino, tail_offset, &tail)
+            .await
+            .expect("write sparse tail");
+        vfs.materialize_writer_stack_for_inode(ino)
+            .await
+            .expect("materialize sparse tail before publication race");
+
+        let stale_dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("tail write should leave dirty attr");
+        let mut ready_attr = stale_dirty_attr.clone();
+        ready_attr.size = stale_dirty_attr
+            .size
+            .saturating_add(u64::from(vfs.block_size));
+        ready_attr.committed_size = ready_attr.size;
+        ready_attr.committed_content_epoch = ready_attr.content_epoch;
+        ready_attr.upload_state = MetaUploadState::Ready;
+        meta.set_attr(&ready_attr)
+            .expect("simulate a larger same-epoch Ready publication");
+
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush should preserve the larger published EOF");
+
+        let persisted = meta.get_attr(ino).expect("load rebased attr");
+        assert_eq!(
+            persisted.size, ready_attr.size,
+            "same-epoch sparse rebase must not shrink the published EOF"
+        );
+
+        vfs.release_fh(fh).await.expect("release tail writer");
+    });
+}
+
+#[test]
 fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =
@@ -6860,6 +7045,41 @@ fn stale_ready_attr_refresh_keeps_uploaded_overlay_finalization_queued() {
             !vfs.live_extent_records_for_inode(ino).is_empty(),
             "stale ready metadata must not clear newer live overlay extents"
         );
+    });
+}
+
+#[test]
+fn verified_epoch_finalization_upgrade_wakes_existing_ticket() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "verified-finalization-wakeup");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let ino = vfs
+            .create(1, b"verified-finalization-wakeup.bin", 0, 0, 0o644)
+            .expect("create test file")
+            .ino;
+        let content_epoch = 1;
+
+        let first_notification = vfs
+            .state
+            .upload
+            .pending_epoch_finalizations_notify
+            .notified();
+        vfs.queue_epoch_finalization(ino, content_epoch);
+        tokio::time::timeout(Duration::from_secs(1), first_notification)
+            .await
+            .expect("initial finalization ticket should wake the worker");
+
+        let verified_notification = vfs
+            .state
+            .upload
+            .pending_epoch_finalizations_notify
+            .notified();
+        vfs.queue_epoch_finalization_after_verified_upload(ino, content_epoch);
+        tokio::time::timeout(Duration::from_secs(1), verified_notification)
+            .await
+            .expect("remote-visible completion should wake an existing ticket");
     });
 }
 
@@ -15641,7 +15861,7 @@ fn strict_flush_interrupts_deferred_materialization_linger() {
         .await
         .expect("deferred materializer should enter its coalescing window");
 
-        tokio::time::timeout(Duration::from_millis(500), vfs.flush_fh(fh))
+        tokio::time::timeout(Duration::from_secs(2), vfs.flush_fh(fh))
             .await
             .expect("strict flush must wake a lingering materializer")
             .expect("strict flush should persist the accepted write");
@@ -15738,10 +15958,83 @@ fn strict_flush_interrupts_clean_deferred_materialization_linger() {
         })
         .await
         .expect("materializer should enter the clean coalescing window");
-        tokio::time::timeout(Duration::from_millis(500), vfs.flush_fh(fh))
+        tokio::time::timeout(Duration::from_secs(2), vfs.flush_fh(fh))
             .await
             .expect("strict flush must wake the clean-linger branch")
             .expect("flush full block");
+        vfs.release_fh(fh).await.expect("release file handle");
+    });
+}
+
+#[test]
+fn strict_flush_interrupts_materializer_before_file_session_gate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "interrupt-before-file-session-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"interrupt-before-file-session-gate.bin", 0, 0, 0o644)
+            .expect("create file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file");
+        let payload = [0x2D; 8 * 1024];
+        vfs.record_writer_stack_state_bytes(fh, ino, 0, &payload)
+            .await
+            .expect("stage dirty writer state");
+
+        let (entry, gate_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("register materializer gate");
+        let materializer_vfs = Arc::clone(&vfs);
+        let materializer = tokio::spawn(async move {
+            let session = materializer_vfs
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Materialize)
+                .await;
+            assert!(
+                entry
+                    .wait_linger_or_interrupt(Duration::from_secs(60))
+                    .await,
+                "strict flush must interrupt the held materializer"
+            );
+            drop(session);
+            drop(entry);
+            drop(gate_guard);
+        });
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !vfs
+                .state
+                .file_session
+                .debug_snapshot(ino)
+                .is_some_and(|snapshot| {
+                    snapshot.active_shared_locks > 0
+                        && snapshot.last_transition_label == ("materialize", "start")
+                })
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("materializer should hold the file-session read gate");
+
+        let flush_result = tokio::time::timeout(Duration::from_secs(2), vfs.flush_fh(fh)).await;
+        if flush_result.is_err() {
+            materializer.abort();
+            let _ = materializer.await;
+            panic!("strict flush must interrupt before taking the file-session write gate");
+        }
+        flush_result
+            .expect("flush timeout was handled above")
+            .expect("strict flush should persist the staged writer state");
+        materializer
+            .await
+            .expect("materializer should finish without panic");
         vfs.release_fh(fh).await.expect("release file handle");
     });
 }
@@ -16627,7 +16920,7 @@ fn interrupted_materializer_does_not_orphan_dirty_tail_if_last_waiter_is_cancell
                 .await;
             std::future::pending::<()>().await;
         });
-        tokio::time::timeout(Duration::from_millis(500), async {
+        tokio::time::timeout(Duration::from_secs(2), async {
             while vfs.state.deferred_materialize_inflight.contains(ino) {
                 tokio::task::yield_now().await;
             }

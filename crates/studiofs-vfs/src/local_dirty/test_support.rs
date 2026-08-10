@@ -513,6 +513,103 @@ mod tests {
     }
 
     #[test]
+    fn pending_slice_commit_returns_retryable_error_after_metadata_retry_exhaustion() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-retry-exhaustion");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-retry-exhaustion.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let block_size = vfs.block_size;
+            let object_id = 9005;
+            let mut stale_attr = meta.get_attr(ino).expect("load stale attr");
+            stale_attr.size = u64::from(block_size);
+            stale_attr.content_epoch = u64::MAX;
+            stale_attr.committed_size = 0;
+            stale_attr.committed_content_epoch = 0;
+            stale_attr.upload_state = studiofs_meta::schema::UploadState::Uploading;
+
+            let mut ready_attr = stale_attr.clone();
+            ready_attr.committed_size = ready_attr.size;
+            ready_attr.committed_content_epoch = ready_attr.content_epoch;
+            ready_attr.upload_state = studiofs_meta::schema::UploadState::Ready;
+            meta.set_attr(&ready_attr).expect("store ready attr");
+
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, block_size)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    object_id,
+                    0,
+                )],
+            )]);
+
+            let result = vfs
+                .local_dirty_flush_session(ino)
+                .commit_pending_slice_snapshot(pending_slices, u64::MAX, Some(stale_attr))
+                .await;
+
+            assert!(
+                matches!(result, Err(VfsError::WouldBlock)),
+                "retry exhaustion must remain retryable instead of reporting success: {result:?}"
+            );
+            assert_eq!(meta.get_attr(ino).expect("load persisted attr"), ready_attr);
+        });
+    }
+
+    #[test]
+    fn rebasing_pending_slice_commit_attr_advances_epoch_and_covers_pending_eof() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-rebase-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-rebase-attr.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, vfs.block_size)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    9004,
+                    0,
+                )],
+            )]);
+            let mut current_attr = meta.get_attr(ino).expect("load attr");
+            current_attr.size = 0;
+            current_attr.committed_size = 0;
+            current_attr.content_epoch = 5;
+            current_attr.committed_content_epoch = 5;
+            current_attr.upload_state = studiofs_meta::schema::UploadState::Ready;
+
+            let rebased = vfs
+                .local_dirty_flush_session(ino)
+                .rebase_pending_slice_commit_attr(&pending_slices, 5, current_attr)
+                .expect("rebase pending slice attr")
+                .expect("rebase must produce an attr");
+
+            assert_eq!(rebased.content_epoch, 6);
+            assert_eq!(rebased.size, u64::from(vfs.block_size));
+            assert_eq!(rebased.committed_content_epoch, 5);
+            assert_eq!(rebased.committed_size, 0);
+            assert_eq!(
+                rebased.upload_state,
+                studiofs_meta::schema::UploadState::Updating
+            );
+        });
+    }
+
+    #[test]
     fn subtract_pending_local_dirty_bytes_saturates_without_panicking() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-bytes-underflow");

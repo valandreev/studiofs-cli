@@ -1154,6 +1154,10 @@ impl StudioVfs {
         sticky_error_policy: StickyErrorPolicy,
     ) -> VfsResult<ExplicitFlushOutcome> {
         self.wait_for_deferred_release_inflight(ino).await;
+        // Interrupt and join the deferred materializer before taking the
+        // session's write-side materialize gate. Taking Flush first can block
+        // the materializer while the barrier waits for its deferred gate.
+        self.wait_for_deferred_materialization_inflight(ino).await;
         let session = self
             .state
             .file_session
@@ -1205,6 +1209,11 @@ impl StudioVfs {
             self.wait_for_deferred_namespace_metadata(open_file.ino)
         );
         metadata_result?;
+        // A materializer may hold the session's read-side materialize gate.
+        // Interrupt it before Flush tries to acquire the write-side gate, or
+        // the barrier can wait on a task that it has already blocked.
+        self.wait_for_deferred_materialization_inflight(open_file.ino)
+            .await;
         if !self.inode_has_local_dirty_state(open_file.ino)
             && !self.state.writer_stack.has_dirty_writers(open_file.ino)
         {
@@ -1304,6 +1313,7 @@ impl StudioVfs {
             self.wait_for_deferred_namespace_metadata(ino)
         );
         metadata_result?;
+        self.wait_for_deferred_materialization_inflight(ino).await;
         let session = self
             .state
             .file_session
