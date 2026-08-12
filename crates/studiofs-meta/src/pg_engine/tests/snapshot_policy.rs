@@ -73,6 +73,57 @@ fn policy_set_load_cancel_uses_generation_cas() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn concurrent_initial_policy_sets_allocate_distinct_generations() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-policy-race");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path_a = dir_a.path().join("meta-a.redb");
+    let db_path_b = dir_b.path().join("meta-b.redb");
+    let info = volume.format_info();
+    seed_local(&db_path_a, &info);
+    seed_local(&db_path_b, &info);
+    let engine_a = PgMetaEngine::open_with_options(
+        &db_path_a,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open first postgres engine");
+    let engine_b = PgMetaEngine::open_with_options(
+        &db_path_b,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open second postgres engine");
+    let policy = SnapshotDailyPolicy::new(
+        NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+        "UTC",
+        Duration::from_secs(3600),
+    )
+    .expect("valid policy");
+
+    run_async(async {
+        let (first, second) = tokio::join!(
+            SnapshotPolicyStore::set_policy(&*engine_a, &policy, None),
+            SnapshotPolicyStore::set_policy(&*engine_b, &policy, None),
+        );
+        let mut generations = [
+            first.expect("first concurrent policy set").generation,
+            second.expect("second concurrent policy set").generation,
+        ];
+        generations.sort_unstable();
+        assert_eq!(generations, [1, 2]);
+        Ok(())
+    })
+    .expect("concurrent policy control plane");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn snapshot_job_claim_renew_release_is_fenced() {
     let Some(dsn) = pg_dsn() else {
         return;

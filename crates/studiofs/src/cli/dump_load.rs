@@ -267,6 +267,23 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                 .map_err(|e| DumpLoadError::Message(format!("upsert volume failed: {e}")))?;
             let target_vol: i64 = row.get(0);
 
+            let has_snapshot_v2_state: bool = tx
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM snapshot_catalog WHERE vol = $1) OR EXISTS (SELECT 1 FROM snapshot_policies WHERE vol = $1)",
+                    &[&target_vol],
+                )
+                .await
+                .map_err(|e| {
+                    DumpLoadError::Message(format!("check snapshot v2 state failed: {e}"))
+                })?
+                .get(0);
+            if has_snapshot_v2_state {
+                return Err(DumpLoadError::Message(
+                    "cannot load metadata over existing Snapshot v2 state; remove snapshots and policy first"
+                        .to_string(),
+                ));
+            }
+
             tx.execute("DELETE FROM snapshot_policies WHERE vol = $1", &[&target_vol])
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("clear snapshot policies failed: {e}")))?;

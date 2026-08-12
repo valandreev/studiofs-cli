@@ -80,6 +80,13 @@ impl SnapshotPolicyStore for PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin policy set"))?;
+                        tx.query_opt(
+                            "SELECT vol FROM volumes WHERE vol = $1 FOR UPDATE",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|_| pg_failure("lock policy volume"))?
+                        .ok_or_else(|| pg_failure("policy volume is missing"))?;
                         let current = tx
                             .query_opt(
                                 "SELECT generation FROM snapshot_policies WHERE vol = $1 FOR UPDATE",

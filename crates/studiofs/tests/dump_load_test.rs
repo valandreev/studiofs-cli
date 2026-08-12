@@ -204,13 +204,22 @@ async fn seed_stale_snapshot_v2_rows(pg_dsn: &str, name: &str) {
         .await
         .expect("find target volume")
         .get(0);
+    let snapshot_id = format!("{name}.2026-08-12T14-07-09.000Z");
     client
         .execute(
-            "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle, retention_seconds) VALUES ($1, 'stale-v2-snapshot', 'manual', 0, clock_timestamp(), 'ready', NULL)",
-            &[&volume_id],
+            "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle, retention_seconds, ready_at) VALUES ($1, $2, 'manual', 0, clock_timestamp(), 'ready', NULL, clock_timestamp())",
+            &[&volume_id, &snapshot_id],
         )
         .await
         .expect("seed stale snapshot catalog row");
+    let checksum = vec![0_u8; 32];
+    client
+        .execute(
+            "INSERT INTO snapshot_artifacts (vol, snapshot_id, object_key, format_version, schema_version, sha256, byte_length, verified_at) VALUES ($1, $2, 'snapshots/stale-v2/artifact', 1, 1, $3, 0, clock_timestamp())",
+            &[&volume_id, &snapshot_id, &checksum],
+        )
+        .await
+        .expect("seed snapshot artifact row");
     client
         .execute(
             "INSERT INTO snapshot_policies (vol, generation, daily_at, timezone, retention_seconds) VALUES ($1, 1, '02:30:00', 'UTC', 3600)",
@@ -221,7 +230,7 @@ async fn seed_stale_snapshot_v2_rows(pg_dsn: &str, name: &str) {
     conn_task.abort();
 }
 
-async fn snapshot_v2_rows_exist(pg_dsn: &str, name: &str) -> (i64, i64) {
+async fn snapshot_v2_state(pg_dsn: &str, name: &str) -> (i64, i64, i64, Option<String>) {
     let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
         .await
         .expect("connect postgres");
@@ -230,13 +239,13 @@ async fn snapshot_v2_rows_exist(pg_dsn: &str, name: &str) -> (i64, i64) {
     });
     let row = client
         .query_one(
-            "SELECT (SELECT count(*) FROM snapshot_catalog WHERE vol = v.vol), (SELECT count(*) FROM snapshot_policies WHERE vol = v.vol) FROM volumes v WHERE v.name = $1",
+            "SELECT (SELECT count(*) FROM snapshot_catalog WHERE vol = v.vol), (SELECT count(*) FROM snapshot_policies WHERE vol = v.vol), (SELECT count(*) FROM snapshot_artifacts WHERE vol = v.vol), (SELECT object_key FROM snapshot_artifacts WHERE vol = v.vol LIMIT 1) FROM volumes v WHERE v.name = $1",
             &[&name],
         )
         .await
         .expect("count snapshot v2 rows");
     conn_task.abort();
-    (row.get(0), row.get(1))
+    (row.get(0), row.get(1), row.get(2), row.get(3))
 }
 
 fn single_object_slice_graph(
@@ -497,7 +506,7 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
 
 #[tokio::test]
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
-async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
+async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes() {
     let Some(env) = load_test_env() else {
         eprintln!("skipping: env not ready");
         return;
@@ -583,11 +592,14 @@ async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
             &raw_pg,
         ],
     );
-    assert_ok(&load, "load target");
+    assert!(
+        !load.status.success(),
+        "load must reject a target with Snapshot v2 state"
+    );
     assert_eq!(
-        snapshot_v2_rows_exist(&pg_dsn, &target).await,
-        (0, 0),
-        "load must replace stale Snapshot v2 control-plane rows"
+        snapshot_v2_state(&pg_dsn, &target).await,
+        (1, 1, 1, Some("snapshots/stale-v2/artifact".to_string())),
+        "rejected load must preserve Snapshot v2 rows and artifact key"
     );
 
     let verify_home = studiofs_test_support::workspace_target_tempdir("verify-home-");

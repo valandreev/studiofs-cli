@@ -1,6 +1,7 @@
 //! Snapshot v2 domain contracts.
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, NaiveTime, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -112,38 +113,41 @@ impl SnapshotId {
 
     /// Parses the only public identifier shape accepted by Snapshot v2.
     pub fn parse(value: &str) -> Result<Self, SnapshotIdError> {
-        let (volume_name, timestamp_and_suffix) =
-            value.split_once('.').ok_or(SnapshotIdError::Invalid)?;
-        validate_volume_name(volume_name)?;
-
         const TIMESTAMP_LEN: usize = 24;
-        let (timestamp, suffix) = if timestamp_and_suffix.len() == TIMESTAMP_LEN {
-            (timestamp_and_suffix, None)
-        } else {
-            if timestamp_and_suffix.len() < TIMESTAMP_LEN {
-                return Err(SnapshotIdError::Invalid);
+        for (separator, _) in value.match_indices('.') {
+            let volume_name = &value[..separator];
+            if validate_volume_name(volume_name).is_err() {
+                continue;
             }
-            let (timestamp, suffix) = timestamp_and_suffix.split_at(TIMESTAMP_LEN);
-            (timestamp, Some(parse_collision_suffix(suffix)?))
-        };
-        if timestamp.len() != TIMESTAMP_LEN {
-            return Err(SnapshotIdError::Invalid);
+            let timestamp_and_suffix = &value[separator + 1..];
+            if timestamp_and_suffix.len() < TIMESTAMP_LEN {
+                continue;
+            }
+            let (timestamp, suffix) = if timestamp_and_suffix.len() == TIMESTAMP_LEN {
+                (timestamp_and_suffix, None)
+            } else {
+                let (timestamp, suffix) = timestamp_and_suffix.split_at(TIMESTAMP_LEN);
+                let Ok(suffix) = parse_collision_suffix(suffix) else {
+                    continue;
+                };
+                (timestamp, Some(suffix))
+            };
+            let Some(timestamp_without_z) = timestamp.strip_suffix('Z') else {
+                continue;
+            };
+            if NaiveDateTime::parse_from_str(timestamp_without_z, "%Y-%m-%dT%H-%M-%S%.3f").is_err()
+            {
+                continue;
+            }
+            let canonical = match suffix {
+                None => format!("{volume_name}.{timestamp}"),
+                Some(suffix) => format!("{volume_name}.{timestamp}-{suffix}"),
+            };
+            if canonical == value {
+                return Ok(Self(canonical));
+            }
         }
-        NaiveDateTime::parse_from_str(
-            timestamp
-                .strip_suffix('Z')
-                .ok_or(SnapshotIdError::Invalid)?,
-            "%Y-%m-%dT%H-%M-%S%.3f",
-        )
-        .map_err(|_| SnapshotIdError::Invalid)?;
-        let canonical = match suffix {
-            None => format!("{volume_name}.{timestamp}"),
-            Some(suffix) => format!("{volume_name}.{timestamp}-{suffix}"),
-        };
-        if canonical != value {
-            return Err(SnapshotIdError::Invalid);
-        }
-        Ok(Self(canonical))
+        Err(SnapshotIdError::Invalid)
     }
 
     /// Returns the canonical public identifier text.
@@ -376,6 +380,9 @@ impl SnapshotDailyPolicy {
         if timezone.is_empty() || timezone.len() > 128 || !timezone.is_ascii() {
             return Err(SnapshotValidationError::InvalidText);
         }
+        timezone
+            .parse::<Tz>()
+            .map_err(|_| SnapshotValidationError::InvalidText)?;
         Ok(Self {
             daily_at,
             timezone,
@@ -411,6 +418,7 @@ pub struct SnapshotPolicyRecord {
 fn validate_retention(ttl: Option<Duration>) -> Result<(), SnapshotValidationError> {
     if ttl.is_some_and(|duration| {
         duration.is_zero()
+            || duration.subsec_nanos() != 0
             || duration.as_secs() > MAX_RETENTION_SECS
             || i64::try_from(duration.as_secs()).is_err()
             || ChronoDuration::from_std(duration).is_err()
@@ -751,12 +759,7 @@ pub struct SnapshotMountLease {
 }
 
 fn validate_volume_name(value: &str) -> Result<(), SnapshotIdError> {
-    if value.is_empty()
-        || value.len() > 255
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
         return Err(SnapshotIdError::InvalidVolumeName);
     }
     Ok(())
@@ -854,6 +857,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_id_round_trips_volume_names_accepted_by_initialization() {
+        let captured_at = Utc
+            .with_ymd_and_hms(2026, 8, 12, 14, 7, 9)
+            .single()
+            .expect("valid UTC timestamp");
+
+        for volume_name in ["client.1", "client volume", "клиент"] {
+            let id = SnapshotId::from_cut(volume_name, captured_at)
+                .expect("initialized volume name must produce a snapshot id");
+            assert_eq!(
+                SnapshotId::parse(id.as_str()).expect("parse snapshot id"),
+                id
+            );
+            assert!(
+                SnapshotVolumeContext::new(1, volume_name, "00000000-0000-0000-0000-000000000001",)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
     fn automatic_origin_rejects_infinite_retention() {
         let infinite = SnapshotRetention::manual(None).expect("manual infinite retention");
         assert!(infinite.validate_for_origin(SnapshotOrigin::Manual).is_ok());
@@ -881,6 +905,12 @@ mod tests {
     }
 
     #[test]
+    fn retention_rejects_subsecond_values_that_postgres_truncates() {
+        assert!(SnapshotRetention::automatic(Duration::from_millis(900)).is_err());
+        assert!(SnapshotRetention::automatic(Duration::new(1, 1)).is_err());
+    }
+
+    #[test]
     fn retention_expiration_reports_datetime_overflow() {
         let retention =
             SnapshotRetention::automatic(Duration::from_secs(60)).expect("finite retention");
@@ -904,7 +934,12 @@ mod tests {
         let policy = SnapshotDailyPolicy::new(daily_at, "UTC", Duration::from_secs(24 * 60 * 60))
             .expect("valid policy");
         assert_eq!(policy.timezone(), "UTC");
+        assert!(
+            SnapshotDailyPolicy::new(daily_at, "America/New_York", Duration::from_secs(60),)
+                .is_ok()
+        );
         assert!(SnapshotDailyPolicy::new(daily_at, "", Duration::from_secs(60)).is_err());
+        assert!(SnapshotDailyPolicy::new(daily_at, "Not/AZone", Duration::from_secs(60)).is_err());
         assert!(SnapshotDailyPolicy::new(daily_at, "UTC", Duration::ZERO).is_err());
     }
 
