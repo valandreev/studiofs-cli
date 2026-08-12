@@ -267,6 +267,12 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                 .map_err(|e| DumpLoadError::Message(format!("upsert volume failed: {e}")))?;
             let target_vol: i64 = row.get(0);
 
+            tx.execute("DELETE FROM snapshot_policies WHERE vol = $1", &[&target_vol])
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("clear snapshot policies failed: {e}")))?;
+            tx.execute("DELETE FROM snapshot_catalog WHERE vol = $1", &[&target_vol])
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("clear snapshot catalog failed: {e}")))?;
             tx.execute("DELETE FROM counters WHERE vol = $1", &[&target_vol])
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("clear counters failed: {e}")))?;

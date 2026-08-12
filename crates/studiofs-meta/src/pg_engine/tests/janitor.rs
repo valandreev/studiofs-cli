@@ -1,4 +1,5 @@
 use super::*;
+use crate::snapshot::{SnapshotOrigin, SnapshotRetention};
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
@@ -61,6 +62,66 @@ fn test_pg_legacy_snapshot_api_does_not_create_local_pins() {
         error
             .to_string()
             .contains("legacy directory-root snapshots are unavailable")
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_janitor_blocks_gc_while_snapshot_is_creating() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-janitor-snapshot-creation");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open postgres engine");
+
+    assert!(
+        !engine
+            .snapshot_gc_is_blocked()
+            .expect("read snapshot GC state before capture")
+    );
+    let snapshot = engine
+        .create_snapshot_v2(
+            SnapshotOrigin::Manual,
+            SnapshotRetention::manual(None).expect("manual infinite retention"),
+        )
+        .expect("create snapshot");
+    assert!(
+        engine
+            .snapshot_gc_is_blocked()
+            .expect("read snapshot GC state during capture")
+    );
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_catalog SET lifecycle = 'ready' WHERE vol = $1 AND id = $2",
+                &[&volume.volume_id, &snapshot.snapshot_id.to_string()],
+            )
+            .await
+            .expect("finish snapshot for janitor test");
+        connection_task.abort();
+        Ok(())
+    })
+    .expect("mark snapshot ready");
+
+    assert!(
+        !engine
+            .snapshot_gc_is_blocked()
+            .expect("read snapshot GC state after capture")
     );
 }
 

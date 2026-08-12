@@ -192,6 +192,53 @@ async fn volume_exists(pg_dsn: &str, name: &str) -> bool {
     row.get::<_, bool>(0)
 }
 
+async fn seed_stale_snapshot_v2_rows(pg_dsn: &str, name: &str) {
+    let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect postgres");
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let volume_id: i64 = client
+        .query_one("SELECT vol FROM volumes WHERE name = $1", &[&name])
+        .await
+        .expect("find target volume")
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle, retention_seconds) VALUES ($1, 'stale-v2-snapshot', 'manual', 0, clock_timestamp(), 'ready', NULL)",
+            &[&volume_id],
+        )
+        .await
+        .expect("seed stale snapshot catalog row");
+    client
+        .execute(
+            "INSERT INTO snapshot_policies (vol, generation, daily_at, timezone, retention_seconds) VALUES ($1, 1, '02:30:00', 'UTC', 3600)",
+            &[&volume_id],
+        )
+        .await
+        .expect("seed stale snapshot policy");
+    conn_task.abort();
+}
+
+async fn snapshot_v2_rows_exist(pg_dsn: &str, name: &str) -> (i64, i64) {
+    let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect postgres");
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM snapshot_catalog WHERE vol = v.vol), (SELECT count(*) FROM snapshot_policies WHERE vol = v.vol) FROM volumes v WHERE v.name = $1",
+            &[&name],
+        )
+        .await
+        .expect("count snapshot v2 rows");
+    conn_task.abort();
+    (row.get(0), row.get(1))
+}
+
 fn single_object_slice_graph(
     payload: &PayloadRef,
 ) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
@@ -501,7 +548,7 @@ async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
     assert_ok(&dump, "dump target");
 
     let pg_dsn = resolved_pg_dsn(&raw_pg).await;
-    delete_volume_by_name(&pg_dsn, &target).await;
+    seed_stale_snapshot_v2_rows(&pg_dsn, &target).await;
 
     for disk in [&extra1, &extra2] {
         let out = run_studiofs(
@@ -537,6 +584,11 @@ async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
         ],
     );
     assert_ok(&load, "load target");
+    assert_eq!(
+        snapshot_v2_rows_exist(&pg_dsn, &target).await,
+        (0, 0),
+        "load must replace stale Snapshot v2 control-plane rows"
+    );
 
     let verify_home = studiofs_test_support::workspace_target_tempdir("verify-home-");
     let discover_target = run_studiofs(

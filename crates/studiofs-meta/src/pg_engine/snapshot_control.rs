@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio_postgres::GenericClient;
 
-use super::PgMetaEngine;
+use super::{PgMetaEngine, janitor::pg_janitor_lock_key};
 use crate::engine::{MetaError, MetaResult};
 use crate::snapshot::{
     SnapshotCatalogEntry, SnapshotCreationState, SnapshotCut, SnapshotId, SnapshotLifecycle,
@@ -78,6 +78,7 @@ impl PgMetaEngine {
 ///
 /// Returns a redacted metadata error when the published checkpoint is absent,
 /// invalid, or cannot be read.
+#[cfg(test)]
 pub(crate) async fn capture_snapshot_cut<C>(
     client: &C,
     volume_id: VolumeId,
@@ -126,27 +127,30 @@ where
 
     let volume_row = client
         .query_opt(
-            "SELECT name, uuid FROM volumes WHERE vol = $1 FOR UPDATE",
-            &[&request.volume_id],
+            "WITH snapshot_lock AS (SELECT pg_advisory_xact_lock($1)) SELECT volumes.name, volumes.uuid FROM volumes CROSS JOIN snapshot_lock WHERE volumes.vol = $2 FOR UPDATE",
+            &[&pg_janitor_lock_key(request.volume_id), &request.volume_id],
         )
         .await
-        .map_err(|_| snapshot_control_error("lock snapshot volume"))?
+        .map_err(|_| snapshot_control_error("lock snapshot janitor lease and volume"))?
         .ok_or_else(|| snapshot_control_error("snapshot volume is missing"))?;
     let volume_name: String = volume_row.get(0);
     let volume_uuid: String = volume_row.get(1);
     let volume = SnapshotVolumeContext::new(request.volume_id, volume_name, volume_uuid)
         .map_err(|_| snapshot_control_error("snapshot volume identity is invalid"))?;
 
-    let cut = capture_snapshot_cut(client, request.volume_id).await?;
     let checkpoint_row = client
         .query_opt(
-            "SELECT snapshot FROM metadata_state WHERE vol = $1 FOR SHARE",
+            "SELECT version, clock_timestamp(), snapshot FROM metadata_state WHERE vol = $1 FOR SHARE",
             &[&request.volume_id],
         )
         .await
-        .map_err(|_| snapshot_control_error("read snapshot checkpoint"))?
+        .map_err(|_| snapshot_control_error("read published checkpoint"))?
         .ok_or_else(|| snapshot_control_error("snapshot checkpoint is missing"))?;
-    let checkpoint_bytes: Vec<u8> = checkpoint_row.get(0);
+    let cut_version: i64 = checkpoint_row.get(0);
+    let captured_at: DateTime<Utc> = checkpoint_row.get(1);
+    let cut = SnapshotCut::new(request.volume_id, cut_version, captured_at)
+        .map_err(|_| snapshot_control_error("published checkpoint is invalid"))?;
+    let checkpoint_bytes: Vec<u8> = checkpoint_row.get(2);
     let base_id = SnapshotId::from_cut(&volume.volume_name, cut.captured_at())
         .map_err(|_| snapshot_control_error("snapshot ID allocation failed"))?;
     let snapshot_id = allocate_snapshot_id(

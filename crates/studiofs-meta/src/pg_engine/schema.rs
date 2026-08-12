@@ -209,6 +209,81 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 REFERENCES snapshot_catalog(vol, id) ON DELETE CASCADE
         );
 
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'snapshot_artifact_payload_proofs'
+                  AND column_name = 'offset'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'snapshot_artifact_payload_proofs'
+                  AND column_name = 'byte_offset'
+            ) THEN
+                ALTER TABLE snapshot_artifact_payload_proofs
+                    RENAME COLUMN "offset" TO byte_offset;
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'snapshot_artifact_payload_proofs'
+                  AND column_name = 'length'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'snapshot_artifact_payload_proofs'
+                  AND column_name = 'byte_length'
+            ) THEN
+                ALTER TABLE snapshot_artifact_payload_proofs
+                    RENAME COLUMN "length" TO byte_length;
+            END IF;
+        END
+        $$;
+
+        ALTER TABLE snapshot_artifact_payload_proofs
+            ADD COLUMN IF NOT EXISTS byte_offset BIGINT;
+        UPDATE snapshot_artifact_payload_proofs
+            SET byte_offset = 0
+            WHERE byte_offset IS NULL;
+        ALTER TABLE snapshot_artifact_payload_proofs
+            ALTER COLUMN byte_offset SET NOT NULL;
+
+        DO $$
+        DECLARE
+            primary_key_name TEXT;
+        BEGIN
+            SELECT tc.constraint_name
+            INTO primary_key_name
+            FROM information_schema.table_constraints AS tc
+            WHERE tc.table_schema = current_schema()
+              AND tc.table_name = 'snapshot_artifact_payload_proofs'
+              AND tc.constraint_type = 'PRIMARY KEY'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM information_schema.key_column_usage
+                  WHERE table_schema = current_schema()
+                    AND table_name = 'snapshot_artifact_payload_proofs'
+                    AND constraint_name = tc.constraint_name
+                    AND column_name = 'byte_offset'
+              );
+            IF primary_key_name IS NOT NULL THEN
+                EXECUTE format(
+                    'ALTER TABLE snapshot_artifact_payload_proofs DROP CONSTRAINT %I',
+                    primary_key_name
+                );
+                ALTER TABLE snapshot_artifact_payload_proofs
+                    ADD CONSTRAINT snapshot_artifact_payload_proofs_pkey
+                    PRIMARY KEY (vol, snapshot_id, object_id, byte_offset);
+            END IF;
+        END
+        $$;
+
         CREATE TABLE IF NOT EXISTS snapshot_artifact_attempts (
             vol BIGINT NOT NULL,
             snapshot_id TEXT NOT NULL,

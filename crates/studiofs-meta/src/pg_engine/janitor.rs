@@ -11,7 +11,7 @@ pub(super) struct PgJanitorLock {
 
 impl PgMetaEngine {
     fn janitor_lock_key(&self) -> i64 {
-        self.volume_id.wrapping_mul(1_000_003) ^ PG_JANITOR_LOCK_SALT
+        pg_janitor_lock_key(self.volume_id)
     }
 
     pub(super) fn try_acquire_pg_janitor_lock(&self) -> MetaResult<bool> {
@@ -131,4 +131,39 @@ impl PgMetaEngine {
         }
         Ok(pins)
     }
+
+    pub(super) fn load_pg_snapshot_gc_is_blocked(&self) -> MetaResult<bool> {
+        let command_pool = self.command_pool.clone();
+        let volume_id = self.volume_id;
+        let command_timeout = self.command_timeout;
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                command_pool,
+                command_timeout,
+                "janitor snapshot creation check",
+                move |client| {
+                    Box::pin(async move {
+                        let row = client
+                            .query_one(
+                                "SELECT EXISTS (SELECT 1 FROM snapshot_catalog WHERE vol = $1 AND lifecycle = 'creating')",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres janitor snapshot creation check failed",
+                                    e,
+                                )
+                            })?;
+                        Ok(row.get(0))
+                    })
+                },
+            )
+            .await
+        })
+    }
+}
+
+pub(super) fn pg_janitor_lock_key(volume_id: i64) -> i64 {
+    volume_id.wrapping_mul(1_000_003) ^ PG_JANITOR_LOCK_SALT
 }

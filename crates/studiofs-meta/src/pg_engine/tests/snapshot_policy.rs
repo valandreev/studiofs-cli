@@ -1,13 +1,13 @@
 use super::*;
 
 use crate::snapshot::{
-    SnapshotCreationLease, SnapshotCreationState, SnapshotDailyPolicy, SnapshotOrigin,
-    SnapshotRetention,
+    SnapshotArtifactDescriptor, SnapshotCreationLease, SnapshotCreationState, SnapshotDailyPolicy,
+    SnapshotLifecycle, SnapshotOrigin, SnapshotRetention, SnapshotSha256,
 };
 use crate::snapshot_ports::{
-    SnapshotJobClaim, SnapshotJobStore, SnapshotPolicyStore, SnapshotWorkerId,
+    SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadProof, SnapshotPolicyStore, SnapshotWorkerId,
 };
-use chrono::NaiveTime;
+use chrono::{NaiveTime, Utc};
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
@@ -159,4 +159,78 @@ fn snapshot_job_claim_renew_release_is_fenced() {
         Ok(())
     })
     .expect("snapshot job control plane");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn snapshot_publish_ready_stores_all_payload_proofs() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-publish");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    let info = volume.format_info();
+    seed_local(&db_path, &info);
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open postgres engine");
+    let created = engine
+        .create_snapshot_v2(
+            SnapshotOrigin::Manual,
+            SnapshotRetention::manual(None).expect("manual infinite retention"),
+        )
+        .expect("create queued snapshot");
+
+    run_async(async {
+        let worker = SnapshotWorkerId::new("publish-worker").expect("worker");
+        let claim = SnapshotJobStore::claim_next(&*engine, &worker, Duration::from_secs(60))
+            .await
+            .expect("claim snapshot job")
+            .expect("queued snapshot job");
+        let descriptor = SnapshotArtifactDescriptor::new(
+            format!("snapshots/{}/artifact", created.snapshot_id),
+            1,
+            1,
+            SnapshotSha256::from_bytes([7; 32]),
+            64,
+            created.cut,
+            Utc::now(),
+        )
+        .expect("artifact descriptor");
+        let proofs: Vec<_> = (0..64)
+            .map(|index| SnapshotPayloadProof {
+                object_id: 10_000 + index,
+                offset: index * 64,
+                length: 64,
+                sha256: SnapshotSha256::from_bytes([index as u8; 32]),
+            })
+            .collect();
+
+        let published = SnapshotJobStore::publish_ready(&*engine, &claim, &descriptor, &proofs)
+            .await
+            .expect("publish snapshot");
+        assert_eq!(published.lifecycle, SnapshotLifecycle::Ready);
+
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to count payload proofs");
+        let connection_task = tokio::spawn(connection);
+        let proof_count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM snapshot_artifact_payload_proofs WHERE vol = $1 AND snapshot_id = $2",
+                &[&volume.volume_id, &created.snapshot_id.to_string()],
+            )
+            .await
+            .expect("count payload proofs")
+            .get(0);
+        connection_task.abort();
+        assert_eq!(proof_count, 64);
+        Ok(())
+    })
+    .expect("publish snapshot proofs");
 }

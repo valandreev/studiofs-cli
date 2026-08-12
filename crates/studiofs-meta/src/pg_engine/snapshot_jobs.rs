@@ -283,7 +283,21 @@ impl SnapshotJobStore for PgMetaEngine {
                             .map_err(|_| pg_failure("begin snapshot claim"))?;
                         let row = tx
                             .query_opt(
-                                "SELECT j.snapshot_id FROM snapshot_creation_jobs AS j LEFT JOIN snapshot_creation_leases AS l ON l.vol = j.vol AND l.snapshot_id = j.snapshot_id WHERE j.vol = $1 AND (j.state = 'queued' OR (j.state = 'retry_wait' AND (j.next_retry_at IS NULL OR j.next_retry_at <= clock_timestamp())) OR (j.state = 'running' AND (l.snapshot_id IS NULL OR l.lease_expires_at <= clock_timestamp()))) AND (l.snapshot_id IS NULL OR l.lease_expires_at <= clock_timestamp()) ORDER BY j.created_at, j.snapshot_id LIMIT 1 FOR UPDATE OF j SKIP LOCKED",
+                                "SELECT j.snapshot_id
+                                 FROM snapshot_creation_jobs AS j
+                                 LEFT JOIN snapshot_creation_leases AS l
+                                   ON l.vol = j.vol
+                                  AND l.snapshot_id = j.snapshot_id
+                                 WHERE j.vol = $1
+                                   AND j.state IN ('queued', 'retry_wait', 'running')
+                                   AND (j.state <> 'retry_wait'
+                                        OR j.next_retry_at IS NULL
+                                        OR j.next_retry_at <= clock_timestamp())
+                                   AND (l.snapshot_id IS NULL
+                                        OR l.lease_expires_at <= clock_timestamp())
+                                 ORDER BY j.created_at, j.snapshot_id
+                                 LIMIT 1
+                                 FOR UPDATE OF j SKIP LOCKED",
                                 &[&volume_id],
                             )
                             .await
@@ -295,7 +309,8 @@ impl SnapshotJobStore for PgMetaEngine {
                             return Ok(None);
                         };
                         let snapshot_id: String = row.get(0);
-                        let claim = claim_job(&tx, volume_id, &snapshot_id, &worker, lease_ms).await?;
+                        let claim =
+                            claim_job(&tx, volume_id, &snapshot_id, &worker, lease_ms).await?;
                         tx.commit()
                             .await
                             .map_err(|_| pg_failure("commit snapshot claim"))?;
@@ -663,6 +678,22 @@ impl SnapshotJobStore for PgMetaEngine {
                             .map_err(|_| MetaError::Storage("invalid artifact schema version".to_string()))?;
                         let byte_length = i64::try_from(descriptor.byte_length)
                             .map_err(|_| MetaError::Storage("invalid artifact length".to_string()))?;
+                        let mut object_ids = Vec::with_capacity(payload_proofs.len());
+                        let mut offsets = Vec::with_capacity(payload_proofs.len());
+                        let mut lengths = Vec::with_capacity(payload_proofs.len());
+                        let mut hashes = Vec::with_capacity(payload_proofs.len());
+                        for proof in &payload_proofs {
+                            object_ids.push(
+                                i64::try_from(proof.object_id).map_err(|_| {
+                                    MetaError::Storage("invalid payload object ID".to_string())
+                                })?,
+                            );
+                            offsets.push(i64::try_from(proof.offset).map_err(|_| {
+                                MetaError::Storage("invalid payload offset".to_string())
+                            })?);
+                            lengths.push(i64::from(proof.length));
+                            hashes.push(proof.sha256.as_bytes().to_vec());
+                        }
                         tx.execute(
                             "INSERT INTO snapshot_artifacts (vol, snapshot_id, object_key, format_version, schema_version, sha256, byte_length, verified_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                             &[
@@ -678,21 +709,16 @@ impl SnapshotJobStore for PgMetaEngine {
                         )
                         .await
                         .map_err(|_| pg_failure("store snapshot artifact"))?;
-                        for proof in &payload_proofs {
-                            let object_id = i64::try_from(proof.object_id)
-                                .map_err(|_| MetaError::Storage("invalid payload object ID".to_string()))?;
-                            let offset = i64::try_from(proof.offset)
-                                .map_err(|_| MetaError::Storage("invalid payload offset".to_string()))?;
-                            let length = i64::from(proof.length);
+                        if !payload_proofs.is_empty() {
                             tx.execute(
-                                "INSERT INTO snapshot_artifact_payload_proofs (vol, snapshot_id, object_id, byte_offset, byte_length, sha256, verified_at) VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())",
+                                "INSERT INTO snapshot_artifact_payload_proofs (vol, snapshot_id, object_id, byte_offset, byte_length, sha256, verified_at) SELECT $1, $2, proof.object_id, proof.byte_offset, proof.byte_length, proof.sha256, clock_timestamp() FROM UNNEST($3::bigint[], $4::bigint[], $5::bigint[], $6::bytea[]) AS proof(object_id, byte_offset, byte_length, sha256)",
                                 &[
                                     &volume_id,
                                     &claim.job.snapshot_id.to_string(),
-                                    &object_id,
-                                    &offset,
-                                    &length,
-                                    &proof.sha256.as_bytes().as_slice(),
+                                    &object_ids,
+                                    &offsets,
+                                    &lengths,
+                                    &hashes,
                                 ],
                             )
                             .await
