@@ -2390,8 +2390,9 @@ mod tests {
         assert_eq!(cache_decisions.local_stable_write_release_seeded, 0);
         assert_eq!(cache_decisions.read_only_keep, 0);
         assert_eq!(cache_decisions.read_only_local_stable_keep, 0);
-        assert_eq!(cache_decisions.read_only_generation_changed, 1);
-        assert_eq!(cache_decisions.read_only_local_stable_generation_changed, 1);
+        assert_eq!(cache_decisions.read_only_local_dirty_state, 1);
+        assert_eq!(cache_decisions.read_only_generation_changed, 0);
+        assert_eq!(cache_decisions.read_only_local_stable_generation_changed, 0);
     }
 
     #[test]

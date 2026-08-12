@@ -441,6 +441,11 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
 
+    /// Return whether remote object deletion must be paused for an in-progress snapshot.
+    fn snapshot_gc_is_blocked(&self) -> MetaResult<bool> {
+        Ok(false)
+    }
+
     /// Acquire a PostgreSQL-backed hard-lock lease for this engine's client.
     fn acquire_file_lock_lease(
         &self,

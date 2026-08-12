@@ -487,32 +487,6 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let _ = table.remove(*object_id);
                 }
-                crate::events::MetaEvent::CreateSnapshot { snapshot } => {
-                    let mut table = txn
-                        .open_table(SNAPSHOTS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let bytes = encode(snapshot)?;
-                    table
-                        .insert(snapshot.id.as_str(), bytes.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                }
-                crate::events::MetaEvent::UpdateSnapshotState { id, state } => {
-                    let mut table = txn
-                        .open_table(SNAPSHOTS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let existing_bytes = table
-                        .get(id.as_str())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?
-                        .map(|existing| existing.value().to_vec());
-                    if let Some(existing_bytes) = existing_bytes {
-                        let mut snapshot: MetadataSnapshot = decode(existing_bytes.as_slice())?;
-                        snapshot.state = *state;
-                        let bytes = encode(&snapshot)?;
-                        table
-                            .insert(id.as_str(), bytes.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                }
             }
         }
 
@@ -763,9 +737,7 @@ impl RedbMetaEngine {
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
-                | crate::events::MetaEvent::RemovePendingDeletion { .. }
-                | crate::events::MetaEvent::CreateSnapshot { .. }
-                | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
+                | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
             }
         }
 
@@ -955,9 +927,7 @@ impl RedbMetaEngine {
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
-                | crate::events::MetaEvent::RemovePendingDeletion { .. }
-                | crate::events::MetaEvent::CreateSnapshot { .. }
-                | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
+                | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
             }
         }
 

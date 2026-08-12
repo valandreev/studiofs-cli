@@ -1,5 +1,5 @@
 use crate::engine::{MetaError, MetaResult};
-use crate::types::{DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
+use crate::types::{DirEntryValue, InodeAttr};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -20,8 +20,6 @@ const TAG_SET_ACL_RULE: u8 = 12;
 const TAG_REMOVE_ACL_RULE: u8 = 13;
 const TAG_ADD_PENDING_DELETION: u8 = 14;
 const TAG_REMOVE_PENDING_DELETION: u8 = 15;
-const TAG_CREATE_SNAPSHOT: u8 = 16;
-const TAG_UPDATE_SNAPSHOT_STATE: u8 = 17;
 
 // These tag values are part of the persisted format: append new values, never
 // reorder or reuse an existing value.
@@ -180,21 +178,6 @@ pub enum MetaEvent {
         /// Object id that finished deferred deletion.
         object_id: u64,
     },
-
-    // ─── Snapshots ───────────────────────────────────────────────────────────
-    /// Create or update snapshot definition.
-    CreateSnapshot {
-        /// Snapshot descriptor to persist.
-        snapshot: MetadataSnapshot,
-    },
-
-    /// Update snapshot replication state.
-    UpdateSnapshotState {
-        /// Snapshot id to update.
-        id: String,
-        /// New replication state for the snapshot.
-        state: SnapshotState,
-    },
 }
 
 impl MetaEvent {
@@ -216,8 +199,6 @@ impl MetaEvent {
             Self::RemoveAclRule { .. } => "remove_acl_rule",
             Self::AddPendingDeletion { .. } => "add_pending_deletion",
             Self::RemovePendingDeletion { .. } => "remove_pending_deletion",
-            Self::CreateSnapshot { .. } => "create_snapshot",
-            Self::UpdateSnapshotState { .. } => "update_snapshot_state",
         }
     }
 
@@ -238,8 +219,6 @@ impl MetaEvent {
             Self::RemoveAclRule { .. } => TAG_REMOVE_ACL_RULE,
             Self::AddPendingDeletion { .. } => TAG_ADD_PENDING_DELETION,
             Self::RemovePendingDeletion { .. } => TAG_REMOVE_PENDING_DELETION,
-            Self::CreateSnapshot { .. } => TAG_CREATE_SNAPSHOT,
-            Self::UpdateSnapshotState { .. } => TAG_UPDATE_SNAPSHOT_STATE,
         }
     }
 
@@ -270,8 +249,6 @@ impl MetaEvent {
             Self::RemoveAclRule { ino, .. } => Some(*ino),
             Self::AddPendingDeletion { .. } => None,
             Self::RemovePendingDeletion { .. } => None,
-            Self::CreateSnapshot { snapshot } => Some(snapshot.root_ino),
-            Self::UpdateSnapshotState { .. } => None,
         }
     }
 }
@@ -339,8 +316,6 @@ pub(crate) fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
             timestamp,
         } => encode_event_envelope(tag, &(*object_id, *timestamp)),
         MetaEvent::RemovePendingDeletion { object_id } => encode_event_envelope(tag, object_id),
-        MetaEvent::CreateSnapshot { snapshot } => encode_event_envelope(tag, snapshot),
-        MetaEvent::UpdateSnapshotState { id, state } => encode_event_envelope(tag, &(id, *state)),
     }
 }
 
@@ -379,8 +354,6 @@ fn wire_tag_for_kind(kind: &str) -> Option<u8> {
         "remove_acl_rule" => Some(TAG_REMOVE_ACL_RULE),
         "add_pending_deletion" => Some(TAG_ADD_PENDING_DELETION),
         "remove_pending_deletion" => Some(TAG_REMOVE_PENDING_DELETION),
-        "create_snapshot" => Some(TAG_CREATE_SNAPSHOT),
-        "update_snapshot_state" => Some(TAG_UPDATE_SNAPSHOT_STATE),
         _ => None,
     }
 }
@@ -427,8 +400,6 @@ fn decode_event_wire_parts(bytes: &[u8]) -> MetaResult<(u8, &[u8])> {
         12 => TAG_REMOVE_ACL_RULE,
         13 => TAG_ADD_PENDING_DELETION,
         14 => TAG_REMOVE_PENDING_DELETION,
-        15 => TAG_CREATE_SNAPSHOT,
-        16 => TAG_UPDATE_SNAPSHOT_STATE,
         _ => {
             return Err(MetaError::Serialization(format!(
                 "unknown legacy MetaEvent ordinal {ordinal}"
@@ -556,13 +527,6 @@ fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
         TAG_REMOVE_PENDING_DELETION => Ok(MetaEvent::RemovePendingDeletion {
             object_id: decode_event_payload(tag, payload)?,
         }),
-        TAG_CREATE_SNAPSHOT => Ok(MetaEvent::CreateSnapshot {
-            snapshot: decode_event_payload(tag, payload)?,
-        }),
-        TAG_UPDATE_SNAPSHOT_STATE => {
-            let (id, state) = decode_event_payload(tag, payload)?;
-            Ok(MetaEvent::UpdateSnapshotState { id, state })
-        }
         _ => Err(MetaError::Serialization(format!(
             "unknown MetaEvent wire kind tag {tag}"
         ))),
@@ -752,29 +716,41 @@ mod tests {
                 b"SFS-EVT\x01\x0f\x1d",
                 b"\x0e\x1d",
             ),
-            (
-                MetaEvent::CreateSnapshot {
-                    snapshot: MetadataSnapshot {
-                        id: "snapshot".to_string(),
-                        root_ino: 30,
-                        created_at: 31,
-                        state: SnapshotState::Synced,
-                        pinned_object_ids: vec![32],
-                        snapshot_payload: b"payload".to_vec(),
-                    },
-                },
-                b"SFS-EVT\x01\x10\x08snapshot\x1e\x3e\x01\x01\x20\x07payload",
-                b"\x0f\x08snapshot\x1e\x3e\x01\x01\x20\x07payload",
-            ),
-            (
-                MetaEvent::UpdateSnapshotState {
-                    id: "snapshot".to_string(),
-                    state: SnapshotState::Failed,
-                },
-                b"SFS-EVT\x01\x11\x08snapshot\x02",
-                b"\x10\x08snapshot\x02",
-            ),
         ]
+    }
+
+    #[test]
+    fn legacy_snapshot_events_are_rejected() {
+        let create_snapshot = b"SFS-EVT\x01\x10\x08snapshot\x1e\x3e\x01\x01\x20\x07payload";
+        let update_snapshot = b"SFS-EVT\x01\x11\x08snapshot\x02";
+
+        for (bytes, tag) in [
+            (create_snapshot.as_slice(), 16),
+            (update_snapshot.as_slice(), 17),
+        ] {
+            let error = decode_event(bytes).expect_err("legacy snapshot event");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown MetaEvent wire kind tag {tag}")),
+                "unexpected error: {error}"
+            );
+        }
+
+        for (bytes, ordinal) in [(b"\x0f\x00".as_slice(), 15), (b"\x10\x00".as_slice(), 16)] {
+            let error = decode_event(bytes).expect_err("legacy snapshot event ordinal");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown legacy MetaEvent ordinal {ordinal}")),
+                "unexpected error: {error}"
+            );
+        }
+
+        assert!(
+            decode_event_with_type("create_snapshot", create_snapshot).is_err(),
+            "v1 snapshot events must not enter the Snapshot v2 event path"
+        );
     }
 
     #[test]

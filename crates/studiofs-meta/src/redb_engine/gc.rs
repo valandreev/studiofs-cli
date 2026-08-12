@@ -106,8 +106,8 @@ impl MetaGc for RedbMetaEngine {
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
-            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let snapshot: MetadataSnapshot = decode(v.value())?;
+            let (_key, value) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let snapshot: MetadataSnapshot = decode(value.value())?;
             refs.extend(snapshot.pinned_object_ids);
         }
         Ok(refs)

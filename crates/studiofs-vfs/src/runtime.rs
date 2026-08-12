@@ -197,6 +197,7 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>);
     forward_method!(fn release_global_janitor_lock(&self) -> MetaResult<()>);
     forward_method!(fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>);
+    forward_method!(fn snapshot_gc_is_blocked(&self) -> MetaResult<bool>);
     forward_method!(
         fn acquire_file_lock_lease(
             &self,

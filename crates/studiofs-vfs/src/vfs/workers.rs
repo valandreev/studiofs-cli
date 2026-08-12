@@ -1411,6 +1411,36 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
+            let snapshot_gc_blocked = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.snapshot_gc_is_blocked()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
+                    warn!(cycle, error = %e, "janitor cycle skipped: snapshot creation check failed");
+                    continue;
+                }
+            };
+            if snapshot_gc_blocked {
+                let meta = self.meta.clone();
+                let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.release_global_janitor_lock()
+                })
+                .await;
+                debug!(
+                    cycle,
+                    "janitor cycle skipped: snapshot creation in progress"
+                );
+                continue;
+            }
+
+            let meta = self.meta.clone();
             let global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.get_global_snapshot_pins()
             })

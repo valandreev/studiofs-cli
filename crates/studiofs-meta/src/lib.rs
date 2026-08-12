@@ -26,6 +26,10 @@ pub mod pg_transport;
 pub mod redb_engine;
 /// Internal on-disk metadata schema and replication model types.
 pub mod schema;
+/// PostgreSQL-authoritative Snapshot v2 domain contracts.
+pub mod snapshot;
+/// Backend-agnostic Snapshot v2 application ports.
+pub mod snapshot_ports;
 /// Public metadata model types shared across engines and callers.
 pub mod types;
 

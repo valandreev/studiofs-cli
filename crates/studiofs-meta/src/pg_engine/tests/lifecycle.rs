@@ -906,65 +906,25 @@ fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn test_pg_snapshot_eventually_visible_and_mountable_on_peer() {
+fn test_pg_legacy_snapshot_api_is_rejected() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
 
-    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
-    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
-    let db_a = dir_a.path().join("meta-a.redb");
-    let db_b = dir_b.path().join("meta-b.redb");
-    let volume = PgTestVolume::new(&dsn, "pg-snapshot-visibility");
-    let info = volume.format_info();
-    seed_local(&db_a, &info);
-    seed_local(&db_b, &info);
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-legacy-snapshot");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open(&db).expect("open postgres engine");
 
-    let a = PgMetaEngine::open(&db_a).expect("open a");
-    let b = PgMetaEngine::open(&db_b).expect("open b");
-
-    let file = a
-        .create_file(ROOT_INO, b"snap-peer.txt", 0, 0, 0o644)
-        .expect("create file on a");
-    set_file_state(&a, file.ino, 64, 1);
-    a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(44_001, 64))
-        .expect("set payload slice");
-
-    let created = a.create_snapshot(ROOT_INO).expect("create snapshot");
-    a.flush_metadata().expect("flush snapshot");
-
-    let visible = wait_until(Duration::from_secs(12), || {
-        let _ = b.sync_metadata();
-        b.get_snapshot(&created.id)
-            .ok()
-            .flatten()
-            .map(|s| s.state == SnapshotState::Synced)
-            .unwrap_or(false)
-    });
-    assert!(visible, "snapshot should become visible on peer");
-
-    let peer_snapshot = b
-        .get_snapshot(&created.id)
-        .expect("snapshot query")
-        .expect("snapshot exists on peer");
-    assert!(peer_snapshot.pinned_object_ids.contains(&44_001));
-    assert!(!peer_snapshot.snapshot_payload.is_empty());
-
-    let mount_dir = studiofs_test_support::workspace_target_tempdir("test-");
-    let mount_db = mount_dir.path().join("snapshot-mount.redb");
-    let mount_engine = RedbMetaEngine::open(&mount_db).expect("open mount redb");
-    let mut mount_info = info.clone();
-    mount_info.metadata.backend = MetadataBackend::RedbLocal;
-    mount_info.metadata.postgres = None;
-    mount_engine
-        .set_format_info(&mount_info)
-        .expect("set mount format");
-    let snap_state = RedbMetaEngine::decode_snapshot_payload(&peer_snapshot.snapshot_payload)
-        .expect("decode payload");
-    mount_engine
-        .import_snapshot(&snap_state)
-        .expect("import payload");
-    assert!(mount_engine.lookup(ROOT_INO, b"snap-peer.txt").is_ok());
+    let error = engine
+        .create_snapshot(ROOT_INO)
+        .expect_err("directory-root v1 snapshot creation must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("legacy directory-root snapshots are unavailable")
+    );
 }
 
 #[test]

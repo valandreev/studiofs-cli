@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use studiofs_data::{
     DataStore, DataStoreConfig, DataStoreCryptoConfig, normalize_s3_endpoint_transport,
 };
+use studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
     FormatInfo, MetaFormat, MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig,
@@ -306,7 +307,7 @@ fn provision_pg_schema(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Resul
             &[&INIT_SCHEMA_ADVISORY_LOCK],
         )
         .await?;
-        tx.batch_execute(init_pg_schema_sql()).await?;
+        ensure_studiofs_pg_schema(&tx).await?;
         tx.commit().await?;
         conn_task.abort();
         Ok(())
@@ -327,110 +328,6 @@ impl<'a> ActiveCryptoKeyRow<'a> {
             state: ACTIVE_CRYPTO_KEY_STATE,
         }
     }
-}
-
-fn init_pg_schema_sql() -> &'static str {
-    r#"
-            CREATE TABLE IF NOT EXISTS volumes (
-                vol BIGSERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                uuid TEXT NOT NULL UNIQUE,
-                block_size INTEGER NOT NULL,
-                encryption_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                encryption_format_version SMALLINT NOT NULL DEFAULT 1,
-                active_crypto_key_id INTEGER NOT NULL DEFAULT 1,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-
-            ALTER TABLE volumes
-                ADD COLUMN IF NOT EXISTS encryption_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-            ALTER TABLE volumes
-                ADD COLUMN IF NOT EXISTS encryption_format_version SMALLINT NOT NULL DEFAULT 1;
-            ALTER TABLE volumes
-                ADD COLUMN IF NOT EXISTS active_crypto_key_id INTEGER NOT NULL DEFAULT 1;
-
-            CREATE TABLE IF NOT EXISTS volume_crypto_keys (
-                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                key_id INTEGER NOT NULL,
-                algorithm TEXT NOT NULL,
-                key_material BYTEA NOT NULL,
-                state TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (vol, key_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS counters (
-                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                value BIGINT NOT NULL,
-                PRIMARY KEY (vol, name)
-            );
-
-            CREATE TABLE IF NOT EXISTS event_log (
-                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                seq_id BIGSERIAL PRIMARY KEY,
-                batch_version BIGINT NOT NULL,
-                event_type TEXT NOT NULL,
-                event_payload BYTEA NOT NULL,
-                client_id TEXT,
-                client_timestamp BIGINT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-
-            CREATE TABLE IF NOT EXISTS metadata_state (
-                vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
-                version BIGINT NOT NULL,
-                snapshot BYTEA NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-
-            CREATE TABLE IF NOT EXISTS acl_rules (
-                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                ino BIGINT NOT NULL,
-                principal TEXT NOT NULL,
-                access_level SMALLINT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (vol, ino, principal)
-            );
-
-            CREATE TABLE IF NOT EXISTS snapshots (
-                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                id TEXT NOT NULL,
-                root_ino BIGINT NOT NULL,
-                created_at BIGINT NOT NULL,
-                state SMALLINT NOT NULL,
-                pinned_object_ids BIGINT[] NOT NULL DEFAULT '{}',
-                snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (vol, id)
-            );
-
-            CREATE TABLE IF NOT EXISTS file_lock_leases (
-                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                ino BIGINT NOT NULL,
-                kind SMALLINT NOT NULL,
-                exclusive_owner TEXT,
-                shared_owners TEXT[] NOT NULL DEFAULT '{}',
-                lease_expires_at_unix_ms BIGINT NOT NULL,
-                generation BIGINT NOT NULL DEFAULT 1,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (vol, ino)
-            );
-
-            ALTER TABLE event_log
-                ADD COLUMN IF NOT EXISTS batch_version BIGINT;
-            UPDATE event_log
-                SET batch_version = 0
-                WHERE batch_version IS NULL;
-            ALTER TABLE event_log
-                ALTER COLUMN batch_version SET NOT NULL;
-
-            CREATE INDEX IF NOT EXISTS idx_event_log_vol_seq
-                ON event_log(vol, seq_id);
-            CREATE INDEX IF NOT EXISTS idx_event_log_vol_batch_seq
-                ON event_log(vol, batch_version, seq_id);
-            "#
 }
 
 fn init_pg_volume_upsert_sql() -> &'static str {
@@ -516,7 +413,7 @@ fn init_pg_schema_and_volume(
         )
         .await?;
 
-        tx.batch_execute(init_pg_schema_sql()).await?;
+        ensure_studiofs_pg_schema(&tx).await?;
 
         let row = tx
             .query_one(
@@ -834,7 +731,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_provisions_volume_encryption_metadata() {
-        let ddl = init_pg_schema_sql();
+        let ddl = studiofs_meta::pg_engine::schema::studiofs_pg_schema_sql();
 
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS file_lock_leases"));
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS volume_crypto_keys"));
@@ -884,7 +781,7 @@ mod tests {
                 let _ = connection.await;
             });
             let tx = client.transaction().await.expect("start setup transaction");
-            tx.batch_execute(init_pg_schema_sql())
+            ensure_studiofs_pg_schema(&tx)
                 .await
                 .expect("create test schema");
             tx.execute(
