@@ -278,7 +278,35 @@ fn escape_like(value: &str) -> String {
 }
 
 fn snapshot_control_error(operation: &'static str) -> MetaError {
-    MetaError::RemoteUnavailable(format!(
-        "snapshot control plane operation failed: {operation}"
-    ))
+    let message = format!("snapshot control plane operation failed: {operation}");
+    match operation {
+        "published checkpoint is missing"
+        | "snapshot volume is missing"
+        | "snapshot checkpoint is missing" => MetaError::Storage(message),
+        _ => MetaError::RemoteUnavailable(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_control_plane_rows_are_permanent() {
+        for operation in [
+            "published checkpoint is missing",
+            "snapshot volume is missing",
+            "snapshot checkpoint is missing",
+        ] {
+            assert!(matches!(
+                snapshot_control_error(operation),
+                MetaError::Storage(_)
+            ));
+        }
+
+        assert!(matches!(
+            snapshot_control_error("read published checkpoint"),
+            MetaError::RemoteUnavailable(_)
+        ));
+    }
 }

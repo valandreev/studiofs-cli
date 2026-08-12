@@ -7,15 +7,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const STALE_POLICY: &str = "snapshot policy generation fenced";
+const POLICY_VOLUME_MISSING: &str = "snapshot policy volume is missing";
 
 fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
-    if matches!(&error, MetaError::Storage(message) if message == STALE_POLICY) {
-        SnapshotPortError::permanent(
+    match &error {
+        MetaError::Storage(message) if message == STALE_POLICY => SnapshotPortError::permanent(
             "stale_policy_generation",
             "snapshot policy generation is no longer current",
-        )
-    } else {
-        SnapshotPortError::from_backend(operation, &error.to_string())
+        ),
+        MetaError::Storage(message) if message == POLICY_VOLUME_MISSING => {
+            SnapshotPortError::permanent(
+                "volume_not_found",
+                "snapshot policy volume does not exist",
+            )
+        }
+        _ => SnapshotPortError::from_backend(operation, &error.to_string()),
     }
 }
 
@@ -86,7 +92,7 @@ impl SnapshotPolicyStore for PgMetaEngine {
                         )
                         .await
                         .map_err(|_| pg_failure("lock policy volume"))?
-                        .ok_or_else(|| pg_failure("policy volume is missing"))?;
+                        .ok_or_else(|| MetaError::Storage(POLICY_VOLUME_MISSING.to_string()))?;
                         let current = tx
                             .query_opt(
                                 "SELECT generation FROM snapshot_policies WHERE vol = $1 FOR UPDATE",
@@ -193,5 +199,23 @@ impl SnapshotPolicyStore for PgMetaEngine {
             .await;
             result.map_err(|error| map_error("cancel snapshot policy", error))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_policy_volume_is_permanent() {
+        let error = map_error(
+            "set snapshot policy",
+            MetaError::Storage("snapshot policy volume is missing".to_string()),
+        );
+
+        assert!(matches!(
+            error,
+            SnapshotPortError::Permanent { code, .. } if code.as_str() == "volume_not_found"
+        ));
     }
 }

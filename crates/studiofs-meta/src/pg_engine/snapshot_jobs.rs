@@ -453,7 +453,22 @@ impl SnapshotJobStore for PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin snapshot lease release"))?;
-                        let deleted = tx
+                        let requeued = tx
+                            .execute(
+                                "UPDATE snapshot_creation_jobs AS j SET state = 'retry_wait', next_retry_at = clock_timestamp(), updated_at = clock_timestamp() WHERE j.vol = $1 AND j.snapshot_id = $2 AND j.state = 'running' AND EXISTS (SELECT 1 FROM snapshot_creation_leases AS l WHERE l.vol = j.vol AND l.snapshot_id = j.snapshot_id AND l.owner = $3 AND l.fencing_token = $4)",
+                                &[
+                                    &volume_id,
+                                    &claim.job.snapshot_id.to_string(),
+                                    &claim.lease.owner,
+                                    &claim.lease.fencing_token,
+                                ],
+                            )
+                            .await
+                            .map_err(|_| pg_failure("requeue released snapshot job"))?;
+                        if requeued != 1 {
+                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                        }
+                        let released = tx
                             .execute(
                                 "UPDATE snapshot_creation_leases SET owner = '', lease_expires_at = clock_timestamp(), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4",
                                 &[
@@ -465,15 +480,9 @@ impl SnapshotJobStore for PgMetaEngine {
                             )
                             .await
                             .map_err(|_| pg_failure("release snapshot lease"))?;
-                        if deleted != 1 {
+                        if released != 1 {
                             return Err(MetaError::Storage(STALE_LEASE.to_string()));
                         }
-                        tx.execute(
-                            "UPDATE snapshot_creation_jobs SET state = 'retry_wait', next_retry_at = clock_timestamp(), updated_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND state = 'running'",
-                            &[&volume_id, &claim.job.snapshot_id.to_string()],
-                        )
-                        .await
-                        .map_err(|_| pg_failure("requeue released snapshot job"))?;
                         tx.commit()
                             .await
                             .map_err(|_| pg_failure("commit snapshot lease release"))?;

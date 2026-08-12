@@ -214,6 +214,92 @@ fn snapshot_job_claim_renew_release_is_fenced() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn concurrent_release_and_expired_claim_preserve_fencing() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-job-release-race");
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path_a = dir_a.path().join("meta-a.redb");
+    let db_path_b = dir_b.path().join("meta-b.redb");
+    let info = volume.format_info();
+    seed_local(&db_path_a, &info);
+    seed_local(&db_path_b, &info);
+    let engine_a = PgMetaEngine::open_with_options(
+        &db_path_a,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open first postgres engine");
+    let engine_b = PgMetaEngine::open_with_options(
+        &db_path_b,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open second postgres engine");
+    let created = engine_a
+        .create_snapshot_v2(
+            SnapshotOrigin::Manual,
+            SnapshotRetention::manual(None).expect("manual infinite retention"),
+        )
+        .expect("create queued snapshot");
+    let worker_a = SnapshotWorkerId::new("release-race-a").expect("worker a");
+    let worker_b = SnapshotWorkerId::new("release-race-b").expect("worker b");
+
+    run_async(async {
+        let claim = SnapshotJobStore::claim_next(&*engine_a, &worker_a, Duration::from_secs(60))
+            .await
+            .expect("claim queued job")
+            .expect("one queued job");
+        assert_eq!(claim.job.snapshot_id, created.snapshot_id);
+
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to expire lease");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_creation_leases SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND snapshot_id = $2",
+                &[&volume.volume_id, &claim.job.snapshot_id.to_string()],
+            )
+            .await
+            .expect("expire test lease");
+        connection_task.abort();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                SnapshotJobStore::release_lease(&*engine_a, &claim),
+                SnapshotJobStore::claim_next(&*engine_b, &worker_b, Duration::from_secs(60)),
+            )
+        })
+        .await
+        .expect("release and takeover must not deadlock");
+        let (released, takeover) = outcome;
+        let takeover = match takeover.expect("takeover query") {
+            Some(takeover) => takeover,
+            None => {
+                assert!(released.is_ok(), "a skipped claim requires a committed release");
+                SnapshotJobStore::claim_next(&*engine_b, &worker_b, Duration::from_secs(60))
+                    .await
+                    .expect("claim released job")
+                    .expect("released job should be claimable")
+            }
+        };
+        assert_eq!(takeover.lease.owner, worker_b.as_str());
+        assert!(takeover.lease.fencing_token > claim.lease.fencing_token);
+        if let Err(error) = released {
+            assert!(error.to_string().contains("stale_lease"));
+        }
+        Ok(())
+    })
+    .expect("concurrent snapshot lease control plane");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn snapshot_publish_ready_stores_all_payload_proofs() {
     let Some(dsn) = pg_dsn() else {
         return;
