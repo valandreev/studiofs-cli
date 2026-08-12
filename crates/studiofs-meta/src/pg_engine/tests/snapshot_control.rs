@@ -16,7 +16,8 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_creation_jobs"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_mount_leases"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_policies"));
-    assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_reachability"));
+    assert!(!ddl.contains("snapshot_current_references"));
+    assert!(!ddl.contains("snapshot_reachability"));
     assert!(ddl.contains("byte_offset BIGINT NOT NULL"));
     assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
     assert!(!ddl.contains("pinned_object_ids"));

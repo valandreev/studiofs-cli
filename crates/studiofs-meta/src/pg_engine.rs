@@ -392,9 +392,7 @@ impl PgMetaEngine {
                                     ('snapshot_source_checkpoints'::TEXT),
                                     ('snapshot_artifacts'::TEXT),
                                     ('snapshot_artifact_payload_proofs'::TEXT),
-                                    ('snapshot_artifact_attempts'::TEXT),
-                                    ('snapshot_current_references'::TEXT),
-                                    ('snapshot_reachability'::TEXT)
+                                    ('snapshot_artifact_attempts'::TEXT)
                             ) AS required(name)
                             LEFT JOIN information_schema.tables AS table_info
                                 ON table_info.table_schema = current_schema()

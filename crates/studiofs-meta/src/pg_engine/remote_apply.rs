@@ -80,11 +80,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. } => None,
-            MetaEvent::CreateSnapshot { snapshot } => {
-                let mut synced = snapshot.clone();
-                synced.state = SnapshotState::Synced;
-                Some(MetaEvent::CreateSnapshot { snapshot: synced })
-            }
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
                 let mut remote_attr = attr.clone();
                 remote_attr.size = remote_attr.committed_size;
@@ -265,9 +260,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
-            MetaEvent::PublishRegularFileBaseSlices { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => true,
+            MetaEvent::PublishRegularFileBaseSlices { .. } => true,
             MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
@@ -346,10 +339,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                         .acl_keys
                         .insert(encode_acl_rule_key(*ino, principal));
                 }
-                MetaEvent::AddPendingDeletion { .. }
-                | MetaEvent::RemovePendingDeletion { .. }
-                | MetaEvent::CreateSnapshot { .. }
-                | MetaEvent::UpdateSnapshotState { .. } => {}
+                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
             }
         }
         overlay
@@ -404,9 +394,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::SetAclRule { .. }
             | MetaEvent::RemoveAclRule { .. }
             | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => true,
+            | MetaEvent::RemovePendingDeletion { .. } => true,
             MetaEvent::SetAttr { .. }
             | MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::AddEntry { .. }
@@ -468,9 +456,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. }
             | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => false,
+            | MetaEvent::RemovePendingDeletion { .. } => false,
         }
     }
 
@@ -527,9 +513,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
             MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => false,
+            | MetaEvent::RemovePendingDeletion { .. } => false,
         }
     }
 

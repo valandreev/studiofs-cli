@@ -3,7 +3,7 @@
 use crate::schema::PayloadRef;
 use crate::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob, SnapshotCreationLease,
-    SnapshotCut, SnapshotId, SnapshotSha256, SnapshotVolumeContext, VolumeId,
+    SnapshotCut, SnapshotId, SnapshotSha256, VolumeId,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -185,120 +185,6 @@ pub struct SnapshotPayloadProof {
     pub sha256: SnapshotSha256,
 }
 
-/// Stable identity of one automatic-policy evaluator.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct SnapshotPolicyEvaluatorId(String);
-
-impl SnapshotPolicyEvaluatorId {
-    /// Creates a non-empty evaluator identity.
-    pub fn new(value: impl Into<String>) -> Result<Self, SnapshotPortError> {
-        let value = value.into();
-        if value.trim().is_empty() {
-            return Err(SnapshotPortError::Permanent {
-                code: "invalid_evaluator".to_string(),
-                message: RedactedSnapshotMessage::new("evaluator identity is empty"),
-            });
-        }
-        Ok(Self(value))
-    }
-}
-
-/// Fenced per-volume policy evaluator lease.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotPolicyEvaluatorLease {
-    /// Verified volume context.
-    pub context: SnapshotVolumeContext,
-    /// Evaluator owner.
-    pub owner: SnapshotPolicyEvaluatorId,
-    /// Lease expiry.
-    pub expires_at: DateTime<Utc>,
-    /// Fencing token.
-    pub fencing_token: i64,
-}
-
-/// Result of evaluating one policy schedule slot.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotPolicyEvaluation {
-    /// Existing or newly queued snapshot, if a slot was claimed.
-    pub snapshot_id: Option<SnapshotId>,
-    /// Next time at which the evaluator should wake.
-    pub next_due_at: Option<DateTime<Utc>>,
-}
-
-/// Stable upload owner identity.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct PayloadUploadOwnerId(String);
-
-/// Stable uploaded-fragment reconciliation owner identity.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct UploadedFragmentReconcileOwnerId(String);
-
-/// PostgreSQL row describing one uploaded payload fragment.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UploadedPayloadFragment {
-    /// Volume owning the object.
-    pub volume_id: VolumeId,
-    /// Never-reused payload object identity.
-    pub object_id: u64,
-    /// Zero-based uploaded fragment ordinal.
-    pub fragment_index: u32,
-    /// Validated object key identity.
-    pub object_key: String,
-    /// Expected fragment length.
-    pub byte_length: u64,
-    /// Expected fragment checksum.
-    pub sha256: SnapshotSha256,
-}
-
-/// Fenced claim for an uploaded fragment row.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UploadedFragmentClaim {
-    /// Claimed fragment.
-    pub fragment: UploadedPayloadFragment,
-    /// Reconciliation or upload fence.
-    pub fencing_token: i64,
-}
-
-/// Remote proof recorded after a fragment PUT.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UploadedFragmentProof {
-    /// Confirmed remote length.
-    pub byte_length: u64,
-    /// Confirmed remote checksum.
-    pub sha256: SnapshotSha256,
-}
-
-/// PostgreSQL object-level upload ledger projection.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UploadedPayloadObject {
-    /// Volume owning the object.
-    pub volume_id: VolumeId,
-    /// Never-reused object identity.
-    pub object_id: u64,
-    /// Number of fragments expected for the object.
-    pub expected_fragments: u32,
-}
-
-/// Durable cursor for bounded uploaded-fragment reconciliation.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UploadedFragmentCursor {
-    /// Volume owning the cursor.
-    pub volume_id: VolumeId,
-    /// Last object ID scanned.
-    pub object_id: u64,
-    /// Last fragment ordinal scanned.
-    pub fragment_index: u32,
-}
-
-/// Bounded page returned to the janitor.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UploadedFragmentReconcilePage {
-    /// Fenced fragment claims, never an unbounded catalog array.
-    pub claims: Vec<UploadedFragmentClaim>,
-    /// Cursor to persist after the page is processed.
-    pub next_cursor: UploadedFragmentCursor,
-}
-
 /// Reference to the immutable captured source used by a materializer.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotSourceDescriptor {
@@ -428,74 +314,6 @@ pub trait SnapshotJobStore: Send + Sync {
         &'a self,
         snapshot_id: &'a SnapshotId,
     ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
-}
-
-/// Automatic-policy scheduling operations implemented by PostgreSQL.
-pub trait SnapshotPolicyStore: Send + Sync {
-    /// Claims a per-volume evaluator lease through a fenced CAS.
-    fn claim_evaluator_lease<'a>(
-        &'a self,
-        context: &'a SnapshotVolumeContext,
-        owner: &'a SnapshotPolicyEvaluatorId,
-        lease_for: Duration,
-    ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluatorLease>;
-    /// Renews an evaluator lease only while its fence is current.
-    fn renew_evaluator_lease<'a>(
-        &'a self,
-        lease: &'a SnapshotPolicyEvaluatorLease,
-        lease_for: Duration,
-    ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluatorLease>;
-    /// Claims the latest due slot and enqueues at most one durable job.
-    fn evaluate_due_slot<'a>(
-        &'a self,
-        context: &'a SnapshotVolumeContext,
-        lease: &'a SnapshotPolicyEvaluatorLease,
-        now: DateTime<Utc>,
-    ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluation>;
-    /// Releases an evaluator lease when ownership is certain.
-    fn release_evaluator_lease<'a>(
-        &'a self,
-        lease: &'a SnapshotPolicyEvaluatorLease,
-    ) -> SnapshotPortFuture<'a, ()>;
-}
-
-/// PostgreSQL-owned upload and reconciliation operations.
-pub trait UploadedFragmentLedger: Send + Sync {
-    /// Registers an upload fragment before remote PUT.
-    fn begin_fragment_upload<'a>(
-        &'a self,
-        fragment: &'a UploadedPayloadFragment,
-        upload_owner: &'a PayloadUploadOwnerId,
-        lease_for: Duration,
-    ) -> SnapshotPortFuture<'a, UploadedFragmentClaim>;
-    /// Confirms a fragment after exact remote proof.
-    fn confirm_fragment_uploaded<'a>(
-        &'a self,
-        claim: &'a UploadedFragmentClaim,
-        proof: &'a UploadedFragmentProof,
-    ) -> SnapshotPortFuture<'a, UploadedPayloadFragment>;
-    /// Claims one bounded page of uploaded fragments.
-    fn claim_uploaded_fragment_page<'a>(
-        &'a self,
-        volume_id: VolumeId,
-        reconcile_owner: &'a UploadedFragmentReconcileOwnerId,
-    ) -> SnapshotPortFuture<'a, UploadedFragmentReconcilePage>;
-    /// Defers a fragment after a retryable validation failure.
-    fn defer_uploaded_fragment<'a>(
-        &'a self,
-        claim: &'a UploadedFragmentClaim,
-        retry: SnapshotRetry,
-    ) -> SnapshotPortFuture<'a, UploadedPayloadFragment>;
-    /// Moves an unreferenced object to deletion-pending through its fence.
-    fn mark_uploaded_object_delete_pending<'a>(
-        &'a self,
-        claim: &'a UploadedFragmentClaim,
-    ) -> SnapshotPortFuture<'a, UploadedPayloadObject>;
-    /// Completes object deletion idempotently through its fence.
-    fn complete_uploaded_object_deletion<'a>(
-        &'a self,
-        claim: &'a UploadedFragmentClaim,
-    ) -> SnapshotPortFuture<'a, UploadedPayloadObject>;
 }
 
 /// Reconstructs the immutable read model for a captured cut.

@@ -245,23 +245,6 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             renewed_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
-        CREATE TABLE IF NOT EXISTS snapshot_current_references (
-            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-            ino BIGINT NOT NULL,
-            object_id BIGINT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (vol, ino, object_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS snapshot_reachability (
-            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-            object_id BIGINT NOT NULL,
-            start_cut_version BIGINT NOT NULL CHECK (start_cut_version >= 0),
-            end_cut_version BIGINT,
-            PRIMARY KEY (vol, object_id, start_cut_version),
-            CHECK (end_cut_version IS NULL OR end_cut_version > start_cut_version)
-        );
-
         CREATE INDEX IF NOT EXISTS idx_event_log_vol_seq
             ON event_log(vol, seq_id);
         CREATE INDEX IF NOT EXISTS idx_event_log_vol_batch_seq
@@ -273,9 +256,6 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_snapshot_mount_leases_active
             ON snapshot_mount_leases(vol, snapshot_id, lease_expires_at)
             WHERE released_at IS NULL;
-        CREATE INDEX IF NOT EXISTS idx_snapshot_reachability_open
-            ON snapshot_reachability(vol, object_id)
-            WHERE end_cut_version IS NULL;
     "#
 }
 
