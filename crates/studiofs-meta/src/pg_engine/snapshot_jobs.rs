@@ -17,7 +17,7 @@ use tokio_postgres::GenericClient;
 const STALE_LEASE: &str = "snapshot lease fenced";
 const SNAPSHOT_NOT_FOUND: &str = "snapshot job not found";
 
-fn lease_millis(lease_for: Duration) -> Result<i64, SnapshotPortError> {
+fn lease_millis(lease_for: Duration) -> Result<f64, SnapshotPortError> {
     let millis = i64::try_from(lease_for.as_millis()).map_err(|_| {
         SnapshotPortError::permanent("invalid_lease", "lease duration is too large")
     })?;
@@ -27,7 +27,7 @@ fn lease_millis(lease_for: Duration) -> Result<i64, SnapshotPortError> {
             "lease duration must be positive",
         ));
     }
-    Ok(millis)
+    Ok(millis as f64)
 }
 
 fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
@@ -223,7 +223,7 @@ async fn claim_job<C>(
     volume_id: i64,
     snapshot_id: &str,
     worker: &SnapshotWorkerId,
-    lease_ms: i64,
+    lease_ms: f64,
 ) -> MetaResult<SnapshotJobClaim>
 where
     C: GenericClient + Sync,
