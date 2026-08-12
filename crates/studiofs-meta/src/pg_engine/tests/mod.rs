@@ -14,6 +14,7 @@ mod metadata_notify;
 mod remote_apply;
 mod replication_backlog;
 mod snapshot_control;
+mod snapshot_policy;
 
 fn pg_err(e: tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {

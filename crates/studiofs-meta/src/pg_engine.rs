@@ -265,6 +265,10 @@ mod runtime;
 pub mod schema;
 /// PostgreSQL Snapshot v2 capture and control-plane queries.
 pub(crate) mod snapshot_control;
+#[path = "pg_engine/snapshot_jobs.rs"]
+mod snapshot_jobs;
+#[path = "pg_engine/snapshot_policy.rs"]
+mod snapshot_policy;
 #[path = "pg_engine/sql.rs"]
 mod sql;
 use janitor::PgJanitorLock;
@@ -387,8 +391,6 @@ impl PgMetaEngine {
                                     ('snapshot_creation_leases'::TEXT),
                                     ('snapshot_mount_leases'::TEXT),
                                     ('snapshot_policies'::TEXT),
-                                    ('snapshot_policy_slots'::TEXT),
-                                    ('snapshot_policy_leases'::TEXT),
                                     ('snapshot_source_checkpoints'::TEXT),
                                     ('snapshot_artifacts'::TEXT),
                                     ('snapshot_artifact_payload_proofs'::TEXT),

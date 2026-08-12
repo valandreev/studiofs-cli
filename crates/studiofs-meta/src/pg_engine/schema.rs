@@ -7,9 +7,9 @@ pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 2;
 ///
 /// This is the single schema definition used by initialization, dump/load, and
 /// PostgreSQL integration fixtures. Snapshot v2 is PostgreSQL-authoritative:
-/// the catalog, durable creation queue, leases, policy slots, source
-/// checkpoints, artifacts, and reachability intervals are all represented by
-/// scalar rows. The legacy thick snapshot table is intentionally not created.
+/// the catalog, durable creation queue, creation leases, daily policy, source
+/// checkpoints, and artifacts are all represented by scalar rows. The legacy
+/// thick snapshot table is intentionally not created.
 ///
 /// The returned SQL creates objects if absent and does not copy or migrate v1
 /// snapshot rows.
@@ -62,6 +62,14 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
+        ALTER TABLE event_log
+            ADD COLUMN IF NOT EXISTS batch_version BIGINT;
+        UPDATE event_log
+            SET batch_version = 0
+            WHERE batch_version IS NULL;
+        ALTER TABLE event_log
+            ALTER COLUMN batch_version SET NOT NULL;
+
         CREATE TABLE IF NOT EXISTS metadata_state (
             vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
             version BIGINT NOT NULL,
@@ -110,6 +118,21 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (vol, id)
         );
+
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'snapshot_catalog'::regclass
+                  AND conname = 'snapshot_catalog_automatic_retention_check'
+            ) THEN
+                ALTER TABLE snapshot_catalog
+                    ADD CONSTRAINT snapshot_catalog_automatic_retention_check
+                    CHECK (origin = 'manual' OR retention_seconds IS NOT NULL);
+            END IF;
+        END
+        $$;
 
         CREATE TABLE IF NOT EXISTS snapshot_creation_jobs (
             vol BIGINT NOT NULL,
@@ -222,27 +245,6 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS snapshot_policy_slots (
-            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-            generation BIGINT NOT NULL,
-            slot_date DATE NOT NULL,
-            slot_time TIME NOT NULL,
-            state TEXT NOT NULL,
-            snapshot_id TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (vol, generation, slot_date, slot_time),
-            FOREIGN KEY (vol, snapshot_id)
-                REFERENCES snapshot_catalog(vol, id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS snapshot_policy_leases (
-            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
-            owner TEXT NOT NULL,
-            lease_expires_at TIMESTAMPTZ NOT NULL,
-            fencing_token BIGINT NOT NULL DEFAULT 1,
-            renewed_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
         CREATE INDEX IF NOT EXISTS idx_event_log_vol_seq

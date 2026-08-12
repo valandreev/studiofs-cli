@@ -3,7 +3,6 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::GenericClient;
 
 use super::PgMetaEngine;
-use crate::connect_studiofs_postgres;
 use crate::engine::{MetaError, MetaResult};
 use crate::snapshot::{
     SnapshotCatalogEntry, SnapshotCreationState, SnapshotCut, SnapshotId, SnapshotLifecycle,
@@ -19,8 +18,6 @@ pub(crate) struct SnapshotCaptureRequest {
     pub(crate) origin: SnapshotOrigin,
     /// Retention beginning at the later Ready transition.
     pub(crate) retention: SnapshotRetention,
-    /// Timestamp supplied by the control-plane clock.
-    pub(crate) captured_at: DateTime<Utc>,
 }
 
 impl PgMetaEngine {
@@ -45,30 +42,27 @@ impl PgMetaEngine {
             volume_id: self.volume_id,
             origin,
             retention,
-            captured_at: Utc::now(),
         };
 
         Self::run_async_once(async move {
-            let (mut client, connection) = connect_studiofs_postgres(&postgres_url)
-                .await
-                .map_err(|_| snapshot_control_error("connect to PostgreSQL"))?;
-            let connection_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let result = async {
-                let tx = client
-                    .transaction()
-                    .await
-                    .map_err(|_| snapshot_control_error("begin snapshot transaction"))?;
-                let entry = capture_snapshot_in_transaction(&tx, &request).await?;
-                tx.commit()
-                    .await
-                    .map_err(|_| snapshot_control_error("commit snapshot transaction"))?;
-                Ok(entry)
-            }
-            .await;
-            connection_task.abort();
-            result
+            Self::with_postgres_client_timeout_once(
+                postgres_url,
+                Self::default_connect_timeout(),
+                Self::default_command_timeout(),
+                "create snapshot",
+                |mut client| async move {
+                    let tx = client
+                        .transaction()
+                        .await
+                        .map_err(|_| snapshot_control_error("begin snapshot transaction"))?;
+                    let entry = capture_snapshot_in_transaction(&tx, &request).await?;
+                    tx.commit()
+                        .await
+                        .map_err(|_| snapshot_control_error("commit snapshot transaction"))?;
+                    Ok(entry)
+                },
+            )
+            .await
         })
     }
 }
@@ -87,20 +81,20 @@ impl PgMetaEngine {
 pub(crate) async fn capture_snapshot_cut<C>(
     client: &C,
     volume_id: VolumeId,
-    captured_at: DateTime<Utc>,
 ) -> MetaResult<SnapshotCut>
 where
     C: GenericClient + Sync,
 {
     let row = client
         .query_opt(
-            "SELECT version FROM metadata_state WHERE vol = $1 FOR SHARE",
+            "SELECT version, clock_timestamp() FROM metadata_state WHERE vol = $1 FOR SHARE",
             &[&volume_id],
         )
         .await
         .map_err(|_| snapshot_control_error("read published checkpoint"))?
         .ok_or_else(|| snapshot_control_error("published checkpoint is missing"))?;
     let cut_version: i64 = row.get(0);
+    let captured_at: DateTime<Utc> = row.get(1);
     SnapshotCut::new(volume_id, cut_version, captured_at)
         .map_err(|_| snapshot_control_error("published checkpoint is invalid"))
 }
@@ -125,6 +119,11 @@ pub(crate) async fn capture_snapshot_in_transaction<C>(
 where
     C: GenericClient + Sync,
 {
+    request
+        .retention
+        .validate_for_origin(request.origin)
+        .map_err(|_| snapshot_control_error("snapshot retention does not match origin"))?;
+
     let volume_row = client
         .query_opt(
             "SELECT name, uuid FROM volumes WHERE vol = $1 FOR UPDATE",
@@ -138,7 +137,7 @@ where
     let volume = SnapshotVolumeContext::new(request.volume_id, volume_name, volume_uuid)
         .map_err(|_| snapshot_control_error("snapshot volume identity is invalid"))?;
 
-    let cut = capture_snapshot_cut(client, request.volume_id, request.captured_at).await?;
+    let cut = capture_snapshot_cut(client, request.volume_id).await?;
     let checkpoint_row = client
         .query_opt(
             "SELECT snapshot FROM metadata_state WHERE vol = $1 FOR SHARE",
@@ -148,16 +147,17 @@ where
         .map_err(|_| snapshot_control_error("read snapshot checkpoint"))?
         .ok_or_else(|| snapshot_control_error("snapshot checkpoint is missing"))?;
     let checkpoint_bytes: Vec<u8> = checkpoint_row.get(0);
-    let base_id = SnapshotId::from_cut(&volume.volume_name, request.captured_at)
+    let base_id = SnapshotId::from_cut(&volume.volume_name, cut.captured_at())
         .map_err(|_| snapshot_control_error("snapshot ID allocation failed"))?;
     let snapshot_id = allocate_snapshot_id(
         client,
         request.volume_id,
         &volume.volume_name,
-        request.captured_at,
+        cut.captured_at(),
         &base_id,
     )
     .await?;
+    let snapshot_id_text = snapshot_id.to_string();
 
     let retention_seconds = request
         .retention
@@ -167,17 +167,19 @@ where
                 .map_err(|_| snapshot_control_error("snapshot retention is too large"))
         })
         .transpose()?;
-    let origin = request.origin.as_str();
+    let origin = request.origin.as_str().to_string();
+    let lifecycle = SnapshotLifecycle::Creating.as_str().to_string();
+    let creation_state = SnapshotCreationState::Queued.as_str().to_string();
     client
         .execute(
             "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle, retention_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             &[
                 &request.volume_id,
-                &snapshot_id.as_str(),
+                &snapshot_id_text,
                 &origin,
                 &cut.cut_version(),
                 &cut.captured_at(),
-                &SnapshotLifecycle::Creating.as_str(),
+                &lifecycle,
                 &retention_seconds,
             ],
         )
@@ -190,7 +192,7 @@ where
             "INSERT INTO snapshot_source_checkpoints (vol, snapshot_id, cut_version, checkpoint_version, checkpoint_format_version, checkpoint_schema_version, checkpoint_bytes, checkpoint_sha256) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
                 &request.volume_id,
-                &snapshot_id.as_str(),
+                &snapshot_id_text,
                 &cut.cut_version(),
                 &cut.cut_version(),
                 &1_i16,
@@ -205,11 +207,7 @@ where
     client
         .execute(
             "INSERT INTO snapshot_creation_jobs (vol, snapshot_id, state) VALUES ($1, $2, $3)",
-            &[
-                &request.volume_id,
-                &snapshot_id.as_str(),
-                &SnapshotCreationState::Queued.as_str(),
-            ],
+            &[&request.volume_id, &snapshot_id_text, &creation_state],
         )
         .await
         .map_err(|_| snapshot_control_error("insert snapshot creation job"))?;
@@ -229,7 +227,7 @@ where
     })
 }
 
-async fn allocate_snapshot_id<C>(
+pub(crate) async fn allocate_snapshot_id<C>(
     client: &C,
     volume_id: VolumeId,
     volume_name: &str,
@@ -240,10 +238,11 @@ where
     C: GenericClient + Sync,
 {
     let prefix = format!("{}-%", escape_like(base_id.as_str()));
+    let base_id_text = base_id.to_string();
     let rows = client
         .query(
             "SELECT id FROM snapshot_catalog WHERE vol = $1 AND (id = $2 OR id LIKE $3 ESCAPE '\\') FOR UPDATE",
-            &[&volume_id, &base_id.as_str(), &prefix],
+            &[&volume_id, &base_id_text, &prefix],
         )
         .await
         .map_err(|_| snapshot_control_error("allocate snapshot ID"))?;

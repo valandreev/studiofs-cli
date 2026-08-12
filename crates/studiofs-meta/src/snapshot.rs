@@ -1,6 +1,6 @@
 //! Snapshot v2 domain contracts.
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -85,8 +85,7 @@ pub enum SnapshotIdError {
 }
 
 /// A validated, PostgreSQL-allocated public snapshot identifier.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 pub struct SnapshotId(String);
 
 impl SnapshotId {
@@ -98,7 +97,7 @@ impl SnapshotId {
         validate_volume_name(volume_name)?;
         Ok(Self(format!(
             "{volume_name}.{}",
-            captured_at.format("%Y-%m-%d-%H-%M-%S")
+            captured_at.format("%Y-%m-%dT%H-%M-%S%.3fZ")
         )))
     }
 
@@ -106,22 +105,28 @@ impl SnapshotId {
     pub fn parse(value: &str) -> Result<Self, SnapshotIdError> {
         let (volume_name, timestamp_and_suffix) =
             value.split_once('.').ok_or(SnapshotIdError::Invalid)?;
-        if timestamp_and_suffix.contains('.') {
-            return Err(SnapshotIdError::Invalid);
-        }
         validate_volume_name(volume_name)?;
 
-        let (timestamp, suffix) = if timestamp_and_suffix.len() <= 19 {
+        const TIMESTAMP_LEN: usize = 24;
+        let (timestamp, suffix) = if timestamp_and_suffix.len() == TIMESTAMP_LEN {
             (timestamp_and_suffix, None)
         } else {
-            let (timestamp, suffix) = timestamp_and_suffix.split_at(19);
+            if timestamp_and_suffix.len() < TIMESTAMP_LEN {
+                return Err(SnapshotIdError::Invalid);
+            }
+            let (timestamp, suffix) = timestamp_and_suffix.split_at(TIMESTAMP_LEN);
             (timestamp, Some(parse_collision_suffix(suffix)?))
         };
-        if timestamp.len() != 19 {
+        if timestamp.len() != TIMESTAMP_LEN {
             return Err(SnapshotIdError::Invalid);
         }
-        NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d-%H-%M-%S")
-            .map_err(|_| SnapshotIdError::Invalid)?;
+        NaiveDateTime::parse_from_str(
+            timestamp
+                .strip_suffix('Z')
+                .ok_or(SnapshotIdError::Invalid)?,
+            "%Y-%m-%dT%H-%M-%S%.3f",
+        )
+        .map_err(|_| SnapshotIdError::Invalid)?;
         let canonical = match suffix {
             None => format!("{volume_name}.{timestamp}"),
             Some(suffix) => format!("{volume_name}.{timestamp}-{suffix}"),
@@ -151,6 +156,16 @@ impl SnapshotId {
     }
 }
 
+impl<'de> Deserialize<'de> for SnapshotId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Display for SnapshotId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -172,11 +187,29 @@ impl FromStr for SnapshotId {
 }
 
 /// The single immutable metadata cut identified by a snapshot.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct SnapshotCut {
     volume_id: VolumeId,
     cut_version: i64,
     captured_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for SnapshotCut {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SnapshotCutFields {
+            volume_id: VolumeId,
+            cut_version: i64,
+            captured_at: DateTime<Utc>,
+        }
+
+        let fields = SnapshotCutFields::deserialize(deserializer)?;
+        Self::new(fields.volume_id, fields.cut_version, fields.captured_at)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl SnapshotCut {
@@ -216,7 +249,7 @@ impl SnapshotCut {
 }
 
 /// Retention attached to a snapshot. `None` means infinite manual retention.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct SnapshotRetention {
     ttl: Option<Duration>,
 }
@@ -236,6 +269,17 @@ impl SnapshotRetention {
         })
     }
 
+    /// Rejects infinite retention for automatic snapshots.
+    pub fn validate_for_origin(
+        &self,
+        origin: SnapshotOrigin,
+    ) -> Result<(), SnapshotValidationError> {
+        if matches!(origin, SnapshotOrigin::Automatic) && self.ttl.is_none() {
+            return Err(SnapshotValidationError::InvalidRetention);
+        }
+        Ok(())
+    }
+
     /// Returns the configured duration, or `None` for infinite retention.
     pub const fn ttl(&self) -> Option<Duration> {
         self.ttl
@@ -247,6 +291,96 @@ impl SnapshotRetention {
         let ttl = ChronoDuration::from_std(ttl).ok()?;
         ready_at.checked_add_signed(ttl)
     }
+}
+
+impl<'de> Deserialize<'de> for SnapshotRetention {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SnapshotRetentionFields {
+            ttl: Option<Duration>,
+        }
+
+        let fields = SnapshotRetentionFields::deserialize(deserializer)?;
+        Self::manual(fields.ttl).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One automatic daily snapshot policy for a volume.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct SnapshotDailyPolicy {
+    /// Local wall-clock time at which the policy becomes due.
+    daily_at: NaiveTime,
+    /// Persisted IANA timezone name, with `UTC` as the default.
+    timezone: String,
+    /// Finite automatic retention beginning at Ready publication.
+    retention: SnapshotRetention,
+}
+
+impl<'de> Deserialize<'de> for SnapshotDailyPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SnapshotDailyPolicyFields {
+            daily_at: NaiveTime,
+            timezone: String,
+            retention: SnapshotRetention,
+        }
+
+        let fields = SnapshotDailyPolicyFields::deserialize(deserializer)?;
+        let retention = fields
+            .retention
+            .ttl()
+            .ok_or_else(|| serde::de::Error::custom("automatic policy retention is infinite"))?;
+        Self::new(fields.daily_at, fields.timezone, retention).map_err(serde::de::Error::custom)
+    }
+}
+
+impl SnapshotDailyPolicy {
+    /// Creates a policy value without claiming PostgreSQL authority.
+    pub fn new(
+        daily_at: NaiveTime,
+        timezone: impl Into<String>,
+        retention: Duration,
+    ) -> Result<Self, SnapshotValidationError> {
+        let timezone = timezone.into();
+        if timezone.is_empty() || timezone.len() > 128 || !timezone.is_ascii() {
+            return Err(SnapshotValidationError::InvalidText);
+        }
+        Ok(Self {
+            daily_at,
+            timezone,
+            retention: SnapshotRetention::automatic(retention)?,
+        })
+    }
+
+    /// Returns the local scheduled time.
+    pub const fn daily_at(&self) -> NaiveTime {
+        self.daily_at
+    }
+
+    /// Returns the persisted timezone name.
+    pub fn timezone(&self) -> &str {
+        &self.timezone
+    }
+
+    /// Returns the finite automatic retention.
+    pub const fn retention(&self) -> SnapshotRetention {
+        self.retention
+    }
+}
+
+/// PostgreSQL-assigned generation and policy projection.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotPolicyRecord {
+    /// Monotonically increasing policy generation.
+    pub generation: i64,
+    /// Active automatic policy value.
+    pub policy: SnapshotDailyPolicy,
 }
 
 fn validate_retention(ttl: Option<Duration>) -> Result<(), SnapshotValidationError> {
@@ -677,19 +811,62 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_id_uses_volume_and_hyphenated_utc_cut_timestamp() {
+    fn snapshot_id_uses_volume_and_millisecond_utc_cut_timestamp() {
         let captured_at = Utc
             .with_ymd_and_hms(2026, 8, 12, 14, 7, 9)
             .single()
             .expect("valid UTC timestamp");
         let id = SnapshotId::from_cut("projectfs", captured_at).expect("valid snapshot id");
 
-        assert_eq!(id.as_str(), "projectfs.2026-08-12-14-07-09");
-        assert_eq!(id.to_string(), "projectfs.2026-08-12-14-07-09");
+        assert_eq!(id.as_str(), "projectfs.2026-08-12T14-07-09.000Z");
+        assert_eq!(id.to_string(), "projectfs.2026-08-12T14-07-09.000Z");
         assert_eq!(SnapshotId::parse(id.as_str()).expect("parse id"), id);
-        assert!(SnapshotId::parse("projectfs.2026-08-12T14-07-09").is_err());
-        assert!(SnapshotId::parse("projectfs.2026-08-12-14-07-09-1").is_err());
-        assert!(SnapshotId::parse("projectfs.2026-08-12-14-07-09-02").is_err());
+        assert!(SnapshotId::parse("projectfs.2026-08-12-14-07-09").is_err());
+        assert!(SnapshotId::parse("projectfs.2026-08-12T14-07-09.000Z-1").is_err());
+        assert!(SnapshotId::parse("projectfs.2026-08-12T14-07-09.000Z-02").is_err());
+        assert!(SnapshotId::parse("projectfs.2026-08-12T14-07-09.000Z-2").is_ok());
+    }
+
+    #[test]
+    fn automatic_origin_rejects_infinite_retention() {
+        let infinite = SnapshotRetention::manual(None).expect("manual infinite retention");
+        assert!(infinite.validate_for_origin(SnapshotOrigin::Manual).is_ok());
+        assert!(
+            infinite
+                .validate_for_origin(SnapshotOrigin::Automatic)
+                .is_err()
+        );
+        assert!(
+            SnapshotRetention::automatic(Duration::from_secs(60))
+                .expect("automatic retention")
+                .validate_for_origin(SnapshotOrigin::Automatic)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn policy_value_requires_finite_retention_and_nonempty_timezone() {
+        let daily_at = NaiveTime::from_hms_opt(2, 30, 0).expect("valid daily time");
+        let policy = SnapshotDailyPolicy::new(daily_at, "UTC", Duration::from_secs(24 * 60 * 60))
+            .expect("valid policy");
+        assert_eq!(policy.timezone(), "UTC");
+        assert!(SnapshotDailyPolicy::new(daily_at, "", Duration::from_secs(60)).is_err());
+        assert!(SnapshotDailyPolicy::new(daily_at, "UTC", Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn serde_deserialization_revalidates_snapshot_values() {
+        let invalid_id = serde_json::from_str::<SnapshotId>("\"projectfs.2026-08-12-14-07-09\"");
+        assert!(invalid_id.is_err());
+
+        let invalid_cut = serde_json::from_str::<SnapshotCut>(
+            "{\"volume_id\":0,\"cut_version\":1,\"captured_at\":\"2026-08-12T14:07:09Z\"}",
+        );
+        assert!(invalid_cut.is_err());
+
+        let invalid_retention =
+            serde_json::from_str::<SnapshotRetention>("{\"ttl\":{\"secs\":0,\"nanos\":0}}");
+        assert!(invalid_retention.is_err());
     }
 
     #[test]

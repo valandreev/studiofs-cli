@@ -1,12 +1,14 @@
 use super::*;
 
 use crate::pg_engine::snapshot_control::{
-    SnapshotCaptureRequest, capture_snapshot_cut, capture_snapshot_in_transaction,
+    SnapshotCaptureRequest, allocate_snapshot_id, capture_snapshot_cut,
+    capture_snapshot_in_transaction,
 };
 use crate::snapshot::{
-    SnapshotCreationState, SnapshotLifecycle, SnapshotOrigin, SnapshotRetention,
+    SnapshotCreationState, SnapshotId, SnapshotLifecycle, SnapshotOrigin, SnapshotRetention,
 };
 use crate::snapshot_ports::SnapshotPortError;
+use chrono::{TimeZone, Utc};
 
 #[test]
 fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
@@ -18,20 +20,29 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_policies"));
     assert!(!ddl.contains("snapshot_current_references"));
     assert!(!ddl.contains("snapshot_reachability"));
+    assert!(!ddl.contains("snapshot_policy_slots"));
+    assert!(!ddl.contains("snapshot_policy_leases"));
     assert!(ddl.contains("byte_offset BIGINT NOT NULL"));
     assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
     assert!(!ddl.contains("pinned_object_ids"));
     assert!(!ddl.contains("snapshot_payload"));
+    assert!(ddl.contains("ADD COLUMN IF NOT EXISTS batch_version BIGINT"));
+    assert!(ddl.contains("SET batch_version = 0"));
+    assert!(ddl.contains("ALTER COLUMN batch_version SET NOT NULL"));
+    assert!(ddl.contains("retention_seconds IS NOT NULL"));
 }
 
 fn snapshot_request(volume_id: i64, origin: SnapshotOrigin) -> SnapshotCaptureRequest {
     SnapshotCaptureRequest {
         volume_id,
         origin,
-        retention: SnapshotRetention::manual(None).expect("infinite manual retention is valid"),
-        captured_at: chrono::DateTime::parse_from_rfc3339("2026-08-12T14:07:09Z")
-            .expect("fixed capture timestamp")
-            .with_timezone(&chrono::Utc),
+        retention: match origin {
+            SnapshotOrigin::Manual => {
+                SnapshotRetention::manual(None).expect("infinite manual retention is valid")
+            }
+            SnapshotOrigin::Automatic => SnapshotRetention::automatic(Duration::from_secs(3600))
+                .expect("finite automatic retention is valid"),
+        },
     }
 }
 
@@ -64,7 +75,11 @@ fn capture_is_one_transaction_and_one_durable_job() {
         assert_eq!(entry.creation_state, SnapshotCreationState::Queued);
         assert_eq!(
             entry.snapshot_id.as_str(),
-            format!("{}.2026-08-12-14-07-09", volume.name)
+            format!(
+                "{}.{}",
+                volume.name,
+                entry.cut.captured_at().format("%Y-%m-%dT%H-%M-%S%.3fZ")
+            )
         );
 
         let job_count: i64 = tx
@@ -91,36 +106,45 @@ fn snapshot_id_collision_suffixes_are_deterministic() {
     };
     let volume = PgTestVolume::new(&dsn, "snapshot-control-collision");
 
-    let ids = run_async(async {
+    run_async(async {
         let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
             .await
             .expect("connect to test postgres");
         let connection_task = tokio::spawn(connection);
-        let mut ids = Vec::new();
-        for _ in 0..3 {
-            let tx = client
-                .transaction()
-                .await
-                .expect("start capture transaction");
-            let entry = capture_snapshot_in_transaction(
-                &tx,
-                &snapshot_request(volume.volume_id, SnapshotOrigin::Automatic),
+        let captured_at = Utc
+            .with_ymd_and_hms(2026, 8, 12, 14, 7, 9)
+            .single()
+            .expect("valid capture timestamp");
+        let base = SnapshotId::from_cut(&volume.name, captured_at).expect("base snapshot ID");
+        let second = SnapshotId::with_collision_suffix(&volume.name, captured_at, 2)
+            .expect("second snapshot ID");
+        let tx = client
+            .transaction()
+            .await
+            .expect("start allocator transaction");
+        for snapshot_id in [base.to_string(), second.to_string()] {
+            tx.execute(
+                "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle, retention_seconds) VALUES ($1, $2, 'manual', 0, $3, 'creating', NULL)",
+                &[&volume.volume_id, &snapshot_id, &captured_at],
             )
             .await
-            .expect("capture snapshot");
-            ids.push(entry.snapshot_id.to_string());
-            tx.commit().await.expect("commit capture transaction");
+            .expect("seed collision catalog row");
         }
+        let third = allocate_snapshot_id(
+            &tx,
+            volume.volume_id,
+            &volume.name,
+            captured_at,
+            &base,
+        )
+        .await
+        .expect("allocate third snapshot ID");
+        assert_eq!(third.as_str(), format!("{base}-3"));
+        tx.commit().await.expect("commit allocator transaction");
         connection_task.abort();
-        Ok(ids)
+        Ok(())
     })
     .expect("capture collision sequence");
-
-    let base = format!("{}.2026-08-12-14-07-09", volume.name);
-    assert_eq!(
-        ids,
-        vec![base.clone(), format!("{base}-2"), format!("{base}-3")]
-    );
 }
 
 async fn capture_once(dsn: &str, request: SnapshotCaptureRequest) -> String {
@@ -159,10 +183,13 @@ fn concurrent_create_is_idempotent_and_redacted() {
     .expect("concurrent capture");
 
     let (first, second) = ids;
-    let mut ids = vec![first, second];
+    let mut ids = [first, second];
     ids.sort();
-    let base = format!("{}.2026-08-12-14-07-09", volume.name);
-    assert_eq!(ids, vec![base.clone(), format!("{base}-2")]);
+    assert_eq!(ids.len(), 2);
+    assert!(
+        ids.iter()
+            .all(|id| id.starts_with(&format!("{}.", volume.name)))
+    );
 
     let error = SnapshotPortError::from_backend(
         "snapshot capture",
@@ -187,14 +214,11 @@ fn query_helpers_accept_client_and_transaction() {
             .await
             .expect("connect to test postgres");
         let connection_task = tokio::spawn(connection);
-        let captured_at = chrono::DateTime::parse_from_rfc3339("2026-08-12T14:07:09Z")
-            .expect("fixed capture timestamp")
-            .with_timezone(&chrono::Utc);
-        let _ = capture_snapshot_cut(&client, volume.volume_id, captured_at)
+        let _ = capture_snapshot_cut(&client, volume.volume_id)
             .await
             .expect("capture cut through client");
         let tx = client.transaction().await.expect("start transaction");
-        let _ = capture_snapshot_cut(&tx, volume.volume_id, captured_at)
+        let _ = capture_snapshot_cut(&tx, volume.volume_id)
             .await
             .expect("capture cut through transaction");
         tx.rollback().await.expect("rollback transaction");
