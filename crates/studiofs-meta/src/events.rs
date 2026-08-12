@@ -339,8 +339,11 @@ pub(crate) fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
             timestamp,
         } => encode_event_envelope(tag, &(*object_id, *timestamp)),
         MetaEvent::RemovePendingDeletion { object_id } => encode_event_envelope(tag, object_id),
-        MetaEvent::CreateSnapshot { snapshot } => encode_event_envelope(tag, snapshot),
-        MetaEvent::UpdateSnapshotState { id, state } => encode_event_envelope(tag, &(id, *state)),
+        MetaEvent::CreateSnapshot { .. } | MetaEvent::UpdateSnapshotState { .. } => {
+            Err(MetaError::Serialization(
+                "legacy snapshot MetaEvents are not accepted by Snapshot v2".to_string(),
+            ))
+        }
     }
 }
 
@@ -379,8 +382,6 @@ fn wire_tag_for_kind(kind: &str) -> Option<u8> {
         "remove_acl_rule" => Some(TAG_REMOVE_ACL_RULE),
         "add_pending_deletion" => Some(TAG_ADD_PENDING_DELETION),
         "remove_pending_deletion" => Some(TAG_REMOVE_PENDING_DELETION),
-        "create_snapshot" => Some(TAG_CREATE_SNAPSHOT),
-        "update_snapshot_state" => Some(TAG_UPDATE_SNAPSHOT_STATE),
         _ => None,
     }
 }
@@ -556,13 +557,9 @@ fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
         TAG_REMOVE_PENDING_DELETION => Ok(MetaEvent::RemovePendingDeletion {
             object_id: decode_event_payload(tag, payload)?,
         }),
-        TAG_CREATE_SNAPSHOT => Ok(MetaEvent::CreateSnapshot {
-            snapshot: decode_event_payload(tag, payload)?,
-        }),
-        TAG_UPDATE_SNAPSHOT_STATE => {
-            let (id, state) = decode_event_payload(tag, payload)?;
-            Ok(MetaEvent::UpdateSnapshotState { id, state })
-        }
+        TAG_CREATE_SNAPSHOT | TAG_UPDATE_SNAPSHOT_STATE => Err(MetaError::Serialization(
+            "legacy snapshot MetaEvents are not accepted by Snapshot v2".to_string(),
+        )),
         _ => Err(MetaError::Serialization(format!(
             "unknown MetaEvent wire kind tag {tag}"
         ))),
@@ -752,29 +749,20 @@ mod tests {
                 b"SFS-EVT\x01\x0f\x1d",
                 b"\x0e\x1d",
             ),
-            (
-                MetaEvent::CreateSnapshot {
-                    snapshot: MetadataSnapshot {
-                        id: "snapshot".to_string(),
-                        root_ino: 30,
-                        created_at: 31,
-                        state: SnapshotState::Synced,
-                        pinned_object_ids: vec![32],
-                        snapshot_payload: b"payload".to_vec(),
-                    },
-                },
-                b"SFS-EVT\x01\x10\x08snapshot\x1e\x3e\x01\x01\x20\x07payload",
-                b"\x0f\x08snapshot\x1e\x3e\x01\x01\x20\x07payload",
-            ),
-            (
-                MetaEvent::UpdateSnapshotState {
-                    id: "snapshot".to_string(),
-                    state: SnapshotState::Failed,
-                },
-                b"SFS-EVT\x01\x11\x08snapshot\x02",
-                b"\x10\x08snapshot\x02",
-            ),
         ]
+    }
+
+    #[test]
+    fn legacy_snapshot_events_are_rejected() {
+        let create_snapshot = b"SFS-EVT\x01\x10\x08snapshot\x1e\x3e\x01\x01\x20\x07payload";
+        let update_snapshot = b"SFS-EVT\x01\x11\x08snapshot\x02";
+
+        assert!(decode_event(create_snapshot).is_err());
+        assert!(decode_event(update_snapshot).is_err());
+        assert!(
+            decode_event_with_type("create_snapshot", create_snapshot).is_err(),
+            "v1 snapshot events must not enter the Snapshot v2 event path"
+        );
     }
 
     #[test]

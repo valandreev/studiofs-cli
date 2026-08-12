@@ -689,13 +689,6 @@ impl MetaSnapshots for RedbMetaEngine {
             table
                 .insert(snapshot.id.as_str(), bytes.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::CreateSnapshot {
-                    snapshot: snapshot.clone(),
-                },
-            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

@@ -34,7 +34,7 @@ todo = "warn"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "net", "signal"] }
 tokio-util = "0.7"
 futures = "0.3"
-tokio-postgres = "0.7"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "1"
@@ -50,6 +50,8 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 serde_json = "1"
 serde-saphyr = "0.0.27"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sha2 = "0.10"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

@@ -4,6 +4,7 @@ use clap::Args;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema;
 use studiofs_meta::{
     MetaError, connect_studiofs_postgres, ensure_studiofs_database, open_meta_engine,
 };
@@ -33,16 +34,7 @@ struct DumpEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DumpSnapshot {
-    id: String,
-    root_ino: i64,
-    created_at: i64,
-    state: i16,
-    pinned_object_ids: Vec<i64>,
-    snapshot_payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetadataDump {
     dump_version: u16,
     volume: DumpVolume,
@@ -50,8 +42,6 @@ struct MetadataDump {
     metadata_state_snapshot: Vec<u8>,
     counters: Vec<DumpCounter>,
     event_log: Vec<DumpEvent>,
-    #[serde(default)]
-    snapshots: Vec<DumpSnapshot>,
 }
 
 #[derive(Debug, Error)]
@@ -106,82 +96,6 @@ impl LoadArgs {
         load(&self.path_to_dump, &self.postgresql_address)?;
         Ok(())
     }
-}
-
-async fn ensure_pg_schema(client: &tokio_postgres::Client) -> DumpLoadResult<()> {
-    client
-        .batch_execute(
-            r#"
-                CREATE TABLE IF NOT EXISTS volumes (
-                    vol BIGSERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    uuid TEXT NOT NULL UNIQUE,
-                    block_size INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-
-                CREATE TABLE IF NOT EXISTS counters (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    name TEXT NOT NULL,
-                    value BIGINT NOT NULL,
-                    PRIMARY KEY (vol, name)
-                );
-
-                CREATE TABLE IF NOT EXISTS event_log (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    seq_id BIGSERIAL PRIMARY KEY,
-                    batch_version BIGINT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    event_payload BYTEA NOT NULL,
-                    client_id TEXT,
-                    client_timestamp BIGINT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-
-                CREATE TABLE IF NOT EXISTS metadata_state (
-                    vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
-                    version BIGINT NOT NULL,
-                    snapshot BYTEA NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-
-                CREATE TABLE IF NOT EXISTS acl_rules (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    ino BIGINT NOT NULL,
-                    principal TEXT NOT NULL,
-                    access_level SMALLINT NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (vol, ino, principal)
-                );
-
-                CREATE TABLE IF NOT EXISTS snapshots (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    id TEXT NOT NULL,
-                    root_ino BIGINT NOT NULL,
-                    created_at BIGINT NOT NULL,
-                    state SMALLINT NOT NULL,
-                    pinned_object_ids BIGINT[] NOT NULL DEFAULT '{}',
-                    snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (vol, id)
-                );
-
-                ALTER TABLE event_log
-                    ADD COLUMN IF NOT EXISTS batch_version BIGINT;
-                UPDATE event_log
-                    SET batch_version = 0
-                    WHERE batch_version IS NULL;
-                ALTER TABLE event_log
-                    ALTER COLUMN batch_version SET NOT NULL;
-
-                CREATE INDEX IF NOT EXISTS idx_event_log_vol_seq
-                    ON event_log(vol, seq_id);
-                CREATE INDEX IF NOT EXISTS idx_event_log_vol_batch_seq
-                    ON event_log(vol, batch_version, seq_id);
-        "#,
-        )
-        .await?;
-    Ok(())
 }
 
 fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDump> {
@@ -262,38 +176,13 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 })
                 .collect();
 
-            let snapshot_rows = client
-                .query(
-                    r#"
-            SELECT id, root_ino, created_at, state, pinned_object_ids, snapshot_payload
-            FROM snapshots
-            WHERE vol = $1
-            ORDER BY created_at DESC, id ASC
-            "#,
-                    &[&volume.vol],
-                )
-                .await
-                .map_err(|e| DumpLoadError::Message(format!("failed to query snapshots: {e}")))?;
-            let snapshots = snapshot_rows
-                .into_iter()
-                .map(|r| DumpSnapshot {
-                    id: r.get(0),
-                    root_ino: r.get(1),
-                    created_at: r.get(2),
-                    state: r.get(3),
-                    pinned_object_ids: r.get(4),
-                    snapshot_payload: r.get(5),
-                })
-                .collect();
-
             Ok(MetadataDump {
-                dump_version: 1,
+                dump_version: 2,
                 volume,
                 metadata_state_version: state_version,
                 metadata_state_snapshot: state_snapshot,
                 counters,
                 event_log,
-                snapshots,
             })
         }
         .await;
@@ -353,7 +242,7 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
         let connection_task = tokio::spawn(connection);
 
         let result = async {
-            ensure_pg_schema(&client).await?;
+            ensure_studiofs_pg_schema(&client).await?;
             let tx = client
                 .transaction()
                 .await
@@ -387,10 +276,6 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
             tx.execute("DELETE FROM metadata_state WHERE vol = $1", &[&target_vol])
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("clear metadata_state failed: {e}")))?;
-            tx.execute("DELETE FROM snapshots WHERE vol = $1", &[&target_vol])
-                .await
-                .map_err(|e| DumpLoadError::Message(format!("clear snapshots failed: {e}")))?;
-
             tx.execute(
                 "INSERT INTO metadata_state (vol, version, snapshot) VALUES ($1, $2, $3)",
                 &[&target_vol, &dump.metadata_state_version, &dump.metadata_state_snapshot],
@@ -433,39 +318,6 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                 })?;
             }
 
-            for snapshot in &dump.snapshots {
-                tx.execute(
-                    r#"
-            INSERT INTO snapshots (
-                vol,
-                id,
-                root_ino,
-                created_at,
-                state,
-                pinned_object_ids,
-                snapshot_payload
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            "#,
-                    &[
-                        &target_vol,
-                        &snapshot.id,
-                        &snapshot.root_ino,
-                        &snapshot.created_at,
-                        &snapshot.state,
-                        &snapshot.pinned_object_ids,
-                        &snapshot.snapshot_payload,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    DumpLoadError::Message(format!(
-                        "insert snapshots row failed for vol={} snapshot_id={}: {e}",
-                        target_vol, snapshot.id
-                    ))
-                })?;
-            }
-
             tx.commit()
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("postgres commit failed: {e}")))?;
@@ -490,7 +342,7 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     })?;
     let volume_name = dump.volume.name.clone();
 
-    if dump.dump_version != 1 {
+    if dump.dump_version != 2 {
         return Err(DumpLoadError::Message(format!(
             "unsupported dump version: {}",
             dump.dump_version

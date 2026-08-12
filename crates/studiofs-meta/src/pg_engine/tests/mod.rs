@@ -13,6 +13,7 @@ mod lock_workers;
 mod metadata_notify;
 mod remote_apply;
 mod replication_backlog;
+mod snapshot_control;
 
 fn pg_err(e: tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {
@@ -586,65 +587,7 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
         .await
         .map_err(|e| MetaError::Storage(format!("postgres advisory lock failed: {}", pg_err(e))))?;
 
-        tx.batch_execute(
-            r#"
-                CREATE TABLE IF NOT EXISTS volumes (
-                    vol BIGSERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    uuid TEXT NOT NULL UNIQUE,
-                    block_size INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                CREATE TABLE IF NOT EXISTS event_log (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    seq_id BIGSERIAL PRIMARY KEY,
-                    batch_version BIGINT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    event_payload BYTEA NOT NULL,
-                    client_id TEXT,
-                    client_timestamp BIGINT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                CREATE TABLE IF NOT EXISTS metadata_state (
-                    vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
-                    version BIGINT NOT NULL,
-                    snapshot BYTEA NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                CREATE TABLE IF NOT EXISTS acl_rules (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    ino BIGINT NOT NULL,
-                    principal TEXT NOT NULL,
-                    access_level SMALLINT NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (vol, ino, principal)
-                );
-                CREATE TABLE IF NOT EXISTS snapshots (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    id TEXT NOT NULL,
-                    root_ino BIGINT NOT NULL,
-                    created_at BIGINT NOT NULL,
-                    state SMALLINT NOT NULL,
-                    pinned_object_ids BIGINT[] NOT NULL DEFAULT '{}',
-                    snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (vol, id)
-                );
-                CREATE TABLE IF NOT EXISTS file_lock_leases (
-                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                    ino BIGINT NOT NULL,
-                    kind SMALLINT NOT NULL,
-                    exclusive_owner TEXT,
-                    shared_owners TEXT[] NOT NULL DEFAULT '{}',
-                    lease_expires_at_unix_ms BIGINT NOT NULL,
-                    generation BIGINT NOT NULL DEFAULT 1,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (vol, ino)
-                );
-                "#,
-        )
-        .await
-        .map_err(|e| MetaError::Storage(format!("postgres schema ensure failed: {}", pg_err(e))))?;
+        crate::pg_engine::schema::ensure_studiofs_pg_schema(&tx).await?;
 
         let row = tx
             .query_one(

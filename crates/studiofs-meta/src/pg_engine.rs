@@ -261,6 +261,10 @@ mod replication_api;
 mod replication_flush;
 #[path = "pg_engine/runtime.rs"]
 mod runtime;
+/// Canonical PostgreSQL schema definition and provisioning helper.
+pub mod schema;
+/// PostgreSQL Snapshot v2 capture and control-plane queries.
+pub(crate) mod snapshot_control;
 #[path = "pg_engine/sql.rs"]
 mod sql;
 use janitor::PgJanitorLock;
@@ -377,8 +381,20 @@ impl PgMetaEngine {
                                     ('event_log'::TEXT),
                                     ('metadata_state'::TEXT),
                                     ('acl_rules'::TEXT),
-                                    ('snapshots'::TEXT),
-                                    ('file_lock_leases'::TEXT)
+                                    ('file_lock_leases'::TEXT),
+                                    ('snapshot_catalog'::TEXT),
+                                    ('snapshot_creation_jobs'::TEXT),
+                                    ('snapshot_creation_leases'::TEXT),
+                                    ('snapshot_mount_leases'::TEXT),
+                                    ('snapshot_policies'::TEXT),
+                                    ('snapshot_policy_slots'::TEXT),
+                                    ('snapshot_policy_leases'::TEXT),
+                                    ('snapshot_source_checkpoints'::TEXT),
+                                    ('snapshot_artifacts'::TEXT),
+                                    ('snapshot_artifact_payload_proofs'::TEXT),
+                                    ('snapshot_artifact_attempts'::TEXT),
+                                    ('snapshot_current_references'::TEXT),
+                                    ('snapshot_reachability'::TEXT)
                             ) AS required(name)
                             LEFT JOIN information_schema.tables AS table_info
                                 ON table_info.table_schema = current_schema()

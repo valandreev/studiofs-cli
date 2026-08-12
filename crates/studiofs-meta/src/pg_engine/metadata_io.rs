@@ -212,69 +212,6 @@ impl PgMetaEngine {
                                     Self::classify_pg_error("postgres acl_rules delete failed", e)
                                 })?;
                             }
-                            MetaEvent::CreateSnapshot { snapshot } => {
-                                let pinned: Vec<i64> = snapshot
-                                    .pinned_object_ids
-                                    .iter()
-                                    .map(|id| {
-                                        i64::try_from(*id).map_err(|_| {
-                                            MetaError::Storage(format!(
-                                                "snapshot pinned object id overflow: {id}"
-                                            ))
-                                        })
-                                    })
-                                    .collect::<MetaResult<Vec<_>>>()?;
-                                tx.execute(
-                                    r#"
-                                    INSERT INTO snapshots (
-                                        vol,
-                                        id,
-                                        root_ino,
-                                        created_at,
-                                        state,
-                                        pinned_object_ids,
-                                        snapshot_payload,
-                                        updated_at
-                                    )
-                                    VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-                                    ON CONFLICT (vol, id) DO UPDATE
-                                    SET root_ino = EXCLUDED.root_ino,
-                                        created_at = EXCLUDED.created_at,
-                                        state = EXCLUDED.state,
-                                        pinned_object_ids = EXCLUDED.pinned_object_ids,
-                                        snapshot_payload = EXCLUDED.snapshot_payload,
-                                        updated_at = now()
-                                    "#,
-                                    &[
-                                        &volume_id,
-                                        &snapshot.id,
-                                        &(snapshot.root_ino as i64),
-                                        &snapshot.created_at,
-                                        &(snapshot.state as i16),
-                                        &pinned,
-                                        &snapshot.snapshot_payload,
-                                    ],
-                                )
-                                .await
-                                .map_err(|e| {
-                                    Self::classify_pg_error("postgres snapshots upsert failed", e)
-                                })?;
-                            }
-                            MetaEvent::UpdateSnapshotState { id, state } => {
-                                tx.execute(
-                                    r#"
-                                    UPDATE snapshots
-                                    SET state = $3,
-                                        updated_at = now()
-                                    WHERE vol = $1 AND id = $2
-                                    "#,
-                                    &[&volume_id, id, &(*state as i16)],
-                                )
-                                .await
-                                .map_err(|e| {
-                                    Self::classify_pg_error("postgres snapshots state update failed", e)
-                                })?;
-                            }
                             _ => {}
                         }
                     }

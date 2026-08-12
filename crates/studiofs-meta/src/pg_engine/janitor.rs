@@ -97,7 +97,13 @@ impl PgMetaEngine {
                     Box::pin(async move {
                         client
                             .query(
-                                "SELECT pinned_object_ids FROM snapshots WHERE vol = $1",
+                                "SELECT DISTINCT proof.object_id
+                                 FROM snapshot_artifact_payload_proofs proof
+                                 JOIN snapshot_catalog catalog
+                                   ON catalog.vol = proof.vol
+                                  AND catalog.id = proof.snapshot_id
+                                 WHERE proof.vol = $1
+                                   AND catalog.lifecycle IN ('creating', 'ready', 'deleting')",
                                 &[&volume_id],
                             )
                             .await
@@ -115,15 +121,13 @@ impl PgMetaEngine {
 
         let mut pins = HashSet::new();
         for row in rows {
-            let raw_ids: Vec<i64> = row.get(0);
-            for object_id in raw_ids {
-                let object_id = u64::try_from(object_id).map_err(|_| {
-                    MetaError::Storage(format!(
-                        "snapshot pinned object id must be non-negative: {object_id}"
-                    ))
-                })?;
-                pins.insert(object_id);
-            }
+            let object_id: i64 = row.get(0);
+            let object_id = u64::try_from(object_id).map_err(|_| {
+                MetaError::Storage(format!(
+                    "snapshot artifact object id must be non-negative: {object_id}"
+                ))
+            })?;
+            pins.insert(object_id);
         }
         Ok(pins)
     }
