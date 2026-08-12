@@ -108,7 +108,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 lifecycle IN ('creating', 'ready', 'failed', 'deleting', 'deleted')
             ),
             retention_seconds BIGINT CHECK (
-                retention_seconds IS NULL OR retention_seconds > 0
+                retention_seconds IS NULL OR retention_seconds BETWEEN 1 AND 4294967295
             ),
             ready_at TIMESTAMPTZ,
             expires_at TIMESTAMPTZ,
@@ -130,6 +130,16 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 ALTER TABLE snapshot_catalog
                     ADD CONSTRAINT snapshot_catalog_automatic_retention_check
                     CHECK (origin = 'manual' OR retention_seconds IS NOT NULL);
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'snapshot_catalog'::regclass
+                  AND conname = 'snapshot_catalog_retention_bounds_check'
+            ) THEN
+                ALTER TABLE snapshot_catalog
+                    ADD CONSTRAINT snapshot_catalog_retention_bounds_check
+                    CHECK (retention_seconds IS NULL OR retention_seconds BETWEEN 1 AND 4294967295);
             END IF;
         END
         $$;
@@ -330,6 +340,9 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             ON snapshot_catalog(vol, lifecycle, captured_at);
         CREATE INDEX IF NOT EXISTS idx_snapshot_creation_jobs_due
             ON snapshot_creation_jobs(state, next_retry_at);
+        CREATE INDEX IF NOT EXISTS idx_snapshot_creation_jobs_queue
+            ON snapshot_creation_jobs(vol, created_at, snapshot_id)
+            WHERE state IN ('queued', 'retry_wait', 'running');
         CREATE INDEX IF NOT EXISTS idx_snapshot_mount_leases_active
             ON snapshot_mount_leases(vol, snapshot_id, lease_expires_at)
             WHERE released_at IS NULL;

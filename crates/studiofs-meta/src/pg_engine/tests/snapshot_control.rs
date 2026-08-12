@@ -5,7 +5,8 @@ use crate::pg_engine::snapshot_control::{
     capture_snapshot_in_transaction,
 };
 use crate::snapshot::{
-    SnapshotCreationState, SnapshotId, SnapshotLifecycle, SnapshotOrigin, SnapshotRetention,
+    MAX_RETENTION_SECS, SnapshotCreationState, SnapshotId, SnapshotLifecycle, SnapshotOrigin,
+    SnapshotRetention,
 };
 use crate::snapshot_ports::SnapshotPortError;
 use chrono::{TimeZone, Utc};
@@ -30,6 +31,8 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(ddl.contains("SET batch_version = 0"));
     assert!(ddl.contains("ALTER COLUMN batch_version SET NOT NULL"));
     assert!(ddl.contains("retention_seconds IS NOT NULL"));
+    assert!(ddl.contains("retention_seconds BETWEEN 1 AND 4294967295"));
+    assert!(ddl.contains("idx_snapshot_creation_jobs_queue"));
 }
 
 fn snapshot_request(volume_id: i64, origin: SnapshotOrigin) -> SnapshotCaptureRequest {
@@ -96,6 +99,41 @@ fn capture_is_one_transaction_and_one_durable_job() {
         Ok(())
     })
     .expect("capture snapshot");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn snapshot_catalog_rejects_retention_above_domain_limit() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-retention-bound");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let captured_at = Utc
+            .with_ymd_and_hms(2026, 8, 12, 14, 7, 9)
+            .single()
+            .expect("valid capture timestamp");
+        let error = client
+            .execute(
+                "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle, retention_seconds) VALUES ($1, 'retention-bound', 'automatic', 0, $2, 'creating', $3)",
+                &[
+                    &volume.volume_id,
+                    &captured_at,
+                    &(MAX_RETENTION_SECS as i64 + 1),
+                ],
+            )
+            .await
+            .expect_err("PostgreSQL must reject oversized retention");
+        connection_task.abort();
+        assert!(error.to_string().contains("snapshot_catalog_retention_bounds_check"));
+        Ok(())
+    })
+    .expect("retention bound test");
 }
 
 #[test]

@@ -10,6 +10,12 @@ use thiserror::Error;
 /// PostgreSQL's durable identifier for a StudioFS volume.
 pub type VolumeId = i64;
 
+/// Maximum finite retention accepted by Snapshot v2.
+///
+/// The bound keeps the PostgreSQL `TIMESTAMPTZ` expiry calculation within a
+/// practical range and prevents a durable job from becoming a poison pill.
+pub const MAX_RETENTION_SECS: u64 = u32::MAX as u64;
+
 /// Errors raised while constructing a Snapshot v2 value object.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
 pub enum SnapshotValidationError {
@@ -28,6 +34,9 @@ pub enum SnapshotValidationError {
     /// A retention duration was zero or could not be represented.
     #[error("invalid snapshot retention")]
     InvalidRetention,
+    /// A retention duration could not be added to its Ready timestamp.
+    #[error("invalid snapshot expiration")]
+    InvalidExpiration,
     /// An artifact descriptor contained an invalid field.
     #[error("invalid snapshot artifact descriptor")]
     InvalidArtifact,
@@ -286,10 +295,26 @@ impl SnapshotRetention {
     }
 
     /// Computes expiry from the durable Ready timestamp.
-    pub fn expires_at(&self, ready_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let ttl = self.ttl?;
-        let ttl = ChronoDuration::from_std(ttl).ok()?;
-        ready_at.checked_add_signed(ttl)
+    ///
+    /// Returns `Ok(None)` only for infinite manual retention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotValidationError::InvalidExpiration`] if the timestamp
+    /// range cannot represent the computed expiry.
+    pub fn expires_at(
+        &self,
+        ready_at: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, SnapshotValidationError> {
+        let Some(ttl) = self.ttl else {
+            return Ok(None);
+        };
+        let ttl = ChronoDuration::from_std(ttl)
+            .map_err(|_| SnapshotValidationError::InvalidExpiration)?;
+        ready_at
+            .checked_add_signed(ttl)
+            .map(Some)
+            .ok_or(SnapshotValidationError::InvalidExpiration)
     }
 }
 
@@ -386,6 +411,7 @@ pub struct SnapshotPolicyRecord {
 fn validate_retention(ttl: Option<Duration>) -> Result<(), SnapshotValidationError> {
     if ttl.is_some_and(|duration| {
         duration.is_zero()
+            || duration.as_secs() > MAX_RETENTION_SECS
             || i64::try_from(duration.as_secs()).is_err()
             || ChronoDuration::from_std(duration).is_err()
     }) {
@@ -842,6 +868,34 @@ mod tests {
                 .validate_for_origin(SnapshotOrigin::Automatic)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn retention_accepts_the_postgres_safe_upper_bound() {
+        assert!(SnapshotRetention::automatic(Duration::from_secs(MAX_RETENTION_SECS)).is_ok());
+    }
+
+    #[test]
+    fn retention_rejects_values_that_can_overflow_postgres_timestamptz() {
+        assert!(SnapshotRetention::automatic(Duration::from_secs(MAX_RETENTION_SECS + 1)).is_err());
+    }
+
+    #[test]
+    fn retention_expiration_reports_datetime_overflow() {
+        let retention =
+            SnapshotRetention::automatic(Duration::from_secs(60)).expect("finite retention");
+
+        assert_eq!(
+            retention.expires_at(DateTime::<Utc>::MAX_UTC),
+            Err(SnapshotValidationError::InvalidExpiration)
+        );
+    }
+
+    #[test]
+    fn infinite_retention_has_no_expiration() {
+        let retention = SnapshotRetention::manual(None).expect("infinite retention");
+
+        assert_eq!(retention.expires_at(DateTime::<Utc>::MIN_UTC), Ok(None));
     }
 
     #[test]
