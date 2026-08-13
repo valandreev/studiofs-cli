@@ -241,10 +241,7 @@ fn normalize_data_prefix(data_prefix: &str) -> Result<String, SnapshotArtifactKe
 
 fn canonical_uuid(value: &str) -> Result<String, SnapshotArtifactKeyError> {
     let uuid = Uuid::parse_str(value).map_err(|_| SnapshotArtifactKeyError::InvalidVolume)?;
-    let canonical = uuid.hyphenated().to_string();
-    (canonical == value)
-        .then_some(canonical)
-        .ok_or(SnapshotArtifactKeyError::InvalidVolume)
+    Ok(uuid.hyphenated().to_string())
 }
 
 fn validate_component(value: &str) -> Result<(), SnapshotArtifactKeyError> {
@@ -324,6 +321,20 @@ mod tests {
                 .as_str()
                 .starts_with("/tenant/demo/metadata/snapshots/")
         );
+    }
+
+    #[test]
+    fn canonicalizes_equivalent_uuid_forms() {
+        let snapshot_id = SnapshotId::parse(SNAPSHOT_ID).expect("snapshot id");
+        for volume_uuid in [
+            "550E8400-E29B-41D4-A716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+        ] {
+            let prefix =
+                SnapshotArtifactPrefix::for_snapshot("tenant/demo/", 7, volume_uuid, &snapshot_id)
+                    .expect("equivalent UUID form");
+            assert!(prefix.as_str().contains(UUID_A));
+        }
     }
 
     #[test]

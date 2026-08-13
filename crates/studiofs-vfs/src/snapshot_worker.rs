@@ -1,5 +1,6 @@
 //! Snapshot v2 materialization and publication worker.
 
+use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
 use sha2::{Digest, Sha256};
@@ -77,8 +78,8 @@ impl SnapshotClock for SystemSnapshotClock {
         deadline: chrono::DateTime<Utc>,
         cancel: CancellationToken,
     ) -> SnapshotPortFuture<'a, ()> {
-        let delay = (deadline - Utc::now()).to_std().unwrap_or_default();
         Box::pin(async move {
+            let delay = (deadline - Utc::now()).to_std().unwrap_or_default();
             tokio::select! {
                 _ = cancel.cancelled() => Err(SnapshotPortError::Cancelled),
                 _ = tokio::time::sleep(delay) => Ok(()),
@@ -152,12 +153,12 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
     ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact> {
         Box::pin(async move {
             let key = self.key(locator)?;
-            let bytes = tokio::fs::read(source).await.map_err(|_| {
+            let bytes = Bytes::from(tokio::fs::read(source).await.map_err(|_| {
                 SnapshotPortError::retryable(
                     "read snapshot artifact",
                     "artifact source unavailable",
                 )
-            })?;
+            })?);
             self.data_store
                 .put_snapshot_artifact(&key, bytes.clone())
                 .await
@@ -176,12 +177,12 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
         Box::pin(async move {
             self.key(attempt)?;
             let final_key = self.key(final_artifact)?;
-            let bytes = tokio::fs::read(source).await.map_err(|_| {
+            let bytes = Bytes::from(tokio::fs::read(source).await.map_err(|_| {
                 SnapshotPortError::retryable(
                     "read snapshot artifact",
                     "artifact source unavailable",
                 )
-            })?;
+            })?);
             let sha256 = digest(&bytes);
             if &sha256 != expected_sha256 {
                 return Err(SnapshotPortError::permanent(
@@ -885,6 +886,11 @@ impl SnapshotWorker {
             let Some(candidate) = parent else {
                 break;
             };
+            if candidate == self.config.materializer_root
+                || !candidate.starts_with(&self.config.materializer_root)
+            {
+                break;
+            }
             match tokio::fs::remove_dir(candidate).await {
                 Ok(()) => parent = candidate.parent(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1072,24 +1078,21 @@ async fn collect_published_payloads(path: PathBuf) -> Result<Vec<PayloadRef>, Sn
         let engine = studiofs_meta::RedbMetaEngine::open(&path).map_err(|_| {
             SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
         })?;
-        let regular_file_base = engine.export_regular_file_base_states().map_err(|_| {
-            SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
-        })?;
         let mut payloads = BTreeMap::<(u64, u32, u32), PayloadRef>::new();
-        for (_, regular) in regular_file_base {
-            for chunk in regular.chunks.values() {
+        engine
+            .visit_regular_file_base_chunks(|_, chunk| {
                 for slice in chunk.slices.values() {
-                    if slice.payload_state != PayloadRefState::Published {
-                        continue;
+                    if slice.payload_state == PayloadRefState::Published
+                        && let Some(payload) = slice.payload
+                    {
+                        let key = (payload.object_id, payload.offset, payload.length);
+                        payloads.insert(key, payload);
                     }
-                    let Some(payload) = slice.payload else {
-                        continue;
-                    };
-                    let key = (payload.object_id, payload.offset, payload.length);
-                    payloads.insert(key, payload);
                 }
-            }
-        }
+            })
+            .map_err(|_| {
+                SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
+            })?;
         Ok(payloads.into_values().collect())
     })
     .await
@@ -1101,7 +1104,6 @@ async fn collect_published_payloads(path: PathBuf) -> Result<Vec<PayloadRef>, Sn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use chrono::{DateTime, TimeZone, Utc};
     use opendal::services::Memory;
     use std::path::{Path, PathBuf};
@@ -1838,7 +1840,7 @@ mod tests {
         );
         let cancel = CancellationToken::new();
         let started = jobs.publish_ready_started.notified();
-        let task = tokio::spawn(worker.run(cancel.clone()));
+        let task = tokio::spawn(worker.clone().run(cancel.clone()));
 
         started.await;
         cancel.cancel();
@@ -1870,6 +1872,11 @@ mod tests {
                 .join(snapshot_id.as_str())
                 .exists()
         );
+        let materializer_root = source_dir.path().join("materializer");
+        worker
+            .cleanup_materializer(&materializer_root.join("attempts").join("1"), &snapshot_id)
+            .await;
+        assert!(materializer_root.exists());
     }
 
     fn published_payload_source(root: &Path) -> PathBuf {
