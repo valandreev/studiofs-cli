@@ -534,6 +534,24 @@ impl MetaPayloadObjects for RedbMetaEngine {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn list_published_object_references(&self) -> MetaResult<Vec<(Ino, u64)>> {
+        let txn = self.begin_read_txn()?;
+        let chunks = Self::regular_file_chunk_states_from_txn(&txn, REGULAR_FILE_BASE_TABLE)?;
+        let mut references = std::collections::BTreeSet::new();
+        for (ino, chunks) in chunks {
+            for chunk in chunks.values() {
+                for slice in chunk.slices.values() {
+                    if slice.payload_state == PayloadRefState::Published
+                        && let Some(payload) = &slice.payload
+                    {
+                        references.insert((ino, payload.object_id));
+                    }
+                }
+            }
+        }
+        Ok(references.into_iter().collect())
+    }
+
     fn publish_regular_file_overlay_to_base_if_matches_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,

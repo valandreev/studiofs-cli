@@ -228,6 +228,14 @@ impl PgMetaEngine {
                         }
                     }
 
+                    super::snapshot_reachability::apply_object_lifetime_changes(
+                        &tx,
+                        volume_id,
+                        batch_version,
+                        &events_vec,
+                    )
+                    .await?;
+
                     let channel = Self::metadata_notify_channel(volume_id);
                     let _ = tx
                         .execute(

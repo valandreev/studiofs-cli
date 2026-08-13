@@ -15,6 +15,7 @@ mod remote_apply;
 mod replication_backlog;
 mod snapshot_control;
 mod snapshot_policy;
+mod snapshot_reachability;
 mod snapshot_replay;
 
 fn pg_err(e: tokio_postgres::Error) -> String {

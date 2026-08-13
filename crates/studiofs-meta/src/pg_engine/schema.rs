@@ -1,7 +1,7 @@
 use crate::engine::{MetaError, MetaResult};
 
 /// The PostgreSQL schema generation owned by the Snapshot v2 control plane.
-pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 4;
+pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 5;
 
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
@@ -400,6 +400,79 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             FOR EACH STATEMENT
             EXECUTE FUNCTION studiofs_reject_snapshot_source_prune();
 
+        CREATE TABLE IF NOT EXISTS snapshot_current_references (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            ino BIGINT NOT NULL,
+            object_id BIGINT NOT NULL CHECK (object_id >= 0),
+            PRIMARY KEY (vol, ino, object_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_object_reachability (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            object_id BIGINT NOT NULL CHECK (object_id >= 0),
+            start_version BIGINT NOT NULL CHECK (start_version >= 0),
+            end_version BIGINT,
+            CHECK (end_version IS NULL OR end_version > start_version),
+            PRIMARY KEY (vol, object_id, start_version)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshot_object_reachability_open
+            ON snapshot_object_reachability(vol, object_id)
+            WHERE end_version IS NULL;
+
+        CREATE TABLE IF NOT EXISTS snapshot_reachability_batches (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            batch_version BIGINT NOT NULL CHECK (batch_version >= 0),
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (vol, batch_version)
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_reachability_bootstrap (
+            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            initialized_version BIGINT NOT NULL CHECK (initialized_version >= 0),
+            initialized_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_payload_upload_objects (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            object_id BIGINT NOT NULL CHECK (object_id >= 0),
+            state TEXT NOT NULL CHECK (
+                state IN ('uploading', 'uploaded', 'published', 'delete_pending', 'retry_wait', 'deleted')
+            ),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            reconcile_owner TEXT,
+            reconcile_lease_expires_at TIMESTAMPTZ,
+            reconcile_fence BIGINT NOT NULL DEFAULT 0 CHECK (reconcile_fence >= 0),
+            next_retry_at TIMESTAMPTZ,
+            publish_batch_version BIGINT,
+            closed_at TIMESTAMPTZ,
+            last_error TEXT,
+            PRIMARY KEY (vol, object_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_payload_upload_fragments (
+            vol BIGINT NOT NULL,
+            object_id BIGINT NOT NULL,
+            fragment_index INTEGER NOT NULL CHECK (fragment_index >= 0),
+            object_key TEXT NOT NULL,
+            expected_byte_length BIGINT NOT NULL CHECK (expected_byte_length >= 0),
+            expected_sha256 BYTEA NOT NULL CHECK (octet_length(expected_sha256) = 32),
+            uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            confirmed_at TIMESTAMPTZ,
+            confirmation_state TEXT NOT NULL CHECK (confirmation_state IN ('pending', 'confirmed')),
+            last_error TEXT,
+            PRIMARY KEY (vol, object_id, fragment_index),
+            FOREIGN KEY (vol, object_id)
+                REFERENCES snapshot_payload_upload_objects(vol, object_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_payload_reconcile_cursors (
+            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            object_id BIGINT NOT NULL DEFAULT 0 CHECK (object_id >= 0),
+            fragment_index INTEGER NOT NULL DEFAULT 0 CHECK (fragment_index >= 0),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS snapshot_artifacts (
             vol BIGINT NOT NULL,
             snapshot_id TEXT NOT NULL,
@@ -555,6 +628,15 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_snapshot_mount_leases_active
             ON snapshot_mount_leases(vol, snapshot_id, lease_expires_at)
             WHERE released_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_snapshot_current_references_object
+            ON snapshot_current_references(vol, object_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshot_object_reachability_cut
+            ON snapshot_object_reachability(vol, start_version, end_version, object_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshot_payload_upload_fragments_due
+            ON snapshot_payload_upload_fragments(vol, uploaded_at, object_id, fragment_index);
+        CREATE INDEX IF NOT EXISTS idx_snapshot_payload_upload_objects_reconcile
+            ON snapshot_payload_upload_objects(vol, next_retry_at, created_at, object_id)
+            WHERE state IN ('uploading', 'uploaded', 'retry_wait');
     "#
 }
 

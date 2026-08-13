@@ -438,13 +438,9 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     /// Release the global janitor lease, if one was acquired.
     fn release_global_janitor_lock(&self) -> MetaResult<()>;
 
-    /// Return object ids protected by published Snapshot v2 artifact proofs.
+    /// Return object ids protected by PostgreSQL reachability intervals and
+    /// active snapshot lifecycle or mount leases.
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
-
-    /// Return whether remote object deletion must be paused for an in-progress snapshot.
-    fn snapshot_gc_is_blocked(&self) -> MetaResult<bool> {
-        Ok(false)
-    }
 
     /// Acquire a PostgreSQL-backed hard-lock lease for this engine's client.
     fn acquire_file_lock_lease(
@@ -851,7 +847,9 @@ pub trait MetaGc: Send + Sync {
 
     /// Get currently referenced object IDs from the full reachability graph.
     ///
-    /// Backends should include regular-file graph overlay/base rows and published artifact proofs so cleanup can reason about publication races
+    /// Backends should include regular-file graph overlay/base rows and
+    /// PostgreSQL-authoritative snapshot reachability so cleanup can reason
+    /// about publication races.
     /// and shadow refs directly from metadata reachability.
     ///
     /// Prefer streaming the underlying rows into a shared accumulator instead
@@ -1022,6 +1020,7 @@ pub trait MetaEngine:
     + MetaXattr
     + MetaAcl
     + MetaReplication
+    + crate::snapshot_ports::UploadedFragmentLedger
 {
     /// Apply ordered regular-file overlay mutations in one local transaction.
     fn apply_regular_file_overlay_batch(

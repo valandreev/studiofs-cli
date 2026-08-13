@@ -1,11 +1,14 @@
 use futures::StreamExt;
 use opendal::ErrorKind;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::time::MissedTickBehavior;
 
 use super::*;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
+
+const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
@@ -1219,6 +1222,7 @@ impl StudioVfs {
 
         let interval = tokio::time::Duration::from_secs(600);
         let grace_period = 3600i64;
+        let mut gc_cycle = 0_u64;
 
         loop {
             tokio::select! {
@@ -1228,6 +1232,7 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
+            gc_cycle = gc_cycle.saturating_add(1);
 
             let meta = self.meta.clone();
             let lock_acquired = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1284,10 +1289,32 @@ impl StudioVfs {
                 }
             };
 
+            let meta = self.meta.clone();
+            let snapshot_pins = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.get_global_snapshot_pins()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
+                    warn!(
+                        error = %e,
+                        "background GC skipped: snapshot protection query failed"
+                    );
+                    continue;
+                }
+            };
+
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
+            let deletion_owner = format!("background-gc-{gc_cycle}");
 
             const PENDING_DELETION_GC_BATCH_LIMIT: usize = 1_000;
             let meta = self.meta.clone();
@@ -1307,14 +1334,57 @@ impl StudioVfs {
                             continue;
                         }
 
+                        if snapshot_pins.contains(&object_id) {
+                            debug!(object_id, "skipping object - protected by a snapshot cut");
+                            continue;
+                        }
+
                         if now - timestamp < grace_period {
                             debug!("skipping object {} - still in grace period", object_id);
                             continue;
                         }
 
+                        let meta = self.meta.clone();
+                        let claim_owner = deletion_owner.clone();
+                        let deletion_claim = match run_meta(
+                            meta,
+                            move |engine: Arc<dyn VfsMeta>| {
+                                engine.claim_uploaded_object_deletion(object_id, &claim_owner)
+                            },
+                        )
+                        .await
+                        {
+                            Ok(claim) => claim,
+                            Err(error) => {
+                                warn!(object_id, error = %error, "GC: failed to claim object deletion");
+                                continue;
+                            }
+                        };
+                        let fencing_token = match deletion_claim {
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Untracked => {
+                                None
+                            }
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Claimed {
+                                fencing_token,
+                            } => Some(fencing_token),
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Protected => {
+                                debug!(object_id, "skipping object - protected by upload ledger");
+                                continue;
+                            }
+                        };
+
+                        let delete_results = futures::future::join_all(
+                            format_object_fragment_keys(&self.data_prefix, object_id)
+                                .into_iter()
+                                .map(|key| async {
+                                    let result = self.data_write.delete_by_key(&key).await;
+                                    (key, result)
+                                }),
+                        )
+                        .await;
                         let mut delete_failed = false;
-                        for key in format_object_fragment_keys(&self.data_prefix, object_id) {
-                            if let Err(e) = self.data_write.delete_by_key(&key).await {
+                        for (key, result) in delete_results {
+                            if let Err(e) = result {
                                 if matches!(&e, DataError::OpenDal(oe) if oe.kind() == ErrorKind::NotFound)
                                 {
                                     continue;
@@ -1328,11 +1398,32 @@ impl StudioVfs {
                                 );
                             }
                         }
+                        let deletion_outcome = if delete_failed {
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Retryable
+                        } else {
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Deleted
+                        };
+                        if let Some(fencing_token) = fencing_token {
+                            let meta = self.meta.clone();
+                            let finish_owner = deletion_owner.clone();
+                            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                                engine.finish_uploaded_object_deletion(
+                                    object_id,
+                                    &finish_owner,
+                                    fencing_token,
+                                    deletion_outcome,
+                                )
+                            })
+                            .await
+                            {
+                                warn!(object_id, error = %error, "GC: failed to finish object deletion claim");
+                                continue;
+                            }
+                        }
                         if !delete_failed {
                             let meta = self.meta.clone();
                             if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                                engine.remove_pending_deletion(object_id)?;
-                                Ok(())
+                                engine.remove_pending_deletion(object_id)
                             })
                             .await
                             {
@@ -1411,37 +1502,7 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            let snapshot_gc_blocked = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.snapshot_gc_is_blocked()
-            })
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.release_global_janitor_lock()
-                    })
-                    .await;
-                    warn!(cycle, error = %e, "janitor cycle skipped: snapshot creation check failed");
-                    continue;
-                }
-            };
-            if snapshot_gc_blocked {
-                let meta = self.meta.clone();
-                let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.release_global_janitor_lock()
-                })
-                .await;
-                debug!(
-                    cycle,
-                    "janitor cycle skipped: snapshot creation in progress"
-                );
-                continue;
-            }
-
-            let meta = self.meta.clone();
-            let global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            let mut global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.get_global_snapshot_pins()
             })
             .await
@@ -1457,6 +1518,100 @@ impl StudioVfs {
                     continue;
                 }
             };
+
+            let meta = self.meta.clone();
+            let reconciliation_owner = format!("janitor-{cycle}");
+            let claim_owner = reconciliation_owner.clone();
+            let reconciliation_claims = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.claim_uploaded_fragment_reconciliation(&claim_owner)
+            })
+            .await
+            {
+                Ok(claims) => claims,
+                Err(e) => {
+                    let meta = self.meta.clone();
+                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                        engine.release_global_janitor_lock()
+                    })
+                    .await;
+                    warn!(cycle, error = %e, "janitor cycle skipped: upload reconciliation claim failed");
+                    continue;
+                }
+            };
+            let reconciliation_claim_count = reconciliation_claims.len();
+            for claim in &reconciliation_claims {
+                global_snapshot_pins.insert(claim.entry.object_id);
+            }
+            let reconciliation_shutdown = self.state.shutdown.background_shutdown_token.clone();
+            let reconciliation_data_store = self.fetch_scheduler.data_store().clone();
+            let reconciliation_outcomes = futures::stream::iter(
+                reconciliation_claims.into_iter().map(|claim| {
+                    let shutdown = reconciliation_shutdown.clone();
+                    let data_store = reconciliation_data_store.clone();
+                    async move {
+                        let proof = run_with_timeout_or_cancel(
+                            &shutdown,
+                            REMOTE_OBJECT_IO_TIMEOUT,
+                            data_store.get_by_key(&claim.entry.object_key),
+                        )
+                        .await;
+                        let outcome = match proof {
+                            TimeoutOrCancel::Completed(Ok(remote_payload)) => {
+                                let remote_bytes = remote_payload.to_bytes();
+                                let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
+                                if remote_bytes.len() as u64 == claim.entry.expected_byte_length
+                                    && remote_sha256 == claim.entry.expected_sha256
+                                {
+                                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed
+                                } else {
+                                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+                                }
+                            }
+                            TimeoutOrCancel::Completed(Err(_))
+                            | TimeoutOrCancel::TimedOut
+                            | TimeoutOrCancel::Cancelled => {
+                                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+                            }
+                        };
+                        (claim, outcome)
+                    }
+                }),
+            )
+            .buffer_unordered(JANITOR_RECONCILIATION_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            let mut upload_reconciliation_confirmed: u64 = 0;
+            let mut upload_reconciliation_retryable: u64 = 0;
+            let mut upload_reconciliation_completion_errors: u64 = 0;
+            for (claim, outcome) in reconciliation_outcomes {
+                match outcome {
+                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed => {
+                        upload_reconciliation_confirmed =
+                            upload_reconciliation_confirmed.saturating_add(1);
+                    }
+                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable => {
+                        upload_reconciliation_retryable =
+                            upload_reconciliation_retryable.saturating_add(1);
+                    }
+                }
+                let owner = reconciliation_owner.clone();
+                let object_id = claim.entry.object_id;
+                let meta = self.meta.clone();
+                if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.finish_uploaded_fragment_reconciliation(&owner, &claim, outcome)
+                })
+                .await
+                {
+                    upload_reconciliation_completion_errors =
+                        upload_reconciliation_completion_errors.saturating_add(1);
+                    warn!(
+                        cycle,
+                        object_id,
+                        error = %e,
+                        "janitor: upload reconciliation completion failed"
+                    );
+                }
+            }
 
             let meta = self.meta.clone();
             let referenced = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1572,6 +1727,7 @@ impl StudioVfs {
             let mut skipped_non_object_key: u64 = 0;
             let mut delete_errors: u64 = 0;
             let mut seen_objects: HashSet<u64> = HashSet::new();
+            let deletion_owner = format!("janitor-delete-{cycle}");
 
             let mut list_error = None;
             while let Some(entry_result) = lister.next().await {
@@ -1628,15 +1784,71 @@ impl StudioVfs {
                     continue;
                 }
 
+                let meta = self.meta.clone();
+                let object_deletion_owner = deletion_owner.clone();
+                let claim_owner = object_deletion_owner.clone();
+                let deletion_claim = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.claim_uploaded_object_deletion(object_id, &claim_owner)
+                })
+                .await
+                {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        delete_errors = delete_errors.saturating_add(1);
+                        warn!(cycle, object_id, error = %error, "janitor: failed to claim object deletion");
+                        continue;
+                    }
+                };
+                let fencing_token = match deletion_claim {
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Untracked => None,
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Claimed {
+                        fencing_token,
+                    } => Some(fencing_token),
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Protected => {
+                        continue;
+                    }
+                };
+
+                let delete_results = futures::future::join_all(
+                    format_object_fragment_keys(&self.data_prefix, object_id)
+                        .into_iter()
+                        .map(|key| async {
+                            let result = self.data_write.delete_by_key(&key).await;
+                            (key, result)
+                        }),
+                )
+                .await;
                 let mut delete_failed = false;
-                for key in format_object_fragment_keys(&self.data_prefix, object_id) {
-                    if let Err(e) = self.data_write.delete_by_key(&key).await {
+                for (key, result) in delete_results {
+                    if let Err(e) = result {
                         if matches!(&e, DataError::OpenDal(oe) if oe.kind() == ErrorKind::NotFound)
                         {
                             continue;
                         }
                         delete_failed = true;
                         warn!(cycle, key, error = %e, "janitor: fragment delete failed");
+                    }
+                }
+                let deletion_outcome = if delete_failed {
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Retryable
+                } else {
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Deleted
+                };
+                if let Some(fencing_token) = fencing_token {
+                    let meta = self.meta.clone();
+                    if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                        engine.finish_uploaded_object_deletion(
+                            object_id,
+                            &object_deletion_owner,
+                            fencing_token,
+                            deletion_outcome,
+                        )
+                    })
+                    .await
+                    {
+                        delete_errors = delete_errors.saturating_add(1);
+                        warn!(cycle, object_id, error = %error, "janitor: failed to finish object deletion claim");
+                        continue;
                     }
                 }
                 if delete_failed {
@@ -1666,6 +1878,10 @@ impl StudioVfs {
                 scanned,
                 referenced = referenced.len(),
                 snapshot_pins = global_snapshot_pins.len(),
+                upload_reconciliation_claims = reconciliation_claim_count,
+                upload_reconciliation_confirmed,
+                upload_reconciliation_retryable,
+                upload_reconciliation_completion_errors,
                 orphan_candidates,
                 recovered_undo_parents = recovered_undo_parents.len(),
                 undo_total,

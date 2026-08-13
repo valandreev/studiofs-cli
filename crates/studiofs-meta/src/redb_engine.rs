@@ -3,6 +3,7 @@
 //! Uses redb as an embedded ACID KV store for all filesystem metadata.
 
 use crate::engine::*;
+use crate::snapshot_ports::{UploadedFragmentLedger, UploadedFragmentLedgerEntry};
 use crate::types::*;
 use redb::{
     Database, Durability, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
@@ -771,6 +772,57 @@ impl MetaEngineCore for RedbMetaEngine {
 
     fn known_file_lock_lease(&self, _ino: Ino) -> Option<FileLockLease> {
         None
+    }
+}
+
+impl UploadedFragmentLedger for RedbMetaEngine {
+    fn fragment_ledger_volume_id(&self) -> MetaResult<crate::snapshot::VolumeId> {
+        // redb-only mounts have no shared PostgreSQL volume identity.
+        Ok(0)
+    }
+
+    fn claim_uploaded_fragment_reconciliation(
+        &self,
+        _owner: &str,
+    ) -> MetaResult<Vec<crate::snapshot_ports::UploadedFragmentReconciliationClaim>> {
+        Ok(Vec::new())
+    }
+
+    fn finish_uploaded_fragment_reconciliation(
+        &self,
+        _owner: &str,
+        _claim: &crate::snapshot_ports::UploadedFragmentReconciliationClaim,
+        _outcome: crate::snapshot_ports::UploadedFragmentReconciliationOutcome,
+    ) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn claim_uploaded_object_deletion(
+        &self,
+        _object_id: u64,
+        _owner: &str,
+    ) -> MetaResult<crate::snapshot_ports::UploadedObjectDeletionClaim> {
+        Ok(crate::snapshot_ports::UploadedObjectDeletionClaim::Untracked)
+    }
+
+    fn finish_uploaded_object_deletion(
+        &self,
+        _object_id: u64,
+        _owner: &str,
+        _fencing_token: i64,
+        _outcome: crate::snapshot_ports::UploadedObjectDeletionOutcome,
+    ) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn begin_fragment_upload(&self, _entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
+        // CONTEXT: redb-only mounts have no shared PostgreSQL authority; the
+        // existing local upload lifecycle remains their source of truth.
+        Ok(())
+    }
+
+    fn confirm_fragment_uploaded(&self, _entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
+        Ok(())
     }
 }
 
