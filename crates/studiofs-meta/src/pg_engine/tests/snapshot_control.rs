@@ -188,7 +188,13 @@ fn snapshot_catalog_rejects_retention_above_domain_limit() {
             .await
             .expect_err("PostgreSQL must reject oversized retention");
         connection_task.abort();
-        assert!(error.to_string().contains("snapshot_catalog_retention_bounds_check"));
+        let db_error = error
+            .as_db_error()
+            .expect("retention violation must be a PostgreSQL database error");
+        assert_eq!(
+            db_error.constraint(),
+            Some("snapshot_catalog_retention_bounds_check")
+        );
         Ok(())
     })
     .expect("retention bound test");

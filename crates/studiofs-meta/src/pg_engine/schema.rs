@@ -114,19 +114,21 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             lifecycle TEXT NOT NULL CHECK (
                 lifecycle IN ('creating', 'ready', 'failed', 'deleting', 'deleted')
             ),
-            retention_seconds BIGINT CHECK (
-                retention_seconds IS NULL OR retention_seconds BETWEEN 1 AND 4294967295
-            ),
+            retention_seconds BIGINT,
             ready_at TIMESTAMPTZ,
             expires_at TIMESTAMPTZ,
             failure_code TEXT,
             failure_message TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT snapshot_catalog_retention_bounds_check
+                CHECK (retention_seconds IS NULL OR retention_seconds BETWEEN 1 AND 4294967295),
             PRIMARY KEY (vol, id)
         );
 
         DO $$
+        DECLARE
+            legacy_constraint_name TEXT;
         BEGIN
             IF NOT EXISTS (
                 SELECT 1
@@ -138,6 +140,35 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     ADD CONSTRAINT snapshot_catalog_automatic_retention_check
                     CHECK (origin = 'manual' OR retention_seconds IS NOT NULL);
             END IF;
+            FOR legacy_constraint_name IN
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = 'snapshot_catalog'::regclass
+                  AND contype = 'c'
+                  AND conname NOT IN (
+                      'snapshot_catalog_automatic_retention_check',
+                      'snapshot_catalog_retention_bounds_check'
+                  )
+                  AND pg_get_constraintdef(oid) LIKE '%retention_seconds%'
+            LOOP
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conrelid = 'snapshot_catalog'::regclass
+                      AND conname = 'snapshot_catalog_retention_bounds_check'
+                ) THEN
+                    EXECUTE format(
+                        'ALTER TABLE snapshot_catalog DROP CONSTRAINT %I',
+                        legacy_constraint_name
+                    );
+                ELSE
+                    EXECUTE format(
+                        'ALTER TABLE snapshot_catalog RENAME CONSTRAINT %I TO snapshot_catalog_retention_bounds_check',
+                        legacy_constraint_name
+                    );
+                END IF;
+            END LOOP;
+
             IF NOT EXISTS (
                 SELECT 1
                 FROM pg_constraint
