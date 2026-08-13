@@ -194,6 +194,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             event_end_seq BIGINT,
             event_start_version BIGINT,
             event_end_version BIGINT,
+            event_row_count BIGINT NOT NULL DEFAULT 0 CHECK (event_row_count >= 0),
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (vol, snapshot_id),
             FOREIGN KEY (vol, snapshot_id)
@@ -204,6 +205,8 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             ADD COLUMN IF NOT EXISTS event_start_version BIGINT;
         ALTER TABLE snapshot_source_checkpoints
             ADD COLUMN IF NOT EXISTS event_end_version BIGINT;
+        ALTER TABLE snapshot_source_checkpoints
+            ADD COLUMN IF NOT EXISTS event_row_count BIGINT NOT NULL DEFAULT 0;
 
         DO $$
         DECLARE
@@ -235,6 +238,136 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             END IF;
         END
         $$;
+
+        CREATE OR REPLACE FUNCTION studiofs_reject_snapshot_source_event_prune()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF TG_OP = 'TRUNCATE' THEN
+                IF EXISTS (
+                    SELECT 1
+                    FROM snapshot_source_checkpoints AS s
+                    INNER JOIN snapshot_catalog AS c
+                        ON c.vol = s.vol AND c.id = s.snapshot_id
+                    WHERE c.lifecycle = 'creating'
+                      AND s.event_row_count > 0
+                ) THEN
+                    RAISE EXCEPTION 'event rows are retained by a creating snapshot'
+                        USING ERRCODE = 'restrict_violation';
+                END IF;
+                RETURN NULL;
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM snapshot_source_checkpoints AS s
+                INNER JOIN snapshot_catalog AS c
+                    ON c.vol = s.vol AND c.id = s.snapshot_id
+                WHERE c.lifecycle = 'creating'
+                  AND s.vol = OLD.vol
+                  AND s.event_row_count > 0
+                  AND s.event_start_seq IS NOT NULL
+                  AND s.event_end_seq IS NOT NULL
+                  AND OLD.seq_id BETWEEN s.event_start_seq AND s.event_end_seq
+                  AND OLD.batch_version > s.checkpoint_version
+                  AND OLD.batch_version <= s.cut_version
+            ) THEN
+                RAISE EXCEPTION 'event row is retained by a creating snapshot'
+                    USING ERRCODE = 'restrict_violation';
+            END IF;
+            RETURN OLD;
+        END
+        $$;
+
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_event_prune_guard ON event_log;
+        CREATE TRIGGER studiofs_snapshot_source_event_prune_guard
+            BEFORE DELETE ON event_log
+            FOR EACH ROW
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_event_prune();
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_event_truncate_guard ON event_log;
+        CREATE TRIGGER studiofs_snapshot_source_event_truncate_guard
+            BEFORE TRUNCATE ON event_log
+            FOR EACH STATEMENT
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_event_prune();
+
+        CREATE OR REPLACE FUNCTION studiofs_reject_snapshot_source_prune()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF TG_OP = 'TRUNCATE' THEN
+                IF EXISTS (
+                    SELECT 1
+                    FROM snapshot_source_checkpoints AS s
+                    INNER JOIN snapshot_catalog AS c
+                        ON c.vol = s.vol AND c.id = s.snapshot_id
+                    WHERE c.lifecycle = 'creating'
+                       OR EXISTS (
+                           SELECT 1
+                           FROM snapshot_creation_leases AS l
+                           WHERE l.vol = s.vol
+                             AND l.snapshot_id = s.snapshot_id
+                             AND l.owner <> ''
+                             AND l.lease_expires_at > clock_timestamp()
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM snapshot_mount_leases AS l
+                           WHERE l.vol = s.vol
+                             AND l.snapshot_id = s.snapshot_id
+                             AND l.released_at IS NULL
+                             AND l.lease_expires_at > clock_timestamp()
+                       )
+                ) THEN
+                    RAISE EXCEPTION 'snapshot sources are still referenced'
+                        USING ERRCODE = 'restrict_violation';
+                END IF;
+                RETURN NULL;
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM snapshot_catalog AS c
+                WHERE c.vol = OLD.vol
+                  AND c.id = OLD.snapshot_id
+                  AND (
+                      c.lifecycle = 'creating'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM snapshot_creation_leases AS l
+                          WHERE l.vol = OLD.vol
+                            AND l.snapshot_id = OLD.snapshot_id
+                            AND l.owner <> ''
+                            AND l.lease_expires_at > clock_timestamp()
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM snapshot_mount_leases AS l
+                          WHERE l.vol = OLD.vol
+                            AND l.snapshot_id = OLD.snapshot_id
+                            AND l.released_at IS NULL
+                            AND l.lease_expires_at > clock_timestamp()
+                      )
+                  )
+            ) THEN
+                RAISE EXCEPTION 'snapshot source is still referenced'
+                    USING ERRCODE = 'restrict_violation';
+            END IF;
+            RETURN OLD;
+        END
+        $$;
+
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_prune_guard
+            ON snapshot_source_checkpoints;
+        CREATE TRIGGER studiofs_snapshot_source_prune_guard
+            BEFORE DELETE ON snapshot_source_checkpoints
+            FOR EACH ROW
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_prune();
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_truncate_guard
+            ON snapshot_source_checkpoints;
+        CREATE TRIGGER studiofs_snapshot_source_truncate_guard
+            BEFORE TRUNCATE ON snapshot_source_checkpoints
+            FOR EACH STATEMENT
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_prune();
 
         CREATE TABLE IF NOT EXISTS snapshot_artifacts (
             vol BIGINT NOT NULL,

@@ -223,7 +223,7 @@ pub struct SnapshotPayloadProof {
 }
 
 /// Reference to the immutable captured source used by a materializer.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotSourceDescriptor {
     /// Internal immutable source checkpoint key.
     pub checkpoint_id: String,
@@ -241,8 +241,16 @@ pub struct SnapshotSourceDescriptor {
     pub event_start_version: Option<i64>,
     /// Last event batch version included by the cut.
     pub event_end_version: Option<i64>,
+    /// Number of event rows captured for the bounded replay range.
+    pub event_row_count: i64,
     /// SHA-256 proof for the immutable checkpoint bytes.
     pub replay_proof: SnapshotSha256,
+}
+
+impl std::fmt::Debug for SnapshotSourceDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SnapshotSourceDescriptor(REDACTED)")
+    }
 }
 
 /// Result of reconstructing one immutable source artifact.
@@ -383,6 +391,11 @@ pub trait SnapshotPolicyStore: Send + Sync {
 
 /// Reconstructs the immutable read model for a captured cut.
 pub trait SnapshotSourceReader: Send + Sync {
+    /// Loads the immutable source descriptor for a captured snapshot.
+    fn load_descriptor<'a>(
+        &'a self,
+        snapshot_id: &'a SnapshotId,
+    ) -> SnapshotPortFuture<'a, SnapshotSourceDescriptor>;
     /// Writes a reconstruction below the caller-owned temporary root.
     fn reconstruct<'a>(
         &'a self,

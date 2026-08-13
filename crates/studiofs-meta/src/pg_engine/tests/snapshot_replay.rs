@@ -1,9 +1,10 @@
 use super::{PgTestVolume, pg_dsn, run_async, seed_local};
-use crate::engine::{MetaFsOps, MetaInodes, MetaNamespace, MetaReplication};
+use crate::engine::{MetaError, MetaFsOps, MetaInodes, MetaNamespace, MetaReplication};
 use crate::pg_engine::{PgMetaEngine, PgOpenOptions};
 use crate::redb_engine::RedbMetaEngine;
 use crate::schema::ROOT_INO;
 use crate::snapshot::{SnapshotOrigin, SnapshotRetention};
+use crate::snapshot_ports::SnapshotSourceReader;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use tempfile::TempDir;
@@ -140,6 +141,30 @@ fn remote_payload_metrics(dsn: &str, volume_id: i64) -> (i64, i64, i64) {
     .expect("read remote payload metrics")
 }
 
+fn reconstruct_from_production_source_port(
+    claimant: &std::sync::Arc<PgMetaEngine>,
+    snapshot_id: &crate::snapshot::SnapshotId,
+    cut: crate::snapshot::SnapshotCut,
+    destination: PathBuf,
+) -> PathBuf {
+    let claimant = std::sync::Arc::clone(claimant);
+    let runtime_engine = std::sync::Arc::clone(&claimant);
+    let snapshot_id = snapshot_id.clone();
+    runtime_engine
+        .run_async(async move {
+            let descriptor = claimant
+                .load_descriptor(&snapshot_id)
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            claimant
+                .reconstruct(&cut, &descriptor, &destination)
+                .await
+                .map(|reconstruction| reconstruction.path)
+                .map_err(|error| MetaError::Storage(error.to_string()))
+        })
+        .expect("production source port reconstructs captured cut")
+}
+
 fn assert_present(meta: &RedbMetaEngine, name: &[u8]) {
     assert!(meta.lookup(ROOT_INO, name).is_ok(), "expected {:?}", name);
 }
@@ -197,10 +222,13 @@ fn reconstructs_exact_cut_and_excludes_later_events() {
 
     let replay_dir = snapshot_replay_tempdir("exact-cut-");
     let destination = replay_dir.path().join("meta.redb");
-    let reconstruction = claimant
-        .reconstruct_snapshot_source(&entry.snapshot_id, &destination)
-        .expect("claimant reconstructs captured cut");
-    let reconstructed = RedbMetaEngine::open(&reconstruction.path).expect("open reconstruction");
+    let reconstruction = reconstruct_from_production_source_port(
+        &claimant,
+        &entry.snapshot_id,
+        entry.cut,
+        destination,
+    );
+    let reconstructed = RedbMetaEngine::open(&reconstruction).expect("open reconstruction");
 
     assert_present(&reconstructed, b"before-cut");
     assert_present(&reconstructed, b"at-cut");
@@ -237,10 +265,13 @@ fn captured_checkpoint_bytes_survive_serving_checkpoint_replacement() {
 
     let replay_dir = snapshot_replay_tempdir("replacement-");
     let destination = replay_dir.path().join("meta.redb");
-    let reconstruction = engine
-        .reconstruct_snapshot_source(&entry.snapshot_id, &destination)
-        .expect("reconstruct from retained source bytes");
-    let reconstructed = RedbMetaEngine::open(&reconstruction.path).expect("open reconstruction");
+    let reconstruction = reconstruct_from_production_source_port(
+        &engine,
+        &entry.snapshot_id,
+        entry.cut,
+        destination,
+    );
+    let reconstructed = RedbMetaEngine::open(&reconstruction).expect("open reconstruction");
 
     assert_present(&reconstructed, b"original-cut");
     assert_absent(&reconstructed, b"newer-serving-state");

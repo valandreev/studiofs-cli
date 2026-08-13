@@ -937,6 +937,9 @@ mod tests {
         assert!(ddl.contains("checkpoint_version BIGINT"));
         assert!(ddl.contains("event_start_version BIGINT"));
         assert!(ddl.contains("event_end_version BIGINT"));
+        assert!(ddl.contains("event_row_count BIGINT"));
+        assert!(ddl.contains("studiofs_snapshot_source_event_prune_guard"));
+        assert!(ddl.contains("studiofs_snapshot_source_prune_guard"));
         assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
         assert!(!ddl.contains("snapshot_payload"));
         assert!(!ddl.contains("pinned_object_ids"));

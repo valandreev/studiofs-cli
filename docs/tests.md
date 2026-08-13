@@ -61,6 +61,18 @@ cargo test -p studiofs init_pg_schema_provisions_volume_encryption_metadata -- -
 cargo test -p studiofs init_repairs_existing_schema_before_volume_guard -- --ignored --nocapture
 ```
 
+### SFS-36 Snapshot Source Replay Regressions
+
+These focused PostgreSQL tests require `STUDIOFS_TEST_PG_DSN` with a local
+PostgreSQL instance:
+
+```powershell
+cargo test -p studiofs-meta capture_is_one_transaction_and_one_durable_job -- --ignored --nocapture
+cargo test -p studiofs-meta reconstructs_exact_cut_and_excludes_later_events -- --ignored --nocapture
+cargo test -p studiofs-meta captured_checkpoint_bytes_survive_serving_checkpoint_replacement -- --ignored --nocapture
+cargo test -p studiofs-meta many_snapshots_do_not_grow_serving_checkpoint_or_event_payloads -- --ignored --nocapture
+```
+
 ### SFS-647 Secret Redaction and Error Category Regressions
 
 Run these focused checks when changing persisted-config diagnostics, PostgreSQL
@@ -473,6 +485,10 @@ regressions:
   - `pending_slice_commit_returns_retryable_error_after_metadata_retry_exhaustion`
 
 - Recovery and replay
+  - `capture_is_one_transaction_and_one_durable_job`
+  - `reconstructs_exact_cut_and_excludes_later_events`
+  - `captured_checkpoint_bytes_survive_serving_checkpoint_replacement`
+  - `many_snapshots_do_not_grow_serving_checkpoint_or_event_payloads`
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
   - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
   - `sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg`

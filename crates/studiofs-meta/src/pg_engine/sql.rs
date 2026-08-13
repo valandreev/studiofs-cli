@@ -60,7 +60,8 @@ pub(super) const SELECT_SNAPSHOT_SOURCE: &str = r#"
         s.event_start_seq,
         s.event_end_seq,
         s.event_start_version,
-        s.event_end_version
+        s.event_end_version,
+        s.event_row_count
     FROM snapshot_catalog AS c
     INNER JOIN snapshot_source_checkpoints AS s
         ON s.vol = c.vol AND s.snapshot_id = c.id
