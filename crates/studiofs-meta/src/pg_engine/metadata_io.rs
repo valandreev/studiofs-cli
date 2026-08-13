@@ -1,4 +1,4 @@
-//! Owns remote serving-checkpoint reads and local checkpoint import.
+//! Owns remote metadata snapshot reads and local checkpoint import.
 
 #[cfg(test)]
 use super::RemoteApplyCoordinator;
