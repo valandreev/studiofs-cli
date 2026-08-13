@@ -941,7 +941,9 @@ mod tests {
         assert!(ddl.contains("studiofs_snapshot_source_event_prune_guard"));
         assert!(ddl.contains("studiofs_snapshot_source_prune_guard"));
         assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
-        assert!(!ddl.contains("snapshot_payload"));
+        assert!(ddl.contains("snapshot_payload_upload_objects"));
+        assert!(ddl.contains("snapshot_payload_upload_fragments"));
+        assert!(ddl.contains("snapshot_payload_reconcile_cursors"));
         assert!(!ddl.contains("pinned_object_ids"));
     }
 }

@@ -1,5 +1,6 @@
 //! Backend-agnostic Snapshot v2 ports.
 
+use crate::engine::MetaResult;
 use crate::schema::PayloadRef;
 use crate::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob, SnapshotCreationLease,
@@ -137,6 +138,72 @@ fn safe_token(value: &str) -> String {
 /// Future returned by an asynchronous Snapshot v2 port.
 pub type SnapshotPortFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SnapshotPortError>> + Send + 'a>>;
+
+/// One immutable fragment row that has been accepted by the upload ledger.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UploadedFragmentLedgerEntry {
+    /// Volume owning the payload object.
+    pub volume_id: VolumeId,
+    /// Never-reused payload object identity.
+    pub object_id: u64,
+    /// Zero-based fragment number.
+    pub fragment_index: u32,
+    /// Validated configured-prefix object key.
+    pub object_key: String,
+    /// Expected remote byte length.
+    pub expected_byte_length: u64,
+    /// Expected full-fragment SHA-256 digest.
+    pub expected_sha256: [u8; 32],
+}
+
+/// One bounded PostgreSQL reconciliation claim for an uploaded fragment.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UploadedFragmentReconciliationClaim {
+    /// Immutable fragment proof selected by the claim.
+    pub entry: UploadedFragmentLedgerEntry,
+    /// Monotonic fence owned by the reconciliation worker.
+    pub fencing_token: i64,
+}
+
+/// Result of a bounded remote-proof reconciliation attempt.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UploadedFragmentReconciliationOutcome {
+    /// Remote bytes match the durable fragment proof; normal janitor grace now
+    /// governs eventual deletion if the object is never published.
+    RemoteConfirmed,
+    /// Remote proof was unavailable or mismatched; retry after the lease window.
+    Retryable,
+}
+
+/// PostgreSQL operations needed by an upload worker to leave durable proof
+/// before and after each remote fragment PUT.
+pub trait UploadedFragmentLedger: Send + Sync {
+    /// Returns the metadata volume identity used by the ledger.
+    fn fragment_ledger_volume_id(&self) -> MetaResult<VolumeId>;
+
+    /// Claims one bounded page of upload fragments for remote reconciliation.
+    fn claim_uploaded_fragment_reconciliation(
+        &self,
+        owner: &str,
+    ) -> MetaResult<Vec<UploadedFragmentReconciliationClaim>>;
+
+    /// Completes a reconciliation claim if its fencing token is still current.
+    fn finish_uploaded_fragment_reconciliation(
+        &self,
+        owner: &str,
+        claim: &UploadedFragmentReconciliationClaim,
+        outcome: UploadedFragmentReconciliationOutcome,
+    ) -> MetaResult<()>;
+
+    /// Records an upload attempt before remote I/O.
+    fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
+
+    /// Records remote stat/read/hash confirmation after remote I/O.
+    fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
+
+    /// Marks all durable upload-ledger rows deleted after remote cleanup.
+    fn mark_uploaded_object_deleted(&self, object_id: u64) -> MetaResult<()>;
+}
 
 /// Stable identity of one materializer worker.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize)]

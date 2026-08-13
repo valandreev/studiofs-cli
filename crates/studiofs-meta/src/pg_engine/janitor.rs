@@ -95,15 +95,47 @@ impl PgMetaEngine {
                 "janitor snapshot pin query",
                 move |client| {
                     Box::pin(async move {
+                        let bootstrap_ready = client
+                            .query_opt(
+                                "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres janitor snapshot bootstrap query failed",
+                                    e,
+                                )
+                            })?;
+                        if bootstrap_ready.is_none() {
+                            return Err(MetaError::Storage(
+                                "snapshot reachability bootstrap incomplete".to_owned(),
+                            ));
+                        }
                         client
                             .query(
-                                "SELECT DISTINCT proof.object_id
-                                 FROM snapshot_artifact_payload_proofs proof
-                                 JOIN snapshot_catalog catalog
-                                   ON catalog.vol = proof.vol
-                                  AND catalog.id = proof.snapshot_id
-                                 WHERE proof.vol = $1
-                                   AND catalog.lifecycle IN ('creating', 'ready', 'deleting')",
+                                "SELECT DISTINCT reachability.object_id
+                                 FROM snapshot_object_reachability AS reachability
+                                 JOIN snapshot_catalog AS catalog
+                                   ON catalog.vol = reachability.vol
+                                  AND catalog.cut_version >= reachability.start_version
+                                  AND (reachability.end_version IS NULL
+                                       OR catalog.cut_version < reachability.end_version)
+                                 WHERE reachability.vol = $1
+                                   AND (
+                                       catalog.lifecycle IN ('creating', 'ready')
+                                       OR (
+                                           catalog.lifecycle = 'deleting'
+                                           AND EXISTS (
+                                               SELECT 1
+                                               FROM snapshot_mount_leases AS mount_lease
+                                               WHERE mount_lease.vol = catalog.vol
+                                                 AND mount_lease.snapshot_id = catalog.id
+                                                 AND mount_lease.released_at IS NULL
+                                                 AND mount_lease.lease_expires_at > clock_timestamp()
+                                           )
+                                       )
+                                   )",
                                 &[&volume_id],
                             )
                             .await
@@ -130,37 +162,6 @@ impl PgMetaEngine {
             pins.insert(object_id);
         }
         Ok(pins)
-    }
-
-    pub(super) fn load_pg_snapshot_gc_is_blocked(&self) -> MetaResult<bool> {
-        let command_pool = self.command_pool.clone();
-        let volume_id = self.volume_id;
-        let command_timeout = self.command_timeout;
-        self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                command_pool,
-                command_timeout,
-                "janitor snapshot creation check",
-                move |client| {
-                    Box::pin(async move {
-                        let row = client
-                            .query_one(
-                                "SELECT EXISTS (SELECT 1 FROM snapshot_catalog WHERE vol = $1 AND lifecycle = 'creating')",
-                                &[&volume_id],
-                            )
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres janitor snapshot creation check failed",
-                                    e,
-                                )
-                            })?;
-                        Ok(row.get(0))
-                    })
-                },
-            )
-            .await
-        })
     }
 }
 

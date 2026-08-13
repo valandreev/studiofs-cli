@@ -23,10 +23,6 @@ impl MetaEngineCore for PgMetaEngine {
         self.load_pg_global_snapshot_pins()
     }
 
-    fn snapshot_gc_is_blocked(&self) -> MetaResult<bool> {
-        self.load_pg_snapshot_gc_is_blocked()
-    }
-
     fn acquire_file_lock_lease(
         &self,
         ino: Ino,

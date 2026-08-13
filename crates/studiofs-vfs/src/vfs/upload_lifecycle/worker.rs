@@ -5,6 +5,7 @@ use crate::utils::now_unix_millis;
 use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use studiofs_meta::schema::{
     ResolvedSliceSpan, SliceId, SliceOrder, SliceRange, SliceRecord, block_index_from_offset,
     chunk_id_from_offset, chunk_start_offset,
 };
+use studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -1637,7 +1639,12 @@ struct VfsRemoteUploadPort {
 }
 
 impl VfsRemoteUploadPort {
-    fn build_fragments(raw_payload: Bytes) -> VfsResult<Vec<Buffer>> {
+    fn build_fragments(
+        raw_payload: Bytes,
+        volume_id: studiofs_meta::snapshot::VolumeId,
+        object_id: u64,
+        fragment_keys: &[String],
+    ) -> VfsResult<Vec<(String, Buffer, UploadedFragmentLedgerEntry)>> {
         let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
         for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
             let start = fragment_index * CLOUD_FRAGMENT_SIZE;
@@ -1647,7 +1654,24 @@ impl VfsRemoteUploadPort {
             } else {
                 Bytes::new()
             };
-            fragments.push(create_object_buffer(fragment_payload)?);
+            let payload = create_object_buffer(fragment_payload)?;
+            let expected_bytes = payload.clone().to_bytes();
+            let expected_sha256 = Sha256::digest(&expected_bytes).into();
+            let Some(object_key) = fragment_keys.get(fragment_index).cloned() else {
+                continue;
+            };
+            fragments.push((
+                object_key.clone(),
+                payload,
+                UploadedFragmentLedgerEntry {
+                    volume_id,
+                    object_id,
+                    fragment_index: fragment_index as u32,
+                    object_key,
+                    expected_byte_length: expected_bytes.len() as u64,
+                    expected_sha256,
+                },
+            ));
         }
         Ok(fragments)
     }
@@ -1742,25 +1766,110 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         else {
             return UploadPutOutcome::Cancelled;
         };
-        let object_bytes = match Self::build_fragments(raw_payload) {
-            Ok(fragments) => fragments,
+        let meta = self.vfs.meta.clone();
+        let volume_id = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.fragment_ledger_volume_id()
+        })
+        .await
+        {
+            Ok(volume_id) => volume_id,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let uploads = fragment_keys.iter().zip(object_bytes).enumerate().map(
-            |(fragment_index, (key, payload))| {
-                let key = key.clone();
-                let cancel_token = cancel_token.clone();
-                async move {
-                    let err_key = key.clone();
-                    self.vfs
-                        .upload_scheduler
-                        .put(&key, payload, &cancel_token)
-                        .await
-                        .map(|_| (fragment_index, key))
-                        .map_err(|error| (fragment_index, err_key, error))
-                }
-            },
-        );
+        let object_bytes =
+            match Self::build_fragments(raw_payload, volume_id, op.object_id, fragment_keys) {
+                Ok(fragments) => fragments,
+                Err(error) => return UploadPutOutcome::Failed(error),
+            };
+        let uploads =
+            object_bytes
+                .into_iter()
+                .enumerate()
+                .map(|(fragment_index, (key, payload, entry))| {
+                    let cancel_token = cancel_token.clone();
+                    async move {
+                        let err_key = key.clone();
+                        if cancel_token.is_cancelled() {
+                            return Err((fragment_index, err_key, None));
+                        }
+                        let begin_entry = entry.clone();
+                        if let Err(error) =
+                            run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                                engine.begin_fragment_upload(&begin_entry)
+                            })
+                            .await
+                        {
+                            return Err((fragment_index, err_key, Some(error.to_string())));
+                        }
+                        if let Err(error) = self
+                            .vfs
+                            .upload_scheduler
+                            .put(&key, payload, &cancel_token)
+                            .await
+                        {
+                            return match error {
+                                crate::upload::UploadError::Cancelled => {
+                                    Err((fragment_index, err_key, None))
+                                }
+                                error => Err((
+                                    fragment_index,
+                                    err_key,
+                                    Some(format!("fragment upload failed: {error}")),
+                                )),
+                            };
+                        }
+                        let proof = run_with_timeout_or_cancel(
+                            &cancel_token,
+                            Duration::from_secs(5),
+                            self.vfs.fetch_scheduler.data_store().get_by_key(&key),
+                        )
+                        .await;
+                        match proof {
+                            TimeoutOrCancel::Cancelled => {
+                                return Err((fragment_index, err_key, None));
+                            }
+                            TimeoutOrCancel::TimedOut => {
+                                return Err((
+                                    fragment_index,
+                                    err_key,
+                                    Some("fragment upload proof timed out".to_string()),
+                                ));
+                            }
+                            TimeoutOrCancel::Completed(Err(_)) => {
+                                return Err((
+                                    fragment_index,
+                                    err_key,
+                                    Some("fragment upload proof read failed".to_string()),
+                                ));
+                            }
+                            TimeoutOrCancel::Completed(Ok(remote_payload)) => {
+                                let remote_bytes = remote_payload.to_bytes();
+                                let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
+                                if remote_bytes.len() as u64 != entry.expected_byte_length
+                                    || remote_sha256 != entry.expected_sha256
+                                {
+                                    return Err((
+                                        fragment_index,
+                                        err_key,
+                                        Some(
+                                            "fragment upload proof did not match expected bytes"
+                                                .to_string(),
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        let confirm_entry = entry.clone();
+                        if let Err(error) =
+                            run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                                engine.confirm_fragment_uploaded(&confirm_entry)
+                            })
+                            .await
+                        {
+                            return Err((fragment_index, err_key, Some(error.to_string())));
+                        }
+                        Ok((fragment_index, key))
+                    }
+                });
         let done = join_all(uploads).await;
 
         let mut first_error = None;
@@ -1777,10 +1886,10 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                         "process_upload fragment put completed"
                     );
                 }
-                Err((_, _, crate::upload::UploadError::Cancelled)) => {
+                Err((_, _, None)) => {
                     saw_cancel = true;
                 }
-                Err((fragment_index, key, error)) => {
+                Err((fragment_index, key, Some(error))) => {
                     if first_error.is_none() {
                         first_error = Some((fragment_index, key, error));
                     }
@@ -2331,6 +2440,27 @@ mod tests {
         assert_eq!(post_put_visibility_delay(2), Duration::from_millis(100));
         assert_eq!(post_put_visibility_delay(6), Duration::from_millis(1_000));
         assert_eq!(post_put_visibility_delay(32), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn built_fragment_proofs_match_encoded_remote_bytes() {
+        let keys = format_object_fragment_keys("data", 42);
+        let fragments = VfsRemoteUploadPort::build_fragments(
+            Bytes::from_static(b"fragment-proof"),
+            7,
+            42,
+            &keys,
+        )
+        .expect("build upload fragments");
+
+        assert_eq!(fragments.len(), CLOUD_FRAGMENT_COUNT);
+        for (key, buffer, entry) in fragments {
+            let bytes = buffer.to_bytes();
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            assert_eq!(key, entry.object_key);
+            assert_eq!(bytes.len() as u64, entry.expected_byte_length);
+            assert_eq!(digest, entry.expected_sha256);
+        }
     }
 
     #[test]

@@ -265,6 +265,8 @@ pub(crate) mod snapshot_control;
 mod snapshot_jobs;
 #[path = "pg_engine/snapshot_policy.rs"]
 mod snapshot_policy;
+#[path = "pg_engine/snapshot_reachability.rs"]
+pub(crate) mod snapshot_reachability;
 #[path = "pg_engine/sql.rs"]
 mod sql;
 use janitor::PgJanitorLock;
@@ -388,6 +390,13 @@ impl PgMetaEngine {
                                     ('snapshot_mount_leases'::TEXT),
                                     ('snapshot_policies'::TEXT),
                                     ('snapshot_source_checkpoints'::TEXT),
+                                    ('snapshot_current_references'::TEXT),
+                                    ('snapshot_object_reachability'::TEXT),
+                                    ('snapshot_reachability_batches'::TEXT),
+                                    ('snapshot_reachability_bootstrap'::TEXT),
+                                    ('snapshot_payload_upload_objects'::TEXT),
+                                    ('snapshot_payload_upload_fragments'::TEXT),
+                                    ('snapshot_payload_reconcile_cursors'::TEXT),
                                     ('snapshot_artifacts'::TEXT),
                                     ('snapshot_artifact_payload_proofs'::TEXT),
                                     ('snapshot_artifact_attempts'::TEXT)
@@ -453,6 +462,7 @@ impl PgMetaEngine {
                 "PgMetaEngine open requested for non-Postgres volume".to_string(),
             ));
         }
+        let metadata_sync_succeeded;
         if repair_local_graph_recovery_pending {
             // A crash can persist the durable repair marker before the caller
             // resets these cursors. Reset them here as well, before any remote
@@ -571,6 +581,7 @@ impl PgMetaEngine {
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
             )?;
             engine.sync_metadata_to_current_head()?;
+            metadata_sync_succeeded = true;
             engine.restore_pending_state_from_local_log()?;
             engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
             engine
@@ -588,13 +599,22 @@ impl PgMetaEngine {
                     "postgres metadata startup snapshot pull failed; continuing from local state"
                 );
             }
-            if let Err(error) = engine.sync_metadata_to_current_head() {
+            metadata_sync_succeeded = if let Err(error) = engine.sync_metadata_to_current_head() {
                 warn!(
                     error = %error,
                     "postgres metadata startup catch-up did not reach the current remote head"
                 );
-            }
+                false
+            } else {
+                true
+            };
             engine.restore_pending_state_from_local_log()?;
+        }
+        if metadata_sync_succeeded && let Err(error) = engine.backfill_current_reference_ledger() {
+            warn!(
+                error = %error,
+                "postgres snapshot reachability bootstrap did not complete; janitor will remain conservative"
+            );
         }
         engine.cache_client_slot(client_slot);
         engine.bootstrap_allocator_state();

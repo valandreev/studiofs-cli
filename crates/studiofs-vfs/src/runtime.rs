@@ -7,6 +7,7 @@ use studiofs_meta::engine::{
     MetadataReplicationBacklog, MetadataWriteObservability, PendingCreateRecord, UndoLogKind,
     UndoLogRecord,
 };
+use studiofs_meta::snapshot_ports::UploadedFragmentLedger;
 use studiofs_meta::{
     AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
     InodeLifecycleRecord, MetaAcl, MetaEngine, MetaEngineCore, MetaFormat, MetaFsOps, MetaGc,
@@ -81,6 +82,7 @@ pub trait VfsMeta:
     + MetaXattr
     + MetaAcl
     + MetaReplication
+    + UploadedFragmentLedger
 {
     /// Return local metadata write timing through the runtime metadata facade.
     ///
@@ -106,7 +108,8 @@ where
         + MetaSymlink
         + MetaXattr
         + MetaAcl
-        + MetaReplication,
+        + MetaReplication
+        + UploadedFragmentLedger,
 {
     fn vfs_metadata_write_observability(&self) -> MetadataWriteObservability {
         MetaEngineCore::metadata_write_observability(self)
@@ -192,12 +195,36 @@ impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
     );
 }
 
+impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaHandle<M> {
+    forward_method!(fn fragment_ledger_volume_id(
+        &self,
+    ) -> MetaResult<studiofs_meta::snapshot::VolumeId>);
+    forward_method!(fn claim_uploaded_fragment_reconciliation(
+        &self,
+        owner: &str,
+    ) -> MetaResult<Vec<studiofs_meta::snapshot_ports::UploadedFragmentReconciliationClaim>>);
+    forward_method!(fn finish_uploaded_fragment_reconciliation(
+        &self,
+        owner: &str,
+        claim: &studiofs_meta::snapshot_ports::UploadedFragmentReconciliationClaim,
+        outcome: studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome,
+    ) -> MetaResult<()>);
+    forward_method!(fn begin_fragment_upload(
+        &self,
+        entry: &studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry,
+    ) -> MetaResult<()>);
+    forward_method!(fn confirm_fragment_uploaded(
+        &self,
+        entry: &studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry,
+    ) -> MetaResult<()>);
+    forward_method!(fn mark_uploaded_object_deleted(&self, object_id: u64) -> MetaResult<()>);
+}
+
 impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn metadata_write_observability(&self) -> MetadataWriteObservability);
     forward_method!(fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>);
     forward_method!(fn release_global_janitor_lock(&self) -> MetaResult<()>);
     forward_method!(fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>);
-    forward_method!(fn snapshot_gc_is_blocked(&self) -> MetaResult<bool>);
     forward_method!(
         fn acquire_file_lock_lease(
             &self,
