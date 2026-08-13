@@ -524,8 +524,8 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
         vec![(ino, encode(&base_state).expect("encode base snapshot"))]
     );
     assert_eq!(
-        engine.export_regular_file_base_snapshot().unwrap(),
-        snapshot.regular_file_base
+        engine.export_regular_file_base_states().unwrap(),
+        vec![(ino, base_state.clone())]
     );
     let imported = temp_engine();
     imported.import_snapshot(&snapshot).unwrap();

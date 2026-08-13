@@ -1,6 +1,5 @@
 //! Snapshot v2 materialization and publication worker.
 
-use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
 use sha2::{Digest, Sha256};
@@ -16,17 +15,20 @@ use studiofs_data::snapshot_key::{
     SnapshotArtifactKey, SnapshotArtifactKeyError, SnapshotArtifactPrefix,
 };
 use studiofs_data::{DataStore, store::DataError};
-use studiofs_meta::schema::{PayloadRef, PayloadRefState, RegularFileBaseState};
+use studiofs_meta::schema::{PayloadRef, PayloadRefState};
+#[cfg(test)]
+use studiofs_meta::snapshot::SnapshotCatalogEntry;
 use studiofs_meta::snapshot::{
-    SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotId, SnapshotSha256,
-    SnapshotVolumeContext,
+    SnapshotArtifactDescriptor, SnapshotId, SnapshotSha256, SnapshotVolumeContext,
 };
+#[cfg(test)]
+use studiofs_meta::snapshot_ports::SnapshotClaimOrFollow;
 use studiofs_meta::snapshot_ports::{
     SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator, SnapshotArtifactScope,
-    SnapshotArtifactStore, SnapshotClaimOrFollow, SnapshotClock, SnapshotFailure, SnapshotJobClaim,
-    SnapshotJobStore, SnapshotPayloadBytes, SnapshotPayloadProof, SnapshotPayloadReader,
-    SnapshotPortError, SnapshotPortFuture, SnapshotRetry, SnapshotSourceReader,
-    SnapshotStoredArtifact, SnapshotWorkerId,
+    SnapshotArtifactStore, SnapshotClock, SnapshotFailure, SnapshotJobClaim, SnapshotJobStore,
+    SnapshotPayloadBytes, SnapshotPayloadProof, SnapshotPayloadReader, SnapshotPortError,
+    SnapshotPortFuture, SnapshotRetry, SnapshotSourceReader, SnapshotStoredArtifact,
+    SnapshotWorkerId,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -351,9 +353,9 @@ impl DataStoreSnapshotPayloadReader {
                 "snapshot payload range exceeds object",
             ));
         }
-        let bytes = Bytes::copy_from_slice(&object[start..end]);
+        let bytes = &object[start..end];
         Ok(SnapshotPayloadBytes {
-            sha256: digest(&bytes),
+            sha256: digest(bytes),
             bytes: bytes.to_vec(),
         })
     }
@@ -539,7 +541,8 @@ impl SnapshotWorker {
     }
 
     /// Claims a requested ID or follows its durable catalog until it is Ready.
-    pub async fn claim_or_follow(
+    #[cfg(test)]
+    async fn claim_or_follow(
         &self,
         snapshot_id: SnapshotId,
         cancel: CancellationToken,
@@ -718,9 +721,7 @@ impl SnapshotWorker {
         claim: &SnapshotJobClaim,
         cancel: &CancellationToken,
     ) -> Result<(), SnapshotWorkerError> {
-        let attempt = u64::from(claim.job.retry_count).checked_add(1).ok_or(
-            SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidPayloadRange),
-        )?;
+        let attempt = u64::from(claim.job.retry_count) + 1;
         let attempt_locator = SnapshotArtifactLocator {
             volume_id: self.volume.volume_id,
             volume_uuid: self.volume.volume_uuid.clone(),
@@ -867,12 +868,38 @@ impl SnapshotWorker {
     }
 
     async fn cleanup_materializer(&self, path: &Path, snapshot_id: &SnapshotId) {
-        if let Err(error) = tokio::fs::remove_dir_all(path).await {
-            tracing::warn!(
-                snapshot_id = %snapshot_id,
-                error = %error,
-                "snapshot materializer cleanup failed"
-            );
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    snapshot_id = %snapshot_id,
+                    error = %error,
+                    "snapshot materializer cleanup failed"
+                );
+                return;
+            }
+        }
+        let mut parent = path.parent();
+        for _ in 0..2 {
+            let Some(candidate) = parent else {
+                break;
+            };
+            match tokio::fs::remove_dir(candidate).await {
+                Ok(()) => parent = candidate.parent(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    parent = candidate.parent();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                Err(error) => {
+                    tracing::warn!(
+                        snapshot_id = %snapshot_id,
+                        error = %error,
+                        "snapshot materializer parent cleanup failed"
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -1045,14 +1072,11 @@ async fn collect_published_payloads(path: PathBuf) -> Result<Vec<PayloadRef>, Sn
         let engine = studiofs_meta::RedbMetaEngine::open(&path).map_err(|_| {
             SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
         })?;
-        let regular_file_base = engine.export_regular_file_base_snapshot().map_err(|_| {
+        let regular_file_base = engine.export_regular_file_base_states().map_err(|_| {
             SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
         })?;
         let mut payloads = BTreeMap::<(u64, u32, u32), PayloadRef>::new();
-        for (_, bytes) in regular_file_base {
-            let regular: RegularFileBaseState = postcard::from_bytes(&bytes).map_err(|_| {
-                SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
-            })?;
+        for (_, regular) in regular_file_base {
             for chunk in regular.chunks.values() {
                 for slice in chunk.slices.values() {
                     if slice.payload_state != PayloadRefState::Published {
@@ -1077,6 +1101,7 @@ async fn collect_published_payloads(path: PathBuf) -> Result<Vec<PayloadRef>, Sn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use chrono::{DateTime, TimeZone, Utc};
     use opendal::services::Memory;
     use std::path::{Path, PathBuf};
@@ -1838,6 +1863,13 @@ mod tests {
                 .join("1")
                 .exists()
         );
+        assert!(
+            !source_dir
+                .path()
+                .join("materializer")
+                .join(snapshot_id.as_str())
+                .exists()
+        );
     }
 
     fn published_payload_source(root: &Path) -> PathBuf {
@@ -1968,7 +2000,7 @@ mod tests {
                 claim: Mutex::new(Some(claim)),
                 claim_error: Mutex::new(None),
                 claim_count: AtomicUsize::new(0),
-                follow_lifecycle: Mutex::new(catalog.lifecycle.clone()),
+                follow_lifecycle: Mutex::new(catalog.lifecycle),
                 catalog,
                 published_artifact: Mutex::new(None),
                 failed_catalog: Mutex::new(None),
@@ -2018,11 +2050,7 @@ mod tests {
                     return Ok(SnapshotClaimOrFollow::Claimed(claim));
                 }
                 let mut catalog = self.catalog.clone();
-                catalog.lifecycle = self
-                    .follow_lifecycle
-                    .lock()
-                    .expect("follow lifecycle lock")
-                    .clone();
+                catalog.lifecycle = *self.follow_lifecycle.lock().expect("follow lifecycle lock");
                 Ok(SnapshotClaimOrFollow::Follow(catalog))
             })
         }

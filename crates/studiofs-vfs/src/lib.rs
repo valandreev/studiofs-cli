@@ -19,7 +19,7 @@ mod ordered_mutex;
 pub mod qos;
 pub mod readahead;
 mod runtime;
-pub mod snapshot_worker;
+mod snapshot_worker;
 pub mod upload;
 pub mod utils;
 pub mod vfs;
