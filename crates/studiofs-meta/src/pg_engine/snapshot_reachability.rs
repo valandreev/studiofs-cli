@@ -299,10 +299,10 @@ impl PgMetaEngine {
 
     pub(super) fn backfill_current_reference_ledger(&self) -> MetaResult<()> {
         let references = self.local.list_published_object_references()?;
-        let mut objects = BTreeSet::new();
-        for (_, object_id) in &references {
-            objects.insert(*object_id);
-        }
+        let objects = references
+            .iter()
+            .map(|(_, object_id)| *object_id)
+            .collect::<BTreeSet<_>>();
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;

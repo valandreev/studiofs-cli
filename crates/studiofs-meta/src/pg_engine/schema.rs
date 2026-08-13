@@ -440,8 +440,6 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 state IN ('uploading', 'uploaded', 'published', 'delete_pending', 'retry_wait', 'deleted')
             ),
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            upload_owner TEXT,
-            upload_lease_expires_at TIMESTAMPTZ,
             reconcile_owner TEXT,
             reconcile_lease_expires_at TIMESTAMPTZ,
             reconcile_fence BIGINT NOT NULL DEFAULT 0 CHECK (reconcile_fence >= 0),
@@ -470,7 +468,6 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
 
         CREATE TABLE IF NOT EXISTS snapshot_payload_reconcile_cursors (
             vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
-            uploaded_at TIMESTAMPTZ,
             object_id BIGINT NOT NULL DEFAULT 0 CHECK (object_id >= 0),
             fragment_index INTEGER NOT NULL DEFAULT 0 CHECK (fragment_index >= 0),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

@@ -1644,7 +1644,7 @@ impl VfsRemoteUploadPort {
         volume_id: studiofs_meta::snapshot::VolumeId,
         object_id: u64,
         fragment_keys: &[String],
-    ) -> VfsResult<Vec<(String, Buffer, UploadedFragmentLedgerEntry)>> {
+    ) -> VfsResult<Vec<(Buffer, UploadedFragmentLedgerEntry)>> {
         let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
         for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
             let start = fragment_index * CLOUD_FRAGMENT_SIZE;
@@ -1661,7 +1661,6 @@ impl VfsRemoteUploadPort {
                 continue;
             };
             fragments.push((
-                object_key.clone(),
                 payload,
                 UploadedFragmentLedgerEntry {
                     volume_id,
@@ -1784,9 +1783,10 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             object_bytes
                 .into_iter()
                 .enumerate()
-                .map(|(fragment_index, (key, payload, entry))| {
+                .map(|(fragment_index, (payload, entry))| {
                     let cancel_token = cancel_token.clone();
                     async move {
+                        let key = entry.object_key.clone();
                         let err_key = key.clone();
                         if cancel_token.is_cancelled() {
                             return Err((fragment_index, err_key, None));
@@ -2454,10 +2454,9 @@ mod tests {
         .expect("build upload fragments");
 
         assert_eq!(fragments.len(), CLOUD_FRAGMENT_COUNT);
-        for (key, buffer, entry) in fragments {
+        for (buffer, entry) in fragments {
             let bytes = buffer.to_bytes();
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            assert_eq!(key, entry.object_key);
             assert_eq!(bytes.len() as u64, entry.expected_byte_length);
             assert_eq!(digest, entry.expected_sha256);
         }
