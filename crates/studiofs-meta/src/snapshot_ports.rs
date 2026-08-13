@@ -375,6 +375,8 @@ pub struct SnapshotPayloadBytes {
 /// Stored artifact metadata returned by an artifact adapter.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotStoredArtifact {
+    /// Exact validated object key returned by the storage adapter.
+    pub object_key: String,
     /// Artifact locator.
     pub locator: SnapshotArtifactLocator,
     /// Byte length.

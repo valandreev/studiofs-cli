@@ -7,7 +7,9 @@ use studiofs_meta::engine::{
     MetadataReplicationBacklog, MetadataWriteObservability, PendingCreateRecord, UndoLogKind,
     UndoLogRecord,
 };
-use studiofs_meta::snapshot_ports::UploadedFragmentLedger;
+use studiofs_meta::snapshot_ports::{
+    SnapshotJobStore, SnapshotSourceReader, UploadedFragmentLedger,
+};
 use studiofs_meta::{
     AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
     InodeLifecycleRecord, MetaAcl, MetaEngine, MetaEngineCore, MetaFormat, MetaFsOps, MetaGc,
@@ -37,6 +39,28 @@ pub trait VfsCommitMeta: Send + Sync {
         &self,
         mutations: &[studiofs_meta::RegularFileOverlayMutation],
     ) -> MetaResult<Vec<Option<InodeAttr>>>;
+}
+
+/// Optional Snapshot v2 ports exposed through the runtime metadata facade.
+pub trait VfsSnapshotProvider: Send + Sync {
+    /// Returns the durable snapshot job store, when the backend supports it.
+    fn snapshot_job_store(&self) -> Option<Arc<dyn SnapshotJobStore>>;
+
+    /// Returns the immutable snapshot source reader, when the backend supports it.
+    fn snapshot_source_reader(&self) -> Option<Arc<dyn SnapshotSourceReader>>;
+}
+
+impl<T> VfsSnapshotProvider for T
+where
+    T: ?Sized + MetaEngine,
+{
+    fn snapshot_job_store(&self) -> Option<Arc<dyn SnapshotJobStore>> {
+        MetaEngine::snapshot_job_store(self)
+    }
+
+    fn snapshot_source_reader(&self) -> Option<Arc<dyn SnapshotSourceReader>> {
+        MetaEngine::snapshot_source_reader(self)
+    }
 }
 
 impl<T> VfsCommitMeta for T
@@ -70,6 +94,7 @@ pub trait VfsMeta:
     Send
     + Sync
     + VfsCommitMeta
+    + VfsSnapshotProvider
     + MetaEngineCore
     + MetaFormat
     + MetaInodes
@@ -97,6 +122,7 @@ where
         + Send
         + Sync
         + VfsCommitMeta
+        + VfsSnapshotProvider
         + MetaEngineCore
         + MetaFormat
         + MetaInodes
@@ -193,6 +219,11 @@ impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
             attr: Option<&InodeAttr>,
         ) -> MetaResult<Option<InodeAttr>>
     );
+}
+
+impl<M: ?Sized + VfsSnapshotProvider> VfsSnapshotProvider for RuntimeMetaHandle<M> {
+    forward_method!(fn snapshot_job_store(&self) -> Option<Arc<dyn SnapshotJobStore>>);
+    forward_method!(fn snapshot_source_reader(&self) -> Option<Arc<dyn SnapshotSourceReader>>);
 }
 
 impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaHandle<M> {

@@ -1,5 +1,13 @@
 use super::*;
+use crate::snapshot_worker::{
+    DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotWorker,
+    SnapshotWorkerConfig, SystemSnapshotClock,
+};
 use studiofs_cache::{LocalPayloadSyncMode, LocalPayloadWriteMode};
+use studiofs_meta::snapshot::SnapshotVolumeContext;
+use studiofs_meta::snapshot_ports::{
+    SnapshotArtifactStore, SnapshotPayloadReader, SnapshotWorkerId,
+};
 
 const UPLOAD_HOT_BUFFER_CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
@@ -434,10 +442,12 @@ impl VfsBootstrap {
             retry_base_ms: config.lock_retry_base_ms,
             retry_max_ms: config.lock_retry_max_ms,
         });
+        let snapshot_worker = build_snapshot_worker(meta.as_ref(), resources.data_write.clone());
 
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
             data_write: resources.data_write,
+            snapshot_worker,
             local_payload_backend: resources.local_payload_backend,
             cached_store: resources.cached_store.clone(),
             block_size,
@@ -533,6 +543,40 @@ impl VfsBootstrap {
         vfs.finalize_constructor_bootstrap()?;
         Ok(vfs)
     }
+}
+
+fn build_snapshot_worker(
+    meta: &dyn VfsMeta,
+    data_store: Arc<DataStore>,
+) -> Option<Arc<SnapshotWorker>> {
+    let jobs = meta.snapshot_job_store()?;
+    let sources = meta.snapshot_source_reader()?;
+    let format_info = meta.get_format_info().ok()?;
+    let postgres = format_info.metadata.postgres?;
+    let volume =
+        SnapshotVolumeContext::new(postgres.volume_id, format_info.name, format_info.uuid).ok()?;
+    let payloads: Arc<dyn SnapshotPayloadReader> =
+        Arc::new(DataStoreSnapshotPayloadReader::new(data_store.clone(), volume.clone()).ok()?);
+    let artifacts: Arc<dyn SnapshotArtifactStore> =
+        Arc::new(DataStoreSnapshotArtifactStore::new(data_store, volume.clone()).ok()?);
+    let worker_id = SnapshotWorkerId::new(format!(
+        "vfs-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .ok()?;
+    SnapshotWorker::new(
+        volume,
+        worker_id,
+        jobs,
+        sources,
+        payloads,
+        artifacts,
+        Arc::new(SystemSnapshotClock),
+        SnapshotWorkerConfig::new("target/snapshot-v2/materializer"),
+    )
+    .ok()
+    .map(Arc::new)
 }
 
 impl StudioVfs {

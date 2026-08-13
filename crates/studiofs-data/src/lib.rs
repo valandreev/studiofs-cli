@@ -7,6 +7,7 @@
 pub mod crypto;
 pub mod envelope;
 pub mod object;
+pub mod snapshot_key;
 pub mod store;
 
 pub use store::{

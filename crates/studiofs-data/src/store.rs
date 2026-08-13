@@ -1,6 +1,7 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
 use crate::crypto::{self, ObjectEncryptionContext, VolumeMasterKey};
+use crate::snapshot_key::{SnapshotArtifactKey, SnapshotArtifactPrefix};
 use futures::{Stream, StreamExt};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, EntryMode, Operator, services::S3};
@@ -583,6 +584,16 @@ impl DataStore {
         self.profile
     }
 
+    /// Return the normalized configured prefix used by typed storage keys.
+    pub fn data_prefix(&self) -> &str {
+        &self.config.data_prefix
+    }
+
+    /// Return the immutable volume UUID used by transparent object crypto.
+    pub fn volume_uuid(&self) -> &str {
+        &self.volume_uuid
+    }
+
     /// Get the S3 object key for a generic object (content-addressable).
     ///
     /// Format: `{configured_data_prefix}{ab}/{cd}/{id}` for IDs with at least
@@ -615,6 +626,16 @@ impl DataStore {
     /// buffers internally if vectored writes are unsupported.
     pub async fn put_by_key(&self, key: &str, data: impl Into<Buffer>) -> DataResult<()> {
         self.put_by_key_with_stats(key, data).await.map(|_| ())
+    }
+
+    /// Upload bytes under a validated Snapshot v2 artifact key.
+    pub async fn put_snapshot_artifact(
+        &self,
+        key: &SnapshotArtifactKey,
+        data: impl Into<Buffer>,
+    ) -> DataResult<()> {
+        self.validate_volume_key(key.as_str())?;
+        self.put_by_key(key.as_str(), data).await
     }
 
     /// Upload bytes to an already-formatted storage key and return crypto-safe byte counters.
@@ -652,6 +673,12 @@ impl DataStore {
         self.get_by_key_with_stats(key).await.map(|(data, _)| data)
     }
 
+    /// Download bytes under a validated Snapshot v2 artifact key.
+    pub async fn get_snapshot_artifact(&self, key: &SnapshotArtifactKey) -> DataResult<Buffer> {
+        self.validate_volume_key(key.as_str())?;
+        self.get_by_key(key.as_str()).await
+    }
+
     /// Download bytes from an already-formatted storage key and return crypto-safe byte counters.
     pub async fn get_by_key_with_stats(
         &self,
@@ -686,6 +713,11 @@ impl DataStore {
         Ok(())
     }
 
+    /// Delete a Snapshot v2 artifact by its validated typed key.
+    pub async fn delete_snapshot_artifact(&self, key: &SnapshotArtifactKey) -> DataResult<()> {
+        self.delete_by_key(key.as_str()).await
+    }
+
     /// Stream files below a validated storage prefix.
     ///
     /// Directory entries are skipped. Provider failures are yielded as
@@ -709,6 +741,14 @@ impl DataStore {
                 Err(error) => Some(Err(DataError::from(error))),
             })
         }))
+    }
+
+    /// Stream Snapshot v2 artifacts below a validated typed snapshot prefix.
+    pub async fn list_snapshot_artifacts(
+        &self,
+        prefix: &SnapshotArtifactPrefix,
+    ) -> DataResult<impl Stream<Item = DataResult<DataStoreObjectEntry>>> {
+        self.list_object_entries(prefix.as_str()).await
     }
 
     /// Check if the storage backend is accessible and the bucket exists.
