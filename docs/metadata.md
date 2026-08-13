@@ -22,15 +22,14 @@ sub-traits:
 - `MetaSymlink`
 - `MetaXattr`
 - `MetaAcl`
-- `MetaSnapshots`
 - `MetaReplication`
 
-`MetaEngineCore` now contains only cross-cutting engine responsibilities
-(global janitor lease + global snapshot pins), while filesystem and metadata
-operations are split across capability traits. Consumers can depend on narrower
-contracts instead of a single god-object surface. Capability traits are opt-in
-per backend (`impl MetaNamespace for ...`, etc.), so incomplete backend
-contracts fail at compile time.
+`MetaEngineCore` contains cross-cutting engine responsibilities such as the
+global janitor lease and published Snapshot v2 artifact proofs, while filesystem
+and metadata operations are split across capability traits. Consumers can
+depend on narrower contracts instead of a single god-object surface. Capability
+traits are opt-in per backend (`impl MetaNamespace for ...`, etc.), so incomplete
+backend contracts fail at compile time.
 
 ## Contract/Core Test Harness
 
@@ -65,9 +64,10 @@ Consumer-local bundles now define the active execution boundaries:
 - mount open/session bootstrap:
   - `MountOpenMeta = MetaFormat + MetaReplication`
   - used for UUID consistency checks and initial `FormatInfo` loading
-- snapshot mount source:
-  - `SnapshotSourceMeta = MetaSnapshots`
-  - used only to resolve and materialize snapshot payloads before VFS startup
+- snapshot source reconstruction:
+  - `SnapshotSourceReader`
+  - reads one retained PostgreSQL serving checkpoint and its bounded event range
+    into a clean replay database
 - mount runtime handoff:
   - `MountRuntimeMeta` narrows the post-resolution dependency to the VFS-facing
     runtime bundle instead of carrying `MetaEngine` through the mount path
@@ -309,28 +309,29 @@ flush/pull replication flow as other metadata events.
 - `event_log`
 - `metadata_state`
 - `acl_rules`
-- `snapshots`
+- `snapshot_catalog`
+- `snapshot_creation_jobs` / `snapshot_creation_leases`
+- `snapshot_source_checkpoints`
+- `snapshot_artifacts` and payload proofs
+- `snapshot_policies` and policy leases
 
 `event_log` is the runtime delta stream. `metadata_state` stores:
 - the monotonic `version`
-- the latest remote-visible checkpoint snapshot
+- the latest remote-visible `ServingCheckpoint` and its `checkpoint_version`
+- bounded bootstrap `format_info`, kept separate from serving state
 
-`snapshots` stores immutable historical views:
-- `id` (UUID)
-- `root_ino`
-- `created_at`
-- `state` (`pending`, `synced`, `failed`)
-- pinned object ids
-- serialized snapshot payload used for read-only snapshot mounts
+`snapshot_catalog` stores thin lifecycle/control rows. The immutable source
+row stores only the captured serving-checkpoint bytes, checksum, checkpoint
+version, and bounded event sequence/version boundaries. It contains no root-
+inode selection, object-id array, or read-only snapshot database payload.
 
 Current operational contract:
-- `pending` means the snapshot exists in local metadata but is not yet guaranteed
-  to be cluster-protected.
-- cluster-wide protection begins only after snapshot metadata is published
-  through PostgreSQL and visible to janitor / peer clients.
-- if PostgreSQL is unavailable, snapshot creation may still succeed locally, but
-  that snapshot is treated as a local-only administrative artifact until a
-  later reconcile/publish step completes.
+- `Creating` is a PostgreSQL-authoritative control-plane state; the retained
+  source is immutable while a worker may still claim the snapshot.
+- source reconstruction reads the retained checkpoint and only the recorded
+  event range, so later serving events cannot enter the cut.
+- artifact publication, Ready mounting, expiry, and deletion are follow-up
+  Snapshot v2 workflows; no local redb snapshot is authoritative for them.
 
 ## Consistency
 
@@ -404,9 +405,12 @@ The shared PostgreSQL schema uses:
 - `event_log`
   - append-only remote-visible metadata deltas
 - `metadata_state`
-  - per-volume checkpoint snapshot plus monotonic `version`
-- `snapshots`
-  - immutable historical views (definition + pinned object ids + payload)
+  - per-volume serving checkpoint, checkpoint cursor, format bootstrap bytes,
+    and monotonic `version`
+- `snapshot_catalog`
+  - thin Snapshot v2 lifecycle/control rows
+- `snapshot_source_checkpoints`
+  - immutable checkpoint bytes and bounded replay boundaries per captured cut
 
 Important cursor rule:
 - runtime pull follows `batch_version`, not `seq_id`
@@ -504,11 +508,10 @@ Still single-copy:
 Janitor policy:
 - the janitor must consult PostgreSQL before deleting remote objects for
   PostgreSQL-backed volumes.
-- snapshot pins published through PostgreSQL protect matching object ids from
+- published Snapshot v2 artifact payload proofs protect matching object ids from
   deletion.
-- local-only pending snapshots created while PostgreSQL is down are not yet part
-  of the cluster protection contract; they require a later reconcile/publish
-  step to become globally protected.
+- a Creating source remains retained by its PostgreSQL control-plane row until
+  the snapshot lifecycle can safely release it.
 
 ACL metadata follows the same base+overlay split:
 - `base_acl_rules`
@@ -691,18 +694,18 @@ Current conflict set:
 - inode is present in local symlink overlay
 - xattr key is present in local xattr overlay
 
-## Checkpoint Import / Export
+## Serving Checkpoint Import / Export
 
-### Import snapshot
+### Import serving checkpoint
 
-- checkpoint snapshot populates `base_inodes`, `base_dentries`,
+- a `ServingCheckpoint` populates `base_inodes`, `base_dentries`,
   `base_symlinks`, and `base_xattrs`
 - local symlink/xattr overlay tables and tombstones are cleared
 - serving view after import is still `overlay over base`
 
-### Export remote snapshot
+### Export serving checkpoint
 
-Checkpoint/exported remote-visible state must come from merged remote-visible
+Checkpoint/exported serving state must come from merged remote-visible
 view:
 
 1. Start from `base_*`

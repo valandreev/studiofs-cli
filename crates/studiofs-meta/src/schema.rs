@@ -1891,37 +1891,6 @@ pub struct RenameAtomicResult {
     pub displaced_ino: Option<Ino>,
 }
 
-/// Replication lifecycle of a filesystem snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotState {
-    /// Snapshot is created locally and awaiting remote replication.
-    #[default]
-    Pending,
-    /// Snapshot definition and pinned blocks are remotely visible.
-    Synced,
-    /// Snapshot replication failed and needs retry.
-    Failed,
-}
-
-/// Immutable filesystem snapshot descriptor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetadataSnapshot {
-    /// Globally unique snapshot id (UUID string).
-    pub id: String,
-    /// Inode chosen as snapshot mount root.
-    pub root_ino: Ino,
-    /// Creation time in Unix-nanos.
-    pub created_at: i64,
-    /// Replication state.
-    pub state: SnapshotState,
-    /// Object ids pinned by this snapshot.
-    pub pinned_object_ids: Vec<u64>,
-    /// Serialized metadata payload for historical mounts.
-    #[serde(default)]
-    pub snapshot_payload: Vec<u8>,
-}
-
 // =============================================================================
 // Tests
 // =============================================================================

@@ -31,7 +31,6 @@ pub mod operator_test;
 pub mod perf;
 pub mod runtime_tuning;
 pub mod settings;
-pub mod snapshot;
 pub mod status;
 pub mod test;
 #[cfg(not(unix))]
@@ -141,7 +140,6 @@ enum Commands {
     Dump(dump_load::DumpArgs),
     Load(dump_load::LoadArgs),
     Test(test::TestArgs),
-    Snapshot(snapshot::SnapshotArgs),
     Internal(internal::InternalArgs),
 }
 
@@ -163,7 +161,6 @@ impl Commands {
             Self::Dump(args) => args.dispatch(),
             Self::Load(args) => args.dispatch(),
             Self::Test(args) => args.dispatch(),
-            Self::Snapshot(args) => args.dispatch(),
             Self::Internal(args) => args.dispatch(),
         }
     }

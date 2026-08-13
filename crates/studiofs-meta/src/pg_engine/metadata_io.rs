@@ -1,10 +1,11 @@
-//! Owns remote metadata snapshot reads and local snapshot import.
+//! Owns remote metadata snapshot reads and local checkpoint import.
 
 #[cfg(test)]
 use super::RemoteApplyCoordinator;
 use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
 use crate::engine::{MetaError, MetaResult};
 use crate::events::{MetaEvent, encode_event};
+use crate::snapshot::ServingCheckpoint;
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
@@ -47,7 +48,7 @@ impl PgMetaEngine {
                             .await
                             .map_err(|e| {
                                 Self::classify_pg_error(
-                                    "postgres snapshot payload select failed",
+                                    "postgres serving checkpoint select failed",
                                     e,
                                 )
                             })?;
@@ -64,22 +65,33 @@ impl PgMetaEngine {
         };
 
         let version: i64 = row.get(0);
-        let bytes: Vec<u8> = row.get(1);
+        let checkpoint_version: i64 = row.get(1);
+        let bytes: Vec<u8> = row.get(2);
 
-        let snapshot = Self::decode_snapshot(&bytes)?;
-        let replay_start_version =
-            Self::snapshot_replay_start_version(&snapshot, version, local_version);
+        if checkpoint_version < 0 || checkpoint_version > version {
+            return Err(MetaError::Storage(
+                "postgres serving checkpoint version is invalid".to_string(),
+            ));
+        }
+        if checkpoint_version < local_version {
+            return Ok(false);
+        }
+
+        let checkpoint: ServingCheckpoint = postcard::from_bytes(&bytes).map_err(|e| {
+            MetaError::Serialization(format!("serving checkpoint decode failed: {e}"))
+        })?;
+        let replay_start_version = Self::snapshot_replay_start_version(checkpoint_version, version);
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
-                self.local.import_remote_snapshot(&snapshot)?;
+                self.local.import_serving_checkpoint(&checkpoint)?;
             }
             StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog => {
                 self.local
-                    .import_remote_snapshot_preserving_local_event_log(&snapshot)?;
+                    .import_serving_checkpoint_preserving_local_event_log(&checkpoint)?;
             }
             StartupSnapshotImportMode::PreserveLocalState => {
                 self.local
-                    .import_remote_snapshot_preserving_local_state(&snapshot)?;
+                    .import_serving_checkpoint_preserving_local_state(&checkpoint)?;
             }
         }
         self.reconcile_imported_snapshot_regular_files()?;
@@ -251,9 +263,7 @@ impl PgMetaEngine {
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let snapshot = self.local.export_remote_snapshot()?;
-        let payload = serde_json::to_vec(&snapshot)
-            .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
+        let payload = self.local.export_serving_checkpoint_bytes()?;
         let version = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
 
@@ -267,7 +277,7 @@ impl PgMetaEngine {
                         client
                             .execute(
                                 sql::UPSERT_METADATA_CHECKPOINT,
-                                &[&volume_id, &version, &payload],
+                                &[&volume_id, &version, &version, &payload],
                             )
                             .await
                             .map_err(|e| {

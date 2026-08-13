@@ -261,6 +261,35 @@ impl SnapshotCut {
     }
 }
 
+/// Serving metadata copied into the live replication checkpoint.
+///
+/// This is deliberately smaller than the local redb export. It contains only
+/// the shared read model needed to rebuild a historical view; local counters,
+/// pending cleanup, event journals, snapshot control rows, and client-local
+/// state remain outside the checkpoint bytes.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub(crate) struct ServingCheckpoint {
+    /// Remote-visible inode attributes.
+    pub(crate) inodes: Vec<(u64, Vec<u8>)>,
+    /// Remote-visible directory entries.
+    pub(crate) dentries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Remote-visible regular-file chunk mappings.
+    pub(crate) regular_file_base: Vec<(u64, Vec<u8>)>,
+    /// Remote-visible symlink targets.
+    pub(crate) symlinks: Vec<(u64, Vec<u8>)>,
+    /// Remote-visible extended attributes.
+    pub(crate) xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Remote-visible ACL rules.
+    pub(crate) acl_rules: Vec<(Vec<u8>, u8)>,
+}
+
+impl ServingCheckpoint {
+    /// The persisted checkpoint format version.
+    pub(crate) const FORMAT_VERSION: i16 = 1;
+    /// The serving-state schema version.
+    pub(crate) const SCHEMA_VERSION: i16 = 1;
+}
+
 /// Retention attached to a snapshot. `None` means infinite manual retention.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct SnapshotRetention {

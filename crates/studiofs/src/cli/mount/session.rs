@@ -25,8 +25,8 @@ use studiofs_cache::{
 };
 use studiofs_data::{DataStoreConfig, normalize_s3_endpoint_transport};
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetaFormat, MetaOpenOptions, MetaReplication, MetaSnapshots,
-    MetadataBackend, RedbMetaEngine, open_meta_engine, open_meta_engine_with_options,
+    FormatInfo, MetaFormat, MetaOpenOptions, MetaReplication, open_meta_engine,
+    open_meta_engine_with_options,
 };
 #[cfg(test)]
 use studiofs_vfs::VfsConfig;
@@ -89,7 +89,6 @@ struct PreparedVolumeCacheRuntime {
 struct PreparedMount {
     plan: MountPlan,
     format_info: Option<FormatInfo>,
-    snapshot_mount_db_path: Option<PathBuf>,
     foreground: Option<PreparedForegroundRuntime>,
     mount_lock: Option<utils::MountLockGuard>,
 }
@@ -113,14 +112,10 @@ struct PreparedForegroundRuntime {
 trait MountOpenMeta: Send + Sync + MetaFormat + MetaReplication {}
 impl<T> MountOpenMeta for T where T: ?Sized + Send + Sync + MetaFormat + MetaReplication {}
 
-trait SnapshotSourceMeta: Send + Sync + MetaSnapshots {}
-impl<T> SnapshotSourceMeta for T where T: ?Sized + Send + Sync + MetaSnapshots {}
-
 trait MountRuntimeMeta: Send + Sync + VfsMeta {}
 impl<T> MountRuntimeMeta for T where T: ?Sized + Send + Sync + VfsMeta {}
 
-struct OpenedLiveMountMeta<M: ?Sized + MountOpenMeta> {
-    source_meta: Arc<M>,
+struct OpenedLiveMountMeta {
     runtime_meta: Arc<dyn VfsMeta>,
     format_info: FormatInfo,
 }
@@ -129,7 +124,6 @@ struct MountMetaSession<M: ?Sized + MountRuntimeMeta> {
     meta: Arc<M>,
     format_info: FormatInfo,
     read_only_mount: bool,
-    snapshot_db_path: Option<PathBuf>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -469,7 +463,7 @@ impl MountPlan {
             vfs_config,
             run_in_foreground: resolve_run_in_foreground(command.foreground, command.detach),
             launch_mode: resolve_mount_launch_mode(command.detach),
-            read_only_mount: command.read_only || command.snapshot_id.is_some(),
+            read_only_mount: command.read_only,
             command,
         })
     }
@@ -1052,7 +1046,6 @@ impl MountPlan {
             return Ok(PreparedMount {
                 plan: self,
                 format_info: None,
-                snapshot_mount_db_path: None,
                 foreground: None,
                 mount_lock: None,
             });
@@ -1064,11 +1057,9 @@ impl MountPlan {
             meta,
             format_info,
             read_only_mount,
-            snapshot_db_path,
         } = resolve_mount_meta_session(
             &self.command.name,
             &self.command.meta_dir,
-            self.command.snapshot_id.as_deref(),
             self.command.endpoint.as_deref(),
             self.command.read_only,
         )?;
@@ -1102,7 +1093,7 @@ impl MountPlan {
                 bridge: backend.name().to_string(),
                 cache_size: self.command.cache_size.clone(),
                 endpoint_override: self.command.endpoint.clone(),
-                snapshot_id: self.command.snapshot_id.clone(),
+                snapshot_id: None,
                 vfs_config: serde_json::to_value(self.vfs_config.as_ref())
                     .map_err(|error| anyhow::anyhow!("failed to serialize vfs config: {error}"))?,
             };
@@ -1151,14 +1142,10 @@ impl MountPlan {
             Ok(foreground) => Ok(PreparedMount {
                 plan: self,
                 format_info: Some(format_info),
-                snapshot_mount_db_path: snapshot_db_path,
                 foreground: Some(foreground),
                 mount_lock: Some(mount_lock),
             }),
-            Err(error) => {
-                cleanup_snapshot_mount_db(snapshot_db_path.as_deref());
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -1197,7 +1184,7 @@ impl PreparedMount {
             backend_name,
             vfs_config: &self.plan.vfs_config,
             format_info,
-            snapshot_id: self.plan.command.snapshot_id.as_deref(),
+            snapshot_id: None,
         }) {
             println!("{line}");
         }
@@ -1376,12 +1363,6 @@ impl MountRuntimeGuard {
             utils::remove_pid_file(&self.prepared.plan.actual_mount_path),
         );
         drop(self.prepared.mount_lock.take());
-        let snapshot_db_path = self.prepared.snapshot_mount_db_path.take();
-        record_cleanup_error(
-            &mut first_error,
-            "snapshot database removal",
-            remove_snapshot_mount_db(snapshot_db_path.as_deref()),
-        );
 
         self.cleanup_completed = true;
         first_error
@@ -1401,29 +1382,7 @@ impl Drop for MountRuntimeGuard {
             );
         }
         drop(self.prepared.foreground.take());
-        cleanup_snapshot_mount_db(self.prepared.snapshot_mount_db_path.as_deref());
         drop(self.prepared.mount_lock.take());
-    }
-}
-
-fn cleanup_snapshot_mount_db(snapshot_db_path: Option<&Path>) {
-    if let Err(error) = remove_snapshot_mount_db(snapshot_db_path) {
-        warn!(error = ?error, "failed to remove snapshot mount database");
-    }
-}
-
-fn remove_snapshot_mount_db(snapshot_db_path: Option<&Path>) -> anyhow::Result<()> {
-    let Some(snapshot_db_path) = snapshot_db_path else {
-        return Ok(());
-    };
-
-    match std::fs::remove_file(snapshot_db_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(anyhow::anyhow!(
-            "failed to remove snapshot mount database '{}': {error}",
-            snapshot_db_path.display()
-        )),
     }
 }
 
@@ -1571,10 +1530,7 @@ fn read_live_mount_format_info<M: ?Sized + MountOpenMeta>(
     Ok(live_meta.get_format_info()?)
 }
 
-fn open_live_mount_meta(
-    name: &str,
-    meta_dir: &Path,
-) -> anyhow::Result<OpenedLiveMountMeta<dyn MetaEngine>> {
+fn open_live_mount_meta(name: &str, meta_dir: &Path) -> anyhow::Result<OpenedLiveMountMeta> {
     let db_path = meta_dir.join(format!("{name}.db"));
     debug!("opening volume {name:?} from {db_path:?}");
     let source_meta = open_meta_engine_with_options(
@@ -1586,7 +1542,6 @@ fn open_live_mount_meta(
     let format_info = read_live_mount_format_info(name, source_meta.as_ref())?;
     let runtime_meta = into_vfs_meta(source_meta.clone());
     Ok(OpenedLiveMountMeta {
-        source_meta,
         runtime_meta,
         format_info,
     })
@@ -1619,44 +1574,6 @@ where
     !disabled
 }
 
-fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
-    name: &str,
-    meta_dir: &Path,
-    live_meta: Arc<M>,
-    mut format_info: FormatInfo,
-    snapshot_id: &str,
-) -> anyhow::Result<MountMetaSession<dyn VfsMeta>> {
-    let snapshot = live_meta
-        .get_snapshot(snapshot_id)?
-        .ok_or_else(|| anyhow::anyhow!("snapshot '{snapshot_id}' not found"))?;
-    if snapshot.snapshot_payload.is_empty() {
-        anyhow::bail!("snapshot '{snapshot_id}' payload is empty");
-    }
-    let snapshot_state = RedbMetaEngine::decode_snapshot_payload(&snapshot.snapshot_payload)
-        .map_err(|e| anyhow::anyhow!("invalid snapshot payload for '{snapshot_id}': {e}"))?;
-
-    let snapshot_dir = meta_dir.join("snapshots");
-    std::fs::create_dir_all(&snapshot_dir)?;
-    let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
-    cleanup_snapshot_mount_db(Some(snapshot_db_path.as_path()));
-    let snapshot_engine = (|| -> anyhow::Result<Arc<RedbMetaEngine>> {
-        let snapshot_engine = Arc::new(RedbMetaEngine::open(&snapshot_db_path)?);
-        format_info.metadata.backend = MetadataBackend::RedbLocal;
-        format_info.metadata.postgres = None;
-        snapshot_engine.set_format_info(&format_info)?;
-        snapshot_engine.import_snapshot(&snapshot_state)?;
-        Ok(snapshot_engine)
-    })()
-    .inspect_err(|_| cleanup_snapshot_mount_db(Some(snapshot_db_path.as_path())))?;
-
-    Ok(MountMetaSession {
-        meta: into_vfs_meta(snapshot_engine),
-        format_info,
-        read_only_mount: true,
-        snapshot_db_path: Some(snapshot_db_path),
-    })
-}
-
 fn apply_mount_endpoint_override(
     mut format_info: FormatInfo,
     endpoint: Option<&str>,
@@ -1678,24 +1595,17 @@ fn apply_mount_endpoint_override(
 fn resolve_mount_meta_session(
     name: &str,
     meta_dir: &Path,
-    snapshot_id: Option<&str>,
     endpoint: Option<&str>,
     read_only: bool,
 ) -> anyhow::Result<MountMetaSession<dyn VfsMeta>> {
     let OpenedLiveMountMeta {
-        source_meta,
         runtime_meta,
         format_info,
     } = open_live_mount_meta(name, meta_dir)?;
-    let mut session = if let Some(snapshot_id) = snapshot_id {
-        materialize_snapshot_mount_meta(name, meta_dir, source_meta, format_info, snapshot_id)?
-    } else {
-        MountMetaSession {
-            meta: runtime_meta,
-            format_info,
-            read_only_mount: read_only,
-            snapshot_db_path: None,
-        }
+    let mut session = MountMetaSession {
+        meta: runtime_meta,
+        format_info,
+        read_only_mount: read_only,
     };
 
     session.format_info = apply_mount_endpoint_override(session.format_info, endpoint)?;
@@ -1932,7 +1842,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    use studiofs_meta::{ROOT_INO, RedbMetaEngine};
+    use studiofs_meta::RedbMetaEngine;
 
     type BackendInspect = Arc<dyn Fn(&BackendLaunch) -> io::Result<()> + Send + Sync>;
 
@@ -2142,7 +2052,6 @@ mod tests {
             foreground: false,
             detach: false,
             profile: None,
-            snapshot_id: None,
             read_only: false,
             endpoint: None,
             runtime_tuning: PublicRuntimeTuningArgs::default(),
@@ -2483,30 +2392,6 @@ mod tests {
     }
 
     #[test]
-    fn mount_plan_marks_snapshot_mount_read_only() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-");
-        let meta_dir = temp.path().join("meta");
-        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
-        let mount_point = startup_mount_point(&temp);
-        let mut command = mount_command(
-            "projectfs",
-            &meta_dir,
-            Some(mount_point.to_string()),
-            None,
-            Some("64GB"),
-        );
-        command.snapshot_id = Some("snapshot-123".to_string());
-
-        let plan = MountPlan::resolve(MountRequest {
-            command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
-        })
-        .expect("mount plan resolved");
-
-        assert!(plan.read_only_mount);
-    }
-
-    #[test]
     fn mount_plan_marks_explicit_live_mount_read_only() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let meta_dir = temp.path().join("meta");
@@ -2531,13 +2416,13 @@ mod tests {
     }
 
     #[test]
-    fn mount_meta_session_uses_live_metadata_when_snapshot_id_is_none() {
+    fn mount_meta_session_uses_live_metadata() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, format_info) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
 
-        let session = resolve_mount_meta_session("demo", &meta_dir, None, None, false)
-            .expect("resolve live meta");
+        let session =
+            resolve_mount_meta_session("demo", &meta_dir, None, false).expect("resolve live meta");
 
         assert!(!session.read_only_mount);
         assert_eq!(session.format_info.uuid, format_info.uuid);
@@ -2597,46 +2482,14 @@ mod tests {
     }
 
     #[test]
-    fn mount_meta_session_materializes_snapshot_engine_and_marks_read_only() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-");
-        let (meta_dir, engine, _format_info) = seed_mount_meta_db(&temp, "demo");
-        let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
-        drop(engine);
-
-        let session =
-            resolve_mount_meta_session("demo", &meta_dir, Some(&snapshot.id), None, false)
-                .expect("resolve snapshot meta");
-
-        assert!(session.read_only_mount);
-        assert_eq!(
-            session.format_info.metadata.backend,
-            MetadataBackend::RedbLocal
-        );
-        assert!(session.format_info.metadata.postgres.is_none());
-        let expected_snapshot_db_path = meta_dir
-            .join("snapshots")
-            .join(format!("demo.{}.db", snapshot.id));
-        assert!(expected_snapshot_db_path.exists());
-        assert_eq!(
-            session.snapshot_db_path.as_deref(),
-            Some(expected_snapshot_db_path.as_path())
-        );
-    }
-
-    #[test]
     fn mount_meta_session_applies_endpoint_override_to_runtime_format_info() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
 
-        let session = resolve_mount_meta_session(
-            "demo",
-            &meta_dir,
-            None,
-            Some("http://127.0.0.1:9000"),
-            false,
-        )
-        .expect("resolve with endpoint override");
+        let session =
+            resolve_mount_meta_session("demo", &meta_dir, Some("http://127.0.0.1:9000"), false)
+                .expect("resolve with endpoint override");
 
         assert_eq!(session.format_info.endpoint, "http://127.0.0.1:9000");
     }
@@ -2651,7 +2504,7 @@ mod tests {
             .expect("set explicit http endpoint");
         drop(engine);
 
-        let session = resolve_mount_meta_session("demo", &meta_dir, None, None, false)
+        let session = resolve_mount_meta_session("demo", &meta_dir, None, false)
             .expect("persisted explicit http endpoint should be accepted");
 
         assert_eq!(session.format_info.endpoint, "http://192.168.1.20:10000");
@@ -2668,59 +2521,6 @@ mod tests {
         assert_eq!(backend.name(), "unsupported-unix");
         #[cfg(windows)]
         assert_eq!(backend.name(), "WinFSP");
-    }
-
-    #[test]
-    fn mount_plan_prepare_marks_snapshot_mount_read_only_and_uses_fake_backend() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-");
-        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
-        let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
-        drop(engine);
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let mount_point = startup_mount_point(&temp);
-        let mut command = mount_command(
-            "demo",
-            &meta_dir,
-            Some(mount_point.to_string()),
-            Some(temp.path().join("cache")),
-            Some("64GB"),
-        );
-        command.snapshot_id = Some(snapshot.id.clone());
-
-        let prepared = MountPlan::resolve(MountRequest {
-            command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
-        })
-        .expect("mount plan resolved")
-        .prepare(|| {
-            Box::new(FakeBackend {
-                events: events.clone(),
-                fail: false,
-                inspect: None,
-            })
-        })
-        .expect("prepare mount");
-
-        assert!(prepared.plan.read_only_mount);
-        assert_eq!(
-            prepared
-                .format_info
-                .as_ref()
-                .expect("format info")
-                .metadata
-                .backend,
-            MetadataBackend::RedbLocal
-        );
-        assert_eq!(
-            prepared
-                .foreground
-                .as_ref()
-                .expect("prepared runtime")
-                .backend
-                .name(),
-            "FakeBackend"
-        );
-        assert!(prepared.snapshot_mount_db_path.is_some());
     }
 
     #[test]
@@ -2885,7 +2685,7 @@ mod tests {
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
         let mount_point = startup_mount_point(&temp);
-        let mut prepared = MountPlan::resolve(MountRequest {
+        let prepared = MountPlan::resolve(MountRequest {
             command: mount_command(
                 "demo",
                 &meta_dir,
@@ -2899,9 +2699,6 @@ mod tests {
         .prepare(|| Box::new(PanicBackend))
         .expect("prepare mount");
         let actual_mount_path = prepared.plan.actual_mount_path.clone();
-        let snapshot_path = temp.path().join("panic-snapshot.db");
-        std::fs::write(&snapshot_path, b"snapshot").expect("create snapshot placeholder");
-        prepared.snapshot_mount_db_path = Some(snapshot_path.clone());
 
         let panic_result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepared.launch()));
@@ -2910,10 +2707,6 @@ mod tests {
         assert!(
             utils::read_pid_file(&actual_mount_path).is_err(),
             "panic cleanup should remove the mount record"
-        );
-        assert!(
-            !snapshot_path.exists(),
-            "panic cleanup should remove the snapshot database"
         );
         assert!(
             !utils::mount_is_active(&actual_mount_path).expect("check mount lock"),
@@ -2948,10 +2741,7 @@ mod tests {
         .expect("prepare mount");
         let actual_mount_path = prepared.plan.actual_mount_path.clone();
         let pid_path = utils::pid_file_path(&actual_mount_path).expect("pid path");
-        let snapshot_path = temp.path().join("snapshot.db");
-        std::fs::write(&snapshot_path, b"snapshot").expect("create snapshot placeholder");
         let mut guard = MountRuntimeGuard::new(prepared);
-        guard.prepared.snapshot_mount_db_path = Some(snapshot_path.clone());
         guard
             .prepared
             .write_pid_file()
@@ -2963,14 +2753,12 @@ mod tests {
         let cleanup_error = guard
             .cleanup()
             .expect("mount record cleanup failure should be returned");
-        let snapshot_removed = !snapshot_path.exists();
         let pid_path_removed = std::fs::remove_dir(&pid_path).is_ok();
 
         assert!(
             cleanup_error.to_string().contains("mount record removal"),
             "unexpected cleanup error: {cleanup_error:#}"
         );
-        assert!(snapshot_removed, "later snapshot cleanup must still run");
         assert!(
             pid_path_removed,
             "test fault-injection directory must be removed"
@@ -3071,54 +2859,6 @@ mod tests {
         assert_eq!(
             removed.lock().expect("lock removed").clone(),
             vec!["/tmp/demo".to_string()]
-        );
-    }
-
-    #[test]
-    fn prepared_mount_launch_cleans_up_snapshot_mount_db_on_backend_failure() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-");
-        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
-        let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
-        drop(engine);
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let mount_point = startup_mount_point(&temp);
-        let mut command = mount_command(
-            "demo",
-            &meta_dir,
-            Some(mount_point.to_string()),
-            Some(temp.path().join("cache")),
-            Some("64GB"),
-        );
-        command.snapshot_id = Some(snapshot.id.clone());
-
-        let prepared = MountPlan::resolve(MountRequest {
-            command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
-        })
-        .expect("mount plan resolved")
-        .prepare(|| {
-            Box::new(FakeBackend {
-                events: events.clone(),
-                fail: true,
-                inspect: None,
-            })
-        })
-        .expect("prepare mount");
-        let snapshot_db_path = prepared
-            .snapshot_mount_db_path
-            .clone()
-            .expect("snapshot db path");
-        assert!(
-            snapshot_db_path.exists(),
-            "prepare should materialize snapshot db"
-        );
-
-        let err = prepared.launch().expect_err("backend error should surface");
-
-        assert!(err.to_string().contains("FakeBackend error: boom"));
-        assert!(
-            !snapshot_db_path.exists(),
-            "launch should remove snapshot db after backend return"
         );
     }
 

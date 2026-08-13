@@ -124,27 +124,15 @@ Run actual cleanup (delete up to 500 old objects):
 studiofs janitor myvolume --max-deletes 500
 ```
 
-## 6. Create and List Snapshots
+## 6. Snapshot v2 source capture
 
-Create an instant local snapshot (root inode by default):
+Snapshot v2 capture is PostgreSQL-authoritative. The current metadata layer
+retains a bounded serving checkpoint plus the exact event range for each
+Creating snapshot; it does not replicate a full local snapshot through
+`metadata_state` or `event_log`. The public create/list/materialize/mount
+commands are delivered by the follow-up Snapshot v2 CLI and artifact tickets.
 
-```bash
-studiofs snapshot myvolume create
-```
-
-List snapshots:
-
-```bash
-studiofs snapshot myvolume list
-```
-
-## 7. Mount a Historical Snapshot as Read-Only
-
-```bash
-studiofs mount myvolume Z: --snapshot-id <snapshot-uuid>
-```
-
-## 8. Run Metadata FSCK
+## 7. Run Metadata FSCK
 
 Generate a read-only integrity report:
 
@@ -173,7 +161,7 @@ Repair mode currently:
 - leaves orphan directories / hardlink-like orphan cases and `nlink` mismatch
   entries as report-only
 
-## 9. Benchmarks
+## 8. Benchmarks
 
 Run a configurable JuiceFS-style mounted filesystem benchmark against an
 already mounted StudioFS path:

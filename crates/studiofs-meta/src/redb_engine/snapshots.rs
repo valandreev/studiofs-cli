@@ -9,21 +9,6 @@ enum SnapshotImportMode {
 }
 
 impl RedbMetaEngine {
-    /// Encode a [`RedbSnapshot`] into the canonical persisted snapshot payload format.
-    pub fn encode_snapshot_payload(snapshot: &RedbSnapshot) -> MetaResult<Vec<u8>> {
-        encode(snapshot)
-    }
-
-    /// Decode a persisted snapshot payload, including legacy JSON-encoded snapshots.
-    pub fn decode_snapshot_payload(payload: &[u8]) -> MetaResult<RedbSnapshot> {
-        match decode(payload) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(MetaError::Serialization(_)) => serde_json::from_slice::<RedbSnapshot>(payload)
-                .map_err(|e| MetaError::Serialization(e.to_string())),
-            Err(err) => Err(err),
-        }
-    }
-
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;
@@ -216,21 +201,6 @@ impl RedbMetaEngine {
                 snapshot.event_log.push((k.value(), v.value().to_vec()));
             }
         }
-        {
-            let table = txn
-                .open_table(SNAPSHOTS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for row in table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                snapshot
-                    .snapshots
-                    .push((k.value().to_string(), v.value().to_vec()));
-            }
-        }
-
         Ok(snapshot)
     }
 
@@ -262,6 +232,106 @@ impl RedbMetaEngine {
         snapshot: &RedbSnapshot,
     ) -> MetaResult<()> {
         self.import_snapshot_with_mode(snapshot, SnapshotImportMode::RemotePreserveLocalState)
+    }
+
+    /// Replace the serving view from the narrow checkpoint used by PG
+    /// replication. Local counters, journals, and cleanup state are retained
+    /// from the destination database rather than being copied into the source
+    /// bytes.
+    pub(crate) fn import_serving_checkpoint(
+        &self,
+        checkpoint: &crate::snapshot::ServingCheckpoint,
+    ) -> MetaResult<()> {
+        self.import_snapshot_with_mode(
+            &self.redb_snapshot_from_serving_checkpoint(checkpoint)?,
+            SnapshotImportMode::RemoteReplace,
+        )
+    }
+
+    /// Import the postcard-encoded serving checkpoint used by PostgreSQL.
+    ///
+    /// This keeps the internal checkpoint representation private to the
+    /// metadata crate while allowing bootstrap callers such as `discover` to
+    /// create a local redb view from the thin remote checkpoint.
+    pub fn import_serving_checkpoint_bytes(&self, bytes: &[u8]) -> MetaResult<()> {
+        let checkpoint: crate::snapshot::ServingCheckpoint =
+            postcard::from_bytes(bytes).map_err(|error| {
+                MetaError::Serialization(format!("serving checkpoint decode failed: {error}"))
+            })?;
+        self.import_serving_checkpoint(&checkpoint)
+    }
+
+    /// Replace the serving view while retaining the local event journal used
+    /// by the repair/replay path.
+    pub(crate) fn import_serving_checkpoint_preserving_local_event_log(
+        &self,
+        checkpoint: &crate::snapshot::ServingCheckpoint,
+    ) -> MetaResult<()> {
+        self.import_snapshot_with_mode(
+            &self.redb_snapshot_from_serving_checkpoint(checkpoint)?,
+            SnapshotImportMode::RemoteReplacePreservingEventLog,
+        )
+    }
+
+    /// Replace the serving view while preserving local overlay state and its
+    /// replay journal.
+    pub(crate) fn import_serving_checkpoint_preserving_local_state(
+        &self,
+        checkpoint: &crate::snapshot::ServingCheckpoint,
+    ) -> MetaResult<()> {
+        self.import_snapshot_with_mode(
+            &self.redb_snapshot_from_serving_checkpoint(checkpoint)?,
+            SnapshotImportMode::RemotePreserveLocalState,
+        )
+    }
+
+    pub(crate) fn redb_snapshot_from_serving_checkpoint(
+        &self,
+        checkpoint: &crate::snapshot::ServingCheckpoint,
+    ) -> MetaResult<RedbSnapshot> {
+        let mut snapshot = self.export_snapshot()?;
+        let next_inode = checkpoint
+            .inodes
+            .iter()
+            .map(|(ino, _)| *ino)
+            .max()
+            .unwrap_or(ROOT_INO)
+            .checked_add(1)
+            .ok_or_else(|| MetaError::Storage("imported inode counter overflow".to_string()))?;
+        let total_inodes = u64::try_from(checkpoint.inodes.len())
+            .map_err(|_| MetaError::Storage("imported inode count overflow".to_string()))?;
+        let mut referenced_objects = BTreeMap::new();
+        for (_, bytes) in &checkpoint.regular_file_base {
+            let regular: RegularFileBaseState = decode(bytes)?;
+            for chunk in regular.chunks.values() {
+                for slice in chunk.slices.values() {
+                    if let Some(block) = slice.payload.as_ref() {
+                        referenced_objects
+                            .entry(block.object_id)
+                            .or_insert(block.length as u64);
+                    }
+                }
+            }
+        }
+        let used_space = referenced_objects
+            .values()
+            .fold(0_u64, |acc, len| acc.saturating_add(*len));
+
+        snapshot.inodes = checkpoint.inodes.clone();
+        snapshot.dentries = checkpoint.dentries.clone();
+        snapshot.regular_file_overlay = checkpoint.regular_file_base.clone();
+        snapshot.regular_file_base = checkpoint.regular_file_base.clone();
+        snapshot.counters = vec![
+            (counters::NEXT_INODE.to_string(), next_inode),
+            (counters::TOTAL_INODES.to_string(), total_inodes),
+            (counters::USED_SPACE.to_string(), used_space),
+        ];
+        snapshot.pending_deletions.clear();
+        snapshot.symlinks = checkpoint.symlinks.clone();
+        snapshot.xattrs = checkpoint.xattrs.clone();
+        snapshot.acl_rules = checkpoint.acl_rules.clone();
+        snapshot.event_log.clear();
+        Ok(snapshot)
     }
 
     fn import_snapshot_with_mode(
@@ -606,129 +676,10 @@ impl RedbMetaEngine {
                 }
             }
         }
-        {
-            let mut table = txn
-                .open_table(SNAPSHOTS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .retain(|_, _| false)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for (k, v) in &snapshot.snapshots {
-                table
-                    .insert(k.as_str(), v.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-            }
-        }
         Self::rebuild_inode_lifecycle_table_in_txn(&txn)?;
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
-    }
-
-    fn collect_snapshot_pinned_object_ids(&self, root_ino: Ino) -> MetaResult<Vec<u64>> {
-        let mut pinned = HashSet::new();
-        let mut stack = vec![root_ino];
-        let mut visited = HashSet::new();
-
-        while let Some(ino) = stack.pop() {
-            if !visited.insert(ino) {
-                continue;
-            }
-            let attr = self.get_attr(ino)?;
-            match attr.kind {
-                FileType::RegularFile => {
-                    // Snapshots pin the visible file contents, so resolve the
-                    // overlay/base graph instead of synthesizing single-payload rows.
-                    for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-                        if let Some(block) = span.payload {
-                            pinned.insert(block.object_id);
-                        }
-                    }
-                }
-                FileType::Directory => {
-                    for entry in self.readdir(ino)? {
-                        stack.push(entry.ino);
-                    }
-                }
-                FileType::Symlink => {}
-            }
-        }
-
-        let mut out: Vec<u64> = pinned.into_iter().collect();
-        out.sort_unstable();
-        Ok(out)
-    }
-}
-
-impl MetaSnapshots for RedbMetaEngine {
-    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        let root_attr = self.get_attr(root_ino)?;
-        if root_attr.kind != FileType::Directory {
-            return Err(MetaError::NotADirectory(root_ino));
-        }
-
-        let pinned_object_ids = self.collect_snapshot_pinned_object_ids(root_ino)?;
-        let snapshot_payload = Self::encode_snapshot_payload(&self.export_snapshot()?)?;
-
-        let snapshot = MetadataSnapshot {
-            id: uuid::Uuid::new_v4().to_string(),
-            root_ino,
-            created_at: InodeAttr::now_nanos(),
-            state: SnapshotState::Pending,
-            pinned_object_ids,
-            snapshot_payload,
-        };
-
-        let bytes = encode(&snapshot)?;
-        let txn = self.begin_write_txn()?;
-        {
-            let mut table = txn
-                .open_table(SNAPSHOTS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(snapshot.id.as_str(), bytes.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(snapshot)
-    }
-
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        let txn = self.begin_read_txn()?;
-        let table = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut snapshots = Vec::new();
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_id, raw) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let snapshot: MetadataSnapshot = decode(raw.value())?;
-            snapshots.push(snapshot);
-        }
-        snapshots.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(snapshots)
-    }
-
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        let txn = self.begin_read_txn()?;
-        let table = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let Some(raw) = table
-            .get(snapshot_id)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-        let snapshot: MetadataSnapshot = decode(raw.value())?;
-        Ok(Some(snapshot))
     }
 }

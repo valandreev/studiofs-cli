@@ -27,6 +27,14 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
     assert!(!ddl.contains("pinned_object_ids"));
     assert!(!ddl.contains("snapshot_payload"));
+    assert!(ddl.contains("format_info BYTEA"));
+    assert!(ddl.contains("checkpoint_version BIGINT NOT NULL"));
+    assert!(ddl.contains("event_start_version BIGINT"));
+    assert!(ddl.contains("event_end_version BIGINT"));
+    assert!(ddl.contains("event_row_count BIGINT"));
+    assert!(ddl.contains("snapshot_source_checkpoints_catalog_fk"));
+    assert!(ddl.contains("studiofs_snapshot_source_event_prune_guard"));
+    assert!(ddl.contains("studiofs_snapshot_source_prune_guard"));
     assert!(ddl.contains("ADD COLUMN IF NOT EXISTS batch_version BIGINT"));
     assert!(ddl.contains("SET batch_version = 0"));
     assert!(ddl.contains("ALTER COLUMN batch_version SET NOT NULL"));
@@ -62,6 +70,20 @@ fn capture_is_one_transaction_and_one_durable_job() {
             .await
             .expect("connect to test postgres");
         let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) VALUES ($1, 1, 'test', decode('', 'hex'), 'snapshot-test')",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("insert retained event row");
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 1 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("advance test metadata version");
         let tx = client
             .transaction()
             .await
@@ -95,6 +117,42 @@ fn capture_is_one_transaction_and_one_durable_job() {
             .get(0);
         assert_eq!(job_count, 1);
         tx.commit().await.expect("commit capture transaction");
+
+        let source_prune_error = client
+            .execute(
+                "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
+                &[&volume.volume_id, &entry.snapshot_id.to_string()],
+            )
+            .await
+            .expect_err("creating snapshot source must not be prunable");
+        assert_eq!(
+            source_prune_error.code(),
+            Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION)
+        );
+
+        let event_prune_error = client
+            .execute(
+                "DELETE FROM event_log WHERE vol = $1 AND batch_version = 1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect_err("creating snapshot event range must not be prunable");
+        assert_eq!(
+            event_prune_error.code(),
+            Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION)
+        );
+
+        let error = client
+            .execute(
+                "DELETE FROM snapshot_catalog WHERE vol = $1 AND id = $2",
+                &[&volume.volume_id, &entry.snapshot_id.to_string()],
+            )
+            .await
+            .expect_err("creating snapshot source must not be prunable");
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+        );
         connection_task.abort();
         Ok(())
     })
@@ -130,7 +188,13 @@ fn snapshot_catalog_rejects_retention_above_domain_limit() {
             .await
             .expect_err("PostgreSQL must reject oversized retention");
         connection_task.abort();
-        assert!(error.to_string().contains("snapshot_catalog_retention_bounds_check"));
+        let db_error = error
+            .as_db_error()
+            .expect("retention violation must be a PostgreSQL database error");
+        assert_eq!(
+            db_error.constraint(),
+            Some("snapshot_catalog_retention_bounds_check")
+        );
         Ok(())
     })
     .expect("retention bound test");

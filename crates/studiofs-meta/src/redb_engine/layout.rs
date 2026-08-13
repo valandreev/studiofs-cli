@@ -113,8 +113,6 @@ pub(super) const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
 pub(super) const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
 
-/// Snapshot definitions: snapshot_id (uuid text) -> MetadataSnapshot (postcard)
-pub(super) const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 pub(super) const REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING: &str =
     "remote_namespace_visibility_filter";
 pub(super) const DENTRY_BY_INODE_INDEX_VERSION_SETTING: &str = "dentry_by_inode_index_version";
@@ -147,8 +145,6 @@ pub struct RedbSnapshot {
     pub acl_rules: Vec<(Vec<u8>, u8)>,
     /// Local event-log rows as `(sequence, encoded_event)` pairs.
     pub event_log: Vec<(u64, Vec<u8>)>,
-    /// Snapshot-definition rows as `(snapshot_id, encoded_snapshot)` pairs.
-    pub snapshots: Vec<(String, Vec<u8>)>,
 }
 
 pub(crate) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {

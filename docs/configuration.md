@@ -145,7 +145,6 @@ studiofs mount <name> [<mount-point>] \
   [--readahead <blocks>] \
   [--prefetch <count>] \
   [--principal <name>] \
-  [--snapshot-id <uuid>] \
   [--foreground] \
   [--detach | -d]
 ```
@@ -206,7 +205,6 @@ Notes:
 - `STUDIOFS_PYROSCOPE_TAGS` or `PYROSCOPE_TAGS` adds comma-separated `key=value` labels.
 - Default mount tags include platform, volume name, mount mode, bridge, and `runtime=mount`.
 - When no endpoint is configured, StudioFS still writes a gzipped pprof artifact under `<cache-dir>/<uuid>/profiles/`.
-- `--snapshot-id` mounts the selected snapshot as a read-only historical view.
 - `--endpoint <URL>` overrides the S3 endpoint URL for the current mount session.
   - Use `https://` for TLS or `http://` to explicitly select plain HTTP transport.
   - Plain HTTP is accepted for explicit `http://` endpoint URLs, including non-loopback private-network endpoints such as `http://192.168.1.20:10000`.
@@ -447,26 +445,22 @@ Alias:
 
 What it does:
 - restores/updates target volume record in `volumes` (matched by UUID from dump),
-- replaces target volume rows in `metadata_state`, `counters`, `event_log`, `snapshots`.
+- replaces target rows in `metadata_state`, `counters`, and `event_log`;
+- preserves the separate bounded `metadata_state.format_info` bootstrap record.
 
-### `snapshot`
+### Snapshot v2 metadata source
 
-Create or list immutable snapshots.
+The PostgreSQL metadata layer now captures Snapshot v2 sources without putting a
+full filesystem view into the ordinary checkpoint or event stream. Each source
+retains:
 
-```bash
-studiofs snapshot <name> create [--root-ino <ino>]
-studiofs snapshot <name> list
-```
+- one immutable `cut_version` and capture time in `snapshot_catalog`,
+- the serving checkpoint bytes and checksum in `snapshot_source_checkpoints`,
+- the bounded event sequence/version range needed to replay that cut.
 
-Behavior:
-- `create` is immediate and local-first (state starts as `pending`).
-- background PG replication publishes snapshot metadata and pinned object ids.
-- replicated snapshots transition to `synced` and become discoverable on peers.
-- if PostgreSQL is unavailable at snapshot creation time, the snapshot remains a
-  local-only administrative artifact until the owning client reconciles and
-  publishes it later.
-- janitor protection is cluster-wide only for snapshots that are already
-  published through PostgreSQL.
+The old root-inode snapshot command and `mount --snapshot-id` surface are not
+part of the current CLI. Snapshot artifact materialization and read-only mount
+workflows are follow-up Snapshot v2 tickets.
 
 ## Multi-Client Workflow
 

@@ -1,7 +1,7 @@
 use crate::engine::{MetaError, MetaResult};
 
 /// The PostgreSQL schema generation owned by the Snapshot v2 control plane.
-pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 2;
+pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 4;
 
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
@@ -73,9 +73,16 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE TABLE IF NOT EXISTS metadata_state (
             vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
             version BIGINT NOT NULL,
+            checkpoint_version BIGINT NOT NULL DEFAULT 0,
             snapshot BYTEA NOT NULL,
+            format_info BYTEA NOT NULL DEFAULT decode('', 'hex'),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_version BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS format_info BYTEA NOT NULL DEFAULT decode('', 'hex');
 
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -107,19 +114,21 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             lifecycle TEXT NOT NULL CHECK (
                 lifecycle IN ('creating', 'ready', 'failed', 'deleting', 'deleted')
             ),
-            retention_seconds BIGINT CHECK (
-                retention_seconds IS NULL OR retention_seconds BETWEEN 1 AND 4294967295
-            ),
+            retention_seconds BIGINT,
             ready_at TIMESTAMPTZ,
             expires_at TIMESTAMPTZ,
             failure_code TEXT,
             failure_message TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT snapshot_catalog_retention_bounds_check
+                CHECK (retention_seconds IS NULL OR retention_seconds BETWEEN 1 AND 4294967295),
             PRIMARY KEY (vol, id)
         );
 
         DO $$
+        DECLARE
+            legacy_constraint_name TEXT;
         BEGIN
             IF NOT EXISTS (
                 SELECT 1
@@ -131,6 +140,35 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     ADD CONSTRAINT snapshot_catalog_automatic_retention_check
                     CHECK (origin = 'manual' OR retention_seconds IS NOT NULL);
             END IF;
+            FOR legacy_constraint_name IN
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = 'snapshot_catalog'::regclass
+                  AND contype = 'c'
+                  AND conname NOT IN (
+                      'snapshot_catalog_automatic_retention_check',
+                      'snapshot_catalog_retention_bounds_check'
+                  )
+                  AND pg_get_constraintdef(oid) LIKE '%retention_seconds%'
+            LOOP
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conrelid = 'snapshot_catalog'::regclass
+                      AND conname = 'snapshot_catalog_retention_bounds_check'
+                ) THEN
+                    EXECUTE format(
+                        'ALTER TABLE snapshot_catalog DROP CONSTRAINT %I',
+                        legacy_constraint_name
+                    );
+                ELSE
+                    EXECUTE format(
+                        'ALTER TABLE snapshot_catalog RENAME CONSTRAINT %I TO snapshot_catalog_retention_bounds_check',
+                        legacy_constraint_name
+                    );
+                END IF;
+            END LOOP;
+
             IF NOT EXISTS (
                 SELECT 1
                 FROM pg_constraint
@@ -185,11 +223,182 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             checkpoint_sha256 BYTEA NOT NULL CHECK (octet_length(checkpoint_sha256) = 32),
             event_start_seq BIGINT,
             event_end_seq BIGINT,
+            event_start_version BIGINT,
+            event_end_version BIGINT,
+            event_row_count BIGINT NOT NULL DEFAULT 0 CHECK (event_row_count >= 0),
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (vol, snapshot_id),
             FOREIGN KEY (vol, snapshot_id)
-                REFERENCES snapshot_catalog(vol, id) ON DELETE CASCADE
+                REFERENCES snapshot_catalog(vol, id)
         );
+
+        ALTER TABLE snapshot_source_checkpoints
+            ADD COLUMN IF NOT EXISTS event_start_version BIGINT;
+        ALTER TABLE snapshot_source_checkpoints
+            ADD COLUMN IF NOT EXISTS event_end_version BIGINT;
+        ALTER TABLE snapshot_source_checkpoints
+            ADD COLUMN IF NOT EXISTS event_row_count BIGINT NOT NULL DEFAULT 0;
+
+        DO $$
+        DECLARE
+            constraint_name TEXT;
+        BEGIN
+            FOR constraint_name IN
+                SELECT pg_constraint.conname
+                FROM pg_constraint
+                WHERE pg_constraint.conrelid = 'snapshot_source_checkpoints'::regclass
+                  AND pg_constraint.confrelid = 'snapshot_catalog'::regclass
+                  AND pg_constraint.contype = 'f'
+                  AND pg_constraint.conname <> 'snapshot_source_checkpoints_catalog_fk'
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE snapshot_source_checkpoints DROP CONSTRAINT %I',
+                    constraint_name
+                );
+            END LOOP;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'snapshot_source_checkpoints'::regclass
+                  AND conname = 'snapshot_source_checkpoints_catalog_fk'
+            ) THEN
+                ALTER TABLE snapshot_source_checkpoints
+                    ADD CONSTRAINT snapshot_source_checkpoints_catalog_fk
+                    FOREIGN KEY (vol, snapshot_id)
+                    REFERENCES snapshot_catalog(vol, id);
+            END IF;
+        END
+        $$;
+
+        CREATE OR REPLACE FUNCTION studiofs_reject_snapshot_source_event_prune()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF TG_OP = 'TRUNCATE' THEN
+                IF EXISTS (
+                    SELECT 1
+                    FROM snapshot_source_checkpoints AS s
+                    INNER JOIN snapshot_catalog AS c
+                        ON c.vol = s.vol AND c.id = s.snapshot_id
+                    WHERE c.lifecycle = 'creating'
+                      AND s.event_row_count > 0
+                ) THEN
+                    RAISE EXCEPTION 'event rows are retained by a creating snapshot'
+                        USING ERRCODE = 'restrict_violation';
+                END IF;
+                RETURN NULL;
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM snapshot_source_checkpoints AS s
+                INNER JOIN snapshot_catalog AS c
+                    ON c.vol = s.vol AND c.id = s.snapshot_id
+                WHERE c.lifecycle = 'creating'
+                  AND s.vol = OLD.vol
+                  AND s.event_row_count > 0
+                  AND s.event_start_seq IS NOT NULL
+                  AND s.event_end_seq IS NOT NULL
+                  AND OLD.seq_id BETWEEN s.event_start_seq AND s.event_end_seq
+                  AND OLD.batch_version > s.checkpoint_version
+                  AND OLD.batch_version <= s.cut_version
+            ) THEN
+                RAISE EXCEPTION 'event row is retained by a creating snapshot'
+                    USING ERRCODE = 'restrict_violation';
+            END IF;
+            RETURN OLD;
+        END
+        $$;
+
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_event_prune_guard ON event_log;
+        CREATE TRIGGER studiofs_snapshot_source_event_prune_guard
+            BEFORE DELETE ON event_log
+            FOR EACH ROW
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_event_prune();
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_event_truncate_guard ON event_log;
+        CREATE TRIGGER studiofs_snapshot_source_event_truncate_guard
+            BEFORE TRUNCATE ON event_log
+            FOR EACH STATEMENT
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_event_prune();
+
+        CREATE OR REPLACE FUNCTION studiofs_reject_snapshot_source_prune()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF TG_OP = 'TRUNCATE' THEN
+                IF EXISTS (
+                    SELECT 1
+                    FROM snapshot_source_checkpoints AS s
+                    INNER JOIN snapshot_catalog AS c
+                        ON c.vol = s.vol AND c.id = s.snapshot_id
+                    WHERE c.lifecycle = 'creating'
+                       OR EXISTS (
+                           SELECT 1
+                           FROM snapshot_creation_leases AS l
+                           WHERE l.vol = s.vol
+                             AND l.snapshot_id = s.snapshot_id
+                             AND l.owner <> ''
+                             AND l.lease_expires_at > clock_timestamp()
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM snapshot_mount_leases AS l
+                           WHERE l.vol = s.vol
+                             AND l.snapshot_id = s.snapshot_id
+                             AND l.released_at IS NULL
+                             AND l.lease_expires_at > clock_timestamp()
+                       )
+                ) THEN
+                    RAISE EXCEPTION 'snapshot sources are still referenced'
+                        USING ERRCODE = 'restrict_violation';
+                END IF;
+                RETURN NULL;
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM snapshot_catalog AS c
+                WHERE c.vol = OLD.vol
+                  AND c.id = OLD.snapshot_id
+                  AND (
+                      c.lifecycle = 'creating'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM snapshot_creation_leases AS l
+                          WHERE l.vol = OLD.vol
+                            AND l.snapshot_id = OLD.snapshot_id
+                            AND l.owner <> ''
+                            AND l.lease_expires_at > clock_timestamp()
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM snapshot_mount_leases AS l
+                          WHERE l.vol = OLD.vol
+                            AND l.snapshot_id = OLD.snapshot_id
+                            AND l.released_at IS NULL
+                            AND l.lease_expires_at > clock_timestamp()
+                      )
+                  )
+            ) THEN
+                RAISE EXCEPTION 'snapshot source is still referenced'
+                    USING ERRCODE = 'restrict_violation';
+            END IF;
+            RETURN OLD;
+        END
+        $$;
+
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_prune_guard
+            ON snapshot_source_checkpoints;
+        CREATE TRIGGER studiofs_snapshot_source_prune_guard
+            BEFORE DELETE ON snapshot_source_checkpoints
+            FOR EACH ROW
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_prune();
+        DROP TRIGGER IF EXISTS studiofs_snapshot_source_truncate_guard
+            ON snapshot_source_checkpoints;
+        CREATE TRIGGER studiofs_snapshot_source_truncate_guard
+            BEFORE TRUNCATE ON snapshot_source_checkpoints
+            FOR EACH STATEMENT
+            EXECUTE FUNCTION studiofs_reject_snapshot_source_prune();
 
         CREATE TABLE IF NOT EXISTS snapshot_artifacts (
             vol BIGINT NOT NULL,

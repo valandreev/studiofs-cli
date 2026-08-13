@@ -3,7 +3,7 @@ use super::{
     LOCAL_PG_VERSION_COUNTER, PgMetaEngine, StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
-use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
+use crate::redb_engine::RedbMetaEngine;
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
@@ -110,16 +110,11 @@ impl PgMetaEngine {
     }
 
     pub(super) fn snapshot_replay_start_version(
-        snapshot: &RedbSnapshot,
+        checkpoint_version: i64,
         advertised_head_version: i64,
-        previous_local_version: i64,
     ) -> i64 {
-        snapshot
-            .counters
-            .iter()
-            .find(|(name, _)| name == LOCAL_PG_VERSION_COUNTER)
-            .map(|(_, version)| (*version).min(i64::MAX as u64) as i64)
-            .unwrap_or(previous_local_version)
-            .min(advertised_head_version)
+        checkpoint_version
+            .max(0)
+            .min(advertised_head_version.max(0))
     }
 }

@@ -455,7 +455,8 @@ fn seed_pg_metadata_state(
     rt: &tokio::runtime::Runtime,
     dsn: &str,
     volume_id: i64,
-    snapshot_json: &[u8],
+    checkpoint_bytes: &[u8],
+    format_info_bytes: &[u8],
 ) -> anyhow::Result<()> {
     rt.block_on(async {
         let (client, connection) = connect_studiofs_postgres(dsn).await?;
@@ -468,11 +469,16 @@ fn seed_pg_metadata_state(
         client
             .execute(
                 r#"
-                INSERT INTO metadata_state (vol, version, snapshot)
-                VALUES ($1, $2, $3)
+                INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info)
+                VALUES ($1, $2, $2, $3, $4)
                 ON CONFLICT (vol) DO NOTHING
                 "#,
-                &[&volume_id, &INITIAL_METADATA_STATE_VERSION, &snapshot_json],
+                &[
+                    &volume_id,
+                    &INITIAL_METADATA_STATE_VERSION,
+                    &checkpoint_bytes,
+                    &format_info_bytes,
+                ],
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
@@ -590,9 +596,15 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
     // Initialize root inode owned by the current user
     let (uid, gid) = get_current_ids();
     engine.init_root(uid, gid)?;
-    let snapshot = engine.export_snapshot()?;
-    let snapshot_json = serde_json::to_vec(&snapshot)?;
-    seed_pg_metadata_state(&rt, &postgres_dsn, postgres_volume_id, &snapshot_json)?;
+    let checkpoint_bytes = engine.export_serving_checkpoint_bytes()?;
+    let format_info_bytes = serde_json::to_vec(&format_info)?;
+    seed_pg_metadata_state(
+        &rt,
+        &postgres_dsn,
+        postgres_volume_id,
+        &checkpoint_bytes,
+        &format_info_bytes,
+    )?;
     drop(engine);
 
     let primed_engine = open_meta_engine_with_options(

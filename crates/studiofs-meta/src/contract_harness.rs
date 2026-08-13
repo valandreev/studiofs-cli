@@ -9,7 +9,7 @@ use crate::schema::{
 };
 use crate::{
     MetaError, MetaFormat, MetaFsOps, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
-    MetaResult, MetaSnapshots, RedbMetaEngine,
+    MetaResult, RedbMetaEngine,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -552,11 +552,6 @@ impl ContractCoreFixture {
             .collect();
         diagnostics.lifecycles.sort_by_key(|record| record.ino);
 
-        let mut snapshot_pinned_object_ids = BTreeSet::new();
-        for snapshot in meta.list_snapshots()? {
-            snapshot_pinned_object_ids.extend(snapshot.pinned_object_ids);
-        }
-
         let mut object_graph_ref_inos = BTreeMap::<u64, BTreeSet<u64>>::new();
         for attr in attr_by_ino.values() {
             if attr.kind == FileType::RegularFile {
@@ -615,7 +610,6 @@ impl ContractCoreFixture {
                     *object_id,
                     &object_graph_ref_inos,
                     &deferred_cleanup_object_owners,
-                    &snapshot_pinned_object_ids,
                 )
             {
                 diagnostics.push_violation(format!(
@@ -721,11 +715,7 @@ impl ContractCoreFixture {
         object_id: u64,
         object_graph_ref_inos: &BTreeMap<u64, BTreeSet<u64>>,
         deferred_cleanup_object_owners: &BTreeMap<u64, BTreeSet<u64>>,
-        snapshot_pinned_object_ids: &BTreeSet<u64>,
     ) -> bool {
-        if snapshot_pinned_object_ids.contains(&object_id) {
-            return false;
-        }
         let Some(ref_inos) = object_graph_ref_inos.get(&object_id) else {
             return false;
         };
@@ -884,5 +874,74 @@ fn sanitize_label(label: &str) -> String {
         "fixture".to_string()
     } else {
         sanitized.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redb_engine::RedbSnapshot;
+    use crate::snapshot::{ServingCheckpoint, SnapshotCut};
+    use chrono::TimeZone;
+
+    #[test]
+    fn snapshot_v2_public_contract() {
+        let captured_at = chrono::Utc
+            .with_ymd_and_hms(2026, 8, 13, 10, 11, 12)
+            .single()
+            .expect("valid captured timestamp");
+        let cut = SnapshotCut::new(7, 42, captured_at).expect("valid snapshot cut");
+        let cut_json = serde_json::to_value(cut).expect("serialize public snapshot cut");
+        let cut_fields = cut_json
+            .as_object()
+            .expect("snapshot cut is an object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cut_fields,
+            BTreeSet::from([
+                "captured_at".to_string(),
+                "cut_version".to_string(),
+                "volume_id".to_string(),
+            ])
+        );
+
+        let serving_json = serde_json::to_value(ServingCheckpoint::default())
+            .expect("serialize serving checkpoint");
+        let serving_text = serving_json.to_string();
+        for forbidden in [
+            "root_ino",
+            "snapshot_payload",
+            "pinned_object_ids",
+            "event_log",
+            "counters",
+        ] {
+            assert!(
+                !serving_text.contains(forbidden),
+                "serving checkpoint must not contain legacy/local field {forbidden}"
+            );
+        }
+
+        let local_snapshot_text =
+            serde_json::to_string(&RedbSnapshot::default()).expect("serialize local snapshot");
+        for forbidden in ["\"snapshots\"", "snapshot_payload", "pinned_object_ids"] {
+            assert!(
+                !local_snapshot_text.contains(forbidden),
+                "local recovery snapshot must not contain removed field {forbidden}"
+            );
+        }
+
+        let ddl = crate::pg_engine::schema::studiofs_pg_schema_sql();
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_source_checkpoints"));
+        assert!(ddl.contains("checkpoint_version BIGINT"));
+        assert!(ddl.contains("event_start_version BIGINT"));
+        assert!(ddl.contains("event_end_version BIGINT"));
+        assert!(ddl.contains("event_row_count BIGINT"));
+        assert!(ddl.contains("studiofs_snapshot_source_event_prune_guard"));
+        assert!(ddl.contains("studiofs_snapshot_source_prune_guard"));
+        assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
+        assert!(!ddl.contains("snapshot_payload"));
+        assert!(!ddl.contains("pinned_object_ids"));
     }
 }
