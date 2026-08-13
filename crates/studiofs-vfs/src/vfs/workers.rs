@@ -1529,7 +1529,7 @@ impl StudioVfs {
                 global_snapshot_pins.insert(claim.entry.object_id);
                 let proof = run_with_timeout_or_cancel(
                     &self.state.shutdown.background_shutdown_token,
-                    Duration::from_secs(5),
+                    REMOTE_OBJECT_IO_TIMEOUT,
                     self.fetch_scheduler
                         .data_store()
                         .get_by_key(&claim.entry.object_key),

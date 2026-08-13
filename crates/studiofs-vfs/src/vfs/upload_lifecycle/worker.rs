@@ -1701,7 +1701,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             async move {
                 let result = run_with_timeout_or_cancel(
                     &cancel_token,
-                    Duration::from_secs(5),
+                    crate::vfs::REMOTE_OBJECT_IO_TIMEOUT,
                     self.vfs.fetch_scheduler.data_store().exists(&key),
                 )
                 .await;
@@ -1819,7 +1819,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                         }
                         let proof = run_with_timeout_or_cancel(
                             &cancel_token,
-                            Duration::from_secs(5),
+                            crate::vfs::REMOTE_OBJECT_IO_TIMEOUT,
                             self.vfs.fetch_scheduler.data_store().get_by_key(&key),
                         )
                         .await;

@@ -665,6 +665,7 @@ fn is_blocked_root_macos_metadata(name: &[u8]) -> bool {
 
 /// Attribute cache TTL — read-through attributes are valid for 1 second.
 const ATTR_CACHE_TTL: Duration = Duration::from_secs(1);
+pub(crate) const REMOTE_OBJECT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;

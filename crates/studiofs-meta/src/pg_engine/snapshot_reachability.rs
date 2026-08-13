@@ -60,10 +60,38 @@ where
         return Ok(());
     }
 
-    let mut before_by_inode = BTreeMap::new();
-    for inode in affected_inodes.iter().copied() {
-        let before = load_current_references(client, volume_id, inode).await?;
-        before_by_inode.insert(inode, before);
+    let affected_inode_ids = affected_inodes
+        .iter()
+        .copied()
+        .map(|inode| checked_i64(inode, "inode"))
+        .collect::<MetaResult<Vec<_>>>()?;
+    let current_rows = client
+        .query(
+            "SELECT ino, object_id FROM snapshot_current_references WHERE vol = $1 AND ino = ANY($2::BIGINT[])",
+            &[&volume_id, &affected_inode_ids],
+        )
+        .await
+        .map_err(|error| {
+            PgMetaEngine::classify_pg_error(
+                "postgres snapshot current-reference query failed",
+                error,
+            )
+        })?;
+    let mut before_by_inode = affected_inodes
+        .iter()
+        .copied()
+        .map(|inode| (inode, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for row in current_rows {
+        let inode: i64 = row.get(0);
+        let object_id: i64 = row.get(1);
+        let inode = u64::try_from(inode).map_err(|_| {
+            MetaError::Storage("snapshot current-reference inode is invalid".to_owned())
+        })?;
+        let object_id = u64::try_from(object_id).map_err(|_| {
+            MetaError::Storage("snapshot current-reference object id is invalid".to_owned())
+        })?;
+        before_by_inode.entry(inode).or_default().insert(object_id);
     }
 
     let mut after_by_inode = before_by_inode.clone();
@@ -74,18 +102,69 @@ where
         .chain(after_by_inode.values())
         .flat_map(|objects| objects.iter().copied())
         .collect::<BTreeSet<_>>();
-    let before_counts = count_references(&before_by_inode);
-    let after_counts = count_references(&after_by_inode);
-
-    for object_id in object_ids.iter().copied() {
-        if after_counts.get(&object_id).copied().unwrap_or(0) == 0 {
-            continue;
+    let object_id_values = object_ids
+        .iter()
+        .copied()
+        .map(|object_id| checked_i64(object_id, "object id"))
+        .collect::<MetaResult<Vec<_>>>()?;
+    let global_count_rows = if object_id_values.is_empty() {
+        Vec::new()
+    } else {
+        client
+            .query(
+                "SELECT object_id, count(*)::BIGINT FROM snapshot_current_references WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) GROUP BY object_id",
+                &[&volume_id, &object_id_values],
+            )
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error(
+                    "postgres snapshot object reference count query failed",
+                    error,
+                )
+            })?
+    };
+    let mut before_counts = BTreeMap::new();
+    for row in global_count_rows {
+        let object_id: i64 = row.get(0);
+        let count: i64 = row.get(1);
+        before_counts.insert(
+            u64::try_from(object_id).map_err(|_| {
+                MetaError::Storage("snapshot reference object id is invalid".to_owned())
+            })?,
+            usize::try_from(count).map_err(|_| {
+                MetaError::Storage("snapshot reference count is invalid".to_owned())
+            })?,
+        );
+    }
+    let mut after_counts = before_counts.clone();
+    for (inode, before_objects) in &before_by_inode {
+        let after_objects = after_by_inode.get(inode).ok_or_else(|| {
+            MetaError::Storage("snapshot after-image inode is missing".to_owned())
+        })?;
+        for object_id in before_objects {
+            let count = after_counts.get_mut(object_id).ok_or_else(|| {
+                MetaError::Storage("snapshot reference count is missing".to_owned())
+            })?;
+            *count = count.checked_sub(1).ok_or_else(|| {
+                MetaError::Storage("snapshot reference count underflow".to_owned())
+            })?;
         }
-        let object_id_i64 = checked_i64(object_id, "object id")?;
-        let state = client
-            .query_opt(
-                "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 FOR UPDATE",
-                &[&volume_id, &object_id_i64],
+        for object_id in after_objects {
+            *after_counts.entry(*object_id).or_default() += 1;
+        }
+    }
+
+    let published_object_ids = object_ids
+        .iter()
+        .copied()
+        .filter(|object_id| after_counts.get(object_id).copied().unwrap_or(0) > 0)
+        .map(|object_id| checked_i64(object_id, "object id"))
+        .collect::<MetaResult<Vec<_>>>()?;
+    if !published_object_ids.is_empty() {
+        let states = client
+            .query(
+                "SELECT object_id, state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) FOR UPDATE",
+                &[&volume_id, &published_object_ids],
             )
             .await
             .map_err(|error| {
@@ -93,9 +172,11 @@ where
                     "postgres snapshot upload publication fence read failed",
                     error,
                 )
-            })?
-            .map(|row| row.get::<_, String>(0));
-        if state.as_deref() == Some("delete_pending") {
+            })?;
+        if states
+            .iter()
+            .any(|row| row.get::<_, String>(1) == "delete_pending")
+        {
             return Err(MetaError::Storage(
                 "snapshot payload publication requires a new object id while deletion is pending"
                     .to_owned(),
@@ -103,91 +184,96 @@ where
         }
     }
 
-    for inode in affected_inodes {
-        let inode_i64 = checked_i64(inode, "inode")?;
+    client
+        .execute(
+            "DELETE FROM snapshot_current_references WHERE vol = $1 AND ino = ANY($2::BIGINT[])",
+            &[&volume_id, &affected_inode_ids],
+        )
+        .await
+        .map_err(|error| {
+            PgMetaEngine::classify_pg_error(
+                "postgres snapshot current-reference delete failed",
+                error,
+            )
+        })?;
+
+    let mut reference_inodes = Vec::new();
+    let mut reference_object_ids = Vec::new();
+    for (inode, objects) in &after_by_inode {
+        let inode = checked_i64(*inode, "inode")?;
+        for object_id in objects {
+            reference_inodes.push(inode);
+            reference_object_ids.push(checked_i64(*object_id, "object id")?);
+        }
+    }
+    if !reference_inodes.is_empty() {
         client
             .execute(
-                "DELETE FROM snapshot_current_references WHERE vol = $1 AND ino = $2",
-                &[&volume_id, &inode_i64],
+                "INSERT INTO snapshot_current_references (vol, ino, object_id) SELECT $1, refs.ino, refs.object_id FROM UNNEST($2::BIGINT[], $3::BIGINT[]) AS refs(ino, object_id) ON CONFLICT DO NOTHING",
+                &[&volume_id, &reference_inodes, &reference_object_ids],
             )
             .await
             .map_err(|error| {
                 PgMetaEngine::classify_pg_error(
-                    "postgres snapshot current-reference delete failed",
+                    "postgres snapshot current-reference insert failed",
                     error,
                 )
             })?;
+    }
 
-        if let Some(objects) = after_by_inode.get(&inode) {
-            for object_id in objects {
-                let object_id = checked_i64(*object_id, "object id")?;
-                client
-                    .execute(
-                        "INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                        &[&volume_id, &inode_i64, &object_id],
-                    )
-                    .await
-                    .map_err(|error| {
-                        PgMetaEngine::classify_pg_error(
-                            "postgres snapshot current-reference insert failed",
-                            error,
-                        )
-                    })?;
-            }
+    let mut opened_object_ids = Vec::new();
+    let mut closed_object_ids = Vec::new();
+    for object_id in object_ids.iter().copied() {
+        let before_count = before_counts.get(&object_id).copied().unwrap_or(0);
+        let after_count = after_counts.get(&object_id).copied().unwrap_or(0);
+        match (before_count, after_count) {
+            (0, count) if count > 0 => opened_object_ids.push(checked_i64(object_id, "object id")?),
+            (count, 0) if count > 0 => closed_object_ids.push(checked_i64(object_id, "object id")?),
+            _ => {}
         }
     }
 
-    for object_id in object_ids {
-        let before_count = before_counts.get(&object_id).copied().unwrap_or(0);
-        let after_count = after_counts.get(&object_id).copied().unwrap_or(0);
-        let object_id_i64 = checked_i64(object_id, "object id")?;
-
-        match (before_count, after_count) {
-            (0, count) if count > 0 => {
-                client
-                    .execute(
-                        "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) VALUES ($1, $2, $3)",
-                        &[&volume_id, &object_id_i64, &batch_version],
-                    )
-                    .await
-                    .map_err(|error| {
-                        PgMetaEngine::classify_pg_error(
-                            "postgres snapshot reachability interval open failed",
-                            error,
-                        )
-                    })?;
-            }
-            (count, 0) if count > 0 => {
-                client
-                    .execute(
-                        "UPDATE snapshot_object_reachability SET end_version = $3 WHERE vol = $1 AND object_id = $2 AND end_version IS NULL",
-                        &[&volume_id, &object_id_i64, &batch_version],
-                    )
-                    .await
-                    .map_err(|error| {
-                        PgMetaEngine::classify_pg_error(
-                            "postgres snapshot reachability interval close failed",
-                            error,
-                        )
-                    })?;
-            }
-            _ => {}
-        }
-
-        if after_count > 0 {
-            client
-                .execute(
-                    "UPDATE snapshot_payload_upload_objects SET state = 'published', publish_batch_version = $3, closed_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('uploading', 'uploaded', 'retry_wait')",
-                    &[&volume_id, &object_id_i64, &batch_version],
+    if !opened_object_ids.is_empty() {
+        client
+            .execute(
+                "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) SELECT $1, objects.object_id, $3 FROM UNNEST($2::BIGINT[]) AS objects(object_id)",
+                &[&volume_id, &opened_object_ids, &batch_version],
+            )
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error(
+                    "postgres snapshot reachability interval open failed",
+                    error,
                 )
-                .await
-                .map_err(|error| {
-                    PgMetaEngine::classify_pg_error(
-                        "postgres snapshot upload publication state update failed",
-                        error,
-                    )
-                })?;
-        }
+            })?;
+    }
+    if !closed_object_ids.is_empty() {
+        client
+            .execute(
+                "UPDATE snapshot_object_reachability SET end_version = $3 WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND end_version IS NULL",
+                &[&volume_id, &closed_object_ids, &batch_version],
+            )
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error(
+                    "postgres snapshot reachability interval close failed",
+                    error,
+                )
+            })?;
+    }
+    if !published_object_ids.is_empty() {
+        client
+            .execute(
+                "UPDATE snapshot_payload_upload_objects SET state = 'published', publish_batch_version = $3, closed_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND state IN ('uploading', 'uploaded', 'retry_wait')",
+                &[&volume_id, &published_object_ids, &batch_version],
+            )
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error(
+                    "postgres snapshot upload publication state update failed",
+                    error,
+                )
+            })?;
     }
 
     Ok(())
@@ -238,6 +324,7 @@ fn fold_published_events(after_by_inode: &mut BTreeMap<u64, BTreeSet<u64>>, even
     }
 }
 
+#[cfg(test)]
 fn count_references(references: &BTreeMap<u64, BTreeSet<u64>>) -> BTreeMap<u64, usize> {
     let mut counts = BTreeMap::new();
     for objects in references.values() {
@@ -246,38 +333,6 @@ fn count_references(references: &BTreeMap<u64, BTreeSet<u64>>) -> BTreeMap<u64, 
         }
     }
     counts
-}
-
-async fn load_current_references<C>(
-    client: &C,
-    volume_id: VolumeId,
-    inode: u64,
-) -> MetaResult<BTreeSet<u64>>
-where
-    C: GenericClient + Sync,
-{
-    let inode = checked_i64(inode, "inode")?;
-    let rows = client
-        .query(
-            "SELECT object_id FROM snapshot_current_references WHERE vol = $1 AND ino = $2",
-            &[&volume_id, &inode],
-        )
-        .await
-        .map_err(|error| {
-            PgMetaEngine::classify_pg_error(
-                "postgres snapshot current-reference query failed",
-                error,
-            )
-        })?;
-
-    rows.into_iter()
-        .map(|row| {
-            let object_id: i64 = row.get(0);
-            u64::try_from(object_id).map_err(|_| {
-                MetaError::Storage("snapshot current-reference object id is invalid".to_owned())
-            })
-        })
-        .collect()
 }
 
 fn checked_i64(value: u64, kind: &str) -> MetaResult<i64> {
@@ -542,8 +597,34 @@ impl PgMetaEngine {
                                 )
                             })?;
 
+                        let object_ids = rows
+                            .iter()
+                            .map(|row| row.get::<_, i64>(0))
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let lease_rows = tx
+                            .query(
+                                "UPDATE snapshot_payload_upload_objects SET reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1 WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) RETURNING object_id, reconcile_fence",
+                                &[
+                                    &volume_id,
+                                    &object_ids,
+                                    &owner,
+                                    &(SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64),
+                                ],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot upload reconciliation lease failed",
+                                    error,
+                                )
+                            })?;
+                        let fencing_tokens = lease_rows
+                            .into_iter()
+                            .map(|row| (row.get::<_, i64>(0), row.get::<_, i64>(1)))
+                            .collect::<HashMap<_, _>>();
                         let mut claims = Vec::with_capacity(rows.len());
-                        let mut fencing_tokens = HashMap::new();
                         for row in rows {
                             let object_id: i64 = row.get(0);
                             let fragment_index: i32 = row.get(1);
@@ -554,32 +635,11 @@ impl PgMetaEngine {
                                     "snapshot upload fragment digest is invalid".to_owned(),
                                 )
                             })?;
-                            let fencing_token = if let Some(fencing_token) =
-                                fencing_tokens.get(&object_id).copied()
-                            {
-                                fencing_token
-                            } else {
-                                let fencing_token: i64 = tx
-                                    .query_one(
-                                        "UPDATE snapshot_payload_upload_objects SET reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1 WHERE vol = $1 AND object_id = $2 RETURNING reconcile_fence",
-                                        &[
-                                            &volume_id,
-                                            &object_id,
-                                            &owner,
-                                            &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
-                                        ],
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        Self::classify_pg_error(
-                                            "postgres snapshot upload reconciliation lease failed",
-                                            error,
-                                        )
-                                    })?
-                                    .get(0);
-                                fencing_tokens.insert(object_id, fencing_token);
-                                fencing_token
-                            };
+                            let fencing_token = fencing_tokens.get(&object_id).copied().ok_or_else(|| {
+                                MetaError::Storage(
+                                    "snapshot upload reconciliation lease row is missing".to_owned(),
+                                )
+                            })?;
                             claims.push(UploadedFragmentReconciliationClaim {
                                 entry: UploadedFragmentLedgerEntry {
                                     volume_id,
@@ -746,7 +806,7 @@ impl PgMetaEngine {
                                             &object_id,
                                             &owner,
                                             &fencing_token,
-                                            &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
+                                            &(SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64),
                                         ],
                                     )
                                     .await
@@ -990,7 +1050,7 @@ impl PgMetaEngine {
                                             &volume_id,
                                             &object_id,
                                             &owner,
-                                            &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
+                                            &(SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64),
                                         ],
                                     )
                                     .await
@@ -1059,7 +1119,7 @@ impl PgMetaEngine {
                                     &owner,
                                     &fencing_token,
                                     &state,
-                                    &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
+                                    &(SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64),
                                     &message,
                                 ],
                             )

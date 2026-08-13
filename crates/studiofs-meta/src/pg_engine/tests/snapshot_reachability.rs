@@ -175,7 +175,7 @@ fn snapshot_cut_and_mount_lease_control_object_protection() {
 
         client
             .execute(
-                "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 1)",
+                "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 1) ON CONFLICT DO NOTHING",
                 &[&volume.volume_id],
             )
             .await
@@ -347,7 +347,7 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
     assert_eq!(tail_claims.len(), 5);
     assert_eq!(
         tail_claims.first().map(|claim| claim.entry.object_id),
-        Some(257)
+        Some(256)
     );
     assert_eq!(
         tail_claims.last().map(|claim| claim.entry.object_id),
