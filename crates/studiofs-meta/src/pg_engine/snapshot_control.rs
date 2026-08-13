@@ -100,7 +100,7 @@ impl PgMetaEngine {
         let volume_id = self.volume_id;
         let snapshot_id_text = snapshot_id.to_string();
         let command_timeout = self.command_timeout;
-        let (cut, descriptor, checkpoint_bytes, event_rows) = Self::run_async_once(async move {
+        let (descriptor, checkpoint_bytes, event_rows) = Self::run_async_once(async move {
             Self::with_postgres_client_timeout_once(
                 postgres_url,
                 Self::default_connect_timeout(),
@@ -179,7 +179,7 @@ impl PgMetaEngine {
                         )
                         .await
                         .map_err(|_| snapshot_control_error("read snapshot event range"))?;
-                    Ok((cut, descriptor, checkpoint_bytes, event_rows))
+                    Ok((descriptor, checkpoint_bytes, event_rows))
                 },
             )
             .await
@@ -202,7 +202,6 @@ impl PgMetaEngine {
             },
         )?;
 
-        let _ = cut;
         Ok(SnapshotReconstruction {
             path: destination.to_path_buf(),
         })
