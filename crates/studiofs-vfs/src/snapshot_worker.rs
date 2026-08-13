@@ -28,8 +28,8 @@ use studiofs_meta::snapshot_ports::{
     SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator, SnapshotArtifactScope,
     SnapshotArtifactStore, SnapshotClock, SnapshotFailure, SnapshotJobClaim, SnapshotJobStore,
     SnapshotPayloadBytes, SnapshotPayloadProof, SnapshotPayloadReader, SnapshotPortError,
-    SnapshotPortFuture, SnapshotRetry, SnapshotSourceReader, SnapshotStoredArtifact,
-    SnapshotWorkerId,
+    SnapshotPortFuture, SnapshotReconstruction, SnapshotRetry, SnapshotSourceReader,
+    SnapshotStoredArtifact, SnapshotWorkerId,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -403,6 +403,31 @@ fn digest(bytes: &[u8]) -> SnapshotSha256 {
     SnapshotSha256::from_bytes(Sha256::digest(bytes).into())
 }
 
+fn materializer_attempt_root(
+    materializer_root: &Path,
+    snapshot_id: &SnapshotId,
+    attempt: u64,
+) -> Result<PathBuf, SnapshotWorkerError> {
+    let snapshot_component = snapshot_id.as_str();
+    if snapshot_component.is_empty()
+        || snapshot_component == "."
+        || snapshot_component == ".."
+        || snapshot_component.contains('/')
+        || snapshot_component.contains('\\')
+    {
+        return Err(SnapshotWorkerError::Integrity(
+            SnapshotIntegrityError::InvalidMaterializerPath,
+        ));
+    }
+    let snapshot_root = materializer_root.join(snapshot_component);
+    if !snapshot_root.starts_with(materializer_root) {
+        return Err(SnapshotWorkerError::Integrity(
+            SnapshotIntegrityError::InvalidMaterializerPath,
+        ));
+    }
+    Ok(snapshot_root.join("attempts").join(attempt.to_string()))
+}
+
 /// Integrity failures that must not publish a Ready snapshot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
 pub enum SnapshotIntegrityError {
@@ -427,6 +452,9 @@ pub enum SnapshotIntegrityError {
     /// The artifact adapter returned metadata inconsistent with its attempt.
     #[error("snapshot artifact metadata does not match")]
     ArtifactMetadataMismatch,
+    /// The snapshot identifier cannot be used as a local materializer component.
+    #[error("snapshot materializer path is invalid")]
+    InvalidMaterializerPath,
 }
 
 /// Errors returned by the reusable Snapshot v2 worker.
@@ -761,12 +789,11 @@ impl SnapshotWorker {
             kind: SnapshotArtifactKind::Metadata,
             ..attempt_locator.clone()
         };
-        let attempt_root = self
-            .config
-            .materializer_root
-            .join(claim.job.snapshot_id.as_str())
-            .join("attempts")
-            .join(attempt.to_string());
+        let attempt_root = materializer_attempt_root(
+            &self.config.materializer_root,
+            &claim.job.snapshot_id,
+            attempt,
+        )?;
         let mut attempt_uploaded = false;
         let mut final_published = false;
         let mut materializer_created = false;
@@ -794,7 +821,7 @@ impl SnapshotWorker {
                 })?;
             materializer_created = true;
             let destination = attempt_root.join("metadata.redb");
-            let reconstruction = await_port(
+            let reconstruction = await_reconstruction(
                 self.sources
                     .reconstruct(&catalog.cut, &source_descriptor, &destination),
                 cancel,
@@ -863,12 +890,14 @@ impl SnapshotWorker {
             }
         } else {
             let preserve_final = ready_publish_started
-                && matches!(
-                    &result,
-                    Err(SnapshotWorkerError::Port(
-                        SnapshotPortError::Retryable { .. }
-                    )) | Err(SnapshotWorkerError::Cancelled)
-                );
+                && match &result {
+                    Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. }))
+                    | Err(SnapshotWorkerError::Cancelled) => true,
+                    Err(SnapshotWorkerError::Port(SnapshotPortError::Permanent {
+                        code, ..
+                    })) => code.as_str() == "stale_lease",
+                    _ => false,
+                };
             if final_published && !preserve_final {
                 self.cleanup_artifact(&final_locator).await;
             }
@@ -1099,6 +1128,23 @@ async fn await_port<'a, T>(
     }
 }
 
+async fn await_reconstruction<'a>(
+    future: SnapshotPortFuture<'a, SnapshotReconstruction>,
+    cancel: &CancellationToken,
+) -> Result<SnapshotReconstruction, SnapshotWorkerError> {
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => result.map_err(|error| match error {
+            SnapshotPortError::Cancelled => SnapshotWorkerError::Cancelled,
+            error => SnapshotWorkerError::Port(error),
+        }),
+        _ = cancel.cancelled() => {
+            let _ = future.await;
+            Err(SnapshotWorkerError::Cancelled)
+        }
+    }
+}
+
 async fn collect_published_payloads(path: PathBuf) -> Result<Vec<PayloadRef>, SnapshotWorkerError> {
     tokio::task::spawn_blocking(move || {
         let engine = studiofs_meta::RedbMetaEngine::open(&path).map_err(|_| {
@@ -1150,8 +1196,8 @@ mod tests {
         SnapshotArtifactScope, SnapshotArtifactStore, SnapshotClaimOrFollow, SnapshotClock,
         SnapshotFailure, SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadBytes,
         SnapshotPayloadProof, SnapshotPayloadReader, SnapshotPortError, SnapshotPortFuture,
-        SnapshotReconstruction, SnapshotRetry, SnapshotSourceDescriptor, SnapshotSourceReader,
-        SnapshotStoredArtifact, SnapshotWorkerId,
+        SnapshotRetry, SnapshotSourceDescriptor, SnapshotSourceReader, SnapshotStoredArtifact,
+        SnapshotWorkerId,
     };
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
@@ -1953,6 +1999,109 @@ mod tests {
         assert!(materializer_root.exists());
     }
 
+    #[tokio::test]
+    async fn stale_ready_publication_preserves_final_artifact() {
+        let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = source_dir.path().join("source.redb");
+        studiofs_meta::RedbMetaEngine::open(&source_path).expect("source redb");
+        let jobs = Arc::new(TestJobStore::new(claim, catalog));
+        *jobs.publish_ready_error.lock().expect("publish error lock") = Some(
+            SnapshotPortError::permanent("stale_lease", "snapshot lease generation changed"),
+        );
+        let artifacts = Arc::new(TestArtifactStore::new());
+        let worker = Arc::new(
+            SnapshotWorker::new(
+                volume,
+                SnapshotWorkerId::new("worker-a").expect("worker id"),
+                jobs.clone(),
+                Arc::new(TestSourceReader {
+                    descriptor: source_descriptor,
+                    path: source_path,
+                }),
+                Arc::new(TestPayloadReader::empty()),
+                artifacts.clone(),
+                Arc::new(TestClock { now: captured_at }),
+                SnapshotWorkerConfig::new(source_dir.path().join("materializer")),
+            )
+            .expect("worker"),
+        );
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(worker.run(cancel.clone()));
+
+        jobs.failed.notified().await;
+        cancel.cancel();
+        assert!(task.await.expect("worker join").is_ok());
+        assert_eq!(artifacts.final_publishes.load(Ordering::SeqCst), 1);
+        assert_eq!(artifacts.deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn materializer_path_rejects_snapshot_id_path_separators() {
+        let captured_at = Utc
+            .with_ymd_and_hms(2026, 8, 13, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        for volume_name in ["../escape", r"..\escape", "/absolute"] {
+            let snapshot_id = SnapshotId::from_cut(volume_name, captured_at)
+                .expect("snapshot ID accepts the existing volume-name contract");
+            let error = materializer_attempt_root(Path::new("materializer"), &snapshot_id, 1)
+                .expect_err("snapshot ID must not become a path");
+            assert!(matches!(
+                error,
+                SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidMaterializerPath)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_spawn_blocking_reconstruction() {
+        let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = source_dir.path().join("source.redb");
+        studiofs_meta::RedbMetaEngine::open(&source_path).expect("source redb");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reconstruct_started = Arc::new(Notify::new());
+        let worker_completed = Arc::new(Notify::new());
+        let jobs = Arc::new(TestJobStore::new(claim, catalog));
+        let worker = Arc::new(
+            SnapshotWorker::new(
+                volume,
+                SnapshotWorkerId::new("worker-a").expect("worker id"),
+                jobs,
+                Arc::new(SpawnBlockingSourceReader {
+                    descriptor: source_descriptor,
+                    path: source_path,
+                    started: reconstruct_started.clone(),
+                    release: Mutex::new(Some(release_rx)),
+                }),
+                Arc::new(TestPayloadReader::empty()),
+                Arc::new(TestArtifactStore::new()),
+                Arc::new(TestClock { now: captured_at }),
+                SnapshotWorkerConfig::new(source_dir.path().join("materializer")),
+            )
+            .expect("worker"),
+        );
+        let cancel = CancellationToken::new();
+        let completed = worker_completed.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let result = worker.run(task_cancel).await;
+            completed.notify_one();
+            result
+        });
+
+        reconstruct_started.notified().await;
+        cancel.cancel();
+        let completed_before_release =
+            tokio::time::timeout(Duration::from_millis(100), worker_completed.notified())
+                .await
+                .is_ok();
+        release_tx.send(()).expect("release reconstruction");
+        assert!(task.await.expect("worker join").is_ok());
+        assert!(!completed_before_release);
+    }
+
     fn published_payload_source(root: &Path) -> PathBuf {
         published_payload_source_with_payloads(root, &[PayloadRef::new_full(77, 4)])
     }
@@ -2056,6 +2205,7 @@ mod tests {
         catalog: SnapshotCatalogEntry,
         follow_lifecycle: Mutex<SnapshotLifecycle>,
         published_artifact: Mutex<Option<(SnapshotArtifactDescriptor, Vec<SnapshotPayloadProof>)>>,
+        publish_ready_error: Mutex<Option<SnapshotPortError>>,
         failed_catalog: Mutex<Option<SnapshotCatalogEntry>>,
         retry_job: Mutex<Option<SnapshotCreationJob>>,
         ready_after_retry: AtomicBool,
@@ -2085,6 +2235,7 @@ mod tests {
                 follow_lifecycle: Mutex::new(catalog.lifecycle),
                 catalog,
                 published_artifact: Mutex::new(None),
+                publish_ready_error: Mutex::new(None),
                 failed_catalog: Mutex::new(None),
                 retry_job: Mutex::new(None),
                 ready_after_retry: AtomicBool::new(false),
@@ -2224,6 +2375,14 @@ mod tests {
                 if self.publish_ready_cancelled.load(Ordering::SeqCst) {
                     return Err(SnapshotPortError::Cancelled);
                 }
+                if let Some(error) = self
+                    .publish_ready_error
+                    .lock()
+                    .expect("publish error lock")
+                    .take()
+                {
+                    return Err(error);
+                }
                 *self.published_artifact.lock().expect("published lock") =
                     Some((descriptor, payload_proofs));
                 self.published.notify_one();
@@ -2249,6 +2408,13 @@ mod tests {
         path: PathBuf,
         started: Arc<Notify>,
         release: Arc<Notify>,
+    }
+
+    struct SpawnBlockingSourceReader {
+        descriptor: SnapshotSourceDescriptor,
+        path: PathBuf,
+        started: Arc<Notify>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     }
 
     impl SnapshotSourceReader for BlockingSourceReader {
@@ -2280,6 +2446,58 @@ mod tests {
                 started.notify_one();
                 release.notified().await;
                 Ok(SnapshotReconstruction { path })
+            })
+        }
+    }
+
+    impl SnapshotSourceReader for SpawnBlockingSourceReader {
+        fn load_descriptor<'a>(
+            &'a self,
+            snapshot_id: &'a SnapshotId,
+        ) -> SnapshotPortFuture<'a, SnapshotSourceDescriptor> {
+            Box::pin(async move {
+                if snapshot_id.as_str() != self.descriptor.checkpoint_id {
+                    return Err(SnapshotPortError::permanent(
+                        "invalid_source",
+                        "snapshot source ID mismatch",
+                    ));
+                }
+                Ok(self.descriptor.clone())
+            })
+        }
+
+        fn reconstruct<'a>(
+            &'a self,
+            _cut: &'a SnapshotCut,
+            _descriptor: &'a SnapshotSourceDescriptor,
+            _destination: &'a Path,
+        ) -> SnapshotPortFuture<'a, SnapshotReconstruction> {
+            let path = self.path.clone();
+            let started = self.started.clone();
+            let release = self
+                .release
+                .lock()
+                .expect("reconstruction release lock")
+                .take()
+                .expect("one reconstruction");
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    started.notify_one();
+                    release.recv().map_err(|_| {
+                        SnapshotPortError::retryable(
+                            "snapshot source reconstruct",
+                            "reconstruction release unavailable",
+                        )
+                    })?;
+                    Ok(SnapshotReconstruction { path })
+                })
+                .await
+                .map_err(|_| {
+                    SnapshotPortError::retryable(
+                        "snapshot source reconstruct",
+                        "snapshot reconstruction task failed",
+                    )
+                })?
             })
         }
     }
