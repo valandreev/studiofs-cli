@@ -1222,6 +1222,7 @@ impl StudioVfs {
 
         let interval = tokio::time::Duration::from_secs(600);
         let grace_period = 3600i64;
+        let mut gc_cycle = 0_u64;
 
         loop {
             tokio::select! {
@@ -1231,6 +1232,7 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
+            gc_cycle = gc_cycle.saturating_add(1);
 
             let meta = self.meta.clone();
             let lock_acquired = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1312,6 +1314,7 @@ impl StudioVfs {
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
+            let deletion_owner = format!("background-gc-{gc_cycle}");
 
             const PENDING_DELETION_GC_BATCH_LIMIT: usize = 1_000;
             let meta = self.meta.clone();
@@ -1342,10 +1345,11 @@ impl StudioVfs {
                         }
 
                         let meta = self.meta.clone();
+                        let claim_owner = deletion_owner.clone();
                         let deletion_claim = match run_meta(
                             meta,
                             move |engine: Arc<dyn VfsMeta>| {
-                                engine.claim_uploaded_object_deletion(object_id, "background-gc")
+                                engine.claim_uploaded_object_deletion(object_id, &claim_owner)
                             },
                         )
                         .await
@@ -1401,10 +1405,11 @@ impl StudioVfs {
                         };
                         if let Some(fencing_token) = fencing_token {
                             let meta = self.meta.clone();
+                            let finish_owner = deletion_owner.clone();
                             if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                                 engine.finish_uploaded_object_deletion(
                                     object_id,
-                                    "background-gc",
+                                    &finish_owner,
                                     fencing_token,
                                     deletion_outcome,
                                 )
@@ -1533,13 +1538,14 @@ impl StudioVfs {
                     continue;
                 }
             };
+            let reconciliation_claim_count = reconciliation_claims.len();
             for claim in &reconciliation_claims {
                 global_snapshot_pins.insert(claim.entry.object_id);
             }
             let reconciliation_shutdown = self.state.shutdown.background_shutdown_token.clone();
             let reconciliation_data_store = self.fetch_scheduler.data_store().clone();
             let reconciliation_outcomes = futures::stream::iter(
-                reconciliation_claims.iter().cloned().map(|claim| {
+                reconciliation_claims.into_iter().map(|claim| {
                     let shutdown = reconciliation_shutdown.clone();
                     let data_store = reconciliation_data_store.clone();
                     async move {
@@ -1872,7 +1878,7 @@ impl StudioVfs {
                 scanned,
                 referenced = referenced.len(),
                 snapshot_pins = global_snapshot_pins.len(),
-                upload_reconciliation_claims = reconciliation_claims.len(),
+                upload_reconciliation_claims = reconciliation_claim_count,
                 upload_reconciliation_confirmed,
                 upload_reconciliation_retryable,
                 upload_reconciliation_completion_errors,

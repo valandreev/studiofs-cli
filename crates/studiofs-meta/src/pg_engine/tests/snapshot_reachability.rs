@@ -269,7 +269,12 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
             .await
             .expect("connect to test postgres");
         let connection_task = tokio::spawn(connection);
-        for object_id in 1_i64..=260 {
+        for object_id in 1_i64..=261 {
+            let object_state = if object_id == 261 {
+                "uploaded"
+            } else {
+                "uploading"
+            };
             let confirmation_state = if object_id == 1 {
                 "pending"
             } else {
@@ -277,8 +282,8 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
             };
             client
                 .execute(
-                    "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, 'uploaded')",
-                    &[&volume.volume_id, &object_id],
+                    "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, $3)",
+                    &[&volume.volume_id, &object_id, &object_state],
                 )
                 .await
                 .expect("insert upload object");

@@ -154,11 +154,10 @@ where
         }
     }
 
-    let published_object_ids = object_ids
+    let published_object_ids = after_counts
         .iter()
-        .copied()
-        .filter(|object_id| after_counts.get(object_id).copied().unwrap_or(0) > 0)
-        .map(|object_id| checked_i64(object_id, "object id"))
+        .filter(|(_, count)| **count > 0)
+        .map(|(object_id, _)| checked_i64(*object_id, "object id"))
         .collect::<MetaResult<Vec<_>>>()?;
     if !published_object_ids.is_empty() {
         let states = client
@@ -282,16 +281,16 @@ where
 fn affected_inodes(events: &[MetaEvent]) -> BTreeSet<u64> {
     events
         .iter()
-        .flat_map(|event| match event {
+        .filter_map(|event| match event {
             MetaEvent::RemoveAttr { ino }
             | MetaEvent::RemoveRegularFileGraph { ino }
-            | MetaEvent::PublishRegularFileBaseSlices { ino, .. } => vec![*ino],
+            | MetaEvent::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
             MetaEvent::RenameEntry {
                 displaced_remove_attr_ino,
                 ..
-            } => displaced_remove_attr_ino.iter().copied().collect(),
-            MetaEvent::SetRegularFileOverlaySlices { .. } => Vec::new(),
-            _ => Vec::new(),
+            } => *displaced_remove_attr_ino,
+            MetaEvent::SetRegularFileOverlaySlices { .. } => None,
+            _ => None,
         })
         .collect()
 }
@@ -437,12 +436,16 @@ impl PgMetaEngine {
                             return Ok(());
                         }
 
+                        let mut reference_inodes = Vec::with_capacity(references.len());
+                        let mut reference_object_ids = Vec::with_capacity(references.len());
                         for (inode, object_id) in &references {
-                            let inode = checked_i64(*inode, "inode")?;
-                            let object_id = checked_i64(*object_id, "object id")?;
+                            reference_inodes.push(checked_i64(*inode, "inode")?);
+                            reference_object_ids.push(checked_i64(*object_id, "object id")?);
+                        }
+                        if !reference_inodes.is_empty() {
                             tx.execute(
-                                "INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                                &[&volume_id, &inode, &object_id],
+                                "INSERT INTO snapshot_current_references (vol, ino, object_id) SELECT $1, refs.ino, refs.object_id FROM UNNEST($2::BIGINT[], $3::BIGINT[]) AS refs(ino, object_id) ON CONFLICT DO NOTHING",
+                                &[&volume_id, &reference_inodes, &reference_object_ids],
                             )
                             .await
                             .map_err(|error| {
@@ -452,11 +455,14 @@ impl PgMetaEngine {
                                 )
                             })?;
                         }
-                        for object_id in objects {
-                            let object_id = checked_i64(object_id, "object id")?;
+                        let object_id_values = objects
+                            .into_iter()
+                            .map(|object_id| checked_i64(object_id, "object id"))
+                            .collect::<MetaResult<Vec<_>>>()?;
+                        if !object_id_values.is_empty() {
                             tx.execute(
-                                "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                                &[&volume_id, &object_id, &version],
+                                "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) SELECT $1, objects.object_id, $3 FROM UNNEST($2::BIGINT[]) AS objects(object_id) ON CONFLICT DO NOTHING",
+                                &[&volume_id, &object_id_values, &version],
                             )
                             .await
                             .map_err(|error| {
@@ -569,13 +575,7 @@ impl PgMetaEngine {
                                  JOIN snapshot_payload_upload_objects AS object
                                    ON object.vol = fragment.vol AND object.object_id = fragment.object_id
                                  WHERE fragment.vol = $1
-                                   AND (
-                                       object.state IN ('uploading', 'retry_wait')
-                                       OR (
-                                           object.state = 'uploaded'
-                                           AND fragment.uploaded_at >= clock_timestamp() - interval '60 seconds'
-                                       )
-                                   )
+                                   AND object.state IN ('uploading', 'retry_wait')
                                    AND (object.reconcile_lease_expires_at IS NULL OR object.reconcile_lease_expires_at <= clock_timestamp())
                                    AND (object.next_retry_at IS NULL OR object.next_retry_at <= clock_timestamp())
                                    AND (fragment.object_id, fragment.fragment_index) > ($2, $3)

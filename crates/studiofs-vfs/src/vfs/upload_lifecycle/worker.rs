@@ -1792,9 +1792,8 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                     let cancel_token = cancel_token.clone();
                     async move {
                         let key = entry.object_key.clone();
-                        let err_key = key.clone();
                         if cancel_token.is_cancelled() {
-                            return Err((fragment_index, err_key, None));
+                            return Err((fragment_index, key, None));
                         }
                         let begin_entry = entry.clone();
                         if let Err(error) =
@@ -1803,7 +1802,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                             })
                             .await
                         {
-                            return Err((fragment_index, err_key, Some(error.to_string())));
+                            return Err((fragment_index, key, Some(error.to_string())));
                         }
                         if let Err(error) = self
                             .vfs
@@ -1813,11 +1812,11 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                         {
                             return match error {
                                 crate::upload::UploadError::Cancelled => {
-                                    Err((fragment_index, err_key, None))
+                                    Err((fragment_index, key, None))
                                 }
                                 error => Err((
                                     fragment_index,
-                                    err_key,
+                                    key,
                                     Some(format!("fragment upload failed: {error}")),
                                 )),
                             };
@@ -1830,19 +1829,19 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                         .await;
                         match proof {
                             TimeoutOrCancel::Cancelled => {
-                                return Err((fragment_index, err_key, None));
+                                return Err((fragment_index, key, None));
                             }
                             TimeoutOrCancel::TimedOut => {
                                 return Err((
                                     fragment_index,
-                                    err_key,
+                                    key,
                                     Some("fragment upload proof timed out".to_string()),
                                 ));
                             }
                             TimeoutOrCancel::Completed(Err(_)) => {
                                 return Err((
                                     fragment_index,
-                                    err_key,
+                                    key,
                                     Some("fragment upload proof read failed".to_string()),
                                 ));
                             }
@@ -1854,7 +1853,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                                 {
                                     return Err((
                                         fragment_index,
-                                        err_key,
+                                        key,
                                         Some(
                                             "fragment upload proof did not match expected bytes"
                                                 .to_string(),
@@ -1870,7 +1869,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                             })
                             .await
                         {
-                            return Err((fragment_index, err_key, Some(error.to_string())));
+                            return Err((fragment_index, key, Some(error.to_string())));
                         }
                         Ok((fragment_index, key))
                     }
