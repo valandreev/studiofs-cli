@@ -1022,6 +1022,20 @@ pub trait MetaEngine:
     + MetaReplication
     + crate::snapshot_ports::UploadedFragmentLedger
 {
+    /// Returns the PostgreSQL-backed Snapshot v2 job store when this engine
+    /// owns one, or `None` for local-only metadata engines.
+    fn snapshot_job_store(&self) -> Option<Arc<dyn crate::snapshot_ports::SnapshotJobStore>> {
+        None
+    }
+
+    /// Returns the PostgreSQL-backed Snapshot v2 source reader when this
+    /// engine owns one, or `None` for local-only metadata engines.
+    fn snapshot_source_reader(
+        &self,
+    ) -> Option<Arc<dyn crate::snapshot_ports::SnapshotSourceReader>> {
+        None
+    }
+
     /// Apply ordered regular-file overlay mutations in one local transaction.
     fn apply_regular_file_overlay_batch(
         &self,

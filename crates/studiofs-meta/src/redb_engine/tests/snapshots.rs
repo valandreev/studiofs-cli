@@ -523,6 +523,11 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
         snapshot.regular_file_base,
         vec![(ino, encode(&base_state).expect("encode base snapshot"))]
     );
+    let mut chunks = Vec::new();
+    engine
+        .visit_regular_file_base_chunks(|ino, chunk| chunks.push((ino, chunk)))
+        .unwrap();
+    assert_eq!(chunks, vec![(ino, base_chunk.clone())]);
     let imported = temp_engine();
     imported.import_snapshot(&snapshot).unwrap();
 

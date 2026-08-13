@@ -7,6 +7,7 @@ use crate::engine::{
 };
 use crate::types::*;
 use std::collections::HashSet;
+use std::sync::{Arc, Weak};
 
 impl MetaFormat for PgMetaEngine {
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
@@ -426,6 +427,22 @@ impl MetaAcl for PgMetaEngine {
 }
 
 impl MetaEngine for PgMetaEngine {
+    fn snapshot_job_store(&self) -> Option<Arc<dyn crate::snapshot_ports::SnapshotJobStore>> {
+        self.self_weak
+            .get()
+            .and_then(Weak::upgrade)
+            .map(|engine| engine as Arc<dyn crate::snapshot_ports::SnapshotJobStore>)
+    }
+
+    fn snapshot_source_reader(
+        &self,
+    ) -> Option<Arc<dyn crate::snapshot_ports::SnapshotSourceReader>> {
+        self.self_weak
+            .get()
+            .and_then(Weak::upgrade)
+            .map(|engine| engine as Arc<dyn crate::snapshot_ports::SnapshotSourceReader>)
+    }
+
     fn apply_regular_file_overlay_batch(
         &self,
         mutations: &[crate::engine::RegularFileOverlayMutation],

@@ -1,6 +1,29 @@
 use super::*;
 
 impl RedbMetaEngine {
+    pub(super) fn visit_regular_file_chunk_states_from_txn<F>(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        mut visit: F,
+    ) -> MetaResult<()>
+    where
+        F: FnMut(Ino, RegularFileChunkState),
+    {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (ino, _) = decode_regular_file_chunk_key(key.value())?;
+            let chunk_state: RegularFileChunkState = decode(value.value())?;
+            visit(ino, chunk_state);
+        }
+        Ok(())
+    }
+
     pub(super) fn regular_file_chunk_states_from_txn(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,

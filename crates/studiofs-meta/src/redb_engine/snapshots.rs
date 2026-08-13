@@ -9,6 +9,15 @@ enum SnapshotImportMode {
 }
 
 impl RedbMetaEngine {
+    /// Visit regular-file base chunks without retaining the whole graph in memory.
+    pub fn visit_regular_file_base_chunks<F>(&self, visit: F) -> MetaResult<()>
+    where
+        F: FnMut(u64, RegularFileChunkState),
+    {
+        let txn = self.begin_read_txn()?;
+        Self::visit_regular_file_chunk_states_from_txn(&txn, REGULAR_FILE_BASE_TABLE, visit)
+    }
+
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;
