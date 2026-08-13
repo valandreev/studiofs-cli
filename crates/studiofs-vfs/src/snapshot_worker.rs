@@ -692,27 +692,53 @@ impl SnapshotWorker {
         work_cancel: CancellationToken,
     ) -> Result<(), SnapshotWorkerError> {
         let interval = (self.config.lease_for / 3).max(Duration::from_millis(1));
+        let mut retry_delay = interval;
+        let mut lease_expires_at = claim.lease.expires_at;
         loop {
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(retry_delay) => {}
             }
             let lease = tokio::select! {
-                result = self.jobs.renew_lease(claim, self.config.lease_for) => {
-                    result.map_err(|error| match error {
-                        SnapshotPortError::Cancelled => SnapshotWorkerError::Cancelled,
-                        error => SnapshotWorkerError::Port(error),
-                    })?
-                }
+                result = self.jobs.renew_lease(claim, self.config.lease_for) => result,
                 _ = stop.cancelled() => return Ok(()),
             };
-            if lease.owner != claim.lease.owner || lease.fencing_token != claim.lease.fencing_token
-            {
-                work_cancel.cancel();
-                return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
-                    "stale_lease",
-                    "snapshot lease generation changed",
-                )));
+            match lease {
+                Ok(lease) => {
+                    if lease.owner != claim.lease.owner
+                        || lease.fencing_token != claim.lease.fencing_token
+                    {
+                        work_cancel.cancel();
+                        return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                            "stale_lease",
+                            "snapshot lease generation changed",
+                        )));
+                    }
+                    lease_expires_at = lease.expires_at;
+                    retry_delay = interval;
+                }
+                Err(SnapshotPortError::Cancelled) => {
+                    return Err(SnapshotWorkerError::Cancelled);
+                }
+                Err(error @ SnapshotPortError::Retryable { .. }) => {
+                    let remaining = (lease_expires_at - self.clock.now())
+                        .to_std()
+                        .unwrap_or_default();
+                    if remaining <= retry_delay {
+                        work_cancel.cancel();
+                        return Err(SnapshotWorkerError::Port(error));
+                    }
+                    retry_delay = (interval / 4).max(Duration::from_millis(1));
+                    tracing::warn!(
+                        snapshot_id = %claim.job.snapshot_id,
+                        worker = self.worker.as_str(),
+                        "transient lease renewal failure; will retry before expiration"
+                    );
+                }
+                Err(error) => {
+                    work_cancel.cancel();
+                    return Err(SnapshotWorkerError::Port(error));
+                }
             }
         }
     }
@@ -841,7 +867,7 @@ impl SnapshotWorker {
                     &result,
                     Err(SnapshotWorkerError::Port(
                         SnapshotPortError::Retryable { .. }
-                    ))
+                    )) | Err(SnapshotWorkerError::Cancelled)
                 );
             if final_published && !preserve_final {
                 self.cleanup_artifact(&final_locator).await;
@@ -1481,6 +1507,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_tolerates_one_transient_lease_renewal_failure() {
+        let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = source_dir.path().join("source.redb");
+        studiofs_meta::RedbMetaEngine::open(&source_path).expect("source redb");
+        let reconstruct_started = Arc::new(Notify::new());
+        let reconstruct_release = Arc::new(Notify::new());
+        let jobs = Arc::new(TestJobStore::new(claim, catalog));
+        *jobs.renewal_error.lock().expect("renewal error lock") = Some(
+            SnapshotPortError::retryable("renew snapshot lease", "lease backend unavailable"),
+        );
+        jobs.renewal_error_once_after_initial
+            .store(true, Ordering::SeqCst);
+        let mut config = SnapshotWorkerConfig::new(source_dir.path().join("materializer"));
+        config.lease_for = Duration::from_millis(30);
+        let worker = Arc::new(
+            SnapshotWorker::new(
+                volume,
+                SnapshotWorkerId::new("worker-a").expect("worker id"),
+                jobs.clone(),
+                Arc::new(BlockingSourceReader {
+                    descriptor: source_descriptor,
+                    path: source_path,
+                    started: reconstruct_started.clone(),
+                    release: reconstruct_release.clone(),
+                }),
+                Arc::new(TestPayloadReader::empty()),
+                Arc::new(TestArtifactStore::new()),
+                Arc::new(TestClock { now: captured_at }),
+                config,
+            )
+            .expect("worker"),
+        );
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(worker.run(cancel.clone()));
+
+        reconstruct_started.notified().await;
+        jobs.renewed.notified().await;
+        reconstruct_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), jobs.published.notified())
+            .await
+            .expect("transient renewal failure must not abort materialization");
+        cancel.cancel();
+        assert!(task.await.expect("worker join").is_ok());
+        assert!(jobs.renew_count.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
     async fn worker_renews_lease_during_long_materialization() {
         let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
         let source_dir = tempfile::tempdir().expect("source tempdir");
@@ -1813,7 +1887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_final_artifact_is_not_ready_and_is_cleaned() {
+    async fn interrupted_ready_publication_preserves_final_artifact() {
         let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
         let snapshot_id = claim.job.snapshot_id.clone();
         let source_dir = tempfile::tempdir().expect("source tempdir");
@@ -1854,7 +1928,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(artifacts.final_publishes.load(Ordering::SeqCst), 1);
-        assert_eq!(artifacts.deletes.load(Ordering::SeqCst), 2);
+        assert_eq!(artifacts.deletes.load(Ordering::SeqCst), 1);
         assert_eq!(jobs.release_count.load(Ordering::SeqCst), 1);
         assert!(
             !source_dir
@@ -1986,6 +2060,7 @@ mod tests {
         retry_job: Mutex<Option<SnapshotCreationJob>>,
         ready_after_retry: AtomicBool,
         renewal_error: Mutex<Option<SnapshotPortError>>,
+        renewal_error_once_after_initial: AtomicBool,
         renew_blocked: AtomicBool,
         renew_count: AtomicUsize,
         renew_started: Notify,
@@ -2014,6 +2089,7 @@ mod tests {
                 retry_job: Mutex::new(None),
                 ready_after_retry: AtomicBool::new(false),
                 renewal_error: Mutex::new(None),
+                renewal_error_once_after_initial: AtomicBool::new(false),
                 renew_blocked: AtomicBool::new(false),
                 renew_count: AtomicUsize::new(0),
                 renew_started: Notify::new(),
@@ -2072,7 +2148,8 @@ mod tests {
                     self.renew_started.notify_one();
                     self.renew_release.notified().await;
                 }
-                if self.renew_count.fetch_add(1, Ordering::SeqCst) >= 1 {
+                let renew_number = self.renew_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if renew_number >= 2 {
                     self.renewed.notify_one();
                 }
                 if let Some(error) = self
@@ -2080,6 +2157,8 @@ mod tests {
                     .lock()
                     .expect("renewal error lock")
                     .clone()
+                    && (!self.renewal_error_once_after_initial.load(Ordering::SeqCst)
+                        || renew_number == 2)
                 {
                     return Err(error);
                 }
