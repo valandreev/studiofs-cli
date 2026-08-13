@@ -523,6 +523,10 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
         snapshot.regular_file_base,
         vec![(ino, encode(&base_state).expect("encode base snapshot"))]
     );
+    assert_eq!(
+        engine.export_regular_file_base_snapshot().unwrap(),
+        snapshot.regular_file_base
+    );
     let imported = temp_engine();
     imported.import_snapshot(&snapshot).unwrap();
 

@@ -227,10 +227,12 @@ fn normalize_data_prefix(data_prefix: &str) -> Result<String, SnapshotArtifactKe
         return Ok("/".to_owned());
     }
     let trimmed = data_prefix.trim_end_matches('/');
+    let mut segments = trimmed.split('/');
+    if trimmed.starts_with('/') {
+        segments.next();
+    }
     if trimmed.is_empty()
-        || trimmed
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        || segments.any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(SnapshotArtifactKeyError::InvalidPrefix);
     }
@@ -309,6 +311,18 @@ mod tests {
         assert_eq!(
             prefix.parse_key(final_key.as_str()).expect("parse final"),
             final_key.locator()
+        );
+    }
+
+    #[test]
+    fn leading_slash_prefix_matches_data_store_normalization() {
+        let snapshot_id = SnapshotId::parse(SNAPSHOT_ID).expect("snapshot id");
+        let prefix = SnapshotArtifactPrefix::for_snapshot("/tenant/demo/", 7, UUID_A, &snapshot_id)
+            .expect("leading slash prefix");
+        assert!(
+            prefix
+                .as_str()
+                .starts_with("/tenant/demo/metadata/snapshots/")
         );
     }
 

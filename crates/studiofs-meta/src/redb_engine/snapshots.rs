@@ -9,6 +9,14 @@ enum SnapshotImportMode {
 }
 
 impl RedbMetaEngine {
+    /// Export only the regular-file base rows needed to verify published payloads.
+    pub fn export_regular_file_base_snapshot(&self) -> MetaResult<Vec<(u64, Vec<u8>)>> {
+        let txn = self.begin_read_txn()?;
+        Self::regular_file_snapshot_rows_from_txn(&txn, REGULAR_FILE_BASE_TABLE, |chunks| {
+            RegularFileBaseState { chunks }
+        })
+    }
+
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;

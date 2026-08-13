@@ -395,6 +395,7 @@ struct VfsBootstrap {
     config: VfsConfigValidated,
     plan: VfsBootstrapPlan,
     resources: VfsBootstrapResources,
+    cache_dir: PathBuf,
 }
 
 impl VfsBootstrap {
@@ -425,6 +426,7 @@ impl VfsBootstrap {
             config,
             plan,
             resources,
+            cache_dir: PathBuf::from(cache_dir),
         })
     }
 
@@ -434,6 +436,7 @@ impl VfsBootstrap {
             config,
             plan,
             resources,
+            cache_dir,
         } = self;
         let block_size = plan.block_size();
         let upload_cache_io_slots = plan.cache_runtime_tuning.upload_cache_io_slots;
@@ -442,7 +445,11 @@ impl VfsBootstrap {
             retry_base_ms: config.lock_retry_base_ms,
             retry_max_ms: config.lock_retry_max_ms,
         });
-        let snapshot_worker = build_snapshot_worker(meta.as_ref(), resources.data_write.clone());
+        let snapshot_worker = build_snapshot_worker(
+            meta.as_ref(),
+            resources.data_write.clone(),
+            snapshot_materializer_root(&cache_dir),
+        );
 
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
@@ -548,6 +555,7 @@ impl VfsBootstrap {
 fn build_snapshot_worker(
     meta: &dyn VfsMeta,
     data_store: Arc<DataStore>,
+    materializer_root: PathBuf,
 ) -> Option<Arc<SnapshotWorker>> {
     let jobs = meta.snapshot_job_store()?;
     let sources = meta.snapshot_source_reader()?;
@@ -573,10 +581,14 @@ fn build_snapshot_worker(
         payloads,
         artifacts,
         Arc::new(SystemSnapshotClock),
-        SnapshotWorkerConfig::new("target/snapshot-v2/materializer"),
+        SnapshotWorkerConfig::new(materializer_root),
     )
     .ok()
     .map(Arc::new)
+}
+
+fn snapshot_materializer_root(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("snapshot-v2").join("materializer")
 }
 
 impl StudioVfs {
@@ -680,6 +692,7 @@ impl StudioVfs {
 mod tests {
     use super::*;
     use crate::access::{AccessClass, AccessPolicy};
+    use std::path::Path;
     use std::sync::Arc;
     #[cfg(unix)]
     use std::{fs, os::unix::fs::symlink};
@@ -705,6 +718,14 @@ mod tests {
             ),
             block_size: 4 * 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn snapshot_materializer_root_is_below_configured_cache_directory() {
+        assert_eq!(
+            snapshot_materializer_root(Path::new("/cache/studiofs")),
+            Path::new("/cache/studiofs/snapshot-v2/materializer")
+        );
     }
 
     #[test]

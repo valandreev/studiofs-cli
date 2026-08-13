@@ -517,6 +517,20 @@ pub trait SnapshotPayloadReader: Send + Sync {
         &'a self,
         payload: &'a PayloadRef,
     ) -> SnapshotPortFuture<'a, SnapshotPayloadBytes>;
+
+    /// Reads several ranges, allowing adapters to share one immutable object read.
+    fn stat_and_read_batch<'a>(
+        &'a self,
+        payloads: &'a [PayloadRef],
+    ) -> SnapshotPortFuture<'a, Vec<SnapshotPayloadBytes>> {
+        Box::pin(async move {
+            let mut result = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                result.push(self.stat_and_read(payload).await?);
+            }
+            Ok(result)
+        })
+    }
 }
 
 /// Supplies durable time and cancellation-aware waits.
@@ -539,11 +553,12 @@ pub trait SnapshotArtifactStore: Send + Sync {
         locator: &'a SnapshotArtifactLocator,
         source: &'a Path,
     ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact>;
-    /// Verifies and publishes an immutable final artifact.
+    /// Verifies and publishes an immutable final artifact from the local reconstruction.
     fn publish_final<'a>(
         &'a self,
         attempt: &'a SnapshotArtifactLocator,
         final_artifact: &'a SnapshotArtifactLocator,
+        source: &'a Path,
         expected_sha256: &'a SnapshotSha256,
     ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact>;
     /// Downloads an artifact by validated locator.

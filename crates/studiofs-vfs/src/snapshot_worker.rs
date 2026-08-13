@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 pub const SNAPSHOT_ARTIFACT_FORMAT_VERSION: u16 = 1;
 /// Schema version written to the immutable metadata artifact.
 pub const SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u16 = 1;
+const SNAPSHOT_PAYLOAD_VERIFY_CONCURRENCY: usize = 16;
 
 /// Bounded worker configuration for one verified volume.
 #[derive(Debug, Clone)]
@@ -167,17 +168,18 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
         &'a self,
         attempt: &'a SnapshotArtifactLocator,
         final_artifact: &'a SnapshotArtifactLocator,
+        source: &'a Path,
         expected_sha256: &'a SnapshotSha256,
     ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact> {
         Box::pin(async move {
-            let attempt_key = self.key(attempt)?;
+            self.key(attempt)?;
             let final_key = self.key(final_artifact)?;
-            let bytes = self
-                .data_store
-                .get_snapshot_artifact(&attempt_key)
-                .await
-                .map_err(|error| Self::map_data_error("read snapshot attempt", error))?
-                .to_bytes();
+            let bytes = tokio::fs::read(source).await.map_err(|_| {
+                SnapshotPortError::retryable(
+                    "read snapshot artifact",
+                    "artifact source unavailable",
+                )
+            })?;
             let sha256 = digest(&bytes);
             if &sha256 != expected_sha256 {
                 return Err(SnapshotPortError::permanent(
@@ -286,20 +288,14 @@ impl DataStoreSnapshotPayloadReader {
         }
         Ok(Self { data_store })
     }
-}
 
-impl SnapshotPayloadReader for DataStoreSnapshotPayloadReader {
-    fn stat_and_read<'a>(
-        &'a self,
-        payload: &'a PayloadRef,
-    ) -> SnapshotPortFuture<'a, SnapshotPayloadBytes> {
-        Box::pin(async move {
-            let keys =
-                format_object_fragment_keys(self.data_store.data_prefix(), payload.object_id);
-            let mut assembled = vec![0_u8; keys.len() * CLOUD_FRAGMENT_SIZE];
-            let mut lengths = vec![0_usize; CLOUD_FRAGMENT_COUNT];
-            for (fragment_index, key) in keys.iter().enumerate() {
-                let object = self.data_store.get_by_key(key).await.map_err(|error| {
+    async fn read_object(&self, object_id: u64) -> Result<Vec<u8>, SnapshotPortError> {
+        let keys = format_object_fragment_keys(self.data_store.data_prefix(), object_id);
+        let mut assembled = vec![0_u8; keys.len() * CLOUD_FRAGMENT_SIZE];
+        let mut lengths = vec![0_usize; CLOUD_FRAGMENT_COUNT];
+        let fragments = stream::iter(keys.into_iter().enumerate().map(
+            |(fragment_index, key)| async move {
+                let object = self.data_store.get_by_key(&key).await.map_err(|error| {
                     DataStoreSnapshotArtifactStore::map_data_error("read snapshot payload", error)
                 })?;
                 let fragment = read_object(object).map_err(|_| {
@@ -308,43 +304,94 @@ impl SnapshotPayloadReader for DataStoreSnapshotPayloadReader {
                         "snapshot payload object is invalid",
                     )
                 })?;
-                let start = fragment_index * CLOUD_FRAGMENT_SIZE;
-                let end = start + fragment.len();
-                if end > assembled.len() {
-                    return Err(SnapshotPortError::permanent(
-                        "payload_object",
-                        "snapshot payload fragment is too large",
-                    ));
-                }
-                assembled[start..end].copy_from_slice(&fragment);
-                lengths[fragment_index] = fragment.len();
-            }
-            let total_len = validate_cloud_fragment_layout(&lengths).map_err(|_| {
-                SnapshotPortError::permanent(
-                    "payload_object",
-                    "snapshot payload fragment layout is invalid",
-                )
-            })?;
-            let start = usize::try_from(payload.offset).map_err(|_| {
-                SnapshotPortError::permanent("payload_range", "snapshot payload range is invalid")
-            })?;
-            let length = usize::try_from(payload.length).map_err(|_| {
-                SnapshotPortError::permanent("payload_range", "snapshot payload range is invalid")
-            })?;
-            let end = start.checked_add(length).ok_or_else(|| {
-                SnapshotPortError::permanent("payload_range", "snapshot payload range is invalid")
-            })?;
-            if end > total_len {
+                Ok::<_, SnapshotPortError>((fragment_index, fragment))
+            },
+        ))
+        .buffer_unordered(CLOUD_FRAGMENT_COUNT)
+        .try_collect::<Vec<_>>()
+        .await?;
+        for (fragment_index, fragment) in fragments {
+            let start = fragment_index * CLOUD_FRAGMENT_SIZE;
+            let end = start + fragment.len();
+            if end > assembled.len() {
                 return Err(SnapshotPortError::permanent(
-                    "payload_range",
-                    "snapshot payload range exceeds object",
+                    "payload_object",
+                    "snapshot payload fragment is too large",
                 ));
             }
-            let bytes = Bytes::copy_from_slice(&assembled[start..end]);
-            Ok(SnapshotPayloadBytes {
-                sha256: digest(&bytes),
-                bytes: bytes.to_vec(),
-            })
+            assembled[start..end].copy_from_slice(&fragment);
+            lengths[fragment_index] = fragment.len();
+        }
+        let total_len = validate_cloud_fragment_layout(&lengths).map_err(|_| {
+            SnapshotPortError::permanent(
+                "payload_object",
+                "snapshot payload fragment layout is invalid",
+            )
+        })?;
+        assembled.truncate(total_len);
+        Ok(assembled)
+    }
+
+    fn payload_range(
+        object: &[u8],
+        payload: &PayloadRef,
+    ) -> Result<SnapshotPayloadBytes, SnapshotPortError> {
+        let start = usize::try_from(payload.offset).map_err(|_| {
+            SnapshotPortError::permanent("payload_range", "snapshot payload range is invalid")
+        })?;
+        let length = usize::try_from(payload.length).map_err(|_| {
+            SnapshotPortError::permanent("payload_range", "snapshot payload range is invalid")
+        })?;
+        let end = start.checked_add(length).ok_or_else(|| {
+            SnapshotPortError::permanent("payload_range", "snapshot payload range is invalid")
+        })?;
+        if end > object.len() {
+            return Err(SnapshotPortError::permanent(
+                "payload_range",
+                "snapshot payload range exceeds object",
+            ));
+        }
+        let bytes = Bytes::copy_from_slice(&object[start..end]);
+        Ok(SnapshotPayloadBytes {
+            sha256: digest(&bytes),
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+impl SnapshotPayloadReader for DataStoreSnapshotPayloadReader {
+    fn stat_and_read<'a>(
+        &'a self,
+        payload: &'a PayloadRef,
+    ) -> SnapshotPortFuture<'a, SnapshotPayloadBytes> {
+        Box::pin(async move {
+            let object = self.read_object(payload.object_id).await?;
+            Self::payload_range(&object, payload)
+        })
+    }
+
+    fn stat_and_read_batch<'a>(
+        &'a self,
+        payloads: &'a [PayloadRef],
+    ) -> SnapshotPortFuture<'a, Vec<SnapshotPayloadBytes>> {
+        Box::pin(async move {
+            let Some(first) = payloads.first() else {
+                return Ok(Vec::new());
+            };
+            if payloads
+                .iter()
+                .any(|payload| payload.object_id != first.object_id)
+            {
+                return Err(SnapshotPortError::permanent(
+                    "payload_object",
+                    "payload batch spans multiple objects",
+                ));
+            }
+            let object = self.read_object(first.object_id).await?;
+            payloads
+                .iter()
+                .map(|payload| Self::payload_range(&object, payload))
+                .collect()
         })
     }
 }
@@ -359,9 +406,6 @@ pub enum SnapshotIntegrityError {
     /// The reconstructed redb could not be opened or decoded.
     #[error("reconstructed snapshot metadata is invalid")]
     InvalidReconstructedMetadata,
-    /// One object/offset was associated with conflicting lengths.
-    #[error("snapshot payload range is conflicting")]
-    ConflictingPayloadRange,
     /// A payload offset and length did not form a valid range.
     #[error("snapshot payload range is invalid")]
     InvalidPayloadRange,
@@ -500,20 +544,45 @@ impl SnapshotWorker {
         snapshot_id: SnapshotId,
         cancel: CancellationToken,
     ) -> Result<SnapshotCatalogEntry, SnapshotWorkerError> {
-        let outcome = await_port(
-            self.jobs
-                .claim_id_or_follow(&snapshot_id, &self.worker, self.config.lease_for),
-            &cancel,
-        )
-        .await?;
-        if let SnapshotClaimOrFollow::Claimed(claim) = outcome {
-            match self.process_claim(&claim, &cancel).await {
-                Ok(()) => {}
-                Err(SnapshotWorkerError::Cancelled) => return Err(SnapshotWorkerError::Cancelled),
-                Err(error) => return Err(error),
+        loop {
+            let outcome = await_port(
+                self.jobs
+                    .claim_id_or_follow(&snapshot_id, &self.worker, self.config.lease_for),
+                &cancel,
+            )
+            .await?;
+            match outcome {
+                SnapshotClaimOrFollow::Claimed(claim) => {
+                    match self.process_claim(&claim, &cancel).await {
+                        Ok(()) => continue,
+                        Err(SnapshotWorkerError::Cancelled) => {
+                            return Err(SnapshotWorkerError::Cancelled);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                SnapshotClaimOrFollow::Follow(entry) => match entry.lifecycle {
+                    studiofs_meta::snapshot::SnapshotLifecycle::Ready => return Ok(entry),
+                    studiofs_meta::snapshot::SnapshotLifecycle::Failed => {
+                        return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                            "snapshot_failed",
+                            "snapshot creation failed",
+                        )));
+                    }
+                    studiofs_meta::snapshot::SnapshotLifecycle::Creating => {
+                        self.wait_for_cancel_or_deadline(&cancel, self.config.idle_delay)
+                            .await?;
+                    }
+                    studiofs_meta::snapshot::SnapshotLifecycle::Deleting
+                    | studiofs_meta::snapshot::SnapshotLifecycle::Deleted => {
+                        return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                            "snapshot_unavailable",
+                            "snapshot is unavailable",
+                        )));
+                    }
+                },
             }
         }
-        self.wait_for_ready(&snapshot_id, &cancel).await
     }
 
     async fn process_claim(
@@ -722,6 +791,7 @@ impl SnapshotWorker {
                 self.artifacts.publish_final(
                     &attempt_locator,
                     &final_locator,
+                    &reconstruction.path,
                     &stored_attempt.sha256,
                 ),
                 cancel,
@@ -822,36 +892,71 @@ impl SnapshotWorker {
         payloads: &[PayloadRef],
         cancel: &CancellationToken,
     ) -> Result<Vec<SnapshotPayloadProof>, SnapshotWorkerError> {
-        let mut proofs = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            if payload.length == 0 {
-                return Err(SnapshotWorkerError::Integrity(
-                    SnapshotIntegrityError::InvalidPayloadRange,
-                ));
-            }
-            let bytes = await_port(self.payloads.stat_and_read(payload), cancel).await?;
-            let expected_len = usize::try_from(payload.length).map_err(|_| {
-                SnapshotWorkerError::Integrity(SnapshotIntegrityError::PayloadLengthMismatch)
-            })?;
-            if bytes.bytes.len() != expected_len {
-                return Err(SnapshotWorkerError::Integrity(
-                    SnapshotIntegrityError::PayloadLengthMismatch,
-                ));
-            }
-            let sha256 = digest(&bytes.bytes);
-            if bytes.sha256 != sha256 {
-                return Err(SnapshotWorkerError::Integrity(
-                    SnapshotIntegrityError::PayloadChecksumMismatch,
-                ));
-            }
-            proofs.push(SnapshotPayloadProof {
-                object_id: payload.object_id,
-                offset: u64::from(payload.offset),
-                length: payload.length,
-                sha256,
-            });
+        let mut by_object = BTreeMap::<u64, Vec<PayloadRef>>::new();
+        for payload in payloads.iter().copied() {
+            by_object
+                .entry(payload.object_id)
+                .or_default()
+                .push(payload);
         }
-        Ok(proofs)
+        let proofs = stream::iter(
+            by_object
+                .into_values()
+                .map(|payloads| self.verify_payload_batch(payloads, cancel)),
+        )
+        .buffered(SNAPSHOT_PAYLOAD_VERIFY_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(proofs.into_iter().flatten().collect())
+    }
+
+    async fn verify_payload_batch(
+        &self,
+        payloads: Vec<PayloadRef>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<SnapshotPayloadProof>, SnapshotWorkerError> {
+        if payloads.iter().any(|payload| payload.length == 0) {
+            return Err(SnapshotWorkerError::Integrity(
+                SnapshotIntegrityError::InvalidPayloadRange,
+            ));
+        }
+        let bytes = await_port(self.payloads.stat_and_read_batch(&payloads), cancel).await?;
+        if bytes.len() != payloads.len() {
+            return Err(SnapshotWorkerError::Integrity(
+                SnapshotIntegrityError::PayloadLengthMismatch,
+            ));
+        }
+        payloads
+            .into_iter()
+            .zip(bytes)
+            .map(|(payload, bytes)| Self::verify_payload_bytes(payload, bytes))
+            .collect()
+    }
+
+    fn verify_payload_bytes(
+        payload: PayloadRef,
+        bytes: SnapshotPayloadBytes,
+    ) -> Result<SnapshotPayloadProof, SnapshotWorkerError> {
+        let expected_len = usize::try_from(payload.length).map_err(|_| {
+            SnapshotWorkerError::Integrity(SnapshotIntegrityError::PayloadLengthMismatch)
+        })?;
+        if bytes.bytes.len() != expected_len {
+            return Err(SnapshotWorkerError::Integrity(
+                SnapshotIntegrityError::PayloadLengthMismatch,
+            ));
+        }
+        let sha256 = digest(&bytes.bytes);
+        if bytes.sha256 != sha256 {
+            return Err(SnapshotWorkerError::Integrity(
+                SnapshotIntegrityError::PayloadChecksumMismatch,
+            ));
+        }
+        Ok(SnapshotPayloadProof {
+            object_id: payload.object_id,
+            offset: u64::from(payload.offset),
+            length: payload.length,
+            sha256,
+        })
     }
 
     async fn record_retry(
@@ -905,36 +1010,6 @@ impl SnapshotWorker {
         .map(|_| ())
     }
 
-    async fn wait_for_ready(
-        &self,
-        snapshot_id: &SnapshotId,
-        cancel: &CancellationToken,
-    ) -> Result<SnapshotCatalogEntry, SnapshotWorkerError> {
-        loop {
-            let entry = await_port(self.jobs.load_catalog(snapshot_id), cancel).await?;
-            match entry.lifecycle {
-                studiofs_meta::snapshot::SnapshotLifecycle::Ready => return Ok(entry),
-                studiofs_meta::snapshot::SnapshotLifecycle::Failed => {
-                    return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
-                        "snapshot_failed",
-                        "snapshot creation failed",
-                    )));
-                }
-                studiofs_meta::snapshot::SnapshotLifecycle::Creating => {
-                    self.wait_for_cancel_or_deadline(cancel, self.config.idle_delay)
-                        .await?
-                }
-                studiofs_meta::snapshot::SnapshotLifecycle::Deleting
-                | studiofs_meta::snapshot::SnapshotLifecycle::Deleted => {
-                    return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
-                        "snapshot_unavailable",
-                        "snapshot is unavailable",
-                    )));
-                }
-            }
-        }
-    }
-
     async fn wait_for_cancel_or_deadline(
         &self,
         cancel: &CancellationToken,
@@ -970,11 +1045,11 @@ async fn collect_published_payloads(path: PathBuf) -> Result<Vec<PayloadRef>, Sn
         let engine = studiofs_meta::RedbMetaEngine::open(&path).map_err(|_| {
             SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
         })?;
-        let snapshot = engine.export_remote_snapshot().map_err(|_| {
+        let regular_file_base = engine.export_regular_file_base_snapshot().map_err(|_| {
             SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
         })?;
-        let mut payloads = BTreeMap::<(u64, u32), PayloadRef>::new();
-        for (_, bytes) in snapshot.regular_file_base {
+        let mut payloads = BTreeMap::<(u64, u32, u32), PayloadRef>::new();
+        for (_, bytes) in regular_file_base {
             let regular: RegularFileBaseState = postcard::from_bytes(&bytes).map_err(|_| {
                 SnapshotWorkerError::Integrity(SnapshotIntegrityError::InvalidReconstructedMetadata)
             })?;
@@ -986,14 +1061,8 @@ async fn collect_published_payloads(path: PathBuf) -> Result<Vec<PayloadRef>, Sn
                     let Some(payload) = slice.payload else {
                         continue;
                     };
-                    let key = (payload.object_id, payload.offset);
-                    if let Some(previous) = payloads.insert(key, payload)
-                        && previous.length != payload.length
-                    {
-                        return Err(SnapshotWorkerError::Integrity(
-                            SnapshotIntegrityError::ConflictingPayloadRange,
-                        ));
-                    }
+                    let key = (payload.object_id, payload.offset, payload.length);
+                    payloads.insert(key, payload);
                 }
             }
         }
@@ -1287,6 +1356,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_or_follow_does_not_wait_forever_after_owned_retry() {
+        let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = published_payload_source(source_dir.path());
+        let snapshot_id = claim.job.snapshot_id.clone();
+        let jobs = Arc::new(TestJobStore::new(claim, catalog));
+        jobs.ready_after_retry.store(true, Ordering::SeqCst);
+        let worker = Arc::new(
+            SnapshotWorker::new(
+                volume,
+                SnapshotWorkerId::new("worker-a").expect("worker id"),
+                jobs.clone(),
+                Arc::new(TestSourceReader {
+                    descriptor: source_descriptor,
+                    path: source_path,
+                }),
+                Arc::new(TestPayloadReader::retryable()),
+                Arc::new(TestArtifactStore::new()),
+                Arc::new(TestClock { now: captured_at }),
+                SnapshotWorkerConfig::new(source_dir.path().join("materializer")),
+            )
+            .expect("worker"),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.claim_or_follow(snapshot_id, CancellationToken::new()),
+        )
+        .await
+        .expect("claim_or_follow should finish after the retry is observed")
+        .expect("ready catalog");
+        assert_eq!(result.lifecycle, SnapshotLifecycle::Ready);
+    }
+
+    #[tokio::test]
     async fn claim_or_follow_survives_claimant_cancellation() {
         let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
         let source_dir = tempfile::tempdir().expect("source tempdir");
@@ -1330,6 +1434,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_published_payloads_keeps_distinct_lengths_at_shared_offset() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = published_payload_source_with_payloads(
+            source_dir.path(),
+            &[PayloadRef::new_full(77, 4), PayloadRef::new_partial(77, 2)],
+        );
+
+        let payloads = collect_published_payloads(source_path)
+            .await
+            .expect("published payloads");
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|payload| payload.length)
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+    }
+
+    #[tokio::test]
     async fn worker_renews_lease_during_long_materialization() {
         let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
         let source_dir = tempfile::tempdir().expect("source tempdir");
@@ -1368,6 +1492,89 @@ mod tests {
         jobs.published.notified().await;
         cancel.cancel();
         assert!(task.await.expect("worker join").is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_verifies_payloads_concurrently_with_a_bound() {
+        let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let payload_reader = Arc::new(ConcurrentPayloadReader {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let worker = Arc::new(
+            SnapshotWorker::new(
+                volume,
+                SnapshotWorkerId::new("worker-a").expect("worker id"),
+                Arc::new(TestJobStore::new(claim, catalog)),
+                Arc::new(TestSourceReader {
+                    descriptor: source_descriptor,
+                    path: PathBuf::new(),
+                }),
+                payload_reader.clone(),
+                Arc::new(TestArtifactStore::new()),
+                Arc::new(TestClock { now: captured_at }),
+                SnapshotWorkerConfig::new("target/snapshot-v2/materializer"),
+            )
+            .expect("worker"),
+        );
+        let payloads = vec![
+            PayloadRef::new_full(1, 1),
+            PayloadRef::new_full(2, 1),
+            PayloadRef::new_full(3, 1),
+        ];
+        let cancel = CancellationToken::new();
+        let task_worker = worker.clone();
+        let task_cancel = cancel.clone();
+        let task =
+            tokio::spawn(async move { task_worker.verify_payloads(&payloads, &task_cancel).await });
+
+        started.notified().await;
+        assert!(payload_reader.max_active.load(Ordering::SeqCst) >= 2);
+        release.notify_waiters();
+        assert!(task.await.expect("verification join").is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_batches_payload_ranges_by_object_id() {
+        let (volume, catalog, claim, source_descriptor, captured_at) = test_snapshot_state();
+        let payload_reader = Arc::new(BatchCountingPayloadReader {
+            batch_count: AtomicUsize::new(0),
+        });
+        let worker = SnapshotWorker::new(
+            volume,
+            SnapshotWorkerId::new("worker-a").expect("worker id"),
+            Arc::new(TestJobStore::new(claim, catalog)),
+            Arc::new(TestSourceReader {
+                descriptor: source_descriptor,
+                path: PathBuf::new(),
+            }),
+            payload_reader.clone(),
+            Arc::new(TestArtifactStore::new()),
+            Arc::new(TestClock { now: captured_at }),
+            SnapshotWorkerConfig::new("target/snapshot-v2/materializer"),
+        )
+        .expect("worker");
+        let payloads = vec![
+            PayloadRef::new_full(1, 1),
+            PayloadRef {
+                object_id: 1,
+                offset: 1,
+                length: 1,
+                flags: studiofs_meta::schema::BlockFlags::empty(),
+            },
+            PayloadRef::new_full(2, 1),
+        ];
+
+        let proofs = worker
+            .verify_payloads(&payloads, &CancellationToken::new())
+            .await
+            .expect("payload proofs");
+        assert_eq!(proofs.len(), 3);
+        assert_eq!(payload_reader.batch_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1424,7 +1631,7 @@ mod tests {
             .await
             .expect("put attempt");
         let stored_final = adapter
-            .publish_final(&attempt, &final_artifact, &stored_attempt.sha256)
+            .publish_final(&attempt, &final_artifact, &source, &stored_attempt.sha256)
             .await
             .expect("publish final");
         assert!(
@@ -1436,10 +1643,32 @@ mod tests {
             stored_final.object_key,
             format!("tenant/demo/metadata/snapshots/{VOLUME_UUID}/{snapshot_id}/metadata.redb")
         );
+        let deleted_attempt = SnapshotArtifactLocator {
+            attempt: Some(2),
+            ..attempt.clone()
+        };
+        adapter
+            .put_attempt(&deleted_attempt, &source)
+            .await
+            .expect("put second attempt");
+        adapter
+            .delete(&deleted_attempt)
+            .await
+            .expect("delete second attempt");
+        adapter
+            .publish_final(
+                &deleted_attempt,
+                &final_artifact,
+                &source,
+                &stored_attempt.sha256,
+            )
+            .await
+            .expect("final publication should use the local source");
         let checksum_error = adapter
             .publish_final(
                 &attempt,
                 &final_artifact,
+                &source,
                 &SnapshotSha256::from_bytes([0; 32]),
             )
             .await
@@ -1612,19 +1841,27 @@ mod tests {
     }
 
     fn published_payload_source(root: &Path) -> PathBuf {
+        published_payload_source_with_payloads(root, &[PayloadRef::new_full(77, 4)])
+    }
+
+    fn published_payload_source_with_payloads(root: &Path, payloads: &[PayloadRef]) -> PathBuf {
         let source_path = root.join("source.redb");
         let source = studiofs_meta::RedbMetaEngine::open(&source_path).expect("source redb");
         let mut chunk = studiofs_meta::schema::RegularFileChunkState::default();
-        chunk.slices.insert(
-            studiofs_meta::schema::SliceId(0),
-            studiofs_meta::schema::SliceRecord {
-                slice_id: studiofs_meta::schema::SliceId(0),
-                order: studiofs_meta::schema::SliceOrder(0),
-                range: studiofs_meta::schema::SliceRange::new(0, 4).expect("slice range"),
-                payload: Some(PayloadRef::new_full(77, 4)),
-                payload_state: studiofs_meta::schema::PayloadRefState::Published,
-            },
-        );
+        for (index, payload) in payloads.iter().copied().enumerate() {
+            let slice_id = studiofs_meta::schema::SliceId(index as u64);
+            chunk.slices.insert(
+                slice_id,
+                studiofs_meta::schema::SliceRecord {
+                    slice_id,
+                    order: studiofs_meta::schema::SliceOrder(index as u64),
+                    range: studiofs_meta::schema::SliceRange::new(0, payload.length)
+                        .expect("slice range"),
+                    payload: Some(payload),
+                    payload_state: studiofs_meta::schema::PayloadRefState::Published,
+                },
+            );
+        }
         let mut regular = studiofs_meta::schema::RegularFileBaseState::default();
         regular
             .chunks
@@ -1704,9 +1941,11 @@ mod tests {
         claim_error: Mutex<Option<SnapshotPortError>>,
         claim_count: AtomicUsize,
         catalog: SnapshotCatalogEntry,
+        follow_lifecycle: Mutex<SnapshotLifecycle>,
         published_artifact: Mutex<Option<(SnapshotArtifactDescriptor, Vec<SnapshotPayloadProof>)>>,
         failed_catalog: Mutex<Option<SnapshotCatalogEntry>>,
         retry_job: Mutex<Option<SnapshotCreationJob>>,
+        ready_after_retry: AtomicBool,
         renewal_error: Mutex<Option<SnapshotPortError>>,
         renew_blocked: AtomicBool,
         renew_count: AtomicUsize,
@@ -1729,10 +1968,12 @@ mod tests {
                 claim: Mutex::new(Some(claim)),
                 claim_error: Mutex::new(None),
                 claim_count: AtomicUsize::new(0),
+                follow_lifecycle: Mutex::new(catalog.lifecycle.clone()),
                 catalog,
                 published_artifact: Mutex::new(None),
                 failed_catalog: Mutex::new(None),
                 retry_job: Mutex::new(None),
+                ready_after_retry: AtomicBool::new(false),
                 renewal_error: Mutex::new(None),
                 renew_blocked: AtomicBool::new(false),
                 renew_count: AtomicUsize::new(0),
@@ -1773,13 +2014,16 @@ mod tests {
             _lease_for: Duration,
         ) -> SnapshotPortFuture<'a, SnapshotClaimOrFollow> {
             Box::pin(async move {
-                Ok(self
-                    .claim
+                if let Some(claim) = self.claim.lock().expect("claim lock").take() {
+                    return Ok(SnapshotClaimOrFollow::Claimed(claim));
+                }
+                let mut catalog = self.catalog.clone();
+                catalog.lifecycle = self
+                    .follow_lifecycle
                     .lock()
-                    .expect("claim lock")
-                    .take()
-                    .map(SnapshotClaimOrFollow::Claimed)
-                    .unwrap_or_else(|| SnapshotClaimOrFollow::Follow(self.catalog.clone())))
+                    .expect("follow lifecycle lock")
+                    .clone();
+                Ok(SnapshotClaimOrFollow::Follow(catalog))
             })
         }
 
@@ -1826,6 +2070,10 @@ mod tests {
                 job.retry_count = retry.retry_count;
                 job.next_retry_at = Some(retry.next_retry_at);
                 *self.retry_job.lock().expect("retry lock") = Some(job.clone());
+                if self.ready_after_retry.load(Ordering::SeqCst) {
+                    *self.follow_lifecycle.lock().expect("follow lifecycle lock") =
+                        SnapshotLifecycle::Ready;
+                }
                 self.retry.notify_one();
                 Ok(job)
             })
@@ -1948,6 +2196,74 @@ mod tests {
         response: Mutex<Result<SnapshotPayloadBytes, SnapshotPortError>>,
     }
 
+    struct ConcurrentPayloadReader {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    struct BatchCountingPayloadReader {
+        batch_count: AtomicUsize,
+    }
+
+    impl SnapshotPayloadReader for BatchCountingPayloadReader {
+        fn stat_and_read<'a>(
+            &'a self,
+            _payload: &'a PayloadRef,
+        ) -> SnapshotPortFuture<'a, SnapshotPayloadBytes> {
+            Box::pin(async {
+                Err(SnapshotPortError::permanent(
+                    "unexpected_payload_read",
+                    "test requires batch reads",
+                ))
+            })
+        }
+
+        fn stat_and_read_batch<'a>(
+            &'a self,
+            payloads: &'a [PayloadRef],
+        ) -> SnapshotPortFuture<'a, Vec<SnapshotPayloadBytes>> {
+            let payloads = payloads.to_vec();
+            Box::pin(async move {
+                self.batch_count.fetch_add(1, Ordering::SeqCst);
+                Ok(payloads
+                    .into_iter()
+                    .map(|payload| {
+                        let bytes = vec![0; payload.length as usize];
+                        SnapshotPayloadBytes {
+                            sha256: digest(&bytes),
+                            bytes,
+                        }
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    impl SnapshotPayloadReader for ConcurrentPayloadReader {
+        fn stat_and_read<'a>(
+            &'a self,
+            payload: &'a PayloadRef,
+        ) -> SnapshotPortFuture<'a, SnapshotPayloadBytes> {
+            let length = payload.length as usize;
+            Box::pin(async move {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                if active >= 2 {
+                    self.started.notify_one();
+                }
+                self.release.notified().await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                let bytes = vec![0; length];
+                Ok(SnapshotPayloadBytes {
+                    sha256: digest(&bytes),
+                    bytes,
+                })
+            })
+        }
+    }
+
     impl TestPayloadReader {
         fn empty() -> Self {
             Self::new(SnapshotPayloadBytes {
@@ -2015,6 +2331,7 @@ mod tests {
             &'a self,
             _attempt: &'a SnapshotArtifactLocator,
             final_artifact: &'a SnapshotArtifactLocator,
+            _source: &'a Path,
             _expected_sha256: &'a SnapshotSha256,
         ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact> {
             Box::pin(async move {
