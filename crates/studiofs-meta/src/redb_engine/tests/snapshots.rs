@@ -16,6 +16,38 @@ fn remote_snapshot_hides_root_empty_regular_file_draft() {
 }
 
 #[test]
+fn import_serving_checkpoint_rebuilds_local_counters() {
+    let source = temp_engine();
+    let file = source
+        .create_file(ROOT_INO, b"discovered.bin", 0, 0, 0o644)
+        .unwrap();
+    source
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(90_001, 4096))
+        .unwrap();
+    assert!(
+        source
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 0, 90_001)
+            .unwrap()
+    );
+    assert!(
+        source
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
+            .unwrap()
+    );
+    let checkpoint = source.export_serving_checkpoint().unwrap();
+
+    let dir = studiofs_test_support::workspace_target_tempdir("serving-checkpoint-");
+    let target = RedbMetaEngine::open(dir.path().join("test.db")).unwrap();
+    target.import_serving_checkpoint(&checkpoint).unwrap();
+    target.init_root(0, 0).unwrap();
+
+    assert_eq!(target.get_counter(counters::NEXT_INODE).unwrap(), file.ino + 1);
+    assert_eq!(target.get_counter(counters::TOTAL_INODES).unwrap(), 2);
+    assert_eq!(target.get_counter(counters::USED_SPACE).unwrap(), 4096);
+    assert!(target.lookup(ROOT_INO, b"discovered.bin").is_ok());
+}
+
+#[test]
 fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_log() {
     let local = temp_engine();
     let local_event_start = local.get_counter("nextEventSeq").unwrap();

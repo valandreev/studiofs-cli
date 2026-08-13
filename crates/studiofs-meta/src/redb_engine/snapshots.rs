@@ -290,10 +290,42 @@ impl RedbMetaEngine {
         checkpoint: &crate::snapshot::ServingCheckpoint,
     ) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
+        let next_inode = checkpoint
+            .inodes
+            .iter()
+            .map(|(ino, _)| *ino)
+            .max()
+            .unwrap_or(ROOT_INO)
+            .checked_add(1)
+            .ok_or_else(|| MetaError::Storage("imported inode counter overflow".to_string()))?;
+        let total_inodes = u64::try_from(checkpoint.inodes.len())
+            .map_err(|_| MetaError::Storage("imported inode count overflow".to_string()))?;
+        let mut referenced_objects = BTreeMap::new();
+        for (_, bytes) in &checkpoint.regular_file_base {
+            let regular: RegularFileBaseState = decode(bytes)?;
+            for chunk in regular.chunks.values() {
+                for slice in chunk.slices.values() {
+                    if let Some(block) = slice.payload.as_ref() {
+                        referenced_objects
+                            .entry(block.object_id)
+                            .or_insert(block.length as u64);
+                    }
+                }
+            }
+        }
+        let used_space = referenced_objects
+            .values()
+            .fold(0_u64, |acc, len| acc.saturating_add(*len));
+
         snapshot.inodes = checkpoint.inodes.clone();
         snapshot.dentries = checkpoint.dentries.clone();
         snapshot.regular_file_overlay = checkpoint.regular_file_base.clone();
         snapshot.regular_file_base = checkpoint.regular_file_base.clone();
+        snapshot.counters = vec![
+            (counters::NEXT_INODE.to_string(), next_inode),
+            (counters::TOTAL_INODES.to_string(), total_inodes),
+            (counters::USED_SPACE.to_string(), used_space),
+        ];
         snapshot.pending_deletions.clear();
         snapshot.symlinks = checkpoint.symlinks.clone();
         snapshot.xattrs = checkpoint.xattrs.clone();
