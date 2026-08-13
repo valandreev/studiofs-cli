@@ -4,7 +4,7 @@ use crate::pg_engine::snapshot_reachability::apply_object_lifetime_changes;
 use crate::schema::{
     ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
 };
-use crate::snapshot_ports::UploadedFragmentLedger;
+use crate::snapshot_ports::{UploadedFragmentLedger, UploadedFragmentReconciliationOutcome};
 use chrono::Utc;
 use std::collections::HashSet;
 
@@ -270,6 +270,11 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
             .expect("connect to test postgres");
         let connection_task = tokio::spawn(connection);
         for object_id in 1_i64..=260 {
+            let confirmation_state = if object_id == 1 {
+                "pending"
+            } else {
+                "confirmed"
+            };
             client
                 .execute(
                     "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, 'uploaded')",
@@ -279,16 +284,31 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
                 .expect("insert upload object");
             client
                 .execute(
-                    "INSERT INTO snapshot_payload_upload_fragments (vol, object_id, fragment_index, object_key, expected_byte_length, expected_sha256, uploaded_at, confirmed_at, confirmation_state) VALUES ($1, $2, 0, $3, 0, $4, clock_timestamp(), clock_timestamp(), 'confirmed')",
+                    "INSERT INTO snapshot_payload_upload_fragments (vol, object_id, fragment_index, object_key, expected_byte_length, expected_sha256, uploaded_at, confirmed_at, confirmation_state) VALUES ($1, $2, 0, $3, 0, $4, clock_timestamp(), clock_timestamp(), $5)",
                     &[
                         &volume.volume_id,
                         &object_id,
                         &format!("objects/{object_id}/0"),
                         &vec![0_u8; 32],
+                        &confirmation_state,
                     ],
                 )
                 .await
                 .expect("insert upload fragment");
+            if object_id == 1 {
+                client
+                    .execute(
+                        "INSERT INTO snapshot_payload_upload_fragments (vol, object_id, fragment_index, object_key, expected_byte_length, expected_sha256, uploaded_at, confirmed_at, confirmation_state) VALUES ($1, $2, 1, $3, 0, $4, clock_timestamp(), NULL, 'pending')",
+                        &[
+                            &volume.volume_id,
+                            &object_id,
+                            &format!("objects/{object_id}/1"),
+                            &vec![0_u8; 32],
+                        ],
+                    )
+                    .await
+                    .expect("insert second upload fragment");
+            }
         }
         connection_task.abort();
         Ok::<(), MetaError>(())
@@ -300,13 +320,31 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
         .expect("claim upload reconciliation page");
     assert_eq!(claims.len(), 256);
     assert!(claims.iter().all(|claim| claim.fencing_token > 0));
+    assert_eq!(claims[0].entry.object_id, 1);
+    assert_eq!(claims[1].entry.object_id, 1);
+    assert_eq!(claims[0].fencing_token, claims[1].fencing_token);
     assert_eq!(claims.first().map(|claim| claim.entry.object_id), Some(1));
-    assert_eq!(claims.last().map(|claim| claim.entry.object_id), Some(256));
+    assert_eq!(claims.last().map(|claim| claim.entry.object_id), Some(255));
+
+    engine
+        .finish_uploaded_fragment_reconciliation(
+            "test-janitor",
+            &claims[0],
+            UploadedFragmentReconciliationOutcome::RemoteConfirmed,
+        )
+        .expect("finish first fragment of one object");
+    engine
+        .finish_uploaded_fragment_reconciliation(
+            "test-janitor",
+            &claims[1],
+            UploadedFragmentReconciliationOutcome::RemoteConfirmed,
+        )
+        .expect("finish second fragment of one object");
 
     let tail_claims = engine
         .claim_uploaded_fragment_reconciliation("test-janitor")
         .expect("claim cursor tail");
-    assert_eq!(tail_claims.len(), 4);
+    assert_eq!(tail_claims.len(), 5);
     assert_eq!(
         tail_claims.first().map(|claim| claim.entry.object_id),
         Some(257)

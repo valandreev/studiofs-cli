@@ -1339,6 +1339,34 @@ impl StudioVfs {
                             continue;
                         }
 
+                        let meta = self.meta.clone();
+                        let deletion_claim = match run_meta(
+                            meta,
+                            move |engine: Arc<dyn VfsMeta>| {
+                                engine.claim_uploaded_object_deletion(object_id, "background-gc")
+                            },
+                        )
+                        .await
+                        {
+                            Ok(claim) => claim,
+                            Err(error) => {
+                                warn!(object_id, error = %error, "GC: failed to claim object deletion");
+                                continue;
+                            }
+                        };
+                        let fencing_token = match deletion_claim {
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Untracked => {
+                                None
+                            }
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Claimed {
+                                fencing_token,
+                            } => Some(fencing_token),
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Protected => {
+                                debug!(object_id, "skipping object - protected by upload ledger");
+                                continue;
+                            }
+                        };
+
                         let mut delete_failed = false;
                         for key in format_object_fragment_keys(&self.data_prefix, object_id) {
                             if let Err(e) = self.data_write.delete_by_key(&key).await {
@@ -1355,19 +1383,28 @@ impl StudioVfs {
                                 );
                             }
                         }
-                        if !delete_failed {
+                        let deletion_outcome = if delete_failed {
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Retryable
+                        } else {
+                            studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Deleted
+                        };
+                        if let Some(fencing_token) = fencing_token {
                             let meta = self.meta.clone();
-                            let ledger_deleted = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                                engine.mark_uploaded_object_deleted(object_id)
+                            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                                engine.finish_uploaded_object_deletion(
+                                    object_id,
+                                    "background-gc",
+                                    fencing_token,
+                                    deletion_outcome,
+                                )
                             })
-                            .await;
-                            if let Err(e) = ledger_deleted {
-                                warn!(
-                                    "failed to mark upload ledger deleted for {}: {}",
-                                    object_id, e
-                                );
+                            .await
+                            {
+                                warn!(object_id, error = %error, "GC: failed to finish object deletion claim");
                                 continue;
                             }
+                        }
+                        if !delete_failed {
                             let meta = self.meta.clone();
                             if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                                 engine.remove_pending_deletion(object_id)
@@ -1490,13 +1527,16 @@ impl StudioVfs {
             let mut upload_reconciliation_completion_errors: u64 = 0;
             for claim in &reconciliation_claims {
                 global_snapshot_pins.insert(claim.entry.object_id);
-                let outcome = match self
-                    .fetch_scheduler
-                    .data_store()
-                    .get_by_key(&claim.entry.object_key)
-                    .await
-                {
-                    Ok(remote_payload) => {
+                let proof = run_with_timeout_or_cancel(
+                    &self.state.shutdown.background_shutdown_token,
+                    Duration::from_secs(5),
+                    self.fetch_scheduler
+                        .data_store()
+                        .get_by_key(&claim.entry.object_key),
+                )
+                .await;
+                let outcome = match proof {
+                    TimeoutOrCancel::Completed(Ok(remote_payload)) => {
                         let remote_bytes = remote_payload.to_bytes();
                         let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
                         if remote_bytes.len() as u64 == claim.entry.expected_byte_length
@@ -1507,7 +1547,9 @@ impl StudioVfs {
                             studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
                         }
                     }
-                    Err(_) => {
+                    TimeoutOrCancel::Completed(Err(_))
+                    | TimeoutOrCancel::TimedOut
+                    | TimeoutOrCancel::Cancelled => {
                         studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
                     }
                 };
@@ -1655,6 +1697,7 @@ impl StudioVfs {
             let mut skipped_non_object_key: u64 = 0;
             let mut delete_errors: u64 = 0;
             let mut seen_objects: HashSet<u64> = HashSet::new();
+            let deletion_owner = format!("janitor-delete-{cycle}");
 
             let mut list_error = None;
             while let Some(entry_result) = lister.next().await {
@@ -1711,6 +1754,31 @@ impl StudioVfs {
                     continue;
                 }
 
+                let meta = self.meta.clone();
+                let object_deletion_owner = deletion_owner.clone();
+                let claim_owner = object_deletion_owner.clone();
+                let deletion_claim = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.claim_uploaded_object_deletion(object_id, &claim_owner)
+                })
+                .await
+                {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        delete_errors = delete_errors.saturating_add(1);
+                        warn!(cycle, object_id, error = %error, "janitor: failed to claim object deletion");
+                        continue;
+                    }
+                };
+                let fencing_token = match deletion_claim {
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Untracked => None,
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Claimed {
+                        fencing_token,
+                    } => Some(fencing_token),
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim::Protected => {
+                        continue;
+                    }
+                };
+
                 let mut delete_failed = false;
                 for key in format_object_fragment_keys(&self.data_prefix, object_id) {
                     if let Err(e) = self.data_write.delete_by_key(&key).await {
@@ -1722,18 +1790,30 @@ impl StudioVfs {
                         warn!(cycle, key, error = %e, "janitor: fragment delete failed");
                     }
                 }
+                let deletion_outcome = if delete_failed {
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Retryable
+                } else {
+                    studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Deleted
+                };
+                if let Some(fencing_token) = fencing_token {
+                    let meta = self.meta.clone();
+                    if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                        engine.finish_uploaded_object_deletion(
+                            object_id,
+                            &object_deletion_owner,
+                            fencing_token,
+                            deletion_outcome,
+                        )
+                    })
+                    .await
+                    {
+                        delete_errors = delete_errors.saturating_add(1);
+                        warn!(cycle, object_id, error = %error, "janitor: failed to finish object deletion claim");
+                        continue;
+                    }
+                }
                 if delete_failed {
                     delete_errors = delete_errors.saturating_add(1);
-                    continue;
-                }
-                let meta = self.meta.clone();
-                if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.mark_uploaded_object_deleted(object_id)
-                })
-                .await
-                {
-                    delete_errors = delete_errors.saturating_add(1);
-                    warn!(cycle, object_id, error = %error, "janitor: failed to mark upload ledger deleted");
                     continue;
                 }
                 deleted = deleted.saturating_add(1);

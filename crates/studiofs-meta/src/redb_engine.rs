@@ -797,7 +797,21 @@ impl UploadedFragmentLedger for RedbMetaEngine {
         Ok(())
     }
 
-    fn mark_uploaded_object_deleted(&self, _object_id: u64) -> MetaResult<()> {
+    fn claim_uploaded_object_deletion(
+        &self,
+        _object_id: u64,
+        _owner: &str,
+    ) -> MetaResult<crate::snapshot_ports::UploadedObjectDeletionClaim> {
+        Ok(crate::snapshot_ports::UploadedObjectDeletionClaim::Untracked)
+    }
+
+    fn finish_uploaded_object_deletion(
+        &self,
+        _object_id: u64,
+        _owner: &str,
+        _fencing_token: i64,
+        _outcome: crate::snapshot_ports::UploadedObjectDeletionOutcome,
+    ) -> MetaResult<()> {
         Ok(())
     }
 

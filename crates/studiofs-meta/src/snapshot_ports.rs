@@ -175,6 +175,29 @@ pub enum UploadedFragmentReconciliationOutcome {
     Retryable,
 }
 
+/// Result of claiming an upload object for remote fragment deletion.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UploadedObjectDeletionClaim {
+    /// No upload-ledger row exists; the caller may delete an untracked object.
+    Untracked,
+    /// The caller owns the object-level deletion fence.
+    Claimed {
+        /// Monotonic object-level fence owned by the caller.
+        fencing_token: i64,
+    },
+    /// Publication, upload, reconciliation, or a snapshot currently protects it.
+    Protected,
+}
+
+/// Result of a remote fragment deletion attempt.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UploadedObjectDeletionOutcome {
+    /// All remote fragments were deleted or were already absent.
+    Deleted,
+    /// Remote deletion failed and the object should be retried later.
+    Retryable,
+}
+
 /// PostgreSQL operations needed by an upload worker to leave durable proof
 /// before and after each remote fragment PUT.
 pub trait UploadedFragmentLedger: Send + Sync {
@@ -195,14 +218,27 @@ pub trait UploadedFragmentLedger: Send + Sync {
         outcome: UploadedFragmentReconciliationOutcome,
     ) -> MetaResult<()>;
 
+    /// Claims an unreferenced upload object for remote fragment deletion.
+    fn claim_uploaded_object_deletion(
+        &self,
+        object_id: u64,
+        owner: &str,
+    ) -> MetaResult<UploadedObjectDeletionClaim>;
+
+    /// Completes a deletion claim if its object-level fencing token is current.
+    fn finish_uploaded_object_deletion(
+        &self,
+        object_id: u64,
+        owner: &str,
+        fencing_token: i64,
+        outcome: UploadedObjectDeletionOutcome,
+    ) -> MetaResult<()>;
+
     /// Records an upload attempt before remote I/O.
     fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
 
     /// Records remote stat/read/hash confirmation after remote I/O.
     fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
-
-    /// Marks all durable upload-ledger rows deleted after remote cleanup.
-    fn mark_uploaded_object_deleted(&self, object_id: u64) -> MetaResult<()>;
 }
 
 /// Stable identity of one materializer worker.

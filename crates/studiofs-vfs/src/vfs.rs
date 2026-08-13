@@ -138,8 +138,9 @@ use crate::readahead::{DirAccessEntry, DirAccessTracker, ReadAheadTracker, ReadS
 use crate::{LockTier, OrderedMutex};
 
 use crate::runtime::{
-    LocalCacheIoTiming, MetaExecutor, VfsMeta, cache_io_execution_model, into_vfs_meta,
-    run_local_cache_io, run_local_cache_io_blocking, run_meta,
+    LocalCacheIoTiming, MetaExecutor, TimeoutOrCancel, VfsMeta, cache_io_execution_model,
+    into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta,
+    run_with_timeout_or_cancel,
 };
 use crate::utils::now_unix_millis;
 use crate::vfs::local_dirty::LocalDirtyState;

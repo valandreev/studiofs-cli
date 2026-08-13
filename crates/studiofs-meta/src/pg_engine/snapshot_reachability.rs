@@ -12,9 +12,10 @@ use crate::schema::PayloadRefState;
 use crate::snapshot::VolumeId;
 use crate::snapshot_ports::{
     UploadedFragmentLedger, UploadedFragmentLedgerEntry, UploadedFragmentReconciliationClaim,
-    UploadedFragmentReconciliationOutcome,
+    UploadedFragmentReconciliationOutcome, UploadedObjectDeletionClaim,
+    UploadedObjectDeletionOutcome,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tokio_postgres::GenericClient;
 
 /// Maximum number of uploaded fragment rows one reconciliation cycle may claim.
@@ -75,6 +76,32 @@ where
         .collect::<BTreeSet<_>>();
     let before_counts = count_references(&before_by_inode);
     let after_counts = count_references(&after_by_inode);
+
+    for object_id in object_ids.iter().copied() {
+        if after_counts.get(&object_id).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let object_id_i64 = checked_i64(object_id, "object id")?;
+        let state = client
+            .query_opt(
+                "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 FOR UPDATE",
+                &[&volume_id, &object_id_i64],
+            )
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error(
+                    "postgres snapshot upload publication fence read failed",
+                    error,
+                )
+            })?
+            .map(|row| row.get::<_, String>(0));
+        if state.as_deref() == Some("delete_pending") {
+            return Err(MetaError::Storage(
+                "snapshot payload publication requires a new object id while deletion is pending"
+                    .to_owned(),
+            ));
+        }
+    }
 
     for inode in affected_inodes {
         let inode_i64 = checked_i64(inode, "inode")?;
@@ -150,7 +177,7 @@ where
         if after_count > 0 {
             client
                 .execute(
-                    "UPDATE snapshot_payload_upload_objects SET state = 'published', publish_batch_version = $3, closed_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('uploading', 'uploaded', 'delete_pending', 'retry_wait')",
+                    "UPDATE snapshot_payload_upload_objects SET state = 'published', publish_batch_version = $3, closed_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('uploading', 'uploaded', 'retry_wait')",
                     &[&volume_id, &object_id_i64, &batch_version],
                 )
                 .await
@@ -516,6 +543,7 @@ impl PgMetaEngine {
                             })?;
 
                         let mut claims = Vec::with_capacity(rows.len());
+                        let mut fencing_tokens = HashMap::new();
                         for row in rows {
                             let object_id: i64 = row.get(0);
                             let fragment_index: i32 = row.get(1);
@@ -526,24 +554,32 @@ impl PgMetaEngine {
                                     "snapshot upload fragment digest is invalid".to_owned(),
                                 )
                             })?;
-                            let fencing_token: i64 = tx
-                                .query_one(
-                                    "UPDATE snapshot_payload_upload_objects SET reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1 WHERE vol = $1 AND object_id = $2 RETURNING reconcile_fence",
-                                    &[
-                                        &volume_id,
-                                        &object_id,
-                                        &owner,
-                                        &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
-                                    ],
-                                )
-                                .await
-                                .map_err(|error| {
-                                    Self::classify_pg_error(
-                                        "postgres snapshot upload reconciliation lease failed",
-                                        error,
+                            let fencing_token = if let Some(fencing_token) =
+                                fencing_tokens.get(&object_id).copied()
+                            {
+                                fencing_token
+                            } else {
+                                let fencing_token: i64 = tx
+                                    .query_one(
+                                        "UPDATE snapshot_payload_upload_objects SET reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1 WHERE vol = $1 AND object_id = $2 RETURNING reconcile_fence",
+                                        &[
+                                            &volume_id,
+                                            &object_id,
+                                            &owner,
+                                            &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
+                                        ],
                                     )
-                                })?
-                                .get(0);
+                                    .await
+                                    .map_err(|error| {
+                                        Self::classify_pg_error(
+                                            "postgres snapshot upload reconciliation lease failed",
+                                            error,
+                                        )
+                                    })?
+                                    .get(0);
+                                fencing_tokens.insert(object_id, fencing_token);
+                                fencing_token
+                            };
                             claims.push(UploadedFragmentReconciliationClaim {
                                 entry: UploadedFragmentLedgerEntry {
                                     volume_id,
@@ -682,7 +718,7 @@ impl PgMetaEngine {
                                         .get::<_, bool>(0);
                                     if pending {
                                         tx.execute(
-                                            "UPDATE snapshot_payload_upload_objects SET next_retry_at = NULL, last_error = NULL, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4",
+                                            "UPDATE snapshot_payload_upload_objects SET next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4",
                                             &[&volume_id, &object_id, &owner, &fencing_token],
                                         )
                                         .await
@@ -884,27 +920,153 @@ impl PgMetaEngine {
         })
     }
 
-    fn mark_uploaded_object_deleted_sync(&self, object_id: u64) -> MetaResult<()> {
+    fn claim_uploaded_object_deletion_sync(
+        &self,
+        object_id: u64,
+        owner: &str,
+    ) -> MetaResult<UploadedObjectDeletionClaim> {
         let object_id = checked_i64(object_id, "object id")?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
+        let owner = owner.to_owned();
         self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
-                "mark snapshot upload object deleted",
+                "claim snapshot upload object deletion",
                 move |client| {
                     Box::pin(async move {
-                        client
-                            .execute(
-                                "UPDATE snapshot_payload_upload_objects SET state = 'deleted', closed_at = clock_timestamp(), reconcile_owner = NULL, reconcile_lease_expires_at = NULL, next_retry_at = NULL WHERE vol = $1 AND object_id = $2 AND state <> 'deleted'",
+                        let tx = client.transaction().await.map_err(|error| {
+                            Self::classify_pg_error(
+                                "postgres snapshot upload deletion claim transaction failed",
+                                error,
+                            )
+                        })?;
+                        let row = tx
+                            .query_opt(
+                                "SELECT state, (reconcile_lease_expires_at IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp()) FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 FOR UPDATE",
                                 &[&volume_id, &object_id],
                             )
                             .await
                             .map_err(|error| {
                                 Self::classify_pg_error(
-                                    "postgres snapshot upload object delete state update failed",
+                                    "postgres snapshot upload deletion claim row read failed",
+                                    error,
+                                )
+                            })?;
+                        let claim = if let Some(row) = row {
+                            let state: String = row.get(0);
+                            let lease_active: bool = row.get(1);
+                            if lease_active {
+                                UploadedObjectDeletionClaim::Protected
+                            } else {
+                                let referenced = tx
+                                    .query_one(
+                                        "SELECT EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1 AND object_id = $2)",
+                                        &[&volume_id, &object_id],
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        Self::classify_pg_error(
+                                            "postgres snapshot upload deletion reference check failed",
+                                            error,
+                                        )
+                                    })?
+                                    .get::<_, bool>(0);
+                                if referenced {
+                                    UploadedObjectDeletionClaim::Protected
+                                } else if state == "deleted" {
+                                    UploadedObjectDeletionClaim::Untracked
+                                } else if !matches!(
+                                    state.as_str(),
+                                    "uploaded" | "published" | "retry_wait" | "delete_pending"
+                                ) {
+                                    UploadedObjectDeletionClaim::Protected
+                                } else {
+                                    tx.query_opt(
+                                        "UPDATE snapshot_payload_upload_objects SET state = 'delete_pending', reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('uploaded', 'published', 'retry_wait', 'delete_pending') AND (reconcile_lease_expires_at IS NULL OR reconcile_lease_expires_at <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1 AND object_id = $2) RETURNING reconcile_fence",
+                                        &[
+                                            &volume_id,
+                                            &object_id,
+                                            &owner,
+                                            &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
+                                        ],
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        Self::classify_pg_error(
+                                            "postgres snapshot upload deletion lease failed",
+                                            error,
+                                        )
+                                    })?
+                                    .map(|row| UploadedObjectDeletionClaim::Claimed {
+                                        fencing_token: row.get(0),
+                                    })
+                                    .unwrap_or(UploadedObjectDeletionClaim::Protected)
+                                }
+                            }
+                        } else {
+                            UploadedObjectDeletionClaim::Untracked
+                        };
+                        tx.commit().await.map_err(|error| {
+                            Self::classify_pg_error(
+                                "postgres snapshot upload deletion claim commit failed",
+                                error,
+                            )
+                        })?;
+                        Ok(claim)
+                    })
+                },
+            )
+            .await
+        })
+    }
+
+    fn finish_uploaded_object_deletion_sync(
+        &self,
+        object_id: u64,
+        owner: &str,
+        fencing_token: i64,
+        outcome: UploadedObjectDeletionOutcome,
+    ) -> MetaResult<()> {
+        let object_id = checked_i64(object_id, "object id")?;
+        let command_pool = self.command_pool.clone();
+        let volume_id = self.volume_id;
+        let command_timeout = self.command_timeout;
+        let owner = owner.to_owned();
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                command_pool,
+                command_timeout,
+                "finish snapshot upload object deletion",
+                move |client| {
+                    Box::pin(async move {
+                        let (state, message) = match outcome {
+                            UploadedObjectDeletionOutcome::Deleted => {
+                                ("deleted", None)
+                            }
+                            UploadedObjectDeletionOutcome::Retryable => {
+                                ("retry_wait", Some("remote deletion retry required"))
+                            }
+                        };
+                        client
+                            .execute(
+                                "UPDATE snapshot_payload_upload_objects SET state = $5, closed_at = CASE WHEN $5 = 'deleted' THEN clock_timestamp() ELSE closed_at END, next_retry_at = CASE WHEN $5 = 'retry_wait' THEN clock_timestamp() + ($6 * interval '1 second') ELSE NULL END, last_error = $7, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'",
+                                &[
+                                    &volume_id,
+                                    &object_id,
+                                    &owner,
+                                    &fencing_token,
+                                    &state,
+                                    &SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS,
+                                    &message,
+                                ],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot upload deletion completion failed",
                                     error,
                                 )
                             })?;
@@ -938,16 +1100,30 @@ impl UploadedFragmentLedger for PgMetaEngine {
         self.finish_uploaded_fragment_reconciliation_sync(owner, claim, outcome)
     }
 
+    fn claim_uploaded_object_deletion(
+        &self,
+        object_id: u64,
+        owner: &str,
+    ) -> MetaResult<UploadedObjectDeletionClaim> {
+        self.claim_uploaded_object_deletion_sync(object_id, owner)
+    }
+
+    fn finish_uploaded_object_deletion(
+        &self,
+        object_id: u64,
+        owner: &str,
+        fencing_token: i64,
+        outcome: UploadedObjectDeletionOutcome,
+    ) -> MetaResult<()> {
+        self.finish_uploaded_object_deletion_sync(object_id, owner, fencing_token, outcome)
+    }
+
     fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
         self.begin_fragment_upload_sync(entry)
     }
 
     fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
         self.confirm_fragment_uploaded_sync(entry)
-    }
-
-    fn mark_uploaded_object_deleted(&self, object_id: u64) -> MetaResult<()> {
-        self.mark_uploaded_object_deleted_sync(object_id)
     }
 }
 

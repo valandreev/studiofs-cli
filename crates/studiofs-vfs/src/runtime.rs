@@ -209,6 +209,18 @@ impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaH
         claim: &studiofs_meta::snapshot_ports::UploadedFragmentReconciliationClaim,
         outcome: studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome,
     ) -> MetaResult<()>);
+    forward_method!(fn claim_uploaded_object_deletion(
+        &self,
+        object_id: u64,
+        owner: &str,
+    ) -> MetaResult<studiofs_meta::snapshot_ports::UploadedObjectDeletionClaim>);
+    forward_method!(fn finish_uploaded_object_deletion(
+        &self,
+        object_id: u64,
+        owner: &str,
+        fencing_token: i64,
+        outcome: studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome,
+    ) -> MetaResult<()>);
     forward_method!(fn begin_fragment_upload(
         &self,
         entry: &studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry,
@@ -217,7 +229,6 @@ impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaH
         &self,
         entry: &studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry,
     ) -> MetaResult<()>);
-    forward_method!(fn mark_uploaded_object_deleted(&self, object_id: u64) -> MetaResult<()>);
 }
 
 impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
