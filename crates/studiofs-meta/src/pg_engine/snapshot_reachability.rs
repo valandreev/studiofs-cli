@@ -5,8 +5,8 @@
 //! during which an immutable payload object had at least one current reference.
 //! Snapshot rows never copy object identifiers.
 
-use super::PgMetaEngine;
-use crate::engine::{MetaError, MetaResult};
+use super::{LOCAL_PG_VERSION_COUNTER, PgMetaEngine};
+use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
 use crate::schema::PayloadRefState;
 use crate::snapshot::VolumeId;
@@ -23,6 +23,8 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 
 /// Lease duration used by uploaded-fragment reconciliation.
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
+
+const SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES: usize = 3;
 
 /// Applies one ordered published metadata batch to the PostgreSQL reachability
 /// ledger inside the caller's transaction.
@@ -172,12 +174,14 @@ where
                     error,
                 )
             })?;
-        if states
-            .iter()
-            .any(|row| row.get::<_, String>(1) == "delete_pending")
-        {
+        if states.iter().any(|row| {
+            matches!(
+                row.get::<_, String>(1).as_str(),
+                "delete_pending" | "deleted"
+            )
+        }) {
             return Err(MetaError::Storage(
-                "snapshot payload publication requires a new object id while deletion is pending"
+                "snapshot payload publication requires a new object id after deletion has started"
                     .to_owned(),
             ));
         }
@@ -379,11 +383,23 @@ impl PgMetaEngine {
     }
 
     pub(super) fn backfill_current_reference_ledger(&self) -> MetaResult<()> {
-        let references = self.local.list_published_object_references()?;
-        let objects = references
-            .iter()
-            .map(|(_, object_id)| *object_id)
-            .collect::<BTreeSet<_>>();
+        for attempt in 0..=SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES {
+            if !self.backfill_current_reference_ledger_once()? {
+                return Ok(());
+            }
+            if attempt == SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES {
+                break;
+            }
+            self.sync_metadata_to_current_head()?;
+        }
+        Err(MetaError::Storage(
+            "snapshot reachability bootstrap could not capture a consistent local metadata version"
+                .to_owned(),
+        ))
+    }
+
+    fn backfill_current_reference_ledger_once(&self) -> MetaResult<bool> {
+        let local = self.local.clone();
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
@@ -394,6 +410,7 @@ impl PgMetaEngine {
                 command_timeout,
                 "bootstrap snapshot reachability",
                 move |client| {
+                    let local = local.clone();
                     Box::pin(async move {
                         let tx = client.transaction().await.map_err(|error| {
                             Self::classify_pg_error(
@@ -414,6 +431,66 @@ impl PgMetaEngine {
                                 )
                             })?
                             .get(0);
+                        let initialized = tx
+                            .query_opt(
+                                "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap marker query failed",
+                                    error,
+                                )
+                            })?;
+                        if initialized.is_some() {
+                            tx.commit().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap noop commit failed",
+                                    error,
+                                )
+                            })?;
+                            return Ok(false);
+                        }
+
+                        let local_version_before = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        let references = local.list_published_object_references()?;
+                        let local_version_after = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        if local_version_before != local_version_after
+                            || local_version_before != version
+                        {
+                            return Ok(true);
+                        }
+
+                        let objects = references
+                            .iter()
+                            .map(|(_, object_id)| *object_id)
+                            .collect::<BTreeSet<_>>();
+                        let creating_snapshot = tx
+                            .query_opt(
+                                "SELECT 1 FROM snapshot_catalog WHERE vol = $1 AND lifecycle = 'creating' LIMIT 1",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability creating snapshot check failed",
+                                    error,
+                                )
+                            })?;
+                        if creating_snapshot.is_some() {
+                            return Err(MetaError::Storage(
+                                "snapshot reachability bootstrap deferred while snapshot creation is in progress"
+                                    .to_owned(),
+                            ));
+                        }
+
                         let inserted = tx
                             .execute(
                                 "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -426,15 +503,7 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                        if inserted == 0 {
-                            tx.commit().await.map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot reachability bootstrap noop commit failed",
-                                    error,
-                                )
-                            })?;
-                            return Ok(());
-                        }
+                        debug_assert_eq!(inserted, 1);
 
                         let mut reference_inodes = Vec::with_capacity(references.len());
                         let mut reference_object_ids = Vec::with_capacity(references.len());
@@ -479,7 +548,7 @@ impl PgMetaEngine {
                              JOIN snapshot_catalog AS catalog
                                ON catalog.vol = proofs.vol AND catalog.id = proofs.snapshot_id
                              WHERE proofs.vol = $1
-                               AND catalog.lifecycle IN ('creating', 'ready', 'deleting')
+                               AND catalog.lifecycle IN ('ready', 'deleting')
                                AND catalog.cut_version < 9223372036854775807
                              ON CONFLICT DO NOTHING",
                             &[&volume_id],
@@ -497,7 +566,7 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        Ok(())
+                        Ok(false)
                     })
                 },
             )

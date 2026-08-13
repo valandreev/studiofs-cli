@@ -27,6 +27,54 @@ fn publish_event(ino: u64, object_id: u64) -> MetaEvent {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn publication_rejects_deleted_payload_object() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-deleted-fence");
+
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 11, 'deleted')",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("insert deleted upload object");
+
+        let tx = client
+            .transaction()
+            .await
+            .expect("start deleted publication transaction");
+        let error = apply_object_lifetime_changes(&tx, volume.volume_id, 1, &[publish_event(7, 11)])
+            .await
+            .expect_err("publication must reject a deleted payload object");
+        assert!(error
+            .to_string()
+            .contains("after deletion has started"));
+        tx.rollback().await.expect("rollback rejected publication");
+
+        let references = client
+            .query(
+                "SELECT object_id FROM snapshot_current_references WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("read references after rejected publication");
+        assert!(references.is_empty());
+
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("deleted publication fence transaction");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn published_batch_derives_exact_before_and_after_references() {
     let Some(dsn) = pg_dsn() else {
         return;
@@ -142,6 +190,52 @@ fn retry_and_final_reference_are_idempotent() {
         Ok::<(), MetaError>(())
     })
     .expect("idempotent reachability transaction");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn bootstrap_defers_while_a_snapshot_is_creating() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-bootstrap-creating");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle) VALUES ($1, 'snapshot-creating', 'manual', 1, $2, 'creating')",
+                &[&volume.volume_id, &Utc::now()],
+            )
+            .await
+            .expect("insert creating snapshot");
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("insert creating snapshot");
+
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open postgres engine");
+    let error = engine
+        .get_global_snapshot_pins()
+        .expect_err("janitor pins must stay unavailable until bootstrap completes");
+    assert!(
+        error
+            .to_string()
+            .contains("snapshot reachability bootstrap incomplete")
+    );
+    drop(engine);
 }
 
 #[test]
