@@ -1,6 +1,6 @@
 use super::super::{FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
-use crate::runtime::{TimeoutOrCancel, run_meta, run_with_timeout_or_cancel};
+use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
 use crate::utils::now_unix_millis;
 use bytes::Bytes;
 use futures::future::join_all;
@@ -1774,11 +1774,16 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             Ok(volume_id) => volume_id,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let object_bytes =
-            match Self::build_fragments(raw_payload, volume_id, op.object_id, fragment_keys) {
-                Ok(fragments) => fragments,
-                Err(error) => return UploadPutOutcome::Failed(error),
-            };
+        let fragment_keys = fragment_keys.to_vec();
+        let object_id = op.object_id;
+        let object_bytes = match run_blocking(move || {
+            Self::build_fragments(raw_payload, volume_id, object_id, &fragment_keys)
+        })
+        .await
+        {
+            Ok(fragments) => fragments,
+            Err(error) => return UploadPutOutcome::Failed(error),
+        };
         let uploads =
             object_bytes
                 .into_iter()

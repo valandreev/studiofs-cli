@@ -8,6 +8,8 @@ use super::*;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
 
+const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
+
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
     payloads: HashMap<Ino, Vec<u64>>,
@@ -1367,9 +1369,18 @@ impl StudioVfs {
                             }
                         };
 
+                        let delete_results = futures::future::join_all(
+                            format_object_fragment_keys(&self.data_prefix, object_id)
+                                .into_iter()
+                                .map(|key| async {
+                                    let result = self.data_write.delete_by_key(&key).await;
+                                    (key, result)
+                                }),
+                        )
+                        .await;
                         let mut delete_failed = false;
-                        for key in format_object_fragment_keys(&self.data_prefix, object_id) {
-                            if let Err(e) = self.data_write.delete_by_key(&key).await {
+                        for (key, result) in delete_results {
+                            if let Err(e) = result {
                                 if matches!(&e, DataError::OpenDal(oe) if oe.kind() == ErrorKind::NotFound)
                                 {
                                     continue;
@@ -1522,37 +1533,51 @@ impl StudioVfs {
                     continue;
                 }
             };
+            for claim in &reconciliation_claims {
+                global_snapshot_pins.insert(claim.entry.object_id);
+            }
+            let reconciliation_shutdown = self.state.shutdown.background_shutdown_token.clone();
+            let reconciliation_data_store = self.fetch_scheduler.data_store().clone();
+            let reconciliation_outcomes = futures::stream::iter(
+                reconciliation_claims.iter().cloned().map(|claim| {
+                    let shutdown = reconciliation_shutdown.clone();
+                    let data_store = reconciliation_data_store.clone();
+                    async move {
+                        let proof = run_with_timeout_or_cancel(
+                            &shutdown,
+                            REMOTE_OBJECT_IO_TIMEOUT,
+                            data_store.get_by_key(&claim.entry.object_key),
+                        )
+                        .await;
+                        let outcome = match proof {
+                            TimeoutOrCancel::Completed(Ok(remote_payload)) => {
+                                let remote_bytes = remote_payload.to_bytes();
+                                let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
+                                if remote_bytes.len() as u64 == claim.entry.expected_byte_length
+                                    && remote_sha256 == claim.entry.expected_sha256
+                                {
+                                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed
+                                } else {
+                                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+                                }
+                            }
+                            TimeoutOrCancel::Completed(Err(_))
+                            | TimeoutOrCancel::TimedOut
+                            | TimeoutOrCancel::Cancelled => {
+                                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+                            }
+                        };
+                        (claim, outcome)
+                    }
+                }),
+            )
+            .buffer_unordered(JANITOR_RECONCILIATION_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
             let mut upload_reconciliation_confirmed: u64 = 0;
             let mut upload_reconciliation_retryable: u64 = 0;
             let mut upload_reconciliation_completion_errors: u64 = 0;
-            for claim in &reconciliation_claims {
-                global_snapshot_pins.insert(claim.entry.object_id);
-                let proof = run_with_timeout_or_cancel(
-                    &self.state.shutdown.background_shutdown_token,
-                    REMOTE_OBJECT_IO_TIMEOUT,
-                    self.fetch_scheduler
-                        .data_store()
-                        .get_by_key(&claim.entry.object_key),
-                )
-                .await;
-                let outcome = match proof {
-                    TimeoutOrCancel::Completed(Ok(remote_payload)) => {
-                        let remote_bytes = remote_payload.to_bytes();
-                        let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
-                        if remote_bytes.len() as u64 == claim.entry.expected_byte_length
-                            && remote_sha256 == claim.entry.expected_sha256
-                        {
-                            studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed
-                        } else {
-                            studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
-                        }
-                    }
-                    TimeoutOrCancel::Completed(Err(_))
-                    | TimeoutOrCancel::TimedOut
-                    | TimeoutOrCancel::Cancelled => {
-                        studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
-                    }
-                };
+            for (claim, outcome) in reconciliation_outcomes {
                 match outcome {
                     studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed => {
                         upload_reconciliation_confirmed =
@@ -1565,7 +1590,6 @@ impl StudioVfs {
                 }
                 let owner = reconciliation_owner.clone();
                 let object_id = claim.entry.object_id;
-                let claim = claim.clone();
                 let meta = self.meta.clone();
                 if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.finish_uploaded_fragment_reconciliation(&owner, &claim, outcome)
@@ -1779,9 +1803,18 @@ impl StudioVfs {
                     }
                 };
 
+                let delete_results = futures::future::join_all(
+                    format_object_fragment_keys(&self.data_prefix, object_id)
+                        .into_iter()
+                        .map(|key| async {
+                            let result = self.data_write.delete_by_key(&key).await;
+                            (key, result)
+                        }),
+                )
+                .await;
                 let mut delete_failed = false;
-                for key in format_object_fragment_keys(&self.data_prefix, object_id) {
-                    if let Err(e) = self.data_write.delete_by_key(&key).await {
+                for (key, result) in delete_results {
+                    if let Err(e) = result {
                         if matches!(&e, DataError::OpenDal(oe) if oe.kind() == ErrorKind::NotFound)
                         {
                             continue;
