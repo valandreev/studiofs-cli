@@ -476,7 +476,7 @@ regressions:
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
   - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
   - `sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg`
-  - `sfs316_reachability_reports_active_base_overlay_and_snapshot_pins`
+  - `sfs316_reachability_reports_active_base_and_overlay`
   - `sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent`
   - `sfs316_delete_before_publish_tombstone_does_not_publish_deleted_content`
   - `startup_replay_cancels_ready_inode_stale_pending_upload`

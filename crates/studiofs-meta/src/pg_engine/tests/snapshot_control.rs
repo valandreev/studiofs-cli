@@ -27,6 +27,11 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
     assert!(!ddl.contains("pinned_object_ids"));
     assert!(!ddl.contains("snapshot_payload"));
+    assert!(ddl.contains("format_info BYTEA"));
+    assert!(ddl.contains("checkpoint_version BIGINT NOT NULL"));
+    assert!(ddl.contains("event_start_version BIGINT"));
+    assert!(ddl.contains("event_end_version BIGINT"));
+    assert!(ddl.contains("snapshot_source_checkpoints_catalog_fk"));
     assert!(ddl.contains("ADD COLUMN IF NOT EXISTS batch_version BIGINT"));
     assert!(ddl.contains("SET batch_version = 0"));
     assert!(ddl.contains("ALTER COLUMN batch_version SET NOT NULL"));
@@ -95,6 +100,18 @@ fn capture_is_one_transaction_and_one_durable_job() {
             .get(0);
         assert_eq!(job_count, 1);
         tx.commit().await.expect("commit capture transaction");
+
+        let error = client
+            .execute(
+                "DELETE FROM snapshot_catalog WHERE vol = $1 AND id = $2",
+                &[&volume.volume_id, &entry.snapshot_id.to_string()],
+            )
+            .await
+            .expect_err("creating snapshot source must not be prunable");
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+        );
         connection_task.abort();
         Ok(())
     })

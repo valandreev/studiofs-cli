@@ -1,7 +1,7 @@
 use crate::engine::{MetaError, MetaResult};
 
 /// The PostgreSQL schema generation owned by the Snapshot v2 control plane.
-pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 2;
+pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 4;
 
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
@@ -73,9 +73,16 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE TABLE IF NOT EXISTS metadata_state (
             vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
             version BIGINT NOT NULL,
+            checkpoint_version BIGINT NOT NULL DEFAULT 0,
             snapshot BYTEA NOT NULL,
+            format_info BYTEA NOT NULL DEFAULT decode('', 'hex'),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_version BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS format_info BYTEA NOT NULL DEFAULT decode('', 'hex');
 
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -185,11 +192,49 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             checkpoint_sha256 BYTEA NOT NULL CHECK (octet_length(checkpoint_sha256) = 32),
             event_start_seq BIGINT,
             event_end_seq BIGINT,
+            event_start_version BIGINT,
+            event_end_version BIGINT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (vol, snapshot_id),
             FOREIGN KEY (vol, snapshot_id)
-                REFERENCES snapshot_catalog(vol, id) ON DELETE CASCADE
+                REFERENCES snapshot_catalog(vol, id)
         );
+
+        ALTER TABLE snapshot_source_checkpoints
+            ADD COLUMN IF NOT EXISTS event_start_version BIGINT;
+        ALTER TABLE snapshot_source_checkpoints
+            ADD COLUMN IF NOT EXISTS event_end_version BIGINT;
+
+        DO $$
+        DECLARE
+            constraint_name TEXT;
+        BEGIN
+            FOR constraint_name IN
+                SELECT pg_constraint.conname
+                FROM pg_constraint
+                WHERE pg_constraint.conrelid = 'snapshot_source_checkpoints'::regclass
+                  AND pg_constraint.confrelid = 'snapshot_catalog'::regclass
+                  AND pg_constraint.contype = 'f'
+                  AND pg_constraint.conname <> 'snapshot_source_checkpoints_catalog_fk'
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE snapshot_source_checkpoints DROP CONSTRAINT %I',
+                    constraint_name
+                );
+            END LOOP;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'snapshot_source_checkpoints'::regclass
+                  AND conname = 'snapshot_source_checkpoints_catalog_fk'
+            ) THEN
+                ALTER TABLE snapshot_source_checkpoints
+                    ADD CONSTRAINT snapshot_source_checkpoints_catalog_fk
+                    FOREIGN KEY (vol, snapshot_id)
+                    REFERENCES snapshot_catalog(vol, id);
+            END IF;
+        END
+        $$;
 
         CREATE TABLE IF NOT EXISTS snapshot_artifacts (
             vol BIGINT NOT NULL,

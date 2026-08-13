@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::MetaAcl;
+use crate::redb_engine::RedbSnapshot;
 
 #[test]
 fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
@@ -541,40 +542,28 @@ fn startup_snapshot_replaces_acknowledged_local_overlay() {
 
 #[test]
 fn startup_snapshot_replay_starts_from_snapshot_epoch_not_pg_head() {
-    let mut snapshot = RedbSnapshot::default();
-    snapshot
-        .counters
-        .push((LOCAL_PG_VERSION_COUNTER.to_string(), 3));
-
     assert_eq!(
-        PgMetaEngine::snapshot_replay_start_version(&snapshot, 9, 0),
+        PgMetaEngine::snapshot_replay_start_version(3, 9),
         3,
-        "metadata_state.version is the remote head; snapshot import must resume from the checkpoint epoch"
+        "metadata_state.version is the remote head; serving import must resume from checkpoint_version"
     );
 }
 
 #[test]
 fn startup_snapshot_replay_caps_snapshot_epoch_to_pg_head() {
-    let mut snapshot = RedbSnapshot::default();
-    snapshot
-        .counters
-        .push((LOCAL_PG_VERSION_COUNTER.to_string(), 12));
-
     assert_eq!(
-        PgMetaEngine::snapshot_replay_start_version(&snapshot, 9, 0),
+        PgMetaEngine::snapshot_replay_start_version(12, 9),
         9,
-        "a stale or corrupt checkpoint cursor must not advance past the advertised PG head"
+        "a checkpoint cursor must not advance past the advertised PG head"
     );
 }
 
 #[test]
 fn startup_snapshot_replay_uses_previous_epoch_when_snapshot_has_no_cursor() {
-    let snapshot = RedbSnapshot::default();
-
     assert_eq!(
-        PgMetaEngine::snapshot_replay_start_version(&snapshot, 9, 2),
-        2,
-        "legacy checkpoints without a PG cursor must keep the previous local replay floor"
+        PgMetaEngine::snapshot_replay_start_version(0, 9),
+        0,
+        "a serving checkpoint always carries an explicit checkpoint version"
     );
 }
 
@@ -901,29 +890,6 @@ fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
     assert_eq!(
         version, 10,
         "stale checkpoint writes must not move the remote metadata head backwards"
-    );
-}
-
-#[test]
-#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn test_pg_legacy_snapshot_api_is_rejected() {
-    let Some(dsn) = pg_dsn() else {
-        return;
-    };
-
-    let dir = studiofs_test_support::workspace_target_tempdir("test-");
-    let db = dir.path().join("meta.redb");
-    let volume = PgTestVolume::new(&dsn, "pg-legacy-snapshot");
-    seed_local(&db, &volume.format_info());
-    let engine = PgMetaEngine::open(&db).expect("open postgres engine");
-
-    let error = engine
-        .create_snapshot(ROOT_INO)
-        .expect_err("directory-root v1 snapshot creation must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("legacy directory-root snapshots are unavailable")
     );
 }
 

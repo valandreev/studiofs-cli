@@ -1,9 +1,9 @@
 use super::PgMetaEngine;
 use crate::engine::{
-    DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaError, MetaFormat,
-    MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
-    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, NamespaceMutation,
-    PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaFormat, MetaFsOps,
+    MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication,
+    MetaResult, MetaSymlink, MetaXattr, NamespaceMutation, PendingCreateRecord, UndoLogKind,
+    UndoLogRecord,
 };
 use crate::types::*;
 use std::collections::HashSet;
@@ -420,25 +420,6 @@ impl MetaAcl for PgMetaEngine {
 
     fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>> {
         self.local.get_acl_rule(ino, principal)
-    }
-}
-
-impl MetaSnapshots for PgMetaEngine {
-    fn create_snapshot(&self, _root_ino: Ino) -> MetaResult<MetadataSnapshot> {
-        Err(MetaError::Storage(
-            "legacy directory-root snapshots are unavailable for PostgreSQL; use Snapshot v2"
-                .to_string(),
-        ))
-    }
-
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
-        let _ = self.sync_metadata();
-        self.local.list_snapshots()
-    }
-
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
-        let _ = self.sync_metadata();
-        self.local.get_snapshot(snapshot_id)
     }
 }
 

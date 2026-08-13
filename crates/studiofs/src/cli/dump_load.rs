@@ -39,7 +39,9 @@ struct MetadataDump {
     dump_version: u16,
     volume: DumpVolume,
     metadata_state_version: i64,
+    metadata_state_checkpoint_version: i64,
     metadata_state_snapshot: Vec<u8>,
+    metadata_state_format_info: Vec<u8>,
     counters: Vec<DumpCounter>,
     event_log: Vec<DumpEvent>,
 }
@@ -113,7 +115,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             let row = client
                 .query_opt(
                     r#"
-            SELECT v.vol, v.name, v.uuid, v.block_size, ms.version, ms.snapshot
+            SELECT v.vol, v.name, v.uuid, v.block_size, ms.version, ms.checkpoint_version, ms.snapshot, ms.format_info
             FROM volumes v
             JOIN metadata_state ms ON ms.vol = v.vol
             WHERE v.vol = $1
@@ -136,7 +138,9 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 block_size: row.get(3),
             };
             let state_version: i64 = row.get(4);
-            let state_snapshot: Vec<u8> = row.get(5);
+            let state_checkpoint_version: i64 = row.get(5);
+            let state_snapshot: Vec<u8> = row.get(6);
+            let state_format_info: Vec<u8> = row.get(7);
 
             let counter_rows = client
                 .query(
@@ -177,10 +181,12 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 .collect();
 
             Ok(MetadataDump {
-                dump_version: 2,
+                dump_version: 3,
                 volume,
                 metadata_state_version: state_version,
+                metadata_state_checkpoint_version: state_checkpoint_version,
                 metadata_state_snapshot: state_snapshot,
+                metadata_state_format_info: state_format_info,
                 counters,
                 event_log,
             })
@@ -300,8 +306,14 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("clear metadata_state failed: {e}")))?;
             tx.execute(
-                "INSERT INTO metadata_state (vol, version, snapshot) VALUES ($1, $2, $3)",
-                &[&target_vol, &dump.metadata_state_version, &dump.metadata_state_snapshot],
+                "INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &target_vol,
+                    &dump.metadata_state_version,
+                    &dump.metadata_state_checkpoint_version,
+                    &dump.metadata_state_snapshot,
+                    &dump.metadata_state_format_info,
+                ],
             )
             .await
             .map_err(|e| DumpLoadError::Message(format!("insert metadata_state failed: {e}")))?;
@@ -365,7 +377,7 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     })?;
     let volume_name = dump.volume.name.clone();
 
-    if dump.dump_version != 2 {
+    if dump.dump_version != 3 {
         return Err(DumpLoadError::Message(format!(
             "unsupported dump version: {}",
             dump.dump_version

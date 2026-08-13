@@ -1,15 +1,13 @@
 #[cfg(test)]
 use crate::engine::{
     MetaEngineCore, MetaFsOps, MetaGc, MetaNamespace, MetaPayloadObjects, MetaReplication,
-    MetaSnapshots, MetaSymlink, MetaXattr,
+    MetaSymlink, MetaXattr,
 };
 use crate::engine::{MetaError, MetaFormat, MetaInodes, MetaResult};
 #[cfg(test)]
 use crate::events::MetaEvent;
 use crate::pg_transport::connect_studiofs_postgres;
 use crate::redb_engine::RedbMetaEngine;
-#[cfg(test)]
-use crate::redb_engine::RedbSnapshot;
 use crate::types::*;
 use std::collections::HashMap;
 #[cfg(test)]
@@ -229,8 +227,6 @@ struct ClaimedPendingBatch {
     event_end: u64,
 }
 
-#[path = "pg_engine/codec_keys.rs"]
-mod codec_keys;
 #[path = "pg_engine/engine_core.rs"]
 mod engine_core;
 #[path = "pg_engine/inode_allocator.rs"]

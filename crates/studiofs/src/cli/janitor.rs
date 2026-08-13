@@ -493,7 +493,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             stats.deleted
         );
         println!("  delete errors:        {}", stats.delete_errors);
-        println!("  snapshot pins:        {}", global_snapshot_pins.len());
+        println!(
+            "  artifact-protected objects: {}",
+            global_snapshot_pins.len()
+        );
 
         if !loop_mode {
             break;

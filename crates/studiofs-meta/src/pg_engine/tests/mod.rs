@@ -15,6 +15,7 @@ mod remote_apply;
 mod replication_backlog;
 mod snapshot_control;
 mod snapshot_policy;
+mod snapshot_replay;
 
 fn pg_err(e: tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {
@@ -608,15 +609,15 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
             })?;
         let volume_id: i64 = row.get(0);
 
-        let empty_snapshot = serde_json::to_vec(&RedbSnapshot::default())
+        let empty_checkpoint = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
         tx.execute(
             r#"
-                INSERT INTO metadata_state (vol, version, snapshot)
-                VALUES ($1, 0, $2)
+                INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot)
+                VALUES ($1, 0, 0, $2)
                 ON CONFLICT (vol) DO NOTHING
                 "#,
-            &[&volume_id, &empty_snapshot],
+            &[&volume_id, &empty_checkpoint],
         )
         .await
         .map_err(|e| {

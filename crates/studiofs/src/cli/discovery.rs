@@ -4,22 +4,16 @@ use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
     FormatInfo, MetaFormat, MetaOpenOptions, RedbMetaEngine, connect_studiofs_postgres,
-    ensure_studiofs_database, open_meta_engine_with_options, redb_engine::RedbSnapshot,
+    ensure_studiofs_database, open_meta_engine_with_options,
 };
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
-    #[error("snapshot settings missing: expected 'format' entry")]
+    #[error("remote format info is missing")]
     MissingFormatInfo,
-    #[error("snapshot settings item is not a tuple")]
-    SnapshotItemNotTuple,
-    #[error("snapshot format payload is not a byte array")]
-    PayloadNotArray,
-    #[error("snapshot format payload contains non-byte value")]
-    InvalidFormatPayload,
-    #[error("invalid snapshot json: {0}")]
-    SnapshotJson(#[from] serde_json::Error),
+    #[error("invalid remote format info: {0}")]
+    FormatInfoJson(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -66,39 +60,15 @@ impl DiscoverArgs {
 
 struct DiscoveredState {
     volume_id: i64,
-    snapshot_state: RedbSnapshot,
+    serving_checkpoint: Vec<u8>,
     format_info: FormatInfo,
 }
 
-fn extract_format_info(snapshot_bytes: &[u8]) -> DiscoveryResult<FormatInfo> {
-    let value: serde_json::Value =
-        serde_json::from_slice(snapshot_bytes).map_err(DiscoveryError::from)?;
-    let settings = value
-        .get("settings")
-        .and_then(|v| v.as_array())
-        .ok_or(DiscoveryError::MissingFormatInfo)?;
-
-    for item in settings {
-        let pair = item
-            .as_array()
-            .ok_or(DiscoveryError::SnapshotItemNotTuple)?;
-        if pair.len() != 2 {
-            continue;
-        }
-        let Some("format") = pair[0].as_str() else {
-            continue;
-        };
-        let arr = pair[1].as_array().ok_or(DiscoveryError::PayloadNotArray)?;
-        let mut bytes = Vec::with_capacity(arr.len());
-        for n in arr {
-            let b = n.as_u64().ok_or(DiscoveryError::InvalidFormatPayload)?;
-            bytes.push(u8::try_from(b).map_err(|_| DiscoveryError::InvalidFormatPayload)?);
-        }
-        let info: FormatInfo = serde_json::from_slice(&bytes).map_err(DiscoveryError::from)?;
-        return Ok(info);
+fn decode_format_info(format_info_bytes: &[u8]) -> DiscoveryResult<FormatInfo> {
+    if format_info_bytes.is_empty() {
+        return Err(DiscoveryError::MissingFormatInfo);
     }
-
-    Err(DiscoveryError::MissingFormatInfo)
+    Ok(serde_json::from_slice(format_info_bytes)?)
 }
 
 fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<DiscoveredState> {
@@ -107,12 +77,10 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
             .await
             .map_err(|e| DiscoveryError::Message(e.to_string()))?
             .metadata_dsn;
-        let (volume_id, snapshot) = fetch_remote_snapshot(name, &postgres_dsn).await?;
+        let (volume_id, serving_checkpoint, format_info_bytes) =
+            fetch_remote_state(name, &postgres_dsn).await?;
 
-        let mut format_info = extract_format_info(&snapshot)?;
-        let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot).map_err(|e| {
-            DiscoveryError::Message(format!("invalid metadata snapshot payload: {e}"))
-        })?;
+        let mut format_info = decode_format_info(&format_info_bytes)?;
         let pg = format_info
             .metadata
             .postgres
@@ -125,13 +93,16 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
 
         Ok(DiscoveredState {
             volume_id,
-            snapshot_state,
+            serving_checkpoint,
             format_info,
         })
     })
 }
 
-async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResult<(i64, Vec<u8>)> {
+async fn fetch_remote_state(
+    name: &str,
+    postgres_dsn: &str,
+) -> DiscoveryResult<(i64, Vec<u8>, Vec<u8>)> {
     let (client, connection) = connect_studiofs_postgres(postgres_dsn)
         .await
         .map_err(|e| DiscoveryError::Message(e.to_string()))?;
@@ -141,7 +112,7 @@ async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResul
         let row = client
             .query_opt(
                 r#"
-            SELECT v.vol, ms.snapshot
+            SELECT v.vol, ms.snapshot, ms.format_info
             FROM volumes v
             JOIN metadata_state ms ON ms.vol = v.vol
             WHERE v.name = $1
@@ -159,7 +130,7 @@ async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResul
             ))
         })?;
 
-        Ok::<(i64, Vec<u8>), DiscoveryError>((row.get(0), row.get(1)))
+        Ok::<(i64, Vec<u8>, Vec<u8>), DiscoveryError>((row.get(0), row.get(1), row.get(2)))
     }
     .await;
 
@@ -184,12 +155,12 @@ fn create_local_snapshot(
     }
 
     let DiscoveredState {
-        snapshot_state,
+        serving_checkpoint,
         format_info,
         ..
     } = state;
     let engine = RedbMetaEngine::open(&db_path)?;
-    engine.import_snapshot(&snapshot_state)?;
+    engine.import_serving_checkpoint_bytes(&serving_checkpoint)?;
     engine.set_format_info(&format_info)?;
     let (uid, gid) = {
         #[cfg(unix)]

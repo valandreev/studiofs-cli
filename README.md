@@ -134,9 +134,10 @@ Key points:
 - Append-only ingress and crash recovery for accepted local writes
 - Cross-platform mounts: WinFSP on Windows, FUSE on Linux/macOS
 - Background upload, janitor, and metadata sync workers
-- Instant local snapshots with eventual PostgreSQL replication; cluster-wide
-  snapshot protection begins after PostgreSQL publication
-- Historical snapshot mounts as read-only views
+- Snapshot v2 PostgreSQL control plane with retained, version-bounded sources
+- Snapshot source replay is thin: serving checkpoints and bounded event ranges
+  are retained without replicating a full local snapshot through normal metadata
+  state or event payloads
 
 ## Quick Start
 
@@ -182,7 +183,6 @@ studiofs mount myvolume Y:
 | `fsck` | Scan/repair metadata inconsistencies (dangling entries, orphans, undo state) |
 | `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
 | `load` | Import a metadata dump into PostgreSQL |
-| `snapshot` | Create/list immutable metadata snapshots |
 | `perf` | Watch live runtime stats from a mounted StudioFS volume |
 | `bench` | Run the fixed public mounted filesystem benchmark |
 | `devbench` | Run a configurable developer mounted filesystem benchmark |

@@ -44,29 +44,6 @@ fn test_pg_janitor_lock_is_exclusive() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn test_pg_legacy_snapshot_api_does_not_create_local_pins() {
-    let Some(dsn) = pg_dsn() else {
-        return;
-    };
-
-    let dir = studiofs_test_support::workspace_target_tempdir("test-");
-    let db = dir.path().join("meta.redb");
-    let volume = PgTestVolume::new(&dsn, "pg-legacy-janitor");
-    seed_local(&db, &volume.format_info());
-    let engine = PgMetaEngine::open(&db).expect("open postgres engine");
-
-    let error = engine
-        .create_snapshot(ROOT_INO)
-        .expect_err("directory-root v1 snapshot creation must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("legacy directory-root snapshots are unavailable")
-    );
-}
-
-#[test]
-#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_janitor_blocks_gc_while_snapshot_is_creating() {
     let Some(dsn) = pg_dsn() else {
         return;

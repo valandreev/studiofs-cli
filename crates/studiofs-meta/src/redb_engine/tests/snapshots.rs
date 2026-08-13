@@ -1,71 +1,4 @@
 #[test]
-fn test_snapshot_pins_objects_and_is_listed() {
-    let engine = temp_engine();
-    let file = engine
-        .create_file(ROOT_INO, b"snap.txt", 1000, 1000, 0o644)
-        .unwrap();
-    let mut attr = engine.get_attr(file.ino).unwrap();
-    attr.size = DEFAULT_CHUNK_SIZE as u64;
-    engine.set_attr(&attr).unwrap();
-
-    let mut overlay_chunk = RegularFileChunkState::default();
-    let mut overlay_slice = SliceRecord::new(
-        SliceId(1),
-        SliceOrder(1),
-        SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("valid overlay slice"),
-        PayloadRef::new_partial(9_001, DEFAULT_CHUNK_SIZE),
-    );
-    overlay_slice.payload_state = PayloadRefState::Uploaded;
-    overlay_chunk.insert_slice(overlay_slice);
-
-    let mut base_chunk = RegularFileChunkState::default();
-    let mut base_slice = SliceRecord::new(
-        SliceId(2),
-        SliceOrder(2),
-        SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("valid base slice"),
-        PayloadRef::new_partial(9_002, DEFAULT_CHUNK_SIZE),
-    );
-    base_slice.payload_state = PayloadRefState::Published;
-    base_chunk.insert_slice(base_slice);
-
-    set_regular_file_chunk_rows(
-        &engine,
-        file.ino,
-        &[(ChunkId(0), overlay_chunk)],
-        &[(ChunkId(0), base_chunk)],
-    );
-
-    let refs_before = engine.get_referenced_object_ids().unwrap();
-    assert!(refs_before.contains(&9_001));
-    assert!(refs_before.contains(&9_002));
-
-    let snapshot = engine.create_snapshot(ROOT_INO).unwrap();
-    assert_eq!(snapshot.root_ino, ROOT_INO);
-    assert_eq!(snapshot.state, SnapshotState::Pending);
-    assert_eq!(snapshot.pinned_object_ids, vec![9_001]);
-    assert!(!snapshot.snapshot_payload.is_empty());
-
-    let listed = engine.list_snapshots().unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].id, snapshot.id);
-    assert_eq!(
-        engine.get_snapshot(&snapshot.id).unwrap().unwrap().id,
-        snapshot.id
-    );
-
-    engine.unlink(ROOT_INO, b"snap.txt").unwrap();
-    let refs = engine.get_referenced_object_ids().unwrap();
-    assert!(
-        refs.contains(&9_001),
-        "snapshot pins should keep object ids referenced"
-    );
-    assert!(
-        !refs.contains(&9_002),
-        "shadowed base object should not stay pinned after unlink"
-    );
-}
-
-#[test]
 fn remote_snapshot_hides_root_empty_regular_file_draft() {
     let engine = temp_engine();
     engine
@@ -230,22 +163,6 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_deletes_hidden() {
 }
 
 #[test]
-fn test_snapshot_payload_codec_roundtrips_and_reads_json() {
-    let engine = temp_engine();
-    let state = engine.export_snapshot().unwrap();
-
-    let binary = RedbMetaEngine::encode_snapshot_payload(&state).unwrap();
-    let decoded_binary = RedbMetaEngine::decode_snapshot_payload(&binary).unwrap();
-    assert_eq!(decoded_binary.inodes, state.inodes);
-    assert_eq!(decoded_binary.dentries, state.dentries);
-
-    let json = serde_json::to_vec(&state).unwrap();
-    let decoded_json = RedbMetaEngine::decode_snapshot_payload(&json).unwrap();
-    assert_eq!(decoded_json.inodes, state.inodes);
-    assert_eq!(decoded_json.dentries, state.dentries);
-}
-
-#[test]
 fn test_referenced_object_ids_include_committed_blocks() {
     let engine = temp_engine();
 
@@ -285,7 +202,7 @@ fn unix_now_secs() -> i64 {
 }
 
 #[test]
-fn sfs316_reachability_reports_active_base_overlay_and_snapshot_pins() {
+fn sfs316_reachability_reports_active_base_and_overlay() {
     let fixture = ContractCoreFixture::new("sfs316-reachability").expect("create contract fixture");
     let engine = fixture.meta();
 
@@ -310,9 +227,6 @@ fn sfs316_reachability_reports_active_base_overlay_and_snapshot_pins() {
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
             .unwrap()
     );
-    let snapshot = engine.create_snapshot(ROOT_INO).unwrap();
-    assert_eq!(snapshot.pinned_object_ids, vec![31]);
-
     let mut attr = engine.get_attr(file.ino).unwrap();
     attr.content_epoch = 2;
     engine.set_attr(&attr).unwrap();
@@ -321,7 +235,7 @@ fn sfs316_reachability_reports_active_base_overlay_and_snapshot_pins() {
         .unwrap();
 
     let diagnostics = fixture
-        .assert_invariants("sfs316 active graph and snapshot pins")
+        .assert_invariants("sfs316 active graph")
         .expect("contract invariants");
     let referenced: std::collections::BTreeSet<_> =
         diagnostics.referenced_object_ids.iter().copied().collect();
@@ -744,10 +658,9 @@ fn test_redb_snapshot_defaults_missing_regular_file_fields() {
         "symlinks": [],
         "xattrs": [],
         "acl_rules": [],
-        "event_log": [],
-        "snapshots": []
+        "event_log": []
     }"#;
-    let snapshot = RedbMetaEngine::decode_snapshot_payload(snapshot_json.as_bytes()).unwrap();
+    let snapshot: RedbSnapshot = serde_json::from_slice(snapshot_json.as_bytes()).unwrap();
     assert!(snapshot.regular_file_overlay.is_empty());
     assert!(snapshot.regular_file_base.is_empty());
 }

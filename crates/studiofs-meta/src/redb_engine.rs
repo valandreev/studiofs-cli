@@ -551,7 +551,6 @@ impl RedbMetaEngine {
             let _ = txn.open_table(BASE_ACL_RULES_TABLE);
             let _ = txn.open_table(ACL_RULE_TOMBSTONES_TABLE);
             let _ = txn.open_table(EVENT_LOG_TABLE);
-            let _ = txn.open_table(SNAPSHOTS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }

@@ -225,14 +225,24 @@ pub struct SnapshotPayloadProof {
 /// Reference to the immutable captured source used by a materializer.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotSourceDescriptor {
-    /// Internal immutable source checkpoint row identifier.
-    pub checkpoint_id: i64,
+    /// Internal immutable source checkpoint key.
+    pub checkpoint_id: String,
     /// Source checkpoint version.
     pub checkpoint_version: i64,
-    /// First event version available to replay.
-    pub event_start_version: i64,
-    /// Last event version included by the cut.
-    pub event_end_version: i64,
+    /// Checkpoint envelope format version.
+    pub checkpoint_format_version: i16,
+    /// Serving-state schema version.
+    pub checkpoint_schema_version: i16,
+    /// First event sequence available to replay.
+    pub event_start_seq: Option<i64>,
+    /// Last event sequence included by the cut.
+    pub event_end_seq: Option<i64>,
+    /// First event batch version available to replay.
+    pub event_start_version: Option<i64>,
+    /// Last event batch version included by the cut.
+    pub event_end_version: Option<i64>,
+    /// SHA-256 proof for the immutable checkpoint bytes.
+    pub replay_proof: SnapshotSha256,
 }
 
 /// Result of reconstructing one immutable source artifact.

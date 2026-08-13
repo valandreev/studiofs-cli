@@ -438,7 +438,7 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     /// Release the global janitor lease, if one was acquired.
     fn release_global_janitor_lock(&self) -> MetaResult<()>;
 
-    /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
+    /// Return object ids protected by published Snapshot v2 artifact proofs.
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
 
     /// Return whether remote object deletion must be paused for an in-progress snapshot.
@@ -851,7 +851,7 @@ pub trait MetaGc: Send + Sync {
 
     /// Get currently referenced object IDs from the full reachability graph.
     ///
-    /// Backends should include regular-file graph overlay/base rows and snapshot pins so cleanup can reason about publication races
+    /// Backends should include regular-file graph overlay/base rows and published artifact proofs so cleanup can reason about publication races
     /// and shadow refs directly from metadata reachability.
     ///
     /// Prefer streaming the underlying rows into a shared accumulator instead
@@ -939,18 +939,6 @@ pub trait MetaAcl: Send + Sync {
     fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>>;
 }
 
-/// Capability trait for immutable metadata snapshots.
-pub trait MetaSnapshots: Send + Sync {
-    /// Create an immutable snapshot rooted at `root_ino`.
-    fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot>;
-
-    /// List known snapshots.
-    fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>>;
-
-    /// Look up snapshot by id.
-    fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
-}
-
 /// Capability trait for replication, flushing, and remote consistency hooks.
 pub trait MetaReplication: Send + Sync {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).
@@ -1033,7 +1021,6 @@ pub trait MetaEngine:
     + MetaSymlink
     + MetaXattr
     + MetaAcl
-    + MetaSnapshots
     + MetaReplication
 {
     /// Apply ordered regular-file overlay mutations in one local transaction.

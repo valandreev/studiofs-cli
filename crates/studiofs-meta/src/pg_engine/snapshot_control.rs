@@ -2,12 +2,20 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio_postgres::GenericClient;
 
+use super::{OverlayConflictSets, RemoteApplyCoordinator, RemoteReplayApplyContext, sql};
 use super::{PgMetaEngine, janitor::pg_janitor_lock_key};
-use crate::engine::{MetaError, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaResult};
+use crate::redb_engine::RedbMetaEngine;
 use crate::snapshot::{
-    SnapshotCatalogEntry, SnapshotCreationState, SnapshotCut, SnapshotId, SnapshotLifecycle,
-    SnapshotOrigin, SnapshotRetention, SnapshotVolumeContext, VolumeId,
+    ServingCheckpoint, SnapshotCatalogEntry, SnapshotCreationState, SnapshotCut, SnapshotId,
+    SnapshotLifecycle, SnapshotOrigin, SnapshotRetention, SnapshotSha256, SnapshotVolumeContext,
+    VolumeId,
 };
+use crate::snapshot_ports::{
+    SnapshotPortError, SnapshotPortFuture, SnapshotReconstruction, SnapshotSourceDescriptor,
+    SnapshotSourceReader,
+};
+use std::path::Path;
 
 /// Inputs captured by one PostgreSQL Snapshot v2 registration transaction.
 #[derive(Debug, Clone)]
@@ -63,6 +71,181 @@ impl PgMetaEngine {
                 },
             )
             .await
+        })
+    }
+
+    /// Reconstruct a captured cut from its immutable PostgreSQL source row and
+    /// the bounded event range recorded by the capture transaction.
+    ///
+    /// The destination is caller-owned and must be a temporary path under the
+    /// Snapshot v2 replay sandbox. This method never reads the replaceable
+    /// serving checkpoint in `metadata_state` after the source row is loaded.
+    #[cfg(test)]
+    pub(crate) fn reconstruct_snapshot_source(
+        &self,
+        snapshot_id: &SnapshotId,
+        destination: &Path,
+    ) -> MetaResult<SnapshotReconstruction> {
+        self.reconstruct_snapshot_source_checked(snapshot_id, None, None, destination)
+    }
+
+    fn reconstruct_snapshot_source_checked(
+        &self,
+        snapshot_id: &SnapshotId,
+        expected_cut: Option<SnapshotCut>,
+        expected_descriptor: Option<SnapshotSourceDescriptor>,
+        destination: &Path,
+    ) -> MetaResult<SnapshotReconstruction> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let snapshot_id_text = snapshot_id.to_string();
+        let command_timeout = self.command_timeout;
+        let (cut, descriptor, checkpoint_bytes, event_rows) = Self::run_async_once(async move {
+            Self::with_postgres_client_timeout_once(
+                postgres_url,
+                Self::default_connect_timeout(),
+                command_timeout,
+                "reconstruct snapshot source",
+                move |client| async move {
+                    let source = client
+                        .query_opt(
+                            sql::SELECT_SNAPSHOT_SOURCE,
+                            &[&volume_id, &snapshot_id_text],
+                        )
+                        .await
+                        .map_err(|_| snapshot_control_error("read snapshot source checkpoint"))?
+                        .ok_or_else(|| {
+                            snapshot_control_error("snapshot source checkpoint is missing")
+                        })?;
+
+                    let cut_version: i64 = source.get(0);
+                    let captured_at: DateTime<Utc> = source.get(1);
+                    let cut = SnapshotCut::new(volume_id, cut_version, captured_at)
+                        .map_err(|_| snapshot_control_error("snapshot source cut is invalid"))?;
+                    let checkpoint_version: i64 = source.get(2);
+                    let checkpoint_format_version: i16 = source.get(3);
+                    let checkpoint_schema_version: i16 = source.get(4);
+                    let checkpoint_bytes: Vec<u8> = source.get(5);
+                    let expected_sha: Vec<u8> = source.get(6);
+                    let event_start_seq: Option<i64> = source.get(7);
+                    let event_end_seq: Option<i64> = source.get(8);
+                    let event_start_version: Option<i64> = source.get(9);
+                    let event_end_version: Option<i64> = source.get(10);
+
+                    if checkpoint_version < 0
+                        || checkpoint_version > cut_version
+                        || checkpoint_format_version != ServingCheckpoint::FORMAT_VERSION
+                        || checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
+                        || expected_sha.as_slice() != Sha256::digest(&checkpoint_bytes).as_slice()
+                    {
+                        return Err(snapshot_control_error(
+                            "snapshot source checkpoint is invalid",
+                        ));
+                    }
+                    let replay_proof =
+                        SnapshotSha256::from_bytes(expected_sha.as_slice().try_into().map_err(
+                            |_| snapshot_control_error("snapshot source checksum is invalid"),
+                        )?);
+                    let descriptor = SnapshotSourceDescriptor {
+                        checkpoint_id: snapshot_id_text.clone(),
+                        checkpoint_version,
+                        checkpoint_format_version,
+                        checkpoint_schema_version,
+                        event_start_seq,
+                        event_end_seq,
+                        event_start_version,
+                        event_end_version,
+                        replay_proof,
+                    };
+                    if expected_cut.is_some_and(|expected| expected != cut)
+                        || expected_descriptor
+                            .as_ref()
+                            .is_some_and(|expected| expected != &descriptor)
+                    {
+                        return Err(snapshot_control_error(
+                            "snapshot source descriptor does not match retained source",
+                        ));
+                    }
+                    let event_rows = client
+                        .query(
+                            sql::SELECT_SNAPSHOT_EVENT_ROWS,
+                            &[
+                                &volume_id,
+                                &checkpoint_version,
+                                &cut_version,
+                                &event_start_seq,
+                                &event_end_seq,
+                            ],
+                        )
+                        .await
+                        .map_err(|_| snapshot_control_error("read snapshot event range"))?;
+                    Ok((cut, descriptor, checkpoint_bytes, event_rows))
+                },
+            )
+            .await
+        })?;
+
+        let checkpoint: ServingCheckpoint = postcard::from_bytes(&checkpoint_bytes)
+            .map_err(|_| snapshot_control_error("decode snapshot source checkpoint"))?;
+        let local = RedbMetaEngine::open(destination)?;
+        local.import_serving_checkpoint(&checkpoint)?;
+        RemoteApplyCoordinator::new(&local).apply_event_rows(
+            event_rows,
+            None,
+            "\0studiofs-snapshot-replay",
+            RemoteReplayApplyContext {
+                last_seq: descriptor.checkpoint_version,
+                current_namespace_version: descriptor.checkpoint_version,
+                flushed_event_seq: 0,
+                next_event_seq: local.get_counter("nextEventSeq")?,
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )?;
+
+        let _ = cut;
+        Ok(SnapshotReconstruction {
+            path: destination.to_path_buf(),
+        })
+    }
+}
+
+impl SnapshotSourceReader for PgMetaEngine {
+    fn reconstruct<'a>(
+        &'a self,
+        cut: &'a SnapshotCut,
+        descriptor: &'a SnapshotSourceDescriptor,
+        destination: &'a Path,
+    ) -> SnapshotPortFuture<'a, SnapshotReconstruction> {
+        Box::pin(async move {
+            if cut.volume_id() != self.volume_id
+                || descriptor.checkpoint_version < 0
+                || descriptor.checkpoint_version > cut.cut_version()
+                || descriptor.checkpoint_format_version != ServingCheckpoint::FORMAT_VERSION
+                || descriptor.checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
+            {
+                return Err(SnapshotPortError::permanent(
+                    "invalid_source",
+                    "snapshot source descriptor is invalid",
+                ));
+            }
+            let snapshot_id = SnapshotId::parse(&descriptor.checkpoint_id).map_err(|_| {
+                SnapshotPortError::permanent(
+                    "invalid_source",
+                    "snapshot source descriptor is invalid",
+                )
+            })?;
+            self.reconstruct_snapshot_source_checked(
+                &snapshot_id,
+                Some(*cut),
+                Some(descriptor.clone()),
+                destination,
+            )
+            .map_err(|_| {
+                SnapshotPortError::retryable(
+                    "snapshot source reconstruct",
+                    "snapshot source is temporarily unavailable",
+                )
+            })
         })
     }
 }
@@ -140,17 +323,36 @@ where
 
     let checkpoint_row = client
         .query_opt(
-            "SELECT version, clock_timestamp(), snapshot FROM metadata_state WHERE vol = $1 FOR SHARE",
+            "SELECT version, checkpoint_version, clock_timestamp(), snapshot FROM metadata_state WHERE vol = $1 FOR SHARE",
             &[&request.volume_id],
         )
         .await
         .map_err(|_| snapshot_control_error("read published checkpoint"))?
         .ok_or_else(|| snapshot_control_error("snapshot checkpoint is missing"))?;
     let cut_version: i64 = checkpoint_row.get(0);
-    let captured_at: DateTime<Utc> = checkpoint_row.get(1);
+    let checkpoint_version: i64 = checkpoint_row.get(1);
+    let captured_at: DateTime<Utc> = checkpoint_row.get(2);
     let cut = SnapshotCut::new(request.volume_id, cut_version, captured_at)
         .map_err(|_| snapshot_control_error("published checkpoint is invalid"))?;
-    let checkpoint_bytes: Vec<u8> = checkpoint_row.get(2);
+    let checkpoint_bytes: Vec<u8> = checkpoint_row.get(3);
+    if checkpoint_version < 0 || checkpoint_version > cut_version {
+        return Err(snapshot_control_error(
+            "published checkpoint version is invalid",
+        ));
+    }
+    postcard::from_bytes::<ServingCheckpoint>(&checkpoint_bytes)
+        .map_err(|_| snapshot_control_error("published checkpoint payload is invalid"))?;
+    let event_bounds = client
+        .query_one(
+            "SELECT min(seq_id), max(seq_id), min(batch_version), max(batch_version) FROM event_log WHERE vol = $1 AND batch_version > $2 AND batch_version <= $3",
+            &[&request.volume_id, &checkpoint_version, &cut.cut_version()],
+        )
+        .await
+        .map_err(|_| snapshot_control_error("read snapshot event range"))?;
+    let event_start_seq: Option<i64> = event_bounds.get(0);
+    let event_end_seq: Option<i64> = event_bounds.get(1);
+    let event_start_version: Option<i64> = event_bounds.get(2);
+    let event_end_version: Option<i64> = event_bounds.get(3);
     let base_id = SnapshotId::from_cut(&volume.volume_name, cut.captured_at())
         .map_err(|_| snapshot_control_error("snapshot ID allocation failed"))?;
     let snapshot_id = allocate_snapshot_id(
@@ -193,16 +395,20 @@ where
     let checkpoint_sha256 = Sha256::digest(&checkpoint_bytes).to_vec();
     client
         .execute(
-            "INSERT INTO snapshot_source_checkpoints (vol, snapshot_id, cut_version, checkpoint_version, checkpoint_format_version, checkpoint_schema_version, checkpoint_bytes, checkpoint_sha256) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO snapshot_source_checkpoints (vol, snapshot_id, cut_version, checkpoint_version, checkpoint_format_version, checkpoint_schema_version, checkpoint_bytes, checkpoint_sha256, event_start_seq, event_end_seq, event_start_version, event_end_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             &[
                 &request.volume_id,
                 &snapshot_id_text,
                 &cut.cut_version(),
-                &cut.cut_version(),
-                &1_i16,
-                &1_i16,
+                &checkpoint_version,
+                &ServingCheckpoint::FORMAT_VERSION,
+                &ServingCheckpoint::SCHEMA_VERSION,
                 &checkpoint_bytes,
                 &checkpoint_sha256,
+                &event_start_seq,
+                &event_end_seq,
+                &event_start_version,
+                &event_end_version,
             ],
         )
         .await

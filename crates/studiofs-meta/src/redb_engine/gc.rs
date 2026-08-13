@@ -92,9 +92,6 @@ impl MetaGc for RedbMetaEngine {
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
         let txn = self.begin_read_txn()?;
-        let snapshots = txn
-            .open_table(SNAPSHOTS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut refs = HashSet::new();
         Self::regular_file_graph_object_ids_from_table(
             &txn,
@@ -102,14 +99,6 @@ impl MetaGc for RedbMetaEngine {
             &mut refs,
         )?;
         Self::regular_file_graph_object_ids_from_table(&txn, REGULAR_FILE_BASE_TABLE, &mut refs)?;
-        for item in snapshots
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_key, value) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let snapshot: MetadataSnapshot = decode(value.value())?;
-            refs.extend(snapshot.pinned_object_ids);
-        }
         Ok(refs)
     }
 }
