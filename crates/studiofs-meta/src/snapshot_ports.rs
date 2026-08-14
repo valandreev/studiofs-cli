@@ -282,10 +282,10 @@ impl SnapshotPolicyEvaluatorId {
     /// Creates a non-empty evaluator identity.
     pub fn new(value: impl Into<String>) -> Result<Self, SnapshotPortError> {
         let value = value.into();
-        if value.trim().is_empty() {
+        if value.trim().is_empty() || value.len() > 128 || !value.is_ascii() {
             return Err(SnapshotPortError::permanent(
                 "invalid_evaluator",
-                "evaluator identity is empty",
+                "evaluator identity must be non-empty ASCII within 128 bytes",
             ));
         }
         Ok(Self(value))
@@ -749,5 +749,12 @@ mod tests {
     fn deserialized_policy_evaluator_id_rejects_empty_identity() {
         let error = serde_json::from_str::<SnapshotPolicyEvaluatorId>("\"\"");
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn policy_evaluator_id_rejects_unbounded_or_non_ascii_identity() {
+        assert!(SnapshotPolicyEvaluatorId::new("x".repeat(129)).is_err());
+        assert!(SnapshotPolicyEvaluatorId::new("эvaluator").is_err());
+        assert!(SnapshotPolicyEvaluatorId::new("x".repeat(128)).is_ok());
     }
 }

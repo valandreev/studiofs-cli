@@ -523,7 +523,21 @@ impl SnapshotDailyPolicy {
                 }
                 SnapshotPolicySlot::SkippedDstGap { local_date: today }
             }
-            _ => self.resolve_local_slot_in_timezone(timezone, today.pred_opt()?),
+            _ => {
+                let yesterday = today.pred_opt()?;
+                match self.resolve_local_slot_in_timezone(timezone, yesterday) {
+                    SnapshotPolicySlot::Due { due_at, .. }
+                        if due_at <= now
+                            && !latest_completed.is_some_and(|completed| due_at <= completed) =>
+                    {
+                        SnapshotPolicySlot::Due {
+                            local_date: yesterday,
+                            due_at,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
         };
         let SnapshotPolicySlot::Due { local_date, due_at } = slot else {
             return Some(slot);
@@ -1211,6 +1225,27 @@ mod tests {
                     .single()
                     .expect("valid UTC slot"),
             }
+        );
+    }
+
+    #[test]
+    fn skipped_dst_gap_yesterday_is_not_due_before_today_slot() {
+        let policy = SnapshotDailyPolicy::new(
+            NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+            "America/New_York",
+            Duration::from_secs(60),
+        )
+        .expect("valid policy");
+
+        assert!(
+            policy
+                .latest_due_slot(
+                    Utc.with_ymd_and_hms(2026, 3, 9, 5, 0, 0)
+                        .single()
+                        .expect("valid UTC now"),
+                    None,
+                )
+                .is_none()
         );
     }
 
