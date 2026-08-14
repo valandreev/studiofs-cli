@@ -636,6 +636,25 @@ pub trait SnapshotArtifactStore: Send + Sync {
         &'a self,
         scope: &'a SnapshotArtifactScope,
     ) -> SnapshotPortFuture<'a, Vec<SnapshotStoredArtifact>>;
+
+    /// Lists artifact locators without requiring artifact bodies.
+    ///
+    /// The default keeps adapters source-compatible by projecting the locators
+    /// from `list`; storage-backed adapters should override it when listing can
+    /// be served from object keys alone.
+    fn list_locators<'a>(
+        &'a self,
+        scope: &'a SnapshotArtifactScope,
+    ) -> SnapshotPortFuture<'a, Vec<SnapshotArtifactLocator>> {
+        Box::pin(async move {
+            Ok(self
+                .list(scope)
+                .await?
+                .into_iter()
+                .map(|artifact| artifact.locator)
+                .collect())
+        })
+    }
 }
 
 #[cfg(test)]

@@ -633,6 +633,9 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             ON event_log(vol, batch_version, seq_id);
         CREATE INDEX IF NOT EXISTS idx_snapshot_catalog_vol_lifecycle
             ON snapshot_catalog(vol, lifecycle, captured_at);
+        CREATE INDEX IF NOT EXISTS idx_snapshot_catalog_expiry_queue
+            ON snapshot_catalog(vol, updated_at, id)
+            WHERE lifecycle = 'ready' AND ready_at IS NOT NULL AND expires_at IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_snapshot_creation_jobs_due
             ON snapshot_creation_jobs(state, next_retry_at);
         CREATE INDEX IF NOT EXISTS idx_snapshot_creation_jobs_queue

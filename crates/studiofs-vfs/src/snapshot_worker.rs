@@ -147,6 +147,40 @@ impl DataStoreSnapshotArtifactStore {
             sha256: digest(bytes),
         }
     }
+
+    async fn list_artifact_locators(
+        &self,
+        scope: &SnapshotArtifactScope,
+    ) -> Result<Vec<SnapshotArtifactLocator>, SnapshotPortError> {
+        if scope.volume_id != self.volume.volume_id || scope.volume_uuid != self.volume.volume_uuid
+        {
+            return Err(SnapshotPortError::permanent(
+                "invalid_artifact_scope",
+                "artifact scope does not match volume",
+            ));
+        }
+        let prefix = SnapshotArtifactPrefix::from_scope(self.data_store.data_prefix(), scope)
+            .map_err(|_| {
+                SnapshotPortError::permanent("invalid_artifact_scope", "artifact scope rejected")
+            })?;
+        let entries = self
+            .data_store
+            .list_snapshot_artifacts(&prefix)
+            .await
+            .map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
+        let mut entries = Box::pin(entries);
+        let mut locators = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry =
+                entry.map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
+            let locator = prefix.parse_key(&entry.key).map_err(|_| {
+                SnapshotPortError::permanent("invalid_artifact_key", "listed artifact key rejected")
+            })?;
+            self.key(&locator)?;
+            locators.push(locator);
+        }
+        Ok(locators)
+    }
 }
 
 impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
@@ -239,34 +273,9 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
         scope: &'a SnapshotArtifactScope,
     ) -> SnapshotPortFuture<'a, Vec<SnapshotStoredArtifact>> {
         Box::pin(async move {
-            if scope.volume_id != self.volume.volume_id
-                || scope.volume_uuid != self.volume.volume_uuid
-            {
-                return Err(SnapshotPortError::permanent(
-                    "invalid_artifact_scope",
-                    "artifact scope does not match volume",
-                ));
-            }
-            let prefix = SnapshotArtifactPrefix::from_scope(self.data_store.data_prefix(), scope)
-                .map_err(|_| {
-                SnapshotPortError::permanent("invalid_artifact_scope", "artifact scope rejected")
-            })?;
-            let entries = self
-                .data_store
-                .list_snapshot_artifacts(&prefix)
-                .await
-                .map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
-            let mut entries = Box::pin(entries);
-            let mut stored = Vec::new();
-            while let Some(entry) = entries.next().await {
-                let entry = entry
-                    .map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
-                let locator = prefix.parse_key(&entry.key).map_err(|_| {
-                    SnapshotPortError::permanent(
-                        "invalid_artifact_key",
-                        "listed artifact key rejected",
-                    )
-                })?;
+            let locators = self.list_artifact_locators(scope).await?;
+            let mut stored = Vec::with_capacity(locators.len());
+            for locator in locators {
                 let key = self.key(&locator)?;
                 let bytes = self
                     .data_store
@@ -278,6 +287,13 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
             }
             Ok(stored)
         })
+    }
+
+    fn list_locators<'a>(
+        &'a self,
+        scope: &'a SnapshotArtifactScope,
+    ) -> SnapshotPortFuture<'a, Vec<SnapshotArtifactLocator>> {
+        Box::pin(self.list_artifact_locators(scope))
     }
 }
 
@@ -1335,12 +1351,12 @@ impl SnapshotCleanupWorker {
             volume_uuid: self.volume.volume_uuid.clone(),
             snapshot_id: claim.catalog.snapshot_id.clone(),
         };
-        let artifacts = await_port(self.artifacts.list(&scope), cancel).await?;
+        let artifacts = await_port(self.artifacts.list_locators(&scope), cancel).await?;
         let mut active_claim = claim.clone();
-        for artifact in artifacts {
-            if artifact.locator.volume_id != self.volume.volume_id
-                || artifact.locator.volume_uuid != self.volume.volume_uuid
-                || artifact.locator.snapshot_id != claim.catalog.snapshot_id
+        for locator in artifacts {
+            if locator.volume_id != self.volume.volume_id
+                || locator.volume_uuid != self.volume.volume_uuid
+                || locator.snapshot_id != claim.catalog.snapshot_id
             {
                 return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
                     "invalid_artifact_scope",
@@ -1365,7 +1381,7 @@ impl SnapshotCleanupWorker {
                     "renewed snapshot cleanup claim identity or lifecycle is invalid",
                 )));
             }
-            await_port(self.artifacts.delete(&artifact.locator), cancel).await?;
+            await_port(self.artifacts.delete(&locator), cancel).await?;
         }
 
         let finalized = await_port(self.cleanup.finalize_deleted(&active_claim), cancel).await?;
@@ -2183,6 +2199,20 @@ mod tests {
             listed
                 .iter()
                 .any(|artifact| artifact.locator == final_artifact)
+        );
+        let listed_locators = adapter
+            .list_locators(&SnapshotArtifactScope {
+                volume_id: 7,
+                volume_uuid: VOLUME_UUID.to_owned(),
+                snapshot_id: listed[0].locator.snapshot_id.clone(),
+            })
+            .await
+            .expect("list artifact locators");
+        assert_eq!(listed_locators.len(), 2);
+        assert!(
+            listed_locators
+                .iter()
+                .any(|locator| locator == &final_artifact)
         );
     }
 

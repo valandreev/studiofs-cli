@@ -169,38 +169,6 @@ impl PgMetaEngine {
         })
     }
 
-    /// Applies the ready-relative expiry CAS for one snapshot.
-    pub fn expire_snapshot_v2(
-        &self,
-        snapshot_id: &SnapshotId,
-    ) -> MetaResult<Option<SnapshotCatalogEntry>> {
-        let postgres_url = self.postgres_url.clone();
-        let snapshot_id = snapshot_id.clone();
-        let volume_id = self.volume_id;
-
-        Self::run_async_once(async move {
-            Self::with_postgres_client_timeout_once(
-                postgres_url,
-                Self::default_connect_timeout(),
-                Self::default_command_timeout(),
-                "expire snapshot",
-                |mut client| async move {
-                    let tx = client
-                        .transaction()
-                        .await
-                        .map_err(|_| snapshot_control_error("begin snapshot expiry"))?;
-                    let entry =
-                        expire_snapshot_in_transaction(&tx, volume_id, &snapshot_id).await?;
-                    tx.commit()
-                        .await
-                        .map_err(|_| snapshot_control_error("commit snapshot expiry"))?;
-                    Ok(entry)
-                },
-            )
-            .await
-        })
-    }
-
     async fn load_snapshot_source(
         postgres_url: String,
         volume_id: VolumeId,
@@ -446,6 +414,7 @@ where
 }
 
 /// Applies expiry only to a Ready row whose durable expiry has passed.
+#[cfg(test)]
 pub(crate) async fn expire_snapshot_in_transaction<C>(
     client: &C,
     volume_id: VolumeId,

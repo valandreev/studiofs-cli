@@ -15,7 +15,7 @@ const SNAPSHOT_NOT_DELETING: &str = "snapshot is not deleting";
 const ACTIVE_MOUNT_LEASE: &str = "snapshot cleanup blocked by active mount lease";
 const ACTIVE_CREATION_LEASE: &str = "snapshot cleanup blocked by active creation lease";
 
-fn lease_millis(lease_for: Duration) -> Result<f64, SnapshotPortError> {
+fn lease_millis(lease_for: Duration) -> Result<i64, SnapshotPortError> {
     let millis = i64::try_from(lease_for.as_millis()).map_err(|_| {
         SnapshotPortError::permanent("invalid_lease", "lease duration is too large")
     })?;
@@ -25,7 +25,7 @@ fn lease_millis(lease_for: Duration) -> Result<f64, SnapshotPortError> {
             "lease duration must be positive",
         ));
     }
-    Ok(millis as f64)
+    Ok(millis)
 }
 
 fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
@@ -186,7 +186,7 @@ impl SnapshotCleanupStore for PgMetaEngine {
                         let worker_text = worker.as_str();
                         let lease = tx
                             .query_one(
-                                "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token, acquired_at, renewed_at) VALUES ($1, $2, $3, clock_timestamp() + ($4::double precision * interval '1 millisecond'), 1, clock_timestamp(), clock_timestamp()) ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = snapshot_cleanup_leases.fencing_token + 1, acquired_at = clock_timestamp(), renewed_at = clock_timestamp() RETURNING lease_expires_at, fencing_token",
+                                "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token, acquired_at, renewed_at) VALUES ($1, $2, $3, clock_timestamp() + ($4::bigint * interval '1 millisecond'), 1, clock_timestamp(), clock_timestamp()) ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = snapshot_cleanup_leases.fencing_token + 1, acquired_at = clock_timestamp(), renewed_at = clock_timestamp() RETURNING lease_expires_at, fencing_token",
                                 &[&volume_id, &snapshot_id, &worker_text, &lease_ms],
                             )
                             .await
@@ -232,7 +232,7 @@ impl SnapshotCleanupStore for PgMetaEngine {
                     Box::pin(async move {
                         let row = client
                             .query_opt(
-                                "UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() + ($5::double precision * interval '1 millisecond'), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4 AND lease_expires_at > clock_timestamp() RETURNING lease_expires_at, fencing_token",
+                                "UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() + ($5::bigint * interval '1 millisecond'), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4 AND lease_expires_at > clock_timestamp() RETURNING lease_expires_at, fencing_token",
                                 &[
                                     &volume_id,
                                     &snapshot_id,

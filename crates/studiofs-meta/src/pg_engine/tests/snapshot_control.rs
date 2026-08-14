@@ -48,6 +48,7 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(ddl.contains("retention_seconds IS NOT NULL"));
     assert!(ddl.contains("retention_seconds BETWEEN 1 AND 4294967295"));
     assert!(ddl.contains("idx_snapshot_creation_jobs_queue"));
+    assert!(ddl.contains("idx_snapshot_catalog_expiry_queue"));
 }
 
 fn snapshot_request(volume_id: i64, origin: SnapshotOrigin) -> SnapshotCaptureRequest {
