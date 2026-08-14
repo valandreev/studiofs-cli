@@ -40,6 +40,9 @@ pub const SNAPSHOT_ARTIFACT_FORMAT_VERSION: u16 = 1;
 /// Schema version written to the immutable metadata artifact.
 pub const SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u16 = 1;
 const SNAPSHOT_PAYLOAD_VERIFY_CONCURRENCY: usize = 16;
+const SNAPSHOT_CLEANUP_LEASE_FOR: Duration = Duration::from_secs(60);
+const SNAPSHOT_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SNAPSHOT_CLEANUP_IDLE_DELAY: Duration = Duration::from_secs(1);
 
 /// Bounded worker configuration for one verified volume.
 #[derive(Debug, Clone)]
@@ -62,27 +65,6 @@ impl SnapshotWorkerConfig {
             retry_delay: Duration::from_secs(1),
             idle_delay: Duration::from_secs(1),
             materializer_root: materializer_root.into(),
-        }
-    }
-}
-
-/// Bounded configuration for the connected-client snapshot cleanup worker.
-#[derive(Debug, Clone)]
-pub struct SnapshotCleanupWorkerConfig {
-    /// Lease duration used when claiming and renewing cleanup rows.
-    pub lease_for: Duration,
-    /// Delay before retrying a transient cleanup failure.
-    pub retry_delay: Duration,
-    /// Delay between empty cleanup-queue polls.
-    pub idle_delay: Duration,
-}
-
-impl Default for SnapshotCleanupWorkerConfig {
-    fn default() -> Self {
-        Self {
-            lease_for: Duration::from_secs(60),
-            retry_delay: Duration::from_secs(1),
-            idle_delay: Duration::from_secs(1),
         }
     }
 }
@@ -564,9 +546,12 @@ impl SnapshotWorker {
                 Ok(claim) => claim,
                 Err(SnapshotWorkerError::Cancelled) => return Ok(()),
                 Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
-                    match self
-                        .wait_for_cancel_or_deadline(&cancel, self.config.retry_delay)
-                        .await
+                    match wait_for_cancel_or_deadline(
+                        self.clock.as_ref(),
+                        &cancel,
+                        self.config.retry_delay,
+                    )
+                    .await
                     {
                         Ok(()) => continue,
                         Err(SnapshotWorkerError::Cancelled) => return Ok(()),
@@ -576,9 +561,12 @@ impl SnapshotWorker {
                 Err(error) => return Err(error),
             };
             let Some(claim) = claim else {
-                match self
-                    .wait_for_cancel_or_deadline(&cancel, self.config.idle_delay)
-                    .await
+                match wait_for_cancel_or_deadline(
+                    self.clock.as_ref(),
+                    &cancel,
+                    self.config.idle_delay,
+                )
+                .await
                 {
                     Ok(()) => continue,
                     Err(SnapshotWorkerError::Cancelled) => return Ok(()),
@@ -627,8 +615,12 @@ impl SnapshotWorker {
                         )));
                     }
                     studiofs_meta::snapshot::SnapshotLifecycle::Creating => {
-                        self.wait_for_cancel_or_deadline(&cancel, self.config.idle_delay)
-                            .await?;
+                        wait_for_cancel_or_deadline(
+                            self.clock.as_ref(),
+                            &cancel,
+                            self.config.idle_delay,
+                        )
+                        .await?;
                     }
                     studiofs_meta::snapshot::SnapshotLifecycle::Deleting
                     | studiofs_meta::snapshot::SnapshotLifecycle::Deleted => {
@@ -1144,22 +1136,6 @@ impl SnapshotWorker {
         .await
         .map(|_| ())
     }
-
-    async fn wait_for_cancel_or_deadline(
-        &self,
-        cancel: &CancellationToken,
-        delay: Duration,
-    ) -> Result<(), SnapshotWorkerError> {
-        let deadline = self
-            .clock
-            .now()
-            .checked_add_signed(
-                ChronoDuration::from_std(delay)
-                    .map_err(|_| SnapshotWorkerError::InvalidConfiguration)?,
-            )
-            .ok_or(SnapshotWorkerError::InvalidConfiguration)?;
-        await_port(self.clock.sleep_until(deadline, cancel.clone()), cancel).await
-    }
 }
 
 /// Deletes Snapshot v2 artifacts and finalizes Deleting rows after all
@@ -1170,7 +1146,6 @@ pub struct SnapshotCleanupWorker {
     cleanup: Arc<dyn SnapshotCleanupStore>,
     artifacts: Arc<dyn SnapshotArtifactStore>,
     clock: Arc<dyn SnapshotClock>,
-    config: SnapshotCleanupWorkerConfig,
 }
 
 impl SnapshotCleanupWorker {
@@ -1181,20 +1156,14 @@ impl SnapshotCleanupWorker {
         cleanup: Arc<dyn SnapshotCleanupStore>,
         artifacts: Arc<dyn SnapshotArtifactStore>,
         clock: Arc<dyn SnapshotClock>,
-        config: SnapshotCleanupWorkerConfig,
-    ) -> Result<Self, SnapshotWorkerError> {
-        if config.lease_for.is_zero() || config.retry_delay.is_zero() || config.idle_delay.is_zero()
-        {
-            return Err(SnapshotWorkerError::InvalidConfiguration);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             volume,
             worker,
             cleanup,
             artifacts,
             clock,
-            config,
-        })
+        }
     }
 
     /// Claims cleanup work until cancellation.
@@ -1207,7 +1176,8 @@ impl SnapshotCleanupWorker {
                 return Ok(());
             }
             let claim = match await_port(
-                self.cleanup.claim_next(&self.worker, self.config.lease_for),
+                self.cleanup
+                    .claim_next(&self.worker, SNAPSHOT_CLEANUP_LEASE_FOR),
                 &cancel,
             )
             .await
@@ -1215,9 +1185,12 @@ impl SnapshotCleanupWorker {
                 Ok(claim) => claim,
                 Err(SnapshotWorkerError::Cancelled) => return Ok(()),
                 Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
-                    match self
-                        .wait_for_cancel_or_deadline(&cancel, self.config.retry_delay)
-                        .await
+                    match wait_for_cancel_or_deadline(
+                        self.clock.as_ref(),
+                        &cancel,
+                        SNAPSHOT_CLEANUP_RETRY_DELAY,
+                    )
+                    .await
                     {
                         Ok(()) => continue,
                         Err(SnapshotWorkerError::Cancelled) => return Ok(()),
@@ -1228,9 +1201,12 @@ impl SnapshotCleanupWorker {
                 Err(error) => return Err(error),
             };
             let Some(claim) = claim else {
-                match self
-                    .wait_for_cancel_or_deadline(&cancel, self.config.idle_delay)
-                    .await
+                match wait_for_cancel_or_deadline(
+                    self.clock.as_ref(),
+                    &cancel,
+                    SNAPSHOT_CLEANUP_IDLE_DELAY,
+                )
+                .await
                 {
                     Ok(()) => {}
                     Err(SnapshotWorkerError::Cancelled) => return Ok(()),
@@ -1246,9 +1222,12 @@ impl SnapshotCleanupWorker {
                     return Ok(());
                 }
                 Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
-                    match self
-                        .wait_for_cancel_or_deadline(&cancel, self.config.retry_delay)
-                        .await
+                    match wait_for_cancel_or_deadline(
+                        self.clock.as_ref(),
+                        &cancel,
+                        SNAPSHOT_CLEANUP_RETRY_DELAY,
+                    )
+                    .await
                     {
                         Ok(()) => {}
                         Err(SnapshotWorkerError::Cancelled) => return Ok(()),
@@ -1280,7 +1259,7 @@ impl SnapshotCleanupWorker {
         let expected_owner = claim.lease.owner.clone();
         let expected_fencing_token = claim.lease.fencing_token;
         let claim = await_port(
-            self.cleanup.renew_lease(claim, self.config.lease_for),
+            self.cleanup.renew_lease(claim, SNAPSHOT_CLEANUP_LEASE_FOR),
             cancel,
         )
         .await?;
@@ -1363,7 +1342,7 @@ impl SnapshotCleanupWorker {
             }
             active_claim = await_port(
                 self.cleanup
-                    .renew_lease(&active_claim, self.config.lease_for),
+                    .renew_lease(&active_claim, SNAPSHOT_CLEANUP_LEASE_FOR),
                 cancel,
             )
             .await?;
@@ -1401,7 +1380,7 @@ impl SnapshotCleanupWorker {
         stop: CancellationToken,
         work_cancel: CancellationToken,
     ) -> Result<(), SnapshotWorkerError> {
-        let interval = (self.config.lease_for / 3).max(Duration::from_millis(1));
+        let interval = (SNAPSHOT_CLEANUP_LEASE_FOR / 3).max(Duration::from_millis(1));
         let mut retry_delay = interval;
         let mut lease_expires_at = claim.lease.expires_at;
         loop {
@@ -1410,7 +1389,7 @@ impl SnapshotCleanupWorker {
                 _ = tokio::time::sleep(retry_delay) => {}
             }
             let lease = tokio::select! {
-                result = self.cleanup.renew_lease(claim, self.config.lease_for) => result,
+                result = self.cleanup.renew_lease(claim, SNAPSHOT_CLEANUP_LEASE_FOR) => result,
                 _ = stop.cancelled() => return Ok(()),
             };
             match lease {
@@ -1449,22 +1428,21 @@ impl SnapshotCleanupWorker {
     async fn release_claim(&self, claim: &SnapshotCleanupClaim) {
         let _ = self.cleanup.release_lease(claim).await;
     }
+}
 
-    async fn wait_for_cancel_or_deadline(
-        &self,
-        cancel: &CancellationToken,
-        delay: Duration,
-    ) -> Result<(), SnapshotWorkerError> {
-        let deadline = self
-            .clock
-            .now()
-            .checked_add_signed(
-                ChronoDuration::from_std(delay)
-                    .map_err(|_| SnapshotWorkerError::InvalidConfiguration)?,
-            )
-            .ok_or(SnapshotWorkerError::InvalidConfiguration)?;
-        await_port(self.clock.sleep_until(deadline, cancel.clone()), cancel).await
-    }
+async fn wait_for_cancel_or_deadline(
+    clock: &dyn SnapshotClock,
+    cancel: &CancellationToken,
+    delay: Duration,
+) -> Result<(), SnapshotWorkerError> {
+    let deadline = clock
+        .now()
+        .checked_add_signed(
+            ChronoDuration::from_std(delay)
+                .map_err(|_| SnapshotWorkerError::InvalidConfiguration)?,
+        )
+        .ok_or(SnapshotWorkerError::InvalidConfiguration)?;
+    await_port(clock.sleep_until(deadline, cancel.clone()), cancel).await
 }
 
 fn is_stale_lease_error(error: &SnapshotWorkerError) -> bool {
@@ -2500,9 +2478,7 @@ mod tests {
             cleanup.clone(),
             artifacts.clone(),
             Arc::new(TestClock { now: captured_at }),
-            SnapshotCleanupWorkerConfig::default(),
-        )
-        .expect("cleanup worker");
+        );
         let cancel = CancellationToken::new();
 
         let first = worker

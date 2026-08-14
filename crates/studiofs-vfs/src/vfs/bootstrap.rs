@@ -1,7 +1,7 @@
 use super::*;
 use crate::snapshot_worker::{
     DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotCleanupWorker,
-    SnapshotCleanupWorkerConfig, SnapshotWorker, SnapshotWorkerConfig, SystemSnapshotClock,
+    SnapshotWorker, SnapshotWorkerConfig, SystemSnapshotClock,
 };
 use studiofs_cache::{LocalPayloadSyncMode, LocalPayloadWriteMode};
 use studiofs_meta::snapshot::SnapshotVolumeContext;
@@ -637,16 +637,13 @@ fn build_snapshot_cleanup_worker(
         uuid::Uuid::new_v4()
     ))
     .ok()?;
-    SnapshotCleanupWorker::new(
+    Some(Arc::new(SnapshotCleanupWorker::new(
         volume,
         worker_id,
         cleanup,
         artifacts,
         Arc::new(SystemSnapshotClock),
-        SnapshotCleanupWorkerConfig::default(),
-    )
-    .ok()
-    .map(Arc::new)
+    )))
 }
 
 fn snapshot_materializer_root(cache_dir: &Path) -> PathBuf {
