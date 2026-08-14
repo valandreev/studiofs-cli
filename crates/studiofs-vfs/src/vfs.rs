@@ -4709,6 +4709,7 @@ impl StudioVfs {
         loop {
             match run(cancel.clone()).await {
                 Ok(()) => return,
+                Err(_) if cancel.is_cancelled() => return,
                 Err(error) => {
                     tracing::error!(
                         worker = worker_name,

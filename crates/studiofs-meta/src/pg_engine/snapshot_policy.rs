@@ -380,7 +380,7 @@ impl SnapshotPolicyStore for PgMetaEngine {
                                 next_wake_at: next_poll(now),
                             });
                         };
-                        match slot.clone() {
+                        match slot {
                             SnapshotPolicySlot::SkippedDstGap { local_date } => {
                                 let already_recorded = tx
                                     .query_opt(

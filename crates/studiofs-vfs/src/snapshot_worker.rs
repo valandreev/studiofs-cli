@@ -545,19 +545,39 @@ impl SnapshotPolicyEvaluator {
         self: Arc<Self>,
         cancel: CancellationToken,
     ) -> Result<(), SnapshotPolicyEvaluatorError> {
-        let mut lease = match await_policy(
-            self.policies.claim_evaluator_lease(
-                &self.volume,
-                &self.evaluator,
-                SNAPSHOT_POLICY_EVALUATOR_LEASE_FOR,
-            ),
-            &cancel,
-        )
-        .await
-        {
-            Ok(lease) => lease,
-            Err(SnapshotPolicyEvaluatorError::Cancelled) => return Ok(()),
-            Err(error) => return Err(error),
+        let mut lease = loop {
+            match await_policy(
+                self.policies.claim_evaluator_lease(
+                    &self.volume,
+                    &self.evaluator,
+                    SNAPSHOT_POLICY_EVALUATOR_LEASE_FOR,
+                ),
+                &cancel,
+            )
+            .await
+            {
+                Ok(lease) => break lease,
+                Err(SnapshotPolicyEvaluatorError::Port(SnapshotPortError::Permanent {
+                    ref code,
+                    ..
+                })) if code.as_str() == "stale_evaluator_lease" => {
+                    match await_policy(
+                        self.clock.sleep_until(
+                            self.clock.now() + chrono::Duration::seconds(60),
+                            cancel.clone(),
+                        ),
+                        &cancel,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(SnapshotPolicyEvaluatorError::Cancelled) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(SnapshotPolicyEvaluatorError::Cancelled) => return Ok(()),
+                Err(error) => return Err(error),
+            }
         };
 
         let result = loop {
@@ -1748,6 +1768,32 @@ mod tests {
 
         assert!(task.await.expect("evaluator join").is_ok());
         assert!(store.released.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn evaluator_waits_when_peer_owns_lease() {
+        let volume = SnapshotVolumeContext::new(7, "projectfs", VOLUME_UUID).expect("volume");
+        let store = Arc::new(PolicyEvaluatorTestStore::new());
+        store.stale_claim.store(true, Ordering::SeqCst);
+        let evaluator = Arc::new(SnapshotPolicyEvaluator::new(
+            volume,
+            SnapshotPolicyEvaluatorId::new("evaluator-b").expect("evaluator id"),
+            store.clone(),
+            Arc::new(TestClock {
+                now: Utc
+                    .with_ymd_and_hms(2026, 8, 14, 9, 0, 0)
+                    .single()
+                    .expect("timestamp"),
+            }),
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(evaluator.run(cancel.clone()));
+
+        store.claimed.notified().await;
+        cancel.cancel();
+
+        assert!(task.await.expect("evaluator join").is_ok());
+        assert!(!store.released.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -3638,6 +3684,7 @@ mod tests {
     struct PolicyEvaluatorTestStore {
         claimed: Notify,
         released: AtomicBool,
+        stale_claim: AtomicBool,
     }
 
     impl PolicyEvaluatorTestStore {
@@ -3645,6 +3692,7 @@ mod tests {
             Self {
                 claimed: Notify::new(),
                 released: AtomicBool::new(false),
+                stale_claim: AtomicBool::new(false),
             }
         }
     }
@@ -3675,6 +3723,12 @@ mod tests {
             let owner = owner.as_str().to_string();
             Box::pin(async move {
                 self.claimed.notify_one();
+                if self.stale_claim.swap(false, Ordering::SeqCst) {
+                    return Err(SnapshotPortError::permanent(
+                        "stale_evaluator_lease",
+                        "snapshot policy evaluator lease is held by a peer",
+                    ));
+                }
                 Ok(SnapshotPolicyEvaluatorLease {
                     owner,
                     expires_at: Utc::now() + chrono::Duration::minutes(1),

@@ -504,6 +504,13 @@ impl SnapshotDailyPolicy {
                 due_at,
             },
             SnapshotPolicySlot::SkippedDstGap { .. } => {
+                if let Some(yesterday_slot) = self.resolve_local_slot(today.pred_opt()?).ok()
+                    && let SnapshotPolicySlot::Due { due_at, .. } = yesterday_slot
+                    && due_at <= now
+                    && !latest_completed.is_some_and(|completed| due_at <= completed)
+                {
+                    return Some(yesterday_slot);
+                }
                 SnapshotPolicySlot::SkippedDstGap { local_date: today }
             }
             _ => self.resolve_local_slot(today.pred_opt()?).ok()?,
@@ -1163,6 +1170,36 @@ mod tests {
             slot,
             SnapshotPolicySlot::SkippedDstGap {
                 local_date: NaiveDate::from_ymd_opt(2026, 3, 8).expect("valid local date"),
+            }
+        );
+    }
+
+    #[test]
+    fn dst_gap_catches_up_previous_due_slot_after_downtime() {
+        let policy = SnapshotDailyPolicy::new(
+            NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+            "America/New_York",
+            Duration::from_secs(60),
+        )
+        .expect("valid policy");
+
+        let slot = policy
+            .latest_due_slot(
+                Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0)
+                    .single()
+                    .expect("valid UTC now"),
+                None,
+            )
+            .expect("previous due slot is eligible");
+
+        assert_eq!(
+            slot,
+            SnapshotPolicySlot::Due {
+                local_date: NaiveDate::from_ymd_opt(2026, 3, 7).expect("valid local date"),
+                due_at: Utc
+                    .with_ymd_and_hms(2026, 3, 7, 7, 30, 0)
+                    .single()
+                    .expect("valid UTC slot"),
             }
         );
     }
