@@ -274,6 +274,39 @@ impl<'de> Deserialize<'de> for SnapshotWorkerId {
     }
 }
 
+/// Stable identity of one mounted automatic-policy evaluator.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize)]
+pub struct SnapshotPolicyEvaluatorId(String);
+
+impl SnapshotPolicyEvaluatorId {
+    /// Creates a non-empty evaluator identity.
+    pub fn new(value: impl Into<String>) -> Result<Self, SnapshotPortError> {
+        let value = value.into();
+        if value.trim().is_empty() || value.len() > 128 || !value.is_ascii() {
+            return Err(SnapshotPortError::permanent(
+                "invalid_evaluator",
+                "evaluator identity must be non-empty ASCII within 128 bytes",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the evaluator identity.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotPolicyEvaluatorId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A claimed durable creation job and its fencing lease.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotJobClaim {
@@ -556,6 +589,39 @@ pub trait SnapshotPolicyStore: Send + Sync {
     ) -> SnapshotPortFuture<'a, Option<crate::snapshot::SnapshotPolicyRecord>>;
     /// Cancels the active policy only when its generation still matches.
     fn cancel_policy<'a>(&'a self, expected_generation: i64) -> SnapshotPortFuture<'a, ()>;
+
+    /// Claims or renews the per-volume evaluator lease through a fencing CAS.
+    fn claim_evaluator_lease<'a>(
+        &'a self,
+        context: &'a crate::snapshot::SnapshotVolumeContext,
+        owner: &'a SnapshotPolicyEvaluatorId,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, crate::snapshot::SnapshotPolicyEvaluatorLease>;
+
+    /// Renews the evaluator lease only when its owner and fence still match.
+    fn renew_evaluator_lease<'a>(
+        &'a self,
+        lease: &'a crate::snapshot::SnapshotPolicyEvaluatorLease,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, crate::snapshot::SnapshotPolicyEvaluatorLease>;
+
+    /// Claims the latest eligible policy slot and queues its automatic job.
+    ///
+    /// `next_wake_at` is a backend-provided wake hint. Implementations may use
+    /// the next local slot when known, but must retain a bounded fallback poll
+    /// so a committed policy cannot be stranded by a lost wake-up.
+    fn evaluate_due_slot<'a>(
+        &'a self,
+        context: &'a crate::snapshot::SnapshotVolumeContext,
+        lease: &'a crate::snapshot::SnapshotPolicyEvaluatorLease,
+        now: DateTime<Utc>,
+    ) -> SnapshotPortFuture<'a, crate::snapshot::SnapshotPolicyEvaluation>;
+
+    /// Releases the evaluator lease only when its owner and fence still match.
+    fn release_evaluator_lease<'a>(
+        &'a self,
+        lease: &'a crate::snapshot::SnapshotPolicyEvaluatorLease,
+    ) -> SnapshotPortFuture<'a, ()>;
 }
 
 /// Reconstructs the immutable read model for a captured cut.
@@ -677,5 +743,18 @@ mod tests {
     fn deserialized_worker_id_rejects_empty_identity() {
         let error = serde_json::from_str::<SnapshotWorkerId>("\"\"");
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn deserialized_policy_evaluator_id_rejects_empty_identity() {
+        let error = serde_json::from_str::<SnapshotPolicyEvaluatorId>("\"\"");
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn policy_evaluator_id_rejects_unbounded_or_non_ascii_identity() {
+        assert!(SnapshotPolicyEvaluatorId::new("x".repeat(129)).is_err());
+        assert!(SnapshotPolicyEvaluatorId::new("эvaluator").is_err());
+        assert!(SnapshotPolicyEvaluatorId::new("x".repeat(128)).is_ok());
     }
 }

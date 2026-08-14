@@ -28,8 +28,10 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_payload_upload_objects"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_payload_upload_fragments"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_payload_reconcile_cursors"));
-    assert!(!ddl.contains("snapshot_policy_slots"));
-    assert!(!ddl.contains("snapshot_policy_leases"));
+    assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_policy_slots"));
+    assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_policy_evaluator_leases"));
+    assert!(!ddl.contains("idx_snapshot_policy_slots_due"));
+    assert!(ddl.contains("idx_snapshot_policy_slots_snapshot_id"));
     assert!(ddl.contains("byte_offset BIGINT NOT NULL"));
     assert!(!ddl.contains("CREATE TABLE IF NOT EXISTS snapshots"));
     assert!(!ddl.contains("pinned_object_ids"));

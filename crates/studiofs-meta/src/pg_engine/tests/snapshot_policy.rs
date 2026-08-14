@@ -2,12 +2,14 @@ use super::*;
 
 use crate::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCreationLease, SnapshotCreationState, SnapshotDailyPolicy,
-    SnapshotLifecycle, SnapshotOrigin, SnapshotRetention, SnapshotSha256,
+    SnapshotLifecycle, SnapshotOrigin, SnapshotPolicyEvaluation, SnapshotRetention, SnapshotSha256,
+    SnapshotVolumeContext,
 };
 use crate::snapshot_ports::{
-    SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadProof, SnapshotPolicyStore, SnapshotWorkerId,
+    SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadProof, SnapshotPolicyEvaluatorId,
+    SnapshotPolicyStore, SnapshotWorkerId,
 };
-use chrono::{NaiveTime, Utc};
+use chrono::{NaiveTime, TimeZone, Utc};
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
@@ -47,6 +49,19 @@ fn policy_set_load_cancel_uses_generation_cas() {
             first
         );
 
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to seed completion watermark");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_policies SET latest_completed_slot = clock_timestamp() WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("seed completion watermark");
+        connection_task.abort();
+
         let stale = SnapshotPolicyStore::cancel_policy(&*engine, 99)
             .await
             .expect_err("stale generation must be rejected");
@@ -66,6 +81,21 @@ fn policy_set_load_cancel_uses_generation_cas() {
             .await
             .expect("re-enable policy");
         assert_eq!(second.generation, 2);
+
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to inspect completion watermark");
+        let connection_task = tokio::spawn(connection);
+        let latest_completed: Option<chrono::DateTime<Utc>> = client
+            .query_one(
+                "SELECT latest_completed_slot FROM snapshot_policies WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("load completion watermark")
+            .get(0);
+        connection_task.abort();
+        assert!(latest_completed.is_none());
         Ok(())
     })
     .expect("policy control plane");
@@ -120,6 +150,92 @@ fn concurrent_initial_policy_sets_allocate_distinct_generations() {
         Ok(())
     })
     .expect("concurrent policy control plane");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn policy_slot_claim_and_job_insert_are_one_transaction() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-policy-slot");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    let info = volume.format_info();
+    seed_local(&db_path, &info);
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open postgres engine");
+    let context = SnapshotVolumeContext::new(volume.volume_id, &volume.name, &volume.uuid)
+        .expect("verified snapshot context");
+    let policy = SnapshotDailyPolicy::new(
+        NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+        "UTC",
+        Duration::from_secs(3600),
+    )
+    .expect("valid policy");
+    let evaluator =
+        SnapshotPolicyEvaluatorId::new("policy-evaluator-a").expect("valid evaluator identity");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 14, 3, 0, 0)
+        .single()
+        .expect("valid UTC now");
+
+    run_async(async {
+        SnapshotPolicyStore::set_policy(&*engine, &policy, None)
+            .await
+            .expect("set policy");
+        let lease = SnapshotPolicyStore::claim_evaluator_lease(
+            &*engine,
+            &context,
+            &evaluator,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("claim evaluator lease");
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to expire evaluator lease");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_policy_evaluator_leases SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("expire evaluator lease");
+        connection_task.abort();
+
+        let reclaimed = SnapshotPolicyStore::claim_evaluator_lease(
+            &*engine,
+            &context,
+            &evaluator,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("reclaim expired evaluator lease");
+        assert!(reclaimed.fencing_token > lease.fencing_token);
+        let first = SnapshotPolicyStore::evaluate_due_slot(&*engine, &context, &reclaimed, now)
+            .await
+            .expect("evaluate due slot");
+        assert!(matches!(first, SnapshotPolicyEvaluation::Created { .. }));
+
+        let second = SnapshotPolicyStore::evaluate_due_slot(
+            &*engine,
+            &context,
+            &reclaimed,
+            now + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("follow existing due slot");
+        assert!(matches!(second, SnapshotPolicyEvaluation::Followed { .. }));
+        Ok(())
+    })
+    .expect("automatic policy slot transaction");
 }
 
 #[test]

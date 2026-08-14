@@ -1050,6 +1050,12 @@ pub trait MetaEngine:
         None
     }
 
+    /// Returns the PostgreSQL-backed Snapshot v2 daily-policy store when this
+    /// engine owns one, or `None` for local-only metadata engines.
+    fn snapshot_policy_store(&self) -> Option<Arc<dyn crate::snapshot_ports::SnapshotPolicyStore>> {
+        None
+    }
+
     /// Apply ordered regular-file overlay mutations in one local transaction.
     fn apply_regular_file_overlay_batch(
         &self,
