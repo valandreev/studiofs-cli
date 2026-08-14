@@ -443,6 +443,13 @@ impl MetaEngine for PgMetaEngine {
             .map(|engine| engine as Arc<dyn crate::snapshot_ports::SnapshotSourceReader>)
     }
 
+    fn snapshot_mount_store(&self) -> Option<Arc<dyn crate::snapshot_ports::SnapshotMountStore>> {
+        self.self_weak
+            .get()
+            .and_then(Weak::upgrade)
+            .map(|engine| engine as Arc<dyn crate::snapshot_ports::SnapshotMountStore>)
+    }
+
     fn apply_regular_file_overlay_batch(
         &self,
         mutations: &[crate::engine::RegularFileOverlayMutation],

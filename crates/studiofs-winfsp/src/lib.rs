@@ -755,11 +755,19 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     // WinFSP notifications.
     let invalidation_queue = WinfspInvalidationQueue::new(&vfs);
 
-    let context = StudioFsContext::new(
-        vfs.clone(),
-        runtime_handle.clone(),
-        invalidation_queue.clone(),
-    )
+    let context = if read_only {
+        StudioFsContext::new_read_only(
+            vfs.clone(),
+            runtime_handle.clone(),
+            invalidation_queue.clone(),
+        )
+    } else {
+        StudioFsContext::new(
+            vfs.clone(),
+            runtime_handle.clone(),
+            invalidation_queue.clone(),
+        )
+    }
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP context: {err}")))?;
 
     // Use `new_with_timer_async` so read/write/readdir can return

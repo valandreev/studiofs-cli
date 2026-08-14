@@ -19,6 +19,7 @@ mod ordered_mutex;
 pub mod qos;
 pub mod readahead;
 mod runtime;
+pub mod snapshot_mount;
 mod snapshot_worker;
 pub mod upload;
 pub mod utils;
@@ -37,6 +38,11 @@ pub use readahead::{DirAccessTracker, ReadAheadTracker};
 pub use runtime::{
     AclMeta, JanitorMeta, ReadPathMeta, UploadMeta, VfsCommitMeta, VfsMeta, into_vfs_meta,
 };
+pub use snapshot_mount::{
+    SnapshotArtifactCacheKey, SnapshotMount, SnapshotMountConfig, SnapshotMountError,
+    SnapshotMountSession,
+};
+pub use snapshot_worker::SystemSnapshotClock;
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use utils::parse_size_bytes;

@@ -4,7 +4,7 @@ use crate::engine::MetaResult;
 use crate::schema::PayloadRef;
 use crate::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob, SnapshotCreationLease,
-    SnapshotCut, SnapshotId, SnapshotSha256, VolumeId,
+    SnapshotCut, SnapshotId, SnapshotMountLease, SnapshotSha256, VolumeId,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -476,6 +476,37 @@ pub trait SnapshotJobStore: Send + Sync {
         &'a self,
         snapshot_id: &'a SnapshotId,
     ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
+}
+
+/// PostgreSQL-authoritative leases that fence mounted snapshot cache use.
+pub trait SnapshotMountStore: Send + Sync {
+    /// Acquires a lease only for a currently Ready, unexpired snapshot.
+    fn acquire<'a>(
+        &'a self,
+        snapshot_id: &'a SnapshotId,
+        owner: &'a str,
+        cache_volume_uuid: &'a str,
+        cache_sha256: &'a SnapshotSha256,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, SnapshotMountLease>;
+
+    /// Renews a lease only when its complete identity and fence still match.
+    fn renew<'a>(
+        &'a self,
+        lease: &'a SnapshotMountLease,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, SnapshotMountLease>;
+
+    /// Releases a lease only when its complete identity and fence still match.
+    fn release<'a>(&'a self, lease: &'a SnapshotMountLease) -> SnapshotPortFuture<'a, ()>;
+
+    /// Reports whether a matching lease is currently active.
+    fn has_active_lease<'a>(
+        &'a self,
+        snapshot_id: &'a SnapshotId,
+        cache_volume_uuid: &'a str,
+        cache_sha256: &'a SnapshotSha256,
+    ) -> SnapshotPortFuture<'a, bool>;
 }
 
 /// PostgreSQL-authoritative daily automatic-policy operations.

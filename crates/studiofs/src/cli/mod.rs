@@ -31,6 +31,7 @@ pub mod operator_test;
 pub mod perf;
 pub mod runtime_tuning;
 pub mod settings;
+pub mod smount;
 pub mod status;
 pub mod test;
 #[cfg(not(unix))]
@@ -130,6 +131,7 @@ enum Commands {
     Init(init::InitArgs),
     Discover(discovery::DiscoverArgs),
     Mount(mount::MountArgs),
+    Smount(smount::SmountArgs),
     Umount(umount::UmountArgs),
     Perf(perf::PerfArgs),
     Status(status::StatusArgs),
@@ -151,6 +153,7 @@ impl Commands {
             Self::Init(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),
+            Self::Smount(args) => args.dispatch(),
             Self::Umount(args) => args.dispatch(),
             Self::Perf(args) => args.dispatch(),
             Self::Status(args) => args.dispatch(),

@@ -24,14 +24,16 @@ use studiofs_cache::{
     DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalPayloadRuntime, prepare_local_payload_runtime,
 };
 use studiofs_data::{DataStoreConfig, normalize_s3_endpoint_transport};
+use studiofs_meta::snapshot::SnapshotId;
 use studiofs_meta::{
-    FormatInfo, MetaFormat, MetaOpenOptions, MetaReplication, open_meta_engine,
+    FormatInfo, MetaEngine, MetaFormat, MetaOpenOptions, MetaReplication, open_meta_engine,
     open_meta_engine_with_options,
 };
 #[cfg(test)]
 use studiofs_vfs::VfsConfig;
 use studiofs_vfs::{
-    StudioVfs, VfsConfigRaw, VfsConfigValidated, VfsMeta, into_vfs_meta, parse_size_bytes,
+    SnapshotMount, SnapshotMountConfig, SnapshotMountSession, StudioVfs, SystemSnapshotClock,
+    VfsConfigRaw, VfsConfigValidated, VfsMeta, into_vfs_meta, parse_size_bytes,
 };
 use sysinfo::System;
 use tokio::runtime::Runtime;
@@ -93,6 +95,10 @@ struct PreparedMount {
     mount_lock: Option<utils::MountLockGuard>,
 }
 
+struct PreparedSnapshotMount {
+    mount: Arc<SnapshotMount>,
+}
+
 pub(crate) struct MountSession {
     prepared: PreparedMount,
 }
@@ -107,6 +113,7 @@ struct PreparedForegroundRuntime {
     profiling_backend: Arc<dyn RuntimeProfilingBackend>,
     profiling: Option<MountProfileFinish>,
     write_path_observability_publisher: WritePathObservabilityPublisher,
+    snapshot_mount: Option<PreparedSnapshotMount>,
 }
 
 trait MountOpenMeta: Send + Sync + MetaFormat + MetaReplication {}
@@ -116,11 +123,13 @@ trait MountRuntimeMeta: Send + Sync + VfsMeta {}
 impl<T> MountRuntimeMeta for T where T: ?Sized + Send + Sync + VfsMeta {}
 
 struct OpenedLiveMountMeta {
+    source_meta: Arc<dyn MetaEngine>,
     runtime_meta: Arc<dyn VfsMeta>,
     format_info: FormatInfo,
 }
 
 struct MountMetaSession<M: ?Sized + MountRuntimeMeta> {
+    source_meta: Arc<dyn MetaEngine>,
     meta: Arc<M>,
     format_info: FormatInfo,
     read_only_mount: bool,
@@ -844,6 +853,13 @@ fn prepare_volume_cache_runtime(
     })
 }
 
+fn snapshot_mount_runtime_path(base_cache_path: &Path, owner: &str) -> PathBuf {
+    base_cache_path
+        .join("snapshot-v2")
+        .join("mount-runtime")
+        .join(owner)
+}
+
 fn shutdown_upload_drain_timeout() -> Duration {
     let secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
         .ok()
@@ -874,6 +890,47 @@ fn record_cleanup_error(
         *first_error = Some(error);
     } else {
         warn!(error = ?error, "additional mount cleanup step failed");
+    }
+}
+
+fn run_snapshot_mount_shutdown(
+    runtime: &Runtime,
+    prepared: PreparedSnapshotMount,
+) -> anyhow::Result<()> {
+    let runtime_handle = runtime.handle().clone();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let shutdown = std::thread::Builder::new()
+            .name("snapshot-mount-lease-shutdown".to_string())
+            .spawn(move || block_on_snapshot_mount_shutdown(runtime_handle, prepared))
+            .map_err(|error| {
+                anyhow::anyhow!("failed to spawn snapshot lease shutdown thread: {error}")
+            })?;
+        return shutdown.join().map_err(|_| {
+            anyhow::anyhow!("snapshot lease shutdown thread panicked during unmount")
+        })?;
+    }
+
+    block_on_snapshot_mount_shutdown(runtime_handle, prepared)
+}
+
+fn block_on_snapshot_mount_shutdown(
+    runtime_handle: tokio::runtime::Handle,
+    prepared: PreparedSnapshotMount,
+) -> anyhow::Result<()> {
+    let PreparedSnapshotMount { mount } = prepared;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime_handle.block_on(async move {
+            mount
+                .release()
+                .await
+                .map_err(|error| anyhow::anyhow!("snapshot lease release failed: {error}"))
+        })
+    }));
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "snapshot lease shutdown panicked during unmount"
+        )),
     }
 }
 
@@ -1015,6 +1072,19 @@ impl MountSession {
         )
     }
 
+    pub(crate) fn prepare_snapshot(command: MountCommand) -> anyhow::Result<Self> {
+        if command.snapshot_id.is_none() {
+            return Err(anyhow::anyhow!(
+                "snapshot mount session requires a snapshot identifier"
+            ));
+        }
+        Self::prepare_with_backend_factory(
+            command,
+            settings::load_studiofs_config()?,
+            default_mount_backend,
+        )
+    }
+
     fn prepare_with_backend_factory<Factory>(
         command: MountCommand,
         settings_config: settings::StudioFsConfig,
@@ -1054,6 +1124,7 @@ impl MountPlan {
         let mount_lock = acquire_mount_lock(&self.actual_mount_path)?;
 
         let MountMetaSession {
+            source_meta,
             meta,
             format_info,
             read_only_mount,
@@ -1068,11 +1139,32 @@ impl MountPlan {
         let prepared_foreground = (|| -> anyhow::Result<PreparedForegroundRuntime> {
             let data_config = DataStoreConfig::from(&format_info);
             let memory_cache_budget_bytes = initial_cache_bytes();
-            let PreparedVolumeCacheRuntime {
-                cache_path,
-                cache_path_str,
-                cache_runtime,
-            } = prepare_volume_cache_runtime(&self.base_cache_path, &format_info.uuid)?;
+            let snapshot_owner = self
+                .command
+                .snapshot_id
+                .as_ref()
+                .map(|_| format!("smount-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+            let (cache_path, cache_path_str, cache_runtime) = if self.command.snapshot_id.is_some()
+            {
+                let cache_path = snapshot_mount_runtime_path(
+                    &self.base_cache_path,
+                    snapshot_owner
+                        .as_deref()
+                        .expect("snapshot owner is prepared"),
+                );
+                let cache_path_str = cache_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?
+                    .to_string();
+                (cache_path, cache_path_str, None)
+            } else {
+                let PreparedVolumeCacheRuntime {
+                    cache_path,
+                    cache_path_str,
+                    cache_runtime,
+                } = prepare_volume_cache_runtime(&self.base_cache_path, &format_info.uuid)?;
+                (cache_path, cache_path_str, Some(cache_runtime))
+            };
             let cache_size_bytes = parse_positive_size_arg(&self.cache_size)?;
             let profiling = build_mount_profile_finish(
                 self.command.profile,
@@ -1093,23 +1185,120 @@ impl MountPlan {
                 bridge: backend.name().to_string(),
                 cache_size: self.command.cache_size.clone(),
                 endpoint_override: self.command.endpoint.clone(),
-                snapshot_id: None,
+                snapshot_id: self.command.snapshot_id.as_ref().map(ToString::to_string),
                 vfs_config: serde_json::to_value(self.vfs_config.as_ref())
                     .map_err(|error| anyhow::anyhow!("failed to serialize vfs config: {error}"))?,
             };
-            let vfs = StudioVfs::new_with_prepared_cache_runtime(
-                meta,
-                &data_config,
-                &cache_path_str,
-                cache_size_bytes,
-                memory_cache_budget_bytes,
-                self.vfs_config.clone(),
-                cache_runtime,
-            )
-            .map_err(|error| anyhow::anyhow!("failed to init vfs: {error}"))?;
-            vfs.start().map_err(|error| {
-                anyhow::anyhow!("failed to start vfs background workers: {error}")
-            })?;
+            let (vfs, snapshot_mount) = if let Some(snapshot_id) = self.command.snapshot_id.as_ref()
+            {
+                let data_store = Arc::new(studiofs_data::DataStore::new(&data_config).map_err(
+                    |error| anyhow::anyhow!("failed to init snapshot data store: {error}"),
+                )?);
+                let snapshot_session = SnapshotMountSession::from_meta_engine(
+                    source_meta,
+                    data_store,
+                    Arc::new(SystemSnapshotClock),
+                    SnapshotMountConfig::new(
+                        self.base_cache_path.join("snapshot-v2").join("mount-cache"),
+                    ),
+                )
+                .map_err(|error| anyhow::anyhow!("failed to prepare snapshot mount: {error}"))?;
+                if let Err(error) = runtime.block_on(snapshot_session.evict_idle_cache()) {
+                    warn!(
+                        error = %error,
+                        "snapshot idle-cache cleanup failed before mount admission; continuing"
+                    );
+                }
+                let owner = snapshot_owner.expect("snapshot owner is prepared");
+                let snapshot_mount = Arc::new(
+                    runtime
+                        .block_on(snapshot_session.mount(snapshot_id, owner))
+                        .map_err(|error| {
+                            anyhow::anyhow!("snapshot mount admission failed: {error}")
+                        })?,
+                );
+                let vfs = match snapshot_mount.open_vfs(
+                    &data_config,
+                    &cache_path_str,
+                    cache_size_bytes,
+                    memory_cache_budget_bytes,
+                    self.vfs_config.clone(),
+                ) {
+                    Ok(vfs) => vfs,
+                    Err(error) => {
+                        let release = runtime.block_on(snapshot_mount.release());
+                        if let Err(release_error) = release {
+                            warn!(
+                                error = %release_error,
+                                "failed to release snapshot lease after VFS initialization failure"
+                            );
+                        }
+                        return Err(anyhow::anyhow!("failed to init snapshot vfs: {error}"));
+                    }
+                };
+                (
+                    vfs,
+                    Some(PreparedSnapshotMount {
+                        mount: snapshot_mount,
+                    }),
+                )
+            } else {
+                let vfs = StudioVfs::new_with_prepared_cache_runtime(
+                    meta,
+                    &data_config,
+                    &cache_path_str,
+                    cache_size_bytes,
+                    memory_cache_budget_bytes,
+                    self.vfs_config.clone(),
+                    cache_runtime
+                        .expect("live mount cache runtime is prepared for writable mounts"),
+                )
+                .map_err(|error| anyhow::anyhow!("failed to init vfs: {error}"))?;
+                (vfs, None)
+            };
+            if let Err(error) = vfs.start() {
+                drop(backend);
+                let vfs_runtime =
+                    run_mount_vfs_shutdown(runtime, vfs, shutdown_upload_drain_timeout());
+                let runtime = match vfs_runtime {
+                    Ok((runtime, result)) => {
+                        if let Err(shutdown_error) = result {
+                            warn!(
+                                error = ?shutdown_error,
+                                "failed to shut down VFS after startup failure"
+                            );
+                        }
+                        Some(runtime)
+                    }
+                    Err(shutdown_error) => {
+                        warn!(
+                            error = ?shutdown_error,
+                            "failed to run VFS shutdown after startup failure"
+                        );
+                        None
+                    }
+                };
+                if let Some(snapshot_mount) = snapshot_mount {
+                    if let Some(runtime) = runtime.as_ref() {
+                        if let Err(release_error) =
+                            run_snapshot_mount_shutdown(runtime, snapshot_mount)
+                        {
+                            warn!(
+                                error = ?release_error,
+                                "failed to release snapshot lease after VFS startup failure"
+                            );
+                        }
+                    } else {
+                        drop(snapshot_mount);
+                        warn!(
+                            "snapshot mount lease was left for durable expiry after VFS startup failure"
+                        );
+                    }
+                }
+                return Err(anyhow::anyhow!(
+                    "failed to start vfs background workers: {error}"
+                ));
+            }
             let write_path_observability_publisher = WritePathObservabilityPublisher::new(
                 vfs.clone(),
                 cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
@@ -1135,6 +1324,7 @@ impl MountPlan {
                 profiling_backend,
                 profiling,
                 write_path_observability_publisher,
+                snapshot_mount,
             })
         })();
 
@@ -1184,7 +1374,12 @@ impl PreparedMount {
             backend_name,
             vfs_config: &self.plan.vfs_config,
             format_info,
-            snapshot_id: None,
+            snapshot_id: self
+                .plan
+                .command
+                .snapshot_id
+                .as_ref()
+                .map(SnapshotId::as_str),
         }) {
             println!("{line}");
         }
@@ -1310,6 +1505,7 @@ impl MountRuntimeGuard {
             profiling_backend,
             mut profiling,
             mut write_path_observability_publisher,
+            snapshot_mount,
             ..
         }) = foreground
         {
@@ -1348,6 +1544,24 @@ impl MountRuntimeGuard {
             drop(backend);
             info!("mount foreground owners released");
 
+            if let Some(snapshot_mount) = snapshot_mount {
+                if let Some(runtime) = runtime.as_ref() {
+                    record_cleanup_error(
+                        &mut first_error,
+                        "snapshot mount lease shutdown",
+                        run_snapshot_mount_shutdown(runtime, snapshot_mount),
+                    );
+                } else {
+                    // Without a live runtime the async release cannot be awaited. Drop
+                    // still cancels renewal and fences local access; PostgreSQL expiry
+                    // provides the durable crash-cleanup path.
+                    drop(snapshot_mount);
+                    warn!(
+                        "snapshot mount lease was left for durable expiry after VFS shutdown failure"
+                    );
+                }
+            }
+
             if let Some(runtime) = runtime {
                 record_cleanup_error(
                     &mut first_error,
@@ -1381,7 +1595,68 @@ impl Drop for MountRuntimeGuard {
                 "failed to remove mount record during mount runtime guard drop"
             );
         }
-        drop(self.prepared.foreground.take());
+        if let Some(foreground) = self.prepared.foreground.take() {
+            let PreparedForegroundRuntime {
+                backend,
+                vfs,
+                runtime,
+                diagnostics_source,
+                profiling_backend,
+                mut profiling,
+                mut write_path_observability_publisher,
+                snapshot_mount,
+                ..
+            } = foreground;
+
+            write_path_observability_publisher.stop_and_join();
+            if let Some(mut finish_profiling) = profiling.take() {
+                finish_profiling();
+            }
+            if let Some(diagnostics_host) = self.diagnostics_host.take() {
+                if let Err(error) = stop_mount_diagnostics_host(&runtime, diagnostics_host) {
+                    warn!(
+                        error = ?error,
+                        "diagnostics host shutdown failed during mount guard drop"
+                    );
+                }
+            }
+
+            let runtime =
+                match run_mount_vfs_shutdown(runtime, vfs, shutdown_upload_drain_timeout()) {
+                    Ok((runtime, result)) => {
+                        if let Err(error) = result {
+                            warn!(error = ?error, "VFS shutdown failed during mount guard drop");
+                        }
+                        Some(runtime)
+                    }
+                    Err(error) => {
+                        warn!(error = ?error, "VFS shutdown panicked during mount guard drop");
+                        None
+                    }
+                };
+
+            drop(diagnostics_source);
+            drop(profiling_backend);
+            drop(write_path_observability_publisher);
+            drop(backend);
+
+            if let Some(snapshot_mount) = snapshot_mount {
+                if let Some(runtime) = runtime.as_ref() {
+                    if let Err(error) = run_snapshot_mount_shutdown(runtime, snapshot_mount) {
+                        warn!(
+                            error = ?error,
+                            "failed to release snapshot lease during mount guard drop"
+                        );
+                    }
+                } else {
+                    drop(snapshot_mount);
+                    warn!(
+                        "snapshot mount lease was left for durable expiry during mount guard drop"
+                    );
+                }
+            }
+            drop(runtime);
+        }
         drop(self.prepared.mount_lock.take());
     }
 }
@@ -1542,6 +1817,7 @@ fn open_live_mount_meta(name: &str, meta_dir: &Path) -> anyhow::Result<OpenedLiv
     let format_info = read_live_mount_format_info(name, source_meta.as_ref())?;
     let runtime_meta = into_vfs_meta(source_meta.clone());
     Ok(OpenedLiveMountMeta {
+        source_meta,
         runtime_meta,
         format_info,
     })
@@ -1599,10 +1875,12 @@ fn resolve_mount_meta_session(
     read_only: bool,
 ) -> anyhow::Result<MountMetaSession<dyn VfsMeta>> {
     let OpenedLiveMountMeta {
+        source_meta,
         runtime_meta,
         format_info,
     } = open_live_mount_meta(name, meta_dir)?;
     let mut session = MountMetaSession {
+        source_meta,
         meta: runtime_meta,
         format_info,
         read_only_mount: read_only,
@@ -2055,6 +2333,7 @@ mod tests {
             read_only: false,
             endpoint: None,
             runtime_tuning: PublicRuntimeTuningArgs::default(),
+            snapshot_id: None,
         }
     }
 
@@ -2164,6 +2443,27 @@ mod tests {
             LocalPayloadLayout::from_cache_root(&prepared.cache_path)
         );
         assert!(prepared.cache_runtime.detection.has_runtime_layout());
+    }
+
+    #[test]
+    fn snapshot_mount_runtime_does_not_reopen_live_payload_database() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let live = prepare_volume_cache_runtime(temp.path(), "volume-uuid")
+            .expect("live cache path prepared");
+        let snapshot_path = snapshot_mount_runtime_path(temp.path(), "smount-test-owner");
+        let snapshot =
+            prepare_local_payload_runtime(&snapshot_path).expect("snapshot cache path prepared");
+
+        assert_ne!(
+            live.cache_runtime.layout.redb_index_path, snapshot.layout.redb_index_path,
+            "snapshot setup must not reopen the live payload cache database"
+        );
+        assert!(
+            snapshot
+                .layout
+                .redb_index_path
+                .starts_with(temp.path().join("snapshot-v2").join("mount-runtime"))
+        );
     }
 
     #[test]

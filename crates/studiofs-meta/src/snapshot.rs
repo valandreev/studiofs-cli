@@ -773,10 +773,16 @@ pub struct SnapshotCreationLease {
 /// Fenced mount lease for a verified Ready snapshot.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotMountLease {
+    /// Durable PostgreSQL lease row identity.
+    pub lease_id: i64,
     /// Mounted snapshot identifier.
     pub snapshot_id: SnapshotId,
     /// Mount owner identity.
     pub owner: String,
+    /// Immutable volume UUID used to fence cache identity.
+    pub cache_volume_uuid: String,
+    /// Immutable artifact checksum used to fence cache identity.
+    pub cache_sha256: SnapshotSha256,
     /// Lease expiry in UTC.
     pub expires_at: DateTime<Utc>,
     /// Last successful heartbeat.

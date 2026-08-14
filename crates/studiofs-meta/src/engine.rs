@@ -1036,6 +1036,12 @@ pub trait MetaEngine:
         None
     }
 
+    /// Returns the PostgreSQL-backed Snapshot v2 mount lease store when this
+    /// engine owns one, or `None` for local-only metadata engines.
+    fn snapshot_mount_store(&self) -> Option<Arc<dyn crate::snapshot_ports::SnapshotMountStore>> {
+        None
+    }
+
     /// Apply ordered regular-file overlay mutations in one local transaction.
     fn apply_regular_file_overlay_batch(
         &self,
