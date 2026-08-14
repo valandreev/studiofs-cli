@@ -21,6 +21,30 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn snapshot_worker_supervisor_restarts_after_worker_error() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let stop_after_restart = cancel.clone();
+    let task_attempts = attempts.clone();
+    let task = tokio::spawn(StudioVfs::run_snapshot_worker_with_supervision(
+        cancel.clone(),
+        move |_| {
+            let attempt = task_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if attempt == 1 {
+                stop_after_restart.cancel();
+            }
+            std::future::ready(Err(SnapshotWorkerError::InvalidConfiguration))
+        },
+        "test snapshot worker",
+        Duration::from_millis(1),
+        Duration::from_millis(2),
+    ));
+
+    task.await.expect("supervisor join");
+    assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+}
+
 #[test]
 fn os_cache_prepare_unknown_handle_is_conservative() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");

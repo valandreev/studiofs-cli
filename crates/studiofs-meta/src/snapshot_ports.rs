@@ -522,7 +522,8 @@ pub trait SnapshotMountStore: Send + Sync {
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, SnapshotMountLease>;
 
-    /// Renews a lease only when its complete identity and fence still match.
+    /// Renews a lease only when its complete identity and fence still match and
+    /// cleanup has not claimed the snapshot for deletion.
     fn renew<'a>(
         &'a self,
         lease: &'a SnapshotMountLease,

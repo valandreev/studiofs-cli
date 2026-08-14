@@ -7,9 +7,9 @@ use crate::pg_engine::snapshot_control::{
 };
 use crate::snapshot::{
     MAX_RETENTION_SECS, SnapshotCreationState, SnapshotId, SnapshotLifecycle, SnapshotOrigin,
-    SnapshotRetention,
+    SnapshotRetention, SnapshotSha256,
 };
-use crate::snapshot_ports::SnapshotPortError;
+use crate::snapshot_ports::{SnapshotMountStore, SnapshotPortError};
 use chrono::{TimeZone, Utc};
 
 #[test]
@@ -369,6 +369,86 @@ fn delete_cas_and_ready_relative_expiry_are_idempotent() {
         SnapshotLifecycle::Deleted,
         "repeated delete after tombstoning must remain idempotent"
     );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn mount_renewal_is_fenced_by_active_cleanup_claim() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-control-mount-renewal");
+    let snapshot = capture_entry_once(
+        &dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Manual),
+    );
+    set_snapshot_state(
+        &dsn,
+        volume.volume_id,
+        snapshot.snapshot_id.as_str(),
+        "ready",
+        "completed",
+        Some(Utc::now()),
+        None,
+    );
+
+    let local_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = local_dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open PostgreSQL metadata engine");
+    let checksum = SnapshotSha256::from_bytes([0x31; 32]);
+    let mount_lease = run_async(async {
+        Ok::<_, MetaError>(
+            engine
+                .acquire(
+                    &snapshot.snapshot_id,
+                    "mount-owner",
+                    &volume.uuid,
+                    &checksum,
+                    Duration::from_secs(60),
+                )
+                .await,
+        )
+    })
+    .expect("acquire snapshot mount lease")
+    .expect("mount lease acquisition");
+
+    assert_eq!(
+        request_delete_once(&dsn, volume.volume_id, snapshot.snapshot_id.clone()).lifecycle,
+        SnapshotLifecycle::Deleting
+    );
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token) VALUES ($1, $2, 'cleanup-owner', clock_timestamp() + interval '60 seconds', 1)",
+                &[&volume.volume_id, &snapshot.snapshot_id.to_string()],
+            )
+            .await
+            .expect("insert active cleanup claim");
+        connection_task.abort();
+        Ok(())
+    })
+    .expect("insert active cleanup claim");
+
+    let renewal = run_async(async {
+        Ok::<_, MetaError>(engine.renew(&mount_lease, Duration::from_secs(60)).await)
+    })
+    .expect("run mount lease renewal")
+    .expect_err("cleanup claim must fence mount renewal");
+    assert!(matches!(
+        renewal,
+        SnapshotPortError::Permanent { code, .. } if code.as_str() == "stale_lease"
+    ));
 }
 
 #[test]

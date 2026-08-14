@@ -188,7 +188,46 @@ impl SnapshotMountStore for super::PgMetaEngine {
                 |client| {
                     Box::pin(async move {
                         let snapshot_id = lease.snapshot_id.as_str();
-                        let updated = client
+                        let tx = client
+                            .transaction()
+                            .await
+                            .map_err(|_| pg_failure("begin mount lease renewal"))?;
+                        let catalog = tx
+                            .query_opt(
+                                "SELECT lifecycle
+                                 FROM snapshot_catalog
+                                 WHERE vol = $1 AND id = $2
+                                 FOR UPDATE",
+                                &[&volume_id, &snapshot_id],
+                            )
+                            .await
+                            .map_err(|_| pg_failure("load mount catalog for renewal"))?;
+                        let Some(catalog) = catalog else {
+                            return Err(MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()));
+                        };
+                        let lifecycle: String = catalog.get(0);
+                        if !matches!(lifecycle.as_str(), "ready" | "deleting") {
+                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                        }
+                        let cleanup_claimed: bool = tx
+                            .query_one(
+                                "SELECT EXISTS (
+                                    SELECT 1
+                                    FROM snapshot_cleanup_leases
+                                    WHERE vol = $1
+                                      AND snapshot_id = $2
+                                      AND owner <> ''
+                                      AND lease_expires_at > clock_timestamp()
+                                )",
+                                &[&volume_id, &snapshot_id],
+                            )
+                            .await
+                            .map_err(|_| pg_failure("check cleanup claim for mount renewal"))?
+                            .get(0);
+                        if cleanup_claimed {
+                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                        }
+                        let updated = tx
                             .query_opt(
                                 "UPDATE snapshot_mount_leases
                                  SET lease_expires_at = clock_timestamp() + ($8::double precision * interval '1 millisecond'),
@@ -217,13 +256,17 @@ impl SnapshotMountStore for super::PgMetaEngine {
                             .await
                             .map_err(|_| pg_failure("renew mount lease"))?
                             .ok_or_else(|| MetaError::Storage(STALE_LEASE.to_string()))?;
-                        Ok(lease_from_row(
+                        let renewed = lease_from_row(
                             &updated,
                             lease.snapshot_id,
                             lease.owner,
                             lease.cache_volume_uuid,
                             lease.cache_sha256,
-                        ))
+                        );
+                        tx.commit()
+                            .await
+                            .map_err(|_| pg_failure("commit mount lease renewal"))?;
+                        Ok(renewed)
                     })
                 },
             )
