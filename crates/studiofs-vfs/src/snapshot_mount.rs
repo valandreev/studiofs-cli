@@ -391,10 +391,11 @@ impl SnapshotMountSession {
             .lock()
             .insert(cache_key.clone(), self.clock.now());
         if let Err(error) = self.persist_last_used(&cache_key, self.clock.now()).await {
-            let _ = mounted.release().await;
-            self.metadata_handles.lock().remove(&cache_key);
-            self.cache_last_used.lock().remove(&cache_key);
-            return Err(error);
+            tracing::warn!(
+                cache_path = %cache_key.cache_path(&self.config.cache_root).display(),
+                error = %error,
+                "failed to persist snapshot cache last-used marker; eviction will use fallback metadata"
+            );
         }
         if mounted.is_closed() {
             let _ = mounted.release().await;
@@ -437,7 +438,14 @@ impl SnapshotMountSession {
             match fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(SnapshotMountError::CacheIo),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to evict an idle snapshot cache artifact; will retry later"
+                    );
+                    continue;
+                }
             }
             let _ = fs::remove_file(last_used_path(&path)).await;
             self.cache_last_used.lock().remove(&cache_key);
@@ -569,116 +577,65 @@ impl SnapshotMountSession {
     }
 
     async fn load_persisted_last_used(&self) -> Result<(), SnapshotMountError> {
-        let root = self.config.cache_root.join("metadata").join("snapshots");
-        let mut volumes = match fs::read_dir(&root).await {
+        let volume_dir = self
+            .config
+            .cache_root
+            .join("metadata")
+            .join("snapshots")
+            .join(format!("volume-{}", self.volume.volume_id))
+            .join(format!(
+                "name-{}",
+                encode_path_component(&self.volume.volume_name)
+            ))
+            .join(format!(
+                "uuid-{}",
+                encode_path_component(&self.volume.volume_uuid)
+            ));
+        let mut artifacts = match fs::read_dir(&volume_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => return Err(SnapshotMountError::CacheIo),
         };
-        while let Some(volume_entry) = volumes
+        let volume = self.volume.clone();
+        while let Some(artifact_entry) = artifacts
             .next_entry()
             .await
             .map_err(|_| SnapshotMountError::CacheIo)?
         {
-            let Some(volume_id) = volume_entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_prefix("volume-"))
-                .and_then(|value| value.parse::<i64>().ok())
+            let path = artifact_entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("redb") {
+                continue;
+            }
+            let Some((snapshot_id, checksum)) =
+                parse_cache_file_name(artifact_entry.file_name().to_str().unwrap_or_default())
             else {
                 continue;
             };
-            let mut names = match fs::read_dir(volume_entry.path()).await {
-                Ok(entries) => entries,
-                Err(_) => continue,
+            let sidecar = last_used_path(&path);
+            let last_used = match fs::read_to_string(sidecar).await {
+                Ok(value) => value.trim().parse::<DateTime<Utc>>().ok(),
+                Err(_) => None,
             };
-            while let Some(name_entry) = names
-                .next_entry()
-                .await
-                .map_err(|_| SnapshotMountError::CacheIo)?
-            {
-                let Some(volume_name) = name_entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_prefix("name-"))
-                    .and_then(decode_path_component)
-                else {
-                    continue;
-                };
-                let mut uuids = match fs::read_dir(name_entry.path()).await {
-                    Ok(entries) => entries,
-                    Err(_) => continue,
-                };
-                while let Some(uuid_entry) = uuids
-                    .next_entry()
-                    .await
-                    .map_err(|_| SnapshotMountError::CacheIo)?
-                {
-                    let Some(volume_uuid) = uuid_entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|name| name.strip_prefix("uuid-"))
-                        .and_then(decode_path_component)
+            let last_used = match last_used {
+                Some(last_used) => last_used,
+                None => {
+                    // A crash can leave the immutable artifact without its
+                    // last-used sidecar. Use the artifact mtime so the entry
+                    // remains eligible for bounded cache cleanup.
+                    let Some(modified) = fs::metadata(&path)
+                        .await
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
                     else {
                         continue;
                     };
-                    let mut artifacts = match fs::read_dir(uuid_entry.path()).await {
-                        Ok(entries) => entries,
-                        Err(_) => continue,
-                    };
-                    while let Some(artifact_entry) = artifacts
-                        .next_entry()
-                        .await
-                        .map_err(|_| SnapshotMountError::CacheIo)?
-                    {
-                        let path = artifact_entry.path();
-                        if path.extension().and_then(|value| value.to_str()) != Some("redb") {
-                            continue;
-                        }
-                        let Some((snapshot_id, checksum)) = parse_cache_file_name(
-                            artifact_entry.file_name().to_str().unwrap_or_default(),
-                        ) else {
-                            continue;
-                        };
-                        let sidecar = last_used_path(&path);
-                        let last_used = match fs::read_to_string(sidecar).await {
-                            Ok(value) => value.trim().parse::<DateTime<Utc>>().ok(),
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                            Err(_) => continue,
-                        };
-                        let last_used = match last_used {
-                            Some(last_used) => last_used,
-                            None => {
-                                // A crash can leave the immutable artifact without its
-                                // last-used sidecar. Use the artifact mtime so the entry
-                                // remains eligible for bounded cache cleanup.
-                                let Some(modified) = fs::metadata(&path)
-                                    .await
-                                    .ok()
-                                    .and_then(|metadata| metadata.modified().ok())
-                                else {
-                                    continue;
-                                };
-                                DateTime::<Utc>::from(modified)
-                            }
-                        };
-                        let Ok(volume) = SnapshotVolumeContext::new(
-                            volume_id,
-                            volume_name.clone(),
-                            volume_uuid.clone(),
-                        ) else {
-                            continue;
-                        };
-                        if volume != self.volume {
-                            continue;
-                        }
-                        self.cache_last_used.lock().insert(
-                            SnapshotArtifactCacheKey::new(volume, snapshot_id, checksum),
-                            last_used,
-                        );
-                    }
+                    DateTime::<Utc>::from(modified)
                 }
-            }
+            };
+            self.cache_last_used.lock().insert(
+                SnapshotArtifactCacheKey::new(volume.clone(), snapshot_id, checksum),
+                last_used,
+            );
         }
         Ok(())
     }
@@ -891,13 +848,9 @@ pub struct SnapshotMount {
 }
 
 impl SnapshotMount {
-    /// Returns the read-only metadata facade for this immutable snapshot.
-    pub fn metadata(&self) -> Arc<dyn VfsMeta> {
-        self.metadata
-            .lock()
-            .as_ref()
-            .cloned()
-            .expect("snapshot metadata is available while the mount is admitted")
+    /// Returns the read-only metadata facade, or `None` after the mount is released.
+    pub fn metadata(&self) -> Option<Arc<dyn VfsMeta>> {
+        self.metadata.lock().clone()
     }
 
     /// Opens the normal VFS read path over this snapshot without enabling any
@@ -922,8 +875,13 @@ impl SnapshotMount {
             }
             Ok(())
         });
+        let metadata = self.metadata().ok_or_else(|| {
+            crate::VfsError::Other(
+                "snapshot metadata is unavailable after mount lease release".to_string(),
+            )
+        })?;
         StudioVfs::new_read_only_with_snapshot_mount_fence(
-            self.metadata(),
+            metadata,
             data_config,
             cache_dir,
             cache_size,
@@ -1766,7 +1724,9 @@ mod tests {
             .expect("equal composite identity should reuse the verified cache entry");
         assert_eq!(first.cache_key(), second.cache_key());
         assert_eq!(harness.download_count(), 2);
-        let metadata = first.metadata();
+        let metadata = first
+            .metadata()
+            .expect("admitted snapshot should expose metadata");
         assert!(!metadata.metadata_authority_status().allows_new_mutations());
         assert!(matches!(
             metadata.set_counter("snapshot-test", 1),
@@ -1820,6 +1780,48 @@ mod tests {
             snapshot_vfs.readdir(studiofs_meta::ROOT_INO).is_err(),
             "an expired lease must fence an already-open snapshot VFS"
         );
+    }
+
+    #[tokio::test]
+    async fn last_used_persistence_failure_does_not_abort_mount() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
+        let now = Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap();
+        let snapshot_volume = volume(24, "00000000-0000-0000-0000-000000000024");
+        let snapshot_cut = cut(snapshot_volume.volume_id, now);
+        let snapshot = snapshot_id(&snapshot_volume.volume_name, now);
+        let bytes = valid_snapshot_bytes(root.path(), "sidecar-failure", &snapshot_volume);
+        let checksum = digest(&bytes);
+        let descriptor = artifact(
+            "snapshots/sidecar-failure.redb",
+            snapshot_cut,
+            &bytes,
+            checksum,
+        );
+        let cache_path =
+            SnapshotArtifactCacheKey::new(snapshot_volume.clone(), snapshot.clone(), checksum)
+                .cache_path(root.path());
+        fs::create_dir_all(super::last_used_path(&cache_path))
+            .expect("create a sidecar directory to force persistence failure");
+
+        let harness = SnapshotMountSession::new_for_tests(root.path(), now, snapshot_volume);
+        harness.set_catalog(catalog(
+            SnapshotLifecycle::Ready,
+            volume(24, "00000000-0000-0000-0000-000000000024"),
+            snapshot.clone(),
+            snapshot_cut,
+            Some(descriptor),
+        ));
+        harness.put_artifact(bytes);
+
+        let mount = harness
+            .mount(&snapshot, "sidecar-failure-mount")
+            .await
+            .expect("sidecar persistence failure must not abort verified mount admission");
+        assert!(mount.metadata().is_some());
+        mount
+            .release()
+            .await
+            .expect("release sidecar failure mount");
     }
 
     #[tokio::test]
@@ -1924,6 +1926,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_cache_eviction_continues_after_unremovable_artifact() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
+        let now = Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap();
+        let snapshot_volume = volume(32, "00000000-0000-0000-0000-000000000032");
+        let blocked_snapshot = snapshot_id(&snapshot_volume.volume_name, now);
+        let evict_snapshot = snapshot_id(
+            &snapshot_volume.volume_name,
+            now + chrono::Duration::seconds(1),
+        );
+        let blocked_key = SnapshotArtifactCacheKey::new(
+            snapshot_volume.clone(),
+            blocked_snapshot,
+            digest(b"blocked artifact"),
+        );
+        let evict_key = SnapshotArtifactCacheKey::new(
+            snapshot_volume.clone(),
+            evict_snapshot,
+            digest(b"evict artifact"),
+        );
+        let stale = (now - chrono::Duration::days(8)).to_rfc3339();
+        let blocked_path = blocked_key.cache_path(root.path());
+        fs::create_dir_all(&blocked_path).expect("create an unremovable artifact directory");
+        fs::write(super::last_used_path(&blocked_path), &stale).expect("write blocked sidecar");
+        let evict_path = evict_key.cache_path(root.path());
+        fs::write(&evict_path, b"evict artifact").expect("write evictable artifact");
+        fs::write(super::last_used_path(&evict_path), stale).expect("write evictable sidecar");
+
+        let harness = SnapshotMountSession::new_for_tests(root.path(), now, snapshot_volume);
+        assert_eq!(
+            harness
+                .evict_idle_cache()
+                .await
+                .expect("one blocked artifact must not abort eviction"),
+            1
+        );
+        assert!(blocked_path.exists());
+        assert!(!evict_path.exists());
+    }
+
+    #[tokio::test]
     async fn persisted_last_used_state_survives_session_restart() {
         let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
         let now = Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap();
@@ -1955,6 +1997,7 @@ mod tests {
                 .expect("ready artifact should mount");
             let cache_path = mount.cache_key().cache_path(root.path());
             mount.release().await.expect("release mount lease");
+            assert!(mount.metadata().is_none());
             assert!(super::last_used_path(&cache_path).exists());
             cache_path
         };

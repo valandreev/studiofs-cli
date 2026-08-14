@@ -187,6 +187,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                 "renew snapshot mount lease",
                 |client| {
                     Box::pin(async move {
+                        let snapshot_id = lease.snapshot_id.as_str();
                         let updated = client
                             .query_opt(
                                 "UPDATE snapshot_mount_leases
@@ -205,7 +206,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                                 &[
                                     &lease.lease_id,
                                     &volume_id,
-                                    &lease.snapshot_id.to_string(),
+                                    &snapshot_id,
                                     &lease.owner,
                                     &lease.cache_volume_uuid,
                                     &&cache_sha256[..],
@@ -244,6 +245,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                 "release snapshot mount lease",
                 |client| {
                     Box::pin(async move {
+                        let snapshot_id = lease.snapshot_id.as_str();
                         let updated = client
                             .execute(
                                 "UPDATE snapshot_mount_leases
@@ -260,7 +262,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                                 &[
                                     &lease.lease_id,
                                     &volume_id,
-                                    &lease.snapshot_id.to_string(),
+                                    &snapshot_id,
                                     &lease.owner,
                                     &lease.cache_volume_uuid,
                                     &&cache_sha256[..],
@@ -300,6 +302,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                 "check snapshot mount lease",
                 |client| {
                     Box::pin(async move {
+                        let snapshot_id = snapshot_id.as_str();
                         client
                             .query_one(
                                 "SELECT EXISTS (
@@ -314,7 +317,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                                 )",
                                 &[
                                     &volume_id,
-                                    &snapshot_id.to_string(),
+                                    &snapshot_id,
                                     &cache_volume_uuid,
                                     &&cache_sha256[..],
                                 ],
