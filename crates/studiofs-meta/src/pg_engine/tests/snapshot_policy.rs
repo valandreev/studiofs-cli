@@ -49,6 +49,19 @@ fn policy_set_load_cancel_uses_generation_cas() {
             first
         );
 
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to seed completion watermark");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_policies SET latest_completed_slot = clock_timestamp() WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("seed completion watermark");
+        connection_task.abort();
+
         let stale = SnapshotPolicyStore::cancel_policy(&*engine, 99)
             .await
             .expect_err("stale generation must be rejected");
@@ -68,6 +81,21 @@ fn policy_set_load_cancel_uses_generation_cas() {
             .await
             .expect("re-enable policy");
         assert_eq!(second.generation, 2);
+
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to inspect completion watermark");
+        let connection_task = tokio::spawn(connection);
+        let latest_completed: Option<chrono::DateTime<Utc>> = client
+            .query_one(
+                "SELECT latest_completed_slot FROM snapshot_policies WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("load completion watermark")
+            .get(0);
+        connection_task.abort();
+        assert!(latest_completed.is_none());
         Ok(())
     })
     .expect("policy control plane");

@@ -157,7 +157,7 @@ impl SnapshotPolicyStore for PgMetaEngine {
                         let daily_at = policy.daily_at();
                         let timezone = policy.timezone().to_string();
                         tx.execute(
-                            "INSERT INTO snapshot_policies (vol, generation, daily_at, timezone, retention_seconds, enabled) VALUES ($1, $2, $3, $4, $5, TRUE) ON CONFLICT (vol) DO UPDATE SET generation = EXCLUDED.generation, daily_at = EXCLUDED.daily_at, timezone = EXCLUDED.timezone, retention_seconds = EXCLUDED.retention_seconds, enabled = TRUE, updated_at = clock_timestamp()",
+                            "INSERT INTO snapshot_policies (vol, generation, daily_at, timezone, retention_seconds, enabled) VALUES ($1, $2, $3, $4, $5, TRUE) ON CONFLICT (vol) DO UPDATE SET generation = EXCLUDED.generation, daily_at = EXCLUDED.daily_at, timezone = EXCLUDED.timezone, retention_seconds = EXCLUDED.retention_seconds, latest_completed_slot = NULL, enabled = TRUE, updated_at = clock_timestamp()",
                             &[
                                 &volume_id,
                                 &generation,
@@ -358,6 +358,13 @@ impl SnapshotPolicyStore for PgMetaEngine {
                             .await
                             .map_err(|_| pg_failure("begin snapshot policy evaluation"))?;
                         tx.query_opt(
+                            "SELECT 1 FROM volumes WHERE vol = $1 FOR UPDATE",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|_| pg_failure("lock snapshot policy volume"))?
+                        .ok_or_else(|| MetaError::Storage(POLICY_VOLUME_MISSING.to_string()))?;
+                        tx.query_opt(
                             "SELECT 1 FROM snapshot_policy_evaluator_leases WHERE vol = $1 AND owner = $2 AND fencing_token = $3 AND lease_expires_at > clock_timestamp() FOR UPDATE",
                             &[&volume_id, &lease.owner, &lease.fencing_token],
                         )
@@ -366,7 +373,7 @@ impl SnapshotPolicyStore for PgMetaEngine {
                         .ok_or_else(|| MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))?;
                         let Some(row) = tx
                             .query_opt(
-                                "SELECT generation, daily_at, timezone, retention_seconds, latest_completed_slot FROM snapshot_policies WHERE vol = $1 AND enabled = TRUE",
+                                "SELECT generation, daily_at, timezone, retention_seconds, latest_completed_slot FROM snapshot_policies WHERE vol = $1 AND enabled = TRUE FOR UPDATE",
                                 &[&volume_id],
                             )
                             .await

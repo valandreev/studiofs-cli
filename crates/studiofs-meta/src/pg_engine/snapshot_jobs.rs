@@ -770,7 +770,7 @@ impl SnapshotJobStore for PgMetaEngine {
                             return Err(MetaError::Storage(STALE_LEASE.to_string()));
                         }
                         tx.execute(
-                            "UPDATE snapshot_policies AS p SET latest_completed_slot = GREATEST(COALESCE(p.latest_completed_slot, s.due_at), s.due_at), updated_at = clock_timestamp() FROM snapshot_policy_slots AS s WHERE p.vol = s.vol AND s.vol = $1 AND s.snapshot_id = $2 AND s.slot_kind = 'due' AND s.due_at IS NOT NULL",
+                            "UPDATE snapshot_policies AS p SET latest_completed_slot = GREATEST(COALESCE(p.latest_completed_slot, s.due_at), s.due_at), updated_at = clock_timestamp() FROM snapshot_policy_slots AS s WHERE p.vol = s.vol AND p.generation = s.generation AND s.vol = $1 AND s.snapshot_id = $2 AND s.slot_kind = 'due' AND s.due_at IS NOT NULL",
                             &[&volume_id, &claim.job.snapshot_id.to_string()],
                         )
                         .await
