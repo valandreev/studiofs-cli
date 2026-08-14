@@ -142,7 +142,7 @@ use crate::runtime::{
     into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta,
     run_with_timeout_or_cancel,
 };
-use crate::snapshot_worker::SnapshotWorker;
+use crate::snapshot_worker::{SnapshotCleanupWorker, SnapshotWorker};
 use crate::utils::now_unix_millis;
 use crate::vfs::local_dirty::LocalDirtyState;
 use bytes::{Bytes, BytesMut};
@@ -3549,6 +3549,8 @@ pub struct StudioVfs {
     data_write: Arc<DataStore>,
     /// Optional Snapshot v2 materializer for PostgreSQL-backed mounts.
     snapshot_worker: Option<Arc<SnapshotWorker>>,
+    /// Optional Snapshot v2 artifact/source cleanup worker.
+    snapshot_cleanup_worker: Option<Arc<SnapshotCleanupWorker>>,
     /// Shared local payload backend used by the foreground read path.
     local_payload_backend: Arc<dyn LocalPayloadBackend>,
     /// Shared cached-store runtime that owns local staging + pending uploads.
@@ -4631,6 +4633,7 @@ impl StudioVfs {
         self.spawn_metadata_invalidation_worker();
         self.spawn_janitor_worker();
         self.spawn_snapshot_worker();
+        self.spawn_snapshot_cleanup_worker();
         Ok(())
     }
 
@@ -4642,6 +4645,18 @@ impl StudioVfs {
         self.track_background_task(tokio::spawn(async move {
             if let Err(error) = worker.run(cancel).await {
                 tracing::error!(error = %error, "snapshot worker stopped");
+            }
+        }));
+    }
+
+    fn spawn_snapshot_cleanup_worker(self: &Arc<Self>) {
+        let Some(worker) = self.snapshot_cleanup_worker.clone() else {
+            return;
+        };
+        let cancel = self.state.shutdown.background_shutdown_token.clone();
+        self.track_background_task(tokio::spawn(async move {
+            if let Err(error) = worker.run(cancel).await {
+                tracing::error!(error = %error, "snapshot cleanup worker stopped");
             }
         }));
     }

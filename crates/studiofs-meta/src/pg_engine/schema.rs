@@ -1,7 +1,7 @@
 use crate::engine::{MetaError, MetaResult};
 
 /// The PostgreSQL schema generation owned by the Snapshot v2 control plane.
-pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 5;
+pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 6;
 
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
@@ -210,6 +210,19 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             PRIMARY KEY (vol, snapshot_id),
             FOREIGN KEY (vol, snapshot_id)
                 REFERENCES snapshot_creation_jobs(vol, snapshot_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_cleanup_leases (
+            vol BIGINT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            fencing_token BIGINT NOT NULL DEFAULT 1,
+            acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            renewed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (vol, snapshot_id),
+            FOREIGN KEY (vol, snapshot_id)
+                REFERENCES snapshot_catalog(vol, id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS snapshot_source_checkpoints (
@@ -625,6 +638,9 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_snapshot_creation_jobs_queue
             ON snapshot_creation_jobs(vol, created_at, snapshot_id)
             WHERE state IN ('queued', 'retry_wait', 'running');
+        CREATE INDEX IF NOT EXISTS idx_snapshot_cleanup_leases_active
+            ON snapshot_cleanup_leases(vol, snapshot_id, lease_expires_at)
+            WHERE owner <> '';
         CREATE INDEX IF NOT EXISTS idx_snapshot_mount_leases_active
             ON snapshot_mount_leases(vol, snapshot_id, lease_expires_at)
             WHERE released_at IS NULL;

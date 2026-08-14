@@ -3,8 +3,8 @@
 use crate::engine::MetaResult;
 use crate::schema::PayloadRef;
 use crate::snapshot::{
-    SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob, SnapshotCreationLease,
-    SnapshotCut, SnapshotId, SnapshotMountLease, SnapshotSha256, VolumeId,
+    SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCleanupClaim, SnapshotCreationJob,
+    SnapshotCreationLease, SnapshotCut, SnapshotId, SnapshotMountLease, SnapshotSha256, VolumeId,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -475,6 +475,38 @@ pub trait SnapshotJobStore: Send + Sync {
     fn load_catalog<'a>(
         &'a self,
         snapshot_id: &'a SnapshotId,
+    ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
+}
+
+/// PostgreSQL-authoritative deletion, expiry, and cleanup operations.
+pub trait SnapshotCleanupStore: Send + Sync {
+    /// Enters Deleting through a lifecycle CAS and cancels future creation work.
+    fn request_delete<'a>(
+        &'a self,
+        snapshot_id: &'a SnapshotId,
+    ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
+
+    /// Claims an expired Ready row or a retryable Deleting row through a lease.
+    fn claim_next<'a>(
+        &'a self,
+        worker: &'a SnapshotWorkerId,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, Option<SnapshotCleanupClaim>>;
+
+    /// Renews a cleanup lease only while its owner and fence still match.
+    fn renew_lease<'a>(
+        &'a self,
+        claim: &'a SnapshotCleanupClaim,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, SnapshotCleanupClaim>;
+
+    /// Releases a cleanup lease after a retryable remote cleanup failure.
+    fn release_lease<'a>(&'a self, claim: &'a SnapshotCleanupClaim) -> SnapshotPortFuture<'a, ()>;
+
+    /// Removes durable snapshot children and finalizes the catalog tombstone.
+    fn finalize_deleted<'a>(
+        &'a self,
+        claim: &'a SnapshotCleanupClaim,
     ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
 }
 

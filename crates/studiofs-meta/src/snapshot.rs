@@ -770,6 +770,26 @@ pub struct SnapshotCreationLease {
     pub fencing_token: i64,
 }
 
+/// Fenced cleanup lease for one snapshot lifecycle row.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotCleanupLease {
+    /// Worker that owns the cleanup lease.
+    pub owner: String,
+    /// Lease expiry in UTC.
+    pub expires_at: DateTime<Utc>,
+    /// Monotonically increasing fencing token.
+    pub fencing_token: i64,
+}
+
+/// A snapshot selected for artifact and source cleanup.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotCleanupClaim {
+    /// Authoritative catalog projection at claim time.
+    pub catalog: SnapshotCatalogEntry,
+    /// Lease that fences cleanup finalization.
+    pub lease: SnapshotCleanupLease,
+}
+
 /// Fenced mount lease for a verified Ready snapshot.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotMountLease {
@@ -961,6 +981,26 @@ mod tests {
         let retention = SnapshotRetention::manual(None).expect("infinite retention");
 
         assert_eq!(retention.expires_at(DateTime::<Utc>::MIN_UTC), Ok(None));
+    }
+
+    #[test]
+    fn finite_retention_starts_at_durable_ready_time() {
+        let ready_at = Utc
+            .with_ymd_and_hms(2026, 8, 14, 9, 0, 0)
+            .single()
+            .expect("valid ready timestamp");
+        let retention = SnapshotRetention::manual(Some(Duration::from_secs(90)))
+            .expect("finite manual retention");
+        assert_eq!(
+            retention.expires_at(ready_at),
+            Ok(Some(ready_at + chrono::Duration::seconds(90)))
+        );
+        assert_eq!(
+            SnapshotRetention::automatic(Duration::from_secs(90))
+                .expect("automatic retention")
+                .expires_at(ready_at),
+            Ok(Some(ready_at + chrono::Duration::seconds(90)))
+        );
     }
 
     #[test]

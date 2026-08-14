@@ -1,7 +1,7 @@
 use super::*;
 use crate::snapshot_worker::{
-    DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotWorker,
-    SnapshotWorkerConfig, SystemSnapshotClock,
+    DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotCleanupWorker,
+    SnapshotCleanupWorkerConfig, SnapshotWorker, SnapshotWorkerConfig, SystemSnapshotClock,
 };
 use studiofs_cache::{LocalPayloadSyncMode, LocalPayloadWriteMode};
 use studiofs_meta::snapshot::SnapshotVolumeContext;
@@ -475,6 +475,11 @@ impl VfsBootstrap {
                 snapshot_materializer_root(&cache_dir),
             )
         };
+        let snapshot_cleanup_worker = if read_only_mount {
+            None
+        } else {
+            build_snapshot_cleanup_worker(meta.as_ref(), resources.data_write.clone())
+        };
 
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
@@ -482,6 +487,7 @@ impl VfsBootstrap {
             snapshot_mount_fence,
             data_write: resources.data_write,
             snapshot_worker,
+            snapshot_cleanup_worker,
             local_payload_backend: resources.local_payload_backend,
             cached_store: resources.cached_store.clone(),
             block_size,
@@ -609,6 +615,35 @@ fn build_snapshot_worker(
         artifacts,
         Arc::new(SystemSnapshotClock),
         SnapshotWorkerConfig::new(materializer_root),
+    )
+    .ok()
+    .map(Arc::new)
+}
+
+fn build_snapshot_cleanup_worker(
+    meta: &dyn VfsMeta,
+    data_store: Arc<DataStore>,
+) -> Option<Arc<SnapshotCleanupWorker>> {
+    let cleanup = meta.snapshot_cleanup_store()?;
+    let format_info = meta.get_format_info().ok()?;
+    let postgres = format_info.metadata.postgres?;
+    let volume =
+        SnapshotVolumeContext::new(postgres.volume_id, format_info.name, format_info.uuid).ok()?;
+    let artifacts: Arc<dyn SnapshotArtifactStore> =
+        Arc::new(DataStoreSnapshotArtifactStore::new(data_store, volume.clone()).ok()?);
+    let worker_id = SnapshotWorkerId::new(format!(
+        "vfs-cleanup-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .ok()?;
+    SnapshotCleanupWorker::new(
+        volume,
+        worker_id,
+        cleanup,
+        artifacts,
+        Arc::new(SystemSnapshotClock),
+        SnapshotCleanupWorkerConfig::default(),
     )
     .ok()
     .map(Arc::new)

@@ -8,7 +8,7 @@ use studiofs_meta::engine::{
     UndoLogRecord,
 };
 use studiofs_meta::snapshot_ports::{
-    SnapshotJobStore, SnapshotSourceReader, UploadedFragmentLedger,
+    SnapshotCleanupStore, SnapshotJobStore, SnapshotSourceReader, UploadedFragmentLedger,
 };
 use studiofs_meta::{
     AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
@@ -48,6 +48,9 @@ pub trait VfsSnapshotProvider: Send + Sync {
 
     /// Returns the immutable snapshot source reader, when the backend supports it.
     fn snapshot_source_reader(&self) -> Option<Arc<dyn SnapshotSourceReader>>;
+
+    /// Returns the durable Snapshot v2 cleanup store, when supported.
+    fn snapshot_cleanup_store(&self) -> Option<Arc<dyn SnapshotCleanupStore>>;
 }
 
 impl<T> VfsSnapshotProvider for T
@@ -60,6 +63,10 @@ where
 
     fn snapshot_source_reader(&self) -> Option<Arc<dyn SnapshotSourceReader>> {
         MetaEngine::snapshot_source_reader(self)
+    }
+
+    fn snapshot_cleanup_store(&self) -> Option<Arc<dyn SnapshotCleanupStore>> {
+        MetaEngine::snapshot_cleanup_store(self)
     }
 }
 
@@ -224,6 +231,7 @@ impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
 impl<M: ?Sized + VfsSnapshotProvider> VfsSnapshotProvider for RuntimeMetaHandle<M> {
     forward_method!(fn snapshot_job_store(&self) -> Option<Arc<dyn SnapshotJobStore>>);
     forward_method!(fn snapshot_source_reader(&self) -> Option<Arc<dyn SnapshotSourceReader>>);
+    forward_method!(fn snapshot_cleanup_store(&self) -> Option<Arc<dyn SnapshotCleanupStore>>);
 }
 
 impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaHandle<M> {
