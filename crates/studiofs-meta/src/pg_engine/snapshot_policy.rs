@@ -7,7 +7,7 @@ use crate::snapshot::{
 use crate::snapshot_ports::{
     SnapshotPolicyEvaluatorId, SnapshotPolicyStore, SnapshotPortError, SnapshotPortFuture,
 };
-use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,6 +68,21 @@ fn lease_millis(lease_for: Duration) -> Result<i64, SnapshotPortError> {
 
 fn next_poll(now: DateTime<Utc>) -> DateTime<Utc> {
     now + ChronoDuration::seconds(30)
+}
+
+fn next_policy_wake(
+    policy: &SnapshotDailyPolicy,
+    local_date: NaiveDate,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    local_date
+        .succ_opt()
+        .and_then(|next_date| policy.resolve_local_slot(next_date).ok())
+        .and_then(|slot| match slot {
+            SnapshotPolicySlot::Due { due_at, .. } if due_at > now => Some(due_at),
+            _ => None,
+        })
+        .unwrap_or_else(|| next_poll(now))
 }
 
 fn parse_policy_row(
@@ -257,7 +272,7 @@ impl SnapshotPolicyStore for PgMetaEngine {
                     Box::pin(async move {
                         client
                             .query_opt(
-                                "INSERT INTO snapshot_policy_evaluator_leases (vol, owner, lease_expires_at, fencing_token) VALUES ($1, $2, clock_timestamp() + ($3::bigint * interval '1 millisecond'), 1) ON CONFLICT (vol) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = CASE WHEN snapshot_policy_evaluator_leases.owner = EXCLUDED.owner THEN snapshot_policy_evaluator_leases.fencing_token ELSE snapshot_policy_evaluator_leases.fencing_token + 1 END, acquired_at = CASE WHEN snapshot_policy_evaluator_leases.owner = EXCLUDED.owner THEN snapshot_policy_evaluator_leases.acquired_at ELSE clock_timestamp() END, renewed_at = clock_timestamp() WHERE snapshot_policy_evaluator_leases.owner = EXCLUDED.owner OR snapshot_policy_evaluator_leases.lease_expires_at <= clock_timestamp() RETURNING owner, lease_expires_at, fencing_token",
+                                "INSERT INTO snapshot_policy_evaluator_leases (vol, owner, lease_expires_at, fencing_token) VALUES ($1, $2, clock_timestamp() + ($3::bigint * interval '1 millisecond'), 1) ON CONFLICT (vol) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = CASE WHEN snapshot_policy_evaluator_leases.owner = EXCLUDED.owner AND snapshot_policy_evaluator_leases.lease_expires_at > clock_timestamp() THEN snapshot_policy_evaluator_leases.fencing_token ELSE snapshot_policy_evaluator_leases.fencing_token + 1 END, acquired_at = CASE WHEN snapshot_policy_evaluator_leases.owner = EXCLUDED.owner AND snapshot_policy_evaluator_leases.lease_expires_at > clock_timestamp() THEN snapshot_policy_evaluator_leases.acquired_at ELSE clock_timestamp() END, renewed_at = clock_timestamp() WHERE snapshot_policy_evaluator_leases.owner = EXCLUDED.owner OR snapshot_policy_evaluator_leases.lease_expires_at <= clock_timestamp() RETURNING owner, lease_expires_at, fencing_token",
                                 &[&volume_id, &owner, &lease_ms],
                             )
                             .await
@@ -382,33 +397,27 @@ impl SnapshotPolicyStore for PgMetaEngine {
                         };
                         match slot {
                             SnapshotPolicySlot::SkippedDstGap { local_date } => {
-                                let already_recorded = tx
-                                    .query_opt(
-                                        "SELECT 1 FROM snapshot_policy_slots WHERE vol = $1 AND generation = $2 AND local_date = $3 AND daily_at = $4",
+                                let next_wake_at = next_policy_wake(&policy.policy, local_date, now);
+                                let inserted = tx
+                                    .execute(
+                                        "INSERT INTO snapshot_policy_slots (vol, generation, local_date, daily_at, slot_kind) VALUES ($1, $2, $3, $4, 'skipped_dst_gap') ON CONFLICT (vol, generation, local_date, daily_at) DO NOTHING",
                                         &[&volume_id, &generation, &local_date, &policy.policy.daily_at()],
                                     )
                                     .await
-                                    .map_err(|_| pg_failure("load skipped snapshot policy slot"))?
-                                    .is_some();
-                                if already_recorded {
+                                    .map_err(|_| pg_failure("record skipped snapshot policy slot"))?;
+                                if inserted == 0 {
                                     tx.commit()
                                         .await
                                         .map_err(|_| pg_failure("commit recorded snapshot policy slot"))?;
                                     return Ok(SnapshotPolicyEvaluation::NoPolicy {
-                                        next_wake_at: next_poll(now),
+                                        next_wake_at,
                                     });
                                 }
-                                tx.execute(
-                                    "INSERT INTO snapshot_policy_slots (vol, generation, local_date, daily_at, slot_kind) VALUES ($1, $2, $3, $4, 'skipped_dst_gap') ON CONFLICT (vol, generation, local_date, daily_at) DO NOTHING",
-                                    &[&volume_id, &generation, &local_date, &policy.policy.daily_at()],
-                                )
-                                .await
-                                .map_err(|_| pg_failure("record skipped snapshot policy slot"))?;
                                 tx.commit()
                                     .await
                                     .map_err(|_| pg_failure("commit skipped snapshot policy slot"))?;
                                 Ok(SnapshotPolicyEvaluation::SkippedDstGap {
-                                    next_wake_at: next_poll(now),
+                                    next_wake_at,
                                 })
                             }
                             SnapshotPolicySlot::Due { local_date, due_at } => {
@@ -510,6 +519,7 @@ impl SnapshotPolicyStore for PgMetaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn missing_policy_volume_is_permanent() {
@@ -522,5 +532,30 @@ mod tests {
             error,
             SnapshotPortError::Permanent { code, .. } if code.as_str() == "volume_not_found"
         ));
+    }
+
+    #[test]
+    fn skipped_dst_gap_wakes_at_the_next_local_slot() {
+        let policy = SnapshotDailyPolicy::new(
+            NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+            "America/New_York",
+            Duration::from_secs(60),
+        )
+        .expect("valid policy");
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 8, 8, 0, 0)
+            .single()
+            .expect("valid UTC now");
+
+        assert_eq!(
+            next_policy_wake(
+                &policy,
+                NaiveDate::from_ymd_opt(2026, 3, 8).expect("valid local date"),
+                now,
+            ),
+            Utc.with_ymd_and_hms(2026, 3, 9, 6, 30, 0)
+                .single()
+                .expect("valid next UTC slot")
+        );
     }
 }

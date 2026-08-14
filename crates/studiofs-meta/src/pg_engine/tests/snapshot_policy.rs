@@ -169,7 +169,29 @@ fn policy_slot_claim_and_job_insert_are_one_transaction() {
         )
         .await
         .expect("claim evaluator lease");
-        let first = SnapshotPolicyStore::evaluate_due_slot(&*engine, &context, &lease, now)
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to expire evaluator lease");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_policy_evaluator_leases SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("expire evaluator lease");
+        connection_task.abort();
+
+        let reclaimed = SnapshotPolicyStore::claim_evaluator_lease(
+            &*engine,
+            &context,
+            &evaluator,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("reclaim expired evaluator lease");
+        assert!(reclaimed.fencing_token > lease.fencing_token);
+        let first = SnapshotPolicyStore::evaluate_due_slot(&*engine, &context, &reclaimed, now)
             .await
             .expect("evaluate due slot");
         assert!(matches!(first, SnapshotPolicyEvaluation::Created { .. }));
@@ -177,7 +199,7 @@ fn policy_slot_claim_and_job_insert_are_one_transaction() {
         let second = SnapshotPolicyStore::evaluate_due_slot(
             &*engine,
             &context,
-            &lease,
+            &reclaimed,
             now + chrono::Duration::minutes(1),
         )
         .await

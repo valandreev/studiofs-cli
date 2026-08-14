@@ -474,8 +474,16 @@ impl SnapshotDailyPolicy {
             .timezone
             .parse::<Tz>()
             .map_err(|_| SnapshotValidationError::InvalidText)?;
+        Ok(self.resolve_local_slot_in_timezone(timezone, local_date))
+    }
+
+    fn resolve_local_slot_in_timezone(
+        &self,
+        timezone: Tz,
+        local_date: NaiveDate,
+    ) -> SnapshotPolicySlot {
         let local_datetime = local_date.and_time(self.daily_at);
-        Ok(match timezone.from_local_datetime(&local_datetime) {
+        match timezone.from_local_datetime(&local_datetime) {
             LocalResult::Single(value) => SnapshotPolicySlot::Due {
                 local_date,
                 due_at: value.with_timezone(&Utc),
@@ -485,7 +493,7 @@ impl SnapshotDailyPolicy {
                 due_at: earlier.with_timezone(&Utc),
             },
             LocalResult::None => SnapshotPolicySlot::SkippedDstGap { local_date },
-        })
+        }
     }
 
     /// Returns the latest eligible due slot, at most one, after downtime.
@@ -497,14 +505,16 @@ impl SnapshotDailyPolicy {
         let timezone = self.timezone.parse::<Tz>().ok()?;
         let local_now = now.with_timezone(&timezone);
         let today = local_now.date_naive();
-        let today_slot = self.resolve_local_slot(today).ok()?;
+        let today_slot = self.resolve_local_slot_in_timezone(timezone, today);
         let slot = match today_slot {
             SnapshotPolicySlot::Due { due_at, .. } if due_at <= now => SnapshotPolicySlot::Due {
                 local_date: today,
                 due_at,
             },
             SnapshotPolicySlot::SkippedDstGap { .. } => {
-                if let Some(yesterday_slot) = self.resolve_local_slot(today.pred_opt()?).ok()
+                if let Some(yesterday_slot) = today
+                    .pred_opt()
+                    .map(|date| self.resolve_local_slot_in_timezone(timezone, date))
                     && let SnapshotPolicySlot::Due { due_at, .. } = yesterday_slot
                     && due_at <= now
                     && !latest_completed.is_some_and(|completed| due_at <= completed)
@@ -513,7 +523,7 @@ impl SnapshotDailyPolicy {
                 }
                 SnapshotPolicySlot::SkippedDstGap { local_date: today }
             }
-            _ => self.resolve_local_slot(today.pred_opt()?).ok()?,
+            _ => self.resolve_local_slot_in_timezone(timezone, today.pred_opt()?),
         };
         let SnapshotPolicySlot::Due { local_date, due_at } = slot else {
             return Some(slot);

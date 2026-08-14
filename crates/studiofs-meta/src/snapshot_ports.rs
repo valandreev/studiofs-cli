@@ -606,6 +606,10 @@ pub trait SnapshotPolicyStore: Send + Sync {
     ) -> SnapshotPortFuture<'a, crate::snapshot::SnapshotPolicyEvaluatorLease>;
 
     /// Claims the latest eligible policy slot and queues its automatic job.
+    ///
+    /// `next_wake_at` is a backend-provided wake hint. Implementations may use
+    /// the next local slot when known, but must retain a bounded fallback poll
+    /// so a committed policy cannot be stranded by a lost wake-up.
     fn evaluate_due_slot<'a>(
         &'a self,
         context: &'a crate::snapshot::SnapshotVolumeContext,
