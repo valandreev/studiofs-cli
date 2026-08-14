@@ -1,6 +1,9 @@
 //! Snapshot v2 domain contracts.
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, NaiveTime, Utc};
+use chrono::{
+    DateTime, Duration as ChronoDuration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime,
+    TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -377,6 +380,23 @@ pub struct SnapshotDailyPolicy {
     retention: SnapshotRetention,
 }
 
+/// The resolved local slot considered by an automatic snapshot policy.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SnapshotPolicySlot {
+    /// A valid or ambiguous local time, resolved to its earlier UTC instant.
+    Due {
+        /// Local calendar date of the slot.
+        local_date: NaiveDate,
+        /// UTC instant at which the slot became due.
+        due_at: DateTime<Utc>,
+    },
+    /// A local time that does not exist because of a spring-forward gap.
+    SkippedDstGap {
+        /// Local calendar date whose scheduled time was nonexistent.
+        local_date: NaiveDate,
+    },
+}
+
 impl<'de> Deserialize<'de> for SnapshotDailyPolicy {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -399,6 +419,17 @@ impl<'de> Deserialize<'de> for SnapshotDailyPolicy {
 }
 
 impl SnapshotDailyPolicy {
+    /// The deterministic timezone used when a caller omits one.
+    pub const DEFAULT_TIMEZONE: &'static str = "UTC";
+
+    /// Creates a daily policy using UTC as its persisted timezone.
+    pub fn with_default_timezone(
+        daily_at: NaiveTime,
+        retention: Duration,
+    ) -> Result<Self, SnapshotValidationError> {
+        Self::new(daily_at, Self::DEFAULT_TIMEZONE, retention)
+    }
+
     /// Creates a policy value without claiming PostgreSQL authority.
     pub fn new(
         daily_at: NaiveTime,
@@ -433,6 +464,58 @@ impl SnapshotDailyPolicy {
     pub const fn retention(&self) -> SnapshotRetention {
         self.retention
     }
+
+    /// Resolves one local calendar date into its deterministic UTC slot.
+    pub fn resolve_local_slot(
+        &self,
+        local_date: NaiveDate,
+    ) -> Result<SnapshotPolicySlot, SnapshotValidationError> {
+        let timezone = self
+            .timezone
+            .parse::<Tz>()
+            .map_err(|_| SnapshotValidationError::InvalidText)?;
+        let local_datetime = local_date.and_time(self.daily_at);
+        Ok(match timezone.from_local_datetime(&local_datetime) {
+            LocalResult::Single(value) => SnapshotPolicySlot::Due {
+                local_date,
+                due_at: value.with_timezone(&Utc),
+            },
+            LocalResult::Ambiguous(earlier, _) => SnapshotPolicySlot::Due {
+                local_date,
+                due_at: earlier.with_timezone(&Utc),
+            },
+            LocalResult::None => SnapshotPolicySlot::SkippedDstGap { local_date },
+        })
+    }
+
+    /// Returns the latest eligible due slot, at most one, after downtime.
+    pub fn latest_due_slot(
+        &self,
+        now: DateTime<Utc>,
+        latest_completed: Option<DateTime<Utc>>,
+    ) -> Option<SnapshotPolicySlot> {
+        let timezone = self.timezone.parse::<Tz>().ok()?;
+        let local_now = now.with_timezone(&timezone);
+        let today = local_now.date_naive();
+        let today_slot = self.resolve_local_slot(today).ok()?;
+        let slot = match today_slot {
+            SnapshotPolicySlot::Due { due_at, .. } if due_at <= now => SnapshotPolicySlot::Due {
+                local_date: today,
+                due_at,
+            },
+            SnapshotPolicySlot::SkippedDstGap { .. } => {
+                SnapshotPolicySlot::SkippedDstGap { local_date: today }
+            }
+            _ => self.resolve_local_slot(today.pred_opt()?).ok()?,
+        };
+        let SnapshotPolicySlot::Due { local_date, due_at } = slot else {
+            return Some(slot);
+        };
+        if due_at > now || latest_completed.is_some_and(|completed| due_at <= completed) {
+            return None;
+        }
+        Some(SnapshotPolicySlot::Due { local_date, due_at })
+    }
 }
 
 /// PostgreSQL-assigned generation and policy projection.
@@ -442,6 +525,42 @@ pub struct SnapshotPolicyRecord {
     pub generation: i64,
     /// Active automatic policy value.
     pub policy: SnapshotDailyPolicy,
+}
+
+/// Fenced PostgreSQL lease owned by one mounted policy evaluator.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotPolicyEvaluatorLease {
+    /// Evaluator identity that owns the lease.
+    pub owner: String,
+    /// UTC expiry of the lease.
+    pub expires_at: DateTime<Utc>,
+    /// Monotonically increasing fencing token.
+    pub fencing_token: i64,
+}
+
+/// Result of one policy evaluation transaction.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SnapshotPolicyEvaluation {
+    /// No active policy exists; the evaluator should poll again later.
+    NoPolicy {
+        /// Earliest next evaluation instant.
+        next_wake_at: DateTime<Utc>,
+    },
+    /// A new automatic snapshot job was queued for the slot.
+    Created {
+        /// Earliest next evaluation instant.
+        next_wake_at: DateTime<Utc>,
+    },
+    /// The slot already existed and its durable job should be followed.
+    Followed {
+        /// Earliest next evaluation instant.
+        next_wake_at: DateTime<Utc>,
+    },
+    /// A spring-forward gap was recorded without creating a snapshot.
+    SkippedDstGap {
+        /// Earliest next evaluation instant.
+        next_wake_at: DateTime<Utc>,
+    },
 }
 
 fn validate_retention(ttl: Option<Duration>) -> Result<(), SnapshotValidationError> {
@@ -838,7 +957,7 @@ fn parse_collision_suffix(value: &str) -> Result<u64, SnapshotIdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::{NaiveDate, TimeZone, Utc};
 
     #[test]
     fn origin_is_explicit_and_creation_state_is_not_lifecycle() {
@@ -1016,6 +1135,121 @@ mod tests {
         assert!(SnapshotDailyPolicy::new(daily_at, "", Duration::from_secs(60)).is_err());
         assert!(SnapshotDailyPolicy::new(daily_at, "Not/AZone", Duration::from_secs(60)).is_err());
         assert!(SnapshotDailyPolicy::new(daily_at, "UTC", Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn policy_default_timezone_is_utc() {
+        let daily_at = NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time");
+        let policy = SnapshotDailyPolicy::with_default_timezone(daily_at, Duration::from_secs(60))
+            .expect("valid UTC policy");
+
+        assert_eq!(policy.timezone(), "UTC");
+    }
+
+    #[test]
+    fn dst_gap_records_skipped_slot() {
+        let policy = SnapshotDailyPolicy::new(
+            NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+            "America/New_York",
+            Duration::from_secs(60),
+        )
+        .expect("valid policy");
+
+        let slot = policy
+            .resolve_local_slot(NaiveDate::from_ymd_opt(2026, 3, 8).expect("valid local date"))
+            .expect("valid local slot");
+
+        assert_eq!(
+            slot,
+            SnapshotPolicySlot::SkippedDstGap {
+                local_date: NaiveDate::from_ymd_opt(2026, 3, 8).expect("valid local date"),
+            }
+        );
+    }
+
+    #[test]
+    fn dst_ambiguity_uses_earlier_utc_occurrence() {
+        let policy = SnapshotDailyPolicy::new(
+            NaiveTime::from_hms_opt(1, 30, 0).expect("valid policy time"),
+            "America/New_York",
+            Duration::from_secs(60),
+        )
+        .expect("valid policy");
+
+        let slot = policy
+            .resolve_local_slot(NaiveDate::from_ymd_opt(2026, 11, 1).expect("valid local date"))
+            .expect("valid local slot");
+
+        assert_eq!(
+            slot,
+            SnapshotPolicySlot::Due {
+                local_date: NaiveDate::from_ymd_opt(2026, 11, 1).expect("valid local date"),
+                due_at: Utc
+                    .with_ymd_and_hms(2026, 11, 1, 5, 30, 0)
+                    .single()
+                    .expect("valid UTC slot"),
+            }
+        );
+    }
+
+    #[test]
+    fn catch_up_claims_only_latest_eligible_slot() {
+        let policy = SnapshotDailyPolicy::new(
+            NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+            "UTC",
+            Duration::from_secs(60),
+        )
+        .expect("valid policy");
+
+        let slot = policy
+            .latest_due_slot(
+                Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0)
+                    .single()
+                    .expect("valid UTC now"),
+                None,
+            )
+            .expect("one catch-up slot");
+
+        assert_eq!(
+            slot,
+            SnapshotPolicySlot::Due {
+                local_date: NaiveDate::from_ymd_opt(2026, 8, 14).expect("valid local date"),
+                due_at: Utc
+                    .with_ymd_and_hms(2026, 8, 14, 2, 30, 0)
+                    .single()
+                    .expect("valid UTC slot"),
+            }
+        );
+    }
+
+    #[test]
+    fn catch_up_before_today_time_uses_previous_local_date() {
+        let policy = SnapshotDailyPolicy::new(
+            NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+            "UTC",
+            Duration::from_secs(60),
+        )
+        .expect("valid policy");
+
+        let slot = policy
+            .latest_due_slot(
+                Utc.with_ymd_and_hms(2026, 8, 14, 1, 0, 0)
+                    .single()
+                    .expect("valid UTC now"),
+                None,
+            )
+            .expect("previous local date is eligible");
+
+        assert_eq!(
+            slot,
+            SnapshotPolicySlot::Due {
+                local_date: NaiveDate::from_ymd_opt(2026, 8, 13).expect("valid local date"),
+                due_at: Utc
+                    .with_ymd_and_hms(2026, 8, 13, 2, 30, 0)
+                    .single()
+                    .expect("valid UTC slot"),
+            }
+        );
     }
 
     #[test]

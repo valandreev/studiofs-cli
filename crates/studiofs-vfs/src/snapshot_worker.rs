@@ -21,7 +21,7 @@ use studiofs_meta::schema::{PayloadRef, PayloadRefState};
 use studiofs_meta::snapshot::SnapshotCatalogEntry;
 use studiofs_meta::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCleanupClaim, SnapshotId, SnapshotLifecycle,
-    SnapshotSha256, SnapshotVolumeContext,
+    SnapshotPolicyEvaluation, SnapshotSha256, SnapshotVolumeContext,
 };
 #[cfg(test)]
 use studiofs_meta::snapshot_ports::SnapshotClaimOrFollow;
@@ -29,8 +29,9 @@ use studiofs_meta::snapshot_ports::{
     SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator, SnapshotArtifactScope,
     SnapshotArtifactStore, SnapshotCleanupStore, SnapshotClock, SnapshotFailure, SnapshotJobClaim,
     SnapshotJobStore, SnapshotPayloadBytes, SnapshotPayloadProof, SnapshotPayloadReader,
-    SnapshotPortError, SnapshotPortFuture, SnapshotReconstruction, SnapshotRetry,
-    SnapshotSourceReader, SnapshotStoredArtifact, SnapshotWorkerId,
+    SnapshotPolicyEvaluatorId, SnapshotPolicyStore, SnapshotPortError, SnapshotPortFuture,
+    SnapshotReconstruction, SnapshotRetry, SnapshotSourceReader, SnapshotStoredArtifact,
+    SnapshotWorkerId,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -499,6 +500,120 @@ pub enum SnapshotWorkerError {
     /// The worker configuration was not usable.
     #[error("snapshot worker configuration is invalid")]
     InvalidConfiguration,
+}
+
+const SNAPSHOT_POLICY_EVALUATOR_LEASE_FOR: Duration = Duration::from_secs(60);
+const SNAPSHOT_POLICY_EVALUATOR_MAX_POLL: Duration = Duration::from_secs(30);
+
+/// Errors returned by the mounted daily-policy evaluator.
+#[derive(Debug, Error)]
+pub enum SnapshotPolicyEvaluatorError {
+    /// A backend-independent policy port operation failed.
+    #[error("snapshot policy evaluator port failure: {0}")]
+    Port(#[source] SnapshotPortError),
+    /// The evaluator was cancelled during a port call or wait.
+    #[error("snapshot policy evaluator cancelled")]
+    Cancelled,
+}
+
+/// Evaluates one volume's durable daily snapshot policy.
+pub struct SnapshotPolicyEvaluator {
+    volume: SnapshotVolumeContext,
+    evaluator: SnapshotPolicyEvaluatorId,
+    policies: Arc<dyn SnapshotPolicyStore>,
+    clock: Arc<dyn SnapshotClock>,
+}
+
+impl SnapshotPolicyEvaluator {
+    /// Creates an evaluator scoped to one verified volume identity.
+    pub fn new(
+        volume: SnapshotVolumeContext,
+        evaluator: SnapshotPolicyEvaluatorId,
+        policies: Arc<dyn SnapshotPolicyStore>,
+        clock: Arc<dyn SnapshotClock>,
+    ) -> Self {
+        Self {
+            volume,
+            evaluator,
+            policies,
+            clock,
+        }
+    }
+
+    /// Runs until shutdown, keeping the per-volume evaluator lease fenced.
+    pub async fn run(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+    ) -> Result<(), SnapshotPolicyEvaluatorError> {
+        let mut lease = match await_policy(
+            self.policies.claim_evaluator_lease(
+                &self.volume,
+                &self.evaluator,
+                SNAPSHOT_POLICY_EVALUATOR_LEASE_FOR,
+            ),
+            &cancel,
+        )
+        .await
+        {
+            Ok(lease) => lease,
+            Err(SnapshotPolicyEvaluatorError::Cancelled) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        let result = loop {
+            let now = self.clock.now();
+            if lease.expires_at - now <= chrono::Duration::seconds(30) {
+                lease = await_policy(
+                    self.policies
+                        .renew_evaluator_lease(&lease, SNAPSHOT_POLICY_EVALUATOR_LEASE_FOR),
+                    &cancel,
+                )
+                .await?;
+            }
+            let evaluation = await_policy(
+                self.policies.evaluate_due_slot(&self.volume, &lease, now),
+                &cancel,
+            )
+            .await?;
+            let next_wake_at = match evaluation {
+                SnapshotPolicyEvaluation::NoPolicy { next_wake_at }
+                | SnapshotPolicyEvaluation::Created { next_wake_at, .. }
+                | SnapshotPolicyEvaluation::Followed { next_wake_at, .. }
+                | SnapshotPolicyEvaluation::SkippedDstGap { next_wake_at } => next_wake_at,
+            };
+            let delay = (next_wake_at - self.clock.now())
+                .to_std()
+                .unwrap_or_default()
+                .min(SNAPSHOT_POLICY_EVALUATOR_MAX_POLL);
+            match await_policy(
+                self.clock
+                    .sleep_until(self.clock.now() + delay, cancel.clone()),
+                &cancel,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(SnapshotPolicyEvaluatorError::Cancelled) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+
+        let _ = self.policies.release_evaluator_lease(&lease).await;
+        result
+    }
+}
+
+async fn await_policy<'a, T>(
+    future: SnapshotPortFuture<'a, T>,
+    cancel: &CancellationToken,
+) -> Result<T, SnapshotPolicyEvaluatorError> {
+    tokio::select! {
+        result = future => result.map_err(|error| match error {
+            SnapshotPortError::Cancelled => SnapshotPolicyEvaluatorError::Cancelled,
+            error => SnapshotPolicyEvaluatorError::Port(error),
+        }),
+        _ = cancel.cancelled() => Err(SnapshotPolicyEvaluatorError::Cancelled),
+    }
 }
 
 /// Reusable Snapshot v2 claim/materialize/upload/publish service.
@@ -1593,21 +1708,47 @@ mod tests {
     use studiofs_meta::snapshot::{
         SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCleanupClaim,
         SnapshotCleanupLease, SnapshotCreationJob, SnapshotCreationLease, SnapshotCreationState,
-        SnapshotCut, SnapshotId, SnapshotLifecycle, SnapshotOrigin, SnapshotRetention,
-        SnapshotSha256, SnapshotVolumeContext,
+        SnapshotCut, SnapshotDailyPolicy, SnapshotId, SnapshotLifecycle, SnapshotOrigin,
+        SnapshotPolicyEvaluation, SnapshotPolicyEvaluatorLease, SnapshotPolicyRecord,
+        SnapshotRetention, SnapshotSha256, SnapshotVolumeContext,
     };
     use studiofs_meta::snapshot_ports::{
         SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator,
         SnapshotArtifactScope, SnapshotArtifactStore, SnapshotClaimOrFollow, SnapshotCleanupStore,
         SnapshotClock, SnapshotFailure, SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadBytes,
-        SnapshotPayloadProof, SnapshotPayloadReader, SnapshotPortError, SnapshotPortFuture,
-        SnapshotRetry, SnapshotSourceDescriptor, SnapshotSourceReader, SnapshotStoredArtifact,
-        SnapshotWorkerId,
+        SnapshotPayloadProof, SnapshotPayloadReader, SnapshotPolicyEvaluatorId,
+        SnapshotPolicyStore, SnapshotPortError, SnapshotPortFuture, SnapshotRetry,
+        SnapshotSourceDescriptor, SnapshotSourceReader, SnapshotStoredArtifact, SnapshotWorkerId,
     };
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     const VOLUME_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[tokio::test]
+    async fn evaluator_cancellation_releases_or_expires_lease() {
+        let volume = SnapshotVolumeContext::new(7, "projectfs", VOLUME_UUID).expect("volume");
+        let store = Arc::new(PolicyEvaluatorTestStore::new());
+        let evaluator = Arc::new(SnapshotPolicyEvaluator::new(
+            volume,
+            SnapshotPolicyEvaluatorId::new("evaluator-a").expect("evaluator id"),
+            store.clone(),
+            Arc::new(TestClock {
+                now: Utc
+                    .with_ymd_and_hms(2026, 8, 14, 9, 0, 0)
+                    .single()
+                    .expect("timestamp"),
+            }),
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(evaluator.run(cancel.clone()));
+
+        store.claimed.notified().await;
+        cancel.cancel();
+
+        assert!(task.await.expect("evaluator join").is_ok());
+        assert!(store.released.load(Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn worker_publishes_reconstructed_artifact_after_fenced_upload() {
@@ -3491,6 +3632,86 @@ mod tests {
             }
             let artifacts = self.artifacts.lock().expect("artifact lock").clone();
             Box::pin(async move { Ok(artifacts) })
+        }
+    }
+
+    struct PolicyEvaluatorTestStore {
+        claimed: Notify,
+        released: AtomicBool,
+    }
+
+    impl PolicyEvaluatorTestStore {
+        fn new() -> Self {
+            Self {
+                claimed: Notify::new(),
+                released: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl SnapshotPolicyStore for PolicyEvaluatorTestStore {
+        fn set_policy<'a>(
+            &'a self,
+            _policy: &'a SnapshotDailyPolicy,
+            _expected_generation: Option<i64>,
+        ) -> SnapshotPortFuture<'a, SnapshotPolicyRecord> {
+            Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+
+        fn load_policy<'a>(&'a self) -> SnapshotPortFuture<'a, Option<SnapshotPolicyRecord>> {
+            Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+
+        fn cancel_policy<'a>(&'a self, _expected_generation: i64) -> SnapshotPortFuture<'a, ()> {
+            Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+
+        fn claim_evaluator_lease<'a>(
+            &'a self,
+            _context: &'a SnapshotVolumeContext,
+            owner: &'a SnapshotPolicyEvaluatorId,
+            _lease_for: Duration,
+        ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluatorLease> {
+            let owner = owner.as_str().to_string();
+            Box::pin(async move {
+                self.claimed.notify_one();
+                Ok(SnapshotPolicyEvaluatorLease {
+                    owner,
+                    expires_at: Utc::now() + chrono::Duration::minutes(1),
+                    fencing_token: 1,
+                })
+            })
+        }
+
+        fn renew_evaluator_lease<'a>(
+            &'a self,
+            lease: &'a SnapshotPolicyEvaluatorLease,
+            _lease_for: Duration,
+        ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluatorLease> {
+            Box::pin(async move { Ok(lease.clone()) })
+        }
+
+        fn evaluate_due_slot<'a>(
+            &'a self,
+            _context: &'a SnapshotVolumeContext,
+            _lease: &'a SnapshotPolicyEvaluatorLease,
+            now: DateTime<Utc>,
+        ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluation> {
+            Box::pin(async move {
+                Ok(SnapshotPolicyEvaluation::NoPolicy {
+                    next_wake_at: now + chrono::Duration::minutes(1),
+                })
+            })
+        }
+
+        fn release_evaluator_lease<'a>(
+            &'a self,
+            _lease: &'a SnapshotPolicyEvaluatorLease,
+        ) -> SnapshotPortFuture<'a, ()> {
+            Box::pin(async move {
+                self.released.store(true, Ordering::SeqCst);
+                Ok(())
+            })
         }
     }
 

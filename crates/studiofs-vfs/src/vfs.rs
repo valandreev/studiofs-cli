@@ -142,7 +142,9 @@ use crate::runtime::{
     into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta,
     run_with_timeout_or_cancel,
 };
-use crate::snapshot_worker::{SnapshotCleanupWorker, SnapshotWorker, SnapshotWorkerError};
+#[cfg(test)]
+use crate::snapshot_worker::SnapshotWorkerError;
+use crate::snapshot_worker::{SnapshotCleanupWorker, SnapshotPolicyEvaluator, SnapshotWorker};
 use crate::utils::now_unix_millis;
 use crate::vfs::local_dirty::LocalDirtyState;
 use bytes::{Bytes, BytesMut};
@@ -3552,6 +3554,8 @@ pub struct StudioVfs {
     snapshot_worker: Option<Arc<SnapshotWorker>>,
     /// Optional Snapshot v2 artifact/source cleanup worker.
     snapshot_cleanup_worker: Option<Arc<SnapshotCleanupWorker>>,
+    /// Optional Snapshot v2 daily automatic-policy evaluator.
+    snapshot_policy_evaluator: Option<Arc<SnapshotPolicyEvaluator>>,
     /// Shared local payload backend used by the foreground read path.
     local_payload_backend: Arc<dyn LocalPayloadBackend>,
     /// Shared cached-store runtime that owns local staging + pending uploads.
@@ -4635,6 +4639,7 @@ impl StudioVfs {
         self.spawn_janitor_worker();
         self.spawn_snapshot_worker();
         self.spawn_snapshot_cleanup_worker();
+        self.spawn_snapshot_policy_evaluator();
         Ok(())
     }
 
@@ -4672,7 +4677,24 @@ impl StudioVfs {
         }));
     }
 
-    async fn run_snapshot_worker_with_supervision<F, Fut>(
+    fn spawn_snapshot_policy_evaluator(self: &Arc<Self>) {
+        let Some(evaluator) = self.snapshot_policy_evaluator.clone() else {
+            return;
+        };
+        let cancel = self.state.shutdown.background_shutdown_token.clone();
+        self.track_background_task(tokio::spawn(async move {
+            Self::run_snapshot_worker_with_supervision(
+                cancel,
+                move |run_cancel| evaluator.clone().run(run_cancel),
+                "snapshot policy evaluator",
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+            )
+            .await;
+        }));
+    }
+
+    async fn run_snapshot_worker_with_supervision<F, Fut, E>(
         cancel: CancellationToken,
         mut run: F,
         worker_name: &'static str,
@@ -4680,7 +4702,8 @@ impl StudioVfs {
         max_delay: Duration,
     ) where
         F: FnMut(CancellationToken) -> Fut,
-        Fut: Future<Output = Result<(), SnapshotWorkerError>>,
+        Fut: Future<Output = Result<(), E>>,
+        E: std::fmt::Display,
     {
         let mut retry_delay = initial_delay.min(max_delay);
         loop {

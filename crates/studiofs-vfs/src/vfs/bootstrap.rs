@@ -1,12 +1,12 @@
 use super::*;
 use crate::snapshot_worker::{
     DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotCleanupWorker,
-    SnapshotWorker, SnapshotWorkerConfig, SystemSnapshotClock,
+    SnapshotPolicyEvaluator, SnapshotWorker, SnapshotWorkerConfig, SystemSnapshotClock,
 };
 use studiofs_cache::{LocalPayloadSyncMode, LocalPayloadWriteMode};
 use studiofs_meta::snapshot::SnapshotVolumeContext;
 use studiofs_meta::snapshot_ports::{
-    SnapshotArtifactStore, SnapshotPayloadReader, SnapshotWorkerId,
+    SnapshotArtifactStore, SnapshotPayloadReader, SnapshotPolicyEvaluatorId, SnapshotWorkerId,
 };
 
 const UPLOAD_HOT_BUFFER_CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -480,6 +480,11 @@ impl VfsBootstrap {
         } else {
             build_snapshot_cleanup_worker(meta.as_ref(), resources.data_write.clone())
         };
+        let snapshot_policy_evaluator = if read_only_mount {
+            None
+        } else {
+            build_snapshot_policy_evaluator(meta.as_ref())
+        };
 
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
@@ -488,6 +493,7 @@ impl VfsBootstrap {
             data_write: resources.data_write,
             snapshot_worker,
             snapshot_cleanup_worker,
+            snapshot_policy_evaluator,
             local_payload_backend: resources.local_payload_backend,
             cached_store: resources.cached_store.clone(),
             block_size,
@@ -583,6 +589,26 @@ impl VfsBootstrap {
         vfs.finalize_constructor_bootstrap()?;
         Ok(vfs)
     }
+}
+
+fn build_snapshot_policy_evaluator(meta: &dyn VfsMeta) -> Option<Arc<SnapshotPolicyEvaluator>> {
+    let policies = meta.snapshot_policy_store()?;
+    let format_info = meta.get_format_info().ok()?;
+    let postgres = format_info.metadata.postgres?;
+    let volume =
+        SnapshotVolumeContext::new(postgres.volume_id, format_info.name, format_info.uuid).ok()?;
+    let evaluator = SnapshotPolicyEvaluatorId::new(format!(
+        "vfs-policy-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+    .ok()?;
+    Some(Arc::new(SnapshotPolicyEvaluator::new(
+        volume,
+        evaluator,
+        policies,
+        Arc::new(SystemSnapshotClock),
+    )))
 }
 
 fn build_snapshot_worker(

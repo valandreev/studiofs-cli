@@ -622,9 +622,41 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             daily_at TIME NOT NULL,
             timezone TEXT NOT NULL DEFAULT 'UTC',
             retention_seconds BIGINT NOT NULL CHECK (retention_seconds > 0),
+            latest_completed_slot TIMESTAMPTZ,
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        ALTER TABLE snapshot_policies
+            ADD COLUMN IF NOT EXISTS latest_completed_slot TIMESTAMPTZ;
+
+        CREATE TABLE IF NOT EXISTS snapshot_policy_slots (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            generation BIGINT NOT NULL CHECK (generation > 0),
+            local_date DATE NOT NULL,
+            daily_at TIME NOT NULL,
+            slot_kind TEXT NOT NULL CHECK (slot_kind IN ('due', 'skipped_dst_gap')),
+            due_at TIMESTAMPTZ,
+            snapshot_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (vol, generation, local_date, daily_at),
+            FOREIGN KEY (vol, snapshot_id)
+                REFERENCES snapshot_catalog(vol, id) ON DELETE CASCADE,
+            CHECK (
+                (slot_kind = 'due' AND due_at IS NOT NULL)
+                OR (slot_kind = 'skipped_dst_gap' AND due_at IS NULL AND snapshot_id IS NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshot_policy_evaluator_leases (
+            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            owner TEXT NOT NULL,
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            fencing_token BIGINT NOT NULL DEFAULT 1,
+            acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            renewed_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
         CREATE INDEX IF NOT EXISTS idx_event_log_vol_seq
@@ -641,6 +673,11 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_snapshot_creation_jobs_queue
             ON snapshot_creation_jobs(vol, created_at, snapshot_id)
             WHERE state IN ('queued', 'retry_wait', 'running');
+        CREATE INDEX IF NOT EXISTS idx_snapshot_policy_slots_due
+            ON snapshot_policy_slots(vol, generation, local_date, daily_at);
+        CREATE INDEX IF NOT EXISTS idx_snapshot_policy_evaluator_leases_active
+            ON snapshot_policy_evaluator_leases(vol, lease_expires_at)
+            WHERE owner <> '';
         CREATE INDEX IF NOT EXISTS idx_snapshot_cleanup_leases_active
             ON snapshot_cleanup_leases(vol, snapshot_id, lease_expires_at)
             WHERE owner <> '';

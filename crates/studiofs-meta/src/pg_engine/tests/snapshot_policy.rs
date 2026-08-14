@@ -2,12 +2,14 @@ use super::*;
 
 use crate::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCreationLease, SnapshotCreationState, SnapshotDailyPolicy,
-    SnapshotLifecycle, SnapshotOrigin, SnapshotRetention, SnapshotSha256,
+    SnapshotLifecycle, SnapshotOrigin, SnapshotPolicyEvaluation, SnapshotRetention, SnapshotSha256,
+    SnapshotVolumeContext,
 };
 use crate::snapshot_ports::{
-    SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadProof, SnapshotPolicyStore, SnapshotWorkerId,
+    SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadProof, SnapshotPolicyEvaluatorId,
+    SnapshotPolicyStore, SnapshotWorkerId,
 };
-use chrono::{NaiveTime, Utc};
+use chrono::{NaiveTime, TimeZone, Utc};
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
@@ -120,6 +122,70 @@ fn concurrent_initial_policy_sets_allocate_distinct_generations() {
         Ok(())
     })
     .expect("concurrent policy control plane");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn policy_slot_claim_and_job_insert_are_one_transaction() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-policy-slot");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    let info = volume.format_info();
+    seed_local(&db_path, &info);
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open postgres engine");
+    let context = SnapshotVolumeContext::new(volume.volume_id, &volume.name, &volume.uuid)
+        .expect("verified snapshot context");
+    let policy = SnapshotDailyPolicy::new(
+        NaiveTime::from_hms_opt(2, 30, 0).expect("valid policy time"),
+        "UTC",
+        Duration::from_secs(3600),
+    )
+    .expect("valid policy");
+    let evaluator =
+        SnapshotPolicyEvaluatorId::new("policy-evaluator-a").expect("valid evaluator identity");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 14, 3, 0, 0)
+        .single()
+        .expect("valid UTC now");
+
+    run_async(async {
+        SnapshotPolicyStore::set_policy(&*engine, &policy, None)
+            .await
+            .expect("set policy");
+        let lease = SnapshotPolicyStore::claim_evaluator_lease(
+            &*engine,
+            &context,
+            &evaluator,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("claim evaluator lease");
+        let first = SnapshotPolicyStore::evaluate_due_slot(&*engine, &context, &lease, now)
+            .await
+            .expect("evaluate due slot");
+        assert!(matches!(first, SnapshotPolicyEvaluation::Created { .. }));
+
+        let second = SnapshotPolicyStore::evaluate_due_slot(
+            &*engine,
+            &context,
+            &lease,
+            now + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("follow existing due slot");
+        assert!(matches!(second, SnapshotPolicyEvaluation::Followed { .. }));
+        Ok(())
+    })
+    .expect("automatic policy slot transaction");
 }
 
 #[test]
