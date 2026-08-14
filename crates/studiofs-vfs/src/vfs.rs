@@ -7183,7 +7183,6 @@ impl StudioVfs {
 
     /// Ensure current metadata authority allows mutating operations for an inode.
     pub(super) fn enforce_metadata_mutation_authority(&self, ino: Ino) -> VfsResult<()> {
-        self.enforce_snapshot_mount_fence(ino)?;
         if self.metadata_authority_status().allows_new_mutations() {
             return Ok(());
         }
