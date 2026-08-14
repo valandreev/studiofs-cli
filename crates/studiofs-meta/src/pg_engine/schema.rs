@@ -673,8 +673,6 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_snapshot_creation_jobs_queue
             ON snapshot_creation_jobs(vol, created_at, snapshot_id)
             WHERE state IN ('queued', 'retry_wait', 'running');
-        CREATE INDEX IF NOT EXISTS idx_snapshot_policy_slots_due
-            ON snapshot_policy_slots(vol, generation, local_date, daily_at);
         CREATE INDEX IF NOT EXISTS idx_snapshot_policy_slots_snapshot_id
             ON snapshot_policy_slots(vol, snapshot_id)
             WHERE snapshot_id IS NOT NULL;
