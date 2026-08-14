@@ -669,10 +669,11 @@ impl RedbMetaEngine {
         let Some(runtime) = self.relaxed_durability.as_deref() else {
             return Ok(());
         };
-        if runtime.state.pending.load(Ordering::Acquire) && relaxed_barrier_due(&runtime.state) {
-            if let Some(db) = self.db.as_ref() {
-                immediate_metadata_barrier(db, Some(&runtime.state))?;
-            }
+        if runtime.state.pending.load(Ordering::Acquire)
+            && relaxed_barrier_due(&runtime.state)
+            && let Some(db) = self.db.as_ref()
+        {
+            immediate_metadata_barrier(db, Some(&runtime.state))?;
         }
         Ok(())
     }

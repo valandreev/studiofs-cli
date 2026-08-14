@@ -51,6 +51,7 @@ pub struct SnapshotMountConfig {
 
 impl SnapshotMountConfig {
     /// Creates a configuration with the bounded default lease duration.
+    #[must_use]
     pub fn new(cache_root: impl Into<PathBuf>) -> Self {
         Self {
             cache_root: cache_root.into(),
@@ -59,6 +60,7 @@ impl SnapshotMountConfig {
     }
 
     /// Replaces the default lease duration.
+    #[must_use]
     pub fn with_lease_for(mut self, lease_for: Duration) -> Self {
         self.lease_for = lease_for;
         self
@@ -945,22 +947,25 @@ impl SnapshotMount {
         let renewal_result = self.stop_lease_renewal().await;
         self.metadata.lock().take();
         self.metadata_handles.lock().remove(&self.cache_key);
-        let release_result = {
+        let to_release = {
             let mut lease = self.lease_state.lease.lock();
             if lease.released {
-                Ok(())
+                None
             } else if lease.expires_at <= self.lease_state.clock.now() {
                 lease.released = true;
-                Ok(())
+                None
             } else {
-                let current = lease.clone();
-                drop(lease);
-                self.lease_state
-                    .leases
-                    .release(&current)
-                    .await
-                    .map_err(map_port_error)
+                Some(lease.clone())
             }
+        };
+        let release_result = if let Some(current) = to_release {
+            self.lease_state
+                .leases
+                .release(&current)
+                .await
+                .map_err(map_port_error)
+        } else {
+            Ok(())
         };
         self.lease_state.mark_released();
         match (renewal_result, release_result) {
@@ -1049,6 +1054,16 @@ async fn write_cache_if_absent(
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             CacheWriteOutcome::AlreadyExists
         }
+        Err(error) if hard_link_unsupported(&error) => match fs::rename(&temporary, path).await {
+            Ok(()) => CacheWriteOutcome::Stored,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                CacheWriteOutcome::AlreadyExists
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&temporary).await;
+                return Err(SnapshotMountError::CacheIo);
+            }
+        },
         Err(_) => {
             let _ = fs::remove_file(&temporary).await;
             return Err(SnapshotMountError::CacheIo);
@@ -1056,6 +1071,11 @@ async fn write_cache_if_absent(
     };
     let _ = fs::remove_file(&temporary).await;
     Ok(outcome)
+}
+
+fn hard_link_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || (cfg!(windows) && error.raw_os_error() == Some(50))
 }
 
 fn encode_path_component(value: &str) -> String {
@@ -1075,15 +1095,28 @@ fn last_used_path(cache_path: &Path) -> PathBuf {
     ))
 }
 
-fn decode_path_component(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if !value.is_ascii() || !value.len().is_multiple_of(2) {
         return None;
     }
-    let bytes = (0..value.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()?;
-    String::from_utf8(bytes).ok()
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| Some((decode_hex_nibble(chunk[0])? << 4) | decode_hex_nibble(chunk[1])?))
+        .collect::<Option<Vec<_>>>()
+}
+
+fn decode_path_component(value: &str) -> Option<String> {
+    String::from_utf8(decode_hex_bytes(value)?).ok()
 }
 
 fn parse_cache_file_name(value: &str) -> Option<(SnapshotId, SnapshotSha256)> {
@@ -1093,10 +1126,7 @@ fn parse_cache_file_name(value: &str) -> Option<(SnapshotId, SnapshotSha256)> {
     if checksum_hex.len() != 64 {
         return None;
     }
-    let checksum = (0..64)
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&checksum_hex[index..index + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()?;
+    let checksum = decode_hex_bytes(checksum_hex)?;
     let checksum = SnapshotSha256::from_bytes(checksum.as_slice().try_into().ok()?);
     let snapshot = SnapshotId::parse(&decode_path_component(snapshot_hex)?).ok()?;
     Some((snapshot, checksum))
@@ -1622,6 +1652,15 @@ mod tests {
             .cache_path(root.path()),
             "path derivation must retain the complete composite identity"
         );
+    }
+
+    #[test]
+    fn cache_name_decoding_rejects_non_ascii_without_panicking() {
+        assert_eq!(super::decode_path_component("€a"), None);
+
+        let checksum = format!("€{}", "0".repeat(61));
+        let cache_name = format!("snapshot-placeholder-sha256-{checksum}.redb");
+        assert_eq!(super::parse_cache_file_name(&cache_name), None);
     }
 
     #[tokio::test]

@@ -1612,13 +1612,13 @@ impl Drop for MountRuntimeGuard {
             if let Some(mut finish_profiling) = profiling.take() {
                 finish_profiling();
             }
-            if let Some(diagnostics_host) = self.diagnostics_host.take() {
-                if let Err(error) = stop_mount_diagnostics_host(&runtime, diagnostics_host) {
-                    warn!(
-                        error = ?error,
-                        "diagnostics host shutdown failed during mount guard drop"
-                    );
-                }
+            if let Some(diagnostics_host) = self.diagnostics_host.take()
+                && let Err(error) = stop_mount_diagnostics_host(&runtime, diagnostics_host)
+            {
+                warn!(
+                    error = ?error,
+                    "diagnostics host shutdown failed during mount guard drop"
+                );
             }
 
             let runtime =

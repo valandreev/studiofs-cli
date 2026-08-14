@@ -400,6 +400,12 @@ struct VfsBootstrap {
     snapshot_mount_fence: Option<SnapshotMountFence>,
 }
 
+struct VfsBootstrapOptions {
+    cache_runtime: Option<PreparedLocalPayloadRuntime>,
+    read_only_mount: bool,
+    snapshot_mount_fence: Option<SnapshotMountFence>,
+}
+
 impl VfsBootstrap {
     fn prepare<M>(
         meta: Arc<M>,
@@ -408,13 +414,16 @@ impl VfsBootstrap {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedLocalPayloadRuntime>,
-        read_only_mount: bool,
-        snapshot_mount_fence: Option<SnapshotMountFence>,
+        options: VfsBootstrapOptions,
     ) -> VfsResult<Self>
     where
         M: ?Sized + VfsMeta + 'static,
     {
+        let VfsBootstrapOptions {
+            cache_runtime,
+            read_only_mount,
+            snapshot_mount_fence,
+        } = options;
         let meta = into_vfs_meta(meta);
         let plan = VfsBootstrapPlan::build(
             meta.get_format_info()?,
@@ -656,9 +665,11 @@ impl StudioVfs {
             cache_size,
             memory_cache_budget_bytes,
             config,
-            None,
-            false,
-            None,
+            VfsBootstrapOptions {
+                cache_runtime: None,
+                read_only_mount: false,
+                snapshot_mount_fence: None,
+            },
         )
     }
 
@@ -682,9 +693,11 @@ impl StudioVfs {
             cache_size,
             memory_cache_budget_bytes,
             config,
-            Some(cache_runtime),
-            false,
-            None,
+            VfsBootstrapOptions {
+                cache_runtime: Some(cache_runtime),
+                read_only_mount: false,
+                snapshot_mount_fence: None,
+            },
         )
     }
 
@@ -709,9 +722,11 @@ impl StudioVfs {
             cache_size,
             memory_cache_budget_bytes,
             config,
-            None,
-            true,
-            Some(snapshot_mount_fence),
+            VfsBootstrapOptions {
+                cache_runtime: None,
+                read_only_mount: true,
+                snapshot_mount_fence: Some(snapshot_mount_fence),
+            },
         )
     }
 
@@ -722,9 +737,7 @@ impl StudioVfs {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedLocalPayloadRuntime>,
-        read_only_mount: bool,
-        snapshot_mount_fence: Option<SnapshotMountFence>,
+        options: VfsBootstrapOptions,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -736,9 +749,7 @@ impl StudioVfs {
             cache_size,
             memory_cache_budget_bytes,
             config,
-            cache_runtime,
-            read_only_mount,
-            snapshot_mount_fence,
+            options,
         )?
         .finish()
     }
