@@ -180,7 +180,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
         let volume_id = self.volume_id;
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
-            let cache_sha256 = lease.cache_sha256.as_bytes().to_vec();
+            let cache_sha256 = *lease.cache_sha256.as_bytes();
             let result = super::PgMetaEngine::with_postgres_client_timeout(
                 pool,
                 timeout,
@@ -208,7 +208,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                                     &lease.snapshot_id.to_string(),
                                     &lease.owner,
                                     &lease.cache_volume_uuid,
-                                    &cache_sha256,
+                                    &&cache_sha256[..],
                                     &lease.fencing_token,
                                     &lease_ms,
                                 ],
@@ -237,7 +237,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
         let timeout = self.command_timeout;
         let volume_id = self.volume_id;
         Box::pin(async move {
-            let cache_sha256 = lease.cache_sha256.as_bytes().to_vec();
+            let cache_sha256 = *lease.cache_sha256.as_bytes();
             let result = super::PgMetaEngine::with_postgres_client_timeout(
                 pool,
                 timeout,
@@ -263,7 +263,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                                     &lease.snapshot_id.to_string(),
                                     &lease.owner,
                                     &lease.cache_volume_uuid,
-                                    &cache_sha256,
+                                    &&cache_sha256[..],
                                     &lease.fencing_token,
                                 ],
                             )
@@ -289,7 +289,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
     ) -> SnapshotPortFuture<'a, bool> {
         let snapshot_id = snapshot_id.clone();
         let cache_volume_uuid = cache_volume_uuid.to_string();
-        let cache_sha256 = cache_sha256.as_bytes().to_vec();
+        let cache_sha256 = *cache_sha256.as_bytes();
         let pool = Arc::clone(&self.command_pool);
         let timeout = self.command_timeout;
         let volume_id = self.volume_id;
@@ -316,7 +316,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                                     &volume_id,
                                     &snapshot_id.to_string(),
                                     &cache_volume_uuid,
-                                    &cache_sha256,
+                                    &&cache_sha256[..],
                                 ],
                             )
                             .await

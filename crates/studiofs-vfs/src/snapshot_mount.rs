@@ -480,9 +480,9 @@ impl SnapshotMountSession {
         cache_key: &SnapshotArtifactCacheKey,
         cache_path: &Path,
     ) -> Result<Arc<dyn VfsMeta>, SnapshotMountError> {
-        let mut metadata_handles = self.metadata_handles.lock();
-        if let Some(metadata) = metadata_handles.get(cache_key) {
-            return Ok(Arc::clone(metadata));
+        let cached = self.metadata_handles.lock().get(cache_key).cloned();
+        if let Some(metadata) = cached {
+            return Ok(metadata);
         }
         let snapshot_meta = studiofs_meta::open_read_only_snapshot_meta(cache_path)
             .map_err(map_metadata_open_error)?;
@@ -495,9 +495,10 @@ impl SnapshotMountSession {
             return Err(SnapshotMountError::VolumeMismatch);
         }
         let runtime_meta: Arc<dyn VfsMeta> = into_vfs_meta(snapshot_meta);
+        let mut metadata_handles = self.metadata_handles.lock();
         Ok(metadata_handles
             .entry(cache_key.clone())
-            .or_insert_with(|| Arc::clone(&runtime_meta))
+            .or_insert(runtime_meta)
             .clone())
     }
 
@@ -640,11 +641,26 @@ impl SnapshotMountSession {
                             continue;
                         };
                         let sidecar = last_used_path(&path);
-                        let Ok(value) = fs::read_to_string(sidecar).await else {
-                            continue;
+                        let last_used = match fs::read_to_string(sidecar).await {
+                            Ok(value) => value.trim().parse::<DateTime<Utc>>().ok(),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(_) => continue,
                         };
-                        let Ok(last_used) = value.trim().parse::<DateTime<Utc>>() else {
-                            continue;
+                        let last_used = match last_used {
+                            Some(last_used) => last_used,
+                            None => {
+                                // A crash can leave the immutable artifact without its
+                                // last-used sidecar. Use the artifact mtime so the entry
+                                // remains eligible for bounded cache cleanup.
+                                let Some(modified) = fs::metadata(&path)
+                                    .await
+                                    .ok()
+                                    .and_then(|metadata| metadata.modified().ok())
+                                else {
+                                    continue;
+                                };
+                                DateTime::<Utc>::from(modified)
+                            }
                         };
                         let Ok(volume) = SnapshotVolumeContext::new(
                             volume_id,
@@ -1957,5 +1973,43 @@ mod tests {
         );
         assert!(!cache_path.exists());
         assert!(!super::last_used_path(&cache_path).exists());
+    }
+
+    #[tokio::test]
+    async fn missing_last_used_sidecar_uses_cache_mtime_for_indexing() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
+        let now = Utc::now();
+        let snapshot_volume = volume(42, "00000000-0000-0000-0000-000000000042");
+        let snapshot_cut = cut(snapshot_volume.volume_id, now);
+        let snapshot = snapshot_id(&snapshot_volume.volume_name, now);
+        let bytes = valid_snapshot_bytes(root.path(), "missing-sidecar", &snapshot_volume);
+        let descriptor = artifact(
+            "snapshots/missing-sidecar.redb",
+            snapshot_cut,
+            &bytes,
+            digest(&bytes),
+        );
+
+        let harness =
+            SnapshotMountSession::new_for_tests(root.path(), now, snapshot_volume.clone());
+        harness.set_catalog(catalog(
+            SnapshotLifecycle::Ready,
+            snapshot_volume.clone(),
+            snapshot.clone(),
+            snapshot_cut,
+            Some(descriptor),
+        ));
+        harness.put_artifact(bytes);
+        let mount = harness
+            .mount(&snapshot, "missing-sidecar-mount")
+            .await
+            .expect("ready artifact should mount");
+        let cache_path = mount.cache_key().cache_path(root.path());
+        mount.release().await.expect("release mount lease");
+        fs::remove_file(super::last_used_path(&cache_path)).expect("remove last-used sidecar");
+
+        let restarted = SnapshotMountSession::new_for_tests(root.path(), now, snapshot_volume);
+        assert_eq!(restarted.evict_idle_cache().await.expect("index cache"), 0);
+        assert_eq!(restarted.cache_last_used.lock().len(), 1);
     }
 }

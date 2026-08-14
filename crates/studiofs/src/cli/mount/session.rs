@@ -893,6 +893,44 @@ fn record_cleanup_error(
     }
 }
 
+fn remove_snapshot_mount_runtime_dir(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to remove snapshot mount runtime directory '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+struct SnapshotMountRuntimeDirGuard(Option<PathBuf>);
+
+impl SnapshotMountRuntimeDirGuard {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SnapshotMountRuntimeDirGuard {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else {
+            return;
+        };
+
+        if let Err(error) = remove_snapshot_mount_runtime_dir(&path) {
+            warn!(
+                error = ?error,
+                "failed to remove snapshot mount runtime directory after preparation failure"
+            );
+        }
+    }
+}
+
 fn run_snapshot_mount_shutdown(
     runtime: &Runtime,
     prepared: PreparedSnapshotMount,
@@ -1165,6 +1203,12 @@ impl MountPlan {
                 } = prepare_volume_cache_runtime(&self.base_cache_path, &format_info.uuid)?;
                 (cache_path, cache_path_str, Some(cache_runtime))
             };
+            let mut snapshot_runtime_dir_guard = SnapshotMountRuntimeDirGuard::new(
+                self.command
+                    .snapshot_id
+                    .as_ref()
+                    .map(|_| cache_path.clone()),
+            );
             let cache_size_bytes = parse_positive_size_arg(&self.cache_size)?;
             let profiling = build_mount_profile_finish(
                 self.command.profile,
@@ -1314,6 +1358,7 @@ impl MountPlan {
                     vfs.clone(),
                 ));
 
+            snapshot_runtime_dir_guard.disarm();
             Ok(PreparedForegroundRuntime {
                 cache_path,
                 cache_path_str,
@@ -1498,6 +1543,7 @@ impl MountRuntimeGuard {
         let foreground = self.prepared.foreground.take();
 
         if let Some(PreparedForegroundRuntime {
+            cache_path,
             backend,
             vfs,
             runtime,
@@ -1509,6 +1555,7 @@ impl MountRuntimeGuard {
             ..
         }) = foreground
         {
+            let snapshot_runtime_path = snapshot_mount.as_ref().map(|_| cache_path);
             write_path_observability_publisher.stop_and_join();
 
             if let Some(diagnostics_host) = self.diagnostics_host.take() {
@@ -1562,12 +1609,28 @@ impl MountRuntimeGuard {
                 }
             }
 
-            if let Some(runtime) = runtime {
-                record_cleanup_error(
-                    &mut first_error,
-                    "Tokio runtime shutdown",
-                    shutdown_mount_runtime(runtime, runtime_shutdown_timeout()),
-                );
+            let runtime_shutdown_succeeded = if let Some(runtime) = runtime {
+                let result = shutdown_mount_runtime(runtime, runtime_shutdown_timeout());
+                let succeeded = result.is_ok();
+                record_cleanup_error(&mut first_error, "Tokio runtime shutdown", result);
+                succeeded
+            } else {
+                false
+            };
+
+            if let Some(path) = snapshot_runtime_path {
+                if runtime_shutdown_succeeded {
+                    record_cleanup_error(
+                        &mut first_error,
+                        "snapshot mount runtime cleanup",
+                        remove_snapshot_mount_runtime_dir(&path),
+                    );
+                } else {
+                    warn!(
+                        path = %path.display(),
+                        "snapshot mount runtime cleanup was deferred after runtime shutdown failure"
+                    );
+                }
             }
         }
 
@@ -1597,6 +1660,7 @@ impl Drop for MountRuntimeGuard {
         }
         if let Some(foreground) = self.prepared.foreground.take() {
             let PreparedForegroundRuntime {
+                cache_path,
                 backend,
                 vfs,
                 runtime,
@@ -1607,6 +1671,7 @@ impl Drop for MountRuntimeGuard {
                 snapshot_mount,
                 ..
             } = foreground;
+            let snapshot_runtime_path = snapshot_mount.as_ref().map(|_| cache_path);
 
             write_path_observability_publisher.stop_and_join();
             if let Some(mut finish_profiling) = profiling.take() {
@@ -1634,6 +1699,7 @@ impl Drop for MountRuntimeGuard {
                         None
                     }
                 };
+            let runtime_shutdown_available = runtime.is_some();
 
             drop(diagnostics_source);
             drop(profiling_backend);
@@ -1656,6 +1722,19 @@ impl Drop for MountRuntimeGuard {
                 }
             }
             drop(runtime);
+
+            if let Some(path) = snapshot_runtime_path {
+                if runtime_shutdown_available {
+                    if let Err(error) = remove_snapshot_mount_runtime_dir(&path) {
+                        warn!(error = ?error, "failed to remove snapshot mount runtime directory");
+                    }
+                } else {
+                    warn!(
+                        path = %path.display(),
+                        "snapshot mount runtime cleanup was deferred after runtime shutdown failure"
+                    );
+                }
+            }
         }
         drop(self.prepared.mount_lock.take());
     }
@@ -2464,6 +2543,34 @@ mod tests {
                 .redb_index_path
                 .starts_with(temp.path().join("snapshot-v2").join("mount-runtime"))
         );
+    }
+
+    #[test]
+    fn snapshot_mount_runtime_cleanup_removes_only_ephemeral_tree() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let snapshot_path = snapshot_mount_runtime_path(temp.path(), "smount-test-owner");
+        std::fs::create_dir_all(snapshot_path.join("nested")).expect("create snapshot runtime");
+        std::fs::write(snapshot_path.join("nested").join("state"), b"state")
+            .expect("write snapshot runtime state");
+
+        remove_snapshot_mount_runtime_dir(&snapshot_path).expect("remove snapshot runtime");
+
+        assert!(!snapshot_path.exists());
+        assert!(temp.path().exists());
+        remove_snapshot_mount_runtime_dir(&snapshot_path).expect("missing runtime is harmless");
+    }
+
+    #[test]
+    fn snapshot_mount_runtime_guard_cleans_failed_preparation() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let snapshot_path = snapshot_mount_runtime_path(temp.path(), "smount-failed-owner");
+        std::fs::create_dir_all(&snapshot_path).expect("create snapshot runtime");
+
+        {
+            let _guard = SnapshotMountRuntimeDirGuard::new(Some(snapshot_path.clone()));
+        }
+
+        assert!(!snapshot_path.exists());
     }
 
     #[test]
