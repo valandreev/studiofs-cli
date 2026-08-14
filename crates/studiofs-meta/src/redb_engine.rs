@@ -33,7 +33,8 @@ const REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS: u64 = 1_000;
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
-    db: Arc<RwLock<Database>>,
+    db: Option<Arc<RwLock<Database>>>,
+    read_only_db: Option<Arc<ReadOnlyDatabase>>,
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
     #[cfg(test)]
@@ -403,7 +404,7 @@ fn start_relaxed_durability_runtime_with_interval(
     }))
 }
 
-fn begin_redb_read_txn(db: &Database) -> MetaResult<ReadTransaction> {
+fn begin_redb_read_txn(db: &dyn ReadableDatabase) -> MetaResult<ReadTransaction> {
     db.begin_read()
         .map_err(|e| MetaError::Storage(e.to_string()))
 }
@@ -474,19 +475,31 @@ impl RedbMetaEngine {
         }
     }
 
-    pub(crate) fn read_db(&self) -> MetaResult<RwLockReadGuard<'_, Database>> {
-        self.db
-            .read()
-            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))
-    }
-
     pub(crate) fn begin_read_txn(&self) -> MetaResult<ReadTransaction> {
-        let db = self.read_db()?;
-        begin_redb_read_txn(&db)
+        if let Some(db) = self.db.as_ref() {
+            let db = db
+                .read()
+                .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
+            return begin_redb_read_txn(&*db);
+        }
+
+        self.read_only_db
+            .as_ref()
+            .ok_or_else(|| MetaError::Storage("redb database handle is unavailable".to_string()))?
+            .begin_read()
+            .map_err(|error| MetaError::Storage(error.to_string()))
     }
 
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
-        let db = self.read_db()?;
+        let db = self.db.as_ref().ok_or_else(|| MetaError::AccessDenied {
+            ino: ROOT_INO,
+            principal: "snapshot-read-only".to_string(),
+            required: AccessLevel::ReadWrite,
+            actual: AccessLevel::ReadOnly,
+        })?;
+        let db = db
+            .read()
+            .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
         let started = Instant::now();
         let result = begin_redb_write_txn(&db, self.relaxed_durability.as_deref());
         MetadataWriteMetrics::observe(&self.write_metrics.begin_write, started.elapsed());
@@ -569,7 +582,8 @@ impl RedbMetaEngine {
             );
         });
         let engine = Self {
-            db,
+            db: Some(db),
+            read_only_db: None,
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
             #[cfg(test)]
@@ -599,6 +613,25 @@ impl RedbMetaEngine {
         }
 
         Ok(engine)
+    }
+
+    /// Open an existing metadata database through redb's read-only backend.
+    ///
+    /// Unlike [`Self::open`], this path never creates tables, repairs rows, or
+    /// starts a durability worker. It is intended for immutable snapshot
+    /// artifacts only.
+    pub fn open_read_only(path: impl AsRef<Path>) -> MetaResult<Self> {
+        let db = ReadOnlyDatabase::open(path.as_ref()).map_err(|error| {
+            MetaError::Storage(format!("failed to open redb read-only: {error}"))
+        })?;
+        Ok(Self {
+            db: None,
+            read_only_db: Some(Arc::new(db)),
+            write_metrics: Arc::new(MetadataWriteMetrics::default()),
+            relaxed_durability: None,
+            #[cfg(test)]
+            allocator_state_write_hook: Mutex::new(None),
+        })
     }
 
     /// Initialize a fresh filesystem with root inode.
@@ -636,15 +669,21 @@ impl RedbMetaEngine {
         let Some(runtime) = self.relaxed_durability.as_deref() else {
             return Ok(());
         };
-        if runtime.state.pending.load(Ordering::Acquire) && relaxed_barrier_due(&runtime.state) {
-            immediate_metadata_barrier(&self.db, Some(&runtime.state))?;
+        if runtime.state.pending.load(Ordering::Acquire)
+            && relaxed_barrier_due(&runtime.state)
+            && let Some(db) = self.db.as_ref()
+        {
+            immediate_metadata_barrier(db, Some(&runtime.state))?;
         }
         Ok(())
     }
 
     pub(crate) fn sync_local_metadata(&self) -> MetaResult<()> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
         immediate_metadata_barrier(
-            &self.db,
+            db,
             self.relaxed_durability
                 .as_deref()
                 .map(|runtime| runtime.state.as_ref()),

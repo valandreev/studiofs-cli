@@ -3,7 +3,7 @@ use super::*;
 use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::Duration;
 use studiofs_cache::CachedStoreWriterConfig;
@@ -14372,6 +14372,29 @@ fn test_file_session_background_complete_gc_removes_idle_session() {
             "background completion should collect an otherwise idle session"
         );
     });
+}
+
+#[test]
+fn mutation_access_checks_snapshot_mount_fence_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "snapshot-fence-once");
+    let fence_calls = Arc::new(AtomicUsize::new(0));
+    let fence_calls_for_vfs = Arc::clone(&fence_calls);
+
+    Arc::get_mut(&mut vfs)
+        .expect("test VFS must not have another Arc owner")
+        .snapshot_mount_fence = Some(Arc::new(move |_ino| {
+        fence_calls_for_vfs.fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(())
+    }));
+
+    vfs.enforce_access(ROOT_INO, AccessLevel::ReadWrite)
+        .expect("mutation admission should succeed");
+    assert_eq!(
+        fence_calls.load(AtomicOrdering::Relaxed),
+        1,
+        "mutation admission must evaluate the snapshot fence once"
+    );
 }
 
 #[test]

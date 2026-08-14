@@ -916,6 +916,8 @@ fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool 
 pub struct StudioFsContext {
     vfs: Arc<StudioVfs>,
     rt: Handle,
+    /// Rejects every WinFSP mutation admission for a snapshot-backed context.
+    read_only: bool,
     /// Cached binary security descriptor (Everyone = Full Access).
     default_sd: Vec<u8>,
     /// Pending kernel cache invalidation queue (shared with
@@ -942,11 +944,30 @@ impl StudioFsContext {
         rt: Handle,
         invalidation_queue: Arc<WinfspInvalidationQueue>,
     ) -> std::io::Result<Self> {
+        Self::new_with_read_only(vfs, rt, invalidation_queue, false)
+    }
+
+    /// Creates a WinFSP filesystem context that admits reads only.
+    pub fn new_read_only(
+        vfs: Arc<StudioVfs>,
+        rt: Handle,
+        invalidation_queue: Arc<WinfspInvalidationQueue>,
+    ) -> std::io::Result<Self> {
+        Self::new_with_read_only(vfs, rt, invalidation_queue, true)
+    }
+
+    fn new_with_read_only(
+        vfs: Arc<StudioVfs>,
+        rt: Handle,
+        invalidation_queue: Arc<WinfspInvalidationQueue>,
+        read_only: bool,
+    ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
         Ok(Self {
             vfs,
             rt,
+            read_only,
             default_sd,
             invalidation_queue,
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
@@ -965,6 +986,7 @@ impl StudioFsContext {
         vfs: Arc<StudioVfs>,
         rt: Arc<tokio::runtime::Runtime>,
         invalidation_queue: Arc<WinfspInvalidationQueue>,
+        read_only: bool,
     ) -> Self {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
@@ -972,12 +994,20 @@ impl StudioFsContext {
         Self {
             vfs,
             rt: rt.handle().clone(),
+            read_only,
             default_sd,
             invalidation_queue,
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             _test_runtime: Some(rt),
         }
+    }
+
+    fn ensure_writable(&self) -> winfsp::Result<()> {
+        if self.read_only {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
+        Ok(())
     }
 
     fn should_disable_os_cache_for_handle(
@@ -1540,13 +1570,16 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let open_flags = open_flags_from_access(granted_access, create_options);
+        let raw_create_options = current_winfsp_create_options(create_options);
+        let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
+        if self.read_only && (open_flags_allow_write(open_flags) || trunc) {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
         let attr = resolve_path(&self.vfs, file_name)?;
-        let open_flags = open_flags_from_access(granted_access, create_options);
-        let raw_create_options = current_winfsp_create_options(create_options);
-        let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
         let write_local_sync_policy =
             write_local_sync_policy_from_create_options(raw_create_options);
         Self::write_open_file_info(file_info, &attr);
@@ -1616,6 +1649,7 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        self.ensure_writable()?;
         if is_runtime_stats_windows_path(file_name) {
             let disposition = create_disposition_from_create_options(create_options);
             if (create_options & FILE_DIRECTORY_FILE_OPTION) != 0 {
@@ -1781,6 +1815,7 @@ impl FileSystemContext for StudioFsContext {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        self.ensure_writable()?;
         self.vfs.note_winfsp_write_callback();
         self.clear_handle_zero_fill_range(context.fh);
         let callback_started = Instant::now();
@@ -1887,6 +1922,7 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
+        self.ensure_writable()?;
         if delete_file && self.vfs.is_runtime_stats_file_ino(context.ino) {
             return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
         }
@@ -1926,6 +1962,7 @@ impl FileSystemContext for StudioFsContext {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        self.ensure_writable()?;
         self.vfs.note_winfsp_overwrite_callback();
         // `Overwrite` is an immediate EOF transition, not a backgroundable
         // flush barrier. Later reads/writes in the same open sequence depend on
@@ -1948,6 +1985,7 @@ impl FileSystemContext for StudioFsContext {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        self.ensure_writable()?;
         self.execute_basic_info_callback(
             context.ino,
             build_basic_info_setattr_args(
@@ -1967,6 +2005,7 @@ impl FileSystemContext for StudioFsContext {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        self.ensure_writable()?;
         // WinFSP can call this with set_allocation_size=true to reserve
         // capacity without changing logical EOF. Rust's Windows stdlib also
         // uses a zero allocation-size request as the first truncation step for
@@ -2010,6 +2049,7 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         _buffer: &[u8],
     ) -> winfsp::Result<()> {
+        self.ensure_writable()?;
         // Symlinks are created at create() time via extra_buffer_is_reparse_point.
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
@@ -2020,6 +2060,7 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         _buffer: &[u8],
     ) -> winfsp::Result<()> {
+        self.ensure_writable()?;
         // Reparse points (symlinks) are removed via normal unlink in cleanup.
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
@@ -2031,6 +2072,7 @@ impl FileSystemContext for StudioFsContext {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
+        self.ensure_writable()?;
         let callback_started = Instant::now();
         let old_path = file_name.to_string_lossy();
         let new_path = new_file_name.to_string_lossy();
@@ -2176,15 +2218,19 @@ impl AsyncFileSystemContext for StudioFsContext {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
-        self.vfs.note_winfsp_write_callback();
         let callback_started = Instant::now();
         let ino = context.ino;
         let fh = context.fh;
         let open_flags = context.open_flags;
         let local_sync_policy = context.write_local_sync_policy;
+        let read_only = self.read_only;
         let vfs = self.vfs.clone();
 
         async move {
+            if read_only {
+                return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+            }
+            vfs.note_winfsp_write_callback();
             let pre_write_size =
                 pre_write_size_for_winfsp_write(&vfs, ino, write_to_eof, constrained_io)?;
             let actual_offset = if write_to_eof {
@@ -2380,7 +2426,7 @@ mod tests {
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
         let queue = WinfspInvalidationQueue::new(&vfs);
-        let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone());
+        let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone(), false);
         (tmp, vfs, ctx, queue)
     }
 
@@ -3515,6 +3561,34 @@ mod tests {
             .expect_err("runtime stats delete should be denied")
             .to_ntstatus();
         assert_eq!(status, STATUS_ACCESS_DENIED.0);
+    }
+
+    #[test]
+    fn snapshot_read_only_context_rejects_mutations_before_vfs() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("snapshot-read-only-context");
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let vfs = make_test_vfs(&tmp, "snapshot-read-only", &rt);
+        let queue = WinfspInvalidationQueue::new(&vfs);
+        let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone(), true);
+        let before = vfs.readdir(ROOT_INO).expect("read root before delete");
+        let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDWR);
+        let file_name = U16CString::from_str(r"\snapshot-read-only").expect("u16 path");
+
+        let status = <StudioFsContext as FileSystemContext>::set_delete(
+            &ctx,
+            &handle,
+            file_name.as_ucstr(),
+            true,
+        )
+        .expect_err("snapshot read-only mutation should be denied")
+        .to_ntstatus();
+
+        assert_eq!(status, STATUS_ACCESS_DENIED.0);
+        assert_eq!(
+            vfs.readdir(ROOT_INO).expect("read root after delete").len(),
+            before.len(),
+            "the bridge must reject before touching VFS state"
+        );
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub mod pg_dsn;
 pub mod pg_engine;
 /// TLS-aware PostgreSQL transport helpers.
 pub mod pg_transport;
+/// Read-only metadata adapter used by immutable snapshot mounts.
+pub mod read_only;
 /// redb-backed metadata engine implementation.
 pub mod redb_engine;
 /// Internal on-disk metadata schema and replication model types.
@@ -50,8 +52,33 @@ pub use pg_dsn::{
 };
 pub use pg_engine::{PgMetaEngine, PgOpenOptions};
 pub use pg_transport::connect_studiofs_postgres;
+pub use read_only::ReadOnlyMetaEngine;
 pub use redb_engine::RedbMetaEngine;
 pub use types::*;
+
+/// Opens an immutable snapshot metadata artifact behind the read-only metadata
+/// adapter used by snapshot mounts.
+pub fn open_read_only_snapshot_meta(
+    path: impl AsRef<Path>,
+) -> MetaResult<Arc<ReadOnlyMetaEngine<RedbMetaEngine>>> {
+    let path = path.as_ref();
+    let format_info = RedbMetaEngine::read_format_info_readonly(path)?;
+    ensure_supported_format_version(&format_info)?;
+    let redb = Arc::new(RedbMetaEngine::open_read_only(path)?);
+    let opened_format_info = redb.get_format_info()?;
+    ensure_supported_format_version(&opened_format_info)?;
+    if opened_format_info.format_version != format_info.format_version
+        || opened_format_info.name != format_info.name
+        || opened_format_info.uuid != format_info.uuid
+        || opened_format_info.data_prefix != format_info.data_prefix
+        || opened_format_info.block_size != format_info.block_size
+    {
+        return Err(MetaError::Storage(
+            "snapshot metadata changed while opening".to_string(),
+        ));
+    }
+    Ok(Arc::new(ReadOnlyMetaEngine::new(redb)))
+}
 
 #[derive(Debug, Clone, Copy)]
 /// Runtime knobs that influence how a metadata engine instance is opened.

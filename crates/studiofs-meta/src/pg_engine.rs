@@ -263,6 +263,8 @@ pub mod schema;
 pub(crate) mod snapshot_control;
 #[path = "pg_engine/snapshot_jobs.rs"]
 mod snapshot_jobs;
+#[path = "pg_engine/snapshot_mount_leases.rs"]
+mod snapshot_mount_leases;
 #[path = "pg_engine/snapshot_policy.rs"]
 mod snapshot_policy;
 #[path = "pg_engine/snapshot_reachability.rs"]

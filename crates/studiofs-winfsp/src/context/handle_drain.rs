@@ -131,7 +131,7 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         file_name: Option<&U16CStr>,
         flags: u32,
     ) {
-        if flags & FSP_CLEANUP_DELETE == 0 {
+        if self.context.read_only || flags & FSP_CLEANUP_DELETE == 0 {
             self.cleanup_non_delete(context.ino, context.fh);
             return;
         }

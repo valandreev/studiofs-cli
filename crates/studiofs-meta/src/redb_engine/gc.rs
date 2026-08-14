@@ -3,7 +3,10 @@ use redb::CompactionError;
 
 impl MetaGc for RedbMetaEngine {
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
-        let mut db = match self.db.try_write() {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(LocalStorageCompactionResult::NoWork);
+        };
+        let mut db = match db.try_write() {
             Ok(db) => db,
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Ok(LocalStorageCompactionResult::SkippedBusy);

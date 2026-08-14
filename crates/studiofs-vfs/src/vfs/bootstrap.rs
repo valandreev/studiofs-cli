@@ -396,6 +396,14 @@ struct VfsBootstrap {
     plan: VfsBootstrapPlan,
     resources: VfsBootstrapResources,
     cache_dir: PathBuf,
+    read_only_mount: bool,
+    snapshot_mount_fence: Option<SnapshotMountFence>,
+}
+
+struct VfsBootstrapOptions {
+    cache_runtime: Option<PreparedLocalPayloadRuntime>,
+    read_only_mount: bool,
+    snapshot_mount_fence: Option<SnapshotMountFence>,
 }
 
 impl VfsBootstrap {
@@ -406,11 +414,16 @@ impl VfsBootstrap {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedLocalPayloadRuntime>,
+        options: VfsBootstrapOptions,
     ) -> VfsResult<Self>
     where
         M: ?Sized + VfsMeta + 'static,
     {
+        let VfsBootstrapOptions {
+            cache_runtime,
+            read_only_mount,
+            snapshot_mount_fence,
+        } = options;
         let meta = into_vfs_meta(meta);
         let plan = VfsBootstrapPlan::build(
             meta.get_format_info()?,
@@ -427,6 +440,8 @@ impl VfsBootstrap {
             plan,
             resources,
             cache_dir: PathBuf::from(cache_dir),
+            read_only_mount,
+            snapshot_mount_fence,
         })
     }
 
@@ -437,22 +452,34 @@ impl VfsBootstrap {
             plan,
             resources,
             cache_dir,
+            read_only_mount,
+            snapshot_mount_fence,
         } = self;
         let block_size = plan.block_size();
         let upload_cache_io_slots = plan.cache_runtime_tuning.upload_cache_io_slots;
-        let distributed_flock = meta.invalidation_sender_id().map(|_| DistributedFlock {
-            lease_ttl: Duration::from_secs(config.lock_ttl_secs),
-            retry_base_ms: config.lock_retry_base_ms,
-            retry_max_ms: config.lock_retry_max_ms,
-        });
-        let snapshot_worker = build_snapshot_worker(
-            meta.as_ref(),
-            resources.data_write.clone(),
-            snapshot_materializer_root(&cache_dir),
-        );
+        let distributed_flock = (!read_only_mount)
+            .then(|| {
+                meta.invalidation_sender_id().map(|_| DistributedFlock {
+                    lease_ttl: Duration::from_secs(config.lock_ttl_secs),
+                    retry_base_ms: config.lock_retry_base_ms,
+                    retry_max_ms: config.lock_retry_max_ms,
+                })
+            })
+            .flatten();
+        let snapshot_worker = if read_only_mount {
+            None
+        } else {
+            build_snapshot_worker(
+                meta.as_ref(),
+                resources.data_write.clone(),
+                snapshot_materializer_root(&cache_dir),
+            )
+        };
 
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
+            read_only_mount,
+            snapshot_mount_fence,
             data_write: resources.data_write,
             snapshot_worker,
             local_payload_backend: resources.local_payload_backend,
@@ -593,6 +620,9 @@ fn snapshot_materializer_root(cache_dir: &Path) -> PathBuf {
 
 impl StudioVfs {
     fn finalize_constructor_bootstrap(&self) -> VfsResult<()> {
+        if self.read_only_mount {
+            return Ok(());
+        }
         let recovered_after_unclean_shutdown = self.begin_zeroio_session()?;
         let landing_recovery_inodes = if recovered_after_unclean_shutdown {
             match self.landing_zone.recoverable_inodes() {
@@ -635,7 +665,11 @@ impl StudioVfs {
             cache_size,
             memory_cache_budget_bytes,
             config,
-            None,
+            VfsBootstrapOptions {
+                cache_runtime: None,
+                read_only_mount: false,
+                snapshot_mount_fence: None,
+            },
         )
     }
 
@@ -659,7 +693,40 @@ impl StudioVfs {
             cache_size,
             memory_cache_budget_bytes,
             config,
-            Some(cache_runtime),
+            VfsBootstrapOptions {
+                cache_runtime: Some(cache_runtime),
+                read_only_mount: false,
+                snapshot_mount_fence: None,
+            },
+        )
+    }
+
+    /// Create a read-only VFS fenced by the durable lease of its snapshot
+    /// mount. The fence is checked before every metadata admission decision.
+    pub(crate) fn new_read_only_with_snapshot_mount_fence<M>(
+        meta: Arc<M>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        memory_cache_budget_bytes: u64,
+        config: VfsConfigValidated,
+        snapshot_mount_fence: SnapshotMountFence,
+    ) -> VfsResult<Arc<Self>>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
+        Self::new_impl(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            memory_cache_budget_bytes,
+            config,
+            VfsBootstrapOptions {
+                cache_runtime: None,
+                read_only_mount: true,
+                snapshot_mount_fence: Some(snapshot_mount_fence),
+            },
         )
     }
 
@@ -670,7 +737,7 @@ impl StudioVfs {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedLocalPayloadRuntime>,
+        options: VfsBootstrapOptions,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -682,7 +749,7 @@ impl StudioVfs {
             cache_size,
             memory_cache_budget_bytes,
             config,
-            cache_runtime,
+            options,
         )?
         .finish()
     }

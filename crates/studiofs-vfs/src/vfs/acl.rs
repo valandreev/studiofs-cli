@@ -178,6 +178,7 @@ impl StudioVfs {
 
     /// Enforces minimum required access level, or returns `AccessDenied` / not-found errors.
     pub(super) fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
+        self.enforce_snapshot_mount_fence(ino)?;
         let actual = self.effective_access_level(ino)?;
         if Self::access_satisfies(actual, required) {
             if required == AccessLevel::ReadWrite {
@@ -202,6 +203,7 @@ impl StudioVfs {
         ino: Ino,
         required: AccessLevel,
     ) -> VfsResult<()> {
+        self.enforce_snapshot_mount_fence(ino)?;
         if let Some(actual) = self.effective_access_level_cached(ino) {
             if Self::access_satisfies(actual, required) {
                 if required == AccessLevel::ReadWrite {

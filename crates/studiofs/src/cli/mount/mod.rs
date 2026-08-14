@@ -7,6 +7,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use super::runtime_tuning::PublicRuntimeTuningArgs;
+use studiofs_meta::snapshot::SnapshotId;
 
 pub(crate) use session::MountSession;
 
@@ -24,6 +25,7 @@ pub(crate) struct MountCommand {
     pub(crate) read_only: bool,
     pub(crate) endpoint: Option<String>,
     pub(crate) runtime_tuning: PublicRuntimeTuningArgs,
+    pub(crate) snapshot_id: Option<SnapshotId>,
 }
 
 impl MountCommand {
@@ -42,6 +44,30 @@ impl MountCommand {
             read_only: args.read_only,
             endpoint: args.endpoint,
             runtime_tuning: args.runtime_tuning,
+            snapshot_id: None,
+        })
+    }
+
+    pub(crate) fn from_snapshot_args(
+        name: String,
+        snapshot_id: SnapshotId,
+        mount_point: String,
+    ) -> anyhow::Result<Self> {
+        let meta_dir = super::utils::get_default_meta_dir(&name)?;
+        Ok(Self {
+            name,
+            meta_dir,
+            mount_point: Some(mount_point),
+            cache_dir: None,
+            cache_size: None,
+            principal: None,
+            foreground: false,
+            detach: false,
+            profile: None,
+            read_only: true,
+            endpoint: None,
+            runtime_tuning: PublicRuntimeTuningArgs::default(),
+            snapshot_id: Some(snapshot_id),
         })
     }
 }
@@ -186,7 +212,275 @@ impl MountArgs {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
     use clap::error::ErrorKind;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+    use std::sync::Arc;
+    use studiofs_meta::snapshot::{
+        SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob,
+        SnapshotCreationLease, SnapshotCreationState, SnapshotCut, SnapshotId, SnapshotLifecycle,
+        SnapshotMountLease, SnapshotOrigin, SnapshotRetention, SnapshotSha256,
+        SnapshotVolumeContext,
+    };
+    use studiofs_meta::snapshot_ports::{
+        SnapshotArtifactBytes, SnapshotArtifactLocator, SnapshotArtifactScope,
+        SnapshotArtifactStore, SnapshotClaimOrFollow, SnapshotClock, SnapshotFailure,
+        SnapshotJobClaim, SnapshotJobStore, SnapshotMountStore, SnapshotPayloadProof,
+        SnapshotPortError, SnapshotPortFuture, SnapshotRetry, SnapshotStoredArtifact,
+        SnapshotWorkerId,
+    };
+
+    fn unsupported<'a, T>() -> SnapshotPortFuture<'a, T> {
+        Box::pin(async {
+            Err(SnapshotPortError::permanent(
+                "unsupported_test_port",
+                "operation is not used by this test",
+            ))
+        })
+    }
+
+    #[derive(Default)]
+    struct CliJobStore {
+        catalog: parking_lot::Mutex<Option<SnapshotCatalogEntry>>,
+    }
+
+    impl CliJobStore {
+        fn set_catalog(&self, catalog: SnapshotCatalogEntry) {
+            *self.catalog.lock() = Some(catalog);
+        }
+    }
+
+    impl SnapshotJobStore for CliJobStore {
+        fn claim_next<'a>(
+            &'a self,
+            _worker: &'a SnapshotWorkerId,
+            _lease_for: std::time::Duration,
+        ) -> SnapshotPortFuture<'a, Option<SnapshotJobClaim>> {
+            unsupported()
+        }
+
+        fn claim_id_or_follow<'a>(
+            &'a self,
+            _snapshot_id: &'a SnapshotId,
+            _worker: &'a SnapshotWorkerId,
+            _lease_for: std::time::Duration,
+        ) -> SnapshotPortFuture<'a, SnapshotClaimOrFollow> {
+            unsupported()
+        }
+
+        fn renew_lease<'a>(
+            &'a self,
+            _claim: &'a SnapshotJobClaim,
+            _lease_for: std::time::Duration,
+        ) -> SnapshotPortFuture<'a, SnapshotCreationLease> {
+            unsupported()
+        }
+
+        fn release_lease<'a>(&'a self, _claim: &'a SnapshotJobClaim) -> SnapshotPortFuture<'a, ()> {
+            unsupported()
+        }
+
+        fn mark_retry_wait<'a>(
+            &'a self,
+            _claim: &'a SnapshotJobClaim,
+            _retry: SnapshotRetry,
+        ) -> SnapshotPortFuture<'a, SnapshotCreationJob> {
+            unsupported()
+        }
+
+        fn mark_failed<'a>(
+            &'a self,
+            _claim: &'a SnapshotJobClaim,
+            _failure: SnapshotFailure,
+        ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry> {
+            unsupported()
+        }
+
+        fn publish_ready<'a>(
+            &'a self,
+            _claim: &'a SnapshotJobClaim,
+            _descriptor: &'a SnapshotArtifactDescriptor,
+            _payload_proofs: &'a [SnapshotPayloadProof],
+        ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry> {
+            unsupported()
+        }
+
+        fn load_catalog<'a>(
+            &'a self,
+            _snapshot_id: &'a SnapshotId,
+        ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry> {
+            let catalog = self.catalog.lock().clone();
+            Box::pin(async move {
+                catalog.ok_or_else(|| {
+                    SnapshotPortError::permanent("snapshot_not_found", "snapshot does not exist")
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CliArtifactStore {
+        bytes: parking_lot::Mutex<Option<Vec<u8>>>,
+    }
+
+    impl CliArtifactStore {
+        fn put(&self, bytes: Vec<u8>) {
+            *self.bytes.lock() = Some(bytes);
+        }
+    }
+
+    impl SnapshotArtifactStore for CliArtifactStore {
+        fn put_attempt<'a>(
+            &'a self,
+            _locator: &'a SnapshotArtifactLocator,
+            _source: &'a Path,
+        ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact> {
+            unsupported()
+        }
+
+        fn publish_final<'a>(
+            &'a self,
+            _attempt: &'a SnapshotArtifactLocator,
+            _final_artifact: &'a SnapshotArtifactLocator,
+            _source: &'a Path,
+            _expected_sha256: &'a SnapshotSha256,
+        ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact> {
+            unsupported()
+        }
+
+        fn get<'a>(
+            &'a self,
+            _locator: &'a SnapshotArtifactLocator,
+        ) -> SnapshotPortFuture<'a, SnapshotArtifactBytes> {
+            let bytes = self.bytes.lock().clone();
+            Box::pin(async move {
+                let bytes = bytes.ok_or_else(|| {
+                    SnapshotPortError::permanent(
+                        "artifact_not_found",
+                        "snapshot artifact is unavailable",
+                    )
+                })?;
+                Ok(SnapshotArtifactBytes {
+                    sha256: SnapshotSha256::from_bytes(Sha256::digest(&bytes).into()),
+                    bytes,
+                })
+            })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _locator: &'a SnapshotArtifactLocator,
+        ) -> SnapshotPortFuture<'a, ()> {
+            unsupported()
+        }
+
+        fn list<'a>(
+            &'a self,
+            _scope: &'a SnapshotArtifactScope,
+        ) -> SnapshotPortFuture<'a, Vec<SnapshotStoredArtifact>> {
+            unsupported()
+        }
+    }
+
+    struct CliClock {
+        now: chrono::DateTime<Utc>,
+    }
+
+    impl SnapshotClock for CliClock {
+        fn now(&self) -> chrono::DateTime<Utc> {
+            self.now
+        }
+
+        fn sleep_until<'a>(
+            &'a self,
+            deadline: chrono::DateTime<Utc>,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> SnapshotPortFuture<'a, ()> {
+            let delay = (deadline - self.now).to_std().unwrap_or_default();
+            Box::pin(async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => Err(SnapshotPortError::Cancelled),
+                    _ = tokio::time::sleep(delay) => Ok(()),
+                }
+            })
+        }
+    }
+
+    struct CliMountStore;
+
+    impl SnapshotMountStore for CliMountStore {
+        fn acquire<'a>(
+            &'a self,
+            snapshot_id: &'a SnapshotId,
+            owner: &'a str,
+            cache_volume_uuid: &'a str,
+            cache_sha256: &'a SnapshotSha256,
+            lease_for: std::time::Duration,
+        ) -> SnapshotPortFuture<'a, SnapshotMountLease> {
+            let lease = SnapshotMountLease {
+                lease_id: 1,
+                snapshot_id: snapshot_id.clone(),
+                owner: owner.to_string(),
+                cache_volume_uuid: cache_volume_uuid.to_string(),
+                cache_sha256: *cache_sha256,
+                expires_at: Utc::now() + chrono::Duration::from_std(lease_for).unwrap_or_default(),
+                heartbeat_at: Utc::now(),
+                fencing_token: 1,
+                released: false,
+            };
+            Box::pin(async move { Ok(lease) })
+        }
+
+        fn renew<'a>(
+            &'a self,
+            lease: &'a SnapshotMountLease,
+            _lease_for: std::time::Duration,
+        ) -> SnapshotPortFuture<'a, SnapshotMountLease> {
+            Box::pin(async move { Ok(lease.clone()) })
+        }
+
+        fn release<'a>(&'a self, _lease: &'a SnapshotMountLease) -> SnapshotPortFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn has_active_lease<'a>(
+            &'a self,
+            _snapshot_id: &'a SnapshotId,
+            _cache_volume_uuid: &'a str,
+            _cache_sha256: &'a SnapshotSha256,
+        ) -> SnapshotPortFuture<'a, bool> {
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    fn snapshot_mount_fixture(
+        lifecycle: SnapshotLifecycle,
+        descriptor: Option<SnapshotArtifactDescriptor>,
+    ) -> SnapshotCatalogEntry {
+        let captured_at = Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap();
+        let volume = SnapshotVolumeContext::new(
+            41,
+            "cli-snapshot-test",
+            "00000000-0000-0000-0000-000000000041",
+        )
+        .expect("test volume identity");
+        let cut = SnapshotCut::new(volume.volume_id, 3, captured_at).expect("test cut");
+        SnapshotCatalogEntry {
+            snapshot_id: SnapshotId::from_cut(&volume.volume_name, captured_at)
+                .expect("test snapshot id"),
+            volume,
+            origin: SnapshotOrigin::Manual,
+            cut,
+            lifecycle,
+            creation_state: SnapshotCreationState::Completed,
+            retention: SnapshotRetention::manual(None).expect("manual retention"),
+            ready_at: (lifecycle == SnapshotLifecycle::Ready).then_some(captured_at),
+            expires_at: None,
+            artifact: descriptor,
+            failure: None,
+        }
+    }
 
     #[test]
     fn mount_accepts_public_runtime_tuning_flags() {
@@ -244,5 +538,61 @@ mod tests {
             };
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
         assert!(err.to_string().contains("--prefetch"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_mount_rejects_non_ready_and_corrupt_artifact() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-cli-mount-");
+        let bytes = b"cli snapshot artifact";
+        let checksum = SnapshotSha256::from_bytes(Sha256::digest(bytes).into());
+        let mut ready = snapshot_mount_fixture(SnapshotLifecycle::Ready, None);
+        let descriptor = SnapshotArtifactDescriptor::new(
+            "snapshots/cli.redb",
+            1,
+            1,
+            checksum,
+            bytes.len() as u64,
+            ready.cut,
+            ready.cut.captured_at(),
+        )
+        .expect("test artifact descriptor");
+        ready.artifact = Some(descriptor.clone());
+
+        let snapshot_id = ready.snapshot_id.clone();
+        let jobs = Arc::new(CliJobStore::default());
+        let artifacts = Arc::new(CliArtifactStore::default());
+        let harness = studiofs_vfs::SnapshotMountSession::new(
+            ready.volume.clone(),
+            jobs.clone(),
+            artifacts.clone(),
+            Arc::new(CliMountStore),
+            Arc::new(CliClock { now: Utc::now() }),
+            studiofs_vfs::SnapshotMountConfig::new(root.path()),
+        )
+        .expect("test ports should produce a valid production session");
+        let creating = snapshot_mount_fixture(SnapshotLifecycle::Creating, None);
+        jobs.set_catalog(creating);
+        assert!(
+            harness
+                .mount(&ready.snapshot_id, "cli-before-ready")
+                .await
+                .is_err(),
+            "the CLI mount path must reject a snapshot before Ready"
+        );
+
+        let corrupt = SnapshotArtifactDescriptor {
+            sha256: SnapshotSha256::from_bytes([0xCC; 32]),
+            ..descriptor
+        };
+        ready.artifact = Some(corrupt);
+        jobs.set_catalog(ready);
+        artifacts.put(bytes.to_vec());
+        assert!(
+            harness
+                .mount(&snapshot_id, "cli-corrupt-artifact")
+                .await
+                .is_err(),
+            "the CLI mount path must verify the artifact before opening it"
+        );
     }
 }

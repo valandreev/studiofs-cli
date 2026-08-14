@@ -637,6 +637,10 @@ impl SnapshotWorker {
                 return Err(error);
             }
         };
+        if cancel.is_cancelled() {
+            self.release_claim(&active_claim).await;
+            return Err(SnapshotWorkerError::Cancelled);
+        }
         let work_cancel = cancel.child_token();
         let renewal_stop = cancel.child_token();
         let materialization = self.materialize_claim(&active_claim, &work_cancel);

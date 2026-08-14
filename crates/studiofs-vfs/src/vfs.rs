@@ -577,6 +577,11 @@ pub enum VfsError {
 /// Result type alias used by the VFS public API.
 pub type VfsResult<T> = Result<T, VfsError>;
 
+/// Admission fence shared by a snapshot mount and the VFS instances opened
+/// from it. The inode is supplied so lease failures retain normal metadata
+/// error context at the VFS boundary.
+pub(crate) type SnapshotMountFence = Arc<dyn Fn(Ino) -> VfsResult<()> + Send + Sync>;
+
 /// Directory entry plus the child attributes loaded with the same metadata batch.
 #[derive(Debug, Clone)]
 pub struct DirEntryWithAttr {
@@ -3536,6 +3541,10 @@ fn panic_payload_message(panic_payload: &(dyn Any + Send)) -> Cow<'_, str> {
 pub struct StudioVfs {
     /// Preferred metadata execution boundary for hot-path call sites.
     meta: MetaExecutor<dyn VfsMeta>,
+    /// Whether this VFS is backed by an immutable snapshot artifact.
+    read_only_mount: bool,
+    /// Optional durable-lease fence for an immutable snapshot mount.
+    snapshot_mount_fence: Option<SnapshotMountFence>,
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
     /// Optional Snapshot v2 materializer for PostgreSQL-backed mounts.
@@ -4769,6 +4778,9 @@ impl StudioVfs {
     /// and other maintenance tasks.
     pub fn start(self: &Arc<Self>) -> VfsResult<()> {
         self.ensure_can_start()?;
+        if self.read_only_mount {
+            return Ok(());
+        }
         self.register_overlay_batch_runtime(tokio::runtime::Handle::current());
         self.state
             .namespace
@@ -7147,6 +7159,10 @@ impl StudioVfs {
     }
 
     fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
+        if self.read_only_mount {
+            return MetadataAuthorityStatus::read_only();
+        }
+
         #[cfg(test)]
         if let Some(status) = *self.metadata_authority_override.lock() {
             return status;
@@ -7176,6 +7192,13 @@ impl StudioVfs {
             required: AccessLevel::ReadWrite,
             actual: AccessLevel::ReadOnly,
         }))
+    }
+
+    pub(super) fn enforce_snapshot_mount_fence(&self, ino: Ino) -> VfsResult<()> {
+        if let Some(fence) = &self.snapshot_mount_fence {
+            fence(ino)?;
+        }
+        Ok(())
     }
 
     fn known_file_lock_lease_snapshot(&self, ino: Ino) -> Option<FileLockLease> {
