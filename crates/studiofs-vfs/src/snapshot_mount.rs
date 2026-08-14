@@ -1791,6 +1791,21 @@ mod tests {
         );
 
         harness.set_catalog(catalog(
+            SnapshotLifecycle::Deleting,
+            snapshot_volume.clone(),
+            snapshot.clone(),
+            snapshot_cut,
+            None,
+        ));
+        assert!(
+            harness
+                .mount(&snapshot, "mount-after-deleting")
+                .await
+                .is_err(),
+            "Deleting snapshots must reject new mount leases"
+        );
+
+        harness.set_catalog(catalog(
             SnapshotLifecycle::Ready,
             snapshot_volume.clone(),
             snapshot.clone(),

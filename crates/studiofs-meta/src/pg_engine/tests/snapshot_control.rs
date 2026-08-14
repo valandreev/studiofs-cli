@@ -2,13 +2,14 @@ use super::*;
 
 use crate::pg_engine::snapshot_control::{
     SnapshotCaptureRequest, allocate_snapshot_id, capture_snapshot_cut,
-    capture_snapshot_in_transaction,
+    capture_snapshot_in_transaction, expire_snapshot_in_transaction,
+    request_snapshot_delete_in_transaction,
 };
 use crate::snapshot::{
     MAX_RETENTION_SECS, SnapshotCreationState, SnapshotId, SnapshotLifecycle, SnapshotOrigin,
-    SnapshotRetention,
+    SnapshotRetention, SnapshotSha256,
 };
-use crate::snapshot_ports::SnapshotPortError;
+use crate::snapshot_ports::{SnapshotMountStore, SnapshotPortError};
 use chrono::{TimeZone, Utc};
 
 #[test]
@@ -17,6 +18,7 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
 
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_catalog"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_creation_jobs"));
+    assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_cleanup_leases"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_mount_leases"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_policies"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_current_references"));
@@ -46,6 +48,7 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(ddl.contains("retention_seconds IS NOT NULL"));
     assert!(ddl.contains("retention_seconds BETWEEN 1 AND 4294967295"));
     assert!(ddl.contains("idx_snapshot_creation_jobs_queue"));
+    assert!(ddl.contains("idx_snapshot_catalog_expiry_queue"));
 }
 
 fn snapshot_request(volume_id: i64, origin: SnapshotOrigin) -> SnapshotCaptureRequest {
@@ -60,6 +63,392 @@ fn snapshot_request(volume_id: i64, origin: SnapshotOrigin) -> SnapshotCaptureRe
                 .expect("finite automatic retention is valid"),
         },
     }
+}
+
+fn capture_entry_once(
+    dsn: &str,
+    request: SnapshotCaptureRequest,
+) -> crate::snapshot::SnapshotCatalogEntry {
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let tx = client
+            .transaction()
+            .await
+            .expect("start capture transaction");
+        let entry = capture_snapshot_in_transaction(&tx, &request)
+            .await
+            .expect("capture snapshot");
+        tx.commit().await.expect("commit capture transaction");
+        connection_task.abort();
+        Ok(entry)
+    })
+    .expect("capture snapshot")
+}
+
+fn request_delete_once(
+    dsn: &str,
+    volume_id: i64,
+    snapshot_id: SnapshotId,
+) -> crate::snapshot::SnapshotCatalogEntry {
+    run_async(async move {
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let tx = client
+            .transaction()
+            .await
+            .expect("start deletion transaction");
+        let entry = request_snapshot_delete_in_transaction(&tx, volume_id, &snapshot_id)
+            .await
+            .expect("request snapshot delete");
+        tx.commit().await.expect("commit snapshot delete");
+        connection_task.abort();
+        Ok(entry)
+    })
+    .expect("request snapshot delete")
+}
+
+fn expire_once(
+    dsn: &str,
+    volume_id: i64,
+    snapshot_id: SnapshotId,
+) -> Option<crate::snapshot::SnapshotCatalogEntry> {
+    run_async(async move {
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let tx = client
+            .transaction()
+            .await
+            .expect("start expiry transaction");
+        let entry = expire_snapshot_in_transaction(&tx, volume_id, &snapshot_id)
+            .await
+            .expect("expire snapshot");
+        tx.commit().await.expect("commit snapshot expiry");
+        connection_task.abort();
+        Ok(entry)
+    })
+    .expect("expire snapshot")
+}
+
+fn set_snapshot_state(
+    dsn: &str,
+    volume_id: i64,
+    snapshot_id: &str,
+    lifecycle: &str,
+    job_state: &str,
+    ready_at: Option<chrono::DateTime<Utc>>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+) {
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_catalog SET lifecycle = $3, ready_at = $4, expires_at = $5 WHERE vol = $1 AND id = $2",
+                &[&volume_id, &snapshot_id, &lifecycle, &ready_at, &expires_at],
+            )
+            .await
+            .expect("set snapshot catalog state");
+        client
+            .execute(
+                "UPDATE snapshot_creation_jobs SET state = $3, next_retry_at = NULL WHERE vol = $1 AND snapshot_id = $2",
+                &[&volume_id, &snapshot_id, &job_state],
+            )
+            .await
+            .expect("set snapshot job state");
+        connection_task.abort();
+        Ok(())
+    })
+    .expect("set snapshot state");
+}
+
+fn set_creation_lease(
+    dsn: &str,
+    volume_id: i64,
+    snapshot_id: &SnapshotId,
+    owner: &str,
+    expires_at: chrono::DateTime<Utc>,
+    fencing_token: i64,
+) {
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_creation_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = EXCLUDED.fencing_token, renewed_at = clock_timestamp()",
+                &[&volume_id, &snapshot_id.to_string(), &owner, &expires_at, &fencing_token],
+            )
+            .await
+            .expect("set creation lease");
+        connection_task.abort();
+        Ok(())
+    })
+    .expect("set creation lease");
+}
+
+fn attempt_ready_publication_after_delete(
+    dsn: &str,
+    volume_id: i64,
+    snapshot_id: &SnapshotId,
+    owner: &str,
+    fencing_token: i64,
+) -> u64 {
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let updated = client
+            .execute(
+                "WITH now AS (SELECT clock_timestamp() AS ts) UPDATE snapshot_catalog AS c SET lifecycle = 'ready', ready_at = now.ts FROM snapshot_creation_jobs AS j JOIN snapshot_creation_leases AS l ON l.vol = j.vol AND l.snapshot_id = j.snapshot_id CROSS JOIN now WHERE c.vol = $1 AND c.id = $2 AND c.lifecycle = 'creating' AND j.state = 'running' AND l.owner = $3 AND l.fencing_token = $4 AND l.lease_expires_at > now.ts",
+                &[&volume_id, &snapshot_id.to_string(), &owner, &fencing_token],
+            )
+            .await
+            .expect("attempt ready publication");
+        connection_task.abort();
+        Ok(updated)
+    })
+    .expect("attempt ready publication")
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn delete_cas_and_ready_relative_expiry_are_idempotent() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-control-delete");
+
+    let creating = capture_entry_once(
+        &dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Manual),
+    );
+    set_snapshot_state(
+        &dsn,
+        volume.volume_id,
+        creating.snapshot_id.as_str(),
+        "creating",
+        "running",
+        None,
+        None,
+    );
+    set_creation_lease(
+        &dsn,
+        volume.volume_id,
+        &creating.snapshot_id,
+        "active-worker",
+        Utc::now() + chrono::Duration::minutes(5),
+        7,
+    );
+    let deleting = request_delete_once(&dsn, volume.volume_id, creating.snapshot_id.clone());
+    assert_eq!(deleting.lifecycle, SnapshotLifecycle::Deleting);
+    assert_eq!(deleting.creation_state, SnapshotCreationState::Failed);
+    let lease_state = run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let row = client
+            .query_one(
+                "SELECT owner, fencing_token, lease_expires_at > clock_timestamp() FROM snapshot_creation_leases WHERE vol = $1 AND snapshot_id = $2",
+                &[&volume.volume_id, &creating.snapshot_id.to_string()],
+            )
+            .await
+            .expect("read fenced creation lease");
+        let state = (row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, bool>(2));
+        connection_task.abort();
+        Ok(state)
+    })
+    .expect("read fenced creation lease");
+    assert_eq!(lease_state.0, "active-worker");
+    assert_eq!(lease_state.1, 8);
+    assert!(
+        lease_state.2,
+        "an active creation lease must remain visible until its original expiry"
+    );
+    assert_eq!(
+        attempt_ready_publication_after_delete(
+            &dsn,
+            volume.volume_id,
+            &creating.snapshot_id,
+            "active-worker",
+            7,
+        ),
+        0,
+        "publication CAS must lose after deletion fences the creation claim"
+    );
+    assert_eq!(
+        request_delete_once(&dsn, volume.volume_id, creating.snapshot_id.clone()).lifecycle,
+        SnapshotLifecycle::Deleting
+    );
+
+    let ready = capture_entry_once(
+        &dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Manual),
+    );
+    set_snapshot_state(
+        &dsn,
+        volume.volume_id,
+        ready.snapshot_id.as_str(),
+        "ready",
+        "completed",
+        Some(Utc::now()),
+        None,
+    );
+    assert_eq!(
+        request_delete_once(&dsn, volume.volume_id, ready.snapshot_id).lifecycle,
+        SnapshotLifecycle::Deleting
+    );
+
+    let failed = capture_entry_once(
+        &dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Manual),
+    );
+    set_snapshot_state(
+        &dsn,
+        volume.volume_id,
+        failed.snapshot_id.as_str(),
+        "failed",
+        "failed",
+        None,
+        None,
+    );
+    assert_eq!(
+        request_delete_once(&dsn, volume.volume_id, failed.snapshot_id).lifecycle,
+        SnapshotLifecycle::Deleting
+    );
+
+    let expiring = capture_entry_once(
+        &dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Automatic),
+    );
+    let ready_at = Utc::now() - chrono::Duration::hours(2);
+    let expires_at = Utc::now() - chrono::Duration::seconds(1);
+    set_snapshot_state(
+        &dsn,
+        volume.volume_id,
+        expiring.snapshot_id.as_str(),
+        "ready",
+        "completed",
+        Some(ready_at),
+        Some(expires_at),
+    );
+    let expired = expire_once(&dsn, volume.volume_id, expiring.snapshot_id.clone())
+        .expect("expired Ready row must enter Deleting");
+    assert_eq!(expired.lifecycle, SnapshotLifecycle::Deleting);
+    assert!(
+        expire_once(&dsn, volume.volume_id, expiring.snapshot_id).is_none(),
+        "expiry CAS must not repeat after Deleting"
+    );
+
+    let deleted = capture_entry_once(
+        &dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Manual),
+    );
+    set_snapshot_state(
+        &dsn,
+        volume.volume_id,
+        deleted.snapshot_id.as_str(),
+        "deleted",
+        "failed",
+        None,
+        None,
+    );
+    assert_eq!(
+        request_delete_once(&dsn, volume.volume_id, deleted.snapshot_id).lifecycle,
+        SnapshotLifecycle::Deleted,
+        "repeated delete after tombstoning must remain idempotent"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn mount_renewal_is_fenced_by_active_cleanup_claim() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-control-mount-renewal");
+    let snapshot = capture_entry_once(
+        &dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Manual),
+    );
+    set_snapshot_state(
+        &dsn,
+        volume.volume_id,
+        snapshot.snapshot_id.as_str(),
+        "ready",
+        "completed",
+        Some(Utc::now()),
+        None,
+    );
+
+    let local_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = local_dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open PostgreSQL metadata engine");
+    let checksum = SnapshotSha256::from_bytes([0x31; 32]);
+    let mount_lease = run_async(async {
+        Ok::<_, MetaError>(
+            engine
+                .acquire(
+                    &snapshot.snapshot_id,
+                    "mount-owner",
+                    &volume.uuid,
+                    &checksum,
+                    Duration::from_secs(60),
+                )
+                .await,
+        )
+    })
+    .expect("acquire snapshot mount lease")
+    .expect("mount lease acquisition");
+
+    assert_eq!(
+        request_delete_once(&dsn, volume.volume_id, snapshot.snapshot_id.clone()).lifecycle,
+        SnapshotLifecycle::Deleting
+    );
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token) VALUES ($1, $2, 'cleanup-owner', clock_timestamp() + interval '60 seconds', 1)",
+                &[&volume.volume_id, &snapshot.snapshot_id.to_string()],
+            )
+            .await
+            .expect("insert active cleanup claim");
+        connection_task.abort();
+        Ok(())
+    })
+    .expect("insert active cleanup claim");
+
+    let renewal = run_async(async {
+        Ok::<_, MetaError>(engine.renew(&mount_lease, Duration::from_secs(60)).await)
+    })
+    .expect("run mount lease renewal")
+    .expect_err("cleanup claim must fence mount renewal");
+    assert!(matches!(
+        renewal,
+        SnapshotPortError::Permanent { code, .. } if code.as_str() == "stale_lease"
+    ));
 }
 
 #[test]

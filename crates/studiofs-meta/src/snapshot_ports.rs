@@ -3,8 +3,8 @@
 use crate::engine::MetaResult;
 use crate::schema::PayloadRef;
 use crate::snapshot::{
-    SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob, SnapshotCreationLease,
-    SnapshotCut, SnapshotId, SnapshotMountLease, SnapshotSha256, VolumeId,
+    SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCleanupClaim, SnapshotCreationJob,
+    SnapshotCreationLease, SnapshotCut, SnapshotId, SnapshotMountLease, SnapshotSha256, VolumeId,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -478,6 +478,38 @@ pub trait SnapshotJobStore: Send + Sync {
     ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
 }
 
+/// PostgreSQL-authoritative deletion, expiry, and cleanup operations.
+pub trait SnapshotCleanupStore: Send + Sync {
+    /// Enters Deleting through a lifecycle CAS and cancels future creation work.
+    fn request_delete<'a>(
+        &'a self,
+        snapshot_id: &'a SnapshotId,
+    ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
+
+    /// Claims an expired Ready row or a retryable Deleting row through a lease.
+    fn claim_next<'a>(
+        &'a self,
+        worker: &'a SnapshotWorkerId,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, Option<SnapshotCleanupClaim>>;
+
+    /// Renews a cleanup lease only while its owner and fence still match.
+    fn renew_lease<'a>(
+        &'a self,
+        claim: &'a SnapshotCleanupClaim,
+        lease_for: Duration,
+    ) -> SnapshotPortFuture<'a, SnapshotCleanupClaim>;
+
+    /// Releases a cleanup lease after a retryable remote cleanup failure.
+    fn release_lease<'a>(&'a self, claim: &'a SnapshotCleanupClaim) -> SnapshotPortFuture<'a, ()>;
+
+    /// Removes durable snapshot children and finalizes the catalog tombstone.
+    fn finalize_deleted<'a>(
+        &'a self,
+        claim: &'a SnapshotCleanupClaim,
+    ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
+}
+
 /// PostgreSQL-authoritative leases that fence mounted snapshot cache use.
 pub trait SnapshotMountStore: Send + Sync {
     /// Acquires a lease only for a currently Ready, unexpired snapshot.
@@ -490,7 +522,8 @@ pub trait SnapshotMountStore: Send + Sync {
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, SnapshotMountLease>;
 
-    /// Renews a lease only when its complete identity and fence still match.
+    /// Renews a lease only when its complete identity and fence still match and
+    /// cleanup has not claimed the snapshot for deletion.
     fn renew<'a>(
         &'a self,
         lease: &'a SnapshotMountLease,
@@ -604,6 +637,25 @@ pub trait SnapshotArtifactStore: Send + Sync {
         &'a self,
         scope: &'a SnapshotArtifactScope,
     ) -> SnapshotPortFuture<'a, Vec<SnapshotStoredArtifact>>;
+
+    /// Lists artifact locators without requiring artifact bodies.
+    ///
+    /// The default keeps adapters source-compatible by projecting the locators
+    /// from `list`; storage-backed adapters should override it when listing can
+    /// be served from object keys alone.
+    fn list_locators<'a>(
+        &'a self,
+        scope: &'a SnapshotArtifactScope,
+    ) -> SnapshotPortFuture<'a, Vec<SnapshotArtifactLocator>> {
+        Box::pin(async move {
+            Ok(self
+                .list(scope)
+                .await?
+                .into_iter()
+                .map(|artifact| artifact.locator)
+                .collect())
+        })
+    }
 }
 
 #[cfg(test)]

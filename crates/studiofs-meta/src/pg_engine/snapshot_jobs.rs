@@ -132,7 +132,7 @@ where
     })
 }
 
-async fn load_catalog<C>(
+pub(super) async fn load_catalog<C>(
     client: &C,
     volume_id: i64,
     snapshot_id: &str,
@@ -285,11 +285,15 @@ impl SnapshotJobStore for PgMetaEngine {
                             .query_opt(
                                 "SELECT j.snapshot_id
                                  FROM snapshot_creation_jobs AS j
+                                 JOIN snapshot_catalog AS c
+                                   ON c.vol = j.vol
+                                  AND c.id = j.snapshot_id
                                  LEFT JOIN snapshot_creation_leases AS l
                                    ON l.vol = j.vol
                                   AND l.snapshot_id = j.snapshot_id
                                  WHERE j.vol = $1
                                    AND j.state IN ('queued', 'retry_wait', 'running')
+                                   AND c.lifecycle = 'creating'
                                    AND (j.state <> 'retry_wait'
                                         OR j.next_retry_at IS NULL
                                         OR j.next_retry_at <= clock_timestamp())
@@ -349,7 +353,7 @@ impl SnapshotJobStore for PgMetaEngine {
                             .map_err(|_| pg_failure("begin requested snapshot claim"))?;
                         let row = tx
                             .query_opt(
-                                "SELECT j.state, (j.next_retry_at IS NULL OR j.next_retry_at <= clock_timestamp()) AS retry_due, (l.snapshot_id IS NULL OR l.lease_expires_at <= clock_timestamp()) AS lease_available FROM snapshot_creation_jobs AS j LEFT JOIN snapshot_creation_leases AS l ON l.vol = j.vol AND l.snapshot_id = j.snapshot_id WHERE j.vol = $1 AND j.snapshot_id = $2 FOR UPDATE OF j",
+                                "SELECT j.state, c.lifecycle, (j.next_retry_at IS NULL OR j.next_retry_at <= clock_timestamp()) AS retry_due, (l.snapshot_id IS NULL OR l.lease_expires_at <= clock_timestamp()) AS lease_available FROM snapshot_creation_jobs AS j JOIN snapshot_catalog AS c ON c.vol = j.vol AND c.id = j.snapshot_id LEFT JOIN snapshot_creation_leases AS l ON l.vol = j.vol AND l.snapshot_id = j.snapshot_id WHERE j.vol = $1 AND j.snapshot_id = $2 FOR UPDATE OF j",
                                 &[&volume_id, &snapshot_id_text],
                             )
                             .await
@@ -358,9 +362,11 @@ impl SnapshotJobStore for PgMetaEngine {
                             return Err(MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()));
                         };
                         let state: String = row.get(0);
-                        let retry_due: bool = row.get(1);
-                        let lease_available: bool = row.get(2);
+                        let lifecycle: String = row.get(1);
+                        let retry_due: bool = row.get(2);
+                        let lease_available: bool = row.get(3);
                         let claimable = lease_available
+                            && lifecycle == "creating"
                             && (state == "queued"
                                 || (state == "retry_wait" && retry_due)
                                 || state == "running");

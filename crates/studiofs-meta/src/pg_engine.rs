@@ -259,6 +259,8 @@ mod replication_flush;
 mod runtime;
 /// Canonical PostgreSQL schema definition and provisioning helper.
 pub mod schema;
+#[path = "pg_engine/snapshot_cleanup.rs"]
+mod snapshot_cleanup;
 /// PostgreSQL Snapshot v2 capture and control-plane queries.
 pub(crate) mod snapshot_control;
 #[path = "pg_engine/snapshot_jobs.rs"]
@@ -389,6 +391,7 @@ impl PgMetaEngine {
                                     ('snapshot_catalog'::TEXT),
                                     ('snapshot_creation_jobs'::TEXT),
                                     ('snapshot_creation_leases'::TEXT),
+                                    ('snapshot_cleanup_leases'::TEXT),
                                     ('snapshot_mount_leases'::TEXT),
                                     ('snapshot_policies'::TEXT),
                                     ('snapshot_source_checkpoints'::TEXT),

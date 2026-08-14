@@ -134,6 +134,41 @@ impl PgMetaEngine {
         })
     }
 
+    /// Requests deletion of one Snapshot v2 catalog entry.
+    ///
+    /// The lifecycle CAS and cancellation of any queued or running creation
+    /// claim happen in the same PostgreSQL transaction. A repeated request is
+    /// intentionally idempotent and returns the current Deleting or Deleted
+    /// catalog projection.
+    pub fn delete_snapshot_v2(&self, snapshot_id: &SnapshotId) -> MetaResult<SnapshotCatalogEntry> {
+        let postgres_url = self.postgres_url.clone();
+        let snapshot_id = snapshot_id.clone();
+        let volume_id = self.volume_id;
+
+        Self::run_async_once(async move {
+            Self::with_postgres_client_timeout_once(
+                postgres_url,
+                Self::default_connect_timeout(),
+                Self::default_command_timeout(),
+                "delete snapshot",
+                |mut client| async move {
+                    let tx = client
+                        .transaction()
+                        .await
+                        .map_err(|_| snapshot_control_error("begin snapshot deletion"))?;
+                    let entry =
+                        request_snapshot_delete_in_transaction(&tx, volume_id, &snapshot_id)
+                            .await?;
+                    tx.commit()
+                        .await
+                        .map_err(|_| snapshot_control_error("commit snapshot deletion"))?;
+                    Ok(entry)
+                },
+            )
+            .await
+        })
+    }
+
     async fn load_snapshot_source(
         postgres_url: String,
         volume_id: VolumeId,
@@ -308,6 +343,105 @@ impl PgMetaEngine {
             path: destination.to_path_buf(),
         })
     }
+}
+
+/// Transitions one eligible snapshot to Deleting and fences creation claims.
+pub(crate) async fn request_snapshot_delete_in_transaction<C>(
+    client: &C,
+    volume_id: VolumeId,
+    snapshot_id: &SnapshotId,
+) -> MetaResult<SnapshotCatalogEntry>
+where
+    C: GenericClient + Sync,
+{
+    let snapshot_id_text = snapshot_id.to_string();
+    let row = client
+        .query_opt(
+            "SELECT lifecycle FROM snapshot_catalog WHERE vol = $1 AND id = $2 FOR UPDATE",
+            &[&volume_id, &snapshot_id_text],
+        )
+        .await
+        .map_err(|_| snapshot_control_error("load snapshot for deletion"))?
+        .ok_or_else(|| MetaError::Storage("snapshot job not found".to_string()))?;
+    let lifecycle: String = row.get(0);
+    if lifecycle == SnapshotLifecycle::Deleted.as_str()
+        || lifecycle == SnapshotLifecycle::Deleting.as_str()
+    {
+        return super::snapshot_jobs::load_catalog(client, volume_id, &snapshot_id_text).await;
+    }
+    if !matches!(lifecycle.as_str(), "creating" | "ready" | "failed") {
+        return Err(snapshot_control_error(
+            "invalid snapshot lifecycle for deletion",
+        ));
+    }
+
+    client
+        .execute(
+            "UPDATE snapshot_catalog SET lifecycle = 'deleting', updated_at = clock_timestamp() WHERE vol = $1 AND id = $2 AND lifecycle = $3",
+            &[&volume_id, &snapshot_id_text, &lifecycle],
+        )
+        .await
+        .map_err(|_| snapshot_control_error("enter snapshot deletion"))?;
+    client
+        .execute(
+            "UPDATE snapshot_creation_jobs SET state = 'failed', next_retry_at = NULL, failure_code = 'snapshot_deleted', failure_message = 'snapshot deletion requested', updated_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND state IN ('queued', 'running', 'retry_wait')",
+            &[&volume_id, &snapshot_id_text],
+        )
+        .await
+        .map_err(|_| snapshot_control_error("cancel snapshot creation"))?;
+    client
+        .execute(
+            "WITH now AS (SELECT clock_timestamp() AS ts)
+             UPDATE snapshot_creation_leases AS l
+             SET owner = CASE
+                     WHEN l.owner <> '' AND l.lease_expires_at > now.ts THEN l.owner
+                     ELSE ''
+                 END,
+                 lease_expires_at = CASE
+                     WHEN l.owner <> '' AND l.lease_expires_at > now.ts THEN l.lease_expires_at
+                     ELSE now.ts
+                 END,
+                 fencing_token = l.fencing_token + 1,
+                 renewed_at = now.ts
+             FROM now
+             WHERE l.vol = $1 AND l.snapshot_id = $2",
+            &[&volume_id, &snapshot_id_text],
+        )
+        .await
+        .map_err(|_| snapshot_control_error("fence snapshot creation"))?;
+
+    super::snapshot_jobs::load_catalog(client, volume_id, &snapshot_id_text).await
+}
+
+/// Applies expiry only to a Ready row whose durable expiry has passed.
+#[cfg(test)]
+pub(crate) async fn expire_snapshot_in_transaction<C>(
+    client: &C,
+    volume_id: VolumeId,
+    snapshot_id: &SnapshotId,
+) -> MetaResult<Option<SnapshotCatalogEntry>>
+where
+    C: GenericClient + Sync,
+{
+    let snapshot_id_text = snapshot_id.to_string();
+    let row = client
+        .query_opt(
+            "SELECT lifecycle, ready_at IS NOT NULL AND COALESCE(expires_at <= clock_timestamp(), FALSE) AS expired FROM snapshot_catalog WHERE vol = $1 AND id = $2 FOR UPDATE",
+            &[&volume_id, &snapshot_id_text],
+        )
+        .await
+        .map_err(|_| snapshot_control_error("load snapshot for expiry"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let lifecycle: String = row.get(0);
+    let expired: bool = row.get(1);
+    if lifecycle != SnapshotLifecycle::Ready.as_str() || !expired {
+        return Ok(None);
+    }
+    request_snapshot_delete_in_transaction(client, volume_id, snapshot_id)
+        .await
+        .map(Some)
 }
 
 fn validate_snapshot_event_rows(

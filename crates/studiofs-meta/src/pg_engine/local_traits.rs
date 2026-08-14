@@ -450,6 +450,15 @@ impl MetaEngine for PgMetaEngine {
             .map(|engine| engine as Arc<dyn crate::snapshot_ports::SnapshotMountStore>)
     }
 
+    fn snapshot_cleanup_store(
+        &self,
+    ) -> Option<Arc<dyn crate::snapshot_ports::SnapshotCleanupStore>> {
+        self.self_weak
+            .get()
+            .and_then(Weak::upgrade)
+            .map(|engine| engine as Arc<dyn crate::snapshot_ports::SnapshotCleanupStore>)
+    }
+
     fn apply_regular_file_overlay_batch(
         &self,
         mutations: &[crate::engine::RegularFileOverlayMutation],

@@ -142,7 +142,7 @@ use crate::runtime::{
     into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta,
     run_with_timeout_or_cancel,
 };
-use crate::snapshot_worker::SnapshotWorker;
+use crate::snapshot_worker::{SnapshotCleanupWorker, SnapshotWorker, SnapshotWorkerError};
 use crate::utils::now_unix_millis;
 use crate::vfs::local_dirty::LocalDirtyState;
 use bytes::{Bytes, BytesMut};
@@ -153,6 +153,7 @@ use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -3549,6 +3550,8 @@ pub struct StudioVfs {
     data_write: Arc<DataStore>,
     /// Optional Snapshot v2 materializer for PostgreSQL-backed mounts.
     snapshot_worker: Option<Arc<SnapshotWorker>>,
+    /// Optional Snapshot v2 artifact/source cleanup worker.
+    snapshot_cleanup_worker: Option<Arc<SnapshotCleanupWorker>>,
     /// Shared local payload backend used by the foreground read path.
     local_payload_backend: Arc<dyn LocalPayloadBackend>,
     /// Shared cached-store runtime that owns local staging + pending uploads.
@@ -4631,6 +4634,7 @@ impl StudioVfs {
         self.spawn_metadata_invalidation_worker();
         self.spawn_janitor_worker();
         self.spawn_snapshot_worker();
+        self.spawn_snapshot_cleanup_worker();
         Ok(())
     }
 
@@ -4640,10 +4644,66 @@ impl StudioVfs {
         };
         let cancel = self.state.shutdown.background_shutdown_token.clone();
         self.track_background_task(tokio::spawn(async move {
-            if let Err(error) = worker.run(cancel).await {
-                tracing::error!(error = %error, "snapshot worker stopped");
-            }
+            Self::run_snapshot_worker_with_supervision(
+                cancel,
+                move |run_cancel| worker.clone().run(run_cancel),
+                "snapshot worker",
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+            )
+            .await;
         }));
+    }
+
+    fn spawn_snapshot_cleanup_worker(self: &Arc<Self>) {
+        let Some(worker) = self.snapshot_cleanup_worker.clone() else {
+            return;
+        };
+        let cancel = self.state.shutdown.background_shutdown_token.clone();
+        self.track_background_task(tokio::spawn(async move {
+            Self::run_snapshot_worker_with_supervision(
+                cancel,
+                move |run_cancel| worker.clone().run(run_cancel),
+                "snapshot cleanup worker",
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+            )
+            .await;
+        }));
+    }
+
+    async fn run_snapshot_worker_with_supervision<F, Fut>(
+        cancel: CancellationToken,
+        mut run: F,
+        worker_name: &'static str,
+        initial_delay: Duration,
+        max_delay: Duration,
+    ) where
+        F: FnMut(CancellationToken) -> Fut,
+        Fut: Future<Output = Result<(), SnapshotWorkerError>>,
+    {
+        let mut retry_delay = initial_delay.min(max_delay);
+        loop {
+            match run(cancel.clone()).await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::error!(
+                        worker = worker_name,
+                        error = %error,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        "snapshot worker failed; retrying"
+                    );
+                }
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(retry_delay) => {}
+            }
+            retry_delay = retry_delay.saturating_mul(2).min(max_delay);
+        }
     }
 
     fn run_startup_local_metadata_compaction(&self) {

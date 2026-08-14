@@ -20,16 +20,17 @@ use studiofs_meta::schema::{PayloadRef, PayloadRefState};
 #[cfg(test)]
 use studiofs_meta::snapshot::SnapshotCatalogEntry;
 use studiofs_meta::snapshot::{
-    SnapshotArtifactDescriptor, SnapshotId, SnapshotSha256, SnapshotVolumeContext,
+    SnapshotArtifactDescriptor, SnapshotCleanupClaim, SnapshotId, SnapshotLifecycle,
+    SnapshotSha256, SnapshotVolumeContext,
 };
 #[cfg(test)]
 use studiofs_meta::snapshot_ports::SnapshotClaimOrFollow;
 use studiofs_meta::snapshot_ports::{
     SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator, SnapshotArtifactScope,
-    SnapshotArtifactStore, SnapshotClock, SnapshotFailure, SnapshotJobClaim, SnapshotJobStore,
-    SnapshotPayloadBytes, SnapshotPayloadProof, SnapshotPayloadReader, SnapshotPortError,
-    SnapshotPortFuture, SnapshotReconstruction, SnapshotRetry, SnapshotSourceReader,
-    SnapshotStoredArtifact, SnapshotWorkerId,
+    SnapshotArtifactStore, SnapshotCleanupStore, SnapshotClock, SnapshotFailure, SnapshotJobClaim,
+    SnapshotJobStore, SnapshotPayloadBytes, SnapshotPayloadProof, SnapshotPayloadReader,
+    SnapshotPortError, SnapshotPortFuture, SnapshotReconstruction, SnapshotRetry,
+    SnapshotSourceReader, SnapshotStoredArtifact, SnapshotWorkerId,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +40,10 @@ pub const SNAPSHOT_ARTIFACT_FORMAT_VERSION: u16 = 1;
 /// Schema version written to the immutable metadata artifact.
 pub const SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u16 = 1;
 const SNAPSHOT_PAYLOAD_VERIFY_CONCURRENCY: usize = 16;
+const SNAPSHOT_CLEANUP_LEASE_FOR: Duration = Duration::from_secs(60);
+const SNAPSHOT_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SNAPSHOT_CLEANUP_IDLE_DELAY: Duration = Duration::from_secs(1);
+const SNAPSHOT_CLEANUP_EMPTY_LIST_CONFIRMATIONS: usize = 2;
 
 /// Bounded worker configuration for one verified volume.
 #[derive(Debug, Clone)]
@@ -143,6 +148,40 @@ impl DataStoreSnapshotArtifactStore {
             sha256: digest(bytes),
         }
     }
+
+    async fn list_artifact_locators(
+        &self,
+        scope: &SnapshotArtifactScope,
+    ) -> Result<Vec<SnapshotArtifactLocator>, SnapshotPortError> {
+        if scope.volume_id != self.volume.volume_id || scope.volume_uuid != self.volume.volume_uuid
+        {
+            return Err(SnapshotPortError::permanent(
+                "invalid_artifact_scope",
+                "artifact scope does not match volume",
+            ));
+        }
+        let prefix = SnapshotArtifactPrefix::from_scope(self.data_store.data_prefix(), scope)
+            .map_err(|_| {
+                SnapshotPortError::permanent("invalid_artifact_scope", "artifact scope rejected")
+            })?;
+        let entries = self
+            .data_store
+            .list_snapshot_artifacts(&prefix)
+            .await
+            .map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
+        let mut entries = Box::pin(entries);
+        let mut locators = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry =
+                entry.map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
+            let locator = prefix.parse_key(&entry.key).map_err(|_| {
+                SnapshotPortError::permanent("invalid_artifact_key", "listed artifact key rejected")
+            })?;
+            self.key(&locator)?;
+            locators.push(locator);
+        }
+        Ok(locators)
+    }
 }
 
 impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
@@ -220,10 +259,13 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
     fn delete<'a>(&'a self, locator: &'a SnapshotArtifactLocator) -> SnapshotPortFuture<'a, ()> {
         Box::pin(async move {
             let key = self.key(locator)?;
-            self.data_store
-                .delete_snapshot_artifact(&key)
-                .await
-                .map_err(|error| Self::map_data_error("delete snapshot artifact", error))
+            match self.data_store.delete_snapshot_artifact(&key).await {
+                Ok(()) => Ok(()),
+                Err(DataError::OpenDal(error)) if error.kind() == opendal::ErrorKind::NotFound => {
+                    Ok(())
+                }
+                Err(error) => Err(Self::map_data_error("delete snapshot artifact", error)),
+            }
         })
     }
 
@@ -232,34 +274,9 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
         scope: &'a SnapshotArtifactScope,
     ) -> SnapshotPortFuture<'a, Vec<SnapshotStoredArtifact>> {
         Box::pin(async move {
-            if scope.volume_id != self.volume.volume_id
-                || scope.volume_uuid != self.volume.volume_uuid
-            {
-                return Err(SnapshotPortError::permanent(
-                    "invalid_artifact_scope",
-                    "artifact scope does not match volume",
-                ));
-            }
-            let prefix = SnapshotArtifactPrefix::from_scope(self.data_store.data_prefix(), scope)
-                .map_err(|_| {
-                SnapshotPortError::permanent("invalid_artifact_scope", "artifact scope rejected")
-            })?;
-            let entries = self
-                .data_store
-                .list_snapshot_artifacts(&prefix)
-                .await
-                .map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
-            let mut entries = Box::pin(entries);
-            let mut stored = Vec::new();
-            while let Some(entry) = entries.next().await {
-                let entry = entry
-                    .map_err(|error| Self::map_data_error("list snapshot artifacts", error))?;
-                let locator = prefix.parse_key(&entry.key).map_err(|_| {
-                    SnapshotPortError::permanent(
-                        "invalid_artifact_key",
-                        "listed artifact key rejected",
-                    )
-                })?;
+            let locators = self.list_artifact_locators(scope).await?;
+            let mut stored = Vec::with_capacity(locators.len());
+            for locator in locators {
                 let key = self.key(&locator)?;
                 let bytes = self
                     .data_store
@@ -271,6 +288,13 @@ impl SnapshotArtifactStore for DataStoreSnapshotArtifactStore {
             }
             Ok(stored)
         })
+    }
+
+    fn list_locators<'a>(
+        &'a self,
+        scope: &'a SnapshotArtifactScope,
+    ) -> SnapshotPortFuture<'a, Vec<SnapshotArtifactLocator>> {
+        Box::pin(self.list_artifact_locators(scope))
     }
 }
 
@@ -539,9 +563,12 @@ impl SnapshotWorker {
                 Ok(claim) => claim,
                 Err(SnapshotWorkerError::Cancelled) => return Ok(()),
                 Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
-                    match self
-                        .wait_for_cancel_or_deadline(&cancel, self.config.retry_delay)
-                        .await
+                    match wait_for_cancel_or_deadline(
+                        self.clock.as_ref(),
+                        &cancel,
+                        self.config.retry_delay,
+                    )
+                    .await
                     {
                         Ok(()) => continue,
                         Err(SnapshotWorkerError::Cancelled) => return Ok(()),
@@ -551,9 +578,12 @@ impl SnapshotWorker {
                 Err(error) => return Err(error),
             };
             let Some(claim) = claim else {
-                match self
-                    .wait_for_cancel_or_deadline(&cancel, self.config.idle_delay)
-                    .await
+                match wait_for_cancel_or_deadline(
+                    self.clock.as_ref(),
+                    &cancel,
+                    self.config.idle_delay,
+                )
+                .await
                 {
                     Ok(()) => continue,
                     Err(SnapshotWorkerError::Cancelled) => return Ok(()),
@@ -602,8 +632,12 @@ impl SnapshotWorker {
                         )));
                     }
                     studiofs_meta::snapshot::SnapshotLifecycle::Creating => {
-                        self.wait_for_cancel_or_deadline(&cancel, self.config.idle_delay)
-                            .await?;
+                        wait_for_cancel_or_deadline(
+                            self.clock.as_ref(),
+                            &cancel,
+                            self.config.idle_delay,
+                        )
+                        .await?;
                     }
                     studiofs_meta::snapshot::SnapshotLifecycle::Deleting
                     | studiofs_meta::snapshot::SnapshotLifecycle::Deleted => {
@@ -627,6 +661,10 @@ impl SnapshotWorker {
             Err(SnapshotWorkerError::Cancelled) => {
                 self.release_claim(claim).await;
                 return Err(SnapshotWorkerError::Cancelled);
+            }
+            Err(error) if is_stale_lease_error(&error) => {
+                self.release_claim(claim).await;
+                return Ok(());
             }
             Err(error) => {
                 tracing::warn!(
@@ -675,7 +713,12 @@ impl SnapshotWorker {
             }
             Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. }))
             | Err(SnapshotWorkerError::Io { .. }) => {
-                self.record_retry(&active_claim, cancel).await?;
+                if let Err(error) = self.record_retry(&active_claim, cancel).await {
+                    if is_stale_lease_error(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
                 tracing::warn!(
                     snapshot_id = %claim.job.snapshot_id,
                     worker = self.worker.as_str(),
@@ -685,12 +728,21 @@ impl SnapshotWorker {
             }
             Err(SnapshotWorkerError::Port(SnapshotPortError::Permanent { .. }))
             | Err(SnapshotWorkerError::Integrity(_)) => {
-                self.record_failure(&active_claim, cancel).await?;
+                if let Err(error) = self.record_failure(&active_claim, cancel).await {
+                    if is_stale_lease_error(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
                 tracing::warn!(
                     snapshot_id = %claim.job.snapshot_id,
                     worker = self.worker.as_str(),
                     "snapshot materialization marked failed"
                 );
+                Ok(())
+            }
+            Err(error) if is_stale_lease_error(&error) => {
+                self.release_claim(&active_claim).await;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -1101,22 +1153,370 @@ impl SnapshotWorker {
         .await
         .map(|_| ())
     }
+}
 
-    async fn wait_for_cancel_or_deadline(
-        &self,
-        cancel: &CancellationToken,
-        delay: Duration,
-    ) -> Result<(), SnapshotWorkerError> {
-        let deadline = self
-            .clock
-            .now()
-            .checked_add_signed(
-                ChronoDuration::from_std(delay)
-                    .map_err(|_| SnapshotWorkerError::InvalidConfiguration)?,
-            )
-            .ok_or(SnapshotWorkerError::InvalidConfiguration)?;
-        await_port(self.clock.sleep_until(deadline, cancel.clone()), cancel).await
+/// Deletes Snapshot v2 artifacts and finalizes Deleting rows after all
+/// active creation and mount leases have drained.
+pub struct SnapshotCleanupWorker {
+    volume: SnapshotVolumeContext,
+    worker: SnapshotWorkerId,
+    cleanup: Arc<dyn SnapshotCleanupStore>,
+    artifacts: Arc<dyn SnapshotArtifactStore>,
+    clock: Arc<dyn SnapshotClock>,
+}
+
+impl SnapshotCleanupWorker {
+    /// Creates a cleanup worker scoped to one verified volume identity.
+    pub fn new(
+        volume: SnapshotVolumeContext,
+        worker: SnapshotWorkerId,
+        cleanup: Arc<dyn SnapshotCleanupStore>,
+        artifacts: Arc<dyn SnapshotArtifactStore>,
+        clock: Arc<dyn SnapshotClock>,
+    ) -> Self {
+        Self {
+            volume,
+            worker,
+            cleanup,
+            artifacts,
+            clock,
+        }
     }
+
+    /// Claims cleanup work until cancellation.
+    pub async fn run(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+    ) -> Result<(), SnapshotWorkerError> {
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let claim = match await_port(
+                self.cleanup
+                    .claim_next(&self.worker, SNAPSHOT_CLEANUP_LEASE_FOR),
+                &cancel,
+            )
+            .await
+            {
+                Ok(claim) => claim,
+                Err(SnapshotWorkerError::Cancelled) => return Ok(()),
+                Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
+                    match wait_for_cancel_or_deadline(
+                        self.clock.as_ref(),
+                        &cancel,
+                        SNAPSHOT_CLEANUP_RETRY_DELAY,
+                    )
+                    .await
+                    {
+                        Ok(()) => continue,
+                        Err(SnapshotWorkerError::Cancelled) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if is_stale_lease_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let Some(claim) = claim else {
+                match wait_for_cancel_or_deadline(
+                    self.clock.as_ref(),
+                    &cancel,
+                    SNAPSHOT_CLEANUP_IDLE_DELAY,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(SnapshotWorkerError::Cancelled) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+                continue;
+            };
+
+            match self.process_claim(&claim, &cancel).await {
+                Ok(()) => {}
+                Err(SnapshotWorkerError::Cancelled) => {
+                    return Ok(());
+                }
+                Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
+                    match wait_for_cancel_or_deadline(
+                        self.clock.as_ref(),
+                        &cancel,
+                        SNAPSHOT_CLEANUP_RETRY_DELAY,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(SnapshotWorkerError::Cancelled) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if is_stale_lease_error(&error) => continue,
+                Err(error) => {
+                    tracing::error!(
+                        snapshot_id = %claim.catalog.snapshot_id,
+                        error = %error,
+                        "snapshot cleanup claim failed; retaining lease until expiry"
+                    );
+                    match wait_for_cancel_or_deadline(
+                        self.clock.as_ref(),
+                        &cancel,
+                        SNAPSHOT_CLEANUP_RETRY_DELAY,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(SnapshotWorkerError::Cancelled) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_claim(
+        &self,
+        claim: &SnapshotCleanupClaim,
+        cancel: &CancellationToken,
+    ) -> Result<(), SnapshotWorkerError> {
+        if claim.catalog.volume != self.volume
+            || claim.catalog.cut.volume_id() != self.volume.volume_id
+            || claim.catalog.lifecycle != SnapshotLifecycle::Deleting
+        {
+            return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                "invalid_cleanup_claim",
+                "snapshot cleanup claim identity or lifecycle is invalid",
+            )));
+        }
+
+        let expected_snapshot_id = claim.catalog.snapshot_id.clone();
+        let expected_owner = claim.lease.owner.clone();
+        let expected_fencing_token = claim.lease.fencing_token;
+        let claim = match await_port(
+            self.cleanup.renew_lease(claim, SNAPSHOT_CLEANUP_LEASE_FOR),
+            cancel,
+        )
+        .await
+        {
+            Ok(claim) => claim,
+            Err(SnapshotWorkerError::Cancelled) => {
+                self.release_claim(claim).await;
+                return Err(SnapshotWorkerError::Cancelled);
+            }
+            Err(error) => return Err(error),
+        };
+        if claim.catalog.volume != self.volume
+            || claim.catalog.cut.volume_id() != self.volume.volume_id
+            || claim.catalog.snapshot_id != expected_snapshot_id
+            || claim.catalog.lifecycle != SnapshotLifecycle::Deleting
+            || claim.lease.owner != expected_owner
+            || claim.lease.fencing_token != expected_fencing_token
+        {
+            return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                "invalid_cleanup_claim",
+                "renewed snapshot cleanup claim identity or lifecycle is invalid",
+            )));
+        }
+        let work_cancel = cancel.child_token();
+        let renewal_stop = cancel.child_token();
+        let cleanup = self.cleanup_artifacts(&claim, &work_cancel);
+        let renewal =
+            self.renew_cleanup_lease_until(&claim, renewal_stop.clone(), work_cancel.clone());
+        tokio::pin!(cleanup);
+        tokio::pin!(renewal);
+        let result = tokio::select! {
+            result = &mut cleanup => {
+                renewal_stop.cancel();
+                match renewal.await {
+                    Ok(()) => result,
+                    Err(error) => Err(error),
+                }
+            }
+            renewal_result = &mut renewal => {
+                match renewal_result {
+                    Ok(()) => cleanup.await,
+                    Err(error) => {
+                        work_cancel.cancel();
+                        let _ = cleanup.await;
+                        Err(error)
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_stale_lease_error(&error) => {
+                self.release_claim(&claim).await;
+                Ok(())
+            }
+            Err(SnapshotWorkerError::Cancelled) => {
+                self.release_claim(&claim).await;
+                Err(SnapshotWorkerError::Cancelled)
+            }
+            Err(error @ SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
+                self.release_claim(&claim).await;
+                Err(error)
+            }
+            // Keep non-retryable failures fenced until this lease expires. The
+            // claim query can then skip this row and advance to later cleanup
+            // work instead of repeatedly reclaiming a poisoned snapshot.
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cleanup_artifacts(
+        &self,
+        claim: &SnapshotCleanupClaim,
+        cancel: &CancellationToken,
+    ) -> Result<(), SnapshotWorkerError> {
+        let scope = SnapshotArtifactScope {
+            volume_id: self.volume.volume_id,
+            volume_uuid: self.volume.volume_uuid.clone(),
+            snapshot_id: claim.catalog.snapshot_id.clone(),
+        };
+        let mut active_claim = claim.clone();
+        let mut empty_list_confirmations = 0;
+        loop {
+            let artifacts = await_port(self.artifacts.list_locators(&scope), cancel).await?;
+            if artifacts.is_empty() {
+                empty_list_confirmations += 1;
+                if empty_list_confirmations >= SNAPSHOT_CLEANUP_EMPTY_LIST_CONFIRMATIONS {
+                    break;
+                }
+                // A provider may briefly hide a PUT that was already in
+                // flight. Require a second empty observation before the
+                // catalog can be committed as Deleted.
+                wait_for_cancel_or_deadline(
+                    self.clock.as_ref(),
+                    cancel,
+                    SNAPSHOT_CLEANUP_RETRY_DELAY,
+                )
+                .await?;
+                continue;
+            }
+
+            empty_list_confirmations = 0;
+            for locator in artifacts {
+                if locator.volume_id != self.volume.volume_id
+                    || locator.volume_uuid != self.volume.volume_uuid
+                    || locator.snapshot_id != claim.catalog.snapshot_id
+                {
+                    return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                        "invalid_artifact_scope",
+                        "listed artifact does not match cleanup scope",
+                    )));
+                }
+                active_claim = await_port(
+                    self.cleanup
+                        .renew_lease(&active_claim, SNAPSHOT_CLEANUP_LEASE_FOR),
+                    cancel,
+                )
+                .await?;
+                if active_claim.catalog.volume != self.volume
+                    || active_claim.catalog.cut.volume_id() != self.volume.volume_id
+                    || active_claim.catalog.snapshot_id != claim.catalog.snapshot_id
+                    || active_claim.catalog.lifecycle != SnapshotLifecycle::Deleting
+                    || active_claim.lease.owner != claim.lease.owner
+                    || active_claim.lease.fencing_token != claim.lease.fencing_token
+                {
+                    return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                        "invalid_cleanup_claim",
+                        "renewed snapshot cleanup claim identity or lifecycle is invalid",
+                    )));
+                }
+                await_port(self.artifacts.delete(&locator), cancel).await?;
+            }
+        }
+
+        let finalized = await_port(self.cleanup.finalize_deleted(&active_claim), cancel).await?;
+        if finalized.snapshot_id != claim.catalog.snapshot_id
+            || finalized.volume != self.volume
+            || finalized.lifecycle != SnapshotLifecycle::Deleted
+        {
+            return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                "invalid_cleanup_result",
+                "snapshot cleanup finalization identity or lifecycle is invalid",
+            )));
+        }
+        Ok(())
+    }
+
+    async fn renew_cleanup_lease_until(
+        &self,
+        claim: &SnapshotCleanupClaim,
+        stop: CancellationToken,
+        work_cancel: CancellationToken,
+    ) -> Result<(), SnapshotWorkerError> {
+        let interval = (SNAPSHOT_CLEANUP_LEASE_FOR / 3).max(Duration::from_millis(1));
+        let mut retry_delay = interval;
+        let mut lease_expires_at = claim.lease.expires_at;
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(retry_delay) => {}
+            }
+            let lease = tokio::select! {
+                result = self.cleanup.renew_lease(claim, SNAPSHOT_CLEANUP_LEASE_FOR) => result,
+                _ = stop.cancelled() => return Ok(()),
+            };
+            match lease {
+                Ok(renewed) => {
+                    if renewed.lease.owner != claim.lease.owner
+                        || renewed.lease.fencing_token != claim.lease.fencing_token
+                    {
+                        work_cancel.cancel();
+                        return Err(SnapshotWorkerError::Port(SnapshotPortError::permanent(
+                            "stale_lease",
+                            "snapshot cleanup lease generation changed",
+                        )));
+                    }
+                    lease_expires_at = renewed.lease.expires_at;
+                    retry_delay = interval;
+                }
+                Err(SnapshotPortError::Cancelled) => return Err(SnapshotWorkerError::Cancelled),
+                Err(error @ SnapshotPortError::Retryable { .. }) => {
+                    let remaining = (lease_expires_at - self.clock.now())
+                        .to_std()
+                        .unwrap_or_default();
+                    if remaining <= retry_delay {
+                        work_cancel.cancel();
+                        return Err(SnapshotWorkerError::Port(error));
+                    }
+                    retry_delay = (interval / 4).max(Duration::from_millis(1));
+                }
+                Err(error) => {
+                    work_cancel.cancel();
+                    return Err(SnapshotWorkerError::Port(error));
+                }
+            }
+        }
+    }
+
+    async fn release_claim(&self, claim: &SnapshotCleanupClaim) {
+        let _ = self.cleanup.release_lease(claim).await;
+    }
+}
+
+async fn wait_for_cancel_or_deadline(
+    clock: &dyn SnapshotClock,
+    cancel: &CancellationToken,
+    delay: Duration,
+) -> Result<(), SnapshotWorkerError> {
+    let deadline = clock
+        .now()
+        .checked_add_signed(
+            ChronoDuration::from_std(delay)
+                .map_err(|_| SnapshotWorkerError::InvalidConfiguration)?,
+        )
+        .ok_or(SnapshotWorkerError::InvalidConfiguration)?;
+    await_port(clock.sleep_until(deadline, cancel.clone()), cancel).await
+}
+
+fn is_stale_lease_error(error: &SnapshotWorkerError) -> bool {
+    matches!(
+        error,
+        SnapshotWorkerError::Port(SnapshotPortError::Permanent { code, .. })
+            if code.as_str() == "stale_lease"
+    )
 }
 
 async fn await_port<'a, T>(
@@ -1191,14 +1591,15 @@ mod tests {
     use studiofs_meta::EncryptionConfig;
     use studiofs_meta::schema::PayloadRef;
     use studiofs_meta::snapshot::{
-        SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob,
-        SnapshotCreationLease, SnapshotCreationState, SnapshotCut, SnapshotId, SnapshotLifecycle,
-        SnapshotOrigin, SnapshotRetention, SnapshotSha256, SnapshotVolumeContext,
+        SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCleanupClaim,
+        SnapshotCleanupLease, SnapshotCreationJob, SnapshotCreationLease, SnapshotCreationState,
+        SnapshotCut, SnapshotId, SnapshotLifecycle, SnapshotOrigin, SnapshotRetention,
+        SnapshotSha256, SnapshotVolumeContext,
     };
     use studiofs_meta::snapshot_ports::{
         SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator,
-        SnapshotArtifactScope, SnapshotArtifactStore, SnapshotClaimOrFollow, SnapshotClock,
-        SnapshotFailure, SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadBytes,
+        SnapshotArtifactScope, SnapshotArtifactStore, SnapshotClaimOrFollow, SnapshotCleanupStore,
+        SnapshotClock, SnapshotFailure, SnapshotJobClaim, SnapshotJobStore, SnapshotPayloadBytes,
         SnapshotPayloadProof, SnapshotPayloadReader, SnapshotPortError, SnapshotPortFuture,
         SnapshotRetry, SnapshotSourceDescriptor, SnapshotSourceReader, SnapshotStoredArtifact,
         SnapshotWorkerId,
@@ -1842,6 +2243,20 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact.locator == final_artifact)
         );
+        let listed_locators = adapter
+            .list_locators(&SnapshotArtifactScope {
+                volume_id: 7,
+                volume_uuid: VOLUME_UUID.to_owned(),
+                snapshot_id: listed[0].locator.snapshot_id.clone(),
+            })
+            .await
+            .expect("list artifact locators");
+        assert_eq!(listed_locators.len(), 2);
+        assert!(
+            listed_locators
+                .iter()
+                .any(|locator| locator == &final_artifact)
+        );
     }
 
     #[tokio::test]
@@ -2104,6 +2519,189 @@ mod tests {
         release_tx.send(()).expect("release reconstruction");
         assert!(task.await.expect("worker join").is_ok());
         assert!(!completed_before_release);
+    }
+
+    #[tokio::test]
+    async fn cleanup_retries_artifact_failure_before_finalizing_tombstone() {
+        let (volume, mut catalog, _, _, captured_at) = test_snapshot_state();
+        catalog.lifecycle = SnapshotLifecycle::Deleting;
+        catalog.creation_state = SnapshotCreationState::Completed;
+        let claim = SnapshotCleanupClaim {
+            catalog: catalog.clone(),
+            lease: SnapshotCleanupLease {
+                owner: "cleanup-a".to_string(),
+                expires_at: captured_at + chrono::Duration::minutes(1),
+                fencing_token: 3,
+            },
+        };
+        let attempt = SnapshotArtifactLocator {
+            volume_id: volume.volume_id,
+            volume_uuid: volume.volume_uuid.clone(),
+            snapshot_id: catalog.snapshot_id.clone(),
+            attempt: Some(1),
+            kind: SnapshotArtifactKind::Attempt,
+        };
+        let final_artifact = SnapshotArtifactLocator {
+            attempt: None,
+            kind: SnapshotArtifactKind::Metadata,
+            ..attempt.clone()
+        };
+        let artifacts = Arc::new(CleanupArtifactStore::new(vec![
+            stored_cleanup_artifact(attempt),
+            stored_cleanup_artifact(final_artifact),
+        ]));
+        artifacts.fail_next.store(true, Ordering::SeqCst);
+        let cleanup = Arc::new(CleanupTestStore::new(claim.clone()));
+        let worker = SnapshotCleanupWorker::new(
+            volume.clone(),
+            SnapshotWorkerId::new("cleanup-a").expect("worker id"),
+            cleanup.clone(),
+            artifacts.clone(),
+            Arc::new(ImmediateSnapshotClock { now: captured_at }),
+        );
+        let cancel = CancellationToken::new();
+
+        let first = worker
+            .process_claim(&claim, &cancel)
+            .await
+            .expect_err("first artifact delete should retry");
+        assert!(matches!(
+            first,
+            SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })
+        ));
+        assert_eq!(cleanup.released.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup.finalized.load(Ordering::SeqCst), 0);
+
+        worker
+            .process_claim(&claim, &cancel)
+            .await
+            .expect("second cleanup attempt");
+        assert_eq!(artifacts.deleted.lock().expect("deleted lock").len(), 2);
+        assert_eq!(cleanup.finalized.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup.renewed.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn cleanup_rechecks_empty_artifact_prefix_before_finalizing_tombstone() {
+        let (volume, mut catalog, _, _, captured_at) = test_snapshot_state();
+        catalog.lifecycle = SnapshotLifecycle::Deleting;
+        catalog.creation_state = SnapshotCreationState::Completed;
+        let claim = SnapshotCleanupClaim {
+            catalog: catalog.clone(),
+            lease: SnapshotCleanupLease {
+                owner: "cleanup-a".to_string(),
+                expires_at: captured_at + chrono::Duration::minutes(1),
+                fencing_token: 3,
+            },
+        };
+        let initial_artifact = SnapshotArtifactLocator {
+            volume_id: volume.volume_id,
+            volume_uuid: volume.volume_uuid.clone(),
+            snapshot_id: catalog.snapshot_id.clone(),
+            attempt: Some(1),
+            kind: SnapshotArtifactKind::Attempt,
+        };
+        let late_artifact = SnapshotArtifactLocator {
+            attempt: Some(2),
+            kind: SnapshotArtifactKind::Attempt,
+            ..initial_artifact.clone()
+        };
+        let artifacts = Arc::new(CleanupArtifactStore::with_late_artifact(
+            vec![stored_cleanup_artifact(initial_artifact)],
+            stored_cleanup_artifact(late_artifact),
+        ));
+        let cleanup = Arc::new(CleanupTestStore::new(claim.clone()));
+        let worker = SnapshotCleanupWorker::new(
+            volume.clone(),
+            SnapshotWorkerId::new("cleanup-a").expect("worker id"),
+            cleanup.clone(),
+            artifacts.clone(),
+            Arc::new(ImmediateSnapshotClock { now: captured_at }),
+        );
+
+        worker
+            .process_claim(&claim, &CancellationToken::new())
+            .await
+            .expect("late artifact is drained before finalization");
+
+        assert_eq!(artifacts.list_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(artifacts.deleted.lock().expect("deleted lock").len(), 2);
+        assert_eq!(cleanup.finalized.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_retains_claim_after_permanent_artifact_scope_error() {
+        let (volume, mut catalog, _, _, captured_at) = test_snapshot_state();
+        catalog.lifecycle = SnapshotLifecycle::Deleting;
+        catalog.creation_state = SnapshotCreationState::Completed;
+        let claim = SnapshotCleanupClaim {
+            catalog: catalog.clone(),
+            lease: SnapshotCleanupLease {
+                owner: "cleanup-a".to_string(),
+                expires_at: captured_at + chrono::Duration::minutes(1),
+                fencing_token: 3,
+            },
+        };
+        let invalid_artifact = SnapshotArtifactLocator {
+            volume_id: volume.volume_id + 1,
+            volume_uuid: volume.volume_uuid.clone(),
+            snapshot_id: catalog.snapshot_id.clone(),
+            attempt: None,
+            kind: SnapshotArtifactKind::Metadata,
+        };
+        let cleanup = Arc::new(CleanupTestStore::new(claim.clone()));
+        let worker = SnapshotCleanupWorker::new(
+            volume.clone(),
+            SnapshotWorkerId::new("cleanup-a").expect("worker id"),
+            cleanup.clone(),
+            Arc::new(CleanupArtifactStore::new(vec![stored_cleanup_artifact(
+                invalid_artifact,
+            )])),
+            Arc::new(TestClock { now: captured_at }),
+        );
+
+        let error = worker
+            .process_claim(&claim, &CancellationToken::new())
+            .await
+            .expect_err("invalid listed artifact must be permanent");
+
+        assert!(matches!(
+            error,
+            SnapshotWorkerError::Port(SnapshotPortError::Permanent { ref code, .. })
+                if code.as_str() == "invalid_artifact_scope"
+        ));
+        assert_eq!(cleanup.released.load(Ordering::SeqCst), 0);
+        assert_eq!(cleanup.finalized.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_cancellation_releases_claim_once() {
+        let (volume, mut catalog, _, _, captured_at) = test_snapshot_state();
+        catalog.lifecycle = SnapshotLifecycle::Deleting;
+        let claim = SnapshotCleanupClaim {
+            catalog,
+            lease: SnapshotCleanupLease {
+                owner: "cleanup-a".to_string(),
+                expires_at: captured_at + chrono::Duration::minutes(1),
+                fencing_token: 3,
+            },
+        };
+        let cleanup = Arc::new(CleanupTestStore::new(claim));
+        cleanup.claim_next_once.store(true, Ordering::SeqCst);
+        *cleanup.renew_error.lock().expect("renew error lock") = Some(SnapshotPortError::Cancelled);
+        let worker = Arc::new(SnapshotCleanupWorker::new(
+            volume.clone(),
+            SnapshotWorkerId::new("cleanup-a").expect("worker id"),
+            cleanup.clone(),
+            Arc::new(CleanupArtifactStore::new(Vec::new())),
+            Arc::new(TestClock { now: captured_at }),
+        ));
+
+        worker
+            .run(CancellationToken::new())
+            .await
+            .expect("cancellation is a clean worker shutdown");
+        assert_eq!(cleanup.released.load(Ordering::SeqCst), 1);
     }
 
     fn published_payload_source(root: &Path) -> PathBuf {
@@ -2706,6 +3304,218 @@ mod tests {
             _scope: &'a SnapshotArtifactScope,
         ) -> SnapshotPortFuture<'a, Vec<SnapshotStoredArtifact>> {
             Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+    }
+
+    struct CleanupTestStore {
+        claim: SnapshotCleanupClaim,
+        claim_next_once: AtomicBool,
+        released: AtomicUsize,
+        renewed: AtomicUsize,
+        finalized: AtomicUsize,
+        renew_error: Mutex<Option<SnapshotPortError>>,
+    }
+
+    impl CleanupTestStore {
+        fn new(claim: SnapshotCleanupClaim) -> Self {
+            Self {
+                claim,
+                claim_next_once: AtomicBool::new(false),
+                released: AtomicUsize::new(0),
+                renewed: AtomicUsize::new(0),
+                finalized: AtomicUsize::new(0),
+                renew_error: Mutex::new(None),
+            }
+        }
+    }
+
+    impl SnapshotCleanupStore for CleanupTestStore {
+        fn request_delete<'a>(
+            &'a self,
+            _snapshot_id: &'a SnapshotId,
+        ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry> {
+            Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+
+        fn claim_next<'a>(
+            &'a self,
+            _worker: &'a SnapshotWorkerId,
+            _lease_for: Duration,
+        ) -> SnapshotPortFuture<'a, Option<SnapshotCleanupClaim>> {
+            let claim = self
+                .claim_next_once
+                .swap(false, Ordering::SeqCst)
+                .then(|| self.claim.clone());
+            Box::pin(async move { Ok(claim) })
+        }
+
+        fn renew_lease<'a>(
+            &'a self,
+            _claim: &'a SnapshotCleanupClaim,
+            _lease_for: Duration,
+        ) -> SnapshotPortFuture<'a, SnapshotCleanupClaim> {
+            let claim = self.claim.clone();
+            Box::pin(async move {
+                self.renewed.fetch_add(1, Ordering::SeqCst);
+                if let Some(error) = self.renew_error.lock().expect("renew error lock").take() {
+                    return Err(error);
+                }
+                Ok(claim)
+            })
+        }
+
+        fn release_lease<'a>(
+            &'a self,
+            _claim: &'a SnapshotCleanupClaim,
+        ) -> SnapshotPortFuture<'a, ()> {
+            Box::pin(async move {
+                self.released.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn finalize_deleted<'a>(
+            &'a self,
+            _claim: &'a SnapshotCleanupClaim,
+        ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry> {
+            let mut catalog = self.claim.catalog.clone();
+            catalog.lifecycle = SnapshotLifecycle::Deleted;
+            Box::pin(async move {
+                self.finalized.fetch_add(1, Ordering::SeqCst);
+                Ok(catalog)
+            })
+        }
+    }
+
+    struct CleanupArtifactStore {
+        artifacts: Mutex<Vec<SnapshotStoredArtifact>>,
+        deleted: Mutex<Vec<SnapshotArtifactLocator>>,
+        fail_next: AtomicBool,
+        list_calls: AtomicUsize,
+        late_artifact: Mutex<Option<SnapshotStoredArtifact>>,
+    }
+
+    impl CleanupArtifactStore {
+        fn new(artifacts: Vec<SnapshotStoredArtifact>) -> Self {
+            Self {
+                artifacts: Mutex::new(artifacts),
+                deleted: Mutex::new(Vec::new()),
+                fail_next: AtomicBool::new(false),
+                list_calls: AtomicUsize::new(0),
+                late_artifact: Mutex::new(None),
+            }
+        }
+
+        fn with_late_artifact(
+            artifacts: Vec<SnapshotStoredArtifact>,
+            late_artifact: SnapshotStoredArtifact,
+        ) -> Self {
+            let store = Self::new(artifacts);
+            *store.late_artifact.lock().expect("late artifact lock") = Some(late_artifact);
+            store
+        }
+    }
+
+    fn stored_cleanup_artifact(locator: SnapshotArtifactLocator) -> SnapshotStoredArtifact {
+        SnapshotStoredArtifact {
+            object_key: format!("cleanup/{}", locator.snapshot_id),
+            locator,
+            byte_length: 1,
+            sha256: SnapshotSha256::from_bytes([1; 32]),
+        }
+    }
+
+    impl SnapshotArtifactStore for CleanupArtifactStore {
+        fn put_attempt<'a>(
+            &'a self,
+            _locator: &'a SnapshotArtifactLocator,
+            _source: &'a Path,
+        ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact> {
+            Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+
+        fn publish_final<'a>(
+            &'a self,
+            _attempt: &'a SnapshotArtifactLocator,
+            _final_artifact: &'a SnapshotArtifactLocator,
+            _source: &'a Path,
+            _expected_sha256: &'a SnapshotSha256,
+        ) -> SnapshotPortFuture<'a, SnapshotStoredArtifact> {
+            Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _locator: &'a SnapshotArtifactLocator,
+        ) -> SnapshotPortFuture<'a, SnapshotArtifactBytes> {
+            Box::pin(async { Err(SnapshotPortError::permanent("unused", "unused test port")) })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            locator: &'a SnapshotArtifactLocator,
+        ) -> SnapshotPortFuture<'a, ()> {
+            let locator = locator.clone();
+            Box::pin(async move {
+                if self.fail_next.swap(false, Ordering::SeqCst) {
+                    return Err(SnapshotPortError::retryable(
+                        "delete snapshot artifact",
+                        "artifact backend unavailable",
+                    ));
+                }
+                self.artifacts
+                    .lock()
+                    .expect("artifact lock")
+                    .retain(|artifact| artifact.locator != locator);
+                self.deleted.lock().expect("deleted lock").push(locator);
+                Ok(())
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            _scope: &'a SnapshotArtifactScope,
+        ) -> SnapshotPortFuture<'a, Vec<SnapshotStoredArtifact>> {
+            let list_call = self.list_calls.fetch_add(1, Ordering::SeqCst);
+            if list_call == 1
+                && let Some(late_artifact) = self
+                    .late_artifact
+                    .lock()
+                    .expect("late artifact lock")
+                    .take()
+            {
+                self.artifacts
+                    .lock()
+                    .expect("artifact lock")
+                    .push(late_artifact);
+            }
+            let artifacts = self.artifacts.lock().expect("artifact lock").clone();
+            Box::pin(async move { Ok(artifacts) })
+        }
+    }
+
+    struct ImmediateSnapshotClock {
+        now: DateTime<Utc>,
+    }
+
+    impl SnapshotClock for ImmediateSnapshotClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.now
+        }
+
+        fn sleep_until<'a>(
+            &'a self,
+            _deadline: DateTime<Utc>,
+            cancel: CancellationToken,
+        ) -> SnapshotPortFuture<'a, ()> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                if cancel.is_cancelled() {
+                    Err(SnapshotPortError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            })
         }
     }
 
