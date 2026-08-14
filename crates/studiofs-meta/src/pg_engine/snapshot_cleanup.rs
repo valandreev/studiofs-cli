@@ -183,7 +183,7 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             return Ok(None);
                         };
                         let snapshot_id: String = row.get(0);
-                        let worker_text = worker.as_str().to_string();
+                        let worker_text = worker.as_str();
                         let lease = tx
                             .query_one(
                                 "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token, acquired_at, renewed_at) VALUES ($1, $2, $3, clock_timestamp() + ($4::double precision * interval '1 millisecond'), 1, clock_timestamp(), clock_timestamp()) ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = snapshot_cleanup_leases.fencing_token + 1, acquired_at = clock_timestamp(), renewed_at = clock_timestamp() RETURNING lease_expires_at, fencing_token",

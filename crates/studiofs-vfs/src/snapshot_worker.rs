@@ -1218,7 +1218,6 @@ impl SnapshotCleanupWorker {
             match self.process_claim(&claim, &cancel).await {
                 Ok(()) => {}
                 Err(SnapshotWorkerError::Cancelled) => {
-                    self.release_claim(&claim).await;
                     return Ok(());
                 }
                 Err(SnapshotWorkerError::Port(SnapshotPortError::Retryable { .. })) => {
@@ -1258,11 +1257,19 @@ impl SnapshotCleanupWorker {
         let expected_snapshot_id = claim.catalog.snapshot_id.clone();
         let expected_owner = claim.lease.owner.clone();
         let expected_fencing_token = claim.lease.fencing_token;
-        let claim = await_port(
+        let claim = match await_port(
             self.cleanup.renew_lease(claim, SNAPSHOT_CLEANUP_LEASE_FOR),
             cancel,
         )
-        .await?;
+        .await
+        {
+            Ok(claim) => claim,
+            Err(SnapshotWorkerError::Cancelled) => {
+                self.release_claim(claim).await;
+                return Err(SnapshotWorkerError::Cancelled);
+            }
+            Err(error) => return Err(error),
+        };
         if claim.catalog.volume != self.volume
             || claim.catalog.cut.volume_id() != self.volume.volume_id
             || claim.catalog.snapshot_id != expected_snapshot_id
@@ -2501,6 +2508,36 @@ mod tests {
         assert_eq!(cleanup.renewed.load(Ordering::SeqCst), 5);
     }
 
+    #[tokio::test]
+    async fn cleanup_cancellation_releases_claim_once() {
+        let (volume, mut catalog, _, _, captured_at) = test_snapshot_state();
+        catalog.lifecycle = SnapshotLifecycle::Deleting;
+        let claim = SnapshotCleanupClaim {
+            catalog,
+            lease: SnapshotCleanupLease {
+                owner: "cleanup-a".to_string(),
+                expires_at: captured_at + chrono::Duration::minutes(1),
+                fencing_token: 3,
+            },
+        };
+        let cleanup = Arc::new(CleanupTestStore::new(claim));
+        cleanup.claim_next_once.store(true, Ordering::SeqCst);
+        *cleanup.renew_error.lock().expect("renew error lock") = Some(SnapshotPortError::Cancelled);
+        let worker = Arc::new(SnapshotCleanupWorker::new(
+            volume.clone(),
+            SnapshotWorkerId::new("cleanup-a").expect("worker id"),
+            cleanup.clone(),
+            Arc::new(CleanupArtifactStore::new(Vec::new())),
+            Arc::new(TestClock { now: captured_at }),
+        ));
+
+        worker
+            .run(CancellationToken::new())
+            .await
+            .expect("cancellation is a clean worker shutdown");
+        assert_eq!(cleanup.released.load(Ordering::SeqCst), 1);
+    }
+
     fn published_payload_source(root: &Path) -> PathBuf {
         published_payload_source_with_payloads(root, &[PayloadRef::new_full(77, 4)])
     }
@@ -3106,18 +3143,22 @@ mod tests {
 
     struct CleanupTestStore {
         claim: SnapshotCleanupClaim,
+        claim_next_once: AtomicBool,
         released: AtomicUsize,
         renewed: AtomicUsize,
         finalized: AtomicUsize,
+        renew_error: Mutex<Option<SnapshotPortError>>,
     }
 
     impl CleanupTestStore {
         fn new(claim: SnapshotCleanupClaim) -> Self {
             Self {
                 claim,
+                claim_next_once: AtomicBool::new(false),
                 released: AtomicUsize::new(0),
                 renewed: AtomicUsize::new(0),
                 finalized: AtomicUsize::new(0),
+                renew_error: Mutex::new(None),
             }
         }
     }
@@ -3135,7 +3176,11 @@ mod tests {
             _worker: &'a SnapshotWorkerId,
             _lease_for: Duration,
         ) -> SnapshotPortFuture<'a, Option<SnapshotCleanupClaim>> {
-            Box::pin(async { Ok(None) })
+            let claim = self
+                .claim_next_once
+                .swap(false, Ordering::SeqCst)
+                .then(|| self.claim.clone());
+            Box::pin(async move { Ok(claim) })
         }
 
         fn renew_lease<'a>(
@@ -3146,6 +3191,9 @@ mod tests {
             let claim = self.claim.clone();
             Box::pin(async move {
                 self.renewed.fetch_add(1, Ordering::SeqCst);
+                if let Some(error) = self.renew_error.lock().expect("renew error lock").take() {
+                    return Err(error);
+                }
                 Ok(claim)
             })
         }
