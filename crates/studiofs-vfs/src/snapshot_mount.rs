@@ -4,6 +4,7 @@
 //! admission. Catalog state, immutable artifact bytes, and active mount leases
 //! come from the Snapshot v2 ports supplied by the metadata/runtime layer.
 
+use crate::snapshot_worker::{SNAPSHOT_ARTIFACT_FORMAT_VERSION, SNAPSHOT_ARTIFACT_SCHEMA_VERSION};
 use crate::{StudioVfs, VfsConfigValidated, VfsResult};
 use crate::{VfsMeta, into_vfs_meta};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use studiofs_data::DataStore;
 use studiofs_meta::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotId, SnapshotLifecycle,
@@ -23,12 +24,12 @@ use studiofs_meta::snapshot::{
 };
 use studiofs_meta::snapshot_ports::{
     SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator, SnapshotArtifactStore,
-    SnapshotClock, SnapshotJobStore, SnapshotMountStore, SnapshotPortError,
+    SnapshotClock, SnapshotJobStore, SnapshotMountStore, SnapshotPortError, SnapshotPortFuture,
 };
 #[cfg(test)]
 use studiofs_meta::snapshot_ports::{
-    SnapshotArtifactScope, SnapshotFailure, SnapshotJobClaim, SnapshotPayloadProof,
-    SnapshotPortFuture, SnapshotRetry, SnapshotStoredArtifact, SnapshotWorkerId,
+    SnapshotArtifactScope, SnapshotFailure, SnapshotJobClaim, SnapshotPayloadProof, SnapshotRetry,
+    SnapshotStoredArtifact, SnapshotWorkerId,
 };
 use studiofs_meta::{AccessLevel, MetaEngine, MetaError, MetaFormat};
 use thiserror::Error;
@@ -39,6 +40,39 @@ use tokio_util::sync::CancellationToken;
 const CACHE_IDLE_TTL: ChronoDuration = ChronoDuration::days(7);
 const DEFAULT_MOUNT_LEASE_TTL: Duration = Duration::from_secs(60);
 const CACHE_LAST_USED_SUFFIX: &str = ".last-used";
+
+/// Provides the monotonic local time used to fence a server-owned lease.
+trait SnapshotLeaseClock: Send + Sync {
+    fn monotonic_now(&self) -> Instant;
+
+    fn sleep_until_monotonic<'a>(
+        &'a self,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> SnapshotPortFuture<'a, ()>;
+}
+
+struct SystemSnapshotLeaseClock;
+
+impl SnapshotLeaseClock for SystemSnapshotLeaseClock {
+    fn monotonic_now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep_until_monotonic<'a>(
+        &'a self,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> SnapshotPortFuture<'a, ()> {
+        let delay = deadline.saturating_duration_since(Instant::now());
+        Box::pin(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => Err(SnapshotPortError::Cancelled),
+                _ = tokio::time::sleep(delay) => Ok(()),
+            }
+        })
+    }
+}
 
 /// Configuration for one production snapshot mount session.
 #[derive(Debug, Clone)]
@@ -215,6 +249,7 @@ pub struct SnapshotMountSession {
     artifacts: Arc<dyn SnapshotArtifactStore>,
     leases: Arc<dyn SnapshotMountStore>,
     clock: Arc<dyn SnapshotClock>,
+    lease_clock: Arc<dyn SnapshotLeaseClock>,
     config: SnapshotMountConfig,
     cache_last_used: Arc<Mutex<HashMap<SnapshotArtifactCacheKey, DateTime<Utc>>>>,
     metadata_handles: Arc<Mutex<HashMap<SnapshotArtifactCacheKey, Arc<dyn VfsMeta>>>>,
@@ -238,6 +273,26 @@ impl SnapshotMountSession {
         clock: Arc<dyn SnapshotClock>,
         config: SnapshotMountConfig,
     ) -> Result<Self, SnapshotMountError> {
+        Self::new_with_lease_clock(
+            volume,
+            jobs,
+            artifacts,
+            leases,
+            clock,
+            Arc::new(SystemSnapshotLeaseClock),
+            config,
+        )
+    }
+
+    fn new_with_lease_clock(
+        volume: SnapshotVolumeContext,
+        jobs: Arc<dyn SnapshotJobStore>,
+        artifacts: Arc<dyn SnapshotArtifactStore>,
+        leases: Arc<dyn SnapshotMountStore>,
+        clock: Arc<dyn SnapshotClock>,
+        lease_clock: Arc<dyn SnapshotLeaseClock>,
+        config: SnapshotMountConfig,
+    ) -> Result<Self, SnapshotMountError> {
         if config.cache_root.as_os_str().is_empty() || config.lease_for.is_zero() {
             return Err(SnapshotMountError::InvalidConfig);
         }
@@ -247,6 +302,7 @@ impl SnapshotMountSession {
             artifacts,
             leases,
             clock,
+            lease_clock,
             config,
             cache_last_used: Arc::new(Mutex::new(HashMap::new())),
             metadata_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -320,6 +376,14 @@ impl SnapshotMountSession {
                 "snapshot artifact cut does not match its catalog",
             )));
         }
+        if descriptor.format_version != SNAPSHOT_ARTIFACT_FORMAT_VERSION
+            || descriptor.schema_version != SNAPSHOT_ARTIFACT_SCHEMA_VERSION
+        {
+            return Err(SnapshotMountError::Port(SnapshotPortError::permanent(
+                "unsupported_artifact_version",
+                "snapshot artifact version is unsupported",
+            )));
+        }
         let cache_key = SnapshotArtifactCacheKey::new(
             self.volume.clone(),
             catalog.snapshot_id.clone(),
@@ -332,6 +396,12 @@ impl SnapshotMountSession {
             attempt: None,
             kind: SnapshotArtifactKind::Metadata,
         };
+        // Anchor before the server call so request latency can only shorten the
+        // local safety window, never extend it past the requested lease TTL.
+        let lease_started = self.lease_clock.monotonic_now();
+        let local_deadline = lease_started
+            .checked_add(self.config.lease_for)
+            .ok_or(SnapshotMountError::InvalidConfig)?;
         let lease = self
             .leases
             .acquire(
@@ -348,7 +418,6 @@ impl SnapshotMountSession {
             || lease.cache_volume_uuid != self.volume.volume_uuid
             || lease.cache_sha256 != descriptor.sha256
             || lease.released
-            || lease.expires_at <= self.clock.now()
         {
             let _ = self.leases.release(&lease).await;
             return Err(SnapshotMountError::Port(SnapshotPortError::permanent(
@@ -358,8 +427,9 @@ impl SnapshotMountSession {
         }
         let lease_state = Arc::new(SnapshotMountLeaseState {
             leases: Arc::clone(&self.leases),
-            clock: Arc::clone(&self.clock),
+            lease_clock: Arc::clone(&self.lease_clock),
             lease: Mutex::new(lease),
+            local_deadline: Mutex::new(local_deadline),
             lease_for: self.config.lease_for,
         });
         let mounted = SnapshotMount {
@@ -656,12 +726,13 @@ impl SnapshotMountSession {
         let jobs = Arc::new(TestJobStore::default());
         let artifacts = Arc::new(TestArtifactStore::default());
         let leases = Arc::new(TestMountStore::new(Arc::clone(&clock)));
-        let mut session = Self::new(
+        let mut session = Self::new_with_lease_clock(
             volume,
             Arc::clone(&jobs) as Arc<dyn SnapshotJobStore>,
             Arc::clone(&artifacts) as Arc<dyn SnapshotArtifactStore>,
-            leases,
+            Arc::clone(&leases) as Arc<dyn SnapshotMountStore>,
             Arc::clone(&clock) as Arc<dyn SnapshotClock>,
+            Arc::clone(&clock) as Arc<dyn SnapshotLeaseClock>,
             SnapshotMountConfig::new(root).with_lease_for(lease_for),
         )
         .unwrap_or_else(|_| unreachable!("test mount configuration is valid"));
@@ -701,8 +772,9 @@ impl SnapshotMountSession {
 
 struct SnapshotMountLeaseState {
     leases: Arc<dyn SnapshotMountStore>,
-    clock: Arc<dyn SnapshotClock>,
+    lease_clock: Arc<dyn SnapshotLeaseClock>,
     lease: Mutex<SnapshotMountLease>,
+    local_deadline: Mutex<Instant>,
     lease_for: Duration,
 }
 
@@ -726,7 +798,15 @@ impl SnapshotMountLeaseRenewal {
 impl SnapshotMountLeaseState {
     fn is_closed(&self) -> bool {
         let lease = self.lease.lock();
-        lease.released || lease.expires_at <= self.clock.now()
+        lease.released || self.local_deadline() <= self.lease_clock.monotonic_now()
+    }
+
+    fn local_deadline(&self) -> Instant {
+        *self.local_deadline.lock()
+    }
+
+    fn local_deadline_expired(&self) -> bool {
+        self.local_deadline() <= self.lease_clock.monotonic_now()
     }
 
     fn mark_released(&self) {
@@ -737,12 +817,18 @@ impl SnapshotMountLeaseState {
 async fn renew_lease_state(
     lease_state: &SnapshotMountLeaseState,
 ) -> Result<(), SnapshotMountError> {
+    // Do not convert the server's UTC expiry into a client-clock decision. The
+    // local deadline is monotonic and conservative when the renewal is slow.
+    let request_started = lease_state.lease_clock.monotonic_now();
+    let renewal_deadline = request_started
+        .checked_add(lease_state.lease_for)
+        .ok_or(SnapshotMountError::InvalidConfig)?;
     let current = {
         let mut lease = lease_state.lease.lock();
         if lease.released {
             return Err(SnapshotMountError::LeaseReleased);
         }
-        if lease.expires_at <= lease_state.clock.now() {
+        if lease_state.local_deadline() <= request_started {
             lease.released = true;
             return Err(SnapshotMountError::LeaseExpired);
         }
@@ -761,7 +847,6 @@ async fn renew_lease_state(
                 || renewed.cache_sha256 != current.cache_sha256
                 || renewed.fencing_token != current.fencing_token
                 || renewed.released
-                || renewed.expires_at <= lease_state.clock.now()
             {
                 lease_state.mark_released();
                 return Err(SnapshotMountError::Port(SnapshotPortError::permanent(
@@ -769,7 +854,12 @@ async fn renew_lease_state(
                     "renewed mount lease identity does not match",
                 )));
             }
+            if renewal_deadline <= lease_state.lease_clock.monotonic_now() {
+                lease_state.mark_released();
+                return Err(SnapshotMountError::LeaseExpired);
+            }
             *lease_state.lease.lock() = renewed;
+            *lease_state.local_deadline.lock() = renewal_deadline;
             Ok(())
         }
         Err(error @ (SnapshotMountError::LeaseExpired | SnapshotMountError::LeaseReleased)) => {
@@ -798,21 +888,20 @@ async fn renew_until_cancelled_state(
             if lease.released {
                 return Err(SnapshotMountError::LeaseReleased);
             }
-            let now = lease_state.clock.now();
-            if lease.expires_at <= now {
+            let now = lease_state.lease_clock.monotonic_now();
+            let local_deadline = lease_state.local_deadline();
+            if local_deadline <= now {
                 drop(lease);
                 lease_state.mark_released();
                 return Err(SnapshotMountError::LeaseExpired);
             }
-            let interval =
-                ChronoDuration::from_std(interval).unwrap_or_else(|_| ChronoDuration::zero());
-            now.checked_add_signed(interval)
-                .unwrap_or(lease.expires_at)
-                .min(lease.expires_at)
+            now.checked_add(interval)
+                .unwrap_or(local_deadline)
+                .min(local_deadline)
         };
         match lease_state
-            .clock
-            .sleep_until(deadline, cancel.clone())
+            .lease_clock
+            .sleep_until_monotonic(deadline, cancel.clone())
             .await
         {
             Ok(()) => {}
@@ -925,7 +1014,7 @@ impl SnapshotMount {
             let mut lease = self.lease_state.lease.lock();
             if lease.released {
                 None
-            } else if lease.expires_at <= self.lease_state.clock.now() {
+            } else if self.lease_state.local_deadline_expired() {
                 lease.released = true;
                 None
             } else {
@@ -1120,6 +1209,7 @@ fn unsupported<'a, T>() -> SnapshotPortFuture<'a, T> {
 #[derive(Clone)]
 struct TestClock {
     now: Arc<Mutex<DateTime<Utc>>>,
+    monotonic: Arc<Mutex<Instant>>,
 }
 
 #[cfg(test)]
@@ -1127,6 +1217,7 @@ impl TestClock {
     fn new(now: DateTime<Utc>) -> Self {
         Self {
             now: Arc::new(Mutex::new(now)),
+            monotonic: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -1138,6 +1229,14 @@ impl TestClock {
         *now = now
             .checked_add_signed(delta)
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let mut monotonic = self.monotonic.lock();
+        if let Some(advanced) = monotonic.checked_add(duration) {
+            *monotonic = advanced;
+        }
+    }
+
+    fn set_now(&self, now: DateTime<Utc>) {
+        *self.now.lock() = now;
     }
 }
 
@@ -1158,6 +1257,31 @@ impl SnapshotClock for TestClock {
                     return Err(SnapshotPortError::Cancelled);
                 }
                 if self.now() >= deadline {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+impl SnapshotLeaseClock for TestClock {
+    fn monotonic_now(&self) -> Instant {
+        *self.monotonic.lock()
+    }
+
+    fn sleep_until_monotonic<'a>(
+        &'a self,
+        deadline: Instant,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> SnapshotPortFuture<'a, ()> {
+        Box::pin(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(SnapshotPortError::Cancelled);
+                }
+                if self.monotonic_now() >= deadline {
                     return Ok(());
                 }
                 tokio::task::yield_now().await;
@@ -1779,6 +1903,130 @@ mod tests {
         assert!(
             snapshot_vfs.readdir(studiofs_meta::ROOT_INO).is_err(),
             "an expired lease must fence an already-open snapshot VFS"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_unsupported_artifact_versions_before_download() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
+        let now = Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap();
+        let snapshot_volume = volume(23, "00000000-0000-0000-0000-000000000023");
+        let snapshot_cut = cut(snapshot_volume.volume_id, now);
+        let snapshot = snapshot_id(&snapshot_volume.volume_name, now);
+        let bytes = valid_snapshot_bytes(root.path(), "unsupported-version", &snapshot_volume);
+        let descriptor = SnapshotArtifactDescriptor {
+            format_version: 2,
+            ..artifact(
+                "snapshots/unsupported-version.redb",
+                snapshot_cut,
+                &bytes,
+                digest(&bytes),
+            )
+        };
+
+        let harness = SnapshotMountSession::new_for_tests(root.path(), now, snapshot_volume);
+        harness.set_catalog(catalog(
+            SnapshotLifecycle::Ready,
+            volume(23, "00000000-0000-0000-0000-000000000023"),
+            snapshot.clone(),
+            snapshot_cut,
+            Some(descriptor),
+        ));
+        harness.put_artifact(bytes.clone());
+
+        let error = match harness.mount(&snapshot, "unsupported-version-mount").await {
+            Ok(_) => panic!("unsupported artifact versions must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            super::SnapshotMountError::Port(
+                studiofs_meta::snapshot_ports::SnapshotPortError::Permanent { code, .. }
+            ) if code.as_str() == "unsupported_artifact_version"
+        ));
+        assert_eq!(harness.download_count(), 0);
+
+        let descriptor = SnapshotArtifactDescriptor {
+            schema_version: 2,
+            ..artifact(
+                "snapshots/unsupported-schema-version.redb",
+                snapshot_cut,
+                &bytes,
+                digest(&bytes),
+            )
+        };
+        harness.set_catalog(catalog(
+            SnapshotLifecycle::Ready,
+            volume(23, "00000000-0000-0000-0000-000000000023"),
+            snapshot.clone(),
+            snapshot_cut,
+            Some(descriptor),
+        ));
+        harness.put_artifact(bytes);
+        let error = match harness
+            .mount(&snapshot, "unsupported-schema-version-mount")
+            .await
+        {
+            Ok(_) => panic!("unsupported artifact schemas must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            super::SnapshotMountError::Port(
+                studiofs_meta::snapshot_ports::SnapshotPortError::Permanent { code, .. }
+            ) if code.as_str() == "unsupported_artifact_version"
+        ));
+        assert_eq!(harness.download_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn lease_fence_ignores_client_wall_clock_jumps() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
+        let now = Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap();
+        let snapshot_volume = volume(26, "00000000-0000-0000-0000-000000000026");
+        let snapshot_cut = cut(snapshot_volume.volume_id, now);
+        let snapshot = snapshot_id(&snapshot_volume.volume_name, now);
+        let bytes = valid_snapshot_bytes(root.path(), "clock-skew", &snapshot_volume);
+        let descriptor = artifact(
+            "snapshots/clock-skew.redb",
+            snapshot_cut,
+            &bytes,
+            digest(&bytes),
+        );
+
+        let harness = SnapshotMountSession::new_for_tests(root.path(), now, snapshot_volume);
+        harness.set_catalog(catalog(
+            SnapshotLifecycle::Ready,
+            volume(26, "00000000-0000-0000-0000-000000000026"),
+            snapshot.clone(),
+            snapshot_cut,
+            Some(descriptor),
+        ));
+        harness.put_artifact(bytes);
+        let mount = harness
+            .mount(&snapshot, "clock-skew-mount")
+            .await
+            .expect("ready artifact should mount");
+        mount
+            .stop_lease_renewal()
+            .await
+            .expect("stop lease renewal");
+
+        harness.test_clock.set_now(now + chrono::Duration::hours(1));
+        assert!(
+            !mount.is_closed(),
+            "a client wall clock ahead of the server must not close a new lease"
+        );
+        harness.test_clock.set_now(now - chrono::Duration::hours(1));
+        assert!(
+            !mount.is_closed(),
+            "a client wall clock behind the server must not extend a lease"
+        );
+
+        harness.advance_clock(Duration::from_secs(61));
+        assert!(
+            mount.is_closed(),
+            "the local monotonic lease deadline must close an unrenewed mount"
         );
     }
 
