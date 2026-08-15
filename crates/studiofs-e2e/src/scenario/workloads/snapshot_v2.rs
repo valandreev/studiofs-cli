@@ -784,11 +784,11 @@ fn cleanup_snapshot_mount(
 }
 
 fn kill_snapshot_process(process: &mut Child, job: &ChildJob) -> Result<(), ScenarioError> {
-    match job.force_kill() {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    let job_killed = match job.force_kill() {
+        Ok(killed) => killed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(ScenarioError::Io(error)),
-    }
+    };
     match process.try_wait() {
         Ok(Some(_)) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -797,7 +797,11 @@ fn kill_snapshot_process(process: &mut Child, job: &ChildJob) -> Result<(), Scen
     }
     match process.kill() {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || (job_killed
+                    && cfg!(windows)
+                    && error.kind() == io::ErrorKind::PermissionDenied) => {}
         Err(error) => return Err(ScenarioError::Io(error)),
     }
     match wait_for_child_exit(process, SNAPSHOT_PROCESS_TERMINATION_TIMEOUT) {

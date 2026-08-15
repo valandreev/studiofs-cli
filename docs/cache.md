@@ -16,6 +16,26 @@ Runtime components:
 | Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
 | Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Writer pages, staging, cached reads, pending-upload queue, upload helpers, pinning, and runtime metrics |
 
+## Snapshot v2 Artifact Cache
+
+Snapshot v2 immutable metadata artifacts use the configured snapshot cache
+root with the compact layout:
+
+```text
+<cache-root>/<compact-volume-uuid>/<snapshot-component>-<sha256>.redb
+```
+
+The UUID has its hyphens removed and the volume-name prefix is omitted from
+the snapshot component to keep Windows paths below the path-length budget.
+The full SHA-256 digest remains part of the filename and is the cache identity
+for the immutable artifact.
+
+This layout replaced the older
+`<cache-root>/metadata/snapshots/volume-*/name-*/uuid-*/snapshot-*.redb`
+layout. Existing files in the legacy directory are not imported into the new
+index and are not evicted by the Snapshot v2 cache session; they are safe to
+remove manually after confirming no older StudioFS process still uses them.
+
 ## Architecture
 
 ```text

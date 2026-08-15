@@ -119,6 +119,13 @@ impl SnapshotArtifactCacheKey {
         snapshot_id: SnapshotId,
         checksum: SnapshotSha256,
     ) -> Self {
+        debug_assert!(
+            snapshot_id
+                .as_str()
+                .strip_prefix(volume.volume_name.as_str())
+                .is_some_and(|suffix| suffix.starts_with('.')),
+            "snapshot id must belong to the cache key volume"
+        );
         Self {
             volume,
             snapshot_id,
@@ -127,11 +134,17 @@ impl SnapshotArtifactCacheKey {
     }
 
     /// Returns the deterministic local path for this immutable artifact.
+    ///
+    /// The compact volume UUID and shortened snapshot component keep the
+    /// Windows path within the platform path-length budget. The checksum
+    /// remains the final identity component so cache files are never reused
+    /// across different artifact bytes.
     pub fn cache_path(&self, root: &Path) -> PathBuf {
         let snapshot_component = self
             .snapshot_id
             .as_str()
-            .strip_prefix(&format!("{}.", self.volume.volume_name))
+            .strip_prefix(self.volume.volume_name.as_str())
+            .and_then(|value| value.strip_prefix('.'))
             .unwrap_or_else(|| self.snapshot_id.as_str());
         root.join(compact_volume_uuid(&self.volume.volume_uuid))
             .join(format!(
@@ -1150,29 +1163,34 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    if !value.is_ascii() || !value.len().is_multiple_of(2) {
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if !value.is_ascii() || value.len() != 64 {
         return None;
     }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|chunk| Some((decode_hex_nibble(chunk[0])? << 4) | decode_hex_nibble(chunk[1])?))
-        .collect::<Option<Vec<_>>>()
+    let mut decoded = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (decode_hex_nibble(chunk[0])? << 4) | decode_hex_nibble(chunk[1])?;
+    }
+    Some(decoded)
 }
 
+/// Parses `<snapshot-component>-<sha256>.redb` cache names.
+///
+/// The volume name is supplied separately because it is intentionally omitted
+/// from the compact filename. The checksum is retained in full to preserve
+/// immutable artifact identity.
 fn parse_cache_file_name(value: &str, volume_name: &str) -> Option<(SnapshotId, SnapshotSha256)> {
     let value = value.strip_suffix(".redb")?;
     let (snapshot_component, checksum_hex) = value.rsplit_once('-')?;
-    if checksum_hex.len() != 64 {
-        return None;
-    }
-    let checksum = decode_hex_bytes(checksum_hex)?;
-    let checksum = SnapshotSha256::from_bytes(checksum.as_slice().try_into().ok()?);
+    let checksum = SnapshotSha256::from_bytes(decode_hex_32(checksum_hex)?);
     let snapshot = SnapshotId::parse(&format!("{volume_name}.{snapshot_component}")).ok()?;
     Some((snapshot, checksum))
 }
 
+/// Removes UUID separators so the cache directory consumes fewer path bytes.
+///
+/// This is part of the Windows path-length budget for long volume names; the
+/// UUID remains unchanged as an identity value everywhere outside the path.
 fn compact_volume_uuid(uuid: &str) -> String {
     uuid.replace('-', "")
 }
@@ -1709,7 +1727,11 @@ mod tests {
 
         assert_ne!(
             key,
-            SnapshotArtifactCacheKey::new(second_volume, first_snapshot.clone(), first_checksum),
+            SnapshotArtifactCacheKey::new(
+                second_volume.clone(),
+                snapshot_id(&second_volume.volume_name, captured_at),
+                first_checksum,
+            ),
             "different immutable volume identities must never alias"
         );
         assert_ne!(
