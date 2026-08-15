@@ -61,10 +61,13 @@ pub(super) const SELECT_SNAPSHOT_SOURCE: &str = r#"
         s.event_end_seq,
         s.event_start_version,
         s.event_end_version,
-        s.event_row_count
+        s.event_row_count,
+        m.format_info
     FROM snapshot_catalog AS c
     INNER JOIN snapshot_source_checkpoints AS s
         ON s.vol = c.vol AND s.snapshot_id = c.id
+    INNER JOIN metadata_state AS m
+        ON m.vol = c.vol
     WHERE c.vol = $1 AND c.id = $2 AND c.lifecycle <> 'deleted'
     "#;
 

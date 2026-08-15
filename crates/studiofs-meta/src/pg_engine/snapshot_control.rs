@@ -4,9 +4,10 @@ use tokio_postgres::GenericClient;
 
 use super::{OverlayConflictSets, RemoteApplyCoordinator, RemoteReplayApplyContext, sql};
 use super::{PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess, janitor::pg_janitor_lock_key};
-use crate::engine::{MetaError, MetaInodes, MetaResult};
+use crate::engine::{MetaError, MetaFormat, MetaInodes, MetaResult};
 use crate::pg_transport::classify_postgres_error;
 use crate::redb_engine::RedbMetaEngine;
+use crate::schema::FormatInfo;
 use crate::snapshot::{
     ServingCheckpoint, SnapshotCatalogEntry, SnapshotCreationState, SnapshotCut, SnapshotId,
     SnapshotLifecycle, SnapshotOrigin, SnapshotRetention, SnapshotSha256, SnapshotVolumeContext,
@@ -43,6 +44,7 @@ struct RawSnapshotSource {
     event_start_version: Option<i64>,
     event_end_version: Option<i64>,
     event_row_count: i64,
+    format_info_bytes: Vec<u8>,
     event_rows: Vec<tokio_postgres::Row>,
 }
 
@@ -50,6 +52,7 @@ struct LoadedSnapshotSource {
     cut: SnapshotCut,
     descriptor: SnapshotSourceDescriptor,
     checkpoint_bytes: Vec<u8>,
+    format_info: FormatInfo,
     event_rows: Vec<tokio_postgres::Row>,
 }
 
@@ -293,6 +296,7 @@ impl PgSnapshotBackend {
                 let event_start_version: Option<i64> = source.get(9);
                 let event_end_version: Option<i64> = source.get(10);
                 let event_row_count: i64 = source.get(11);
+                let format_info_bytes: Vec<u8> = source.get(12);
                 let event_rows = if load_event_rows {
                     client
                         .query(
@@ -323,6 +327,7 @@ impl PgSnapshotBackend {
                     event_start_version,
                     event_end_version,
                     event_row_count,
+                    format_info_bytes,
                     event_rows,
                 }))
             },
@@ -355,6 +360,17 @@ impl PgSnapshotBackend {
                 ))
             })?,
         );
+        let format_info: FormatInfo =
+            serde_json::from_slice(&raw.format_info_bytes).map_err(|_| {
+                SnapshotSourceError::permanent(snapshot_control_error(
+                    "snapshot format info is invalid",
+                ))
+            })?;
+        format_info.validate_format_contract().map_err(|_| {
+            SnapshotSourceError::permanent(snapshot_control_error(
+                "snapshot format info is invalid",
+            ))
+        })?;
         let descriptor = SnapshotSourceDescriptor {
             checkpoint_id: snapshot_id_text,
             checkpoint_version: raw.checkpoint_version,
@@ -384,6 +400,7 @@ impl PgSnapshotBackend {
             cut,
             descriptor,
             checkpoint_bytes: raw.checkpoint_bytes,
+            format_info,
             event_rows: raw.event_rows,
         })
     }
@@ -399,6 +416,9 @@ impl PgSnapshotBackend {
                 ))
             })?;
         let local = RedbMetaEngine::open(destination).map_err(SnapshotSourceError::retryable)?;
+        local
+            .set_format_info(&loaded.format_info)
+            .map_err(SnapshotSourceError::local)?;
         local
             .import_serving_checkpoint(&checkpoint)
             .map_err(SnapshotSourceError::local)?;

@@ -1242,9 +1242,7 @@ impl MountPlan {
                     source_meta,
                     data_store,
                     Arc::new(SystemSnapshotClock),
-                    SnapshotMountConfig::new(
-                        self.base_cache_path.join("snapshot-v2").join("mount-cache"),
-                    ),
+                    SnapshotMountConfig::new(self.base_cache_path.clone()),
                 )
                 .map_err(|error| anyhow::anyhow!("failed to prepare snapshot mount: {error}"))?;
                 if let Err(error) = runtime.block_on(snapshot_session.evict_idle_cache()) {

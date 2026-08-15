@@ -1,6 +1,7 @@
 //! `studiofs smount` — mount one verified snapshot read-only.
 
 use clap::Args;
+use std::path::PathBuf;
 use studiofs_meta::snapshot::SnapshotId;
 
 #[derive(Debug, Clone, Args)]
@@ -21,6 +22,10 @@ pub(crate) struct SmountArgs {
 
     /// Mount point: drive letter on Windows or directory path on Unix.
     mount_point: String,
+
+    /// Disk cache directory used for the snapshot mount.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 }
 
 impl SmountArgs {
@@ -32,6 +37,7 @@ impl SmountArgs {
             self.volume,
             self.snapshot_id,
             self.mount_point,
+            self.cache_dir,
         )?;
         crate::cli::mount::MountSession::prepare_snapshot(command)?.launch()
     }
@@ -56,12 +62,37 @@ mod tests {
                 volume,
                 snapshot_id,
                 mount_point,
+                cache_dir,
             }) => {
                 assert_eq!(volume, "myvolume");
                 assert_eq!(snapshot_id.as_str(), "myvolume.2026-08-12T14-07-09.482Z");
                 assert_eq!(mount_point, "/mnt/snapshot");
+                assert_eq!(cache_dir, None);
             }
             other => panic!("expected Smount command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smount_accepts_an_explicit_cache_directory() {
+        let cli = crate::cli::parse_for_test(&[
+            "smount",
+            "myvolume",
+            "myvolume.2026-08-12T14-07-09.482Z",
+            "/mnt/snapshot",
+            "--cache-dir",
+            "/tmp/studiofs-snapshot-cache",
+        ])
+        .expect("smount should parse an explicit cache directory");
+
+        match cli.command {
+            crate::cli::Commands::Smount(SmountArgs { cache_dir, .. }) => {
+                assert_eq!(
+                    cache_dir,
+                    Some(PathBuf::from("/tmp/studiofs-snapshot-cache"))
+                );
+            }
+            other => panic!("expected smount command, got {other:?}"),
         }
     }
 
