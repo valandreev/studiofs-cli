@@ -187,13 +187,13 @@ tasks:
       ARTIFACT_DIR="${RUN_ROOT}/${RUN_ID}"
 
       echo "Starting StudioFS full real E2E run"
-      echo "scenario_selector=1-23"
+      echo "scenario_selector=1-25"
       echo "run_id=${RUN_ID}"
       echo "artifact_path=${ARTIFACT_DIR}"
 
       set +e
       cargo run -p studiofs-e2e -- run \
-        --scenario 1-23 \
+        --scenario 1-25 \
         --studiofs-bin target/debug/studiofs \
         --root "${RUN_ROOT}" \
         --run-id "${RUN_ID}" \

@@ -130,7 +130,16 @@ pub(super) fn unix_socket_path(mounts_dir: &Path, base_name: &str, pid: u32) -> 
     }
 
     let digest = Sha256::digest(base_name.as_bytes());
-    mounts_dir.join(format!("sfsdiag-{pid}-{}.sock", hex::encode(&digest[..8])))
+    let socket_name = format!("sfsdiag-{pid}-{}.sock", hex::encode(&digest[..8]));
+    let temporary = std::env::temp_dir()
+        .join("studiofs-diagnostics")
+        .join(&socket_name);
+    if temporary.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES {
+        return temporary;
+    }
+    PathBuf::from("/tmp")
+        .join("studiofs-diagnostics")
+        .join(socket_name)
 }
 
 pub(super) fn now_unix_millis() -> u64 {

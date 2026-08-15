@@ -318,12 +318,14 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
                 .any(|(key, value)| key == "STUDIOFS_E2E_POSTGRES_PORT" && value == "32000")
     }));
     assert!(calls.iter().any(|call| {
-        call.args.contains(&"start".to_string())
+        call.args.contains(&"up".to_string())
+            && call.args.contains(&"--detach".to_string())
             && call.args.contains(&"--wait".to_string())
             && call.args.contains(&"postgres".to_string())
     }));
     assert!(calls.iter().any(|call| {
-        call.args.contains(&"start".to_string())
+        call.args.contains(&"up".to_string())
+            && call.args.contains(&"--detach".to_string())
             && call.args.contains(&"--wait".to_string())
             && call.args.contains(&"postgres".to_string())
             && call
@@ -513,7 +515,7 @@ struct StartFailureExecutor;
 
 impl CommandExecutor for StartFailureExecutor {
     fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
-        assert!(command.args.contains(&"start".to_string()));
+        assert!(command.args.contains(&"up".to_string()));
         Ok(CommandOutput {
             status: 17,
             stdout: "start stdout".to_string(),

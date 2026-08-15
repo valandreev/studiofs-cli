@@ -375,7 +375,7 @@ fn run_manual_recovery(
     write_file_sync(&post_cut, b"created after snapshot cut\n")?;
     fs::remove_file(&recovery)?;
 
-    let snapshot_mount = snapshot_mount_path(context)?;
+    let snapshot_mount = snapshot_mount_path(context, &config.volume_name)?;
     cleanup_stale_mount_before_remount(&snapshot_mount)?;
     let mut snapshot_process = spawn_snapshot_mount(
         config,
@@ -564,7 +564,7 @@ fn run_materializer_takeover(
         && final_state.id == snapshot_id
         && final_state.artifact_sha256.is_some();
     summary.state_transitions.push(format_state(&final_state));
-    let snapshot_mount = snapshot_mount_path(context)?;
+    let snapshot_mount = snapshot_mount_path(context, &config.volume_name)?;
     let peer = controller.client_at(1)?;
     let snapshot_client = snapshot_mount_client(controller)?;
     cleanup_stale_mount_before_remount(&snapshot_mount)?;
@@ -1241,13 +1241,18 @@ fn percent_encode(value: &[u8]) -> String {
     encoded
 }
 
-fn snapshot_mount_path(context: &ScenarioContext) -> Result<PathBuf, ScenarioError> {
-    available_snapshot_mount_point(&context.scenario_dir).ok_or_else(|| {
-        ScenarioError::Io(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "no mount point is available for snapshot mount",
-        ))
-    })
+fn snapshot_mount_path(
+    context: &ScenarioContext,
+    volume_name: &str,
+) -> Result<PathBuf, ScenarioError> {
+    available_snapshot_mount_point(&context.scenario_dir)
+        .map(|mount| crate::client::product_mount_path(volume_name, mount))
+        .ok_or_else(|| {
+            ScenarioError::Io(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no mount point is available for snapshot mount",
+            ))
+        })
 }
 
 fn wait_for_snapshot_mount(
@@ -1427,6 +1432,23 @@ mod tests {
         assert!(
             SNAPSHOT_CLIENT_NAMES.contains(&"snapshot"),
             "snapshot mount needs a discovered client root separate from live mounts"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn snapshot_mount_path_matches_product_mount_convention() {
+        let context = ScenarioContext {
+            run_id: "run".to_string(),
+            seed: 0,
+            sandbox: PathBuf::from("/tmp/sandbox"),
+            scenario_dir: PathBuf::from("/tmp/scenario"),
+            client_controller_config: None,
+        };
+
+        assert_eq!(
+            snapshot_mount_path(&context, "volume").expect("snapshot mount path"),
+            PathBuf::from("/tmp/scenario/snapshot-mount/volume")
         );
     }
 }

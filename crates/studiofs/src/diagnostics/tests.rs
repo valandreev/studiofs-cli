@@ -433,6 +433,18 @@ fn endpoint_for_shortens_long_unix_socket_paths() {
     assert!(Path::new(&path).as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
 }
 
+#[cfg(unix)]
+#[test]
+fn endpoint_for_shortens_socket_path_when_mounts_directory_is_long() {
+    let root = mounts_dir_temp();
+    let mounts_dir = root.path().join("a".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+    fs::create_dir_all(&mounts_dir).expect("create long mounts directory");
+
+    let LocalDiagnosticsEndpoint::UnixSocket { path } = endpoint_for(&mounts_dir, "volume", 42);
+
+    assert!(Path::new(&path).as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+}
+
 #[test]
 fn mutating_requests_require_current_controller_lease() {
     let source = static_source();

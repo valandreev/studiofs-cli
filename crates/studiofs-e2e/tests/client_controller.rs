@@ -430,6 +430,38 @@ fn bootstrap_workflow_can_clean_stale_local_metadata_before_cli_commands() {
 }
 
 #[test]
+fn bootstrap_workflow_removes_stale_volume_candidates_before_discovery() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_volume = temp
+        .path()
+        .join("run-1")
+        .join("artifacts")
+        .join("clients")
+        .join("client-a")
+        .join("client-root")
+        .join("meta")
+        .join("stale-volume");
+    std::fs::create_dir_all(&stale_volume).unwrap();
+    std::fs::write(stale_volume.join("stale-volume.db"), "stale").unwrap();
+
+    let executor = RecordingExecutor {
+        create_local_metadata_db: true,
+        ..RecordingExecutor::new()
+    };
+    let config = test_config(temp.path());
+    let mut controller = MultiClientController::new(config, executor);
+
+    controller
+        .bootstrap_volume(VolumeBootstrapOptions {
+            client_names: vec!["client-a".to_string()],
+            clean_existing_local_metadata: true,
+        })
+        .unwrap();
+
+    assert!(!stale_volume.exists());
+}
+
+#[test]
 fn bootstrap_workflow_reports_local_metadata_cleanup_failures_with_client_path() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let metadata_path = temp

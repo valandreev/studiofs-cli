@@ -812,7 +812,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     ) -> Result<VolumeBootstrapSummary, ClientControllerError> {
         self.create_clients(options.client_names)?;
         if options.clean_existing_local_metadata {
-            self.clean_local_metadata_dirs()?;
+            self.clean_client_metadata_roots()?;
         }
         self.init_first_client()?;
         self.discover_additional_clients()?;
@@ -1094,33 +1094,32 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
-    fn clean_local_metadata_dirs(&self) -> Result<(), ClientControllerError> {
-        for runtime in &self.clients {
-            let path = &runtime.spec.local_metadata_dir;
-            if path.exists() {
-                fs::remove_dir_all(path).map_err(|source| {
-                    ClientControllerError::CleanLocalMetadataFailed {
-                        client: runtime.spec.name.clone(),
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-            }
-        }
-        Ok(())
-    }
-
     fn clean_client_metadata_roots(&self) -> Result<(), ClientControllerError> {
         for runtime in &self.clients {
-            let path = runtime.spec.client_root.join("meta");
-            if path.exists() {
-                fs::remove_dir_all(&path).map_err(|source| {
+            let meta_root = runtime.spec.client_root.join("meta");
+            if meta_root.exists() {
+                for entry in fs::read_dir(&meta_root).map_err(|source| {
                     ClientControllerError::CleanLocalMetadataFailed {
                         client: runtime.spec.name.clone(),
-                        path,
+                        path: meta_root.clone(),
                         source,
                     }
-                })?;
+                })? {
+                    let path = entry
+                        .map_err(|source| ClientControllerError::CleanLocalMetadataFailed {
+                            client: runtime.spec.name.clone(),
+                            path: meta_root.clone(),
+                            source,
+                        })?
+                        .path();
+                    fs::remove_dir_all(&path).map_err(|source| {
+                        ClientControllerError::CleanLocalMetadataFailed {
+                            client: runtime.spec.name.clone(),
+                            path,
+                            source,
+                        }
+                    })?;
+                }
             }
         }
         Ok(())
@@ -1863,7 +1862,7 @@ fn default_client_mount_point(sandbox: &Path, client: &str, _index: usize) -> Pa
     client_mount_point(sandbox, client)
 }
 
-fn product_mount_path(volume_name: &str, requested_mount_point: PathBuf) -> PathBuf {
+pub(crate) fn product_mount_path(volume_name: &str, requested_mount_point: PathBuf) -> PathBuf {
     #[cfg(windows)]
     if is_windows_drive_mount_point(&requested_mount_point) {
         return requested_mount_point;
