@@ -231,6 +231,7 @@ fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
     let worker = build_worker(&volume)?;
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
+    let cancellation_requested = cancel.clone();
     let snapshot_id = entry.snapshot_id.clone();
     let ready = runtime.block_on(async {
         let signal_task = tokio::spawn(async move {
@@ -250,6 +251,13 @@ fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
             Ok(())
         }
         Err(error) => {
+            if cancellation_requested.is_cancelled() {
+                println!(
+                    "Snapshot creation interrupted. Registration '{}' remains active in PostgreSQL; track it with 'studiofs snapshot inspect {}'.",
+                    snapshot_id, snapshot_id
+                );
+                return Ok(());
+            }
             let failure = snapshot_jobs(&volume)
                 .ok()
                 .and_then(|jobs| runtime.block_on(jobs.load_catalog(&snapshot_id)).ok())
