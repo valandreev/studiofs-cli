@@ -138,6 +138,9 @@ fn resolve_volume() -> Result<ResolvedVolume> {
     for volume_name in candidates {
         let path = crate::cli::utils::default_meta_dir_in_client_root(&client_root, &volume_name)
             .join(format!("{volume_name}.db"));
+        if !path.is_file() {
+            continue;
+        }
         let info = RedbMetaEngine::read_format_info_readonly(&path).map_err(|error| {
             snapshot_context_error(
                 &path,
@@ -466,6 +469,9 @@ fn lifecycle_name(lifecycle: SnapshotLifecycle) -> &'static str {
 
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
+    if seconds == 0 {
+        return "0s".to_string();
+    }
     if seconds.is_multiple_of(7 * 24 * 60 * 60) {
         format!("{}w", seconds / (7 * 24 * 60 * 60))
     } else if seconds.is_multiple_of(24 * 60 * 60) {
@@ -500,11 +506,13 @@ fn parse_timezone(value: &str) -> Result<String, String> {
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    let (number, suffix) = value.split_at(
-        value
-            .find(|character: char| !character.is_ascii_digit())
-            .ok_or_else(|| "expected a duration such as 30m, 7d, or 1w".to_string())?,
-    );
+    let split_at = value
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| "expected a duration such as 30m, 7d, or 1w".to_string())?;
+    let (number, suffix) = value.split_at(split_at);
+    if number.is_empty() {
+        return Err("expected a duration such as 30m, 7d, or 1w".to_string());
+    }
     let amount = number
         .parse::<u64>()
         .map_err(|_| "duration value is out of range".to_string())?;
@@ -535,6 +543,8 @@ fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::super::parse_for_test;
+    use super::format_duration;
+    use std::time::Duration;
 
     #[test]
     fn snapshot_parser_accepts_the_canonical_forms() {
@@ -640,5 +650,16 @@ mod tests {
             ])
             .is_err()
         );
+        for value in ["d", "-5d"] {
+            assert!(
+                parse_for_test(&["snapshot", "create", "--ttl", value,]).is_err(),
+                "accepted malformed duration: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_duration_zero_is_seconds() {
+        assert_eq!(format_duration(Duration::ZERO), "0s");
     }
 }

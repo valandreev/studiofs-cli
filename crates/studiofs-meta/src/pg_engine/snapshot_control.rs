@@ -116,7 +116,6 @@ impl PgMetaEngine {
                 command_timeout,
                 "validate snapshot volume identity",
                 move |client| {
-                    let hint = hint.clone();
                     Box::pin(async move {
                         let tx = client.transaction().await.map_err(|error| {
                             classify_postgres_error(

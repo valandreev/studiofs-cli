@@ -154,7 +154,10 @@ fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEnt
     let job_state = row
         .get::<_, Option<String>>(18)
         .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
-    let retry_count = u32::try_from(row.get::<_, i32>(19))
+    let retry_count = row
+        .get::<_, Option<i32>>(19)
+        .ok_or_else(|| MetaError::Storage("missing snapshot retry count".to_string()))?;
+    let retry_count = u32::try_from(retry_count)
         .map_err(|_| MetaError::Storage("invalid snapshot retry count".to_string()))?;
     let owner = row
         .get::<_, Option<String>>(22)
