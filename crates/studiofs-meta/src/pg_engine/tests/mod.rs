@@ -612,13 +612,15 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
 
         let empty_checkpoint = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
+        let format_info_bytes = serde_json::to_vec(&format_info(name, uuid, dsn, volume_id))
+            .map_err(|e| MetaError::Serialization(format!("format info encode failed: {e}")))?;
         tx.execute(
             r#"
-                INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot)
-                VALUES ($1, 0, 0, $2)
+                INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info)
+                VALUES ($1, 0, 0, $2, $3)
                 ON CONFLICT (vol) DO NOTHING
                 "#,
-            &[&volume_id, &empty_checkpoint],
+            &[&volume_id, &empty_checkpoint, &format_info_bytes],
         )
         .await
         .map_err(|e| {
