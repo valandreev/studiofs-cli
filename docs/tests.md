@@ -73,6 +73,21 @@ cargo test -p studiofs-meta captured_checkpoint_bytes_survive_serving_checkpoint
 cargo test -p studiofs-meta many_snapshots_do_not_grow_serving_checkpoint_or_event_payloads -- --ignored --nocapture
 ```
 
+### SFS-651 Snapshot CLI contract
+
+Run the parser and CLI-service checks for the canonical eight-form surface:
+
+```powershell
+cargo test -p studiofs --bin studiofs snapshot_parser -- --nocapture
+cargo check -p studiofs -p studiofs-meta -p studiofs-vfs
+```
+
+The live resolver, PostgreSQL identity validation, Ready wait, policy CAS, and
+artifact/materializer checks require configured PostgreSQL and object storage;
+run those through the focused Snapshot v2 integration/E2E commands rather than
+claiming them from parser-only evidence. Do not replace these commands with a
+filter that reports `running 0 tests`.
+
 ### SFS-647 Secret Redaction and Error Category Regressions
 
 Run these focused checks when changing persisted-config diagnostics, PostgreSQL

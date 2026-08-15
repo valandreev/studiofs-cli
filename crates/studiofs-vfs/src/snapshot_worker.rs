@@ -17,13 +17,10 @@ use studiofs_data::snapshot_key::{
 };
 use studiofs_data::{DataStore, store::DataError};
 use studiofs_meta::schema::{PayloadRef, PayloadRefState};
-#[cfg(test)]
-use studiofs_meta::snapshot::SnapshotCatalogEntry;
 use studiofs_meta::snapshot::{
-    SnapshotArtifactDescriptor, SnapshotCleanupClaim, SnapshotId, SnapshotLifecycle,
-    SnapshotPolicyEvaluation, SnapshotSha256, SnapshotVolumeContext,
+    SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCleanupClaim, SnapshotId,
+    SnapshotLifecycle, SnapshotPolicyEvaluation, SnapshotSha256, SnapshotVolumeContext,
 };
-#[cfg(test)]
 use studiofs_meta::snapshot_ports::SnapshotClaimOrFollow;
 use studiofs_meta::snapshot_ports::{
     SnapshotArtifactBytes, SnapshotArtifactKind, SnapshotArtifactLocator, SnapshotArtifactScope,
@@ -756,8 +753,7 @@ impl SnapshotWorker {
     }
 
     /// Claims a requested ID or follows its durable catalog until it is Ready.
-    #[cfg(test)]
-    async fn claim_or_follow(
+    pub async fn claim_or_follow(
         &self,
         snapshot_id: SnapshotId,
         cancel: CancellationToken,

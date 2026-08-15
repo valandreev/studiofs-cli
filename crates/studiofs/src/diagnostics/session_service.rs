@@ -99,6 +99,13 @@ impl<'a> DiagnosticsSessionService<'a> {
         Ok(session)
     }
 
+    pub(super) fn snapshot_format_info(&self) -> DiagnosticsServiceResult<FormatInfo> {
+        self.deps
+            .source
+            .snapshot_format_info()
+            .map_err(DiagnosticsServiceError::InvestigationStore)
+    }
+
     pub(super) fn list_workflows(
         &self,
     ) -> DiagnosticsServiceResult<Vec<InvestigationWorkflowPreset>> {
@@ -697,6 +704,14 @@ pub(super) fn dispatch_protocol(
             auth_token,
             || service.session_info(),
             |session| DiagnosticsResponse::SessionInfo { session },
+        ),
+        DiagnosticsRequest::SnapshotFormatInfo {
+            auth_token: provided,
+        } => authorized_response(
+            &provided,
+            auth_token,
+            || service.snapshot_format_info(),
+            |format_info| DiagnosticsResponse::SnapshotFormatInfo { format_info },
         ),
         DiagnosticsRequest::ListWorkflows {
             auth_token: provided,

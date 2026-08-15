@@ -143,6 +143,11 @@ impl From<VfsRuntimeEvent> for DiagnosticsRecentEvent {
 
 pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
     fn session_info(&self) -> DiagnosticsSessionInfo;
+    fn snapshot_format_info(&self) -> Result<FormatInfo> {
+        Err(anyhow!(
+            "snapshot metadata is unavailable for this diagnostics session"
+        ))
+    }
     fn health_snapshot(&self) -> DiagnosticsHealthSnapshot;
     fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot;
     fn recent_events(&self, limit: usize) -> Vec<DiagnosticsRecentEvent>;

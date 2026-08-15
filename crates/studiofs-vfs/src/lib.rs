@@ -43,6 +43,10 @@ pub use snapshot_mount::{
     SnapshotMountSession,
 };
 pub use snapshot_worker::SystemSnapshotClock;
+pub use snapshot_worker::{
+    DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotWorker,
+    SnapshotWorkerConfig,
+};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use utils::parse_size_bytes;

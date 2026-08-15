@@ -1,4 +1,4 @@
-use super::PgMetaEngine;
+use super::{PgMetaEngine, SnapshotBackendAccess};
 use crate::engine::{MetaError, MetaResult};
 use crate::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob, SnapshotCreationLease,
@@ -12,7 +12,7 @@ use crate::snapshot_ports::{
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Row};
 
 const STALE_LEASE: &str = "snapshot lease fenced";
 const SNAPSHOT_NOT_FOUND: &str = "snapshot job not found";
@@ -132,25 +132,15 @@ where
     })
 }
 
-pub(super) async fn load_catalog<C>(
-    client: &C,
-    volume_id: i64,
-    snapshot_id: &str,
-) -> MetaResult<SnapshotCatalogEntry>
-where
-    C: GenericClient + Sync,
-{
-    let row = client
-        .query_opt(
-            "SELECT c.id, v.name, v.uuid, c.origin, c.cut_version, c.captured_at, c.lifecycle, c.retention_seconds, c.ready_at, c.expires_at, c.failure_code, c.failure_message, a.object_key, a.format_version, a.schema_version, a.sha256, a.byte_length, a.verified_at FROM snapshot_catalog AS c JOIN volumes AS v ON v.vol = c.vol LEFT JOIN snapshot_artifacts AS a ON a.vol = c.vol AND a.snapshot_id = c.id WHERE c.vol = $1 AND c.id = $2",
-            &[&volume_id, &snapshot_id],
-        )
-        .await
-        .map_err(|_| pg_failure("load snapshot catalog"))?
-        .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
+fn catalog_query(filter: &str) -> String {
+    format!(
+        "SELECT c.id, v.name, v.uuid, c.origin, c.cut_version, c.captured_at, c.lifecycle, c.retention_seconds, c.ready_at, c.expires_at, c.failure_code, c.failure_message, a.object_key, a.format_version, a.schema_version, a.sha256, a.byte_length, a.verified_at, j.state, j.failure_message FROM snapshot_catalog AS c JOIN volumes AS v ON v.vol = c.vol LEFT JOIN snapshot_artifacts AS a ON a.vol = c.vol AND a.snapshot_id = c.id LEFT JOIN snapshot_creation_jobs AS j ON j.vol = c.vol AND j.snapshot_id = c.id {filter}"
+    )
+}
 
-    let snapshot_id_text: String = row.get(0);
-    let snapshot_id = SnapshotId::parse(&snapshot_id_text)
+fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEntry> {
+    let snapshot_id_text: &str = row.get(0);
+    let snapshot_id = SnapshotId::parse(snapshot_id_text)
         .map_err(|_| MetaError::Storage("invalid snapshot ID in PostgreSQL".to_string()))?;
     let volume =
         SnapshotVolumeContext::new(volume_id, row.get::<_, String>(1), row.get::<_, String>(2))
@@ -161,7 +151,11 @@ where
         .map_err(|_| MetaError::Storage("invalid snapshot cut".to_string()))?;
     let lifecycle = parse_lifecycle(row.get(6))?;
     let retention = parse_retention(origin, row.get(7))?;
-    let job = load_job(client, volume_id, snapshot_id.as_str()).await?;
+    let job_state: &str = row
+        .get::<_, Option<&str>>(18)
+        .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
+    let creation_state = parse_creation_state(job_state)?;
+    let job_failure: Option<String> = row.get(19);
     let artifact = match row.get::<_, Option<String>>(12) {
         None => None,
         Some(object_key) => {
@@ -173,8 +167,8 @@ where
                 MetaError::Storage("missing artifact schema version".to_string())
             })?)
             .map_err(|_| MetaError::Storage("invalid artifact schema version".to_string()))?;
-            let digest: Vec<u8> = row
-                .get::<_, Option<Vec<u8>>>(15)
+            let digest: &[u8] = row
+                .get::<_, Option<&[u8]>>(15)
                 .ok_or_else(|| MetaError::Storage("missing artifact checksum".to_string()))?;
             let sha256: [u8; 32] = digest
                 .try_into()
@@ -209,13 +203,33 @@ where
         origin,
         cut,
         lifecycle,
-        creation_state: job.state,
+        creation_state,
         retention,
         ready_at: row.get(8),
         expires_at: row.get(9),
         artifact,
-        failure: row.get::<_, Option<String>>(11).or_else(|| row.get(10)),
+        failure: row
+            .get::<_, Option<String>>(11)
+            .or_else(|| row.get(10))
+            .or(job_failure),
     })
+}
+
+pub(super) async fn load_catalog<C>(
+    client: &C,
+    volume_id: i64,
+    snapshot_id: &str,
+) -> MetaResult<SnapshotCatalogEntry>
+where
+    C: GenericClient + Sync,
+{
+    let query = catalog_query("WHERE c.vol = $1 AND c.id = $2");
+    let row = client
+        .query_opt(&query, &[&volume_id, &snapshot_id])
+        .await
+        .map_err(|_| pg_failure("load snapshot catalog"))?
+        .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
+    parse_catalog_row(&row, volume_id)
 }
 
 async fn claim_job<C>(
@@ -259,16 +273,16 @@ where
     })
 }
 
-impl SnapshotJobStore for PgMetaEngine {
+impl<T: SnapshotBackendAccess + Send + Sync> SnapshotJobStore for T {
     fn claim_next<'a>(
         &'a self,
         worker: &'a SnapshotWorkerId,
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, Option<SnapshotJobClaim>> {
         let worker = worker.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
             let result = PgMetaEngine::with_postgres_client_timeout(
@@ -335,9 +349,9 @@ impl SnapshotJobStore for PgMetaEngine {
     ) -> SnapshotPortFuture<'a, SnapshotClaimOrFollow> {
         let snapshot_id = snapshot_id.clone();
         let worker = worker.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
             let result = PgMetaEngine::with_postgres_client_timeout(
@@ -403,9 +417,9 @@ impl SnapshotJobStore for PgMetaEngine {
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, SnapshotCreationLease> {
         let claim = claim.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
             let result = PgMetaEngine::with_postgres_client_timeout(
@@ -445,9 +459,9 @@ impl SnapshotJobStore for PgMetaEngine {
 
     fn release_lease<'a>(&'a self, claim: &'a SnapshotJobClaim) -> SnapshotPortFuture<'a, ()> {
         let claim = claim.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -510,9 +524,9 @@ impl SnapshotJobStore for PgMetaEngine {
         let message = retry.message.as_str().to_string();
         let retry_count = retry.retry_count;
         let next_retry_at = retry.next_retry_at;
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let retry_count = i32::try_from(retry_count).map_err(|_| {
                 SnapshotPortError::permanent("invalid_retry", "retry count is too large")
@@ -587,9 +601,9 @@ impl SnapshotJobStore for PgMetaEngine {
             .as_str()
             .to_string();
         let message = failure.message.as_str().to_string();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -656,9 +670,9 @@ impl SnapshotJobStore for PgMetaEngine {
         let claim = claim.clone();
         let descriptor = descriptor.clone();
         let payload_proofs = payload_proofs.to_vec();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -804,9 +818,9 @@ impl SnapshotJobStore for PgMetaEngine {
         snapshot_id: &'a SnapshotId,
     ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry> {
         let snapshot_id = snapshot_id.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -821,6 +835,33 @@ impl SnapshotJobStore for PgMetaEngine {
             )
             .await;
             result.map_err(|error| map_error("load snapshot catalog", error))
+        })
+    }
+
+    fn list_catalog<'a>(&'a self) -> SnapshotPortFuture<'a, Vec<SnapshotCatalogEntry>> {
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
+        Box::pin(async move {
+            let result = PgMetaEngine::with_postgres_client_timeout(
+                pool,
+                timeout,
+                "list snapshot catalog",
+                move |client| {
+                    Box::pin(async move {
+                        let query = catalog_query("WHERE c.vol = $1 ORDER BY c.captured_at, c.id");
+                        let rows = client
+                            .query(&query, &[&volume_id])
+                            .await
+                            .map_err(|_| pg_failure("list snapshot catalog"))?;
+                        rows.iter()
+                            .map(|row| parse_catalog_row(row, volume_id))
+                            .collect()
+                    })
+                },
+            )
+            .await;
+            result.map_err(|error| map_error("list snapshot catalog", error))
         })
     }
 }

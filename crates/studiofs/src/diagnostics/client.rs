@@ -37,6 +37,19 @@ impl LocalDiagnosticsClient {
         }
     }
 
+    pub(crate) async fn snapshot_format_info(&self) -> Result<FormatInfo> {
+        match self
+            .send(DiagnosticsRequest::SnapshotFormatInfo {
+                auth_token: self.discovery.auth_token.clone(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::SnapshotFormatInfo { format_info } => Ok(format_info),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
     pub(crate) async fn list_workflows(&self) -> Result<Vec<InvestigationWorkflowPreset>> {
         match self
             .send(DiagnosticsRequest::ListWorkflows {

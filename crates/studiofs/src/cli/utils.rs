@@ -43,7 +43,7 @@ fn normalize_client_root(root: PathBuf) -> Result<PathBuf> {
         .with_context(|| format!("resolve {CLIENT_ROOT_ENV} '{}'", root.display()))
 }
 
-fn default_meta_dir_in_client_root(client_root: &Path, volume_name: &str) -> PathBuf {
+pub(crate) fn default_meta_dir_in_client_root(client_root: &Path, volume_name: &str) -> PathBuf {
     client_root.join("meta").join(volume_name)
 }
 
@@ -233,6 +233,31 @@ fn write_mount_record_with_cache_and_instance(
     };
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
     Ok(())
+}
+
+pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<MountRecordInfo>> {
+    let mounts_dir = get_mounts_dir()?;
+    for entry in std::fs::read_dir(mounts_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let data = match std::fs::read(entry.path()) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let record = match serde_json::from_slice::<MountRecordInfo>(&data) {
+            Ok(record) if record.volume == volume => record,
+            _ => continue,
+        };
+        if mount_is_active(&record.mount_point)? {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 /// Read PID file → `(pid, mount_point, volume)`.

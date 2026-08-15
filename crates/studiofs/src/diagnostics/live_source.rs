@@ -12,6 +12,7 @@ pub(crate) struct LiveMountRuntimeFingerprint {
 
 pub(crate) struct LiveMountDiagnosticsSource {
     identity: DiagnosticsSessionInfo,
+    format_info: FormatInfo,
     base_fingerprint: EnvironmentFingerprint,
     vfs: Arc<StudioVfs>,
     process_sampler: Mutex<ProcessMetricsSampler>,
@@ -77,6 +78,7 @@ impl LiveMountDiagnosticsSource {
         let base_fingerprint = base_environment_fingerprint(&identity, &runtime_fingerprint);
         Self {
             identity,
+            format_info: format_info.clone(),
             base_fingerprint,
             vfs,
             process_sampler: Mutex::new(ProcessMetricsSampler::new(pid)),
@@ -87,6 +89,10 @@ impl LiveMountDiagnosticsSource {
 impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
     fn session_info(&self) -> DiagnosticsSessionInfo {
         self.identity.clone()
+    }
+
+    fn snapshot_format_info(&self) -> Result<FormatInfo> {
+        Ok(self.format_info.clone())
     }
 
     fn health_snapshot(&self) -> DiagnosticsHealthSnapshot {

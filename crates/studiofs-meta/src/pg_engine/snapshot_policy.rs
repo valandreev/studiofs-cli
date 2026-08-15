@@ -1,4 +1,4 @@
-use super::{PgMetaEngine, snapshot_control};
+use super::{PgMetaEngine, SnapshotBackendAccess, snapshot_control};
 use crate::engine::{MetaError, MetaResult};
 use crate::snapshot::{
     SnapshotDailyPolicy, SnapshotOrigin, SnapshotPolicyEvaluation, SnapshotPolicyEvaluatorLease,
@@ -108,16 +108,16 @@ fn parse_policy_row(
     Ok(SnapshotPolicyRecord { generation, policy })
 }
 
-impl SnapshotPolicyStore for PgMetaEngine {
+impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
     fn set_policy<'a>(
         &'a self,
         policy: &'a SnapshotDailyPolicy,
         expected_generation: Option<i64>,
     ) -> SnapshotPortFuture<'a, SnapshotPolicyRecord> {
         let policy = policy.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let retention_seconds = retention_seconds(&policy)?;
             let result = PgMetaEngine::with_postgres_client_timeout(
@@ -181,9 +181,9 @@ impl SnapshotPolicyStore for PgMetaEngine {
     }
 
     fn load_policy<'a>(&'a self) -> SnapshotPortFuture<'a, Option<SnapshotPolicyRecord>> {
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -216,9 +216,9 @@ impl SnapshotPolicyStore for PgMetaEngine {
     }
 
     fn cancel_policy<'a>(&'a self, expected_generation: i64) -> SnapshotPortFuture<'a, ()> {
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -251,9 +251,9 @@ impl SnapshotPolicyStore for PgMetaEngine {
         owner: &'a SnapshotPolicyEvaluatorId,
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluatorLease> {
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         let owner = owner.as_str().to_string();
         let context_volume_id = context.volume_id;
         Box::pin(async move {
@@ -296,9 +296,9 @@ impl SnapshotPolicyStore for PgMetaEngine {
         lease: &'a SnapshotPolicyEvaluatorLease,
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluatorLease> {
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         let lease = lease.clone();
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
@@ -335,9 +335,9 @@ impl SnapshotPolicyStore for PgMetaEngine {
         lease: &'a SnapshotPolicyEvaluatorLease,
         now: DateTime<Utc>,
     ) -> SnapshotPortFuture<'a, SnapshotPolicyEvaluation> {
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         let lease = lease.clone();
         let context_volume_id = context.volume_id;
         Box::pin(async move {
@@ -492,9 +492,9 @@ impl SnapshotPolicyStore for PgMetaEngine {
         &'a self,
         lease: &'a SnapshotPolicyEvaluatorLease,
     ) -> SnapshotPortFuture<'a, ()> {
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         let lease = lease.clone();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
