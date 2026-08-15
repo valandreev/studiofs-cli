@@ -20,7 +20,7 @@ pub mod qos;
 pub mod readahead;
 mod runtime;
 pub mod snapshot_mount;
-pub mod snapshot_worker;
+mod snapshot_worker;
 pub mod upload;
 pub mod utils;
 pub mod vfs;
@@ -45,7 +45,7 @@ pub use snapshot_mount::{
 pub use snapshot_worker::SystemSnapshotClock;
 pub use snapshot_worker::{
     DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotWorker,
-    SnapshotWorkerConfig, SnapshotWorkerError,
+    SnapshotWorkerConfig,
 };
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;

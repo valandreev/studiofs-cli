@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveTime;
 use clap::{Args, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -135,7 +135,8 @@ fn resolve_volume() -> Result<ResolvedVolume> {
 
     let mut resolved = Vec::new();
     for volume_name in candidates {
-        let path = snapshot_meta_path(&client_root, &volume_name);
+        let path = crate::cli::utils::default_meta_dir_in_client_root(&client_root, &volume_name)
+            .join(format!("{volume_name}.db"));
         let info = RedbMetaEngine::read_format_info_readonly(&path).map_err(|_| {
             snapshot_context_error(&path, "local metadata is corrupt or unsupported")
         })?;
@@ -445,13 +446,13 @@ fn lifecycle_name(lifecycle: SnapshotLifecycle) -> &'static str {
 
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
-    if seconds % (7 * 24 * 60 * 60) == 0 {
+    if seconds.is_multiple_of(7 * 24 * 60 * 60) {
         format!("{}w", seconds / (7 * 24 * 60 * 60))
-    } else if seconds % (24 * 60 * 60) == 0 {
+    } else if seconds.is_multiple_of(24 * 60 * 60) {
         format!("{}d", seconds / (24 * 60 * 60))
-    } else if seconds % (60 * 60) == 0 {
+    } else if seconds.is_multiple_of(60 * 60) {
         format!("{}h", seconds / (60 * 60))
-    } else if seconds % 60 == 0 {
+    } else if seconds.is_multiple_of(60) {
         format!("{}m", seconds / 60)
     } else {
         format!("{seconds}s")
@@ -502,11 +503,6 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
         return Err("duration must be greater than zero".to_string());
     }
     Ok(Duration::from_secs(seconds))
-}
-
-fn snapshot_meta_path(client_root: &Path, volume_name: &str) -> PathBuf {
-    crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)
-        .join(format!("{volume_name}.db"))
 }
 
 fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
