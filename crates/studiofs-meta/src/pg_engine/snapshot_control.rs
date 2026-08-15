@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::GenericClient;
 
 use super::{OverlayConflictSets, RemoteApplyCoordinator, RemoteReplayApplyContext, sql};
-use super::{PgMetaEngine, janitor::pg_janitor_lock_key};
+use super::{PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess, janitor::pg_janitor_lock_key};
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::pg_transport::classify_postgres_error;
 use crate::redb_engine::RedbMetaEngine;
@@ -89,7 +89,7 @@ impl SnapshotSourceError {
     }
 }
 
-impl PgMetaEngine {
+impl PgSnapshotBackend {
     /// Validates one locally discovered volume identity against PostgreSQL.
     ///
     /// The local hint is used only to select the candidate row. The returned
@@ -108,10 +108,10 @@ impl PgMetaEngine {
         hint.validate()
             .map_err(|_| MetaError::Storage("invalid local snapshot volume identity".into()))?;
         let hint = hint.clone();
-        let command_pool = self.command_pool.clone();
-        let command_timeout = self.command_timeout;
-        self.run_async(async move {
-            Self::with_postgres_client_timeout(
+        let command_pool = self.snapshot_command_pool().clone();
+        let command_timeout = self.snapshot_command_timeout();
+        PgMetaEngine::run_async_once(async move {
+            PgMetaEngine::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
                 "validate snapshot volume identity",
@@ -190,18 +190,18 @@ impl PgMetaEngine {
         origin: SnapshotOrigin,
         retention: SnapshotRetention,
     ) -> MetaResult<SnapshotCatalogEntry> {
-        let postgres_url = self.postgres_url.clone();
+        let postgres_url = self.snapshot_postgres_url().to_string();
         let request = SnapshotCaptureRequest {
-            volume_id: self.volume_id,
+            volume_id: self.snapshot_volume_id(),
             origin,
             retention,
         };
 
-        Self::run_async_once(async move {
-            Self::with_postgres_client_timeout_once(
+        PgMetaEngine::run_async_once(async move {
+            PgMetaEngine::with_postgres_client_timeout_once(
                 postgres_url,
-                Self::default_connect_timeout(),
-                Self::default_command_timeout(),
+                PgMetaEngine::default_connect_timeout(),
+                PgMetaEngine::default_command_timeout(),
                 "create snapshot",
                 |mut client| async move {
                     let tx = client
@@ -226,15 +226,15 @@ impl PgMetaEngine {
     /// intentionally idempotent and returns the current Deleting or Deleted
     /// catalog projection.
     pub fn delete_snapshot_v2(&self, snapshot_id: &SnapshotId) -> MetaResult<SnapshotCatalogEntry> {
-        let postgres_url = self.postgres_url.clone();
+        let postgres_url = self.snapshot_postgres_url().to_string();
         let snapshot_id = snapshot_id.clone();
-        let volume_id = self.volume_id;
+        let volume_id = self.snapshot_volume_id();
 
-        Self::run_async_once(async move {
-            Self::with_postgres_client_timeout_once(
+        PgMetaEngine::run_async_once(async move {
+            PgMetaEngine::with_postgres_client_timeout_once(
                 postgres_url,
-                Self::default_connect_timeout(),
-                Self::default_command_timeout(),
+                PgMetaEngine::default_connect_timeout(),
+                PgMetaEngine::default_command_timeout(),
                 "delete snapshot",
                 |mut client| async move {
                     let tx = client
@@ -264,9 +264,9 @@ impl PgMetaEngine {
         load_event_rows: bool,
     ) -> Result<LoadedSnapshotSource, SnapshotSourceError> {
         let query_snapshot_id = snapshot_id_text.clone();
-        let raw = Self::with_postgres_client_timeout_once(
+        let raw = PgMetaEngine::with_postgres_client_timeout_once(
             postgres_url,
-            Self::default_connect_timeout(),
+            PgMetaEngine::default_connect_timeout(),
             command_timeout,
             "reconstruct snapshot source",
             move |client| async move {
@@ -430,6 +430,32 @@ impl PgMetaEngine {
     }
 }
 
+impl PgMetaEngine {
+    /// Validates a snapshot volume identity against PostgreSQL.
+    pub fn validate_snapshot_volume_context(
+        &self,
+        hint: &SnapshotVolumeIdentityHint,
+    ) -> MetaResult<SnapshotVolumeContext> {
+        self.snapshot_backend()
+            .validate_snapshot_volume_context(hint)
+    }
+
+    /// Registers a manual or automatic Snapshot v2 cut in PostgreSQL.
+    pub fn create_snapshot_v2(
+        &self,
+        origin: SnapshotOrigin,
+        retention: SnapshotRetention,
+    ) -> MetaResult<SnapshotCatalogEntry> {
+        self.snapshot_backend()
+            .create_snapshot_v2(origin, retention)
+    }
+
+    /// Requests deletion of one Snapshot v2 catalog entry.
+    pub fn delete_snapshot_v2(&self, snapshot_id: &SnapshotId) -> MetaResult<SnapshotCatalogEntry> {
+        self.snapshot_backend().delete_snapshot_v2(snapshot_id)
+    }
+}
+
 /// Transitions one eligible snapshot to Deleting and fences creation claims.
 pub(crate) async fn request_snapshot_delete_in_transaction<C>(
     client: &C,
@@ -587,16 +613,16 @@ fn validate_snapshot_event_rows(
     Ok(())
 }
 
-impl SnapshotSourceReader for PgMetaEngine {
+impl<T: SnapshotBackendAccess + Send + Sync> SnapshotSourceReader for T {
     fn load_descriptor<'a>(
         &'a self,
         snapshot_id: &'a SnapshotId,
     ) -> SnapshotPortFuture<'a, SnapshotSourceDescriptor> {
         Box::pin(async move {
-            let loaded = Self::load_snapshot_source(
-                self.postgres_url.clone(),
-                self.volume_id,
-                self.command_timeout,
+            let loaded = PgSnapshotBackend::load_snapshot_source(
+                self.snapshot_postgres_url().to_string(),
+                self.snapshot_volume_id(),
+                self.snapshot_command_timeout(),
                 snapshot_id.to_string(),
                 None,
                 None,
@@ -615,7 +641,7 @@ impl SnapshotSourceReader for PgMetaEngine {
         destination: &'a Path,
     ) -> SnapshotPortFuture<'a, SnapshotReconstruction> {
         Box::pin(async move {
-            if cut.volume_id() != self.volume_id
+            if cut.volume_id() != self.snapshot_volume_id()
                 || descriptor.checkpoint_version < 0
                 || descriptor.checkpoint_version > cut.cut_version()
                 || descriptor.checkpoint_format_version != ServingCheckpoint::FORMAT_VERSION
@@ -632,10 +658,10 @@ impl SnapshotSourceReader for PgMetaEngine {
                     "snapshot source descriptor is invalid",
                 )
             })?;
-            let loaded = Self::load_snapshot_source(
-                self.postgres_url.clone(),
-                self.volume_id,
-                self.command_timeout,
+            let loaded = PgSnapshotBackend::load_snapshot_source(
+                self.snapshot_postgres_url().to_string(),
+                self.snapshot_volume_id(),
+                self.snapshot_command_timeout(),
                 snapshot_id.to_string(),
                 Some(*cut),
                 Some(descriptor.clone()),
@@ -645,7 +671,7 @@ impl SnapshotSourceReader for PgMetaEngine {
             .map_err(SnapshotSourceError::into_port_error)?;
             let destination = destination.to_path_buf();
             tokio::task::spawn_blocking(move || {
-                Self::reconstruct_loaded_snapshot_source(loaded, &destination)
+                PgSnapshotBackend::reconstruct_loaded_snapshot_source(loaded, &destination)
                     .map_err(SnapshotSourceError::into_port_error)
             })
             .await

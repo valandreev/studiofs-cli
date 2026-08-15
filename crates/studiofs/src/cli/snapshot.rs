@@ -14,9 +14,7 @@ use studiofs_meta::snapshot::{
     SnapshotCatalogEntry, SnapshotDailyPolicy, SnapshotId, SnapshotLifecycle, SnapshotOrigin,
     SnapshotRetention, SnapshotVolumeContext, SnapshotVolumeIdentityHint,
 };
-use studiofs_meta::{
-    FormatInfo, MetaEngine, MetadataBackend, PgMetaEngine, PgOpenOptions, RedbMetaEngine,
-};
+use studiofs_meta::{FormatInfo, MetadataBackend, PgMetaEngine, PgSnapshotBackend, RedbMetaEngine};
 use studiofs_vfs::{
     DataStoreSnapshotArtifactStore, DataStoreSnapshotPayloadReader, SnapshotWorker,
     SnapshotWorkerConfig, SystemSnapshotClock,
@@ -108,7 +106,7 @@ impl SnapshotArgs {
 
 struct ResolvedVolume {
     format_info: FormatInfo,
-    engine: Arc<PgMetaEngine>,
+    engine: Arc<PgSnapshotBackend>,
     context: SnapshotVolumeContext,
 }
 
@@ -184,12 +182,15 @@ fn resolve_volume_candidate(
     if !path.is_file() {
         return Ok(None);
     }
-    let info = RedbMetaEngine::read_format_info_readonly(&path).map_err(|error| {
-        snapshot_context_error(
-            &path,
-            format!("local metadata is corrupt or unsupported: {error}"),
-        )
-    })?;
+    let info = match mounted_format_info(volume_name)? {
+        Some(info) => info,
+        None => RedbMetaEngine::read_format_info_readonly(&path).map_err(|error| {
+            snapshot_context_error(
+                &path,
+                format!("local metadata is corrupt or unsupported: {error}"),
+            )
+        })?,
+    };
     if info.metadata.backend != MetadataBackend::Postgres {
         return Ok(None);
     }
@@ -201,13 +202,8 @@ fn resolve_volume_candidate(
             .map_err(|error| {
             snapshot_context_error(&path, format!("local volume identity is invalid: {error}"))
         })?;
-    let engine = PgMetaEngine::open_with_options(
-        &path,
-        PgOpenOptions {
-            background_poll: false,
-        },
-    )
-    .map_err(|error| snapshot_context_error(&path, error))?;
+    let engine = PgMetaEngine::open_snapshot_backend(&postgres.url, postgres.volume_id)
+        .map_err(|error| snapshot_context_error(&path, error))?;
     let context = engine
         .validate_snapshot_volume_context(&hint)
         .map_err(|error| {
@@ -221,6 +217,34 @@ fn resolve_volume_candidate(
         engine,
         context,
     }))
+}
+
+fn mounted_format_info(volume_name: &str) -> Result<Option<FormatInfo>> {
+    let active_mount = crate::cli::utils::active_mount_record_for_volume(volume_name)?;
+    let Some(discovery) = crate::diagnostics::discover_local_sessions()?
+        .into_iter()
+        .find(|session| session.volume == volume_name)
+    else {
+        if active_mount.is_some() {
+            return Err(anyhow!(
+                "mounted volume metadata service is unavailable; stop the active mount or restart it with current diagnostics support"
+            ));
+        }
+        return Ok(None);
+    };
+    let expected_uuid = discovery.volume_uuid.clone();
+    let info = crate::runtime_bridge::block_on(async move {
+        crate::diagnostics::LocalDiagnosticsClient::new(discovery)
+            .snapshot_format_info()
+            .await
+    })
+    .map_err(|error| anyhow!("mounted volume metadata is unavailable: {error}"))?;
+    if info.name != volume_name || info.uuid != expected_uuid {
+        return Err(anyhow!(
+            "mounted volume metadata identity does not match the active mount"
+        ));
+    }
+    Ok(Some(info))
 }
 
 fn runtime() -> Result<Runtime> {
@@ -259,11 +283,11 @@ fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
         }
         Err(error) => {
             if cancellation_requested.is_cancelled() {
-                println!(
-                    "Snapshot creation interrupted. Registration '{}' remains active in PostgreSQL; track it with 'studiofs snapshot inspect {}'.",
-                    snapshot_id, snapshot_id
-                );
-                return Ok(());
+                return Err(anyhow!(
+                    "snapshot creation interrupted. Registration '{}' remains active in PostgreSQL; track it with 'studiofs snapshot inspect {}'",
+                    snapshot_id,
+                    snapshot_id
+                ));
             }
             let failure = snapshot_jobs(&volume)
                 .ok()
@@ -322,10 +346,8 @@ fn set_policy(args: PolicySetArgs, runtime: &Runtime) -> Result<()> {
         .unwrap_or_else(|| SnapshotDailyPolicy::DEFAULT_TIMEZONE.to_string());
     let policy = SnapshotDailyPolicy::new(args.daily_at, timezone, args.retention)
         .map_err(|error| anyhow!("invalid snapshot policy: {error}"))?;
-    let store = volume
-        .engine
-        .snapshot_policy_store()
-        .ok_or_else(|| anyhow!("daily snapshot policy requires a PostgreSQL-backed volume"))?;
+    let store =
+        volume.engine.clone() as Arc<dyn studiofs_meta::snapshot_ports::SnapshotPolicyStore>;
     let current = runtime
         .block_on(store.load_policy())
         .map_err(|error| anyhow!("could not load snapshot policy: {error}"))?;
@@ -345,10 +367,8 @@ fn set_policy(args: PolicySetArgs, runtime: &Runtime) -> Result<()> {
 
 fn show_policy(runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
-    let store = volume
-        .engine
-        .snapshot_policy_store()
-        .ok_or_else(|| anyhow!("daily snapshot policy requires a PostgreSQL-backed volume"))?;
+    let store =
+        volume.engine.clone() as Arc<dyn studiofs_meta::snapshot_ports::SnapshotPolicyStore>;
     match runtime
         .block_on(store.load_policy())
         .map_err(|error| anyhow!("could not load snapshot policy: {error}"))?
@@ -367,10 +387,8 @@ fn show_policy(runtime: &Runtime) -> Result<()> {
 
 fn cancel_policy(runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
-    let store = volume
-        .engine
-        .snapshot_policy_store()
-        .ok_or_else(|| anyhow!("daily snapshot policy requires a PostgreSQL-backed volume"))?;
+    let store =
+        volume.engine.clone() as Arc<dyn studiofs_meta::snapshot_ports::SnapshotPolicyStore>;
     let Some(record) = runtime
         .block_on(store.load_policy())
         .map_err(|error| anyhow!("could not load snapshot policy: {error}"))?
@@ -387,10 +405,8 @@ fn cancel_policy(runtime: &Runtime) -> Result<()> {
 
 fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
     let jobs = snapshot_jobs(volume)?;
-    let sources = volume
-        .engine
-        .snapshot_source_reader()
-        .ok_or_else(|| anyhow!("snapshot source reader is unavailable"))?;
+    let sources =
+        volume.engine.clone() as Arc<dyn studiofs_meta::snapshot_ports::SnapshotSourceReader>;
     let data_store = Arc::new(
         DataStore::new(&DataStoreConfig::from(&volume.format_info))
             .map_err(|error| anyhow!("snapshot object storage is unavailable: {error}"))?,
@@ -433,10 +449,7 @@ fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
 fn snapshot_jobs(
     volume: &ResolvedVolume,
 ) -> Result<Arc<dyn studiofs_meta::snapshot_ports::SnapshotJobStore>> {
-    volume
-        .engine
-        .snapshot_job_store()
-        .ok_or_else(|| anyhow!("snapshot jobs require a PostgreSQL-backed volume"))
+    Ok(volume.engine.clone() as Arc<dyn studiofs_meta::snapshot_ports::SnapshotJobStore>)
 }
 
 fn load_catalog(

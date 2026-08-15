@@ -6,6 +6,9 @@ pub(super) enum DiagnosticsRequest {
     SessionInfo {
         auth_token: String,
     },
+    SnapshotFormatInfo {
+        auth_token: String,
+    },
     ListWorkflows {
         auth_token: String,
     },
@@ -150,6 +153,9 @@ pub(super) enum DiagnosticsRequest {
 pub(super) enum DiagnosticsResponse {
     SessionInfo {
         session: DiagnosticsSessionInfo,
+    },
+    SnapshotFormatInfo {
+        format_info: FormatInfo,
     },
     WorkflowPresets {
         workflows: Vec<InvestigationWorkflowPreset>,

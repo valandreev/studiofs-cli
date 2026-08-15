@@ -192,6 +192,89 @@ pub struct PgMetaEngine {
     metadata_last_successful_sync_unix_ms: AtomicI64,
 }
 
+/// PostgreSQL-only snapshot capabilities for callers that must not open the
+/// volume's live redb database a second time.
+pub struct PgSnapshotBackend {
+    postgres_url: String,
+    volume_id: i64,
+    command_timeout: Duration,
+    command_pool: Arc<runtime::PgConnectionPool>,
+}
+
+trait SnapshotBackendAccess {
+    fn snapshot_postgres_url(&self) -> &str;
+    fn snapshot_volume_id(&self) -> i64;
+    fn snapshot_command_timeout(&self) -> Duration;
+    fn snapshot_command_pool(&self) -> Arc<runtime::PgConnectionPool>;
+}
+
+impl SnapshotBackendAccess for PgSnapshotBackend {
+    fn snapshot_postgres_url(&self) -> &str {
+        &self.postgres_url
+    }
+
+    fn snapshot_volume_id(&self) -> i64 {
+        self.volume_id
+    }
+
+    fn snapshot_command_timeout(&self) -> Duration {
+        self.command_timeout
+    }
+
+    fn snapshot_command_pool(&self) -> Arc<runtime::PgConnectionPool> {
+        self.command_pool.clone()
+    }
+}
+
+impl SnapshotBackendAccess for PgMetaEngine {
+    fn snapshot_postgres_url(&self) -> &str {
+        &self.postgres_url
+    }
+
+    fn snapshot_volume_id(&self) -> i64 {
+        self.volume_id
+    }
+
+    fn snapshot_command_timeout(&self) -> Duration {
+        self.command_timeout
+    }
+
+    fn snapshot_command_pool(&self) -> Arc<runtime::PgConnectionPool> {
+        self.command_pool.clone()
+    }
+}
+
+impl PgSnapshotBackend {
+    pub(crate) fn from_engine(engine: &PgMetaEngine) -> Arc<Self> {
+        Arc::new(Self {
+            postgres_url: engine.postgres_url.clone(),
+            volume_id: engine.volume_id,
+            command_timeout: engine.command_timeout,
+            command_pool: engine.command_pool.clone(),
+        })
+    }
+
+    /// Opens snapshot capabilities without opening any local metadata file.
+    pub fn open(postgres_url: &str, volume_id: i64) -> MetaResult<Arc<Self>> {
+        if postgres_url.trim().is_empty() {
+            return Err(MetaError::Storage(
+                "metadata.postgres.url must not be empty".to_string(),
+            ));
+        }
+        let connect_timeout = PgMetaEngine::default_connect_timeout();
+        Ok(Arc::new(Self {
+            postgres_url: postgres_url.to_string(),
+            volume_id,
+            command_timeout: PgMetaEngine::default_command_timeout(),
+            command_pool: Arc::new(runtime::PgConnectionPool::new(
+                postgres_url.to_string(),
+                connect_timeout,
+                connect_timeout,
+            )),
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 /// Options that control how a [`PgMetaEngine`] instance is opened.
 pub struct PgOpenOptions {
@@ -641,6 +724,19 @@ impl PgMetaEngine {
     /// Return the configured PostgreSQL DSN for this engine instance.
     pub fn postgres_url(&self) -> &str {
         &self.postgres_url
+    }
+
+    /// Opens snapshot capabilities without opening the volume's local redb
+    /// metadata database.
+    pub fn open_snapshot_backend(
+        postgres_url: &str,
+        volume_id: i64,
+    ) -> MetaResult<Arc<PgSnapshotBackend>> {
+        PgSnapshotBackend::open(postgres_url, volume_id)
+    }
+
+    pub(crate) fn snapshot_backend(&self) -> Arc<PgSnapshotBackend> {
+        PgSnapshotBackend::from_engine(self)
     }
 
     fn fetch_remote_uuid(&self, volume_id: i64) -> MetaResult<String> {

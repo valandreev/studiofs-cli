@@ -235,6 +235,31 @@ fn write_mount_record_with_cache_and_instance(
     Ok(())
 }
 
+pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<MountRecordInfo>> {
+    let mounts_dir = get_mounts_dir()?;
+    for entry in std::fs::read_dir(mounts_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let data = match std::fs::read(entry.path()) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let record = match serde_json::from_slice::<MountRecordInfo>(&data) {
+            Ok(record) if record.volume == volume => record,
+            _ => continue,
+        };
+        if mount_is_active(&record.mount_point)? {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
 /// Read PID file → `(pid, mount_point, volume)`.
 pub fn read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
     let record = read_mount_record(mount_point)?;

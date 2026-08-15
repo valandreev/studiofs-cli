@@ -1,4 +1,4 @@
-use super::PgMetaEngine;
+use super::{PgMetaEngine, SnapshotBackendAccess};
 use crate::engine::{MetaError, MetaResult};
 use crate::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCreationJob, SnapshotCreationLease,
@@ -273,16 +273,16 @@ where
     })
 }
 
-impl SnapshotJobStore for PgMetaEngine {
+impl<T: SnapshotBackendAccess + Send + Sync> SnapshotJobStore for T {
     fn claim_next<'a>(
         &'a self,
         worker: &'a SnapshotWorkerId,
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, Option<SnapshotJobClaim>> {
         let worker = worker.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
             let result = PgMetaEngine::with_postgres_client_timeout(
@@ -349,9 +349,9 @@ impl SnapshotJobStore for PgMetaEngine {
     ) -> SnapshotPortFuture<'a, SnapshotClaimOrFollow> {
         let snapshot_id = snapshot_id.clone();
         let worker = worker.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
             let result = PgMetaEngine::with_postgres_client_timeout(
@@ -417,9 +417,9 @@ impl SnapshotJobStore for PgMetaEngine {
         lease_for: Duration,
     ) -> SnapshotPortFuture<'a, SnapshotCreationLease> {
         let claim = claim.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let lease_ms = lease_millis(lease_for)?;
             let result = PgMetaEngine::with_postgres_client_timeout(
@@ -459,9 +459,9 @@ impl SnapshotJobStore for PgMetaEngine {
 
     fn release_lease<'a>(&'a self, claim: &'a SnapshotJobClaim) -> SnapshotPortFuture<'a, ()> {
         let claim = claim.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -524,9 +524,9 @@ impl SnapshotJobStore for PgMetaEngine {
         let message = retry.message.as_str().to_string();
         let retry_count = retry.retry_count;
         let next_retry_at = retry.next_retry_at;
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let retry_count = i32::try_from(retry_count).map_err(|_| {
                 SnapshotPortError::permanent("invalid_retry", "retry count is too large")
@@ -601,9 +601,9 @@ impl SnapshotJobStore for PgMetaEngine {
             .as_str()
             .to_string();
         let message = failure.message.as_str().to_string();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -670,9 +670,9 @@ impl SnapshotJobStore for PgMetaEngine {
         let claim = claim.clone();
         let descriptor = descriptor.clone();
         let payload_proofs = payload_proofs.to_vec();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -818,9 +818,9 @@ impl SnapshotJobStore for PgMetaEngine {
         snapshot_id: &'a SnapshotId,
     ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry> {
         let snapshot_id = snapshot_id.clone();
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,
@@ -839,9 +839,9 @@ impl SnapshotJobStore for PgMetaEngine {
     }
 
     fn list_catalog<'a>(&'a self) -> SnapshotPortFuture<'a, Vec<SnapshotCatalogEntry>> {
-        let pool = Arc::clone(&self.command_pool);
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
+        let pool = Arc::clone(&self.snapshot_command_pool());
+        let timeout = self.snapshot_command_timeout();
+        let volume_id = self.snapshot_volume_id();
         Box::pin(async move {
             let result = PgMetaEngine::with_postgres_client_timeout(
                 pool,

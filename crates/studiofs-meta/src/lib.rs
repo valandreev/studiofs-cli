@@ -50,7 +50,7 @@ pub use events::MetaEvent;
 pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,
 };
-pub use pg_engine::{PgMetaEngine, PgOpenOptions};
+pub use pg_engine::{PgMetaEngine, PgOpenOptions, PgSnapshotBackend};
 pub use pg_transport::connect_studiofs_postgres;
 pub use read_only::ReadOnlyMetaEngine;
 pub use redb_engine::RedbMetaEngine;
