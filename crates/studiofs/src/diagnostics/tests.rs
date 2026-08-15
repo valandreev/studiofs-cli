@@ -430,6 +430,7 @@ fn endpoint_for_shortens_long_unix_socket_paths() {
                 .to_string_lossy()
                 .len()
     );
+    assert_eq!(Path::new(&path).parent(), Some(dir.path()));
     assert!(Path::new(&path).as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
 }
 
