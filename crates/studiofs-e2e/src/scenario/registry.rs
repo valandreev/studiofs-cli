@@ -41,6 +41,8 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             AdvancedMountedScenario::new(AdvancedMountedKind::InvalidationDropoutFallback)
                 .definition(),
             AdvancedMountedScenario::new(AdvancedMountedKind::SymlinkAttribute).definition(),
+            SnapshotV2Scenario::new(SnapshotV2Kind::ManualRecovery).definition(),
+            SnapshotV2Scenario::new(SnapshotV2Kind::MaterializerTakeover).definition(),
         ]
     })
 }
@@ -132,6 +134,12 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
                 AdvancedMountedKind::SymlinkAttribute,
             )))
         }
+        SNAPSHOT_MANUAL_RECOVERY => Some(Box::new(SnapshotV2Scenario::new(
+            SnapshotV2Kind::ManualRecovery,
+        ))),
+        SNAPSHOT_MATERIALIZER_TAKEOVER => Some(Box::new(SnapshotV2Scenario::new(
+            SnapshotV2Kind::MaterializerTakeover,
+        ))),
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,

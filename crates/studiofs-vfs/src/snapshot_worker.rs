@@ -42,6 +42,9 @@ const SNAPSHOT_CLEANUP_LEASE_FOR: Duration = Duration::from_secs(60);
 const SNAPSHOT_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SNAPSHOT_CLEANUP_IDLE_DELAY: Duration = Duration::from_secs(1);
 const SNAPSHOT_CLEANUP_EMPTY_LIST_CONFIRMATIONS: usize = 2;
+const SNAPSHOT_TEST_STARTUP_DELAY_MS_ENV: &str = "STUDIOFS_SNAPSHOT_TEST_STARTUP_DELAY_MS";
+const SNAPSHOT_TEST_PAUSE_BEFORE_READY_MS_ENV: &str =
+    "STUDIOFS_SNAPSHOT_TEST_PAUSE_BEFORE_READY_MS";
 
 /// Bounded worker configuration for one verified volume.
 #[derive(Debug, Clone)]
@@ -52,6 +55,10 @@ pub struct SnapshotWorkerConfig {
     pub retry_delay: Duration,
     /// Delay between empty-queue/catalog polls.
     pub idle_delay: Duration,
+    /// Optional deterministic delay before the worker claims its first job.
+    pub startup_delay: Duration,
+    /// Optional deterministic delay before the worker publishes Ready.
+    pub publish_ready_delay: Duration,
     /// Root for all local materializer files.
     pub materializer_root: PathBuf,
 }
@@ -63,9 +70,26 @@ impl SnapshotWorkerConfig {
             lease_for: Duration::from_secs(60),
             retry_delay: Duration::from_secs(1),
             idle_delay: Duration::from_secs(1),
+            startup_delay: Duration::ZERO,
+            publish_ready_delay: Duration::ZERO,
             materializer_root: materializer_root.into(),
         }
     }
+
+    fn with_test_delays_from_environment(mut self) -> Self {
+        self.startup_delay = test_delay_from_environment(SNAPSHOT_TEST_STARTUP_DELAY_MS_ENV);
+        self.publish_ready_delay =
+            test_delay_from_environment(SNAPSHOT_TEST_PAUSE_BEFORE_READY_MS_ENV);
+        self
+    }
+}
+
+fn test_delay_from_environment(name: &str) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Wall clock used by the tracked VFS worker.
@@ -694,7 +718,7 @@ impl SnapshotWorker {
             payloads,
             artifacts,
             clock,
-            config,
+            config: config.with_test_delays_from_environment(),
         })
     }
 
@@ -703,6 +727,10 @@ impl SnapshotWorker {
         self: Arc<Self>,
         cancel: CancellationToken,
     ) -> Result<(), SnapshotWorkerError> {
+        if !self.config.startup_delay.is_zero() {
+            wait_for_cancel_or_deadline(self.clock.as_ref(), &cancel, self.config.startup_delay)
+                .await?;
+        }
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
@@ -1081,6 +1109,14 @@ impl SnapshotWorker {
             .map_err(|_| {
                 SnapshotWorkerError::Integrity(SnapshotIntegrityError::ArtifactMetadataMismatch)
             })?;
+            if !self.config.publish_ready_delay.is_zero() {
+                wait_for_cancel_or_deadline(
+                    self.clock.as_ref(),
+                    cancel,
+                    self.config.publish_ready_delay,
+                )
+                .await?;
+            }
             ready_publish_started = true;
             await_port(self.jobs.publish_ready(claim, &descriptor, &proofs), cancel)
                 .await

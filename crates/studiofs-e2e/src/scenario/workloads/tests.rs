@@ -87,6 +87,7 @@ mod chaos_barriers;
 mod crash_restart;
 mod namespace_collision;
 mod outage;
+mod snapshot_v2;
 
 struct RecordingSmokeDriver {
     clients: Vec<ClientSpec>,

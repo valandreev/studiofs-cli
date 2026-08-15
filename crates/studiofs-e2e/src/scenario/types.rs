@@ -82,6 +82,16 @@ pub enum ScenarioError {
         #[from]
         ClientControllerError,
     ),
+    /// The scenario and its cleanup both failed; retain both typed errors.
+    #[error("{context} failed: {primary}; cleanup failed: {cleanup}")]
+    CleanupAfterFailure {
+        /// Scenario context used to identify the failed operation.
+        context: String,
+        /// Primary scenario error.
+        primary: Box<ScenarioError>,
+        /// Cleanup error.
+        cleanup: Box<ScenarioError>,
+    },
     /// Mounted smoke scenario failed and unmount also failed.
     #[error("mounted smoke scenario failed: {primary}; unmount also failed: {cleanup}")]
     MountedSmokeUnmountAfterFailure {

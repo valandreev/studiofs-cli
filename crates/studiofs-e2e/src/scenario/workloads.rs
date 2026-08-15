@@ -93,6 +93,10 @@ pub const MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE: &str =
     "mounted-invalidation-dropout-fallback-convergence";
 /// Symlink attribute convergence scenario.
 pub const MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE: &str = "mounted-symlink-attribute-convergence";
+/// Manual Snapshot v2 recovery scenario.
+pub const SNAPSHOT_MANUAL_RECOVERY: &str = "snapshot-manual-recovery";
+/// Snapshot v2 materializer claimant takeover scenario.
+pub const SNAPSHOT_MATERIALIZER_TAKEOVER: &str = "snapshot-materializer-takeover";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const ADVANCED_MOUNTED_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
@@ -228,6 +232,7 @@ mod assertions;
 mod faults;
 mod namespace_collision;
 mod smoke_outage;
+mod snapshot_v2;
 #[cfg(test)]
 mod test_fixtures;
 
@@ -241,6 +246,7 @@ pub(super) use assertions::*;
 pub(super) use faults::*;
 pub(super) use namespace_collision::*;
 pub(super) use smoke_outage::*;
+pub(super) use snapshot_v2::*;
 #[cfg(test)]
 pub(super) use test_fixtures::*;
 

@@ -4914,6 +4914,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "libc",
+ "percent-encoding",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -4925,6 +4926,8 @@ dependencies = [
  "syn 2.0.116",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
+ "url",
  "uuid",
 ]
 

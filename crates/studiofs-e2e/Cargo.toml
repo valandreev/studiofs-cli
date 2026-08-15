@@ -15,17 +15,20 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+percent-encoding = "2"
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 studiofs-data.workspace = true
 studiofs-meta.workspace = true
 studiofs-vfs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
+url.workspace = true
 uuid.workspace = true
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono.workspace = true
 ctrlc = { version = "3", features = ["termination"] }
 
 [dev-dependencies]

@@ -1554,6 +1554,24 @@ pub fn client_mount_point(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("mount")
 }
 
+/// Returns an unused mount point for a scenario-owned read-only snapshot mount.
+pub fn available_snapshot_mount_point(sandbox: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let _ = sandbox;
+    #[cfg(windows)]
+    {
+        DEFAULT_WINDOWS_MOUNT_LETTERS
+            .iter()
+            .copied()
+            .filter_map(windows_available_drive_root)
+            .next()
+    }
+    #[cfg(not(windows))]
+    {
+        Some(sandbox.join("snapshot-mount"))
+    }
+}
+
 /// Returns the default stdout log path for a client.
 pub fn client_stdout_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs.stdout.log")
@@ -1899,13 +1917,13 @@ fn debug_log_process_job_error(context: &str, error: &impl std::fmt::Display) {
 fn debug_log_process_job_error(_context: &str, _error: &impl std::fmt::Display) {}
 
 #[cfg(target_os = "linux")]
-fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     let mountinfo = fs::read("/proc/self/mountinfo")?;
     Ok(mountinfo_contains_mount_point(&mountinfo, path))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = match fs::metadata(path) {
@@ -1979,7 +1997,7 @@ fn decode_mountinfo_path(value: &[u8]) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     let Some(root) = windows_drive_root(path) else {
         return Ok(false);
     };
@@ -2360,7 +2378,7 @@ fn windows_logical_drive_mask() -> u32 {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     Ok(path.exists())
 }
 
