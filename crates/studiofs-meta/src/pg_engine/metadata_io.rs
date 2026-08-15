@@ -3,7 +3,7 @@
 #[cfg(test)]
 use super::RemoteApplyCoordinator;
 use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
-use crate::engine::{MetaError, MetaResult};
+use crate::engine::{MetaError, MetaFormat, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::snapshot::ServingCheckpoint;
 use std::sync::atomic::Ordering;
@@ -272,6 +272,10 @@ impl PgMetaEngine {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let payload = self.local.export_serving_checkpoint_bytes()?;
+        let format_info = self.local.get_format_info()?;
+        let format_info = serde_json::to_vec(&format_info).map_err(|error| {
+            MetaError::Serialization(format!("format info encode failed: {error}"))
+        })?;
         let version = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
 
@@ -285,7 +289,7 @@ impl PgMetaEngine {
                         client
                             .execute(
                                 sql::UPSERT_METADATA_CHECKPOINT,
-                                &[&volume_id, &version, &version, &payload],
+                                &[&volume_id, &version, &version, &payload, &format_info],
                             )
                             .await
                             .map_err(|e| {

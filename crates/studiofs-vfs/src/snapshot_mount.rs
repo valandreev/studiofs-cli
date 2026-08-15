@@ -119,7 +119,7 @@ impl SnapshotArtifactCacheKey {
         snapshot_id: SnapshotId,
         checksum: SnapshotSha256,
     ) -> Self {
-        assert!(
+        debug_assert!(
             snapshot_id
                 .as_str()
                 .strip_prefix(volume.volume_name.as_str())
@@ -145,7 +145,7 @@ impl SnapshotArtifactCacheKey {
             .as_str()
             .strip_prefix(self.volume.volume_name.as_str())
             .and_then(|value| value.strip_prefix('.'))
-            .expect("snapshot id must belong to the cache key volume");
+            .unwrap_or_else(|| self.snapshot_id.as_str());
         root.join(compact_volume_uuid(&self.volume.volume_uuid))
             .join(format!(
                 "{snapshot_component}-{}.redb",
@@ -1780,6 +1780,25 @@ mod tests {
             "snapshot cache path must stay within the Windows path budget: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn cache_path_falls_back_to_full_snapshot_id_for_mismatched_key() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
+        let volume = volume(11, "00000000-0000-0000-0000-000000000011");
+        let foreign_snapshot = snapshot_id(
+            "snapshot-test-12",
+            Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap(),
+        );
+        let key = SnapshotArtifactCacheKey {
+            volume,
+            snapshot_id: foreign_snapshot.clone(),
+            checksum: digest(b"artifact"),
+        };
+
+        let path = key.cache_path(root.path());
+
+        assert!(path.to_string_lossy().contains(foreign_snapshot.as_str()));
     }
 
     #[test]
