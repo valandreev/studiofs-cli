@@ -1350,6 +1350,20 @@ fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn snapshot_mount_client(
+    controller: &MultiClientController<SystemClientProcessExecutor>,
+) -> Result<&ClientSpec, ScenarioError> {
+    controller
+        .clients()
+        .into_iter()
+        .find(|client| client.name == SNAPSHOT_MOUNT_CLIENT_NAME)
+        .ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "snapshot scenario did not bootstrap its isolated mount client",
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,18 +1425,4 @@ mod tests {
             "snapshot mount needs a discovered client root separate from live mounts"
         );
     }
-}
-
-fn snapshot_mount_client(
-    controller: &MultiClientController<SystemClientProcessExecutor>,
-) -> Result<&ClientSpec, ScenarioError> {
-    controller
-        .clients()
-        .into_iter()
-        .find(|client| client.name == SNAPSHOT_MOUNT_CLIENT_NAME)
-        .ok_or_else(|| {
-            ScenarioError::Io(io::Error::other(
-                "snapshot scenario did not bootstrap its isolated mount client",
-            ))
-        })
 }
