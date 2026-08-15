@@ -59,6 +59,7 @@ struct LoadedSnapshotSource {
 enum SnapshotSourceError {
     Retryable,
     Permanent,
+    MissingFormatInfo,
 }
 
 impl SnapshotSourceError {
@@ -87,6 +88,10 @@ impl SnapshotSourceError {
             Self::Permanent => SnapshotPortError::permanent(
                 "invalid_source",
                 "snapshot source is invalid or incomplete",
+            ),
+            Self::MissingFormatInfo => SnapshotPortError::permanent(
+                "missing_format_info",
+                "snapshot source format info is missing",
             ),
         }
     }
@@ -360,6 +365,9 @@ impl PgSnapshotBackend {
                 ))
             })?,
         );
+        if raw.format_info_bytes.is_empty() {
+            return Err(SnapshotSourceError::MissingFormatInfo);
+        }
         let format_info: FormatInfo =
             serde_json::from_slice(&raw.format_info_bytes).map_err(|_| {
                 SnapshotSourceError::permanent(snapshot_control_error(
@@ -971,5 +979,15 @@ mod tests {
             snapshot_control_error("read published checkpoint"),
             MetaError::RemoteUnavailable(_)
         ));
+    }
+
+    #[test]
+    fn missing_format_info_is_reported_as_a_safe_permanent_error() {
+        assert_eq!(
+            SnapshotSourceError::MissingFormatInfo
+                .into_port_error()
+                .to_string(),
+            "snapshot operation rejected: missing_format_info: snapshot source format info is missing"
+        );
     }
 }

@@ -119,7 +119,7 @@ impl SnapshotArtifactCacheKey {
         snapshot_id: SnapshotId,
         checksum: SnapshotSha256,
     ) -> Self {
-        debug_assert!(
+        assert!(
             snapshot_id
                 .as_str()
                 .strip_prefix(volume.volume_name.as_str())
@@ -145,7 +145,7 @@ impl SnapshotArtifactCacheKey {
             .as_str()
             .strip_prefix(self.volume.volume_name.as_str())
             .and_then(|value| value.strip_prefix('.'))
-            .unwrap_or_else(|| self.snapshot_id.as_str());
+            .expect("snapshot id must belong to the cache key volume");
         root.join(compact_volume_uuid(&self.volume.volume_uuid))
             .join(format!(
                 "{snapshot_component}-{}.redb",
@@ -1182,6 +1182,9 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
 fn parse_cache_file_name(value: &str, volume_name: &str) -> Option<(SnapshotId, SnapshotSha256)> {
     let value = value.strip_suffix(".redb")?;
     let (snapshot_component, checksum_hex) = value.rsplit_once('-')?;
+    if snapshot_component.len() < 24 {
+        return None;
+    }
     let checksum = SnapshotSha256::from_bytes(decode_hex_32(checksum_hex)?);
     let snapshot = SnapshotId::parse(&format!("{volume_name}.{snapshot_component}")).ok()?;
     Some((snapshot, checksum))
