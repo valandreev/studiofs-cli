@@ -823,4 +823,38 @@ impl SnapshotJobStore for PgMetaEngine {
             result.map_err(|error| map_error("load snapshot catalog", error))
         })
     }
+
+    fn list_catalog<'a>(&'a self) -> SnapshotPortFuture<'a, Vec<SnapshotCatalogEntry>> {
+        let pool = Arc::clone(&self.command_pool);
+        let timeout = self.command_timeout;
+        let volume_id = self.volume_id;
+        Box::pin(async move {
+            let result = PgMetaEngine::with_postgres_client_timeout(
+                pool,
+                timeout,
+                "list snapshot catalog",
+                move |client| {
+                    Box::pin(async move {
+                        let rows = client
+                            .query(
+                                "SELECT id FROM snapshot_catalog WHERE vol = $1 ORDER BY captured_at, id",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|_| pg_failure("list snapshot catalog"))?;
+                        let mut entries = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            let id = SnapshotId::parse(&row.get::<_, String>(0)).map_err(|_| {
+                                pg_failure("invalid snapshot identifier in catalog")
+                            })?;
+                            entries.push(load_catalog(client, volume_id, id.as_str()).await?);
+                        }
+                        Ok(entries)
+                    })
+                },
+            )
+            .await;
+            result.map_err(|error| map_error("list snapshot catalog", error))
+        })
+    }
 }

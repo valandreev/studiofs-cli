@@ -509,6 +509,16 @@ pub trait SnapshotJobStore: Send + Sync {
         &'a self,
         snapshot_id: &'a SnapshotId,
     ) -> SnapshotPortFuture<'a, SnapshotCatalogEntry>;
+
+    /// Lists the authoritative catalog projection for the verified volume.
+    fn list_catalog<'a>(&'a self) -> SnapshotPortFuture<'a, Vec<SnapshotCatalogEntry>> {
+        Box::pin(async {
+            Err(SnapshotPortError::permanent(
+                "snapshot_list_unsupported",
+                "snapshot catalog listing is unavailable",
+            ))
+        })
+    }
 }
 
 /// PostgreSQL-authoritative deletion, expiry, and cleanup operations.

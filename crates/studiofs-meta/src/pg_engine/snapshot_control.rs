@@ -9,7 +9,7 @@ use crate::redb_engine::RedbMetaEngine;
 use crate::snapshot::{
     ServingCheckpoint, SnapshotCatalogEntry, SnapshotCreationState, SnapshotCut, SnapshotId,
     SnapshotLifecycle, SnapshotOrigin, SnapshotRetention, SnapshotSha256, SnapshotVolumeContext,
-    VolumeId,
+    SnapshotVolumeIdentityHint, VolumeId,
 };
 use crate::snapshot_ports::{
     SnapshotPortError, SnapshotPortFuture, SnapshotReconstruction, SnapshotSourceDescriptor,
@@ -89,6 +89,88 @@ impl SnapshotSourceError {
 }
 
 impl PgMetaEngine {
+    /// Validates one locally discovered volume identity against PostgreSQL.
+    ///
+    /// The local hint is used only to select the candidate row. The returned
+    /// context is suitable for Snapshot v2 catalog operations only after the
+    /// transactionally locked row matches all identity fields byte-for-byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted metadata error when the local hint is invalid, the
+    /// authority is unavailable, the volume is missing or ambiguous, or any
+    /// identity field differs.
+    pub fn validate_snapshot_volume_context(
+        &self,
+        hint: &SnapshotVolumeIdentityHint,
+    ) -> MetaResult<SnapshotVolumeContext> {
+        hint.validate()
+            .map_err(|_| MetaError::Storage("invalid local snapshot volume identity".into()))?;
+        let hint = hint.clone();
+        let command_pool = self.command_pool.clone();
+        let command_timeout = self.command_timeout;
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                command_pool,
+                command_timeout,
+                "validate snapshot volume identity",
+                move |client| {
+                    let hint = hint.clone();
+                    Box::pin(async move {
+                        let tx = client.transaction().await.map_err(|_| {
+                            MetaError::RemoteUnavailable(
+                                "snapshot volume validation transaction unavailable".into(),
+                            )
+                        })?;
+                        let rows = tx
+                            .query(
+                                "SELECT vol, name, uuid FROM volumes WHERE vol = $1 OR uuid = $2 FOR UPDATE",
+                                &[&hint.volume_id, &hint.volume_uuid],
+                            )
+                            .await
+                            .map_err(|_| {
+                                MetaError::RemoteUnavailable(
+                                    "snapshot volume identity query unavailable".into(),
+                                )
+                            })?;
+                        if rows.len() != 1 {
+                            return Err(MetaError::Storage(
+                                "snapshot volume identity is missing or ambiguous".into(),
+                            ));
+                        }
+                        let row = &rows[0];
+                        let volume_id = row.get::<_, VolumeId>(0);
+                        let volume_name = row.get::<_, String>(1);
+                        let volume_uuid = row.get::<_, String>(2);
+                        if volume_id != hint.volume_id
+                            || volume_name != hint.volume_name
+                            || volume_uuid != hint.volume_uuid
+                        {
+                            return Err(MetaError::Storage(
+                                "snapshot volume identity does not match PostgreSQL".into(),
+                            ));
+                        }
+                        let context = SnapshotVolumeContext::new(
+                            volume_id,
+                            volume_name,
+                            volume_uuid,
+                        )
+                        .map_err(|_| {
+                            MetaError::Storage("PostgreSQL snapshot volume identity is invalid".into())
+                        })?;
+                        tx.commit().await.map_err(|_| {
+                            MetaError::RemoteUnavailable(
+                                "snapshot volume validation commit unavailable".into(),
+                            )
+                        })?;
+                        Ok(context)
+                    })
+                },
+            )
+            .await
+        })
+    }
+
     /// Registers a manual or automatic Snapshot v2 cut in PostgreSQL.
     ///
     /// PostgreSQL owns the short transaction, captured cut, immutable source

@@ -458,9 +458,32 @@ retains:
 - the serving checkpoint bytes and checksum in `snapshot_source_checkpoints`,
 - the bounded event sequence/version range needed to replay that cut.
 
-The old root-inode snapshot command and `mount --snapshot-id` surface are not
-part of the current CLI. Snapshot artifact materialization and read-only mount
-workflows are follow-up Snapshot v2 tickets.
+### Snapshot v2 operator workflow
+
+Snapshot commands resolve the one current PostgreSQL-backed volume from the
+client root and validate its name, immutable UUID, and numeric volume ID in
+PostgreSQL before reading or changing snapshot state. They never use local redb
+as catalog authority and do not accept a directory root or caller-selected
+snapshot ID for creation.
+
+```text
+studiofs snapshot create [--ttl <duration>]
+studiofs snapshot list
+studiofs snapshot inspect <snapshot-id>
+studiofs snapshot delete <snapshot-id>
+studiofs snapshot policy set --daily-at <HH:MM> [--timezone <IANA zone>] --retention <duration>
+studiofs snapshot policy show
+studiofs snapshot policy cancel
+studiofs smount <volume-name> <snapshot-id> <mount-point>
+```
+
+Manual creation waits for the shared materializer to publish `Ready`; a
+terminal failure is returned as a nonzero command result. `list` and `inspect`
+show origin, captured cut, lifecycle, creation state, Ready time, expiry,
+artifact checksum, and the latest redacted failure. `smount` is the only public
+snapshot mount form and is always read-only; unmount it with ordinary `umount`.
+An omitted policy timezone is persisted as `UTC`. Retention durations use
+integer values with `s`, `m`, `h`, `d`, or `w` suffixes (for example `7d`).
 
 ## Multi-Client Workflow
 

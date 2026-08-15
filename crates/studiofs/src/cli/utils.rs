@@ -43,7 +43,7 @@ fn normalize_client_root(root: PathBuf) -> Result<PathBuf> {
         .with_context(|| format!("resolve {CLIENT_ROOT_ENV} '{}'", root.display()))
 }
 
-fn default_meta_dir_in_client_root(client_root: &Path, volume_name: &str) -> PathBuf {
+pub(crate) fn default_meta_dir_in_client_root(client_root: &Path, volume_name: &str) -> PathBuf {
     client_root.join("meta").join(volume_name)
 }
 

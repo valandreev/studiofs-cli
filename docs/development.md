@@ -181,6 +181,20 @@ Use a different `STUDIOFS_CLIENT_ROOT` for each local client on the same host so
 their `redb` metadata databases, mount records, logs, and default cache roots do
 not overlap.
 
+Snapshot recovery uses the same client root to discover exactly one current
+PostgreSQL-backed volume. After a manual snapshot reaches `Ready`, mount its
+immutable view with the explicit read-only command:
+
+```bash
+studiofs snapshot create --ttl 7d
+studiofs snapshot list
+studiofs smount <volume-name> <snapshot-id> <mount-point>
+studiofs umount <mount-point>
+```
+
+The CLI claimant uses the shared Snapshot v2 materializer and leaves the
+durable job available for takeover by a mounted client if the process exits.
+
 The `studiofs-e2e` crate provides a reusable multi-client process controller
 for mounted scenarios. It prepares `client-a` through `client-d` style layouts
 under `target/e2e-runs/<run-id>/artifacts/clients/`, runs `init` for the first

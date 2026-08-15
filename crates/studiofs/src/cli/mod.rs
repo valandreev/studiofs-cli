@@ -32,6 +32,7 @@ pub mod perf;
 pub mod runtime_tuning;
 pub mod settings;
 pub mod smount;
+pub mod snapshot;
 pub mod status;
 pub mod test;
 #[cfg(not(unix))]
@@ -83,6 +84,11 @@ EXAMPLES:
   Unmount:
     studiofs umount Z:
     studiofs umount /mnt/studio
+
+  Create and recover a whole-volume snapshot:
+    studiofs snapshot create --ttl 7d
+    studiofs snapshot list
+    studiofs smount myvolume <snapshot-id> Z:
 
   Check volume status:
     studiofs status myvolume
@@ -136,6 +142,7 @@ enum Commands {
     Perf(perf::PerfArgs),
     Status(status::StatusArgs),
     Settings(settings::SettingsArgs),
+    Snapshot(snapshot::SnapshotArgs),
     Janitor(janitor::JanitorArgs),
     Fsck(fsck::FsckArgs),
     Destroy(destroy::DestroyArgs),
@@ -158,6 +165,7 @@ impl Commands {
             Self::Perf(args) => args.dispatch(),
             Self::Status(args) => args.dispatch(),
             Self::Settings(args) => args.dispatch(),
+            Self::Snapshot(args) => args.dispatch(),
             Self::Janitor(args) => args.dispatch(),
             Self::Fsck(args) => args.dispatch(),
             Self::Destroy(args) => args.dispatch(),
