@@ -119,6 +119,13 @@ impl SnapshotArtifactCacheKey {
         snapshot_id: SnapshotId,
         checksum: SnapshotSha256,
     ) -> Self {
+        debug_assert!(
+            snapshot_id
+                .as_str()
+                .strip_prefix(volume.volume_name.as_str())
+                .is_some_and(|suffix| suffix.starts_with('.')),
+            "snapshot id must belong to the cache key volume"
+        );
         Self {
             volume,
             snapshot_id,
@@ -127,21 +134,21 @@ impl SnapshotArtifactCacheKey {
     }
 
     /// Returns the deterministic local path for this immutable artifact.
+    ///
+    /// The compact volume UUID and shortened snapshot component keep the
+    /// Windows path within the platform path-length budget. The checksum
+    /// remains the final identity component so cache files are never reused
+    /// across different artifact bytes.
     pub fn cache_path(&self, root: &Path) -> PathBuf {
-        root.join("metadata")
-            .join("snapshots")
-            .join(format!("volume-{}", self.volume.volume_id))
+        let snapshot_component = self
+            .snapshot_id
+            .as_str()
+            .strip_prefix(self.volume.volume_name.as_str())
+            .and_then(|value| value.strip_prefix('.'))
+            .unwrap_or_else(|| self.snapshot_id.as_str());
+        root.join(compact_volume_uuid(&self.volume.volume_uuid))
             .join(format!(
-                "name-{}",
-                encode_path_component(&self.volume.volume_name)
-            ))
-            .join(format!(
-                "uuid-{}",
-                encode_path_component(&self.volume.volume_uuid)
-            ))
-            .join(format!(
-                "snapshot-{}-sha256-{}.redb",
-                encode_path_component(self.snapshot_id.as_str()),
+                "{snapshot_component}-{}.redb",
                 self.checksum.to_hex()
             ))
     }
@@ -562,8 +569,15 @@ impl SnapshotMountSession {
         if let Some(metadata) = cached {
             return Ok(metadata);
         }
-        let snapshot_meta = studiofs_meta::open_read_only_snapshot_meta(cache_path)
-            .map_err(map_metadata_open_error)?;
+        let snapshot_meta =
+            studiofs_meta::open_read_only_snapshot_meta(cache_path).map_err(|error| {
+                tracing::error!(
+                    path = %cache_path.display(),
+                    error = %error,
+                    "failed to open snapshot metadata artifact"
+                );
+                map_metadata_open_error(error)
+            })?;
         let format_info = snapshot_meta
             .get_format_info()
             .map_err(map_metadata_open_error)?;
@@ -650,17 +664,7 @@ impl SnapshotMountSession {
         let volume_dir = self
             .config
             .cache_root
-            .join("metadata")
-            .join("snapshots")
-            .join(format!("volume-{}", self.volume.volume_id))
-            .join(format!(
-                "name-{}",
-                encode_path_component(&self.volume.volume_name)
-            ))
-            .join(format!(
-                "uuid-{}",
-                encode_path_component(&self.volume.volume_uuid)
-            ));
+            .join(compact_volume_uuid(&self.volume.volume_uuid));
         let mut artifacts = match fs::read_dir(&volume_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -676,9 +680,10 @@ impl SnapshotMountSession {
             if path.extension().and_then(|value| value.to_str()) != Some("redb") {
                 continue;
             }
-            let Some((snapshot_id, checksum)) =
-                parse_cache_file_name(artifact_entry.file_name().to_str().unwrap_or_default())
-            else {
+            let Some((snapshot_id, checksum)) = parse_cache_file_name(
+                artifact_entry.file_name().to_str().unwrap_or_default(),
+                &volume.volume_name,
+            ) else {
                 continue;
             };
             let sidecar = last_used_path(&path);
@@ -1141,15 +1146,6 @@ fn hard_link_unsupported(error: &std::io::Error) -> bool {
         || (cfg!(windows) && error.raw_os_error() == Some(50))
 }
 
-fn encode_path_component(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        use std::fmt::Write;
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
-}
-
 fn last_used_path(cache_path: &Path) -> PathBuf {
     PathBuf::from(format!(
         "{}{}",
@@ -1167,32 +1163,39 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    if !value.is_ascii() || !value.len().is_multiple_of(2) {
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if !value.is_ascii() || value.len() != 64 {
         return None;
     }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|chunk| Some((decode_hex_nibble(chunk[0])? << 4) | decode_hex_nibble(chunk[1])?))
-        .collect::<Option<Vec<_>>>()
+    let mut decoded = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (decode_hex_nibble(chunk[0])? << 4) | decode_hex_nibble(chunk[1])?;
+    }
+    Some(decoded)
 }
 
-fn decode_path_component(value: &str) -> Option<String> {
-    String::from_utf8(decode_hex_bytes(value)?).ok()
-}
-
-fn parse_cache_file_name(value: &str) -> Option<(SnapshotId, SnapshotSha256)> {
+/// Parses `<snapshot-component>-<sha256>.redb` cache names.
+///
+/// The volume name is supplied separately because it is intentionally omitted
+/// from the compact filename. The checksum is retained in full to preserve
+/// immutable artifact identity.
+fn parse_cache_file_name(value: &str, volume_name: &str) -> Option<(SnapshotId, SnapshotSha256)> {
     let value = value.strip_suffix(".redb")?;
-    let value = value.strip_prefix("snapshot-")?;
-    let (snapshot_hex, checksum_hex) = value.split_once("-sha256-")?;
-    if checksum_hex.len() != 64 {
+    let (snapshot_component, checksum_hex) = value.rsplit_once('-')?;
+    if snapshot_component.len() < 24 {
         return None;
     }
-    let checksum = decode_hex_bytes(checksum_hex)?;
-    let checksum = SnapshotSha256::from_bytes(checksum.as_slice().try_into().ok()?);
-    let snapshot = SnapshotId::parse(&decode_path_component(snapshot_hex)?).ok()?;
+    let checksum = SnapshotSha256::from_bytes(decode_hex_32(checksum_hex)?);
+    let snapshot = SnapshotId::parse(&format!("{volume_name}.{snapshot_component}")).ok()?;
     Some((snapshot, checksum))
+}
+
+/// Removes UUID separators so the cache directory consumes fewer path bytes.
+///
+/// This is part of the Windows path-length budget for long volume names; the
+/// UUID remains unchanged as an identity value everywhere outside the path.
+fn compact_volume_uuid(uuid: &str) -> String {
+    uuid.replace('-', "")
 }
 
 #[cfg(test)]
@@ -1727,7 +1730,11 @@ mod tests {
 
         assert_ne!(
             key,
-            SnapshotArtifactCacheKey::new(second_volume, first_snapshot.clone(), first_checksum),
+            SnapshotArtifactCacheKey::new(
+                second_volume.clone(),
+                snapshot_id(&second_volume.volume_name, captured_at),
+                first_checksum,
+            ),
             "different immutable volume identities must never alias"
         );
         assert_ne!(
@@ -1753,12 +1760,55 @@ mod tests {
     }
 
     #[test]
-    fn cache_name_decoding_rejects_non_ascii_without_panicking() {
-        assert_eq!(super::decode_path_component("€a"), None);
+    fn cache_path_stays_compact_for_long_volume_names() {
+        let volume_name = format!("snapshot-test-{}", "a".repeat(80));
+        let volume = SnapshotVolumeContext::new(
+            11,
+            volume_name.clone(),
+            "00000000-0000-0000-0000-000000000011",
+        )
+        .expect("long test volume identity");
+        let snapshot = snapshot_id(
+            &volume_name,
+            Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap(),
+        );
+        let key = SnapshotArtifactCacheKey::new(volume, snapshot, digest(b"artifact"));
+        let path = key.cache_path(Path::new(r"C:\cache\studiofs"));
 
+        assert!(
+            path.to_string_lossy().len() < 240,
+            "snapshot cache path must stay within the Windows path budget: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn cache_path_falls_back_to_full_snapshot_id_for_mismatched_key() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-v2-mount-cache-");
+        let volume = volume(11, "00000000-0000-0000-0000-000000000011");
+        let foreign_snapshot = snapshot_id(
+            "snapshot-test-12",
+            Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap(),
+        );
+        let key = SnapshotArtifactCacheKey {
+            volume,
+            snapshot_id: foreign_snapshot.clone(),
+            checksum: digest(b"artifact"),
+        };
+
+        let path = key.cache_path(root.path());
+
+        assert!(path.to_string_lossy().contains(foreign_snapshot.as_str()));
+    }
+
+    #[test]
+    fn cache_name_decoding_rejects_non_ascii_without_panicking() {
         let checksum = format!("€{}", "0".repeat(61));
-        let cache_name = format!("snapshot-placeholder-sha256-{checksum}.redb");
-        assert_eq!(super::parse_cache_file_name(&cache_name), None);
+        let cache_name = format!("2026-08-14T09-00-00.000Z-{checksum}.redb");
+        assert_eq!(
+            super::parse_cache_file_name(&cache_name, "placeholder"),
+            None
+        );
     }
 
     #[tokio::test]

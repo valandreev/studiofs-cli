@@ -895,6 +895,66 @@ fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_checkpoint_repairs_missing_remote_format_info() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-format-info");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open(&db).expect("open pg");
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .execute(
+                "UPDATE metadata_state SET format_info = decode('', 'hex') WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        conn_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("clear remote format info");
+
+    pg.write_checkpoint_locked()
+        .expect("write checkpoint with format info");
+
+    let actual = run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let row = client
+            .query_one(
+                "SELECT format_info FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        conn_task.abort();
+        Ok::<Vec<u8>, MetaError>(row.get(0))
+    })
+    .expect("read repaired format info");
+
+    assert_eq!(
+        actual,
+        serde_json::to_vec(&volume.format_info()).expect("serialize expected format info")
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
     let Some(dsn) = pg_dsn() else {
         return;

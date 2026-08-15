@@ -52,13 +52,14 @@ impl MountCommand {
         name: String,
         snapshot_id: SnapshotId,
         mount_point: String,
+        cache_dir: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let meta_dir = super::utils::get_default_meta_dir(&name)?;
         Ok(Self {
             name,
             meta_dir,
             mount_point: Some(mount_point),
-            cache_dir: None,
+            cache_dir,
             cache_size: None,
             principal: None,
             foreground: false,

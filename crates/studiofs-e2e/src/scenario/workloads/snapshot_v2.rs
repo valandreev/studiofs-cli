@@ -25,7 +25,9 @@ use crate::client::{
 use crate::process_job::{ChildJob, wait_for_child_exit};
 use studiofs_meta::schema::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 
-const SNAPSHOT_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
+const SNAPSHOT_LIVE_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
+const SNAPSHOT_MOUNT_CLIENT_NAME: &str = "snapshot";
+const SNAPSHOT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "snapshot"];
 const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SNAPSHOT_STATE_TIMEOUT: Duration = Duration::from_secs(180);
 const SNAPSHOT_MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -304,7 +306,9 @@ fn run_manual_recovery(
             .collect(),
         clean_existing_local_metadata: true,
     })?;
-    controller.mount_all()?;
+    for client_name in SNAPSHOT_LIVE_CLIENT_NAMES {
+        controller.mount(client_name)?;
+    }
     let actual_clients = controller.clients().len();
     if actual_clients < 2 {
         return Err(ScenarioError::InsufficientMountedClients {
@@ -314,6 +318,7 @@ fn run_manual_recovery(
     }
     let writer = controller.client_at(0)?;
     let peer = controller.client_at(1)?;
+    let snapshot_client = snapshot_mount_client(controller)?;
     let recovery = writer.mount_point.join(RECOVERY_FILE);
     let versioned = writer.mount_point.join(VERSIONED_FILE);
     let post_cut = writer.mount_point.join(POST_CUT_FILE);
@@ -370,10 +375,15 @@ fn run_manual_recovery(
     write_file_sync(&post_cut, b"created after snapshot cut\n")?;
     fs::remove_file(&recovery)?;
 
-    let snapshot_mount = snapshot_mount_path(context)?;
+    let snapshot_mount = snapshot_mount_path(context, &config.volume_name)?;
     cleanup_stale_mount_before_remount(&snapshot_mount)?;
-    let mut snapshot_process =
-        spawn_snapshot_mount(config, writer, context, &snapshot_id, &snapshot_mount)?;
+    let mut snapshot_process = spawn_snapshot_mount(
+        config,
+        snapshot_client,
+        context,
+        &snapshot_id,
+        &snapshot_mount,
+    )?;
     let result = (|| {
         wait_for_snapshot_mount(
             &mut snapshot_process,
@@ -451,10 +461,9 @@ fn run_materializer_takeover(
         )],
     )?;
     controller.mount(SNAPSHOT_CLIENT_NAMES[0])?;
-    let claimant_client = controller.client_at(0)?;
-    let snapshot_mount = snapshot_mount_path(context)?;
-    let pre_cut = claimant_client.mount_point.join(RECOVERY_FILE);
-    let post_cut = claimant_client.mount_point.join(POST_CUT_FILE);
+    let claimant_mount_point = controller.client_at(0)?.mount_point.clone();
+    let pre_cut = claimant_mount_point.join(RECOVERY_FILE);
+    let post_cut = claimant_mount_point.join(POST_CUT_FILE);
     let version_1 = repeated_payload(
         b"snapshot-v2-takeover-pre-cut\n",
         SNAPSHOT_MULTI_CHUNK_BYTES,
@@ -464,6 +473,15 @@ fn run_materializer_takeover(
     summary.recovery_size_bytes = Some(version_1.len() as u64);
     write_file_sync(&pre_cut, &version_1)?;
 
+    controller.mount(SNAPSHOT_CLIENT_NAMES[1])?;
+    let peer = controller.client_at(1)?;
+    wait_for_checksum(
+        &peer.mount_point.join(RECOVERY_FILE),
+        &version_1_sha256,
+        SNAPSHOT_STATE_TIMEOUT,
+    )?;
+
+    let claimant_client = controller.client_at(0)?;
     let mut creator = spawn_snapshot_create(config, claimant_client, context)?;
     let expected_claimant = format!("cli-{}", creator.child.id());
     let snapshot_id = match wait_for_snapshot_id(&creator.stdout_path, SNAPSHOT_STATE_TIMEOUT) {
@@ -498,16 +516,11 @@ fn run_materializer_takeover(
     summary.lease_expires_at = first.lease_expires_at.clone();
     summary.state_transitions.push(format_state(&first));
     write_file_sync(&post_cut, b"created after takeover cut\n")?;
-    let creator_kill = kill_snapshot_process(&mut creator.child, &creator.job);
-    creator_kill?;
-
-    controller.mount(SNAPSHOT_CLIENT_NAMES[1])?;
-    let peer = controller.client_at(1)?;
-    wait_for_checksum(
-        &peer.mount_point.join(RECOVERY_FILE),
-        &version_1_sha256,
-        SNAPSHOT_STATE_TIMEOUT,
-    )?;
+    kill_snapshot_process(&mut creator.child, &creator.job).map_err(|error| {
+        ScenarioError::Io(io::Error::other(format!(
+            "snapshot creator cleanup failed: {error}"
+        )))
+    })?;
 
     let takeover = wait_for_snapshot_state(
         config,
@@ -551,17 +564,33 @@ fn run_materializer_takeover(
         && final_state.id == snapshot_id
         && final_state.artifact_sha256.is_some();
     summary.state_transitions.push(format_state(&final_state));
+    let snapshot_mount = snapshot_mount_path(context, &config.volume_name)?;
     let peer = controller.client_at(1)?;
+    let snapshot_client = snapshot_mount_client(controller)?;
     cleanup_stale_mount_before_remount(&snapshot_mount)?;
-    let mut snapshot_process =
-        spawn_snapshot_mount(config, peer, context, &snapshot_id, &snapshot_mount)?;
+    let mut snapshot_process = spawn_snapshot_mount(
+        config,
+        snapshot_client,
+        context,
+        &snapshot_id,
+        &snapshot_mount,
+    )?;
     let result = (|| {
         wait_for_snapshot_mount(
             &mut snapshot_process,
             &snapshot_mount,
             SNAPSHOT_MOUNT_READY_TIMEOUT,
         )?;
-        let snapshot_recovery_bytes = fs::read(snapshot_mount.join(RECOVERY_FILE))?;
+        let snapshot_recovery_path = snapshot_mount.join(RECOVERY_FILE);
+        let snapshot_recovery_bytes = fs::read(&snapshot_recovery_path).map_err(|error| {
+            ScenarioError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "read snapshot recovery '{}': {error}",
+                    snapshot_recovery_path.display()
+                ),
+            ))
+        })?;
         if Some(snapshot_recovery_bytes.len() as u64) != summary.recovery_size_bytes {
             return Err(ScenarioError::Io(io::Error::other(
                 "snapshot recovery size does not match the multi-chunk oracle",
@@ -574,7 +603,17 @@ fn run_materializer_takeover(
             )));
         }
         summary.restored_sha256 = summary.original_sha256.clone();
-        summary.peer_sha256 = bytes_sha256(&fs::read(peer.mount_point.join(RECOVERY_FILE))?);
+        let peer_recovery_path = peer.mount_point.join(RECOVERY_FILE);
+        let peer_recovery_bytes = fs::read(&peer_recovery_path).map_err(|error| {
+            ScenarioError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "read peer recovery '{}': {error}",
+                    peer_recovery_path.display()
+                ),
+            ))
+        })?;
+        summary.peer_sha256 = bytes_sha256(&peer_recovery_bytes);
         summary.post_cut_absent = !snapshot_mount.join(POST_CUT_FILE).exists();
         let snapshot_recovery = snapshot_mount.join(RECOVERY_FILE);
         summary.read_only_failures =
@@ -679,6 +718,7 @@ fn spawn_snapshot_mount(
     let stderr = fs::File::create(context.scenario_dir.join("smount.stderr.log"))?;
     let args = snapshot_mount_args(&config.volume_name, snapshot_id, mount);
     let mut command = cli_command(config, client, args);
+    command.arg("--cache-dir").arg(&client.cache_dir);
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -744,25 +784,37 @@ fn cleanup_snapshot_mount(
 }
 
 fn kill_snapshot_process(process: &mut Child, job: &ChildJob) -> Result<(), ScenarioError> {
-    job.force_kill()?;
-    if process.try_wait()?.is_some() {
-        return Ok(());
+    let job_killed = match job.force_kill() {
+        Ok(killed) => killed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(ScenarioError::Io(error)),
+    };
+    match process.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(None) => {}
+        Err(error) => return Err(ScenarioError::Io(error)),
     }
     match process.kill() {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || (job_killed
+                    && cfg!(windows)
+                    && error.kind() == io::ErrorKind::PermissionDenied) => {}
         Err(error) => return Err(ScenarioError::Io(error)),
     }
-    if wait_for_child_exit(process, SNAPSHOT_PROCESS_TERMINATION_TIMEOUT)? {
-        Ok(())
-    } else {
-        Err(ScenarioError::Io(io::Error::new(
+    match wait_for_child_exit(process, SNAPSHOT_PROCESS_TERMINATION_TIMEOUT) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ScenarioError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "timed out waiting for snapshot process {} to terminate",
                 process.id()
             ),
-        )))
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ScenarioError::Io(error)),
     }
 }
 
@@ -1189,13 +1241,18 @@ fn percent_encode(value: &[u8]) -> String {
     encoded
 }
 
-fn snapshot_mount_path(context: &ScenarioContext) -> Result<PathBuf, ScenarioError> {
-    available_snapshot_mount_point(&context.scenario_dir).ok_or_else(|| {
-        ScenarioError::Io(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "no mount point is available for snapshot mount",
-        ))
-    })
+fn snapshot_mount_path(
+    context: &ScenarioContext,
+    volume_name: &str,
+) -> Result<PathBuf, ScenarioError> {
+    available_snapshot_mount_point(&context.scenario_dir)
+        .map(|mount| crate::client::product_mount_path(volume_name, mount))
+        .ok_or_else(|| {
+            ScenarioError::Io(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no mount point is available for snapshot mount",
+            ))
+        })
 }
 
 fn wait_for_snapshot_mount(
@@ -1302,6 +1359,20 @@ fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn snapshot_mount_client(
+    controller: &MultiClientController<SystemClientProcessExecutor>,
+) -> Result<&ClientSpec, ScenarioError> {
+    controller
+        .clients()
+        .into_iter()
+        .find(|client| client.name == SNAPSHOT_MOUNT_CLIENT_NAME)
+        .ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "snapshot scenario did not bootstrap its isolated mount client",
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,5 +1425,30 @@ mod tests {
 
         let scenario = SnapshotV2Scenario::new(SnapshotV2Kind::ManualRecovery);
         assert!(scenario.validate(&context).is_err());
+    }
+
+    #[test]
+    fn snapshot_scenario_reserves_a_discovered_client_for_snapshot_mount() {
+        assert!(
+            SNAPSHOT_CLIENT_NAMES.contains(&"snapshot"),
+            "snapshot mount needs a discovered client root separate from live mounts"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn snapshot_mount_path_matches_product_mount_convention() {
+        let context = ScenarioContext {
+            run_id: "run".to_string(),
+            seed: 0,
+            sandbox: PathBuf::from("/tmp/sandbox"),
+            scenario_dir: PathBuf::from("/tmp/scenario"),
+            client_controller_config: None,
+        };
+
+        assert_eq!(
+            snapshot_mount_path(&context, "volume").expect("snapshot mount path"),
+            PathBuf::from("/tmp/scenario/snapshot-mount/volume")
+        );
     }
 }

@@ -31,12 +31,13 @@ pub(super) const INSERT_EVENT_LOG_BATCH: &str = r#"
     "#;
 
 pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
-    INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot)
-    VALUES ($1, $2, $3, $4)
+    INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info)
+    VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (vol) DO UPDATE
     SET version = GREATEST(metadata_state.version, EXCLUDED.version),
         checkpoint_version = EXCLUDED.checkpoint_version,
         snapshot = EXCLUDED.snapshot,
+        format_info = EXCLUDED.format_info,
         updated_at = now()
     WHERE EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
     "#;
@@ -61,10 +62,13 @@ pub(super) const SELECT_SNAPSHOT_SOURCE: &str = r#"
         s.event_end_seq,
         s.event_start_version,
         s.event_end_version,
-        s.event_row_count
+        s.event_row_count,
+        m.format_info
     FROM snapshot_catalog AS c
     INNER JOIN snapshot_source_checkpoints AS s
         ON s.vol = c.vol AND s.snapshot_id = c.id
+    INNER JOIN metadata_state AS m
+        ON m.vol = c.vol
     WHERE c.vol = $1 AND c.id = $2 AND c.lifecycle <> 'deleted'
     "#;
 

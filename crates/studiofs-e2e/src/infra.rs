@@ -1116,7 +1116,8 @@ impl ComposeServiceControl {
     ) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.extend([
-            "start".to_string(),
+            "up".to_string(),
+            "--detach".to_string(),
             "--wait".to_string(),
             "--wait-timeout".to_string(),
             self.wait_timeout_secs.to_string(),
@@ -1124,7 +1125,7 @@ impl ComposeServiceControl {
         ]);
         run_success(
             executor,
-            &format!("docker compose start --wait {service}"),
+            &format!("docker compose up --detach --wait {service}"),
             command,
         )?;
         Ok(())
