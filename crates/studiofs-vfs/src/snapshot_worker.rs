@@ -17,8 +17,6 @@ use studiofs_data::snapshot_key::{
 };
 use studiofs_data::{DataStore, store::DataError};
 use studiofs_meta::schema::{PayloadRef, PayloadRefState};
-#[cfg(test)]
-use studiofs_meta::snapshot::SnapshotCatalogEntry;
 use studiofs_meta::snapshot::{
     SnapshotArtifactDescriptor, SnapshotCatalogEntry, SnapshotCleanupClaim, SnapshotId,
     SnapshotLifecycle, SnapshotPolicyEvaluation, SnapshotSha256, SnapshotVolumeContext,

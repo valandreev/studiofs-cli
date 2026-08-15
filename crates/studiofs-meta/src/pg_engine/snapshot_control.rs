@@ -5,6 +5,7 @@ use tokio_postgres::GenericClient;
 use super::{OverlayConflictSets, RemoteApplyCoordinator, RemoteReplayApplyContext, sql};
 use super::{PgMetaEngine, janitor::pg_janitor_lock_key};
 use crate::engine::{MetaError, MetaInodes, MetaResult};
+use crate::pg_transport::classify_postgres_error;
 use crate::redb_engine::RedbMetaEngine;
 use crate::snapshot::{
     ServingCheckpoint, SnapshotCatalogEntry, SnapshotCreationState, SnapshotCut, SnapshotId,
@@ -117,9 +118,10 @@ impl PgMetaEngine {
                 move |client| {
                     let hint = hint.clone();
                     Box::pin(async move {
-                        let tx = client.transaction().await.map_err(|_| {
-                            MetaError::RemoteUnavailable(
-                                "snapshot volume validation transaction unavailable".into(),
+                        let tx = client.transaction().await.map_err(|error| {
+                            classify_postgres_error(
+                                "snapshot volume validation transaction unavailable",
+                                error,
                             )
                         })?;
                         let rows = tx
@@ -128,9 +130,10 @@ impl PgMetaEngine {
                                 &[&hint.volume_id, &hint.volume_uuid],
                             )
                             .await
-                            .map_err(|_| {
-                                MetaError::RemoteUnavailable(
-                                    "snapshot volume identity query unavailable".into(),
+                            .map_err(|error| {
+                                classify_postgres_error(
+                                    "snapshot volume identity query unavailable",
+                                    error,
                                 )
                             })?;
                         if rows.len() != 1 {
@@ -158,9 +161,10 @@ impl PgMetaEngine {
                         .map_err(|_| {
                             MetaError::Storage("PostgreSQL snapshot volume identity is invalid".into())
                         })?;
-                        tx.commit().await.map_err(|_| {
-                            MetaError::RemoteUnavailable(
-                                "snapshot volume validation commit unavailable".into(),
+                        tx.commit().await.map_err(|error| {
+                            classify_postgres_error(
+                                "snapshot volume validation commit unavailable",
+                                error,
                             )
                         })?;
                         Ok(context)

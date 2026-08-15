@@ -91,15 +91,16 @@ struct PolicySetArgs {
 
 impl SnapshotArgs {
     pub(crate) fn dispatch(self) -> Result<()> {
+        let runtime = runtime()?;
         match self.command {
-            SnapshotCommand::Create(args) => create_snapshot(args.ttl),
-            SnapshotCommand::List => list_snapshots(),
-            SnapshotCommand::Inspect(args) => inspect_snapshot(args.snapshot_id),
+            SnapshotCommand::Create(args) => create_snapshot(args.ttl, &runtime),
+            SnapshotCommand::List => list_snapshots(&runtime),
+            SnapshotCommand::Inspect(args) => inspect_snapshot(args.snapshot_id, &runtime),
             SnapshotCommand::Delete(args) => delete_snapshot(args.snapshot_id),
             SnapshotCommand::Policy(args) => match args.command {
-                PolicyCommand::Set(args) => set_policy(args),
-                PolicyCommand::Show => show_policy(),
-                PolicyCommand::Cancel => cancel_policy(),
+                PolicyCommand::Set(args) => set_policy(args, &runtime),
+                PolicyCommand::Show => show_policy(&runtime),
+                PolicyCommand::Cancel => cancel_policy(&runtime),
             },
         }
     }
@@ -137,14 +138,14 @@ fn resolve_volume() -> Result<ResolvedVolume> {
     for volume_name in candidates {
         let path = crate::cli::utils::default_meta_dir_in_client_root(&client_root, &volume_name)
             .join(format!("{volume_name}.db"));
-        let info = RedbMetaEngine::read_format_info_readonly(&path).map_err(|_| {
-            snapshot_context_error(&path, "local metadata is corrupt or unsupported")
+        let info = RedbMetaEngine::read_format_info_readonly(&path).map_err(|error| {
+            snapshot_context_error(
+                &path,
+                format!("local metadata is corrupt or unsupported: {error}"),
+            )
         })?;
         if info.metadata.backend != MetadataBackend::Postgres {
-            return Err(snapshot_context_error(
-                &path,
-                "the candidate is not PostgreSQL-backed",
-            ));
+            continue;
         }
         let postgres = info.metadata.postgres.as_ref().ok_or_else(|| {
             snapshot_context_error(&path, "PostgreSQL connection metadata is missing")
@@ -154,18 +155,23 @@ fn resolve_volume() -> Result<ResolvedVolume> {
             info.name.clone(),
             info.uuid.clone(),
         )
-        .map_err(|_| snapshot_context_error(&path, "local volume identity is invalid"))?;
+        .map_err(|error| {
+            snapshot_context_error(&path, format!("local volume identity is invalid: {error}"))
+        })?;
         let engine = PgMetaEngine::open_with_options(
             &path,
             PgOpenOptions {
                 background_poll: false,
             },
         )
-        .map_err(|_| snapshot_context_error(&path, "PostgreSQL is unavailable"))?;
+        .map_err(|error| snapshot_context_error(&path, error))?;
         let context = engine
             .validate_snapshot_volume_context(&hint)
-            .map_err(|_| {
-                snapshot_context_error(&path, "PostgreSQL volume identity validation failed")
+            .map_err(|error| {
+                snapshot_context_error(
+                    &path,
+                    format!("PostgreSQL volume identity validation failed: {error}"),
+                )
             })?;
         resolved.push(ResolvedVolume {
             format_info: info,
@@ -177,6 +183,10 @@ fn resolve_volume() -> Result<ResolvedVolume> {
     resolved.sort_by(|left, right| left.context.volume_name.cmp(&right.context.volume_name));
     resolved.dedup_by(|left, right| left.context == right.context);
     match resolved.len() {
+        0 => Err(anyhow!(
+            "no PostgreSQL-backed snapshot volume context found under '{}'; initialize a PostgreSQL-backed volume first",
+            meta_root.display()
+        )),
         1 => Ok(resolved.pop().expect("one resolved volume")),
         _ => Err(anyhow!(
             "multiple snapshot volume contexts found: {}; run the command with one client root containing exactly one current PostgreSQL-backed volume",
@@ -193,18 +203,18 @@ fn runtime() -> Result<Runtime> {
     Runtime::new().context("create snapshot command runtime")
 }
 
-fn create_snapshot(ttl: Option<Duration>) -> Result<()> {
+fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
     let retention = SnapshotRetention::manual(ttl).map_err(|error| anyhow!(error.to_string()))?;
     let entry = volume
         .engine
         .create_snapshot_v2(SnapshotOrigin::Manual, retention)
-        .map_err(|_| anyhow!("PostgreSQL could not register the manual snapshot"))?;
+        .map_err(|error| anyhow!("PostgreSQL could not register the manual snapshot: {error}"))?;
     println!("Creating manual snapshot {}...", entry.snapshot_id);
     let worker = build_worker(&volume)?;
     let cancel = CancellationToken::new();
     let snapshot_id = entry.snapshot_id.clone();
-    let ready = runtime()?.block_on(worker.claim_or_follow(snapshot_id.clone(), cancel));
+    let ready = runtime.block_on(worker.claim_or_follow(snapshot_id.clone(), cancel));
     match ready {
         Ok(entry) => {
             println!("Snapshot {} is Ready.", entry.snapshot_id);
@@ -212,13 +222,9 @@ fn create_snapshot(ttl: Option<Duration>) -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            let failure = runtime()
+            let failure = snapshot_jobs(&volume)
                 .ok()
-                .and_then(|runtime| {
-                    runtime
-                        .block_on(snapshot_jobs(&volume).ok()?.load_catalog(&snapshot_id))
-                        .ok()
-                })
+                .and_then(|jobs| runtime.block_on(jobs.load_catalog(&snapshot_id)).ok())
                 .and_then(|entry| entry.failure);
             Err(anyhow!(
                 "snapshot {} did not become Ready: {}",
@@ -229,10 +235,10 @@ fn create_snapshot(ttl: Option<Duration>) -> Result<()> {
     }
 }
 
-fn list_snapshots() -> Result<()> {
+fn list_snapshots(runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
     let jobs = snapshot_jobs(&volume)?;
-    let entries = runtime()?.block_on(jobs.list_catalog());
+    let entries = runtime.block_on(jobs.list_catalog());
     let entries = entries.map_err(|error| anyhow!("could not list snapshots: {error}"))?;
     if entries.is_empty() {
         println!("No snapshots for {}.", volume.context.volume_name);
@@ -244,9 +250,9 @@ fn list_snapshots() -> Result<()> {
     Ok(())
 }
 
-fn inspect_snapshot(snapshot_id: SnapshotId) -> Result<()> {
+fn inspect_snapshot(snapshot_id: SnapshotId, runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
-    let entry = load_catalog(&volume, &snapshot_id)?;
+    let entry = load_catalog(&volume, &snapshot_id, runtime)?;
     print_catalog(&entry);
     Ok(())
 }
@@ -256,7 +262,7 @@ fn delete_snapshot(snapshot_id: SnapshotId) -> Result<()> {
     let entry = volume
         .engine
         .delete_snapshot_v2(&snapshot_id)
-        .map_err(|_| anyhow!("could not request snapshot deletion"))?;
+        .map_err(|error| anyhow!("could not request snapshot deletion: {error}"))?;
     println!(
         "Snapshot {} is {}.",
         entry.snapshot_id,
@@ -266,7 +272,7 @@ fn delete_snapshot(snapshot_id: SnapshotId) -> Result<()> {
     Ok(())
 }
 
-fn set_policy(args: PolicySetArgs) -> Result<()> {
+fn set_policy(args: PolicySetArgs, runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
     let timezone = args
         .timezone
@@ -277,11 +283,11 @@ fn set_policy(args: PolicySetArgs) -> Result<()> {
         .engine
         .snapshot_policy_store()
         .ok_or_else(|| anyhow!("daily snapshot policy requires a PostgreSQL-backed volume"))?;
-    let current = runtime()?
+    let current = runtime
         .block_on(store.load_policy())
         .map_err(|error| anyhow!("could not load snapshot policy: {error}"))?;
     let expected_generation = current.as_ref().map(|record| record.generation);
-    let record = runtime()?
+    let record = runtime
         .block_on(store.set_policy(&policy, expected_generation))
         .map_err(|error| anyhow!("could not save snapshot policy: {error}"))?;
     println!(
@@ -300,13 +306,13 @@ fn set_policy(args: PolicySetArgs) -> Result<()> {
     Ok(())
 }
 
-fn show_policy() -> Result<()> {
+fn show_policy(runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
     let store = volume
         .engine
         .snapshot_policy_store()
         .ok_or_else(|| anyhow!("daily snapshot policy requires a PostgreSQL-backed volume"))?;
-    match runtime()?
+    match runtime
         .block_on(store.load_policy())
         .map_err(|error| anyhow!("could not load snapshot policy: {error}"))?
     {
@@ -328,20 +334,20 @@ fn show_policy() -> Result<()> {
     Ok(())
 }
 
-fn cancel_policy() -> Result<()> {
+fn cancel_policy(runtime: &Runtime) -> Result<()> {
     let volume = resolve_volume()?;
     let store = volume
         .engine
         .snapshot_policy_store()
         .ok_or_else(|| anyhow!("daily snapshot policy requires a PostgreSQL-backed volume"))?;
-    let Some(record) = runtime()?
+    let Some(record) = runtime
         .block_on(store.load_policy())
         .map_err(|error| anyhow!("could not load snapshot policy: {error}"))?
     else {
         println!("Daily snapshots are already disabled.");
         return Ok(());
     };
-    runtime()?
+    runtime
         .block_on(store.cancel_policy(record.generation))
         .map_err(|error| anyhow!("could not cancel snapshot policy: {error}"))?;
     println!("Daily snapshot policy canceled. Existing snapshots are unaffected.");
@@ -356,19 +362,29 @@ fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
         .ok_or_else(|| anyhow!("snapshot source reader is unavailable"))?;
     let data_store = Arc::new(
         DataStore::new(&DataStoreConfig::from(&volume.format_info))
-            .map_err(|_| anyhow!("snapshot object storage is unavailable"))?,
+            .map_err(|error| anyhow!("snapshot object storage is unavailable: {error}"))?,
     );
     let artifacts = Arc::new(
-        DataStoreSnapshotArtifactStore::new(data_store.clone(), volume.context.clone())
-            .map_err(|_| anyhow!("snapshot artifact storage configuration is invalid"))?,
+        DataStoreSnapshotArtifactStore::new(data_store.clone(), volume.context.clone()).map_err(
+            |error| anyhow!("snapshot artifact storage configuration is invalid: {error}"),
+        )?,
     );
     let payloads = Arc::new(
-        DataStoreSnapshotPayloadReader::new(data_store, volume.context.clone())
-            .map_err(|_| anyhow!("snapshot payload storage configuration is invalid"))?,
+        DataStoreSnapshotPayloadReader::new(data_store, volume.context.clone()).map_err(
+            |error| anyhow!("snapshot payload storage configuration is invalid: {error}"),
+        )?,
     );
     let worker_id =
         studiofs_meta::snapshot_ports::SnapshotWorkerId::new(format!("cli-{}", std::process::id()))
-            .map_err(|_| anyhow!("snapshot worker identity is invalid"))?;
+            .map_err(|error| anyhow!("snapshot worker identity is invalid: {error}"))?;
+    let client_root = crate::cli::utils::get_client_root()?;
+    let materializer_root = crate::cli::utils::default_meta_dir_in_client_root(
+        &client_root,
+        &volume.context.volume_name,
+    )
+    .join("cache")
+    .join("snapshot-v2")
+    .join("materializer");
     SnapshotWorker::new(
         volume.context.clone(),
         worker_id,
@@ -377,7 +393,7 @@ fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
         payloads,
         artifacts,
         Arc::new(SystemSnapshotClock),
-        SnapshotWorkerConfig::new(Path::new("target/snapshot-v2/materializer")),
+        SnapshotWorkerConfig::new(materializer_root),
     )
     .map(Arc::new)
     .map_err(|error| anyhow!("snapshot worker configuration is invalid: {error}"))
@@ -392,8 +408,12 @@ fn snapshot_jobs(
         .ok_or_else(|| anyhow!("snapshot jobs require a PostgreSQL-backed volume"))
 }
 
-fn load_catalog(volume: &ResolvedVolume, snapshot_id: &SnapshotId) -> Result<SnapshotCatalogEntry> {
-    let entry = runtime()?
+fn load_catalog(
+    volume: &ResolvedVolume,
+    snapshot_id: &SnapshotId,
+    runtime: &Runtime,
+) -> Result<SnapshotCatalogEntry> {
+    let entry = runtime
         .block_on(snapshot_jobs(volume)?.load_catalog(snapshot_id))
         .map_err(|error| anyhow!("could not load snapshot: {error}"))?;
     if entry.volume != volume.context {
@@ -415,7 +435,7 @@ fn print_catalog(entry: &SnapshotCatalogEntry) {
         entry.cut.captured_at(),
         entry.cut.cut_version(),
         lifecycle_name(entry.lifecycle),
-        format!("{:?}", entry.creation_state).to_lowercase(),
+        entry.creation_state.as_str(),
         entry
             .ready_at
             .map_or_else(|| "-".to_string(), |value| value.to_rfc3339()),
