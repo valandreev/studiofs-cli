@@ -134,7 +134,7 @@ where
 
 fn catalog_query(filter: &str) -> String {
     format!(
-        "SELECT c.id, v.name, v.uuid, c.origin, c.cut_version, c.captured_at, c.lifecycle, c.retention_seconds, c.ready_at, c.expires_at, c.failure_code, c.failure_message, a.object_key, a.format_version, a.schema_version, a.sha256, a.byte_length, a.verified_at, j.state, j.retry_count, j.next_retry_at, j.failure_message, l.owner, l.lease_expires_at, l.fencing_token FROM snapshot_catalog AS c JOIN volumes AS v ON v.vol = c.vol LEFT JOIN snapshot_artifacts AS a ON a.vol = c.vol AND a.snapshot_id = c.id LEFT JOIN snapshot_creation_jobs AS j ON j.vol = c.vol AND j.snapshot_id = c.id LEFT JOIN snapshot_creation_leases AS l ON l.vol = c.vol AND l.snapshot_id = c.id {filter}"
+        "SELECT c.id, v.name, v.uuid, c.origin, c.cut_version, c.captured_at, c.lifecycle, c.retention_seconds, c.ready_at, c.expires_at, c.failure_code, c.failure_message, a.object_key, a.format_version, a.schema_version, a.sha256, a.byte_length, a.verified_at, j.state, j.failure_message FROM snapshot_catalog AS c JOIN volumes AS v ON v.vol = c.vol LEFT JOIN snapshot_artifacts AS a ON a.vol = c.vol AND a.snapshot_id = c.id LEFT JOIN snapshot_creation_jobs AS j ON j.vol = c.vol AND j.snapshot_id = c.id {filter}"
     )
 }
 
@@ -154,24 +154,8 @@ fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEnt
     let job_state = row
         .get::<_, Option<String>>(18)
         .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
-    let retry_count = row
-        .get::<_, Option<i32>>(19)
-        .ok_or_else(|| MetaError::Storage("missing snapshot retry count".to_string()))?;
-    let retry_count = u32::try_from(retry_count)
-        .map_err(|_| MetaError::Storage("invalid snapshot retry count".to_string()))?;
-    let owner = row
-        .get::<_, Option<String>>(22)
-        .filter(|owner| !owner.is_empty());
-    let job = SnapshotCreationJob {
-        snapshot_id: snapshot_id.clone(),
-        state: parse_creation_state(&job_state)?,
-        retry_count,
-        owner: owner.clone(),
-        lease_expires_at: owner.as_ref().and_then(|_| row.get(23)),
-        fencing_token: row.get::<_, Option<i64>>(24).unwrap_or(0),
-        next_retry_at: row.get(20),
-        failure: row.get(21),
-    };
+    let creation_state = parse_creation_state(&job_state)?;
+    let job_failure: Option<String> = row.get(19);
     let artifact = match row.get::<_, Option<String>>(12) {
         None => None,
         Some(object_key) => {
@@ -219,7 +203,7 @@ fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEnt
         origin,
         cut,
         lifecycle,
-        creation_state: job.state,
+        creation_state,
         retention,
         ready_at: row.get(8),
         expires_at: row.get(9),
@@ -227,7 +211,7 @@ fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEnt
         failure: row
             .get::<_, Option<String>>(11)
             .or_else(|| row.get(10))
-            .or_else(|| job.failure.clone()),
+            .or(job_failure),
     })
 }
 
@@ -870,11 +854,9 @@ impl SnapshotJobStore for PgMetaEngine {
                             .query(&query, &[&volume_id])
                             .await
                             .map_err(|_| pg_failure("list snapshot catalog"))?;
-                        let mut entries = Vec::with_capacity(rows.len());
-                        for row in rows {
-                            entries.push(parse_catalog_row(&row, volume_id)?);
-                        }
-                        Ok(entries)
+                        rows.iter()
+                            .map(|row| parse_catalog_row(row, volume_id))
+                            .collect()
                     })
                 },
             )

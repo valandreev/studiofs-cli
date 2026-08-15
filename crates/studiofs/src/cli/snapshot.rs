@@ -135,62 +135,28 @@ fn resolve_volume() -> Result<ResolvedVolume> {
     }
 
     let mut resolved = Vec::new();
+    let mut failures = Vec::new();
     for volume_name in candidates {
-        let path = crate::cli::utils::default_meta_dir_in_client_root(&client_root, &volume_name)
-            .join(format!("{volume_name}.db"));
-        if !path.is_file() {
-            continue;
+        match resolve_volume_candidate(&client_root, &volume_name) {
+            Ok(Some(volume)) => resolved.push(volume),
+            Ok(None) => {}
+            Err(error) => failures.push(error),
         }
-        let info = RedbMetaEngine::read_format_info_readonly(&path).map_err(|error| {
-            snapshot_context_error(
-                &path,
-                format!("local metadata is corrupt or unsupported: {error}"),
-            )
-        })?;
-        if info.metadata.backend != MetadataBackend::Postgres {
-            continue;
-        }
-        let postgres = info.metadata.postgres.as_ref().ok_or_else(|| {
-            snapshot_context_error(&path, "PostgreSQL connection metadata is missing")
-        })?;
-        let hint = SnapshotVolumeIdentityHint::new(
-            postgres.volume_id,
-            info.name.clone(),
-            info.uuid.clone(),
-        )
-        .map_err(|error| {
-            snapshot_context_error(&path, format!("local volume identity is invalid: {error}"))
-        })?;
-        let engine = PgMetaEngine::open_with_options(
-            &path,
-            PgOpenOptions {
-                background_poll: false,
-            },
-        )
-        .map_err(|error| snapshot_context_error(&path, error))?;
-        let context = engine
-            .validate_snapshot_volume_context(&hint)
-            .map_err(|error| {
-                snapshot_context_error(
-                    &path,
-                    format!("PostgreSQL volume identity validation failed: {error}"),
-                )
-            })?;
-        resolved.push(ResolvedVolume {
-            format_info: info,
-            engine,
-            context,
-        });
     }
 
     resolved.sort_by(|left, right| left.context.volume_name.cmp(&right.context.volume_name));
     resolved.dedup_by(|left, right| left.context == right.context);
     match resolved.len() {
-        0 => Err(anyhow!(
-            "no PostgreSQL-backed snapshot volume context found under '{}'; initialize a PostgreSQL-backed volume first",
-            meta_root.display()
-        )),
-        1 => Ok(resolved.pop().expect("one resolved volume")),
+        0 => match failures.into_iter().next() {
+            Some(error) => Err(error),
+            None => Err(anyhow!(
+                "no PostgreSQL-backed snapshot volume context found under '{}'; initialize a PostgreSQL-backed volume first",
+                meta_root.display()
+            )),
+        },
+        1 => resolved
+            .pop()
+            .ok_or_else(|| anyhow!("resolved snapshot volume disappeared")),
         _ => Err(anyhow!(
             "multiple snapshot volume contexts found: {}; run the command with one client root containing exactly one current PostgreSQL-backed volume",
             resolved
@@ -200,6 +166,54 @@ fn resolve_volume() -> Result<ResolvedVolume> {
                 .join(", ")
         )),
     }
+}
+
+fn resolve_volume_candidate(
+    client_root: &Path,
+    volume_name: &str,
+) -> Result<Option<ResolvedVolume>> {
+    let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)
+        .join(format!("{volume_name}.db"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let info = RedbMetaEngine::read_format_info_readonly(&path).map_err(|error| {
+        snapshot_context_error(
+            &path,
+            format!("local metadata is corrupt or unsupported: {error}"),
+        )
+    })?;
+    if info.metadata.backend != MetadataBackend::Postgres {
+        return Ok(None);
+    }
+    let postgres = info.metadata.postgres.as_ref().ok_or_else(|| {
+        snapshot_context_error(&path, "PostgreSQL connection metadata is missing")
+    })?;
+    let hint =
+        SnapshotVolumeIdentityHint::new(postgres.volume_id, info.name.clone(), info.uuid.clone())
+            .map_err(|error| {
+            snapshot_context_error(&path, format!("local volume identity is invalid: {error}"))
+        })?;
+    let engine = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .map_err(|error| snapshot_context_error(&path, error))?;
+    let context = engine
+        .validate_snapshot_volume_context(&hint)
+        .map_err(|error| {
+            snapshot_context_error(
+                &path,
+                format!("PostgreSQL volume identity validation failed: {error}"),
+            )
+        })?;
+    Ok(Some(ResolvedVolume {
+        format_info: info,
+        engine,
+        context,
+    }))
 }
 
 fn runtime() -> Result<Runtime> {
@@ -216,8 +230,19 @@ fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
     println!("Creating manual snapshot {}...", entry.snapshot_id);
     let worker = build_worker(&volume)?;
     let cancel = CancellationToken::new();
+    let signal_cancel = cancel.clone();
     let snapshot_id = entry.snapshot_id.clone();
-    let ready = runtime.block_on(worker.claim_or_follow(snapshot_id.clone(), cancel));
+    let ready = runtime.block_on(async {
+        let signal_task = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_cancel.cancel();
+            }
+        });
+        let result = worker.claim_or_follow(snapshot_id.clone(), cancel).await;
+        signal_task.abort();
+        let _ = signal_task.await;
+        result
+    });
     match ready {
         Ok(entry) => {
             println!("Snapshot {} is Ready.", entry.snapshot_id);
@@ -297,13 +322,7 @@ fn set_policy(args: PolicySetArgs, runtime: &Runtime) -> Result<()> {
         "Daily snapshots enabled at {} {} with {} retention (generation {}).",
         record.policy.daily_at(),
         record.policy.timezone(),
-        format_duration(
-            record
-                .policy
-                .retention()
-                .ttl()
-                .expect("finite policy retention")
-        ),
+        format_retention(record.policy.retention()),
         record.generation
     );
     Ok(())
@@ -323,13 +342,7 @@ fn show_policy(runtime: &Runtime) -> Result<()> {
             "Daily snapshots: {} {}\nRetention: {}\nGeneration: {}",
             record.policy.daily_at(),
             record.policy.timezone(),
-            format_duration(
-                record
-                    .policy
-                    .retention()
-                    .ttl()
-                    .expect("finite policy retention")
-            ),
+            format_retention(record.policy.retention()),
             record.generation
         ),
         None => println!("Daily snapshots: disabled"),
@@ -483,6 +496,13 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn format_retention(retention: SnapshotRetention) -> String {
+    retention
+        .ttl()
+        .map(format_duration)
+        .unwrap_or_else(|| "infinite".to_string())
 }
 
 fn parse_daily_at(value: &str) -> Result<NaiveTime, String> {
