@@ -139,8 +139,8 @@ fn catalog_query(filter: &str) -> String {
 }
 
 fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEntry> {
-    let snapshot_id_text: String = row.get(0);
-    let snapshot_id = SnapshotId::parse(&snapshot_id_text)
+    let snapshot_id_text: &str = row.get(0);
+    let snapshot_id = SnapshotId::parse(snapshot_id_text)
         .map_err(|_| MetaError::Storage("invalid snapshot ID in PostgreSQL".to_string()))?;
     let volume =
         SnapshotVolumeContext::new(volume_id, row.get::<_, String>(1), row.get::<_, String>(2))
@@ -151,10 +151,10 @@ fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEnt
         .map_err(|_| MetaError::Storage("invalid snapshot cut".to_string()))?;
     let lifecycle = parse_lifecycle(row.get(6))?;
     let retention = parse_retention(origin, row.get(7))?;
-    let job_state = row
-        .get::<_, Option<String>>(18)
+    let job_state: &str = row
+        .get::<_, Option<&str>>(18)
         .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
-    let creation_state = parse_creation_state(&job_state)?;
+    let creation_state = parse_creation_state(job_state)?;
     let job_failure: Option<String> = row.get(19);
     let artifact = match row.get::<_, Option<String>>(12) {
         None => None,
@@ -167,8 +167,8 @@ fn parse_catalog_row(row: &Row, volume_id: i64) -> MetaResult<SnapshotCatalogEnt
                 MetaError::Storage("missing artifact schema version".to_string())
             })?)
             .map_err(|_| MetaError::Storage("invalid artifact schema version".to_string()))?;
-            let digest: Vec<u8> = row
-                .get::<_, Option<Vec<u8>>>(15)
+            let digest: &[u8] = row
+                .get::<_, Option<&[u8]>>(15)
                 .ok_or_else(|| MetaError::Storage("missing artifact checksum".to_string()))?;
             let sha256: [u8; 32] = digest
                 .try_into()

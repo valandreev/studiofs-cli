@@ -146,6 +146,13 @@ fn resolve_volume() -> Result<ResolvedVolume> {
 
     resolved.sort_by(|left, right| left.context.volume_name.cmp(&right.context.volume_name));
     resolved.dedup_by(|left, right| left.context == right.context);
+    if !failures.is_empty() && !resolved.is_empty() {
+        return Err(anyhow!(
+            "could not unambiguously resolve a snapshot volume: {} PostgreSQL-backed candidate(s) are valid, but {} other candidate(s) failed validation; remove stale metadata or restore the unavailable volume authority",
+            resolved.len(),
+            failures.len()
+        ));
+    }
     match resolved.len() {
         0 => match failures.into_iter().next() {
             Some(error) => Err(error),
@@ -456,7 +463,7 @@ fn print_catalog(entry: &SnapshotCatalogEntry) {
         "{} origin={} captured_at={} cut_version={} state={} creation={} ready_at={} expires_at={} checksum={} last_error={}",
         entry.snapshot_id,
         origin_name(entry.origin),
-        entry.cut.captured_at(),
+        entry.cut.captured_at().to_rfc3339(),
         entry.cut.cut_version(),
         lifecycle_name(entry.lifecycle),
         entry.creation_state.as_str(),
@@ -467,8 +474,24 @@ fn print_catalog(entry: &SnapshotCatalogEntry) {
             .expires_at
             .map_or_else(|| "-".to_string(), |value| value.to_rfc3339()),
         checksum,
-        entry.failure.as_deref().unwrap_or("-")
+        format_catalog_error(entry.failure.as_deref())
     );
+}
+
+fn format_catalog_error(error: Option<&str>) -> String {
+    let Some(error) = error else {
+        return "-".to_string();
+    };
+    if error.chars().all(|character| {
+        !character.is_whitespace()
+            && !character.is_control()
+            && character != '"'
+            && character != '\\'
+    }) {
+        error.to_string()
+    } else {
+        format!("{error:?}")
+    }
 }
 
 fn origin_name(origin: SnapshotOrigin) -> &'static str {
@@ -571,7 +594,7 @@ fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::super::parse_for_test;
-    use super::format_duration;
+    use super::{format_catalog_error, format_duration};
     use std::time::Duration;
 
     #[test]
@@ -689,5 +712,30 @@ mod tests {
     #[test]
     fn format_duration_zero_is_seconds() {
         assert_eq!(format_duration(Duration::ZERO), "0s");
+    }
+
+    #[test]
+    fn format_duration_uses_the_largest_exact_unit() {
+        assert_eq!(
+            format_duration(Duration::from_secs(14 * 24 * 60 * 60)),
+            "2w"
+        );
+        assert_eq!(format_duration(Duration::from_secs(25 * 60 * 60)), "25h");
+        assert_eq!(format_duration(Duration::from_secs(90 * 60)), "90m");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn format_catalog_error_quotes_unescaped_text() {
+        assert_eq!(format_catalog_error(None), "-");
+        assert_eq!(format_catalog_error(Some("timeout")), "timeout");
+        assert_eq!(
+            format_catalog_error(Some("connection reset by peer")),
+            "\"connection reset by peer\""
+        );
+        assert_eq!(
+            format_catalog_error(Some("quoted \"error\"")),
+            "\"quoted \\\"error\\\"\""
+        );
     }
 }
