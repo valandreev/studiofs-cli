@@ -1704,32 +1704,40 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let uploads = fragment_keys.iter().zip(built_fragments).enumerate().map(
-            |(fragment_index, (key, fragment))| {
-                let entry = UploadedFragmentLedgerEntry {
-                    volume_id,
-                    object_id,
-                    fragment_index: fragment_index as u32,
-                    object_key: key.clone(),
-                    expected_byte_length: fragment.expected_byte_length,
-                    expected_sha256: fragment.expected_sha256,
-                };
-                let key = key.clone();
+        if cancel_token.is_cancelled() {
+            return UploadPutOutcome::Cancelled;
+        }
+        let mut fragment_uploads = Vec::with_capacity(fragment_keys.len());
+        let mut ledger_entries = Vec::with_capacity(fragment_keys.len());
+        for (fragment_index, (key, fragment)) in
+            fragment_keys.iter().zip(built_fragments).enumerate()
+        {
+            let entry = UploadedFragmentLedgerEntry {
+                volume_id,
+                object_id,
+                fragment_index: fragment_index as u32,
+                object_key: key.clone(),
+                expected_byte_length: fragment.expected_byte_length,
+                expected_sha256: fragment.expected_sha256,
+            };
+            ledger_entries.push(entry.clone());
+            fragment_uploads.push((key.clone(), fragment.payload, entry));
+        }
+        let begin_error = run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.begin_fragment_uploads(&ledger_entries)
+        })
+        .await
+        .err();
+        if let Some(error) = begin_error {
+            return UploadPutOutcome::Failed(error);
+        }
+        let uploads = fragment_uploads.into_iter().enumerate().map(
+            |(fragment_index, (key, payload, entry))| {
                 let cancel_token = cancel_token.clone();
-                let payload = fragment.payload;
                 async move {
                     let err_key = key.clone();
                     if cancel_token.is_cancelled() {
                         return Err((fragment_index, err_key, None));
-                    }
-                    let begin_entry = entry.clone();
-                    if let Err(error) =
-                        run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                            engine.begin_fragment_upload(&begin_entry)
-                        })
-                        .await
-                    {
-                        return Err((fragment_index, err_key, Some(error.to_string())));
                     }
                     if let Err(error) = self
                         .vfs
@@ -1748,16 +1756,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                             )),
                         };
                     }
-                    let confirm_entry = entry;
-                    if let Err(error) =
-                        run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                            engine.confirm_fragment_uploaded(&confirm_entry)
-                        })
-                        .await
-                    {
-                        return Err((fragment_index, key, Some(error.to_string())));
-                    }
-                    Ok((fragment_index, key))
+                    Ok((fragment_index, entry))
                 }
             },
         );
@@ -1765,9 +1764,11 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
 
         let mut first_error = None;
         let mut saw_cancel = false;
+        let mut confirmed_entries = Vec::new();
         for result in done {
             match result {
-                Ok((fragment_index, key)) => {
+                Ok((fragment_index, entry)) => {
+                    let key = entry.object_key.clone();
                     debug!(
                         ino = op.ino,
                         object_id = op.object_id,
@@ -1776,6 +1777,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                         key,
                         "process_upload fragment put completed"
                     );
+                    confirmed_entries.push(entry);
                 }
                 Err((_, _, None)) => {
                     saw_cancel = true;
@@ -1787,12 +1789,26 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                 }
             }
         }
+        let confirmation_error = if confirmed_entries.is_empty() {
+            None
+        } else {
+            run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.confirm_fragment_uploads(&confirmed_entries)
+            })
+            .await
+            .err()
+        };
         if saw_cancel {
             return UploadPutOutcome::Cancelled;
         }
         if let Some((fragment_index, key, error)) = first_error {
             return UploadPutOutcome::Failed(VfsError::Other(format!(
                 "fragment upload failed (idx={fragment_index}, key={key}): {error}"
+            )));
+        }
+        if let Some(error) = confirmation_error {
+            return UploadPutOutcome::Failed(VfsError::Other(format!(
+                "fragment upload ledger confirmation failed: {error}"
             )));
         }
         UploadPutOutcome::Uploaded

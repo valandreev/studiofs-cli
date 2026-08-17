@@ -198,9 +198,9 @@ pub enum UploadedObjectDeletionOutcome {
     Retryable,
 }
 
-/// PostgreSQL operations needed by an upload worker to record each remote
-/// fragment PUT. Exact remote-byte validation remains in janitor
-/// reconciliation, so the upload hot path does not read a fragment back.
+/// PostgreSQL operations needed by an upload worker to record remote fragment
+/// PUTs. Exact remote-byte validation remains in janitor reconciliation, so the
+/// upload hot path does not read a fragment back.
 pub trait UploadedFragmentLedger: Send + Sync {
     /// Returns the metadata volume identity used by the ledger.
     fn fragment_ledger_volume_id(&self) -> MetaResult<VolumeId>;
@@ -238,10 +238,34 @@ pub trait UploadedFragmentLedger: Send + Sync {
     /// Records an upload attempt before remote I/O.
     fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
 
+    /// Records a batch of upload attempts before remote I/O.
+    ///
+    /// Implementations with a remote metadata store should override this to
+    /// persist the whole object in one transaction. The default keeps smaller
+    /// metadata engines compatible with the single-entry port.
+    fn begin_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
+        for entry in entries {
+            self.begin_fragment_upload(entry)?;
+        }
+        Ok(())
+    }
+
     /// Records a successful remote PUT and its expected bytes for the durable
     /// upload ledger. Janitor reconciliation performs the remote stat/read/hash
     /// proof when it needs to recover an incomplete upload.
     fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
+
+    /// Records successful remote PUTs in one batch.
+    ///
+    /// Implementations with a remote metadata store should override this to
+    /// persist the whole object in one transaction. The default keeps smaller
+    /// metadata engines compatible with the single-entry port.
+    fn confirm_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
+        for entry in entries {
+            self.confirm_fragment_uploaded(entry)?;
+        }
+        Ok(())
+    }
 }
 
 /// Stable identity of one materializer worker.
