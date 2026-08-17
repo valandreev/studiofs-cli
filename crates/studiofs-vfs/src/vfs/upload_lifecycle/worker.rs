@@ -1572,8 +1572,14 @@ struct VfsRemoteUploadPort {
     vfs: Arc<StudioVfs>,
 }
 
+struct BuiltFragment {
+    payload: Buffer,
+    expected_byte_length: u64,
+    expected_sha256: [u8; 32],
+}
+
 impl VfsRemoteUploadPort {
-    fn build_fragments(raw_payload: Bytes) -> VfsResult<Vec<Buffer>> {
+    fn build_fragments(raw_payload: Bytes) -> VfsResult<Vec<BuiltFragment>> {
         let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
         for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
             let start = fragment_index * CLOUD_FRAGMENT_SIZE;
@@ -1583,7 +1589,13 @@ impl VfsRemoteUploadPort {
             } else {
                 Bytes::new()
             };
-            fragments.push(create_object_buffer(fragment_payload)?);
+            let payload = create_object_buffer(fragment_payload)?;
+            let expected_bytes = payload.clone().to_bytes();
+            fragments.push(BuiltFragment {
+                payload,
+                expected_byte_length: expected_bytes.len() as u64,
+                expected_sha256: Sha256::digest(&expected_bytes).into(),
+            });
         }
         Ok(fragments)
     }
@@ -1688,23 +1700,23 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             Err(error) => return UploadPutOutcome::Failed(error),
         };
         let object_id = op.object_id;
-        let object_bytes = match run_blocking(move || Self::build_fragments(raw_payload)).await {
+        let built_fragments = match run_blocking(move || Self::build_fragments(raw_payload)).await {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let uploads = fragment_keys.iter().zip(object_bytes).enumerate().map(
-            |(fragment_index, (key, payload))| {
-                let expected_bytes = payload.clone().to_bytes();
+        let uploads = fragment_keys.iter().zip(built_fragments).enumerate().map(
+            |(fragment_index, (key, fragment))| {
                 let entry = UploadedFragmentLedgerEntry {
                     volume_id,
                     object_id,
                     fragment_index: fragment_index as u32,
                     object_key: key.clone(),
-                    expected_byte_length: expected_bytes.len() as u64,
-                    expected_sha256: Sha256::digest(&expected_bytes).into(),
+                    expected_byte_length: fragment.expected_byte_length,
+                    expected_sha256: fragment.expected_sha256,
                 };
                 let key = key.clone();
                 let cancel_token = cancel_token.clone();
+                let payload = fragment.payload;
                 async move {
                     let err_key = key.clone();
                     if cancel_token.is_cancelled() {
@@ -2318,7 +2330,11 @@ mod tests {
             .expect("build upload fragments");
 
         assert_eq!(fragments.len(), CLOUD_FRAGMENT_COUNT);
-        assert!(!fragments[0].to_bytes().is_empty());
+        let bytes = fragments[0].payload.to_bytes();
+        assert!(!bytes.is_empty());
+        assert_eq!(fragments[0].expected_byte_length, bytes.len() as u64);
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(fragments[0].expected_sha256, digest);
     }
 
     #[test]
