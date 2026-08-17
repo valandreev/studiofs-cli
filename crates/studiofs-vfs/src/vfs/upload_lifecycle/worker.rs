@@ -1,6 +1,8 @@
 use super::super::{FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
-use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
+use crate::runtime::{
+    MetaExecutor, TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel,
+};
 use crate::utils::now_unix_millis;
 use bytes::Bytes;
 use futures::future::join_all;
@@ -21,7 +23,7 @@ use studiofs_meta::schema::{
     chunk_id_from_offset, chunk_start_offset,
 };
 use studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -1567,9 +1569,170 @@ impl UploadMetaPort for VfsUploadMetaPort {
     }
 }
 
+// The ledger remains a pre/post-PUT fence, but concurrent object workers share
+// each PG transaction instead of paying one transaction per object.
+const UPLOAD_LEDGER_BATCH_MAX_REQUESTS: usize = 128;
+const UPLOAD_LEDGER_BATCH_DELAY: Duration = Duration::from_millis(1);
+
+struct UploadLedgerBatchRequest {
+    entries: Vec<UploadedFragmentLedgerEntry>,
+    result: oneshot::Sender<Result<(), Arc<VfsError>>>,
+}
+
+#[derive(Default)]
+struct UploadLedgerBatchInner {
+    queue: VecDeque<UploadLedgerBatchRequest>,
+    draining: bool,
+}
+
+struct UploadLedgerBatchQueue {
+    inner: parking_lot::Mutex<UploadLedgerBatchInner>,
+}
+
+#[derive(Clone, Copy)]
+enum UploadLedgerBatchOperation {
+    Begin,
+    Confirm,
+}
+
+fn take_upload_ledger_batch(inner: &mut UploadLedgerBatchInner) -> Vec<UploadLedgerBatchRequest> {
+    let take = UPLOAD_LEDGER_BATCH_MAX_REQUESTS.min(inner.queue.len());
+    inner.queue.drain(..take).collect()
+}
+
+async fn drain_upload_ledger_batch_queue(
+    queue: Arc<UploadLedgerBatchQueue>,
+    meta: MetaExecutor<dyn VfsMeta>,
+    operation: UploadLedgerBatchOperation,
+) {
+    loop {
+        tokio::time::sleep(UPLOAD_LEDGER_BATCH_DELAY).await;
+        let requests = {
+            let mut inner = queue.inner.lock();
+            let requests = take_upload_ledger_batch(&mut inner);
+            if requests.is_empty() {
+                inner.draining = false;
+                return;
+            }
+            requests
+        };
+        let entries = requests
+            .iter()
+            .flat_map(|request| request.entries.iter().cloned())
+            .collect::<Vec<_>>();
+        let result = run_meta(
+            meta.clone(),
+            move |engine: Arc<dyn VfsMeta>| match operation {
+                UploadLedgerBatchOperation::Begin => engine.begin_fragment_uploads(&entries),
+                UploadLedgerBatchOperation::Confirm => engine.confirm_fragment_uploads(&entries),
+            },
+        )
+        .await
+        .map_err(Arc::new);
+        for request in requests {
+            let _ = request.result.send(result.clone());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct UploadLedgerBatcher {
+    begin: Arc<UploadLedgerBatchQueue>,
+    confirm: Arc<UploadLedgerBatchQueue>,
+}
+
+impl UploadLedgerBatcher {
+    fn new() -> Self {
+        Self {
+            begin: Arc::new(UploadLedgerBatchQueue {
+                inner: parking_lot::Mutex::new(UploadLedgerBatchInner::default()),
+            }),
+            confirm: Arc::new(UploadLedgerBatchQueue {
+                inner: parking_lot::Mutex::new(UploadLedgerBatchInner::default()),
+            }),
+        }
+    }
+
+    async fn submit(
+        queue: &Arc<UploadLedgerBatchQueue>,
+        meta: MetaExecutor<dyn VfsMeta>,
+        entries: Vec<UploadedFragmentLedgerEntry>,
+        operation: UploadLedgerBatchOperation,
+        operation_name: &'static str,
+    ) -> VfsResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (result_sender, result_receiver) = oneshot::channel();
+        let should_spawn = {
+            let mut inner = queue.inner.lock();
+            inner.queue.push_back(UploadLedgerBatchRequest {
+                entries,
+                result: result_sender,
+            });
+            if inner.draining {
+                false
+            } else {
+                inner.draining = true;
+                true
+            }
+        };
+        if should_spawn {
+            let queue = Arc::clone(queue);
+            tokio::spawn(drain_upload_ledger_batch_queue(queue, meta, operation));
+        }
+        match result_receiver.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(clone_upload_ledger_error(&error)),
+            Err(_) => Err(VfsError::Other(format!(
+                "upload ledger {operation_name} batcher stopped"
+            ))),
+        }
+    }
+
+    async fn begin(
+        &self,
+        meta: MetaExecutor<dyn VfsMeta>,
+        entries: Vec<UploadedFragmentLedgerEntry>,
+    ) -> VfsResult<()> {
+        Self::submit(
+            &self.begin,
+            meta,
+            entries,
+            UploadLedgerBatchOperation::Begin,
+            "begin",
+        )
+        .await
+    }
+
+    async fn confirm(
+        &self,
+        meta: MetaExecutor<dyn VfsMeta>,
+        entries: Vec<UploadedFragmentLedgerEntry>,
+    ) -> VfsResult<()> {
+        Self::submit(
+            &self.confirm,
+            meta,
+            entries,
+            UploadLedgerBatchOperation::Confirm,
+            "confirm",
+        )
+        .await
+    }
+}
+
+fn clone_upload_ledger_error(error: &VfsError) -> VfsError {
+    match error {
+        VfsError::Meta(error) => VfsError::Meta(error.clone()),
+        _ => VfsError::Other(error.to_string()),
+    }
+}
+
 #[derive(Clone)]
 struct VfsRemoteUploadPort {
     vfs: Arc<StudioVfs>,
+    ledger_batcher: UploadLedgerBatcher,
+    ledger_volume_id: Arc<AsyncMutex<Option<studiofs_meta::snapshot::VolumeId>>>,
 }
 
 struct BuiltFragment {
@@ -1579,6 +1742,19 @@ struct BuiltFragment {
 }
 
 impl VfsRemoteUploadPort {
+    async fn ledger_volume_id(&self) -> VfsResult<studiofs_meta::snapshot::VolumeId> {
+        let mut cached = self.ledger_volume_id.lock().await;
+        if let Some(volume_id) = *cached {
+            return Ok(volume_id);
+        }
+        let volume_id = run_meta(self.vfs.meta.clone(), |engine: Arc<dyn VfsMeta>| {
+            engine.fragment_ledger_volume_id()
+        })
+        .await?;
+        *cached = Some(volume_id);
+        Ok(volume_id)
+    }
+
     fn build_fragments(raw_payload: Bytes) -> VfsResult<Vec<BuiltFragment>> {
         let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
         for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
@@ -1690,12 +1866,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         else {
             return UploadPutOutcome::Cancelled;
         };
-        let meta = self.vfs.meta.clone();
-        let volume_id = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.fragment_ledger_volume_id()
-        })
-        .await
-        {
+        let volume_id = match self.ledger_volume_id().await {
             Ok(volume_id) => volume_id,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
@@ -1723,12 +1894,11 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             ledger_entries.push(entry.clone());
             fragment_uploads.push((key.clone(), fragment.payload, entry));
         }
-        let begin_error = run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.begin_fragment_uploads(&ledger_entries)
-        })
-        .await
-        .err();
-        if let Some(error) = begin_error {
+        if let Err(error) = self
+            .ledger_batcher
+            .begin(self.vfs.meta.clone(), ledger_entries)
+            .await
+        {
             return UploadPutOutcome::Failed(error);
         }
         let uploads = fragment_uploads.into_iter().enumerate().map(
@@ -1792,11 +1962,10 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         let confirmation_error = if confirmed_entries.is_empty() {
             None
         } else {
-            run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.confirm_fragment_uploads(&confirmed_entries)
-            })
-            .await
-            .err()
+            self.ledger_batcher
+                .confirm(self.vfs.meta.clone(), confirmed_entries)
+                .await
+                .err()
         };
         if saw_cancel {
             return UploadPutOutcome::Cancelled;
@@ -2002,11 +2171,16 @@ impl Drop for ActiveUploadWorkerGuard<'_> {
 
 impl UploadLifecycleWorker {
     pub(crate) fn new(vfs: Arc<StudioVfs>) -> Self {
+        let ledger_batcher = UploadLedgerBatcher::new();
         let processor = UploadProcessor {
             coordinator: VfsCachedStorePort { vfs: vfs.clone() },
             local_payloads: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
             meta: VfsUploadMetaPort { vfs: vfs.clone() },
-            remote: VfsRemoteUploadPort { vfs: vfs.clone() },
+            remote: VfsRemoteUploadPort {
+                vfs: vfs.clone(),
+                ledger_batcher,
+                ledger_volume_id: Arc::new(AsyncMutex::new(None)),
+            },
             shutdown: VfsUploadShutdownPort { vfs: vfs.clone() },
             policy: VfsUploadPolicyPort { vfs: vfs.clone() },
             block_size: vfs.block_size,
@@ -2319,6 +2493,7 @@ mod tests {
     use studiofs_meta::{MetaEngine, MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
+    use tokio::sync::oneshot;
 
     type FakePendingInodes = Arc<Mutex<HashSet<Ino>>>;
     type FakeProcessor = UploadProcessor<
@@ -2338,6 +2513,44 @@ mod tests {
             assert_eq!(active_workers.load(Ordering::Relaxed), 1);
         }
         assert_eq!(active_workers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn upload_ledger_batches_entries_from_multiple_objects() {
+        let mut inner = UploadLedgerBatchInner::default();
+        let (first_result, _first_result_receiver) = oneshot::channel();
+        let (second_result, _second_result_receiver) = oneshot::channel();
+        inner.queue.push_back(UploadLedgerBatchRequest {
+            entries: vec![UploadedFragmentLedgerEntry {
+                volume_id: 7,
+                object_id: 11,
+                fragment_index: 0,
+                object_key: "objects/11".to_owned(),
+                expected_byte_length: 1,
+                expected_sha256: [0; 32],
+            }],
+            result: first_result,
+        });
+        inner.queue.push_back(UploadLedgerBatchRequest {
+            entries: vec![UploadedFragmentLedgerEntry {
+                volume_id: 7,
+                object_id: 12,
+                fragment_index: 0,
+                object_key: "objects/12".to_owned(),
+                expected_byte_length: 1,
+                expected_sha256: [0; 32],
+            }],
+            result: second_result,
+        });
+
+        let requests = take_upload_ledger_batch(&mut inner);
+        let object_ids = requests
+            .into_iter()
+            .flat_map(|request| request.entries)
+            .map(|entry| entry.object_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(object_ids, vec![11, 12]);
     }
 
     #[test]
