@@ -8,6 +8,7 @@
 use super::{LOCAL_PG_VERSION_COUNTER, PgMetaEngine};
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
+use crate::redb_engine::RedbMetaEngine;
 use crate::schema::PayloadRefState;
 use crate::snapshot::VolumeId;
 use crate::snapshot_ports::{
@@ -25,6 +26,44 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
 const SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES: usize = 3;
+const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
+
+fn replay_local_upload_ledger_once<B, C>(
+    local: &RedbMetaEngine,
+    mut begin_remote: B,
+    mut confirm_remote: C,
+) -> MetaResult<()>
+where
+    B: FnMut(&[UploadedFragmentLedgerEntry]) -> MetaResult<()>,
+    C: FnMut(&[UploadedFragmentLedgerEntry]) -> MetaResult<()>,
+{
+    let pending = local.pending_local_upload_ledger(UPLOAD_LEDGER_REPLAY_BATCH_SIZE)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let begins = pending
+        .iter()
+        .filter(|record| !record.begin_replicated)
+        .map(|record| record.entry.clone())
+        .collect::<Vec<_>>();
+    if !begins.is_empty() {
+        begin_remote(&begins)?;
+        local.mark_local_upload_ledger_begun(&begins)?;
+    }
+
+    let confirmations = local
+        .pending_local_upload_ledger(UPLOAD_LEDGER_REPLAY_BATCH_SIZE)?
+        .into_iter()
+        .filter(|record| record.begin_replicated && record.confirmed)
+        .map(|record| record.entry)
+        .collect::<Vec<_>>();
+    if !confirmations.is_empty() {
+        confirm_remote(&confirmations)?;
+        local.remove_local_upload_ledger_confirmed(&confirmations)?;
+    }
+    Ok(())
+}
 
 /// Applies one ordered published metadata batch to the PostgreSQL reachability
 /// ledger inside the caller's transaction.
@@ -344,6 +383,14 @@ fn checked_i64(value: u64, kind: &str) -> MetaResult<i64> {
 }
 
 impl PgMetaEngine {
+    pub(super) fn replay_local_upload_ledger(&self) -> MetaResult<()> {
+        replay_local_upload_ledger_once(
+            &self.local,
+            |entries| self.begin_fragment_uploads_sync(entries),
+            |entries| self.confirm_fragment_uploads_sync(entries),
+        )
+    }
+
     pub(super) fn load_pg_current_reference_object_ids(&self) -> MetaResult<HashSet<u64>> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
@@ -929,10 +976,6 @@ impl PgMetaEngine {
         ))
     }
 
-    fn begin_fragment_upload_sync(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
-        self.begin_fragment_uploads_sync(std::slice::from_ref(entry))
-    }
-
     fn begin_fragment_uploads_sync(
         &self,
         entries: &[UploadedFragmentLedgerEntry],
@@ -1001,13 +1044,6 @@ impl PgMetaEngine {
             )
             .await
         })
-    }
-
-    fn confirm_fragment_uploaded_sync(
-        &self,
-        entry: &UploadedFragmentLedgerEntry,
-    ) -> MetaResult<()> {
-        self.confirm_fragment_uploads_sync(std::slice::from_ref(entry))
     }
 
     fn confirm_fragment_uploads_sync(
@@ -1285,19 +1321,23 @@ impl UploadedFragmentLedger for PgMetaEngine {
     }
 
     fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
-        self.begin_fragment_upload_sync(entry)
+        self.begin_fragment_uploads(std::slice::from_ref(entry))
     }
 
     fn begin_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
-        self.begin_fragment_uploads_sync(entries)
+        self.local.record_local_upload_ledger_begin(entries)?;
+        self.signal_poll_wakeup();
+        Ok(())
     }
 
     fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
-        self.confirm_fragment_uploaded_sync(entry)
+        self.confirm_fragment_uploads(std::slice::from_ref(entry))
     }
 
     fn confirm_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
-        self.confirm_fragment_uploads_sync(entries)
+        self.local.record_local_upload_ledger_confirm(entries)?;
+        self.signal_poll_wakeup();
+        Ok(())
     }
 }
 
@@ -1365,5 +1405,86 @@ mod tests {
 
         assert_eq!(count_references(&references)[&7], 2);
         assert_eq!(count_references(&references)[&8], 1);
+    }
+
+    #[test]
+    fn local_upload_ledger_replay_orders_remote_begin_before_confirm() {
+        let dir = studiofs_test_support::workspace_target_tempdir("upload-ledger-replay-");
+        let path = dir.path().join("meta.redb");
+        let engine = RedbMetaEngine::open(&path).expect("open local metadata");
+        let entry = UploadedFragmentLedgerEntry {
+            volume_id: 7,
+            object_id: 42,
+            fragment_index: 0,
+            object_key: "objects/42".to_string(),
+            expected_byte_length: 4,
+            expected_sha256: [0xA5; 32],
+        };
+        engine
+            .record_local_upload_ledger_begin(std::slice::from_ref(&entry))
+            .expect("record local upload begin");
+        engine
+            .record_local_upload_ledger_confirm(std::slice::from_ref(&entry))
+            .expect("record local upload confirmation");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        replay_local_upload_ledger_once(
+            &engine,
+            |entries| {
+                assert_eq!(entries, [entry.clone()]);
+                calls.borrow_mut().push("begin");
+                Ok(())
+            },
+            |entries| {
+                assert_eq!(entries, [entry.clone()]);
+                calls.borrow_mut().push("confirm");
+                Ok(())
+            },
+        )
+        .expect("replay local upload ledger");
+
+        assert_eq!(&*calls.borrow(), &["begin", "confirm"]);
+        assert!(
+            engine
+                .pending_local_upload_ledger(16)
+                .expect("read local upload ledger")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_local_upload_ledger_replay_keeps_pending_confirmation() {
+        let dir = studiofs_test_support::workspace_target_tempdir("upload-ledger-retry-");
+        let path = dir.path().join("meta.redb");
+        let engine = RedbMetaEngine::open(&path).expect("open local metadata");
+        let entry = UploadedFragmentLedgerEntry {
+            volume_id: 7,
+            object_id: 42,
+            fragment_index: 0,
+            object_key: "objects/42".to_string(),
+            expected_byte_length: 4,
+            expected_sha256: [0xA5; 32],
+        };
+        engine
+            .record_local_upload_ledger_begin(std::slice::from_ref(&entry))
+            .expect("record local upload begin");
+        engine
+            .record_local_upload_ledger_confirm(std::slice::from_ref(&entry))
+            .expect("record local upload confirmation");
+
+        let result = replay_local_upload_ledger_once(
+            &engine,
+            |_| Err(MetaError::Storage("remote unavailable".to_string())),
+            |_| panic!("confirmation must wait for a successful begin"),
+        );
+
+        assert!(result.is_err());
+        let pending = engine
+            .pending_local_upload_ledger(16)
+            .expect("read local upload ledger");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].entry, entry);
+        assert!(!pending[0].begin_replicated);
+        assert!(pending[0].confirmed);
     }
 }

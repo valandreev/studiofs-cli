@@ -103,6 +103,38 @@ fn versioned_event_rows_survive_local_engine_restart() {
     ));
 }
 
+#[test]
+fn local_upload_ledger_survives_reopen_until_remote_ack() {
+    let dir = studiofs_test_support::workspace_target_tempdir("upload-ledger-restart-");
+    let path = dir.path().join("meta.redb");
+    let entry = UploadedFragmentLedgerEntry {
+        volume_id: 7,
+        object_id: 42,
+        fragment_index: 0,
+        object_key: "objects/42".to_string(),
+        expected_byte_length: 4,
+        expected_sha256: [0xA5; 32],
+    };
+
+    {
+        let engine = RedbMetaEngine::open(&path).expect("open local metadata");
+        engine
+            .record_local_upload_ledger_begin(std::slice::from_ref(&entry))
+            .expect("record local upload begin");
+        engine
+            .record_local_upload_ledger_confirm(std::slice::from_ref(&entry))
+            .expect("record local upload confirmation");
+    }
+
+    let reopened = RedbMetaEngine::open(&path).expect("reopen local metadata");
+    let pending = reopened
+        .pending_local_upload_ledger(16)
+        .expect("read local upload ledger");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].entry, entry);
+    assert!(pending[0].confirmed);
+}
+
 trait FileGraphFixture {
     fn stage_payload_slice(&self, ino: Ino, block_index: u32, block: &PayloadRef)
     -> MetaResult<()>;
