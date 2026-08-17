@@ -198,8 +198,9 @@ pub enum UploadedObjectDeletionOutcome {
     Retryable,
 }
 
-/// PostgreSQL operations needed by an upload worker to leave durable proof
-/// before and after each remote fragment PUT.
+/// PostgreSQL operations needed by an upload worker to record each remote
+/// fragment PUT. Exact remote-byte validation remains in janitor
+/// reconciliation, so the upload hot path does not read a fragment back.
 pub trait UploadedFragmentLedger: Send + Sync {
     /// Returns the metadata volume identity used by the ledger.
     fn fragment_ledger_volume_id(&self) -> MetaResult<VolumeId>;
@@ -237,7 +238,9 @@ pub trait UploadedFragmentLedger: Send + Sync {
     /// Records an upload attempt before remote I/O.
     fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
 
-    /// Records remote stat/read/hash confirmation after remote I/O.
+    /// Records a successful remote PUT and its expected bytes for the durable
+    /// upload ledger. Janitor reconciliation performs the remote stat/read/hash
+    /// proof when it needs to recover an incomplete upload.
     fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
 }
 

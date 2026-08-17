@@ -138,17 +138,6 @@ struct UploadedObjectReconcile {
 
 const POST_PUT_STALE_RECONCILE_ATTEMPTS: usize = 16;
 const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
-const POST_PUT_VISIBILITY_ATTEMPTS: usize = 8;
-const POST_PUT_VISIBILITY_INITIAL_DELAY_MS: u64 = 25;
-const POST_PUT_VISIBILITY_MAX_DELAY_MS: u64 = 1_000;
-fn post_put_visibility_delay(attempt: usize) -> Duration {
-    let multiplier = 1u64.checked_shl(attempt.min(20) as u32).unwrap_or(u64::MAX);
-    Duration::from_millis(
-        POST_PUT_VISIBILITY_INITIAL_DELAY_MS
-            .saturating_mul(multiplier)
-            .min(POST_PUT_VISIBILITY_MAX_DELAY_MS),
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteVisibility {
@@ -718,29 +707,6 @@ where
                 }
                 UploadPutOutcome::Failed(error) => return Err(error),
             }
-            let post_put_cancel_token = self.shutdown.shutdown_token();
-            match self
-                .wait_for_uploaded_fragments_visible(op, &fragment_keys, &post_put_cancel_token)
-                .await
-            {
-                RemoteVisibility::Visible => {}
-                RemoteVisibility::Cancelled => {
-                    return if self.cancel_upload_if_inode_deleted(op).await? {
-                        Ok(SingleUploadOutcome::CancelledDeleted)
-                    } else {
-                        Ok(SingleUploadOutcome::Shutdown)
-                    };
-                }
-                RemoteVisibility::NotVisible => {
-                    if self.cancel_upload_if_inode_deleted(op).await? {
-                        return Ok(SingleUploadOutcome::CancelledDeleted);
-                    }
-                    return Err(VfsError::Other(format!(
-                        "uploaded object {} fragments were not visible after remote put",
-                        op.object_id
-                    )));
-                }
-            }
         }
 
         if self.cancel_upload_if_inode_deleted(op).await? {
@@ -925,38 +891,6 @@ where
         }
 
         Ok(None)
-    }
-
-    async fn wait_for_uploaded_fragments_visible(
-        &self,
-        op: &PendingUpload,
-        fragment_keys: &[String],
-        upload_cancel_token: &CancellationToken,
-    ) -> RemoteVisibility {
-        for attempt in 0..POST_PUT_VISIBILITY_ATTEMPTS {
-            match self
-                .remote
-                .all_fragments_visible(op, fragment_keys, upload_cancel_token)
-                .await
-            {
-                RemoteVisibility::Visible => return RemoteVisibility::Visible,
-                RemoteVisibility::Cancelled => return RemoteVisibility::Cancelled,
-                RemoteVisibility::NotVisible => {}
-            }
-
-            if attempt + 1 == POST_PUT_VISIBILITY_ATTEMPTS {
-                break;
-            }
-
-            let shutdown_token = self.shutdown.shutdown_token();
-            tokio::select! {
-                _ = shutdown_token.cancelled() => return RemoteVisibility::Cancelled,
-                _ = upload_cancel_token.cancelled() => return RemoteVisibility::Cancelled,
-                _ = tokio::time::sleep(post_put_visibility_delay(attempt)) => {}
-            }
-        }
-
-        RemoteVisibility::NotVisible
     }
 
     async fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> VfsResult<bool> {
@@ -1821,47 +1755,6 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                                 )),
                             };
                         }
-                        let proof = run_with_timeout_or_cancel(
-                            &cancel_token,
-                            crate::vfs::REMOTE_OBJECT_IO_TIMEOUT,
-                            self.vfs.fetch_scheduler.data_store().get_by_key(&key),
-                        )
-                        .await;
-                        match proof {
-                            TimeoutOrCancel::Cancelled => {
-                                return Err((fragment_index, key, None));
-                            }
-                            TimeoutOrCancel::TimedOut => {
-                                return Err((
-                                    fragment_index,
-                                    key,
-                                    Some("fragment upload proof timed out".to_string()),
-                                ));
-                            }
-                            TimeoutOrCancel::Completed(Err(_)) => {
-                                return Err((
-                                    fragment_index,
-                                    key,
-                                    Some("fragment upload proof read failed".to_string()),
-                                ));
-                            }
-                            TimeoutOrCancel::Completed(Ok(remote_payload)) => {
-                                let remote_bytes = remote_payload.to_bytes();
-                                let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
-                                if remote_bytes.len() as u64 != entry.expected_byte_length
-                                    || remote_sha256 != entry.expected_sha256
-                                {
-                                    return Err((
-                                        fragment_index,
-                                        key,
-                                        Some(
-                                            "fragment upload proof did not match expected bytes"
-                                                .to_string(),
-                                        ),
-                                    ));
-                                }
-                            }
-                        }
                         let confirm_entry = entry.clone();
                         if let Err(error) =
                             run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
@@ -2438,15 +2331,6 @@ mod tests {
     }
 
     #[test]
-    fn post_put_visibility_delay_uses_bounded_exponential_backoff() {
-        assert_eq!(post_put_visibility_delay(0), Duration::from_millis(25));
-        assert_eq!(post_put_visibility_delay(1), Duration::from_millis(50));
-        assert_eq!(post_put_visibility_delay(2), Duration::from_millis(100));
-        assert_eq!(post_put_visibility_delay(6), Duration::from_millis(1_000));
-        assert_eq!(post_put_visibility_delay(32), Duration::from_millis(1_000));
-    }
-
-    #[test]
     fn built_fragment_proofs_match_encoded_remote_bytes() {
         let keys = format_object_fragment_keys("data", 42);
         let fragments = VfsRemoteUploadPort::build_fragments(
@@ -2787,6 +2671,7 @@ mod tests {
         trace: FakeUploadTrace,
         adaptive_penalty_ms: u64,
         visibility: Arc<Mutex<RemoteVisibility>>,
+        visibility_checks: Arc<AtomicUsize>,
         visibility_after_upload: Arc<Mutex<Option<RemoteVisibility>>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
@@ -2802,6 +2687,7 @@ mod tests {
                 trace: FakeUploadTrace::default(),
                 adaptive_penalty_ms: 0,
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
+                visibility_checks: Arc::new(AtomicUsize::new(0)),
                 visibility_after_upload: Arc::new(Mutex::new(Some(RemoteVisibility::Visible))),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
@@ -2832,6 +2718,7 @@ mod tests {
             _fragment_keys: &[String],
             _cancel_token: &CancellationToken,
         ) -> RemoteVisibility {
+            self.visibility_checks.fetch_add(1, Ordering::Relaxed);
             let visibility = *self.visibility.lock();
             if matches!(visibility, RemoteVisibility::Visible)
                 && let Some((meta, ino, object_id)) =
@@ -3519,8 +3406,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_upload_requeues_when_uploaded_fragments_are_not_visible() {
-        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+    async fn process_upload_does_not_gate_completion_on_post_put_visibility() {
+        let (processor, coordinator, _local_payloads, meta, remote, _shutdown, _policy) =
             processor_fixture();
         let op = make_pending_upload();
         coordinator.pending_inodes.lock().insert(op.ino);
@@ -3534,21 +3421,8 @@ mod tests {
 
         let outcome = processor.process_upload(op.clone()).await;
 
-        assert_eq!(outcome, UploadOutcome::Requeued);
-        assert!(
-            meta.uploaded_overlay_objects.lock().is_empty(),
-            "metadata must not reference a remote payload before all fragments are visible"
-        );
-        assert!(coordinator.completed.lock().is_empty());
-        assert_eq!(coordinator.requeued.lock().len(), 1);
-        assert_eq!(coordinator.requeued.lock()[0].object_id, op.object_id);
-        assert_eq!(local_payloads.failed.lock().as_slice(), &[op.object_id]);
-        assert!(local_payloads.uploaded.lock().is_empty());
-        assert!(local_payloads.removed.lock().is_empty());
-        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
-        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
-        assert_eq!(policy.sticky_errors.lock().len(), 1);
-        assert!(policy.finalized_upload_epochs.lock().is_empty());
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(remote.visibility_checks.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
