@@ -5,6 +5,7 @@ use crate::utils::now_unix_millis;
 use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use studiofs_meta::schema::{
     ResolvedSliceSpan, SliceId, SliceOrder, SliceRange, SliceRecord, block_index_from_offset,
     chunk_id_from_offset, chunk_start_offset,
 };
+use studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -1676,20 +1678,46 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         else {
             return UploadPutOutcome::Cancelled;
         };
-        // ponytail: keep per-fragment PG ledgering out of the data plane; stronger
-        // orphan recovery belongs in a separate batched queue.
+        let meta = self.vfs.meta.clone();
+        let volume_id = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.fragment_ledger_volume_id()
+        })
+        .await
+        {
+            Ok(volume_id) => volume_id,
+            Err(error) => return UploadPutOutcome::Failed(error),
+        };
+        let object_id = op.object_id;
         let object_bytes = match run_blocking(move || Self::build_fragments(raw_payload)).await {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
         let uploads = fragment_keys.iter().zip(object_bytes).enumerate().map(
             |(fragment_index, (key, payload))| {
+                let expected_bytes = payload.clone().to_bytes();
+                let entry = UploadedFragmentLedgerEntry {
+                    volume_id,
+                    object_id,
+                    fragment_index: fragment_index as u32,
+                    object_key: key.clone(),
+                    expected_byte_length: expected_bytes.len() as u64,
+                    expected_sha256: Sha256::digest(&expected_bytes).into(),
+                };
                 let key = key.clone();
                 let cancel_token = cancel_token.clone();
                 async move {
                     let err_key = key.clone();
                     if cancel_token.is_cancelled() {
                         return Err((fragment_index, err_key, None));
+                    }
+                    let begin_entry = entry.clone();
+                    if let Err(error) =
+                        run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                            engine.begin_fragment_upload(&begin_entry)
+                        })
+                        .await
+                    {
+                        return Err((fragment_index, err_key, Some(error.to_string())));
                     }
                     if let Err(error) = self
                         .vfs
@@ -1707,6 +1735,15 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                                 Some(format!("fragment upload failed: {error}")),
                             )),
                         };
+                    }
+                    let confirm_entry = entry;
+                    if let Err(error) =
+                        run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                            engine.confirm_fragment_uploaded(&confirm_entry)
+                        })
+                        .await
+                    {
+                        return Err((fragment_index, key, Some(error.to_string())));
                     }
                     Ok((fragment_index, key))
                 }
