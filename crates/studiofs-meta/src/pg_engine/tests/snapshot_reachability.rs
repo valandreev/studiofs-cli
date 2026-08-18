@@ -493,6 +493,9 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
     engine
         .begin_fragment_uploads(&entries)
         .expect("begin upload fragment batch");
+    engine
+        .flush_metadata()
+        .expect("replicate upload begin batch");
 
     run_async(async {
         let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
@@ -525,6 +528,9 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
     engine
         .confirm_fragment_uploads(&entries)
         .expect("confirm upload fragment batch");
+    engine
+        .flush_metadata()
+        .expect("replicate upload confirmation batch");
 
     run_async(async {
         let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)

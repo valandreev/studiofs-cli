@@ -28,6 +28,8 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 const SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES: usize = 3;
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
 
+type FragmentUploadColumns = (Vec<i64>, Vec<i32>, Vec<String>, Vec<i64>, Vec<Vec<u8>>);
+
 fn replay_local_upload_ledger_once<B, C>(
     local: &RedbMetaEngine,
     mut begin_remote: B,
@@ -951,7 +953,7 @@ impl PgMetaEngine {
     fn fragment_upload_columns(
         &self,
         entries: &[UploadedFragmentLedgerEntry],
-    ) -> MetaResult<(Vec<i64>, Vec<i32>, Vec<String>, Vec<i64>, Vec<Vec<u8>>)> {
+    ) -> MetaResult<FragmentUploadColumns> {
         let mut object_ids = Vec::with_capacity(entries.len());
         let mut fragment_indices = Vec::with_capacity(entries.len());
         let mut object_keys = Vec::with_capacity(entries.len());
@@ -1431,12 +1433,12 @@ mod tests {
         replay_local_upload_ledger_once(
             &engine,
             |entries| {
-                assert_eq!(entries, [entry.clone()]);
+                assert_eq!(entries, std::slice::from_ref(&entry));
                 calls.borrow_mut().push("begin");
                 Ok(())
             },
             |entries| {
-                assert_eq!(entries, [entry.clone()]);
+                assert_eq!(entries, std::slice::from_ref(&entry));
                 calls.borrow_mut().push("confirm");
                 Ok(())
             },
