@@ -273,9 +273,17 @@ impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaH
         &self,
         entry: &studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry,
     ) -> MetaResult<()>);
+    forward_method!(fn begin_fragment_uploads(
+        &self,
+        entries: &[studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry],
+    ) -> MetaResult<()>);
     forward_method!(fn confirm_fragment_uploaded(
         &self,
         entry: &studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry,
+    ) -> MetaResult<()>);
+    forward_method!(fn confirm_fragment_uploads(
+        &self,
+        entries: &[studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry],
     ) -> MetaResult<()>);
 }
 

@@ -8,6 +8,7 @@
 use super::{LOCAL_PG_VERSION_COUNTER, PgMetaEngine};
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
+use crate::redb_engine::RedbMetaEngine;
 use crate::schema::PayloadRefState;
 use crate::snapshot::VolumeId;
 use crate::snapshot_ports::{
@@ -25,6 +26,44 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
 const SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES: usize = 3;
+const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
+
+fn replay_local_upload_ledger_once<B, C>(
+    local: &RedbMetaEngine,
+    mut begin_remote: B,
+    mut confirm_remote: C,
+) -> MetaResult<()>
+where
+    B: FnMut(&[UploadedFragmentLedgerEntry]) -> MetaResult<()>,
+    C: FnMut(&[UploadedFragmentLedgerEntry]) -> MetaResult<()>,
+{
+    let pending = local.pending_local_upload_ledger(UPLOAD_LEDGER_REPLAY_BATCH_SIZE)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let begins = pending
+        .iter()
+        .filter(|record| !record.begin_replicated)
+        .map(|record| record.entry.clone())
+        .collect::<Vec<_>>();
+    if !begins.is_empty() {
+        begin_remote(&begins)?;
+        local.mark_local_upload_ledger_begun(&begins)?;
+    }
+
+    let confirmations = local
+        .pending_local_upload_ledger(UPLOAD_LEDGER_REPLAY_BATCH_SIZE)?
+        .into_iter()
+        .filter(|record| record.begin_replicated && record.confirmed)
+        .map(|record| record.entry)
+        .collect::<Vec<_>>();
+    if !confirmations.is_empty() {
+        confirm_remote(&confirmations)?;
+        local.remove_local_upload_ledger_confirmed(&confirmations)?;
+    }
+    Ok(())
+}
 
 /// Applies one ordered published metadata batch to the PostgreSQL reachability
 /// ledger inside the caller's transaction.
@@ -344,6 +383,14 @@ fn checked_i64(value: u64, kind: &str) -> MetaResult<i64> {
 }
 
 impl PgMetaEngine {
+    pub(super) fn replay_local_upload_ledger(&self) -> MetaResult<()> {
+        replay_local_upload_ledger_once(
+            &self.local,
+            |entries| self.begin_fragment_uploads_sync(entries),
+            |entries| self.confirm_fragment_uploads_sync(entries),
+        )
+    }
+
     pub(super) fn load_pg_current_reference_object_ids(&self) -> MetaResult<HashSet<u64>> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
@@ -901,14 +948,44 @@ impl PgMetaEngine {
         })
     }
 
-    fn begin_fragment_upload_sync(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
-        self.validate_fragment_entry_volume(entry)?;
-        let object_id = checked_i64(entry.object_id, "object id")?;
-        let fragment_index = i32::try_from(entry.fragment_index)
-            .map_err(|_| MetaError::Storage("snapshot fragment index is invalid".to_owned()))?;
-        let expected_byte_length = checked_i64(entry.expected_byte_length, "fragment length")?;
-        let key = entry.object_key.clone();
-        let digest = entry.expected_sha256.to_vec();
+    fn fragment_upload_columns(
+        &self,
+        entries: &[UploadedFragmentLedgerEntry],
+    ) -> MetaResult<(Vec<i64>, Vec<i32>, Vec<String>, Vec<i64>, Vec<Vec<u8>>)> {
+        let mut object_ids = Vec::with_capacity(entries.len());
+        let mut fragment_indices = Vec::with_capacity(entries.len());
+        let mut object_keys = Vec::with_capacity(entries.len());
+        let mut expected_byte_lengths = Vec::with_capacity(entries.len());
+        let mut expected_sha256 = Vec::with_capacity(entries.len());
+        for entry in entries {
+            self.validate_fragment_entry_volume(entry)?;
+            object_ids.push(checked_i64(entry.object_id, "object id")?);
+            fragment_indices.push(i32::try_from(entry.fragment_index).map_err(|_| {
+                MetaError::Storage("snapshot fragment index is invalid".to_owned())
+            })?);
+            object_keys.push(entry.object_key.clone());
+            expected_byte_lengths.push(checked_i64(entry.expected_byte_length, "fragment length")?);
+            expected_sha256.push(entry.expected_sha256.to_vec());
+        }
+        Ok((
+            object_ids,
+            fragment_indices,
+            object_keys,
+            expected_byte_lengths,
+            expected_sha256,
+        ))
+    }
+
+    fn begin_fragment_uploads_sync(
+        &self,
+        entries: &[UploadedFragmentLedgerEntry],
+    ) -> MetaResult<()> {
+        let (object_ids, fragment_indices, object_keys, expected_byte_lengths, expected_sha256) =
+            self.fragment_upload_columns(entries)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let object_ids_for_objects = object_ids.clone();
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
@@ -917,7 +994,7 @@ impl PgMetaEngine {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
-                "begin snapshot fragment upload",
+                "begin snapshot fragment upload batch",
                 move |client| {
                     Box::pin(async move {
                         let tx = client.transaction().await.map_err(|error| {
@@ -926,30 +1003,35 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        tx
-                            .execute(
-                                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, 'uploading') ON CONFLICT (vol, object_id) DO UPDATE SET state = CASE WHEN snapshot_payload_upload_objects.state = 'deleted' THEN 'uploading' ELSE snapshot_payload_upload_objects.state END, closed_at = NULL",
-                                &[&volume_id, &object_id],
+                        tx.execute(
+                            "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) SELECT $1, object_id, 'uploading' FROM unnest($2::BIGINT[]) AS object_ids(object_id) GROUP BY object_id ON CONFLICT (vol, object_id) DO UPDATE SET state = CASE WHEN snapshot_payload_upload_objects.state = 'deleted' THEN 'uploading' ELSE snapshot_payload_upload_objects.state END, closed_at = NULL",
+                            &[&volume_id, &object_ids_for_objects],
+                        )
+                        .await
+                        .map_err(|error| {
+                            Self::classify_pg_error(
+                                "postgres snapshot upload object begin failed",
+                                error,
                             )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot upload object begin failed",
-                                    error,
-                                )
-                            })?;
-                        tx
-                            .execute(
-                                "INSERT INTO snapshot_payload_upload_fragments (vol, object_id, fragment_index, object_key, expected_byte_length, expected_sha256, confirmation_state) VALUES ($1, $2, $3, $4, $5, $6, 'pending') ON CONFLICT (vol, object_id, fragment_index) DO UPDATE SET object_key = EXCLUDED.object_key, expected_byte_length = EXCLUDED.expected_byte_length, expected_sha256 = EXCLUDED.expected_sha256, uploaded_at = now(), confirmed_at = NULL, confirmation_state = 'pending', last_error = NULL",
-                                &[&volume_id, &object_id, &fragment_index, &key, &expected_byte_length, &digest],
+                        })?;
+                        tx.execute(
+                            "INSERT INTO snapshot_payload_upload_fragments (vol, object_id, fragment_index, object_key, expected_byte_length, expected_sha256, confirmation_state) SELECT $1, object_id, fragment_index, object_key, expected_byte_length, expected_sha256, 'pending' FROM unnest($2::BIGINT[], $3::INT[], $4::TEXT[], $5::BIGINT[], $6::BYTEA[]) AS fragment_values(object_id, fragment_index, object_key, expected_byte_length, expected_sha256) ON CONFLICT (vol, object_id, fragment_index) DO UPDATE SET object_key = EXCLUDED.object_key, expected_byte_length = EXCLUDED.expected_byte_length, expected_sha256 = EXCLUDED.expected_sha256, uploaded_at = now(), confirmed_at = NULL, confirmation_state = 'pending', last_error = NULL",
+                            &[
+                                &volume_id,
+                                &object_ids,
+                                &fragment_indices,
+                                &object_keys,
+                                &expected_byte_lengths,
+                                &expected_sha256,
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            Self::classify_pg_error(
+                                "postgres snapshot fragment upload begin failed",
+                                error,
                             )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot upload fragment begin failed",
-                                    error,
-                                )
-                            })?;
+                        })?;
                         tx.commit().await.map_err(|error| {
                             Self::classify_pg_error(
                                 "postgres snapshot upload begin commit failed",
@@ -964,16 +1046,17 @@ impl PgMetaEngine {
         })
     }
 
-    fn confirm_fragment_uploaded_sync(
+    fn confirm_fragment_uploads_sync(
         &self,
-        entry: &UploadedFragmentLedgerEntry,
+        entries: &[UploadedFragmentLedgerEntry],
     ) -> MetaResult<()> {
-        self.validate_fragment_entry_volume(entry)?;
-        let object_id = checked_i64(entry.object_id, "object id")?;
-        let fragment_index = i32::try_from(entry.fragment_index)
-            .map_err(|_| MetaError::Storage("snapshot fragment index is invalid".to_owned()))?;
-        let expected_byte_length = checked_i64(entry.expected_byte_length, "fragment length")?;
-        let digest = entry.expected_sha256.to_vec();
+        let (object_ids, fragment_indices, _object_keys, expected_byte_lengths, expected_sha256) =
+            self.fragment_upload_columns(entries)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let expected_row_count = u64::try_from(entries.len())
+            .map_err(|_| MetaError::Storage("too many upload fragments".to_owned()))?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
@@ -982,7 +1065,7 @@ impl PgMetaEngine {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
-                "confirm snapshot fragment upload",
+                "confirm snapshot fragment upload batch",
                 move |client| {
                     Box::pin(async move {
                         let tx = client.transaction().await.map_err(|error| {
@@ -993,8 +1076,14 @@ impl PgMetaEngine {
                         })?;
                         let updated = tx
                             .execute(
-                                "UPDATE snapshot_payload_upload_fragments SET expected_byte_length = $4, expected_sha256 = $5, confirmed_at = now(), confirmation_state = 'confirmed', last_error = NULL WHERE vol = $1 AND object_id = $2 AND fragment_index = $3",
-                                &[&volume_id, &object_id, &fragment_index, &expected_byte_length, &digest],
+                                "WITH entries AS (SELECT * FROM unnest($2::BIGINT[], $3::INT[], $4::BIGINT[], $5::BYTEA[]) AS fragment_values(object_id, fragment_index, expected_byte_length, expected_sha256)) UPDATE snapshot_payload_upload_fragments AS fragment SET expected_byte_length = entries.expected_byte_length, expected_sha256 = entries.expected_sha256, confirmed_at = now(), confirmation_state = 'confirmed', last_error = NULL FROM entries WHERE fragment.vol = $1 AND fragment.object_id = entries.object_id AND fragment.fragment_index = entries.fragment_index",
+                                &[
+                                    &volume_id,
+                                    &object_ids,
+                                    &fragment_indices,
+                                    &expected_byte_lengths,
+                                    &expected_sha256,
+                                ],
                             )
                             .await
                             .map_err(|error| {
@@ -1003,38 +1092,22 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                        if updated != 1 {
+                        if updated != expected_row_count {
                             return Err(MetaError::Storage(
                                 "snapshot upload fragment confirmation row is missing".to_owned(),
                             ));
                         }
-                        let pending = tx
-                            .query_one(
-                                "SELECT EXISTS (SELECT 1 FROM snapshot_payload_upload_fragments WHERE vol = $1 AND object_id = $2 AND confirmation_state <> 'confirmed')",
-                                &[&volume_id, &object_id],
+                        tx.execute(
+                            "UPDATE snapshot_payload_upload_objects AS upload_object SET state = 'uploaded' WHERE upload_object.vol = $1 AND upload_object.object_id = ANY($2::BIGINT[]) AND upload_object.state = 'uploading' AND NOT EXISTS (SELECT 1 FROM snapshot_payload_upload_fragments AS fragment WHERE fragment.vol = upload_object.vol AND fragment.object_id = upload_object.object_id AND fragment.confirmation_state <> 'confirmed')",
+                            &[&volume_id, &object_ids],
+                        )
+                        .await
+                        .map_err(|error| {
+                            Self::classify_pg_error(
+                                "postgres snapshot upload object confirmation failed",
+                                error,
                             )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot upload confirmation state query failed",
-                                    error,
-                                )
-                            })?
-                            .get::<_, bool>(0);
-                        if !pending {
-                            tx
-                            .execute(
-                                "UPDATE snapshot_payload_upload_objects SET state = 'uploaded' WHERE vol = $1 AND object_id = $2 AND state = 'uploading'",
-                                &[&volume_id, &object_id],
-                            )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot upload object confirmation failed",
-                                    error,
-                                )
-                            })?;
-                        }
+                        })?;
                         tx.commit().await.map_err(|error| {
                             Self::classify_pg_error(
                                 "postgres snapshot upload confirmation commit failed",
@@ -1248,11 +1321,23 @@ impl UploadedFragmentLedger for PgMetaEngine {
     }
 
     fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
-        self.begin_fragment_upload_sync(entry)
+        self.begin_fragment_uploads(std::slice::from_ref(entry))
+    }
+
+    fn begin_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
+        self.local.record_local_upload_ledger_begin(entries)?;
+        self.signal_poll_wakeup();
+        Ok(())
     }
 
     fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()> {
-        self.confirm_fragment_uploaded_sync(entry)
+        self.confirm_fragment_uploads(std::slice::from_ref(entry))
+    }
+
+    fn confirm_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
+        self.local.record_local_upload_ledger_confirm(entries)?;
+        self.signal_poll_wakeup();
+        Ok(())
     }
 }
 
@@ -1320,5 +1405,86 @@ mod tests {
 
         assert_eq!(count_references(&references)[&7], 2);
         assert_eq!(count_references(&references)[&8], 1);
+    }
+
+    #[test]
+    fn local_upload_ledger_replay_orders_remote_begin_before_confirm() {
+        let dir = studiofs_test_support::workspace_target_tempdir("upload-ledger-replay-");
+        let path = dir.path().join("meta.redb");
+        let engine = RedbMetaEngine::open(&path).expect("open local metadata");
+        let entry = UploadedFragmentLedgerEntry {
+            volume_id: 7,
+            object_id: 42,
+            fragment_index: 0,
+            object_key: "objects/42".to_string(),
+            expected_byte_length: 4,
+            expected_sha256: [0xA5; 32],
+        };
+        engine
+            .record_local_upload_ledger_begin(std::slice::from_ref(&entry))
+            .expect("record local upload begin");
+        engine
+            .record_local_upload_ledger_confirm(std::slice::from_ref(&entry))
+            .expect("record local upload confirmation");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        replay_local_upload_ledger_once(
+            &engine,
+            |entries| {
+                assert_eq!(entries, [entry.clone()]);
+                calls.borrow_mut().push("begin");
+                Ok(())
+            },
+            |entries| {
+                assert_eq!(entries, [entry.clone()]);
+                calls.borrow_mut().push("confirm");
+                Ok(())
+            },
+        )
+        .expect("replay local upload ledger");
+
+        assert_eq!(&*calls.borrow(), &["begin", "confirm"]);
+        assert!(
+            engine
+                .pending_local_upload_ledger(16)
+                .expect("read local upload ledger")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_local_upload_ledger_replay_keeps_pending_confirmation() {
+        let dir = studiofs_test_support::workspace_target_tempdir("upload-ledger-retry-");
+        let path = dir.path().join("meta.redb");
+        let engine = RedbMetaEngine::open(&path).expect("open local metadata");
+        let entry = UploadedFragmentLedgerEntry {
+            volume_id: 7,
+            object_id: 42,
+            fragment_index: 0,
+            object_key: "objects/42".to_string(),
+            expected_byte_length: 4,
+            expected_sha256: [0xA5; 32],
+        };
+        engine
+            .record_local_upload_ledger_begin(std::slice::from_ref(&entry))
+            .expect("record local upload begin");
+        engine
+            .record_local_upload_ledger_confirm(std::slice::from_ref(&entry))
+            .expect("record local upload confirmation");
+
+        let result = replay_local_upload_ledger_once(
+            &engine,
+            |_| Err(MetaError::Storage("remote unavailable".to_string())),
+            |_| panic!("confirmation must wait for a successful begin"),
+        );
+
+        assert!(result.is_err());
+        let pending = engine
+            .pending_local_upload_ledger(16)
+            .expect("read local upload ledger");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].entry, entry);
+        assert!(!pending[0].begin_replicated);
+        assert!(pending[0].confirmed);
     }
 }

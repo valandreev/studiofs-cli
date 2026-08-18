@@ -1345,7 +1345,6 @@ struct UploadState {
     deferred_deleted_local_payloads:
         OrderedMutex<std::collections::HashMap<Ino, std::collections::HashSet<u64>>>,
     pending_epoch_finalizations: OrderedMutex<BTreeSet<(Ino, u64)>>,
-    verified_remote_epoch_finalizations: OrderedMutex<BTreeSet<(Ino, u64)>>,
     pending_epoch_finalizations_notify: tokio::sync::Notify,
     upload_sticky_errors: OrderedMutex<std::collections::HashMap<Ino, String>>,
     upload_completion_batch: tokio::sync::Mutex<UploadCompletionBatch>,
@@ -1578,10 +1577,6 @@ impl UploadState {
                 LockTier::Upload,
             ),
             pending_epoch_finalizations: OrderedMutex::new(BTreeSet::new(), LockTier::Upload),
-            verified_remote_epoch_finalizations: OrderedMutex::new(
-                BTreeSet::new(),
-                LockTier::Upload,
-            ),
             pending_epoch_finalizations_notify: tokio::sync::Notify::new(),
             upload_sticky_errors: OrderedMutex::new(
                 std::collections::HashMap::new(),
@@ -5652,28 +5647,18 @@ impl StudioVfs {
     }
 
     fn queue_epoch_finalization(&self, ino: Ino, content_epoch: u64) {
-        self.queue_epoch_finalization_inner(ino, content_epoch, false);
+        self.queue_epoch_finalization_inner(ino, content_epoch);
     }
 
-    fn queue_epoch_finalization_after_verified_upload(&self, ino: Ino, content_epoch: u64) {
-        self.queue_epoch_finalization_inner(ino, content_epoch, true);
-    }
-
-    fn queue_epoch_finalization_inner(
-        &self,
-        ino: Ino,
-        content_epoch: u64,
-        remote_visibility_confirmed: bool,
-    ) {
+    fn queue_epoch_finalization_inner(&self, ino: Ino, content_epoch: u64) {
         let key = (ino, content_epoch);
-        let (inserted, verified_changed) = {
-            let mut verified = self.state.upload.verified_remote_epoch_finalizations.lock();
-            let mut pending = self.state.upload.pending_epoch_finalizations.lock();
-            let inserted = pending.insert(key);
-            let verified_changed = remote_visibility_confirmed && verified.insert(key);
-            (inserted, verified_changed)
-        };
-        if inserted || verified_changed {
+        let inserted = self
+            .state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .insert(key);
+        if inserted {
             self.state.file_session.note_background_transition(
                 ino,
                 FileSessionOperation::Finalize,
@@ -5688,14 +5673,11 @@ impl StudioVfs {
     }
 
     fn remove_pending_epoch_finalizations_for_inode(&self, ino: Ino) {
-        let mut verified = self.state.upload.verified_remote_epoch_finalizations.lock();
         let mut pending = self.state.upload.pending_epoch_finalizations.lock();
         let before = pending.len();
         pending.retain(|(candidate, _)| *candidate != ino);
         let removed = before.saturating_sub(pending.len());
-        verified.retain(|(candidate, _)| *candidate != ino);
         drop(pending);
-        drop(verified);
         if removed > 0 {
             self.debug_pending_inode_state(ino, "epoch_finalization_cleared");
         }
@@ -5761,13 +5743,10 @@ impl StudioVfs {
         }
     }
 
-    fn pop_epoch_finalization(&self) -> Option<(Ino, u64, bool)> {
-        let mut verified = self.state.upload.verified_remote_epoch_finalizations.lock();
+    fn pop_epoch_finalization(&self) -> Option<(Ino, u64)> {
         let mut pending = self.state.upload.pending_epoch_finalizations.lock();
         let next = pending.pop_first();
-        let verified_remote_visibility = next.map(|key| verified.remove(&key)).unwrap_or(false);
         drop(pending);
-        drop(verified);
         if let Some((ino, _)) = next {
             self.state.file_session.note_background_transition(
                 ino,
@@ -5776,7 +5755,7 @@ impl StudioVfs {
             );
             self.debug_pending_inode_state(ino, "epoch_finalization_dequeued");
         }
-        next.map(|(ino, content_epoch)| (ino, content_epoch, verified_remote_visibility))
+        next
     }
 
     fn record_live_extents(&self, extents: &[(Ino, u32, u64, u64)]) {

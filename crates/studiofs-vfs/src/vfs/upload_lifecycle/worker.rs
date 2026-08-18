@@ -1,6 +1,8 @@
 use super::super::{FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
-use crate::runtime::{TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel};
+use crate::runtime::{
+    MetaExecutor, TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel,
+};
 use crate::utils::now_unix_millis;
 use bytes::Bytes;
 use futures::future::join_all;
@@ -21,7 +23,7 @@ use studiofs_meta::schema::{
     chunk_id_from_offset, chunk_start_offset,
 };
 use studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -138,17 +140,6 @@ struct UploadedObjectReconcile {
 
 const POST_PUT_STALE_RECONCILE_ATTEMPTS: usize = 16;
 const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
-const POST_PUT_VISIBILITY_ATTEMPTS: usize = 8;
-const POST_PUT_VISIBILITY_INITIAL_DELAY_MS: u64 = 25;
-const POST_PUT_VISIBILITY_MAX_DELAY_MS: u64 = 1_000;
-fn post_put_visibility_delay(attempt: usize) -> Duration {
-    let multiplier = 1u64.checked_shl(attempt.min(20) as u32).unwrap_or(u64::MAX);
-    Duration::from_millis(
-        POST_PUT_VISIBILITY_INITIAL_DELAY_MS
-            .saturating_mul(multiplier)
-            .min(POST_PUT_VISIBILITY_MAX_DELAY_MS),
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteVisibility {
@@ -718,29 +709,6 @@ where
                 }
                 UploadPutOutcome::Failed(error) => return Err(error),
             }
-            let post_put_cancel_token = self.shutdown.shutdown_token();
-            match self
-                .wait_for_uploaded_fragments_visible(op, &fragment_keys, &post_put_cancel_token)
-                .await
-            {
-                RemoteVisibility::Visible => {}
-                RemoteVisibility::Cancelled => {
-                    return if self.cancel_upload_if_inode_deleted(op).await? {
-                        Ok(SingleUploadOutcome::CancelledDeleted)
-                    } else {
-                        Ok(SingleUploadOutcome::Shutdown)
-                    };
-                }
-                RemoteVisibility::NotVisible => {
-                    if self.cancel_upload_if_inode_deleted(op).await? {
-                        return Ok(SingleUploadOutcome::CancelledDeleted);
-                    }
-                    return Err(VfsError::Other(format!(
-                        "uploaded object {} fragments were not visible after remote put",
-                        op.object_id
-                    )));
-                }
-            }
         }
 
         if self.cancel_upload_if_inode_deleted(op).await? {
@@ -832,9 +800,11 @@ where
             self.local_payloads.remove(op.object_id).await?;
         }
         self.local_payloads.remove_upload_hot(op.object_id).await?;
-        self.local_payloads
-            .remove_upload_stage(op.object_id)
-            .await?;
+        if !keep_local_object {
+            self.local_payloads
+                .remove_upload_stage(op.object_id)
+                .await?;
+        }
 
         self.coordinator.complete_upload(op);
 
@@ -925,38 +895,6 @@ where
         }
 
         Ok(None)
-    }
-
-    async fn wait_for_uploaded_fragments_visible(
-        &self,
-        op: &PendingUpload,
-        fragment_keys: &[String],
-        upload_cancel_token: &CancellationToken,
-    ) -> RemoteVisibility {
-        for attempt in 0..POST_PUT_VISIBILITY_ATTEMPTS {
-            match self
-                .remote
-                .all_fragments_visible(op, fragment_keys, upload_cancel_token)
-                .await
-            {
-                RemoteVisibility::Visible => return RemoteVisibility::Visible,
-                RemoteVisibility::Cancelled => return RemoteVisibility::Cancelled,
-                RemoteVisibility::NotVisible => {}
-            }
-
-            if attempt + 1 == POST_PUT_VISIBILITY_ATTEMPTS {
-                break;
-            }
-
-            let shutdown_token = self.shutdown.shutdown_token();
-            tokio::select! {
-                _ = shutdown_token.cancelled() => return RemoteVisibility::Cancelled,
-                _ = upload_cancel_token.cancelled() => return RemoteVisibility::Cancelled,
-                _ = tokio::time::sleep(post_put_visibility_delay(attempt)) => {}
-            }
-        }
-
-        RemoteVisibility::NotVisible
     }
 
     async fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> VfsResult<bool> {
@@ -1633,18 +1571,193 @@ impl UploadMetaPort for VfsUploadMetaPort {
     }
 }
 
+// The ledger remains a pre/post-PUT fence, but concurrent object workers share
+// each PG transaction instead of paying one transaction per object.
+const UPLOAD_LEDGER_BATCH_MAX_REQUESTS: usize = 128;
+const UPLOAD_LEDGER_BATCH_DELAY: Duration = Duration::from_millis(1);
+
+struct UploadLedgerBatchRequest {
+    entries: Vec<UploadedFragmentLedgerEntry>,
+    result: oneshot::Sender<Result<(), Arc<VfsError>>>,
+}
+
+#[derive(Default)]
+struct UploadLedgerBatchInner {
+    queue: VecDeque<UploadLedgerBatchRequest>,
+    draining: bool,
+}
+
+struct UploadLedgerBatchQueue {
+    inner: parking_lot::Mutex<UploadLedgerBatchInner>,
+}
+
+#[derive(Clone, Copy)]
+enum UploadLedgerBatchOperation {
+    Begin,
+    Confirm,
+}
+
+fn take_upload_ledger_batch(inner: &mut UploadLedgerBatchInner) -> Vec<UploadLedgerBatchRequest> {
+    let take = UPLOAD_LEDGER_BATCH_MAX_REQUESTS.min(inner.queue.len());
+    inner.queue.drain(..take).collect()
+}
+
+async fn drain_upload_ledger_batch_queue(
+    queue: Arc<UploadLedgerBatchQueue>,
+    meta: MetaExecutor<dyn VfsMeta>,
+    operation: UploadLedgerBatchOperation,
+) {
+    loop {
+        tokio::time::sleep(UPLOAD_LEDGER_BATCH_DELAY).await;
+        let requests = {
+            let mut inner = queue.inner.lock();
+            let requests = take_upload_ledger_batch(&mut inner);
+            if requests.is_empty() {
+                inner.draining = false;
+                return;
+            }
+            requests
+        };
+        let entries = requests
+            .iter()
+            .flat_map(|request| request.entries.iter().cloned())
+            .collect::<Vec<_>>();
+        let result = run_meta(
+            meta.clone(),
+            move |engine: Arc<dyn VfsMeta>| match operation {
+                UploadLedgerBatchOperation::Begin => engine.begin_fragment_uploads(&entries),
+                UploadLedgerBatchOperation::Confirm => engine.confirm_fragment_uploads(&entries),
+            },
+        )
+        .await
+        .map_err(Arc::new);
+        for request in requests {
+            let _ = request.result.send(result.clone());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct UploadLedgerBatcher {
+    begin: Arc<UploadLedgerBatchQueue>,
+    confirm: Arc<UploadLedgerBatchQueue>,
+}
+
+impl UploadLedgerBatcher {
+    fn new() -> Self {
+        Self {
+            begin: Arc::new(UploadLedgerBatchQueue {
+                inner: parking_lot::Mutex::new(UploadLedgerBatchInner::default()),
+            }),
+            confirm: Arc::new(UploadLedgerBatchQueue {
+                inner: parking_lot::Mutex::new(UploadLedgerBatchInner::default()),
+            }),
+        }
+    }
+
+    async fn submit(
+        queue: &Arc<UploadLedgerBatchQueue>,
+        meta: MetaExecutor<dyn VfsMeta>,
+        entries: Vec<UploadedFragmentLedgerEntry>,
+        operation: UploadLedgerBatchOperation,
+        operation_name: &'static str,
+    ) -> VfsResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (result_sender, result_receiver) = oneshot::channel();
+        let should_spawn = {
+            let mut inner = queue.inner.lock();
+            inner.queue.push_back(UploadLedgerBatchRequest {
+                entries,
+                result: result_sender,
+            });
+            if inner.draining {
+                false
+            } else {
+                inner.draining = true;
+                true
+            }
+        };
+        if should_spawn {
+            let queue = Arc::clone(queue);
+            tokio::spawn(drain_upload_ledger_batch_queue(queue, meta, operation));
+        }
+        match result_receiver.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(clone_upload_ledger_error(&error)),
+            Err(_) => Err(VfsError::Other(format!(
+                "upload ledger {operation_name} batcher stopped"
+            ))),
+        }
+    }
+
+    async fn begin(
+        &self,
+        meta: MetaExecutor<dyn VfsMeta>,
+        entries: Vec<UploadedFragmentLedgerEntry>,
+    ) -> VfsResult<()> {
+        Self::submit(
+            &self.begin,
+            meta,
+            entries,
+            UploadLedgerBatchOperation::Begin,
+            "begin",
+        )
+        .await
+    }
+
+    async fn confirm(
+        &self,
+        meta: MetaExecutor<dyn VfsMeta>,
+        entries: Vec<UploadedFragmentLedgerEntry>,
+    ) -> VfsResult<()> {
+        Self::submit(
+            &self.confirm,
+            meta,
+            entries,
+            UploadLedgerBatchOperation::Confirm,
+            "confirm",
+        )
+        .await
+    }
+}
+
+fn clone_upload_ledger_error(error: &VfsError) -> VfsError {
+    match error {
+        VfsError::Meta(error) => VfsError::Meta(error.clone()),
+        _ => VfsError::Other(error.to_string()),
+    }
+}
+
 #[derive(Clone)]
 struct VfsRemoteUploadPort {
     vfs: Arc<StudioVfs>,
+    ledger_batcher: UploadLedgerBatcher,
+    ledger_volume_id: Arc<AsyncMutex<Option<studiofs_meta::snapshot::VolumeId>>>,
+}
+
+struct BuiltFragment {
+    payload: Buffer,
+    expected_byte_length: u64,
+    expected_sha256: [u8; 32],
 }
 
 impl VfsRemoteUploadPort {
-    fn build_fragments(
-        raw_payload: Bytes,
-        volume_id: studiofs_meta::snapshot::VolumeId,
-        object_id: u64,
-        fragment_keys: &[String],
-    ) -> VfsResult<Vec<(Buffer, UploadedFragmentLedgerEntry)>> {
+    async fn ledger_volume_id(&self) -> VfsResult<studiofs_meta::snapshot::VolumeId> {
+        let mut cached = self.ledger_volume_id.lock().await;
+        if let Some(volume_id) = *cached {
+            return Ok(volume_id);
+        }
+        let volume_id = run_meta(self.vfs.meta.clone(), |engine: Arc<dyn VfsMeta>| {
+            engine.fragment_ledger_volume_id()
+        })
+        .await?;
+        *cached = Some(volume_id);
+        Ok(volume_id)
+    }
+
+    fn build_fragments(raw_payload: Bytes) -> VfsResult<Vec<BuiltFragment>> {
         let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
         for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
             let start = fragment_index * CLOUD_FRAGMENT_SIZE;
@@ -1656,21 +1769,11 @@ impl VfsRemoteUploadPort {
             };
             let payload = create_object_buffer(fragment_payload)?;
             let expected_bytes = payload.clone().to_bytes();
-            let expected_sha256 = Sha256::digest(&expected_bytes).into();
-            let Some(object_key) = fragment_keys.get(fragment_index).cloned() else {
-                continue;
-            };
-            fragments.push((
+            fragments.push(BuiltFragment {
                 payload,
-                UploadedFragmentLedgerEntry {
-                    volume_id,
-                    object_id,
-                    fragment_index: fragment_index as u32,
-                    object_key,
-                    expected_byte_length: expected_bytes.len() as u64,
-                    expected_sha256,
-                },
-            ));
+                expected_byte_length: expected_bytes.len() as u64,
+                expected_sha256: Sha256::digest(&expected_bytes).into(),
+            });
         }
         Ok(fragments)
     }
@@ -1765,122 +1868,79 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         else {
             return UploadPutOutcome::Cancelled;
         };
-        let meta = self.vfs.meta.clone();
-        let volume_id = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.fragment_ledger_volume_id()
-        })
-        .await
-        {
+        let volume_id = match self.ledger_volume_id().await {
             Ok(volume_id) => volume_id,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let fragment_keys = fragment_keys.to_vec();
         let object_id = op.object_id;
-        let object_bytes = match run_blocking(move || {
-            Self::build_fragments(raw_payload, volume_id, object_id, &fragment_keys)
-        })
-        .await
-        {
+        let built_fragments = match run_blocking(move || Self::build_fragments(raw_payload)).await {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let uploads =
-            object_bytes
-                .into_iter()
-                .enumerate()
-                .map(|(fragment_index, (payload, entry))| {
-                    let cancel_token = cancel_token.clone();
-                    async move {
-                        let key = entry.object_key.clone();
-                        if cancel_token.is_cancelled() {
-                            return Err((fragment_index, key, None));
-                        }
-                        let begin_entry = entry.clone();
-                        if let Err(error) =
-                            run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                                engine.begin_fragment_upload(&begin_entry)
-                            })
-                            .await
-                        {
-                            return Err((fragment_index, key, Some(error.to_string())));
-                        }
-                        if let Err(error) = self
-                            .vfs
-                            .upload_scheduler
-                            .put(&key, payload, &cancel_token)
-                            .await
-                        {
-                            return match error {
-                                crate::upload::UploadError::Cancelled => {
-                                    Err((fragment_index, key, None))
-                                }
-                                error => Err((
-                                    fragment_index,
-                                    key,
-                                    Some(format!("fragment upload failed: {error}")),
-                                )),
-                            };
-                        }
-                        let proof = run_with_timeout_or_cancel(
-                            &cancel_token,
-                            crate::vfs::REMOTE_OBJECT_IO_TIMEOUT,
-                            self.vfs.fetch_scheduler.data_store().get_by_key(&key),
-                        )
-                        .await;
-                        match proof {
-                            TimeoutOrCancel::Cancelled => {
-                                return Err((fragment_index, key, None));
-                            }
-                            TimeoutOrCancel::TimedOut => {
-                                return Err((
-                                    fragment_index,
-                                    key,
-                                    Some("fragment upload proof timed out".to_string()),
-                                ));
-                            }
-                            TimeoutOrCancel::Completed(Err(_)) => {
-                                return Err((
-                                    fragment_index,
-                                    key,
-                                    Some("fragment upload proof read failed".to_string()),
-                                ));
-                            }
-                            TimeoutOrCancel::Completed(Ok(remote_payload)) => {
-                                let remote_bytes = remote_payload.to_bytes();
-                                let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
-                                if remote_bytes.len() as u64 != entry.expected_byte_length
-                                    || remote_sha256 != entry.expected_sha256
-                                {
-                                    return Err((
-                                        fragment_index,
-                                        key,
-                                        Some(
-                                            "fragment upload proof did not match expected bytes"
-                                                .to_string(),
-                                        ),
-                                    ));
-                                }
-                            }
-                        }
-                        let confirm_entry = entry.clone();
-                        if let Err(error) =
-                            run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                                engine.confirm_fragment_uploaded(&confirm_entry)
-                            })
-                            .await
-                        {
-                            return Err((fragment_index, key, Some(error.to_string())));
-                        }
-                        Ok((fragment_index, key))
+        if cancel_token.is_cancelled() {
+            return UploadPutOutcome::Cancelled;
+        }
+        let mut fragment_uploads = Vec::with_capacity(fragment_keys.len());
+        let mut ledger_entries = Vec::with_capacity(fragment_keys.len());
+        for (fragment_index, (key, fragment)) in
+            fragment_keys.iter().zip(built_fragments).enumerate()
+        {
+            let entry = UploadedFragmentLedgerEntry {
+                volume_id,
+                object_id,
+                fragment_index: fragment_index as u32,
+                object_key: key.clone(),
+                expected_byte_length: fragment.expected_byte_length,
+                expected_sha256: fragment.expected_sha256,
+            };
+            ledger_entries.push(entry.clone());
+            fragment_uploads.push((key.clone(), fragment.payload, entry));
+        }
+        if let Err(error) = self
+            .ledger_batcher
+            .begin(self.vfs.meta.clone(), ledger_entries)
+            .await
+        {
+            return UploadPutOutcome::Failed(error);
+        }
+        let uploads = fragment_uploads.into_iter().enumerate().map(
+            |(fragment_index, (key, payload, entry))| {
+                let cancel_token = cancel_token.clone();
+                async move {
+                    let err_key = key.clone();
+                    if cancel_token.is_cancelled() {
+                        return Err((fragment_index, err_key, None));
                     }
-                });
+                    if let Err(error) = self
+                        .vfs
+                        .upload_scheduler
+                        .put(&key, payload, &cancel_token)
+                        .await
+                    {
+                        return match error {
+                            crate::upload::UploadError::Cancelled => {
+                                Err((fragment_index, err_key, None))
+                            }
+                            error => Err((
+                                fragment_index,
+                                err_key,
+                                Some(format!("fragment upload failed: {error}")),
+                            )),
+                        };
+                    }
+                    Ok((fragment_index, entry))
+                }
+            },
+        );
         let done = join_all(uploads).await;
 
         let mut first_error = None;
         let mut saw_cancel = false;
+        let mut confirmed_entries = Vec::new();
         for result in done {
             match result {
-                Ok((fragment_index, key)) => {
+                Ok((fragment_index, entry)) => {
+                    let key = entry.object_key.clone();
                     debug!(
                         ino = op.ino,
                         object_id = op.object_id,
@@ -1889,6 +1949,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                         key,
                         "process_upload fragment put completed"
                     );
+                    confirmed_entries.push(entry);
                 }
                 Err((_, _, None)) => {
                     saw_cancel = true;
@@ -1900,12 +1961,25 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                 }
             }
         }
+        let confirmation_error = if confirmed_entries.is_empty() {
+            None
+        } else {
+            self.ledger_batcher
+                .confirm(self.vfs.meta.clone(), confirmed_entries)
+                .await
+                .err()
+        };
         if saw_cancel {
             return UploadPutOutcome::Cancelled;
         }
         if let Some((fragment_index, key, error)) = first_error {
             return UploadPutOutcome::Failed(VfsError::Other(format!(
                 "fragment upload failed (idx={fragment_index}, key={key}): {error}"
+            )));
+        }
+        if let Some(error) = confirmation_error {
+            return UploadPutOutcome::Failed(VfsError::Other(format!(
+                "fragment upload ledger confirmation failed: {error}"
             )));
         }
         UploadPutOutcome::Uploaded
@@ -2055,15 +2129,13 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
             return;
         }
         if self.vfs.inode_has_pending_uploads(ino) {
-            // Keep a non-verified ticket alive while sibling uploads are pending. The
-            // finalizer may have consumed the previous ticket before returning
-            // WaitingForUploads; the last upload completion will mark this same ticket
-            // as remote-visibility verified.
+            // Keep the ticket alive while sibling uploads are pending. The finalizer
+            // may have consumed the previous ticket before returning WaitingForUploads;
+            // the last upload completion must retain the remote-visibility fence.
             self.vfs.queue_epoch_finalization(ino, content_epoch);
             return;
         }
-        self.vfs
-            .queue_epoch_finalization_after_verified_upload(ino, content_epoch);
+        self.vfs.queue_epoch_finalization(ino, content_epoch);
     }
 }
 
@@ -2099,11 +2171,16 @@ impl Drop for ActiveUploadWorkerGuard<'_> {
 
 impl UploadLifecycleWorker {
     pub(crate) fn new(vfs: Arc<StudioVfs>) -> Self {
+        let ledger_batcher = UploadLedgerBatcher::new();
         let processor = UploadProcessor {
             coordinator: VfsCachedStorePort { vfs: vfs.clone() },
             local_payloads: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
             meta: VfsUploadMetaPort { vfs: vfs.clone() },
-            remote: VfsRemoteUploadPort { vfs: vfs.clone() },
+            remote: VfsRemoteUploadPort {
+                vfs: vfs.clone(),
+                ledger_batcher,
+                ledger_volume_id: Arc::new(AsyncMutex::new(None)),
+            },
             shutdown: VfsUploadShutdownPort { vfs: vfs.clone() },
             policy: VfsUploadPolicyPort { vfs: vfs.clone() },
             block_size: vfs.block_size,
@@ -2416,6 +2493,7 @@ mod tests {
     use studiofs_meta::{MetaEngine, MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
+    use tokio::sync::oneshot;
 
     type FakePendingInodes = Arc<Mutex<HashSet<Ino>>>;
     type FakeProcessor = UploadProcessor<
@@ -2438,32 +2516,54 @@ mod tests {
     }
 
     #[test]
-    fn post_put_visibility_delay_uses_bounded_exponential_backoff() {
-        assert_eq!(post_put_visibility_delay(0), Duration::from_millis(25));
-        assert_eq!(post_put_visibility_delay(1), Duration::from_millis(50));
-        assert_eq!(post_put_visibility_delay(2), Duration::from_millis(100));
-        assert_eq!(post_put_visibility_delay(6), Duration::from_millis(1_000));
-        assert_eq!(post_put_visibility_delay(32), Duration::from_millis(1_000));
+    fn upload_ledger_batches_entries_from_multiple_objects() {
+        let mut inner = UploadLedgerBatchInner::default();
+        let (first_result, _first_result_receiver) = oneshot::channel();
+        let (second_result, _second_result_receiver) = oneshot::channel();
+        inner.queue.push_back(UploadLedgerBatchRequest {
+            entries: vec![UploadedFragmentLedgerEntry {
+                volume_id: 7,
+                object_id: 11,
+                fragment_index: 0,
+                object_key: "objects/11".to_owned(),
+                expected_byte_length: 1,
+                expected_sha256: [0; 32],
+            }],
+            result: first_result,
+        });
+        inner.queue.push_back(UploadLedgerBatchRequest {
+            entries: vec![UploadedFragmentLedgerEntry {
+                volume_id: 7,
+                object_id: 12,
+                fragment_index: 0,
+                object_key: "objects/12".to_owned(),
+                expected_byte_length: 1,
+                expected_sha256: [0; 32],
+            }],
+            result: second_result,
+        });
+
+        let requests = take_upload_ledger_batch(&mut inner);
+        let object_ids = requests
+            .into_iter()
+            .flat_map(|request| request.entries)
+            .map(|entry| entry.object_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(object_ids, vec![11, 12]);
     }
 
     #[test]
-    fn built_fragment_proofs_match_encoded_remote_bytes() {
-        let keys = format_object_fragment_keys("data", 42);
-        let fragments = VfsRemoteUploadPort::build_fragments(
-            Bytes::from_static(b"fragment-proof"),
-            7,
-            42,
-            &keys,
-        )
-        .expect("build upload fragments");
+    fn built_fragments_need_no_shared_metadata() {
+        let fragments = VfsRemoteUploadPort::build_fragments(Bytes::from_static(b"local-upload"))
+            .expect("build upload fragments");
 
         assert_eq!(fragments.len(), CLOUD_FRAGMENT_COUNT);
-        for (buffer, entry) in fragments {
-            let bytes = buffer.to_bytes();
-            let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            assert_eq!(bytes.len() as u64, entry.expected_byte_length);
-            assert_eq!(digest, entry.expected_sha256);
-        }
+        let bytes = fragments[0].payload.to_bytes();
+        assert!(!bytes.is_empty());
+        assert_eq!(fragments[0].expected_byte_length, bytes.len() as u64);
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(fragments[0].expected_sha256, digest);
     }
 
     #[test]
@@ -2787,6 +2887,7 @@ mod tests {
         trace: FakeUploadTrace,
         adaptive_penalty_ms: u64,
         visibility: Arc<Mutex<RemoteVisibility>>,
+        visibility_checks: Arc<AtomicUsize>,
         visibility_after_upload: Arc<Mutex<Option<RemoteVisibility>>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
@@ -2802,6 +2903,7 @@ mod tests {
                 trace: FakeUploadTrace::default(),
                 adaptive_penalty_ms: 0,
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
+                visibility_checks: Arc::new(AtomicUsize::new(0)),
                 visibility_after_upload: Arc::new(Mutex::new(Some(RemoteVisibility::Visible))),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
@@ -2832,6 +2934,7 @@ mod tests {
             _fragment_keys: &[String],
             _cancel_token: &CancellationToken,
         ) -> RemoteVisibility {
+            self.visibility_checks.fetch_add(1, Ordering::Relaxed);
             let visibility = *self.visibility.lock();
             if matches!(visibility, RemoteVisibility::Visible)
                 && let Some((meta, ino, object_id)) =
@@ -3519,8 +3622,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_upload_requeues_when_uploaded_fragments_are_not_visible() {
-        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+    async fn process_upload_does_not_gate_completion_on_post_put_visibility() {
+        let (processor, coordinator, _local_payloads, meta, remote, _shutdown, _policy) =
             processor_fixture();
         let op = make_pending_upload();
         coordinator.pending_inodes.lock().insert(op.ino);
@@ -3534,21 +3637,8 @@ mod tests {
 
         let outcome = processor.process_upload(op.clone()).await;
 
-        assert_eq!(outcome, UploadOutcome::Requeued);
-        assert!(
-            meta.uploaded_overlay_objects.lock().is_empty(),
-            "metadata must not reference a remote payload before all fragments are visible"
-        );
-        assert!(coordinator.completed.lock().is_empty());
-        assert_eq!(coordinator.requeued.lock().len(), 1);
-        assert_eq!(coordinator.requeued.lock()[0].object_id, op.object_id);
-        assert_eq!(local_payloads.failed.lock().as_slice(), &[op.object_id]);
-        assert!(local_payloads.uploaded.lock().is_empty());
-        assert!(local_payloads.removed.lock().is_empty());
-        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
-        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
-        assert_eq!(policy.sticky_errors.lock().len(), 1);
-        assert!(policy.finalized_upload_epochs.lock().is_empty());
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(remote.visibility_checks.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3934,7 +4024,10 @@ mod tests {
         );
         assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
-        assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
+        assert!(
+            local_payloads.upload_stage_removed.lock().is_empty(),
+            "publish-ready upload stage must remain until epoch publication"
+        );
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
         assert_eq!(
             remote.trace.events.lock().as_slice(),
@@ -4008,7 +4101,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_upload_attempts_epoch_finalization_after_upload_completion() {
-        let (processor, _coordinator, _local_payloads, meta, _remote, _shutdown, policy) =
+        let (processor, _coordinator, local_payloads, meta, _remote, _shutdown, policy) =
             processor_fixture();
         let op = make_pending_upload();
         meta.attrs
@@ -4025,6 +4118,13 @@ mod tests {
             *policy.finalized_upload_epochs.lock(),
             vec![(op.ino, op.content_epoch)],
             "completed uploads must immediately drive epoch finalization so crash-replayed data becomes peer-visible"
+        );
+        assert!(
+            !local_payloads
+                .upload_stage_removed
+                .lock()
+                .contains(&op.object_id),
+            "uploaded unpublished payloads must retain their local stage until publication"
         );
     }
 
@@ -4095,15 +4195,6 @@ mod tests {
                 .contains(&(ino, content_epoch)),
             "a completion while another upload is pending must keep an unverified finalization queued"
         );
-        assert!(
-            !vfs.state
-                .upload
-                .verified_remote_epoch_finalizations
-                .lock()
-                .contains(&(ino, content_epoch)),
-            "finalization must not skip the remote-visibility check while another upload is pending"
-        );
-
         vfs.cached_store().complete_upload(&second);
         rt.block_on(policy.finalize_completed_upload_epoch(ino, content_epoch));
         assert_eq!(
@@ -4116,14 +4207,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(ino, content_epoch)],
             "the final pending upload should enqueue epoch finalization"
-        );
-        assert!(
-            vfs.state
-                .upload
-                .verified_remote_epoch_finalizations
-                .lock()
-                .contains(&(ino, content_epoch)),
-            "the last upload completion should mark the queued finalization as remotely verified"
         );
     }
 
@@ -4193,7 +4276,10 @@ mod tests {
         assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
-        assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
+        assert!(
+            local_payloads.upload_stage_removed.lock().is_empty(),
+            "fragmented publish-ready upload stage must remain until epoch publication"
+        );
         assert!(
             local_payloads.removed.lock().is_empty(),
             "current fragmented overlay object should stay in the local backend"

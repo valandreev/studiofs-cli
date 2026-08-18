@@ -198,8 +198,12 @@ pub enum UploadedObjectDeletionOutcome {
     Retryable,
 }
 
-/// PostgreSQL operations needed by an upload worker to leave durable proof
-/// before and after each remote fragment PUT.
+/// Durable upload-ledger operations used by an upload worker.
+///
+/// PostgreSQL-backed implementations persist these rows locally before the
+/// remote PUT and replicate them asynchronously. Exact remote-byte validation
+/// remains in janitor reconciliation, so the upload hot path does not read a
+/// fragment back or wait for PostgreSQL.
 pub trait UploadedFragmentLedger: Send + Sync {
     /// Returns the metadata volume identity used by the ledger.
     fn fragment_ledger_volume_id(&self) -> MetaResult<VolumeId>;
@@ -234,11 +238,38 @@ pub trait UploadedFragmentLedger: Send + Sync {
         outcome: UploadedObjectDeletionOutcome,
     ) -> MetaResult<()>;
 
-    /// Records an upload attempt before remote I/O.
+    /// Durably records an upload attempt locally before remote I/O.
     fn begin_fragment_upload(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
 
-    /// Records remote stat/read/hash confirmation after remote I/O.
+    /// Durably records a batch of upload attempts locally before remote I/O.
+    ///
+    /// Implementations may override this to persist the whole local ledger in
+    /// one transaction. The default keeps smaller metadata engines compatible
+    /// with the single-entry port.
+    fn begin_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
+        for entry in entries {
+            self.begin_fragment_upload(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Durably records a successful remote PUT locally. The asynchronous
+    /// replication worker publishes the expected bytes to PostgreSQL, while
+    /// janitor reconciliation performs the remote stat/read/hash proof when it
+    /// needs to recover an incomplete upload.
     fn confirm_fragment_uploaded(&self, entry: &UploadedFragmentLedgerEntry) -> MetaResult<()>;
+
+    /// Durably records successful remote PUTs locally in one batch.
+    ///
+    /// Implementations may override this to persist the whole local ledger in
+    /// one transaction. The default keeps smaller metadata engines compatible
+    /// with the single-entry port.
+    fn confirm_fragment_uploads(&self, entries: &[UploadedFragmentLedgerEntry]) -> MetaResult<()> {
+        for entry in entries {
+            self.confirm_fragment_uploaded(entry)?;
+        }
+        Ok(())
+    }
 }
 
 /// Stable identity of one materializer worker.

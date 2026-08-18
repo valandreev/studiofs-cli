@@ -7095,41 +7095,6 @@ fn stale_ready_attr_refresh_keeps_uploaded_overlay_finalization_queued() {
 }
 
 #[test]
-fn verified_epoch_finalization_upgrade_wakes_existing_ticket() {
-    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "verified-finalization-wakeup");
-    let _guard = rt.enter();
-
-    rt.block_on(async {
-        let ino = vfs
-            .create(1, b"verified-finalization-wakeup.bin", 0, 0, 0o644)
-            .expect("create test file")
-            .ino;
-        let content_epoch = 1;
-
-        let first_notification = vfs
-            .state
-            .upload
-            .pending_epoch_finalizations_notify
-            .notified();
-        vfs.queue_epoch_finalization(ino, content_epoch);
-        tokio::time::timeout(Duration::from_secs(1), first_notification)
-            .await
-            .expect("initial finalization ticket should wake the worker");
-
-        let verified_notification = vfs
-            .state
-            .upload
-            .pending_epoch_finalizations_notify
-            .notified();
-        vfs.queue_epoch_finalization_after_verified_upload(ino, content_epoch);
-        tokio::time::timeout(Duration::from_secs(1), verified_notification)
-            .await
-            .expect("remote-visible completion should wake an existing ticket");
-    });
-}
-
-#[test]
 fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-requeues-retained");
@@ -12168,6 +12133,51 @@ fn retained_inode_payload_evict_does_not_mark_inode_deleted() {
             vfs.local_payload_backend().contains(object_id),
             "retained-inode payload eviction must not remove bytes while upload is still pending"
         );
+    });
+}
+
+#[test]
+fn metadata_eviction_keeps_completed_overlay_payload_until_publication() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "completed-overlay-payload-evict");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"completed-overlay-payload-evict.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x7A; vfs.block_size as usize];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let (content_epoch, object_ids) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "setup must model a completed PUT before publication"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(attr.ino)
+                .iter()
+                .any(|(_, object_id, epoch)| object_ids.contains(object_id)
+                    && *epoch == content_epoch),
+            "setup must retain the local live extent until publication"
+        );
+        vfs.queue_epoch_finalization(attr.ino, content_epoch);
+
+        vfs.evict_payload_objects_from_caches(attr.ino, &object_ids)
+            .await;
+
+        for object_id in object_ids {
+            assert!(
+                vfs.cached_store().has_staged_upload(object_id),
+                "completed unpublished overlay payload must retain its upload-stage fallback"
+            );
+            assert!(
+                vfs.local_payload_backend().contains(object_id),
+                "completed unpublished overlay payload must retain its local bytes"
+            );
+        }
     });
 }
 

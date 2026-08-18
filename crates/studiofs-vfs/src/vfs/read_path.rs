@@ -458,7 +458,7 @@ impl<'a> DataReader<'a> {
                 if matches!(
                     &source,
                     PendingOverlayBlockSource::Extent(object_id)
-                        if !vfs.local_payload_backend.contains(*object_id)
+                        if !Self::has_local_payload_for_read(vfs, *object_id)
                 ) {
                     continue;
                 }
@@ -4037,6 +4037,21 @@ mod tests {
             vfs.payload_store_put_async(pending_object_id, Bytes::from_static(b"pending"), false)
                 .await
                 .expect("seed pending payload object");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[pending_object_id])
+                .expect("link pending payload into upload stage");
+            vfs.payload_store_remove_async(pending_object_id)
+                .await
+                .expect("evict primary pending payload");
+            assert!(
+                vfs.cached_store().has_staged_upload(pending_object_id),
+                "test setup must retain the upload-stage copy"
+            );
+            assert!(
+                !vfs.local_payload_backend().contains(pending_object_id),
+                "test setup must remove only the primary local payload"
+            );
+
             vfs.payload_store_put_async(newer_object_id, Bytes::from_static(b"newer!!"), false)
                 .await
                 .expect("seed newer payload object");

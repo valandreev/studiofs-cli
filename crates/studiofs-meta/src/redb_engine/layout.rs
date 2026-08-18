@@ -113,6 +113,10 @@ pub(super) const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
 pub(super) const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
 
+/// Local durable upload ledger: (volume, object, fragment) -> replication state.
+pub(super) const LOCAL_UPLOAD_LEDGER_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("local_upload_ledger");
+
 pub(super) const REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING: &str =
     "remote_namespace_visibility_filter";
 pub(super) const DENTRY_BY_INODE_INDEX_VERSION_SETTING: &str = "dentry_by_inode_index_version";

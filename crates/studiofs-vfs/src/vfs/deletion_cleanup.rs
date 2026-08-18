@@ -383,10 +383,20 @@ impl StudioVfs {
             .into_iter()
             .map(|op| op.object_id)
             .collect::<std::collections::HashSet<_>>();
+        // A completed upload remains read-owned by its live extent until publication;
+        // the finalizer may already be running and no longer be in the pending queue.
+        let live_extent_object_ids = self
+            .live_extent_records_for_inode(ino)
+            .into_iter()
+            .map(|(_, object_id, _)| object_id)
+            .collect::<std::collections::HashSet<_>>();
         let object_ids = object_ids
             .iter()
             .copied()
-            .filter(|object_id| !pending_upload_object_ids.contains(object_id))
+            .filter(|object_id| {
+                !pending_upload_object_ids.contains(object_id)
+                    && !live_extent_object_ids.contains(object_id)
+            })
             .collect::<Vec<_>>();
         if object_ids.is_empty() {
             return;

@@ -4,7 +4,9 @@ use crate::pg_engine::snapshot_reachability::apply_object_lifetime_changes;
 use crate::schema::{
     ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
 };
-use crate::snapshot_ports::{UploadedFragmentLedger, UploadedFragmentReconciliationOutcome};
+use crate::snapshot_ports::{
+    UploadedFragmentLedger, UploadedFragmentLedgerEntry, UploadedFragmentReconciliationOutcome,
+};
 use chrono::Utc;
 use std::collections::HashSet;
 
@@ -457,4 +459,98 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
         .claim_uploaded_fragment_reconciliation("test-janitor")
         .expect("respect active reconciliation leases after cursor wrap");
     assert!(no_claim_after_cursor_wrap.is_empty());
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-upload-batch");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open postgres engine");
+
+    let entries = (0..3)
+        .map(|fragment_index| UploadedFragmentLedgerEntry {
+            volume_id: volume.volume_id,
+            object_id: 41,
+            fragment_index,
+            object_key: format!("objects/41/{fragment_index}"),
+            expected_byte_length: 4 + u64::from(fragment_index),
+            expected_sha256: [fragment_index as u8; 32],
+        })
+        .collect::<Vec<_>>();
+
+    engine
+        .begin_fragment_uploads(&entries)
+        .expect("begin upload fragment batch");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let object_state = client
+            .query_one(
+                "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = 41",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("read upload object state")
+            .get::<_, String>(0);
+        assert_eq!(object_state, "uploading");
+        let fragment_count = client
+            .query_one(
+                "SELECT count(*)::BIGINT FROM snapshot_payload_upload_fragments WHERE vol = $1 AND object_id = 41 AND confirmation_state = 'pending'",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("read pending upload fragments")
+            .get::<_, i64>(0);
+        assert_eq!(fragment_count, 3);
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("verify upload fragment batch rows");
+
+    engine
+        .confirm_fragment_uploads(&entries)
+        .expect("confirm upload fragment batch");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let object_state = client
+            .query_one(
+                "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = 41",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("read confirmed upload object state")
+            .get::<_, String>(0);
+        assert_eq!(object_state, "uploaded");
+        let confirmed_count = client
+            .query_one(
+                "SELECT count(*)::BIGINT FROM snapshot_payload_upload_fragments WHERE vol = $1 AND object_id = 41 AND confirmation_state = 'confirmed'",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("read confirmed upload fragments")
+            .get::<_, i64>(0);
+        assert_eq!(confirmed_count, 3);
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("verify confirmed upload fragment batch rows");
 }
