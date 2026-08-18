@@ -153,7 +153,7 @@ impl CommitCoordinator {
         ino: Ino,
         content_epoch: u64,
     ) -> VfsResult<EpochFinalizeStatus> {
-        Self::finalize_inode_epoch_inner(vfs, ino, content_epoch, None, false).await
+        Self::finalize_inode_epoch_inner(vfs, ino, content_epoch, None).await
     }
 
     pub(super) async fn finalize_inode_epoch_with_publisher(
@@ -161,16 +161,8 @@ impl CommitCoordinator {
         ino: studiofs_meta::Ino,
         content_epoch: u64,
         publisher: Arc<EpochPublicationBatcher>,
-        remote_visibility_confirmed: bool,
     ) -> VfsResult<EpochFinalizeStatus> {
-        Self::finalize_inode_epoch_inner(
-            vfs,
-            ino,
-            content_epoch,
-            Some(publisher),
-            remote_visibility_confirmed,
-        )
-        .await
+        Self::finalize_inode_epoch_inner(vfs, ino, content_epoch, Some(publisher)).await
     }
 
     async fn finalize_inode_epoch_inner(
@@ -178,7 +170,6 @@ impl CommitCoordinator {
         ino: studiofs_meta::Ino,
         content_epoch: u64,
         publisher: Option<Arc<EpochPublicationBatcher>>,
-        remote_visibility_confirmed: bool,
     ) -> VfsResult<EpochFinalizeStatus> {
         let _commit_qos = vfs
             .qos
@@ -262,9 +253,7 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        if !remote_visibility_confirmed
-            && let Err(err) = Self::wait_until_remote_objects_visible(vfs, &meta.object_ids).await
-        {
+        if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &meta.object_ids).await {
             tracing::debug!(
                 ino,
                 content_epoch,
@@ -381,6 +370,14 @@ impl CommitCoordinator {
                 return Ok(EpochFinalizeStatus::Skipped);
             }
             return Ok(EpochFinalizeStatus::Deferred);
+        }
+        if let Err(error) = vfs.upload_stage_remove_batch_async(&meta.object_ids).await {
+            tracing::warn!(
+                ino,
+                content_epoch,
+                error = %error,
+                "published overlay cleanup could not remove local upload stages"
+            );
         }
 
         let had_live_extents_for_epoch = vfs

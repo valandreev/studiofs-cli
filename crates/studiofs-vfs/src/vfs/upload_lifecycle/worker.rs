@@ -800,9 +800,11 @@ where
             self.local_payloads.remove(op.object_id).await?;
         }
         self.local_payloads.remove_upload_hot(op.object_id).await?;
-        self.local_payloads
-            .remove_upload_stage(op.object_id)
-            .await?;
+        if !keep_local_object {
+            self.local_payloads
+                .remove_upload_stage(op.object_id)
+                .await?;
+        }
 
         self.coordinator.complete_upload(op);
 
@@ -2127,15 +2129,13 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
             return;
         }
         if self.vfs.inode_has_pending_uploads(ino) {
-            // Keep a non-verified ticket alive while sibling uploads are pending. The
-            // finalizer may have consumed the previous ticket before returning
-            // WaitingForUploads; the last upload completion will mark this same ticket
-            // as remote-visibility verified.
+            // Keep the ticket alive while sibling uploads are pending. The finalizer
+            // may have consumed the previous ticket before returning WaitingForUploads;
+            // the last upload completion must retain the remote-visibility fence.
             self.vfs.queue_epoch_finalization(ino, content_epoch);
             return;
         }
-        self.vfs
-            .queue_epoch_finalization_after_verified_upload(ino, content_epoch);
+        self.vfs.queue_epoch_finalization(ino, content_epoch);
     }
 }
 
@@ -4024,7 +4024,10 @@ mod tests {
         );
         assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
-        assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
+        assert!(
+            local_payloads.upload_stage_removed.lock().is_empty(),
+            "publish-ready upload stage must remain until epoch publication"
+        );
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
         assert_eq!(
             remote.trace.events.lock().as_slice(),
@@ -4098,7 +4101,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_upload_attempts_epoch_finalization_after_upload_completion() {
-        let (processor, _coordinator, _local_payloads, meta, _remote, _shutdown, policy) =
+        let (processor, _coordinator, local_payloads, meta, _remote, _shutdown, policy) =
             processor_fixture();
         let op = make_pending_upload();
         meta.attrs
@@ -4115,6 +4118,13 @@ mod tests {
             *policy.finalized_upload_epochs.lock(),
             vec![(op.ino, op.content_epoch)],
             "completed uploads must immediately drive epoch finalization so crash-replayed data becomes peer-visible"
+        );
+        assert!(
+            !local_payloads
+                .upload_stage_removed
+                .lock()
+                .contains(&op.object_id),
+            "uploaded unpublished payloads must retain their local stage until publication"
         );
     }
 
@@ -4185,15 +4195,6 @@ mod tests {
                 .contains(&(ino, content_epoch)),
             "a completion while another upload is pending must keep an unverified finalization queued"
         );
-        assert!(
-            !vfs.state
-                .upload
-                .verified_remote_epoch_finalizations
-                .lock()
-                .contains(&(ino, content_epoch)),
-            "finalization must not skip the remote-visibility check while another upload is pending"
-        );
-
         vfs.cached_store().complete_upload(&second);
         rt.block_on(policy.finalize_completed_upload_epoch(ino, content_epoch));
         assert_eq!(
@@ -4206,14 +4207,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(ino, content_epoch)],
             "the final pending upload should enqueue epoch finalization"
-        );
-        assert!(
-            vfs.state
-                .upload
-                .verified_remote_epoch_finalizations
-                .lock()
-                .contains(&(ino, content_epoch)),
-            "the last upload completion should mark the queued finalization as remotely verified"
         );
     }
 
@@ -4283,7 +4276,10 @@ mod tests {
         assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
-        assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
+        assert!(
+            local_payloads.upload_stage_removed.lock().is_empty(),
+            "fragmented publish-ready upload stage must remain until epoch publication"
+        );
         assert!(
             local_payloads.removed.lock().is_empty(),
             "current fragmented overlay object should stay in the local backend"

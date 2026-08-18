@@ -289,9 +289,7 @@ impl StudioVfs {
         let publisher = Arc::new(commit::EpochPublicationBatcher::default());
 
         'finalizer: loop {
-            let Some((ino, content_epoch, remote_visibility_confirmed)) =
-                self.pop_epoch_finalization()
-            else {
+            let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {
                 tokio::select! {
                     _ = self.state.shutdown.shutdown_notify.notified() => break,
                     _ = self.state.upload.pending_epoch_finalizations_notify.notified() => {}
@@ -299,7 +297,7 @@ impl StudioVfs {
                 continue;
             };
 
-            let mut work = vec![(ino, content_epoch, remote_visibility_confirmed)];
+            let mut work = vec![(ino, content_epoch)];
             while work.len() < MAX_FINALIZATIONS_IN_FLIGHT {
                 if self.shutdown_requested() {
                     break;
@@ -310,8 +308,8 @@ impl StudioVfs {
                 work.push(next);
             }
             let shutdown_token = self.state.shutdown.background_shutdown_token.clone();
-            let results = futures::future::join_all(work.into_iter().map(
-                |(ino, content_epoch, remote_visibility_confirmed)| {
+            let results =
+                futures::future::join_all(work.into_iter().map(|(ino, content_epoch)| {
                     let vfs = Arc::clone(&self);
                     let publisher = Arc::clone(&publisher);
                     let shutdown_token = shutdown_token.clone();
@@ -323,15 +321,13 @@ impl StudioVfs {
                                 ino,
                                 content_epoch,
                                 publisher,
-                                remote_visibility_confirmed,
                             ),
                         )
                         .await;
                         (ino, content_epoch, result)
                     }
-                },
-            ))
-            .await;
+                }))
+                .await;
 
             for (ino, content_epoch, finalize_result) in results {
                 let Some(finalize_result) = finalize_result else {
