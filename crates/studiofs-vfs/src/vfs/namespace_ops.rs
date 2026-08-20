@@ -2460,7 +2460,10 @@ impl StudioVfs {
                     Instant::now(),
                 );
             }
-            meta.request_eager_flush();
+            // Keep ordinary namespace deletes local-first. The metadata
+            // engine batches this remote-visible event through its normal
+            // group-commit window; explicit barriers remain responsible for
+            // callers that require immediate publication.
             Ok(Some(unlinked_attr))
         }
         .await;
@@ -2556,7 +2559,8 @@ impl StudioVfs {
         if let Some(removed_ino) = removed {
             self.bump_directory_generation(removed_ino);
         }
-        self.sync_meta().request_eager_flush();
+        // Directory removals follow the same local-first group-commit path as
+        // child unlinks instead of waking PostgreSQL once per entry.
         Ok(())
     }
 

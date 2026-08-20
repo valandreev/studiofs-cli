@@ -334,6 +334,11 @@ fn run_manual_recovery(
         &version_1_sha256,
         SNAPSHOT_STATE_TIMEOUT,
     )?;
+    wait_for_checksum(
+        &peer.mount_point.join(VERSIONED_FILE),
+        &version_1_sha256,
+        SNAPSHOT_STATE_TIMEOUT,
+    )?;
 
     let output = run_cli_command(
         config,
