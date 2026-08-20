@@ -369,8 +369,8 @@ impl MetaPayloadObjects for RedbMetaEngine {
                         chunk_slices: changed_chunk_slices.clone(),
                     },
                 )?;
-                Self::sync_unpublished_upload_progress_lifecycle_in_txn(&txn, &attr)?;
             }
+            Self::sync_unpublished_upload_progress_lifecycle_in_txn(&txn, &attr)?;
 
             matched_ids
         };

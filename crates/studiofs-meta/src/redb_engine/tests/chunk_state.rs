@@ -889,6 +889,48 @@ fn mark_overlay_objects_uploaded_batches_matching_objects() {
 }
 
 #[test]
+fn mark_uploaded_overlay_rebuilds_missing_lifecycle_for_already_uploaded_object() {
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"overlay-upload-lifecycle.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.content_epoch = 7;
+    attr.size = 4096;
+    attr.committed_size = 0;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = UploadState::Uploading;
+
+    engine
+        .flush_regular_file_overlay_slices_with_attr(
+            ino,
+            &[(ChunkId(0), vec![local_payload_slice(700_003)])],
+            Some(&attr),
+        )
+        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(ino, 7, 700_003)
+            .unwrap()
+    );
+
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::remove_inode_lifecycle_in_txn(&txn, ino).unwrap();
+    txn.commit().unwrap();
+
+    assert!(engine.get_inode_lifecycle(ino).unwrap().is_none());
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(ino, 7, 700_003)
+            .unwrap()
+    );
+    assert_eq!(
+        engine.get_inode_lifecycle(ino).unwrap().unwrap().state,
+        InodeLifecycleState::PublishReady
+    );
+}
+
+#[test]
 fn regular_file_publication_batch_commits_two_inodes_in_one_transaction() {
     let engine = temp_engine();
     let first = engine
