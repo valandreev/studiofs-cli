@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Weak};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -287,6 +288,7 @@ impl WinfspInvalidationQueue {
         state.coalesced = 0;
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();

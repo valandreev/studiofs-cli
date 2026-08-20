@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::Mutex;
 use tracing::{debug, error, trace, warn};
@@ -241,20 +240,12 @@ impl<'a> WinfspHandleDrainFacade<'a> {
             } else {
                 studiofs_meta::FileType::RegularFile
             };
+            // The VFS unlink is the local completion point. Keep WinFSP's
+            // change notification asynchronous so deleting a directory does
+            // not wait for one notification batch per child.
             self.context
                 .invalidation_queue
                 .push_deleted_path(ino, path, kind);
-            if !self
-                .context
-                .invalidation_queue
-                .wait_for_quiescence(Duration::from_secs(1))
-            {
-                debug!(
-                    ino,
-                    is_dir,
-                    "cleanup delete invalidation did not reach WinFSP before callback return"
-                );
-            }
         }
 
         match result {
@@ -369,15 +360,58 @@ impl Drop for FlushGateRelease<'_> {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
 
     use studiofs_meta::ROOT_INO;
     use studiofs_meta::types::{SetattrArgs, TimeSpec};
     use studiofs_vfs::{OpenFlags, VfsError};
+    use winfsp::notify::NotifyingFileSystemContext;
 
     use super::super::tests::{
         flush_barrier_calls, make_test_context, winfsp_callbacks, winfsp_foreground_flushes,
     };
+    use super::super::{PreparedWinfspNotifications, StudioFsContext};
     use super::WinfspHandleDrainFacade;
+
+    #[test]
+    fn cleanup_delete_does_not_wait_for_notification_delivery() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("cleanup-delete-async-notify");
+        let attr = vfs
+            .create(ROOT_INO, b"cleanup-delete-async-notify.txt", 0, 0, 0o644)
+            .expect("create file");
+        let notification_source = vfs
+            .create(ROOT_INO, b"cleanup-delete-in-flight.txt", 0, 0, 0o644)
+            .expect("create in-flight notification source");
+        queue.push_deleted_path(
+            notification_source.ino,
+            r"\cleanup-delete-in-flight.txt".to_string(),
+            studiofs_meta::FileType::RegularFile,
+        );
+        let in_flight = <StudioFsContext as NotifyingFileSystemContext<
+            PreparedWinfspNotifications,
+        >>::should_notify(&ctx)
+        .expect("prepare in-flight notification batch");
+        let facade = WinfspHandleDrainFacade::new(&ctx);
+
+        let started = Instant::now();
+        facade.cleanup_delete(
+            attr.ino,
+            ROOT_INO,
+            b"cleanup-delete-async-notify.txt".to_vec(),
+            r"\cleanup-delete-async-notify.txt".to_string(),
+            false,
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "cleanup delete must not wait for the one-second WinFSP notification barrier"
+        );
+        assert!(
+            !queue.is_empty(),
+            "deleted-path notification should remain queued for asynchronous delivery"
+        );
+        drop(in_flight);
+    }
 
     #[test]
     fn cleanup_non_delete_on_write_committed_inode_skips_deferred_release_hint() {
