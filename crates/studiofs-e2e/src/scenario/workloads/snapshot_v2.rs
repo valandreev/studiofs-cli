@@ -392,6 +392,16 @@ fn run_manual_recovery(
         )?;
         let snapshot_recovery = snapshot_mount.join(RECOVERY_FILE);
         let snapshot_versioned = snapshot_mount.join(VERSIONED_FILE);
+        wait_for_checksum(
+            &snapshot_recovery,
+            &summary.original_sha256,
+            SNAPSHOT_MOUNT_READY_TIMEOUT,
+        )?;
+        wait_for_checksum(
+            &snapshot_versioned,
+            &version_1_sha256,
+            SNAPSHOT_MOUNT_READY_TIMEOUT,
+        )?;
         let snapshot_recovery_bytes = fs::read(&snapshot_recovery)?;
         if Some(snapshot_recovery_bytes.len() as u64) != summary.recovery_size_bytes {
             return Err(ScenarioError::Io(io::Error::other(
@@ -453,13 +463,6 @@ fn run_materializer_takeover(
             actual: actual_clients,
         });
     }
-    controller.set_client_env_overrides(
-        SNAPSHOT_CLIENT_NAMES[0],
-        [(
-            SNAPSHOT_TEST_STARTUP_DELAY_MS_ENV,
-            SNAPSHOT_TAKEOVER_STARTUP_DELAY_MS,
-        )],
-    )?;
     controller.mount(SNAPSHOT_CLIENT_NAMES[0])?;
     let claimant_mount_point = controller.client_at(0)?.mount_point.clone();
     let pre_cut = claimant_mount_point.join(RECOVERY_FILE);
@@ -481,6 +484,16 @@ fn run_materializer_takeover(
         SNAPSHOT_STATE_TIMEOUT,
     )?;
 
+    // Keep the takeover failpoint scoped to the transient snapshot creator.
+    // The mounted claimant must retain the normal upload/finalization schedule
+    // so this deterministic takeover test does not perturb peer visibility.
+    controller.set_client_env_overrides(
+        SNAPSHOT_CLIENT_NAMES[0],
+        [(
+            SNAPSHOT_TEST_STARTUP_DELAY_MS_ENV,
+            SNAPSHOT_TAKEOVER_STARTUP_DELAY_MS,
+        )],
+    )?;
     let claimant_client = controller.client_at(0)?;
     let mut creator = spawn_snapshot_create(config, claimant_client, context)?;
     let expected_claimant = format!("cli-{}", creator.child.id());
