@@ -18,9 +18,9 @@ use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
 pub(crate) use invalidation::PreparedWinfspNotifications;
 #[cfg(test)]
 use invalidation::{
-    FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-    build_notify_info, ino_to_windows_path, notify_filter_for_kind,
+    FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SIZE, build_notify_info, ino_to_windows_path, notify_filter_for_kind,
 };
 pub use invalidation::{WinfspInvalidationQueue, WinfspKernelInvalidator};
 use parking_lot::Mutex;
@@ -2309,7 +2309,7 @@ impl AsyncFileSystemContext for StudioFsContext {
 mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
-        CREATE_DISPOSITION_SHIFT, CreateCallbackKind, FILE_ACTION_MODIFIED,
+        CREATE_DISPOSITION_SHIFT, CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
         FILE_APPEND_DATA_ACCESS, FILE_CREATE_DISPOSITION, FILE_DIRECTORY_FILE_OPTION,
         FILE_FLAG_NO_BUFFERING_ATTRIBUTE, FILE_FLAG_WRITE_THROUGH_ATTRIBUTE,
         FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
@@ -5040,6 +5040,30 @@ mod tests {
 
         vfs.unlink(ROOT_INO, b"gone.txt").expect("unlink");
         assert_eq!(ino_to_windows_path(&vfs, file.ino), None);
+    }
+
+    #[test]
+    fn deleted_path_notification_keeps_path_after_unlink() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("deleted_path_notification");
+        let file = vfs
+            .create(ROOT_INO, b"gone.txt", 0, 0, 0o644)
+            .expect("create");
+
+        queue.push_deleted_path(file.ino, "\\gone.txt".to_string(), FileType::RegularFile);
+        vfs.unlink(ROOT_INO, b"gone.txt").expect("unlink");
+
+        let notifications = ctx
+            .should_notify()
+            .expect("pending deleted-path notification");
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].path, "\\gone.txt");
+        assert_eq!(notifications[0].info.action, FILE_ACTION_REMOVED);
+        assert!(
+            !queue.wait_for_quiescence(Duration::from_millis(1)),
+            "a prepared notification must remain in flight until it is published"
+        );
+        drop(notifications);
+        assert!(queue.wait_for_quiescence(Duration::from_secs(1)));
     }
 
     #[test]

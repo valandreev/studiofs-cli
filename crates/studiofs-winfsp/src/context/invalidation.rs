@@ -1,5 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Deref;
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use studiofs_meta::{FileType, Ino};
@@ -17,6 +19,7 @@ pub(super) const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
 pub(super) const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
 pub(super) const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
 pub(super) const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
+pub(super) const FILE_ACTION_REMOVED: u32 = 0x0000_0002;
 /// Maximum number of distinct inode invalidations retained by WinFSP.
 pub const WINFSP_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 
@@ -31,7 +34,16 @@ pub(super) fn notify_filter_for_kind(kind: FileType) -> u32 {
     }
 }
 
+#[cfg(test)]
 pub(super) fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo<512>> {
+    build_notify_info_with_action(path, kind, FILE_ACTION_MODIFIED)
+}
+
+fn build_notify_info_with_action(
+    path: &str,
+    kind: FileType,
+    action: u32,
+) -> Option<NotifyInfo<512>> {
     if let Err(error) = ensure_winfsp_runtime_loaded() {
         warn!(
             error = %error,
@@ -41,7 +53,7 @@ pub(super) fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo
     }
     let mut info = NotifyInfo::<512>::new();
     info.filter = notify_filter_for_kind(kind);
-    info.action = FILE_ACTION_MODIFIED;
+    info.action = action;
     info.set_name(path).ok()?;
     Some(info)
 }
@@ -53,16 +65,56 @@ pub(crate) struct PreparedWinfspNotify {
     pub(super) info: NotifyInfo<512>,
 }
 
-pub(crate) type PreparedWinfspNotifications = Vec<PreparedWinfspNotify>;
+pub(crate) struct PreparedWinfspNotifications {
+    notifications: Vec<PreparedWinfspNotify>,
+    completion_queue: Option<Arc<WinfspInvalidationQueue>>,
+}
+
+impl PreparedWinfspNotifications {
+    fn new(
+        notifications: Vec<PreparedWinfspNotify>,
+        completion_queue: Arc<WinfspInvalidationQueue>,
+    ) -> Self {
+        Self {
+            notifications,
+            completion_queue: Some(completion_queue),
+        }
+    }
+}
+
+impl Deref for PreparedWinfspNotifications {
+    type Target = [PreparedWinfspNotify];
+
+    fn deref(&self) -> &Self::Target {
+        &self.notifications
+    }
+}
+
+impl Drop for PreparedWinfspNotifications {
+    fn drop(&mut self) {
+        if let Some(queue) = self.completion_queue.take() {
+            queue.finish_notification_batch();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WinfspInvalidationOverride {
+    path: String,
+    kind: FileType,
+    action: u32,
+}
 
 #[derive(Debug, Default)]
 struct WinfspInvalidationQueueState {
     closed: bool,
     order: VecDeque<Ino>,
     pending: HashSet<Ino>,
+    path_overrides: HashMap<Ino, WinfspInvalidationOverride>,
     queue_peak: usize,
     coalesced: u64,
     snapshot_generation: u64,
+    notification_batches_in_flight: usize,
     #[cfg(test)]
     waiting_producers: usize,
 }
@@ -73,6 +125,7 @@ struct WinfspInvalidationQueueState {
 pub struct WinfspInvalidationQueue {
     state: Mutex<WinfspInvalidationQueueState>,
     not_full: Condvar,
+    quiescent: Condvar,
     metrics_vfs: Weak<StudioVfs>,
 }
 
@@ -82,6 +135,7 @@ impl WinfspInvalidationQueue {
         let queue = Arc::new(Self {
             state: Mutex::new(WinfspInvalidationQueueState::default()),
             not_full: Condvar::new(),
+            quiescent: Condvar::new(),
             metrics_vfs: Arc::downgrade(vfs),
         });
         let snapshot = {
@@ -104,6 +158,28 @@ impl WinfspInvalidationQueue {
         if let Some(snapshot) = snapshot {
             self.record_metrics(snapshot);
         }
+    }
+
+    fn push_path(&self, ino: Ino, path: String, kind: FileType, action: u32) {
+        let snapshot = {
+            let mut state = self.state.lock();
+            if state.closed {
+                None
+            } else {
+                state
+                    .path_overrides
+                    .insert(ino, WinfspInvalidationOverride { path, kind, action });
+                self.push_locked(&mut state, ino)
+                    .then(|| Self::next_metrics_snapshot(&mut state))
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            self.record_metrics(snapshot);
+        }
+    }
+
+    pub(crate) fn push_deleted_path(&self, ino: Ino, path: String, kind: FileType) {
+        self.push_path(ino, path, kind, FILE_ACTION_REMOVED);
     }
 
     fn push_locked(
@@ -138,18 +214,42 @@ impl WinfspInvalidationQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn drain(&self) -> Vec<Ino> {
+        self.drain_targets(false)
+            .into_iter()
+            .map(|(ino, _)| ino)
+            .collect()
+    }
+
+    fn drain_for_notify(&self) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
+        self.drain_targets(true)
+    }
+
+    fn drain_targets(
+        &self,
+        mark_notification_in_flight: bool,
+    ) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
         let mut state = self.state.lock();
         let mut inodes: Vec<_> = state.order.drain(..).collect();
         state.pending.clear();
+        let mut targets = inodes
+            .drain(..)
+            .map(|ino| (ino, state.path_overrides.remove(&ino)))
+            .collect::<Vec<_>>();
+        if mark_notification_in_flight && !targets.is_empty() {
+            state.notification_batches_in_flight =
+                state.notification_batches_in_flight.saturating_add(1);
+        }
         self.not_full.notify_all();
-        let snapshot = (!inodes.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
+        self.quiescent.notify_all();
+        let snapshot = (!targets.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
-        inodes.sort_unstable();
+        targets.sort_unstable_by_key(|(ino, _)| *ino);
         if let Some(snapshot) = snapshot {
             self.record_metrics(snapshot);
         }
-        inodes
+        targets
     }
 
     #[cfg(test)]
@@ -175,6 +275,7 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         state.closed = true;
         self.not_full.notify_all();
+        self.quiescent.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
         self.record_metrics(snapshot);
@@ -184,6 +285,26 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         state.queue_peak = 0;
         state.coalesced = 0;
+    }
+
+    pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while (!state.pending.is_empty() || state.notification_batches_in_flight != 0)
+            && !state.closed
+        {
+            if self.quiescent.wait_until(&mut state, deadline).timed_out() {
+                break;
+            }
+        }
+        state.pending.is_empty() && state.notification_batches_in_flight == 0
+    }
+
+    fn finish_notification_batch(&self) {
+        let mut state = self.state.lock();
+        state.notification_batches_in_flight =
+            state.notification_batches_in_flight.saturating_sub(1);
+        self.quiescent.notify_all();
     }
 
     #[cfg(test)]
@@ -255,39 +376,47 @@ impl KernelInvalidator for WinfspKernelInvalidator {
 
 impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext {
     fn should_notify(&self) -> Option<PreparedWinfspNotifications> {
-        let inodes = self.invalidation_queue.drain();
-        if inodes.is_empty() {
+        let targets = self.invalidation_queue.drain_for_notify();
+        if targets.is_empty() {
             return None;
         }
 
         let meta = self.vfs.meta();
-        let mut notifications = Vec::with_capacity(inodes.len());
-        for ino in &inodes {
-            let Some(path) = ino_to_windows_path(&self.vfs, *ino) else {
-                trace!(ino, "skipping notify - inode no longer resolvable");
-                continue;
+        let mut notifications = Vec::with_capacity(targets.len());
+        for (ino, path_override) in targets {
+            let (path, kind, action) = if let Some(path_override) = path_override {
+                (path_override.path, path_override.kind, path_override.action)
+            } else {
+                let Some(path) = ino_to_windows_path(&self.vfs, ino) else {
+                    trace!(ino, "skipping notify - inode no longer resolvable");
+                    continue;
+                };
+                let kind = meta
+                    .get_attr(ino)
+                    .map(|a| a.kind)
+                    .unwrap_or(FileType::RegularFile);
+                (path, kind, FILE_ACTION_MODIFIED)
             };
 
-            let kind = meta
-                .get_attr(*ino)
-                .map(|a| a.kind)
-                .unwrap_or(FileType::RegularFile);
-
-            let Some(info) = build_notify_info(&path, kind) else {
+            let Some(info) = build_notify_info_with_action(&path, kind, action) else {
                 warn!(ino, path, "notify path too long, skipping");
                 continue;
             };
-            notifications.push(PreparedWinfspNotify {
-                ino: *ino,
-                path,
-                info,
-            });
+            notifications.push(PreparedWinfspNotify { ino, path, info });
         }
-        (!notifications.is_empty()).then_some(notifications)
+        if notifications.is_empty() {
+            self.invalidation_queue.finish_notification_batch();
+            None
+        } else {
+            Some(PreparedWinfspNotifications::new(
+                notifications,
+                self.invalidation_queue.clone(),
+            ))
+        }
     }
 
     fn notify(&self, notifications: PreparedWinfspNotifications, notifier: &Notifier) {
-        for notification in &notifications {
+        for notification in notifications.iter() {
             notifier.notify(&notification.info);
             debug!(
                 ino = notification.ino,

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tracing::{debug, error, trace, warn};
@@ -158,7 +159,13 @@ impl<'a> WinfspHandleDrainFacade<'a> {
                 return;
             }
         };
-        self.cleanup_delete(context.ino, parent_ino, name, context.is_dir);
+        self.cleanup_delete(
+            context.ino,
+            parent_ino,
+            name,
+            file_name.to_string_lossy(),
+            context.is_dir,
+        );
     }
 
     fn flush_local_dirty_state(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<bool> {
@@ -201,7 +208,7 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         op()
     }
 
-    fn cleanup_delete(&self, ino: Ino, parent_ino: Ino, name: Vec<u8>, is_dir: bool) {
+    fn cleanup_delete(&self, ino: Ino, parent_ino: Ino, name: Vec<u8>, path: String, is_dir: bool) {
         self.context.vfs.note_winfsp_cleanup_callback();
         let healed_orphans = if is_dir {
             self.context
@@ -223,6 +230,32 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         } else {
             self.context.vfs.unlink(parent_ino, &name)
         };
+
+        let should_notify = match &result {
+            Ok(()) => true,
+            Err(error) => is_benign_cleanup_delete_error(error, is_dir),
+        };
+        if should_notify {
+            let kind = if is_dir {
+                studiofs_meta::FileType::Directory
+            } else {
+                studiofs_meta::FileType::RegularFile
+            };
+            self.context
+                .invalidation_queue
+                .push_deleted_path(ino, path, kind);
+            if !self
+                .context
+                .invalidation_queue
+                .wait_for_quiescence(Duration::from_secs(1))
+            {
+                debug!(
+                    ino,
+                    is_dir,
+                    "cleanup delete invalidation did not reach WinFSP before callback return"
+                );
+            }
+        }
 
         match result {
             Ok(()) => {
