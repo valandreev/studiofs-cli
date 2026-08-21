@@ -420,7 +420,7 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
 
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
         #[cfg(target_os = "macos")]
-        let active = macos_mount_is_active(&command.client_root, &command.mount_point)?;
+        let active = macos_mount_is_active(&command.mount_point)?;
         #[cfg(not(target_os = "macos"))]
         let active = mount_point_is_active(&command.mount_point)?;
         Ok(active)
@@ -1952,12 +1952,8 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_mount_is_active(client_root: &Path, mount_point: &Path) -> io::Result<bool> {
-    // macFUSE can detach the filesystem before the killed StudioFS process releases this lock.
-    if mount_point_is_active(mount_point)? {
-        return Ok(true);
-    }
-    macos_mount_lock_is_held(client_root, mount_point)
+fn macos_mount_is_active(mount_point: &Path) -> io::Result<bool> {
+    mount_point_is_active(mount_point)
 }
 
 #[cfg(target_os = "macos")]
@@ -2533,7 +2529,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_mount_readiness_sees_lifecycle_lock_after_fuse_detaches() {
+    fn macos_mount_readiness_ignores_lifecycle_lock_after_fuse_detaches() {
         use fs2::FileExt as _;
 
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
@@ -2553,7 +2549,7 @@ mod tests {
         lock.try_lock_exclusive().expect("hold lifecycle lock");
         let mount_point = Path::new("/tmp/studiofs-e2e-lock-probe");
 
-        assert!(macos_mount_is_active(&client_root, mount_point).expect("probe active mount"));
+        assert!(!macos_mount_is_active(mount_point).expect("probe active mount"));
         let error = wait_for_macos_mount_lock_release(
             &client_root,
             mount_point,
@@ -2565,7 +2561,7 @@ mod tests {
 
         lock.unlock().expect("release lifecycle lock");
         drop(lock);
-        assert!(!macos_mount_is_active(&client_root, mount_point).expect("probe inactive mount"));
+        assert!(!macos_mount_is_active(mount_point).expect("probe inactive mount"));
         wait_for_macos_mount_lock_release(
             &client_root,
             mount_point,
