@@ -335,6 +335,9 @@ impl StudioVfs {
         let dirty_before = self.state.writer_stack.dirty_bytes_for_inode(ino);
         let total_before = self.total_pending_write_buffer_bytes();
         if dirty_before == 0 {
+            if self.inode_has_local_dirty_state(ino) {
+                return DeferredMaterializationPassOutcome::Idle;
+            }
             if *no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
                 && self.should_linger_clean_deferred_materialization(ino)
             {
