@@ -2563,6 +2563,7 @@ mod tests {
         .expect_err("held lifecycle lock should not be reported as released");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 
+        lock.unlock().expect("release lifecycle lock");
         drop(lock);
         assert!(!macos_mount_is_active(&client_root, mount_point).expect("probe inactive mount"));
         wait_for_macos_mount_lock_release(
