@@ -93,6 +93,9 @@ impl RedbMetaEngine {
         let Some(stored_lifecycle) = stored_lifecycle else {
             return Ok(None);
         };
+        if stored_lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
+            return Ok(Some(stored_lifecycle));
+        }
 
         let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
         let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
