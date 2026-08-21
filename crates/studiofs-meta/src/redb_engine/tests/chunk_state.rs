@@ -931,6 +931,62 @@ fn mark_uploaded_overlay_rebuilds_missing_lifecycle_for_already_uploaded_object(
 }
 
 #[test]
+fn regular_file_overlay_reflush_preserves_uploaded_payload_state() {
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"overlay-uploaded-reflush.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.content_epoch = 1;
+    attr.size = 4096;
+
+    engine
+        .flush_regular_file_overlay_slices_with_attr(
+            ino,
+            &[(ChunkId(0), vec![local_payload_slice(700_004)])],
+            Some(&attr),
+        )
+        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(ino, 1, 700_004)
+            .unwrap()
+    );
+    assert_eq!(
+        engine.get_inode_lifecycle(ino).unwrap().unwrap().state,
+        InodeLifecycleState::PublishReady
+    );
+
+    engine
+        .flush_regular_file_overlay_slices(
+            ino,
+            &[(ChunkId(0), vec![local_payload_slice(700_004)])],
+        )
+        .unwrap();
+
+    let txn = engine.begin_read_txn().unwrap();
+    let overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+    let key = encode_regular_file_chunk_key(ino, ChunkId(0));
+    let row = overlay_table
+        .get(key.as_slice())
+        .unwrap()
+        .expect("overlay row after reflush");
+    let chunk: RegularFileChunkState = decode(row.value()).expect("decode overlay row");
+    assert!(
+        chunk.slices.values().all(|slice| {
+            slice.payload.as_ref().map(|payload| payload.object_id) == Some(700_004)
+                && slice.payload_state == PayloadRefState::Uploaded
+        }),
+        "reflushing the same immutable payload must not downgrade it: {:?}",
+        chunk.slices
+    );
+    assert_eq!(
+        engine.get_inode_lifecycle(ino).unwrap().unwrap().state,
+        InodeLifecycleState::PublishReady
+    );
+}
+
+#[test]
 fn regular_file_publication_batch_commits_two_inodes_in_one_transaction() {
     let engine = temp_engine();
     let first = engine

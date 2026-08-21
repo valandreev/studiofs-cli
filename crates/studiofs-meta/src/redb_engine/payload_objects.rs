@@ -656,6 +656,38 @@ impl RedbMetaEngine {
         Ok(true)
     }
 
+    fn preserve_completed_overlay_payload_state(
+        state: &RegularFileChunkState,
+        new_slice: &mut crate::schema::SliceRecord,
+    ) {
+        let Some(payload) = new_slice.payload else {
+            return;
+        };
+        if !matches!(
+            new_slice.payload_state,
+            crate::schema::PayloadRefState::LocalOnly
+                | crate::schema::PayloadRefState::Uploading
+                | crate::schema::PayloadRefState::Recovering
+        ) {
+            return;
+        }
+
+        if let Some(existing) = state.slices.values().find(|existing| {
+            existing.payload == Some(payload)
+                && new_slice.range.start <= existing.range.start
+                && new_slice.range.end >= existing.range.end
+                && matches!(
+                    existing.payload_state,
+                    crate::schema::PayloadRefState::Uploaded
+                        | crate::schema::PayloadRefState::Published
+                )
+        }) {
+            // Payload objects are immutable. A late flush of the same object may
+            // replace its slice record, but it must not erase upload completion.
+            new_slice.payload_state = existing.payload_state;
+        }
+    }
+
     fn apply_regular_file_overlay_mutation_in_txn(
         &self,
         txn: &redb::WriteTransaction,
@@ -716,7 +748,7 @@ impl RedbMetaEngine {
 
             let mut space_delta: i64 = 0;
 
-            for (chunk_id, new_slices) in chunk_slices {
+            for (chunk_id, incoming_slices) in chunk_slices {
                 let key = encode_regular_file_chunk_key(ino, *chunk_id);
                 let mut state = if let Some(entry) = overlay_table
                     .get(key.as_slice())
@@ -726,6 +758,10 @@ impl RedbMetaEngine {
                 } else {
                     crate::schema::RegularFileChunkState::default()
                 };
+                let mut new_slices = incoming_slices.to_vec();
+                for new_slice in &mut new_slices {
+                    Self::preserve_completed_overlay_payload_state(&state, new_slice);
+                }
 
                 // Pre-calculate which existing slices are fully covered by the incoming ones.
                 // This bounds metadata growth and performs O(N*M) where N is incoming slices and M is existing in one chunk.
@@ -749,7 +785,7 @@ impl RedbMetaEngine {
                     }
                 }
 
-                for mut new_slice in new_slices.iter().cloned() {
+                for mut new_slice in new_slices {
                     let slice_id = state
                         .try_alloc_slice_id()
                         .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
