@@ -1302,10 +1302,9 @@ fn write_file_sync(path: &Path, payload: &[u8]) -> Result<(), ScenarioError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
+    let mut file = mounted_write_barrier_open_options()
         .create(true)
         .truncate(true)
-        .write(true)
         .open(path)?;
     file.write_all(payload)?;
     file.sync_all()?;
