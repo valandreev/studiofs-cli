@@ -3,7 +3,7 @@
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use tokio_postgres::NoTls;
 use url::Url;
 
