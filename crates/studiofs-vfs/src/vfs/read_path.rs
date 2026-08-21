@@ -29,6 +29,7 @@ type ReadRange = IntervalRange;
 #[derive(Debug, Clone)]
 enum ReadSegmentSource {
     Dirty { data: Bytes, block_offset: u64 },
+    LocalPayload { object_id: u64, data_offset: u32 },
     PendingOverlay { data: Bytes, block_offset: u32 },
     PendingExtent { object_id: u64, block_offset: u32 },
     Overlay { payload: PayloadRef },
@@ -264,6 +265,7 @@ impl<'a> DataReader<'a> {
             return;
         };
         let mut dirty_spans = 0usize;
+        let mut local_payload_spans = 0usize;
         let mut pending_overlay_spans = 0usize;
         let mut pending_extent_spans = 0usize;
         let mut overlay_spans = 0usize;
@@ -272,6 +274,7 @@ impl<'a> DataReader<'a> {
         for segment in segments {
             match &segment.source {
                 ReadSegmentSource::Dirty { .. } => dirty_spans += 1,
+                ReadSegmentSource::LocalPayload { .. } => local_payload_spans += 1,
                 ReadSegmentSource::PendingOverlay { .. } => pending_overlay_spans += 1,
                 ReadSegmentSource::PendingExtent { .. } => pending_extent_spans += 1,
                 ReadSegmentSource::Overlay { .. } => overlay_spans += 1,
@@ -286,6 +289,7 @@ impl<'a> DataReader<'a> {
             length,
             spans = segments.len(),
             dirty_spans,
+            local_payload_spans,
             pending_overlay_spans,
             pending_extent_spans,
             overlay_spans,
@@ -304,6 +308,7 @@ impl<'a> DataReader<'a> {
                     payload
                 }
                 ReadSegmentSource::Dirty { .. }
+                | ReadSegmentSource::LocalPayload { .. }
                 | ReadSegmentSource::PendingOverlay { .. }
                 | ReadSegmentSource::PendingExtent { .. }
                 | ReadSegmentSource::Zero => continue,
@@ -391,10 +396,16 @@ impl<'a> DataReader<'a> {
                 };
                 segments.push(ReadSegment {
                     range: *overlap,
-                    source: ReadSegmentSource::Dirty {
-                        data: dirty.data.clone(),
-                        block_offset: u64::from(block_offset),
-                    },
+                    source: dirty.object_id.map_or_else(
+                        || ReadSegmentSource::Dirty {
+                            data: dirty.data.clone(),
+                            block_offset: u64::from(block_offset),
+                        },
+                        |object_id| ReadSegmentSource::LocalPayload {
+                            object_id,
+                            data_offset: block_offset,
+                        },
+                    ),
                 });
             }
         }
@@ -421,10 +432,16 @@ impl<'a> DataReader<'a> {
                 };
                 segments.push(ReadSegment {
                     range: *overlap,
-                    source: ReadSegmentSource::Dirty {
-                        data: dirty.data.clone(),
-                        block_offset: u64::from(block_offset),
-                    },
+                    source: dirty.object_id.map_or_else(
+                        || ReadSegmentSource::Dirty {
+                            data: dirty.data.clone(),
+                            block_offset: u64::from(block_offset),
+                        },
+                        |object_id| ReadSegmentSource::LocalPayload {
+                            object_id,
+                            data_offset: block_offset,
+                        },
+                    ),
                 });
             }
         }
@@ -712,7 +729,8 @@ impl<'a> DataReader<'a> {
                         .entry(payload.object_id)
                         .or_insert_with(|| *payload);
                 }
-                ReadSegmentSource::PendingExtent { object_id, .. } => {
+                ReadSegmentSource::LocalPayload { object_id, .. }
+                | ReadSegmentSource::PendingExtent { object_id, .. } => {
                     local_pending.insert(*object_id);
                 }
                 ReadSegmentSource::Dirty { .. }
@@ -856,7 +874,11 @@ impl<'a> DataReader<'a> {
                     let dst = &mut buffer[dst_start..dst_end];
                     vfs.copy_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
                 }
-                ReadSegmentSource::PendingExtent {
+                ReadSegmentSource::LocalPayload {
+                    object_id,
+                    data_offset: block_offset,
+                }
+                | ReadSegmentSource::PendingExtent {
                     object_id,
                     block_offset,
                 } => {
@@ -879,7 +901,7 @@ impl<'a> DataReader<'a> {
                                 block_offset,
                                 requested = dst.len(),
                                 read,
-                                "data_reader: short local read for pending extent; padding tail with zeros"
+                                "data_reader: short local payload read; padding tail with zeros"
                             );
                             dst[read..].fill(0);
                         }
@@ -889,7 +911,7 @@ impl<'a> DataReader<'a> {
                                 file_offset = segment.range.start(),
                                 block_offset,
                                 requested = dst.len(),
-                                "data_reader: pending extent missing from local backend, zeroing range"
+                                "data_reader: local payload missing from backend, zeroing range"
                             );
                             dst.fill(0);
                         }
@@ -936,6 +958,7 @@ impl<'a> DataReader<'a> {
                 Some(payload)
             }
             ReadSegmentSource::Dirty { .. }
+            | ReadSegmentSource::LocalPayload { .. }
             | ReadSegmentSource::PendingOverlay { .. }
             | ReadSegmentSource::PendingExtent { .. }
             | ReadSegmentSource::Zero => None,
@@ -4908,6 +4931,109 @@ mod tests {
             .await
             .expect(
                 "prefetch should warm already-local payloads instead of treating them as a no-op",
+            );
+        });
+    }
+
+    #[test]
+    fn prefetch_warms_persisted_local_dirty_extents_without_loading_them() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-local-dirty-extents");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"prefetch-local-dirty-extents.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let block_size = vfs.block_size as usize;
+            let payload = vec![0x73; block_size.saturating_mul(2)];
+
+            vfs.write(ino, 0, &payload)
+                .await
+                .expect("write fresh payload");
+            counting_backend.reset_counters();
+
+            let attr = vfs.getattr(ino).expect("load fresh attr");
+            let pending_content_epoch = vfs
+                .refresh_inode_incarnation_state_from_attr(ino, &attr)
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch);
+            DataReader::new(
+                &vfs,
+                ino,
+                0,
+                payload.len() as u64,
+                pending_content_epoch,
+                None,
+            )
+            .prefetch_only()
+            .await
+            .expect("prefetch fresh local extents");
+
+            assert_eq!(
+                counting_backend.get_calls(),
+                0,
+                "prefetch must not synchronously load each local dirty extent into memory"
+            );
+            assert_eq!(
+                counting_backend.advise_will_need_calls(),
+                2,
+                "prefetch must warm every local extent through the backend hint"
+            );
+
+            let object_ids: Vec<_> = vfs
+                .snapshot_pending_dirty_slice_read_spans(ino, 0, payload.len() as u64)
+                .into_iter()
+                .filter_map(|span| span.object_id)
+                .collect();
+            assert_eq!(
+                object_ids.len(),
+                2,
+                "fresh full blocks should have two local extents"
+            );
+            vfs.upload_hot_remove_batch(&object_ids);
+            assert!(
+                object_ids
+                    .iter()
+                    .all(|object_id| vfs.cached_store.get_hot_upload(*object_id).is_none()),
+                "hot upload copies should be removable before the direct local read"
+            );
+
+            let mut readback = vec![0_u8; payload.len()];
+            let read = DataReader::new(
+                &vfs,
+                ino,
+                0,
+                payload.len() as u64,
+                pending_content_epoch,
+                None,
+            )
+            .read_into(&mut readback)
+            .await
+            .expect("read fresh local extents");
+            assert_eq!(read, payload.len());
+            assert_eq!(readback, payload);
+            assert_eq!(
+                counting_backend.get_calls(),
+                0,
+                "foreground reads of persisted local extents should use range reads"
+            );
+            assert_eq!(
+                counting_backend.read_into_calls(),
+                2,
+                "foreground reads should issue one range read per local extent"
             );
         });
     }

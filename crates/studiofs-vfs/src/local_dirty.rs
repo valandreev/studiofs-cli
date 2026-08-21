@@ -203,6 +203,7 @@ pub(super) struct PendingDirtyReadSpan {
     pub(super) end: u64,
     pub(super) block_offset: u32,
     pub(super) seq: u64,
+    pub(super) object_id: Option<u64>,
     pub(super) data: Bytes,
 }
 
@@ -3099,7 +3100,6 @@ impl StudioVfs {
 
         let pending_payloads = self.state.local_dirty.pending_payloads.lock();
         let mut buffered_block_data = HashMap::<u32, Bytes>::new();
-        let mut persisted_slice_data = HashMap::<u64, Bytes>::new();
         let mut spans = Vec::new();
         let Some(requested_range) = IntervalRange::new(offset, end) else {
             return Vec::new();
@@ -3119,18 +3119,13 @@ impl StudioVfs {
                 continue;
             };
 
-            let data = if let Some(object_id) = slice.object_id {
-                if let Some(data) = persisted_slice_data.get(&object_id) {
-                    data.clone()
-                } else {
-                    let Some(data) = self.local_payload_backend.get(object_id) else {
-                        continue;
-                    };
-                    persisted_slice_data.insert(object_id, data.clone());
-                    data
+            let (data, object_id) = if let Some(object_id) = slice.object_id {
+                if !self.local_payload_backend.contains(object_id) {
+                    continue;
                 }
+                (Bytes::new(), Some(object_id))
             } else if let Some(data) = buffered_block_data.get(&slice.block_index) {
-                data.clone()
+                (data.clone(), None)
             } else {
                 let Some(pending_payload) = pending_payloads.get(&(ino, slice.block_index)) else {
                     continue;
@@ -3140,7 +3135,7 @@ impl StudioVfs {
                 }
                 let data = pending_payload.data.clone().freeze();
                 buffered_block_data.insert(slice.block_index, data.clone());
-                data
+                (data, None)
             };
 
             let start = overlap.start();
@@ -3159,17 +3154,20 @@ impl StudioVfs {
                 continue;
             };
             let span_len = (stop - start) as usize;
-            let Some(block_offset_usize) = usize::try_from(block_offset).ok() else {
-                continue;
-            };
-            if block_offset_usize.saturating_add(span_len) > data.len() {
-                continue;
+            if object_id.is_none() {
+                let Some(block_offset_usize) = usize::try_from(block_offset).ok() else {
+                    continue;
+                };
+                if block_offset_usize.saturating_add(span_len) > data.len() {
+                    continue;
+                }
             }
             spans.push(PendingDirtyReadSpan {
                 start,
                 end: stop,
                 block_offset,
                 seq: slice.seq,
+                object_id,
                 data,
             });
         }
@@ -3210,10 +3208,10 @@ impl StudioVfs {
                 let object_id = block
                     .local_extent_id()
                     .expect("local extent pending payload must have an object id");
-                let data = self
-                    .local_payload_backend
-                    .get(object_id)
-                    .expect("local payload missing during dirty read span resolution");
+                assert!(
+                    self.local_payload_backend.contains(object_id),
+                    "local payload missing during dirty read span resolution"
+                );
                 let block_start =
                     u64::from(*block_index).saturating_mul(u64::from(self.block_size));
                 let block_end = block_start.saturating_add(block.logical_len() as u64);
@@ -3231,7 +3229,8 @@ impl StudioVfs {
                     end: stop,
                     block_offset,
                     seq: 0,
-                    data,
+                    object_id: Some(object_id),
+                    data: Bytes::new(),
                 });
                 continue;
             }
@@ -3256,6 +3255,7 @@ impl StudioVfs {
                 end: stop,
                 block_offset,
                 seq: 0,
+                object_id: None,
                 data: block.data.clone().freeze(),
             });
         }
