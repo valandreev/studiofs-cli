@@ -2547,6 +2547,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)
             .expect("open lifecycle lock");
         lock.try_lock_exclusive().expect("hold lifecycle lock");
