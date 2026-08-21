@@ -747,7 +747,9 @@ fn decode_symlink_reparse(buffer: &[u8]) -> Option<Vec<u8>> {
     }
     // Decode UTF-16LE
     let utf16: Vec<u16> = buffer[start..end]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     let s = String::from_utf16_lossy(&utf16);

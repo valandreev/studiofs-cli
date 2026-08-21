@@ -365,11 +365,10 @@ pub(crate) fn fill_deterministic_bytes(buffer: &mut Vec<u8>, len: usize, seed: u
     buffer.resize(len, 0);
     let mut rng = XorShift64::new(seed ^ 0x6ac9_fe0f);
     let out = &mut buffer[..len];
-    let mut chunks = out.chunks_exact_mut(8);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = out.as_chunks_mut::<8>();
+    for chunk in chunks {
         chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
     }
-    let remainder = chunks.into_remainder();
     if !remainder.is_empty() {
         let bytes = rng.next_u64().to_le_bytes();
         remainder.copy_from_slice(&bytes[..remainder.len()]);

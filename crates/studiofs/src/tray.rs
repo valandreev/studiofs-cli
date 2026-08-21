@@ -116,7 +116,9 @@ mod supported {
             let (width, height) = image.dimensions();
             let source_alpha = image
                 .as_raw()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|pixel| pixel[3])
                 .collect::<Vec<_>>();
             let Some((min_x, min_y, max_x, max_y)) =
