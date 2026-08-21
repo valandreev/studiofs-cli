@@ -511,8 +511,7 @@ fn test_regular_file_overlay_flush_emits_final_chunk_state() {
         .get(next_event_seq - 1)
         .unwrap()
         .expect("flushed event");
-    let event: MetaEvent =
-        crate::events::decode_event(row.value()).expect("decode flushed event");
+    let event: MetaEvent = crate::events::decode_event(row.value()).expect("decode flushed event");
     let payload = match event {
         MetaEvent::SetRegularFileOverlaySlices {
             ino: event_ino,
@@ -889,6 +888,51 @@ fn mark_overlay_objects_uploaded_batches_matching_objects() {
 }
 
 #[test]
+fn get_inode_lifecycle_recomputes_stale_local_only_row_from_uploaded_overlay() {
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"stale-upload-lifecycle.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.content_epoch = 7;
+    attr.size = 8192;
+
+    let slices = vec![
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(0, 4096).expect("valid range"),
+            payload: Some(PayloadRef::new_partial(700_101, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        },
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(4096, 8192).expect("valid range"),
+            payload: Some(PayloadRef::new_partial(700_102, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        },
+    ];
+    engine
+        .flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), slices)], Some(&attr))
+        .unwrap();
+    engine
+        .mark_regular_file_overlay_objects_uploaded_if_match(ino, 7, &[700_101, 700_102])
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let mut stale = engine.get_inode_lifecycle(ino).unwrap().unwrap();
+    stale.state = InodeLifecycleState::LocalOnly;
+    RedbMetaEngine::put_inode_lifecycle_in_txn(&txn, &stale).unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(
+        engine.get_inode_lifecycle(ino).unwrap().unwrap().state,
+        InodeLifecycleState::PublishReady
+    );
+}
+
+#[test]
 fn mark_uploaded_overlay_rebuilds_missing_lifecycle_for_already_uploaded_object() {
     let engine = temp_engine();
     let mut attr = engine
@@ -958,10 +1002,7 @@ fn regular_file_overlay_reflush_preserves_uploaded_payload_state() {
     );
 
     engine
-        .flush_regular_file_overlay_slices(
-            ino,
-            &[(ChunkId(0), vec![local_payload_slice(700_004)])],
-        )
+        .flush_regular_file_overlay_slices(ino, &[(ChunkId(0), vec![local_payload_slice(700_004)])])
         .unwrap();
 
     let txn = engine.begin_read_txn().unwrap();
@@ -1093,7 +1134,11 @@ fn regular_file_overlay_batch_does_not_regress_ready_attr_same_epoch() {
 
     assert_eq!(result, vec![None]);
     assert_eq!(engine.get_attr(published.ino).unwrap(), published);
-    assert!(!engine.has_local_regular_file_overlay(published.ino).unwrap());
+    assert!(
+        !engine
+            .has_local_regular_file_overlay(published.ino)
+            .unwrap()
+    );
 }
 
 #[test]

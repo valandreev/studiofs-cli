@@ -75,17 +75,60 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// Return the lifecycle record for one inode, if the table contains it.
+    /// Return the current lifecycle record for one inode, if it is a regular file.
+    ///
+    /// The persisted lifecycle row is a recovery aid, not the source of truth for
+    /// the current overlay state. Upload completion can update overlay slices in
+    /// separate transactions, leaving that row briefly stale; derive the state
+    /// from the same read snapshot used by the foreground metadata.
     pub fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
         let txn = self.begin_read_txn()?;
-        let table = txn
+        let stored_lifecycle = txn
             .open_table(INODE_LIFECYCLE_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        table
+            .map_err(|e| MetaError::Storage(e.to_string()))?
             .get(ino)
             .map_err(|e| MetaError::Storage(e.to_string()))?
-            .map(|value| decode(value.value()))
-            .transpose()
+            .map(|value| decode::<InodeLifecycleRecord>(value.value()))
+            .transpose()?;
+        let Some(stored_lifecycle) = stored_lifecycle else {
+            return Ok(None);
+        };
+
+        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
+        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
+        let attr = match Self::resolve_attr_in_read_snapshot(
+            &txn,
+            ino,
+            &overlay_block_inodes,
+            &overlay_attr_inodes,
+        ) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(Some(stored_lifecycle)),
+            Err(error) => return Err(error),
+        };
+        if attr.kind != FileType::RegularFile {
+            return Ok(Some(stored_lifecycle));
+        }
+
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        if overlay_chunks.is_empty() {
+            return Ok(Some(stored_lifecycle));
+        }
+        let has_published_base =
+            Self::has_regular_file_chunk_rows_in_read_txn(&txn, REGULAR_FILE_BASE_TABLE, ino)?
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0;
+
+        Ok(Some(Self::compute_inode_lifecycle_record(
+            &attr,
+            overlay_chunks.values(),
+            has_published_base,
+            stored_lifecycle.deferred_cleanup_object_ids,
+        )))
     }
 
     /// Return all persisted inode lifecycle rows.
@@ -357,7 +400,21 @@ impl RedbMetaEngine {
             Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?
                 || attr.committed_size > 0
                 || attr.committed_content_epoch > 0;
-        let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
+        Ok(Self::compute_inode_lifecycle_record(
+            attr,
+            overlay_chunks.values(),
+            has_published_base,
+            Vec::new(),
+        ))
+    }
+
+    fn compute_inode_lifecycle_record<'a>(
+        attr: &InodeAttr,
+        overlay_chunks: impl Iterator<Item = &'a RegularFileChunkState>,
+        has_published_base: bool,
+        deferred_cleanup_object_ids: Vec<u64>,
+    ) -> InodeLifecycleRecord {
+        let overlay_state = Self::overlay_lifecycle_state(overlay_chunks);
         let (local_matches_published, blockless_graph_ready) = if overlay_state.is_some() {
             (false, false)
         } else {
@@ -375,7 +432,7 @@ impl RedbMetaEngine {
             blockless_graph_ready,
         );
 
-        Ok(InodeLifecycleRecord {
+        InodeLifecycleRecord {
             ino: attr.ino,
             state,
             local_visible_size: attr.size,
@@ -384,8 +441,8 @@ impl RedbMetaEngine {
             published_content_epoch: attr.committed_content_epoch,
             has_published_base,
             retention,
-            deferred_cleanup_object_ids: Vec::new(),
-        })
+            deferred_cleanup_object_ids,
+        }
     }
 
     fn derive_inode_lifecycle_state_and_retention(
