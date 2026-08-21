@@ -419,7 +419,11 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
     }
 
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
-        mount_point_is_active(&command.mount_point)
+        #[cfg(target_os = "macos")]
+        let active = macos_mount_is_active(&command.client_root, &command.mount_point)?;
+        #[cfg(not(target_os = "macos"))]
+        let active = mount_point_is_active(&command.mount_point)?;
+        Ok(active)
     }
 
     fn cleanup_stale_mount_before_remount(&self, command: &ClientCommand) -> io::Result<()> {
@@ -1212,7 +1216,14 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let command = self.mount_command(index)?;
         self.executor
             .cleanup_stale_mount_before_remount(&command)
-            .map_err(ClientControllerError::Io)
+            .map_err(ClientControllerError::Io)?;
+        wait_for_macos_mount_lock_release(
+            &command.client_root,
+            &command.mount_point,
+            self.config.mount_exit_timeout,
+            self.config.poll_interval,
+        )
+        .map_err(ClientControllerError::Io)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1940,6 +1951,69 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+#[cfg(target_os = "macos")]
+fn macos_mount_is_active(client_root: &Path, mount_point: &Path) -> io::Result<bool> {
+    // macFUSE can detach the filesystem before the killed StudioFS process releases this lock.
+    if mount_point_is_active(mount_point)? {
+        return Ok(true);
+    }
+    macos_mount_lock_is_held(client_root, mount_point)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_lock_is_held(client_root: &Path, mount_point: &Path) -> io::Result<bool> {
+    use fs2::FileExt as _;
+
+    // Keep this path layout aligned with studiofs::cli::utils mount records.
+    let mounts_dir = client_root.join("mounts");
+    fs::create_dir_all(&mounts_dir)?;
+    let lock_path = mounts_dir.join(format!(
+        "{}.lock",
+        mount_point
+            .to_string_lossy()
+            .replace(['\\', '/', ':'], "_")
+            .trim_matches('_')
+            .to_lowercase()
+    ));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_mount_lock_release(
+    client_root: &Path,
+    mount_point: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !macos_mount_lock_is_held(client_root, mount_point)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "macOS mount lifecycle lock was not released for '{}' within {} ms",
+                    mount_point.display(),
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        std::thread::sleep(poll_interval.max(Duration::from_millis(1)));
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn mountinfo_contains_mount_point(mountinfo: &[u8], path: &Path) -> bool {
     mountinfo.split(|byte| *byte == b'\n').any(|line| {
@@ -2455,6 +2529,48 @@ mod tests {
                 .any(|(program, args, _)| *program == "umount" && *args == ["-f"]),
             "macOS stale mount cleanup should fall back to forced umount"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mount_readiness_sees_lifecycle_lock_after_fuse_detaches() {
+        use fs2::FileExt as _;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let client_root = temp.path().join("client-root");
+        let lock_path = client_root
+            .join("mounts")
+            .join("tmp_studiofs-e2e-lock-probe.lock");
+        fs::create_dir_all(lock_path.parent().expect("lock parent"))
+            .expect("create client mounts directory");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(lock_path)
+            .expect("open lifecycle lock");
+        lock.try_lock_exclusive().expect("hold lifecycle lock");
+        let mount_point = Path::new("/tmp/studiofs-e2e-lock-probe");
+
+        assert!(macos_mount_is_active(&client_root, mount_point).expect("probe active mount"));
+        let error = wait_for_macos_mount_lock_release(
+            &client_root,
+            mount_point,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect_err("held lifecycle lock should not be reported as released");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        drop(lock);
+        assert!(!macos_mount_is_active(&client_root, mount_point).expect("probe inactive mount"));
+        wait_for_macos_mount_lock_release(
+            &client_root,
+            mount_point,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect("released lifecycle lock should be reusable");
     }
 
     #[cfg(target_os = "macos")]
