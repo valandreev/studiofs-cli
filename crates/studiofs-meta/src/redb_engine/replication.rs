@@ -929,15 +929,34 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                    let mut current = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                        &txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        *ino,
+                    )?;
                     for (chunk_id, slices) in chunk_slices {
-                        Self::set_regular_file_chunk_state_in_txn(
+                        // Pending-state replay can apply a stale whole-chunk snapshot after an
+                        // upload completion. Immutable payload completion is monotonic, so keep
+                        // the newer local state for the same payload reference.
+                        let mut slices = slices.clone();
+                        if let Some(current) = current.get(chunk_id) {
+                            for slice in &mut slices {
+                                Self::preserve_completed_overlay_payload_state(current, slice);
+                            }
+                        }
+                        let next = Self::set_regular_file_chunk_state_in_txn(
                             &txn,
                             REGULAR_FILE_OVERLAY_TABLE,
                             true,
                             *ino,
                             *chunk_id,
-                            slices,
+                            &slices,
                         )?;
+                        if let Some(next) = next {
+                            current.insert(*chunk_id, next);
+                        } else {
+                            current.remove(chunk_id);
+                        }
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {

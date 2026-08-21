@@ -1173,6 +1173,86 @@ fn replica_serving_base_publish_preserves_unpublished_local_overlay() {
 }
 
 #[test]
+fn replica_serving_overlay_replay_preserves_uploaded_payload_state() {
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"replica-serving-stale-overlay.bin", 1000, 1000, 0o644)
+        .unwrap();
+    attr.content_epoch = 7;
+    attr.size = 8192;
+
+    let first = PayloadRef::new_partial(91_101, 4096);
+    let second = PayloadRef::new_partial(91_102, 4096);
+    engine
+        .flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![
+                    SliceRecord::new(
+                        SliceId::default(),
+                        SliceOrder::default(),
+                        SliceRange::new(0, 4096).unwrap(),
+                        first,
+                    ),
+                    SliceRecord::new(
+                        SliceId::default(),
+                        SliceOrder::default(),
+                        SliceRange::new(4096, 8192).unwrap(),
+                        second,
+                    ),
+                ],
+            )],
+            Some(&attr),
+        )
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, attr.ino, 7, &[first.object_id]);
+
+    let chunk_key = encode_regular_file_chunk_key(attr.ino, ChunkId(0));
+    let stale_slices = {
+        let txn = engine.begin_read_txn().unwrap();
+        let table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let row = table
+            .get(chunk_key.as_slice())
+            .unwrap()
+            .expect("uploaded overlay chunk");
+        let mut chunk: RegularFileChunkState = decode(row.value()).unwrap();
+        chunk
+            .slices
+            .values_mut()
+            .find(|slice| slice.payload == Some(first))
+            .expect("first payload slice")
+            .payload_state = PayloadRefState::LocalOnly;
+        chunk.slices.values().cloned().collect::<Vec<_>>()
+    };
+
+    engine
+        .apply_replica_serving_state(&[MetaEvent::SetRegularFileOverlaySlices {
+            ino: attr.ino,
+            chunk_slices: vec![(ChunkId(0), stale_slices)],
+        }])
+        .unwrap();
+
+    let txn = engine.begin_read_txn().unwrap();
+    let table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+    let row = table
+        .get(chunk_key.as_slice())
+        .unwrap()
+        .expect("replayed overlay chunk");
+    let chunk: RegularFileChunkState = decode(row.value()).unwrap();
+    assert_eq!(
+        chunk
+            .slices
+            .values()
+            .find(|slice| slice.payload == Some(first))
+            .expect("first payload after replay")
+            .payload_state,
+        PayloadRefState::Uploaded,
+        "stale serving replay must not roll back an upload completion"
+    );
+}
+
+#[test]
 fn replica_serving_ready_attr_after_publish_replaces_stale_overlay_payload() {
     let engine = temp_engine();
     let file = engine

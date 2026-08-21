@@ -656,7 +656,7 @@ impl RedbMetaEngine {
         Ok(true)
     }
 
-    fn preserve_completed_overlay_payload_state(
+    pub(super) fn preserve_completed_overlay_payload_state(
         state: &RegularFileChunkState,
         new_slice: &mut crate::schema::SliceRecord,
     ) {
