@@ -28,8 +28,8 @@ use plans::{CreateCallbackPlan, RenameCallbackPlan};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, MetaError, ROOT_INO};
 use studiofs_vfs::{
-    BridgeVfsErrorKind, LocalSyncPolicy, NamespacePathStyle, OpenFlags, StudioVfs, VfsError,
-    classify_vfs_error, is_hidden_platform_root_metadata_name, normalize_attr_times,
+    BridgeVfsErrorKind, LocalSyncPolicy, NamespacePathStyle, OpenFlags, ReadAheadOwner, StudioVfs,
+    VfsError, classify_vfs_error, is_hidden_platform_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
@@ -365,6 +365,14 @@ fn should_disable_winfsp_file_cache(
     // example Total Commander). Keep WinFSP cache writeback out of every
     // write-capable handle so lazy writes cannot arrive after close.
     open_flags_allow_write(open_flags) || truncates_on_open || requested_uncached
+}
+
+fn read_ahead_owner_for_winfsp_handle(disable_os_cache: bool) -> ReadAheadOwner {
+    if disable_os_cache {
+        ReadAheadOwner::Vfs
+    } else {
+        ReadAheadOwner::Kernel
+    }
 }
 
 fn winfsp_read_cache_diagnostics_enabled() -> bool {
@@ -1149,6 +1157,7 @@ impl StudioFsContext {
         open_flags: OpenFlags,
         trunc: bool,
         write_local_sync_policy: LocalSyncPolicy,
+        read_ahead_owner: ReadAheadOwner,
     ) -> winfsp::Result<StudioFileHandle> {
         let is_dir = attr.kind == FileType::Directory;
         let fh = if self.vfs.is_runtime_stats_file_ino(attr.ino) {
@@ -1163,7 +1172,7 @@ impl StudioFsContext {
             0
         } else {
             self.vfs
-                .open_file(attr.ino, open_flags, trunc)
+                .open_file_with_read_ahead_owner(attr.ino, open_flags, trunc, read_ahead_owner)
                 .map_err(vfs_to_winfsp_err)?
         };
         let handle = StudioFileHandle::new_with_local_sync_policy(
@@ -1300,6 +1309,13 @@ impl StudioFsContext {
         } else {
             let truncates_on_open =
                 should_truncate_existing_file_on_open(plan.create_options, plan.open_flags);
+            let disable_os_cache = should_disable_winfsp_file_cache(
+                attr.kind == FileType::Directory,
+                plan.open_flags,
+                truncates_on_open,
+                plan.create_options,
+                plan.file_attributes,
+            );
             let handle = PendingStudioFileHandle::new(
                 self,
                 self.open_file_handle_for_attr(
@@ -1307,6 +1323,7 @@ impl StudioFsContext {
                     plan.open_flags,
                     false,
                     plan.write_local_sync_policy,
+                    read_ahead_owner_for_winfsp_handle(disable_os_cache),
                 )?,
             );
             if truncates_on_open
@@ -1582,23 +1599,30 @@ impl FileSystemContext for StudioFsContext {
         let attr = resolve_path(&self.vfs, file_name)?;
         let write_local_sync_policy =
             write_local_sync_policy_from_create_options(raw_create_options);
+        let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
+            || should_disable_winfsp_file_cache(
+                attr.kind == FileType::Directory,
+                open_flags,
+                trunc,
+                raw_create_options,
+                0,
+            );
         Self::write_open_file_info(file_info, &attr);
         let mut handle = PendingStudioFileHandle::new(
             self,
-            self.open_file_handle_for_attr(&attr, open_flags, false, write_local_sync_policy)?,
+            self.open_file_handle_for_attr(
+                &attr,
+                open_flags,
+                false,
+                write_local_sync_policy,
+                read_ahead_owner_for_winfsp_handle(disable_os_cache),
+            )?,
         );
         if trunc
             && let Err(error) = self.truncate_open_handle_after_open(handle.handle(), file_info)
         {
             return Err(error);
         }
-        let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
-            || self.should_disable_os_cache_for_handle(
-                handle.handle(),
-                trunc,
-                raw_create_options,
-                0,
-            );
         handle.handle_mut().set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
@@ -1674,6 +1698,7 @@ impl FileSystemContext for StudioFsContext {
                 open_flags,
                 false,
                 write_local_sync_policy_from_create_parameters(create_options, file_attributes),
+                ReadAheadOwner::Vfs,
             )?;
             handle.set_disable_os_cache(true);
             self.vfs.note_winfsp_os_cache_open(true);
@@ -2341,7 +2366,9 @@ mod tests {
         MetadataConfig, ROOT_INO, RedbMetaEngine, TimeSpec,
     };
     use studiofs_meta::{FileLockLease, HardLockKind, MetaError};
-    use studiofs_vfs::{KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig};
+    use studiofs_vfs::{
+        KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StudioVfs, VfsConfig,
+    };
     use studiofs_vfs::{RUNTIME_STATS_FILE_INO, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
@@ -2670,6 +2697,32 @@ mod tests {
     }
 
     #[test]
+    fn read_only_open_uses_kernel_readahead_owner() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("read-only-kernel-readahead");
+        vfs.create(ROOT_INO, b"read-only.txt", 0, 0, 0o644)
+            .expect("create file");
+
+        let file_name = U16CString::from_str(r"\read-only.txt").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut file_info,
+        )
+        .expect("open existing file read-only");
+
+        assert_eq!(
+            vfs.read_ahead_owner(handle.fh),
+            Some(ReadAheadOwner::Kernel),
+            "WinFSP cacheable read-only handles must leave readahead to the OS cache"
+        );
+
+        <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+    }
+
+    #[test]
     fn non_truncating_readwrite_open_disables_winfsp_file_cache() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("readwrite-open-disables-cache");
         vfs.create(ROOT_INO, b"existing.txt", 0, 0, 0o644)
@@ -2690,6 +2743,11 @@ mod tests {
         assert!(
             handle.disable_os_cache,
             "all write-capable opens must bypass cache-manager writeback"
+        );
+        assert_eq!(
+            vfs.read_ahead_owner(handle.fh),
+            Some(ReadAheadOwner::Vfs),
+            "write-capable handles must retain VFS readahead ownership"
         );
     }
 
