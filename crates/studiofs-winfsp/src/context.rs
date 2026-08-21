@@ -367,12 +367,12 @@ fn should_disable_winfsp_file_cache(
     open_flags_allow_write(open_flags) || truncates_on_open || requested_uncached
 }
 
-fn read_ahead_owner_for_winfsp_handle(disable_os_cache: bool) -> ReadAheadOwner {
-    if disable_os_cache {
-        ReadAheadOwner::Vfs
-    } else {
-        ReadAheadOwner::Kernel
-    }
+fn read_ahead_owner_for_winfsp_handle() -> ReadAheadOwner {
+    // WinFSP's cache-manager caches the exposed mount, while the VFS still
+    // owns the separate local payload cache. Keep VFS prefetch enabled even
+    // for cacheable read-only handles so a cold local payload is warmed before
+    // the next WinFSP read callback arrives.
+    ReadAheadOwner::Vfs
 }
 
 fn winfsp_read_cache_diagnostics_enabled() -> bool {
@@ -1309,13 +1309,6 @@ impl StudioFsContext {
         } else {
             let truncates_on_open =
                 should_truncate_existing_file_on_open(plan.create_options, plan.open_flags);
-            let disable_os_cache = should_disable_winfsp_file_cache(
-                attr.kind == FileType::Directory,
-                plan.open_flags,
-                truncates_on_open,
-                plan.create_options,
-                plan.file_attributes,
-            );
             let handle = PendingStudioFileHandle::new(
                 self,
                 self.open_file_handle_for_attr(
@@ -1323,7 +1316,7 @@ impl StudioFsContext {
                     plan.open_flags,
                     false,
                     plan.write_local_sync_policy,
-                    read_ahead_owner_for_winfsp_handle(disable_os_cache),
+                    read_ahead_owner_for_winfsp_handle(),
                 )?,
             );
             if truncates_on_open
@@ -1615,7 +1608,7 @@ impl FileSystemContext for StudioFsContext {
                 open_flags,
                 false,
                 write_local_sync_policy,
-                read_ahead_owner_for_winfsp_handle(disable_os_cache),
+                read_ahead_owner_for_winfsp_handle(),
             )?,
         );
         if trunc
@@ -2697,8 +2690,8 @@ mod tests {
     }
 
     #[test]
-    fn read_only_open_uses_kernel_readahead_owner() {
-        let (_tmp, vfs, ctx, _queue) = make_test_context("read-only-kernel-readahead");
+    fn read_only_open_uses_vfs_readahead_owner() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("read-only-vfs-readahead");
         vfs.create(ROOT_INO, b"read-only.txt", 0, 0, 0o644)
             .expect("create file");
 
@@ -2715,8 +2708,8 @@ mod tests {
 
         assert_eq!(
             vfs.read_ahead_owner(handle.fh),
-            Some(ReadAheadOwner::Kernel),
-            "WinFSP cacheable read-only handles must leave readahead to the OS cache"
+            Some(ReadAheadOwner::Vfs),
+            "WinFSP cacheable read-only handles still need VFS prefetch for the local payload cache"
         );
 
         <StudioFsContext as FileSystemContext>::close(&ctx, handle);
