@@ -1974,6 +1974,38 @@ mod tests {
     }
 
     #[test]
+    fn build_overlay_slice_records_deduplicates_repeated_payload_reference() {
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(events, false, false, None, uploads, observed_inodes);
+        let range = studiofs_meta::schema::SliceRange::new(0, 4096).expect("slice range");
+        let mut dirty_chunk_slices = std::collections::BTreeMap::new();
+        dirty_chunk_slices.insert(
+            0,
+            vec![PendingDirtySlice::persisted(range, 0, 0, 9001, 9001, 0)],
+        );
+
+        let records = drain
+            .build_overlay_slice_records(
+                41,
+                &[PersistedPayloadEntry::from_payload(
+                    0,
+                    9001,
+                    Bytes::from(vec![0xAB; 4096]),
+                )],
+                dirty_chunk_slices,
+            )
+            .expect("repeated payload reference should be accepted");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1.len(), 1);
+        let payload = records[0].1[0].payload.as_ref().expect("payload");
+        assert_eq!(payload.object_id, 9001);
+        assert!(payload.flags.is_empty());
+    }
+
+    #[test]
     fn pending_dirty_slice_order_key_uses_range_end_and_object_id_ties() {
         let first = PendingDirtySlice::persisted(
             studiofs_meta::schema::SliceRange::new(0, 4096).expect("short range"),

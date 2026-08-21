@@ -548,9 +548,8 @@ pub(super) struct FileSessionPermit {
     _read_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     /// Write side lock guard held while the operation is active.
     _write_gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
-    /// Background-materialization guard held while an opportunistic drain is active.
-    _materialize_read_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    /// Barrier guard that waits for active background materialization.
+    /// Per-inode materialization guard held while an opportunistic drain or
+    /// durability barrier is active.
     _materialize_write_gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
     /// Shared counters used by the permit.
     counters: Arc<FileSessionCounters>,
@@ -567,7 +566,6 @@ impl Drop for FileSessionPermit {
         // observe lower tail latency on contended inodes.
         drop(self._read_gate.take());
         drop(self._write_gate.take());
-        drop(self._materialize_read_gate.take());
         drop(self._materialize_write_gate.take());
         drop(self._finalize_gate.take());
         self.session.note_active_finish(self.op);
@@ -707,16 +705,12 @@ impl FileSessionState {
         } else {
             None
         };
-        let materialize_write_guard = if op.blocks_materialize() {
-            Some(session.materialize_gate.clone().write_owned().await)
-        } else {
-            None
-        };
-        let materialize_read_guard = if op == FileSessionOperation::Materialize {
-            Some(session.materialize_gate.clone().read_owned().await)
-        } else {
-            None
-        };
+        let materialize_write_guard =
+            if op.blocks_materialize() || op == FileSessionOperation::Materialize {
+                Some(session.materialize_gate.clone().write_owned().await)
+            } else {
+                None
+            };
         let (read_guard, write_guard) = if op == FileSessionOperation::Materialize {
             (None, None)
         } else if op.shared_lock() {
@@ -756,7 +750,6 @@ impl FileSessionState {
             _finalize_gate: finalize_guard,
             _read_gate: read_guard,
             _write_gate: write_guard,
-            _materialize_read_gate: materialize_read_guard,
             _materialize_write_gate: materialize_write_guard,
             counters,
             session,

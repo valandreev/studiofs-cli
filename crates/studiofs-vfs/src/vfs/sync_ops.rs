@@ -506,6 +506,16 @@ impl StudioVfs {
         self.track_background_task(tokio::spawn(async move {
             let _guard = guard;
             let ino = entry.ino;
+            // Local-dirty drains mutate the inode's pending payload/slice
+            // state and commit an overlay snapshot. Serialize this task with
+            // the periodic local-dirty worker through the same per-inode
+            // materialization gate; otherwise both workers can snapshot the
+            // same state before either one retires it.
+            let session = vfs
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Materialize)
+                .await;
             let mut no_progress_retries = 0usize;
             let (mut allow_reschedule_on_exit, linger_interrupted) = loop {
                 match vfs
@@ -555,6 +565,8 @@ impl StudioVfs {
                 }
             }
 
+            drop(session);
+            vfs.state.file_session.gc_if_idle(ino);
             vfs.finish_deferred_materialization_task(entry, allow_reschedule_on_exit);
         }));
     }
@@ -840,6 +852,10 @@ impl StudioVfs {
             return result;
         }
 
+        // Release blocks materialization, so join the deferred materializer
+        // before acquiring the release gate or the two operations can wait on
+        // each other.
+        self.wait_for_deferred_materialization_inflight(ino).await;
         let session = self
             .state
             .file_session
@@ -888,6 +904,9 @@ impl StudioVfs {
             let _os_cache_writer_lease = os_cache_writer_lease;
             let _os_cache_foreground_read_lease = os_cache_foreground_read_lease;
             tokio::task::yield_now().await;
+            // Release blocks materialization; join the deferred materializer
+            // first so it can drop that gate before this barrier acquires it.
+            vfs.wait_for_deferred_materialization_inflight(ino).await;
             let session = vfs
                 .state
                 .file_session
@@ -1209,7 +1228,7 @@ impl StudioVfs {
             self.wait_for_deferred_namespace_metadata(open_file.ino)
         );
         metadata_result?;
-        // A materializer may hold the session's read-side materialize gate.
+        // A materializer may hold the session's per-inode materialize gate.
         // Interrupt it before Flush tries to acquire the write-side gate, or
         // the barrier can wait on a task that it has already blocked.
         self.wait_for_deferred_materialization_inflight(open_file.ino)

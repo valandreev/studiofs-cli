@@ -234,7 +234,9 @@ where
                 for slice in slices {
                     if let Some(object_id) = slice.object_id {
                         let slice_len = slice.range.len();
-                        chunks.entry(chunk_id).or_default().push(
+                        append_unique_overlay_slice_record(
+                            &mut chunks,
+                            chunk_id,
                             studiofs_meta::schema::SliceRecord {
                                 slice_id: studiofs_meta::schema::SliceId::default(),
                                 order: studiofs_meta::schema::SliceOrder::default(),
@@ -385,10 +387,10 @@ where
                     ),
                 ))
             })?;
-            chunks
-                .entry(chunk_id)
-                .or_default()
-                .push(studiofs_meta::schema::SliceRecord {
+            append_unique_overlay_slice_record(
+                chunks,
+                chunk_id,
+                studiofs_meta::schema::SliceRecord {
                     slice_id: studiofs_meta::schema::SliceId::default(),
                     order: studiofs_meta::schema::SliceOrder::default(),
                     range: slice_range,
@@ -399,7 +401,8 @@ where
                         flags,
                     }),
                     payload_state: studiofs_meta::schema::PayloadRefState::LocalOnly,
-                });
+                },
+            );
             file_pos = file_pos.checked_add(slice_len).ok_or_else(|| {
                 crate::VfsError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -513,6 +516,44 @@ where
         }
 
         Ok(DrainOutcome { persisted_blocks })
+    }
+}
+
+fn append_unique_overlay_slice_record(
+    chunks: &mut std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>>,
+    chunk_id: u64,
+    record: studiofs_meta::schema::SliceRecord,
+) {
+    let slices = chunks.entry(chunk_id).or_default();
+    let Some(existing) = slices.iter_mut().find(|existing| {
+        existing.range == record.range
+            && existing.payload_state == record.payload_state
+            && same_overlay_payload_reference(existing.payload, record.payload)
+    }) else {
+        slices.push(record);
+        return;
+    };
+    // A pending persisted slice marks every object as partial, while the
+    // block-snapshot path can prove that the same object covers a full block.
+    // Keep the later, more precise reference when both describe the same
+    // immutable object span.
+    if existing.payload != record.payload {
+        *existing = record;
+    }
+}
+
+fn same_overlay_payload_reference(
+    left: Option<studiofs_meta::schema::PayloadRef>,
+    right: Option<studiofs_meta::schema::PayloadRef>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.object_id == right.object_id
+                && left.offset == right.offset
+                && left.length == right.length
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 

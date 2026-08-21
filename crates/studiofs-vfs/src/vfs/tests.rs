@@ -1571,6 +1571,39 @@ fn opportunistic_write_does_not_wait_for_background_materialize_session() {
 }
 
 #[test]
+fn materialize_sessions_are_exclusive_per_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "exclusive-materialize-session");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"exclusive-materialize-session.bin", 0, 0, 0o644)
+            .expect("create file");
+        let first = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        let waiting_vfs = Arc::clone(&vfs);
+        let mut second = tokio::spawn(async move {
+            waiting_vfs
+                .state
+                .file_session
+                .enter_op(attr.ino, FileSessionOperation::Materialize)
+                .await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(50), &mut second)
+            .await
+            .expect_err("same-inode materialize operations must not overlap");
+        drop(first);
+        second
+            .await
+            .expect("second materialize operation should finish");
+    });
+}
+
+#[test]
 fn durability_barrier_still_waits_for_background_materialize_session() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-during-materialize");
@@ -16037,6 +16070,13 @@ fn strict_flush_interrupts_clean_deferred_materialization_linger() {
         })
         .await
         .expect("materializer should enter the clean coalescing window");
+        assert!(
+            vfs.state
+                .file_session
+                .debug_snapshot(ino)
+                .is_some_and(|snapshot| snapshot.active_shared_locks > 0),
+            "deferred materializer must hold the per-inode file-session materialize gate"
+        );
         tokio::time::timeout(Duration::from_secs(2), vfs.flush_fh(fh))
             .await
             .expect("strict flush must wake the clean-linger branch")
@@ -16100,7 +16140,7 @@ fn strict_flush_interrupts_materializer_before_file_session_gate() {
             }
         })
         .await
-        .expect("materializer should hold the file-session read gate");
+        .expect("materializer should hold the file-session materialize gate");
 
         let flush_result = tokio::time::timeout(Duration::from_secs(2), vfs.flush_fh(fh)).await;
         if flush_result.is_err() {
