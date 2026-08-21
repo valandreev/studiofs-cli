@@ -977,8 +977,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     /// Cleans up stale mount artifacts and remounts a named client.
     pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
-        let command = self.mount_command(index)?;
-        self.executor.cleanup_stale_mount_before_remount(&command)?;
+        #[cfg(target_os = "macos")]
+        self.cleanup_stale_mount(index)?;
+        #[cfg(not(target_os = "macos"))]
+        self.executor
+            .cleanup_stale_mount_before_remount(&self.mount_command(index)?)?;
         self.mount_index(index)
     }
 

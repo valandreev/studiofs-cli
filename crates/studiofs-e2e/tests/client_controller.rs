@@ -11,6 +11,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use fs2::FileExt as _;
 use studiofs_e2e::client::{
     ClientCommand, ClientCommandOutput, ClientControllerConfig, ClientControllerError,
     ClientLifecycleState, ClientProcess, ClientProcessExecutor, MultiClientController,
@@ -763,6 +765,49 @@ fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
             .any(|call| call.client == "client-a" && call.action == "umount"),
         "abrupt crash recovery must not model a clean unmount"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn remount_waits_for_lifecycle_lock_after_stale_cleanup() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let mut config = test_config(temp.path());
+    config.mount_exit_timeout = Duration::from_millis(1);
+    let executor = RecordingExecutor::new();
+    let mut controller = MultiClientController::new(config, executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+    controller.force_kill("client-a").unwrap();
+
+    let client = &controller.clients()[0];
+    let lock_name = client
+        .mount_point
+        .to_string_lossy()
+        .replace(['\\', '/', ':'], "_")
+        .trim_matches('_')
+        .to_lowercase();
+    let lock_path = client
+        .client_root
+        .join("mounts")
+        .join(format!("{lock_name}.lock"));
+    std::fs::create_dir_all(lock_path.parent().expect("lock parent")).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    let error = controller
+        .remount("client-a")
+        .expect_err("remount must wait for the stale lifecycle lock");
+    assert!(matches!(
+        error,
+        ClientControllerError::Io(source) if source.kind() == io::ErrorKind::TimedOut
+    ));
 }
 
 #[test]
