@@ -2000,14 +2000,16 @@ fn wait_for_macos_mount_lock_release(
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if !macos_mount_lock_is_held(client_root, mount_point)? {
+        let mount_active = macos_mount_is_active(mount_point)?;
+        let lock_held = macos_mount_lock_is_held(client_root, mount_point)?;
+        if !mount_active && !lock_held {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "macOS mount lifecycle lock was not released for '{}' within {} ms",
+                    "macOS mount or lifecycle lock was not released for '{}' within {} ms",
                     mount_point.display(),
                     timeout.as_millis()
                 ),
@@ -2576,6 +2578,28 @@ mod tests {
             Duration::ZERO,
         )
         .expect("released lifecycle lock should be reusable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_remount_waits_for_mount_detach_after_lifecycle_lock_release() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let client_root = temp.path().join("client-root");
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mount_point = manifest_dir
+            .ancestors()
+            .find(|path| macos_mount_is_active(path).expect("probe mount activity"))
+            .expect("test checkout must be on a mounted filesystem")
+            .to_path_buf();
+
+        let error = wait_for_macos_mount_lock_release(
+            &client_root,
+            &mount_point,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect_err("remount must wait for an active mount even after its lock is free");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[cfg(target_os = "macos")]
