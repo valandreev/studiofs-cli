@@ -370,7 +370,7 @@ mod tests {
         assert!(mount_args.iter().any(|arg| arg == "-osparse"));
         assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
         assert!(!mount_args.iter().any(|arg| arg == "-onolocalcaches"));
-        assert!(!mount_args.iter().any(|arg| arg == "-oauto_cache"));
+        assert!(mount_args.iter().any(|arg| arg == "-oauto_cache"));
         let expected_geometry = super::low_level::MACOS_FUSE_IOSIZE_BYTES;
         assert!(
             mount_args

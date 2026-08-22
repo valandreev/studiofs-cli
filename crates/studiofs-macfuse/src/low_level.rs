@@ -491,6 +491,7 @@ impl SessionConfig {
             format!("-ovolname={}", self.volume_name),
             "-olocal".to_owned(),
             "-onovncache".to_owned(),
+            "-oauto_cache".to_owned(),
             format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"),
             format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"),
             "-odefer_permissions".to_owned(),
@@ -847,13 +848,8 @@ impl SessionInvalidationQueue {
             .name("studiofs-macfuse-invalidation".to_string())
             .spawn(move || {
                 while let Some(invalidation) = worker_queue.next() {
-                    notify_inode_range(
-                        channel,
-                        &invalidation_state,
-                        invalidation.ino,
-                        if invalidation.data { 0 } else { -1 },
-                        if invalidation.data { -1 } else { 0 },
-                    );
+                    let (offset, len) = invalidation_range(invalidation.data);
+                    notify_inode_range(channel, &invalidation_state, invalidation.ino, offset, len);
                 }
             })?;
         *queue.worker.lock() = Some(worker);
@@ -1089,6 +1085,10 @@ impl KernelInvalidator for MacFuseKernelInvalidator {
     fn reset_diagnostics(&self) {
         self.queue.reset_metrics();
     }
+}
+
+fn invalidation_range(data: bool) -> (off_t, off_t) {
+    if data { (0, 0) } else { (-1, 0) }
 }
 
 fn notify_inode_range(
@@ -1899,6 +1899,12 @@ mod tests {
                 data: false,
             })
         );
+    }
+
+    #[test]
+    fn macfuse_data_invalidation_uses_zero_length_for_the_whole_cache() {
+        assert_eq!(invalidation_range(true), (0, 0));
+        assert_eq!(invalidation_range(false), (-1, 0));
     }
 
     #[test]

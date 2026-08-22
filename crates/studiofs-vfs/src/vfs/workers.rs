@@ -716,6 +716,7 @@ impl StudioVfs {
                 .into_iter()
                 .map(|upload| upload.ino),
         );
+        inodes.extend(self.os_cache.lock().generation_inodes());
         inodes
     }
 

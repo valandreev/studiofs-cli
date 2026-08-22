@@ -1,6 +1,6 @@
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use studiofs_meta::schema::{
@@ -258,6 +258,10 @@ impl OsCacheState {
     #[cfg(test)]
     pub(crate) fn has_generation(&self, ino: Ino) -> bool {
         self.generations.contains(&ino)
+    }
+
+    pub(crate) fn generation_inodes(&self) -> HashSet<Ino> {
+        self.generations.iter().map(|(ino, _)| *ino).collect()
     }
 
     pub(crate) fn end_writer(&mut self, ino: Ino) {

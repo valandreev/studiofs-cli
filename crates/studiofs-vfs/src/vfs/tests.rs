@@ -10628,6 +10628,7 @@ fn namespace_invalidation_includes_runtime_only_inodes() {
     rt.block_on(async {
         let dirty = vfs.create(1, b"dirty-runtime-only.bin", 0, 0, 0o644).unwrap();
         let cached = vfs.create(1, b"cached-runtime-only.bin", 0, 0, 0o644).unwrap();
+        let os_cached = vfs.create(1, b"os-cached-runtime-only.bin", 0, 0, 0o644).unwrap();
 
         let mut dirty_attr = dirty.clone();
         dirty_attr.size = 227;
@@ -10643,6 +10644,28 @@ fn namespace_invalidation_includes_runtime_only_inodes() {
             ATTR_CACHE_TTL,
             Instant::now(),
         );
+        let cached_fh = vfs
+            .open_file(cached.ino, OpenFlags::RDONLY, false)
+            .expect("open cached runtime-only inode");
+        assert_eq!(
+            vfs.prepare_os_cache_open(cached_fh, OsCacheParticipation::Enabled)
+                .disposition(),
+            OsCacheDisposition::Replace
+        );
+        vfs.release_fh(cached_fh).await.expect("release cached inode");
+        let os_cached_fh = vfs
+            .open_file(os_cached.ino, OpenFlags::RDONLY, false)
+            .expect("open OS-cached runtime-only inode");
+        assert_eq!(
+            vfs.prepare_os_cache_open(os_cached_fh, OsCacheParticipation::Enabled)
+                .disposition(),
+            OsCacheDisposition::Replace
+        );
+        vfs.release_fh(os_cached_fh)
+            .await
+            .expect("release OS-cached inode");
+        vfs.state.namespace.dirty_attrs.lock().remove(&os_cached.ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(os_cached.ino);
 
         let inodes = vfs.runtime_namespace_invalidation_inodes();
 
@@ -10653,6 +10676,10 @@ fn namespace_invalidation_includes_runtime_only_inodes() {
         assert!(
             inodes.contains(&cached.ino),
             "namespace invalidation must include attr/read cache keys whose path may have been replaced by remote rename reconciliation"
+        );
+        assert!(
+            inodes.contains(&os_cached.ino),
+            "namespace invalidation must include OS-cache generations for observed inodes that remote metadata may have removed"
         );
     });
 }
