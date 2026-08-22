@@ -5116,6 +5116,11 @@ mod tests {
             "a prepared notification must remain in flight until it is published"
         );
         drop(notifications);
+        assert!(
+            !queue.wait_for_quiescence(Duration::from_millis(1)),
+            "an unpublished notification must remain queued for retry"
+        );
+        assert_eq!(queue.drain(), vec![file.ino]);
         assert!(queue.wait_for_quiescence(Duration::from_secs(1)));
     }
 
