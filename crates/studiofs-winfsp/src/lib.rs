@@ -712,6 +712,16 @@ fn winfsp_host_drop_timeout() -> std::time::Duration {
         .unwrap_or(DEFAULT_TIMEOUT)
 }
 
+fn winfsp_async_callback_drain_timeout() -> std::time::Duration {
+    const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    std::env::var("STUDIOFS_WINFSP_ASYNC_CALLBACK_DRAIN_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_TIMEOUT)
+}
+
 /// Start the WinFSP filesystem, mount, and block until unmounted.
 ///
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
@@ -769,6 +779,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
         )
     }
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP context: {err}")))?;
+    let async_callback_tracker = context.async_callback_tracker();
 
     // Use `new_with_timer_async` so read/write/readdir can return
     // STATUS_PENDING and complete from the Tokio runtime without parking
@@ -877,6 +888,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     tracing::info!("unmounting StudioFS from {mount_point}");
     vfs.clear_kernel_invalidator();
     invalidation_queue.close();
+    async_callback_tracker.close();
     // Graceful shutdown: first drain VFS background work so
     // metadata engines (pg/redb) can stop their threads and be closed cleanly
     // before the kernel unmounts the filesystem. Use the same env var as the
@@ -888,7 +900,22 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     let upload_drain_timeout = std::time::Duration::from_secs(upload_secs);
     // Stop WinFSP before the VFS shutdown drain so late callbacks cannot race
     // after the local metadata/cache checkpoint has been flushed.
+    let callback_drain_timeout = winfsp_async_callback_drain_timeout();
     stop_host_before_vfs_shutdown_and_process_exit(host, || {
+        let drain_started = std::time::Instant::now();
+        if !async_callback_tracker.wait_for_quiescence(callback_drain_timeout) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "WinFSP async callbacks did not quiesce within {} ms",
+                    callback_drain_timeout.as_millis()
+                ),
+            ));
+        }
+        tracing::info!(
+            elapsed_ms = drain_started.elapsed().as_millis(),
+            "WinFSP async callbacks quiescent before VFS shutdown"
+        );
         runtime_handle
             .block_on(vfs.shutdown(upload_drain_timeout))
             .map_err(|error| std::io::Error::other(format!("VFS shutdown failed: {error}")))

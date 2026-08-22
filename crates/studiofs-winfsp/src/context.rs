@@ -23,7 +23,7 @@ use invalidation::{
     FILE_NOTIFY_CHANGE_SIZE, build_notify_info, ino_to_windows_path, notify_filter_for_kind,
 };
 pub use invalidation::{WinfspInvalidationQueue, WinfspKernelInvalidator};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use plans::{CreateCallbackPlan, RenameCallbackPlan};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, MetaError, ROOT_INO};
@@ -89,10 +89,92 @@ const STATUS_IO_TIMEOUT: NTSTATUS = NTSTATUS(0xC000_00B5_u32 as i32);
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = NTSTATUS(0xC000_009A_u32 as i32);
 const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001_u32 as i32);
 const STATUS_INVALID_PARAMETER: NTSTATUS = NTSTATUS(0xC000_000D_u32 as i32);
+const STATUS_CANCELLED: NTSTATUS = NTSTATUS(0xC000_0120_u32 as i32);
 const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 const STATUS_EA_TOO_LARGE: NTSTATUS = NTSTATUS(0xC000_0050_u32 as i32);
 const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
+
+#[derive(Debug, Default)]
+struct AsyncCallbackState {
+    closed: bool,
+    in_flight: usize,
+}
+
+/// Tracks async WinFSP operations that retain an Arc<StudioVfs> after the
+/// native callback has returned STATUS_PENDING.
+pub(crate) struct WinfspAsyncCallbackTracker {
+    state: Mutex<AsyncCallbackState>,
+    quiescent: Condvar,
+}
+
+impl WinfspAsyncCallbackTracker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AsyncCallbackState::default()),
+            quiescent: Condvar::new(),
+        }
+    }
+
+    fn try_enter(self: &Arc<Self>) -> winfsp::Result<AsyncCallbackGuard> {
+        let mut state = self.state.lock();
+        if state.closed {
+            return Err(winfsp::FspError::from(STATUS_CANCELLED));
+        }
+        state.in_flight = state.in_flight.saturating_add(1);
+        Ok(AsyncCallbackGuard {
+            tracker: Arc::clone(self),
+        })
+    }
+
+    fn enter_task(self: &Arc<Self>) -> AsyncCallbackGuard {
+        let mut state = self.state.lock();
+        state.in_flight = state.in_flight.saturating_add(1);
+        AsyncCallbackGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        self.quiescent.notify_all();
+    }
+
+    pub(crate) fn wait_for_quiescence(&self, timeout: std::time::Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while state.in_flight != 0 {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if self.quiescent.wait_for(&mut state, remaining).timed_out() {
+                return state.in_flight == 0;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.state.lock().in_flight
+    }
+}
+
+struct AsyncCallbackGuard {
+    tracker: Arc<WinfspAsyncCallbackTracker>,
+}
+
+impl Drop for AsyncCallbackGuard {
+    fn drop(&mut self) {
+        let mut state = self.tracker.state.lock();
+        debug_assert!(state.in_flight > 0);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.tracker.quiescent.notify_all();
+        }
+    }
+}
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
 
@@ -934,6 +1016,9 @@ pub struct StudioFsContext {
     /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<WinfspInvalidationQueue>,
+    /// Lifecycle barrier for async read/write/readdir futures spawned by
+    /// WinFSP after their native callbacks return STATUS_PENDING.
+    async_callback_tracker: Arc<WinfspAsyncCallbackTracker>,
     /// Per-handle EOF extensions that Windows may read while closing cached
     /// writer handles. The newly exposed range is defined to read as zeros.
     handle_zero_fill_ranges: Mutex<HashMap<u64, HandleZeroFillRange>>,
@@ -980,6 +1065,7 @@ impl StudioFsContext {
             read_only,
             default_sd,
             invalidation_queue,
+            async_callback_tracker: Arc::new(WinfspAsyncCallbackTracker::new()),
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             #[cfg(test)]
@@ -1007,10 +1093,15 @@ impl StudioFsContext {
             read_only,
             default_sd,
             invalidation_queue,
+            async_callback_tracker: Arc::new(WinfspAsyncCallbackTracker::new()),
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             _test_runtime: Some(rt),
         }
+    }
+
+    pub(crate) fn async_callback_tracker(&self) -> Arc<WinfspAsyncCallbackTracker> {
+        Arc::clone(&self.async_callback_tracker)
     }
 
     fn ensure_writable(&self) -> winfsp::Result<()> {
@@ -2217,8 +2308,10 @@ impl AsyncFileSystemContext for StudioFsContext {
         let fh = context.fh;
         let open_flags = context.open_flags;
         let vfs = self.vfs.clone();
+        let async_callback_tracker = self.async_callback_tracker.clone();
 
         async move {
+            let _callback = async_callback_tracker.try_enter()?;
             match vfs.read_into_fh(fh, ino, offset, buffer).await {
                 Ok(n) => {
                     trace!(ino, fh, offset, n, open_flags = open_flags.bits(), "read");
@@ -2245,8 +2338,10 @@ impl AsyncFileSystemContext for StudioFsContext {
         let local_sync_policy = context.write_local_sync_policy;
         let read_only = self.read_only;
         let vfs = self.vfs.clone();
+        let async_callback_tracker = self.async_callback_tracker.clone();
 
         async move {
+            let _callback = async_callback_tracker.try_enter()?;
             if read_only {
                 return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
             }
@@ -2317,11 +2412,18 @@ impl AsyncFileSystemContext for StudioFsContext {
         marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        let _callback = self.async_callback_tracker.try_enter()?;
         <Self as FileSystemContext>::read_directory(self, context, pattern, marker, buffer)
     }
 
     fn spawn_task(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.rt.spawn(future);
+        // Admit before queueing so a future that has not been polled yet is
+        // still included in the shutdown drain.
+        let callback = self.async_callback_tracker.enter_task();
+        self.rt.spawn(async move {
+            let _callback = callback;
+            future.await;
+        });
     }
 }
 
@@ -2341,14 +2443,14 @@ mod tests {
         READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR,
         STATUS_DISK_CORRUPT_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
-        StudioFsContext, WinfspInvalidationQueue, WinfspKernelInvalidator, attr_to_file_info,
-        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
-        hidden_platform_root_path_component, ino_to_windows_path, is_runtime_stats_windows_path,
-        maybe_hide_platform_root_entry, notify_filter_for_kind, open_flags_from_access,
-        resolve_create_callback_kind, resolve_file_size_callback_action,
-        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
-        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
-        write_local_sync_policy_from_create_options,
+        StudioFsContext, WinfspAsyncCallbackTracker, WinfspInvalidationQueue,
+        WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
+        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
+        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
+        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
+        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
+        winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
         write_local_sync_policy_from_create_parameters,
     };
     use std::collections::BTreeSet;
@@ -2370,6 +2472,28 @@ mod tests {
     use winfsp::U16CString;
     use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
+
+    #[test]
+    fn async_callback_tracker_drains_admitted_work_before_rejecting_new_work() {
+        let tracker = Arc::new(WinfspAsyncCallbackTracker::new());
+        let guard = tracker.try_enter().expect("tracker should admit work");
+
+        assert_eq!(tracker.in_flight(), 1);
+        assert!(
+            !tracker.wait_for_quiescence(Duration::from_millis(1)),
+            "quiescence must wait for admitted async work"
+        );
+
+        tracker.close();
+        assert!(
+            tracker.try_enter().is_err(),
+            "closed tracker must reject new async work"
+        );
+
+        drop(guard);
+        assert!(tracker.wait_for_quiescence(Duration::from_secs(1)));
+        assert_eq!(tracker.in_flight(), 0);
+    }
 
     #[test]
     fn callback_buffer_helpers_live_in_focused_module_and_remain_send() {

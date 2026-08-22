@@ -83,6 +83,18 @@ impl Drop for RelaxedDurabilityRuntime {
     }
 }
 
+impl Drop for RedbMetaEngine {
+    fn drop(&mut self) {
+        // Redb writes its allocator-state checkpoint from Database::Drop.
+        // Stop and join the relaxed-durability worker first so it cannot still
+        // hold a database Arc or start a final barrier while that checkpoint
+        // is being written.
+        drop(self.relaxed_durability.take());
+        drop(self.read_only_db.take());
+        drop(self.db.take());
+    }
+}
+
 /// Lock-free counters for one metadata write-transaction stage.
 #[derive(Default)]
 struct MetadataWriteStageMetrics {

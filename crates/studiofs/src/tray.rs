@@ -64,6 +64,7 @@ mod supported {
     const COLOR_WHITE: [u8; 3] = [0xF7, 0xF7, 0xF3];
     const ANIMATION_TICK: Duration = Duration::from_millis(100);
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
+    const DIAGNOSTICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
     const DIAGNOSTICS_STARTUP_GRACE: Duration = Duration::from_secs(5);
     const IDLE_CYCLE: Duration = Duration::from_millis(4400);
     const ACTIVE_CYCLE: Duration = Duration::from_millis(1200);
@@ -777,8 +778,13 @@ mod supported {
 
     fn current_activity_status(discovery: &LocalDiagnosticsDiscovery) -> Option<TrayActivity> {
         let client = LocalDiagnosticsClient::new(discovery.clone());
-        let snapshot =
-            crate::runtime_bridge::block_on(async move { client.runtime_snapshot().await }).ok()?;
+        let snapshot = crate::runtime_bridge::block_on(async move {
+            tokio::time::timeout(DIAGNOSTICS_REQUEST_TIMEOUT, client.runtime_snapshot())
+                .await
+                .map_err(|error| anyhow::anyhow!(error))
+                .and_then(|result| result)
+        })
+        .ok()?;
         Some(activity_status(&snapshot))
     }
 
