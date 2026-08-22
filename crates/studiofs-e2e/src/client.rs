@@ -978,7 +978,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         #[cfg(target_os = "macos")]
-        self.cleanup_stale_mount(index)?;
+        if self.clients[index].spec.state != ClientLifecycleState::Killed {
+            self.cleanup_stale_mount(index)?;
+        } else {
+            self.wait_for_macos_mount_lock_release(index)?;
+        }
         #[cfg(not(target_os = "macos"))]
         self.executor
             .cleanup_stale_mount_before_remount(&self.mount_command(index)?)?;
@@ -1214,6 +1218,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.executor
             .cleanup_stale_mount_before_remount(&command)
             .map_err(ClientControllerError::Io)?;
+        self.wait_for_macos_mount_lock_release(index)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_macos_mount_lock_release(&self, index: usize) -> Result<(), ClientControllerError> {
+        let command = self.mount_command(index)?;
         wait_for_macos_mount_lock_release(
             &command.client_root,
             &command.mount_point,
