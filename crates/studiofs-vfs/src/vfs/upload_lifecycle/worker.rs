@@ -1447,9 +1447,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
         };
         if should_drain {
             let port = self.clone();
-            tokio::spawn(async move {
-                port.drain_upload_completion_batch().await;
-            });
+            port.drain_upload_completion_batch().await;
         }
         result_rx.await.map_err(|_| {
             VfsError::Other("upload completion batch result was dropped".to_string())
@@ -1681,7 +1679,7 @@ impl UploadLedgerBatcher {
         };
         if should_spawn {
             let queue = Arc::clone(queue);
-            tokio::spawn(drain_upload_ledger_batch_queue(queue, meta, operation));
+            drain_upload_ledger_batch_queue(queue, meta, operation).await;
         }
         match result_receiver.await {
             Ok(Ok(())) => Ok(()),
