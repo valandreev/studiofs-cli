@@ -746,13 +746,21 @@ fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
 
     controller.force_kill("client-a").unwrap();
     assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
+    let expected_cleanups_before_remount = if cfg!(target_os = "macos") { 1 } else { 0 };
+    assert_eq!(
+        stale_remount_cleanups.get(),
+        expected_cleanups_before_remount
+    );
     controller.remount("client-a").unwrap();
 
     let clients = controller.clients();
     assert_eq!(clients[0].client_root, original_root);
     assert_eq!(clients[0].state, ClientLifecycleState::Mounted);
     assert_eq!(killed.get(), 1);
-    assert_eq!(stale_remount_cleanups.get(), 2);
+    assert_eq!(
+        stale_remount_cleanups.get(),
+        expected_cleanups_before_remount + 1
+    );
     let calls = calls.borrow();
     let mount_calls = calls
         .iter()
