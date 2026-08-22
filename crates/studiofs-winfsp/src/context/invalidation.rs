@@ -63,12 +63,15 @@ fn build_notify_info_with_action(
 pub(crate) struct PreparedWinfspNotify {
     pub(super) ino: Ino,
     pub(super) path: String,
+    kind: FileType,
+    action: u32,
     pub(super) info: NotifyInfo<512>,
 }
 
 pub(crate) struct PreparedWinfspNotifications {
     notifications: Vec<PreparedWinfspNotify>,
     completion_queue: Option<Arc<WinfspInvalidationQueue>>,
+    published: bool,
 }
 
 impl PreparedWinfspNotifications {
@@ -79,6 +82,7 @@ impl PreparedWinfspNotifications {
         Self {
             notifications,
             completion_queue: Some(completion_queue),
+            published: false,
         }
     }
 }
@@ -94,6 +98,20 @@ impl Deref for PreparedWinfspNotifications {
 impl Drop for PreparedWinfspNotifications {
     fn drop(&mut self) {
         if let Some(queue) = self.completion_queue.take() {
+            // WinFSP's timer drops this value when NotifyBegin returns
+            // STATUS_CANT_WAIT, for example while a rename is in progress.
+            // Requeue the batch so a transient begin failure cannot leave
+            // the OS cache permanently stale.
+            if !self.published {
+                for notification in &self.notifications {
+                    queue.push_path(
+                        notification.ino,
+                        notification.path.clone(),
+                        notification.kind,
+                        notification.action,
+                    );
+                }
+            }
             queue.finish_notification_batch();
         }
     }
@@ -404,7 +422,13 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 warn!(ino, path, "notify path too long, skipping");
                 continue;
             };
-            notifications.push(PreparedWinfspNotify { ino, path, info });
+            notifications.push(PreparedWinfspNotify {
+                ino,
+                path,
+                kind,
+                action,
+                info,
+            });
         }
         if notifications.is_empty() {
             self.invalidation_queue.finish_notification_batch();
@@ -417,7 +441,7 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
         }
     }
 
-    fn notify(&self, notifications: PreparedWinfspNotifications, notifier: &Notifier) {
+    fn notify(&self, mut notifications: PreparedWinfspNotifications, notifier: &Notifier) {
         for notification in notifications.iter() {
             notifier.notify(&notification.info);
             debug!(
@@ -426,5 +450,6 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 "WinFSP notify sent"
             );
         }
+        notifications.published = true;
     }
 }

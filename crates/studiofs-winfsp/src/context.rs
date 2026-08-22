@@ -5120,6 +5120,32 @@ mod tests {
     }
 
     #[test]
+    fn unsubmitted_notification_batch_is_requeued_for_retry() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("notify_retry");
+        let file = vfs
+            .create(ROOT_INO, b"retry-gone.txt", 0, 0, 0o644)
+            .expect("create");
+
+        queue.push_deleted_path(
+            file.ino,
+            r"\retry-gone.txt".to_string(),
+            FileType::RegularFile,
+        );
+        let prepared = ctx.should_notify().expect("pending notification batch");
+        drop(prepared);
+
+        let retry = ctx
+            .should_notify()
+            .expect("unsubmitted batch should be retried");
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].path, r"\retry-gone.txt");
+        assert_eq!(retry[0].info.action, FILE_ACTION_REMOVED);
+        drop(retry);
+        assert_eq!(queue.drain(), vec![file.ino]);
+        assert!(queue.wait_for_quiescence(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn notify_filter_matches_inode_kind() {
         assert_eq!(
             notify_filter_for_kind(studiofs_meta::FileType::Directory),
