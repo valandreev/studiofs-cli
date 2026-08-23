@@ -12135,6 +12135,7 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
         vfs.lazy_evict_removed_metadata_payloads(
             std::collections::HashMap::from([(attr.ino, vec![object_id])]),
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -12182,6 +12183,7 @@ fn retained_inode_payload_evict_does_not_mark_inode_deleted() {
         vfs.lazy_evict_removed_metadata_payloads(
             std::collections::HashMap::from([(attr.ino, vec![object_id])]),
             &std::collections::HashSet::from([ROOT_INO, attr.ino]),
+            &std::collections::HashSet::new(),
         )
         .await;
 
@@ -12192,6 +12194,48 @@ fn retained_inode_payload_evict_does_not_mark_inode_deleted() {
         assert!(
             vfs.local_payload_backend().contains(object_id),
             "retained-inode payload eviction must not remove bytes while upload is still pending"
+        );
+    });
+}
+
+#[test]
+fn payload_evict_does_not_cancel_unpublished_inode_missing_from_snapshot() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "unpublished-inode-payload-evict");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"unpublished-inode-payload-evict.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x7A; vfs.block_size as usize];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let object_id = vfs
+            .local_payload_backend()
+            .object_ids()
+            .into_iter()
+            .next()
+            .expect("flushed file should seed one local payload object");
+        let retained_inodes = vfs.runtime_namespace_invalidation_inodes();
+        assert!(retained_inodes.contains(&attr.ino));
+
+        vfs.lazy_evict_removed_metadata_payloads(
+            std::collections::HashMap::from([(attr.ino, vec![object_id])]),
+            &std::collections::HashSet::new(),
+            &retained_inodes,
+        )
+        .await;
+
+        assert!(
+            !vfs.state.upload.deleted_inodes.lock().contains(&attr.ino),
+            "an unpublished inode with local payload must not be cancelled by a transient snapshot gap"
+        );
+        assert!(
+            vfs.local_payload_backend().contains(object_id),
+            "an unpublished inode must retain its payload until its upload lifecycle completes"
         );
     });
 }

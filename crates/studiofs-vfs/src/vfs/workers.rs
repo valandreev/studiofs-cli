@@ -519,12 +519,13 @@ impl StudioVfs {
         &self,
         removed_payloads: HashMap<Ino, Vec<u64>>,
         current_inodes: &HashSet<Ino>,
+        retained_inodes: &HashSet<Ino>,
     ) {
         for (ino, object_ids) in removed_payloads {
             if object_ids.is_empty() {
                 continue;
             }
-            let inode_deleted = !current_inodes.contains(&ino);
+            let inode_deleted = !current_inodes.contains(&ino) && !retained_inodes.contains(&ino);
             if !inode_deleted {
                 self.evict_payload_objects_from_caches(ino, &object_ids)
                     .await;
@@ -833,14 +834,17 @@ impl StudioVfs {
                 ),
                 None => HashMap::new(),
             };
-            self.lazy_evict_removed_metadata_payloads(removed_payloads, &current_snapshot.inodes)
-                .await;
-
             let runtime_inodes = if namespace_changed {
                 self.runtime_namespace_invalidation_inodes()
             } else {
                 HashSet::new()
             };
+            self.lazy_evict_removed_metadata_payloads(
+                removed_payloads,
+                &current_snapshot.inodes,
+                &runtime_inodes,
+            )
+            .await;
             let attr_cache_inodes = match &last_snapshot {
                 Some(last_snapshot) => metadata_attr_cache_invalidation_set(
                     last_snapshot,
