@@ -397,6 +397,7 @@ impl KernelInvalidator for OpenCacheKernelInvalidator {
         #[cfg(test)]
         self.open_cache_snapshots.lock().pop(&ino);
         if self.kernel_invalidations.defer_data_if_reads_active(ino) {
+            self.kernel_invalidations.defer_attrs_if_reads_active(ino);
             debug!(
                 ino,
                 "macFUSE kernel data invalidation deferred until async reads drain"
@@ -404,6 +405,7 @@ impl KernelInvalidator for OpenCacheKernelInvalidator {
             return;
         }
         self.inner.inval_inode(ino);
+        self.inner.inval_inode_attrs(ino);
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
@@ -482,7 +484,6 @@ impl KernelInvalidationGate {
             return false;
         }
         state.pending_data_inodes.insert(ino);
-        state.pending_attr_inodes.remove(&ino);
         true
     }
 
@@ -491,9 +492,7 @@ impl KernelInvalidationGate {
         if state.active_reads == 0 {
             return false;
         }
-        if !state.pending_data_inodes.contains(&ino) {
-            state.pending_attr_inodes.insert(ino);
-        }
+        state.pending_attr_inodes.insert(ino);
         true
     }
 }

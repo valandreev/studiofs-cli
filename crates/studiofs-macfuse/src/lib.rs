@@ -1239,8 +1239,6 @@ mod tests {
 
         let inner = Arc::new(RecordingInvalidator::default());
         let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
-        invalidator.inval_inode_attrs(attr.ino);
-
         invalidator.inval_inode(attr.ino);
         assert!(
             !adapter.has_open_cache_snapshot_for_test(attr.ino),
@@ -1300,6 +1298,7 @@ mod tests {
         #[derive(Default)]
         struct RecordingInvalidator {
             data_calls: AtomicUsize,
+            attr_calls: AtomicUsize,
         }
 
         impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
@@ -1307,7 +1306,9 @@ mod tests {
                 self.data_calls.fetch_add(1, Ordering::AcqRel);
             }
 
-            fn inval_inode_attrs(&self, _ino: u64) {}
+            fn inval_inode_attrs(&self, _ino: u64) {
+                self.attr_calls.fetch_add(1, Ordering::AcqRel);
+            }
         }
 
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
@@ -1362,6 +1363,7 @@ mod tests {
             0,
             "kernel FFI invalidation must not run while a macFUSE async read is active"
         );
+        assert_eq!(inner.attr_calls.load(Ordering::Acquire), 0);
         drop(held_capacity);
         assert_eq!(
             &queued.wait().expect("queued read should complete")[..],
@@ -1372,6 +1374,7 @@ mod tests {
             1,
             "deferred kernel invalidation must flush after active reads drain"
         );
+        assert_eq!(inner.attr_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -2533,6 +2536,8 @@ mod tests {
             fn inval_inode(&self, _ino: u64) {
                 self.data_calls.fetch_add(1, Ordering::AcqRel);
             }
+
+            fn inval_inode_attrs(&self, _ino: u64) {}
         }
 
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
@@ -2597,6 +2602,8 @@ mod tests {
             fn inval_inode(&self, _ino: u64) {
                 self.data_calls.fetch_add(1, Ordering::AcqRel);
             }
+
+            fn inval_inode_attrs(&self, _ino: u64) {}
         }
 
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
@@ -2648,6 +2655,8 @@ mod tests {
             fn inval_inode(&self, _ino: u64) {
                 self.data_calls.fetch_add(1, Ordering::AcqRel);
             }
+
+            fn inval_inode_attrs(&self, _ino: u64) {}
         }
 
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
@@ -2690,6 +2699,8 @@ mod tests {
             fn inval_inode(&self, _ino: u64) {
                 self.data_calls.fetch_add(1, Ordering::AcqRel);
             }
+
+            fn inval_inode_attrs(&self, _ino: u64) {}
         }
 
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(

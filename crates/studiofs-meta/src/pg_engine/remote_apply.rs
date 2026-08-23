@@ -1017,6 +1017,34 @@ impl<'a> RemoteApplyCoordinator<'a> {
             if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
                 continue;
             }
+            if attr.upload_state == UploadState::Ready
+                && attr.content_epoch == attr.committed_content_epoch
+                && attr.size == attr.committed_size
+                && payload_publish_inodes.contains(&attr.ino)
+                && !Self::batch_publish_covers_committed_extent(
+                    batch_events,
+                    attr.ino,
+                    attr.committed_size,
+                )
+                && current.content_epoch == current.committed_content_epoch
+                && current.content_epoch == attr.content_epoch
+            {
+                continue;
+            }
+            if attr.upload_state == UploadState::Ready
+                && attr.content_epoch == attr.committed_content_epoch
+                && attr.size == attr.committed_size
+                && attr.committed_size < current.committed_size
+                && (!base_range_preserve_inodes.contains(&attr.ino)
+                    || Self::batch_publish_covers_committed_extent(
+                        batch_events,
+                        attr.ino,
+                        attr.committed_size,
+                    ))
+            {
+                merged.push(MetaEvent::SetAttr { attr: attr.clone() });
+                continue;
+            }
             let ready_complete_publish = attr.upload_state == UploadState::Ready
                 && attr.content_epoch == attr.committed_content_epoch
                 && attr.size == attr.committed_size
@@ -1102,6 +1130,27 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut base_range_preserve_inodes = self
             .protected_base_range_preserve_inodes(&batch_events, &protected_regular_file_inodes)?;
         base_range_preserve_inodes.extend(partial_publish_inodes.iter().copied());
+        let mut stale_partial_ready_attr_inodes = HashSet::new();
+        for event in &batch_events {
+            let MetaEvent::SetAttr { attr } = event else {
+                continue;
+            };
+            if !partial_publish_inodes.contains(&attr.ino)
+                || attr.kind != FileType::RegularFile
+                || attr.upload_state != UploadState::Ready
+                || attr.content_epoch != attr.committed_content_epoch
+                || attr.size != attr.committed_size
+            {
+                continue;
+            }
+            let current = self.local.get_attr(attr.ino)?;
+            if current.upload_state == UploadState::Ready
+                && current.content_epoch == current.committed_content_epoch
+                && current.content_epoch == attr.content_epoch
+            {
+                stale_partial_ready_attr_inodes.insert(attr.ino);
+            }
+        }
         let protected_attr_merges = self.protected_regular_file_attr_merges(
             &batch_events,
             &protected_regular_file_inodes,
@@ -1109,12 +1158,27 @@ impl<'a> RemoteApplyCoordinator<'a> {
         )?;
         self.local
             .apply_replica_events_to_base_preserving_protected_base_ranges(
-                &batch_events,
+                &batch_events
+                    .iter()
+                    .filter(|event| {
+                        !matches!(
+                            event,
+                            MetaEvent::SetAttr { attr }
+                                if stale_partial_ready_attr_inodes.contains(&attr.ino)
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 &base_range_preserve_inodes,
             )?;
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
+                if let MetaEvent::SetAttr { attr } = event
+                    && stale_partial_ready_attr_inodes.contains(&attr.ino)
+                {
+                    return false;
+                }
                 if let MetaEvent::SetAttr { attr } = event
                     && attr.kind == FileType::RegularFile
                     && protected_regular_file_inodes.contains(&attr.ino)

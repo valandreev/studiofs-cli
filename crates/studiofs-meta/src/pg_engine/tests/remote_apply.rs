@@ -2151,6 +2151,90 @@ fn ready_foreign_overwrite_replaces_larger_same_epoch_protected_base_graph() {
 }
 
 #[test]
+fn ready_foreign_overwrite_attr_after_separate_publish_replaces_larger_same_epoch_attr() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(
+            ROOT_INO,
+            b"protected-ready-overwrite-separate.txt",
+            0,
+            0,
+            0o644,
+        )
+        .expect("create file");
+    set_file_state(&pg, file.ino, 275, 3);
+    let local_payload = PayloadRef::new_partial(77_093, 275);
+    pg.stage_payload_slice(file.ino, 0, &local_payload)
+        .expect("stage local payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 3, &[local_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .expect("publish local payload"),
+        "local payload publish should succeed"
+    );
+
+    let mut remote_attr = pg.get_attr(file.ino).expect("load local attr");
+    remote_attr.size = 270;
+    remote_attr.committed_size = 270;
+    remote_attr.mtime = remote_attr.mtime.saturating_add(1);
+    remote_attr.ctime = remote_attr.ctime.saturating_add(1);
+    let remote_payload = PayloadRef::new_partial(77_094, 270);
+    let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, 270).expect("remote overwrite range"),
+                payload: Some(remote_payload),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    let protected = HashSet::from([file.ino]);
+
+    apply_foreign_batch(
+        &pg,
+        std::slice::from_ref(&remote_publish),
+        &OverlayConflictSets::default(),
+        &protected,
+    )
+    .expect("apply foreign publish batch");
+    apply_foreign_batch(
+        &pg,
+        &[MetaEvent::SetAttr { attr: remote_attr }],
+        &OverlayConflictSets::default(),
+        &protected,
+    )
+    .expect("apply foreign attr batch");
+
+    assert_eq!(
+        pg.get_attr(file.ino).expect("load applied attr").size,
+        270,
+        "a ready foreign overwrite must shrink a protected attr when publish and attr are separate batches"
+    );
+
+    let mut stale_attr = pg.get_attr(file.ino).expect("load applied remote attr");
+    stale_attr.size = 275;
+    stale_attr.committed_size = 275;
+    apply_foreign_batch(
+        &pg,
+        &[remote_publish, MetaEvent::SetAttr { attr: stale_attr }],
+        &OverlayConflictSets::default(),
+        &protected,
+    )
+    .expect("apply late partial ready attr batch");
+
+    assert_eq!(
+        pg.get_attr(file.ino).expect("load final attr").size,
+        270,
+        "a late partial ready attr must not restore a larger same-epoch size"
+    );
+}
+
+#[test]
 fn publish_without_ready_attr_preserves_protected_base_graph() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
