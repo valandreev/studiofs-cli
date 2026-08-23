@@ -1417,7 +1417,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 !matches!(
                     event,
                     MetaEvent::SetAttr { attr }
-                        if stale_self_updating_inodes.contains(&attr.ino)
+                        if attr.upload_state != UploadState::Ready
+                            && stale_self_updating_inodes.contains(&attr.ino)
                 )
             })
             .collect::<Vec<_>>();

@@ -2519,6 +2519,93 @@ fn late_self_updating_attr_does_not_restore_older_base_before_ready_replay() {
 }
 
 #[test]
+fn stale_self_updating_attr_does_not_filter_ready_publish_in_same_batch() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"self-updating-then-ready.txt", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 275, 1);
+    let original_payload = PayloadRef::new_partial(77_203, 275);
+    pg.stage_payload_slice(file.ino, 0, &original_payload)
+        .expect("stage original payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 1, &[original_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish original payload")
+    );
+    let original_attr = pg.get_attr(file.ino).expect("load original attr");
+
+    set_file_state(&pg, file.ino, 270, 3);
+    let replacement_payload = PayloadRef::new_partial(77_204, 270);
+    pg.stage_payload_slice(file.ino, 0, &replacement_payload)
+        .expect("stage replacement payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 3, &[replacement_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .expect("publish replacement payload locally")
+    );
+    let ready_attr = pg.get_attr(file.ino).expect("load ready replacement attr");
+
+    pg.local
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+            attr: original_attr.clone(),
+        }])
+        .expect("restore stale base attr before self replay");
+
+    let mut stale_updating_attr = original_attr;
+    stale_updating_attr.content_epoch = ready_attr.content_epoch;
+    stale_updating_attr.upload_state = UploadState::Updating;
+    let replacement_publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![
+                SliceRecord {
+                    slice_id: SliceId(0),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 270).expect("replacement payload range"),
+                    payload: Some(replacement_payload),
+                    payload_state: PayloadRefState::Published,
+                },
+                SliceRecord {
+                    slice_id: SliceId(1),
+                    order: SliceOrder(1),
+                    range: SliceRange::new(270, 275).expect("truncated tail range"),
+                    payload: None,
+                    payload_state: PayloadRefState::Published,
+                },
+            ],
+        )],
+    };
+
+    apply_visible_self_batch(
+        &pg,
+        &[
+            MetaEvent::SetAttr {
+                attr: stale_updating_attr,
+            },
+            replacement_publish,
+            MetaEvent::SetAttr {
+                attr: ready_attr.clone(),
+            },
+        ],
+    )
+    .expect("apply combined self publish batch");
+
+    let base_attr = pg
+        .local
+        .get_base_attr(file.ino)
+        .expect("load base attr")
+        .expect("base attr exists");
+    assert_eq!(base_attr.size, 270);
+    assert_eq!(base_attr.committed_size, 270);
+    assert_eq!(base_attr.content_epoch, 3);
+    assert_eq!(base_attr.committed_content_epoch, 3);
+    assert_eq!(base_attr.upload_state, UploadState::Ready);
+}
+
+#[test]
 fn publish_without_ready_attr_preserves_protected_base_graph() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
