@@ -10,6 +10,44 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 #[test]
+fn inspect_snapshot_materializer_takeover_retained_state() {
+    for (label, path) in [
+        (
+            "client-a",
+            "/Volumes/Storage/dev/studiofs/target/e2e-runs/20260823T205233Z-0ae83f/artifacts/clients/client-a/client-root/meta/sfs-e2e-20260823t205233z-0ae83f-0-snapshot-mat-cace4295d29e6b2d/sfs-e2e-20260823t205233z-0ae83f-0-snapshot-mat-cace4295d29e6b2d.db",
+        ),
+        (
+            "client-b",
+            "/Volumes/Storage/dev/studiofs/target/e2e-runs/20260823T205233Z-0ae83f/artifacts/clients/client-b/client-root/meta/sfs-e2e-20260823t205233z-0ae83f-0-snapshot-mat-cace4295d29e6b2d/sfs-e2e-20260823t205233z-0ae83f-0-snapshot-mat-cace4295d29e6b2d.db",
+        ),
+        (
+            "snapshot",
+            "/Volumes/Storage/dev/studiofs/target/e2e-runs/20260823T205233Z-0ae83f/artifacts/clients/snapshot/client-root/meta/sfs-e2e-20260823t205233z-0ae83f-0-snapshot-mat-cace4295d29e6b2d/sfs-e2e-20260823t205233z-0ae83f-0-snapshot-mat-cace4295d29e6b2d.db",
+        ),
+    ] {
+        let engine = RedbMetaEngine::open(path).expect("open retained metadata");
+        let mut inodes: Vec<_> = engine
+            .local_overlay_inodes()
+            .expect("read local overlay inodes")
+            .into_iter()
+            .collect();
+        inodes.sort_unstable();
+        println!("{label} inodes={inodes:?}");
+        for ino in inodes {
+            let attr = engine.get_attr(ino).expect("read attr");
+            let objects = engine
+                .get_regular_file_overlay_object_ids(ino)
+                .expect("read overlay objects");
+            println!("{label} ino={ino} attr={attr:?} objects={objects:?}");
+        }
+        println!(
+            "{label} referenced={:?}",
+            engine.get_referenced_object_ids().expect("read references")
+        );
+    }
+}
+
+#[test]
 fn legacy_meta_event_fixture_replays_from_local_event_log() {
     let engine = temp_engine();
     let legacy_bytes = [1_u8, 42_u8];
