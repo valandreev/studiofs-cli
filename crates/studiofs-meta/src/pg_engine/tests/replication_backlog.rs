@@ -451,6 +451,86 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
 }
 
 #[test]
+fn redb_repair_merges_uploaded_payloads_across_stale_overlay_events() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"repair-stale-overlay-events.bin", 0, 0, 0o644)
+        .expect("create file");
+    let first = PayloadRef::new_partial(77_012, DEFAULT_BLOCK_SIZE);
+    let second = PayloadRef::new_partial(77_013, DEFAULT_BLOCK_SIZE);
+
+    pg.stage_payload_slice(file.ino, 0, &first)
+        .expect("stage first payload");
+    pg.stage_payload_slice(file.ino, 1, &second)
+        .expect("stage second payload");
+    set_file_state(&pg, file.ino, u64::from(DEFAULT_BLOCK_SIZE) * 2, 1);
+    let accepted = pg.get_attr(file.ino).expect("accepted attr");
+    pg.mark_regular_file_overlay_object_uploaded_if_matches(
+        file.ino,
+        accepted.content_epoch,
+        first.object_id,
+    )
+    .expect("mark first payload uploaded");
+
+    let mut stale_snapshot = pg.local.export_snapshot().expect("export snapshot");
+    for (_, bytes) in &mut stale_snapshot.regular_file_overlay {
+        let mut state: crate::schema::RegularFileOverlayState =
+            postcard::from_bytes(bytes).expect("decode overlay snapshot");
+        for chunk in state.chunks.values_mut() {
+            for slice in chunk.slices.values_mut() {
+                if slice
+                    .payload
+                    .is_some_and(|payload| payload.object_id == first.object_id)
+                {
+                    slice.payload_state = PayloadRefState::LocalOnly;
+                }
+            }
+        }
+        *bytes = postcard::to_stdvec(&state).expect("encode stale overlay snapshot");
+    }
+    pg.local
+        .import_remote_snapshot_preserving_local_event_log(&stale_snapshot)
+        .expect("replace serving state while retaining event log");
+
+    pg.mark_regular_file_overlay_object_uploaded_if_matches(
+        file.ino,
+        accepted.content_epoch,
+        second.object_id,
+    )
+    .expect("mark second payload uploaded");
+
+    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+        .expect("restore acknowledged uploaded overlay");
+
+    let restored = pg.local.export_snapshot().expect("export restored state");
+    let (_, bytes) = restored
+        .regular_file_overlay
+        .iter()
+        .find(|(ino, _)| *ino == file.ino)
+        .expect("restored overlay row");
+    let state: crate::schema::RegularFileOverlayState =
+        postcard::from_bytes(bytes).expect("decode restored overlay");
+    let states: std::collections::HashMap<_, _> = state
+        .chunks
+        .values()
+        .flat_map(|chunk| chunk.slices.values())
+        .filter_map(|slice| {
+            slice
+                .payload
+                .map(|payload| (payload.object_id, slice.payload_state))
+        })
+        .collect();
+    assert_eq!(
+        states.get(&first.object_id),
+        Some(&PayloadRefState::Uploaded)
+    );
+    assert_eq!(
+        states.get(&second.object_id),
+        Some(&PayloadRefState::Uploaded)
+    );
+}
+
+#[test]
 fn upload_progress_only_mutation_does_not_advance_cursor_past_inflight_visible_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

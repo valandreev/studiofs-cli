@@ -3,7 +3,7 @@
 use super::{
     ClaimedPendingBatch, PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaPayloadObjects, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
 use crate::schema::{ChunkId, PayloadRefState, SliceRecord, UploadState};
 use crate::types::{FileType, Ino, InodeAttr};
@@ -44,6 +44,34 @@ fn attrs_match_repair_candidate(current: &InodeAttr, candidate: &InodeAttr) -> b
     current == candidate
         || (attrs_match_repair_identity(current, candidate)
             && current.size == candidate.committed_size)
+}
+
+fn preserve_repaired_uploaded_payload_state(
+    previous: &[SliceRecord],
+    incoming: &mut [SliceRecord],
+) {
+    for slice in incoming {
+        let Some(payload) = slice.payload else {
+            continue;
+        };
+        if !matches!(
+            slice.payload_state,
+            PayloadRefState::LocalOnly | PayloadRefState::Uploading | PayloadRefState::Recovering
+        ) {
+            continue;
+        }
+        if let Some(previous) = previous.iter().find(|previous| {
+            previous.payload == Some(payload)
+                && slice.range.start <= previous.range.start
+                && slice.range.end >= previous.range.end
+                && matches!(
+                    previous.payload_state,
+                    PayloadRefState::Uploaded | PayloadRefState::Published
+                )
+        }) {
+            slice.payload_state = previous.payload_state;
+        }
+    }
 }
 
 fn push_repaired_overlay_events(
@@ -184,6 +212,10 @@ impl PgMetaEngine {
                     MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                         let overlay = overlays.entry(ino).or_default();
                         for (chunk_id, slices) in chunk_slices {
+                            let previous =
+                                overlay.chunks.get(&chunk_id).cloned().unwrap_or_default();
+                            let mut slices = slices;
+                            preserve_repaired_uploaded_payload_state(&previous, &mut slices);
                             overlay.chunks.insert(chunk_id, slices);
                         }
                     }
@@ -224,9 +256,7 @@ impl PgMetaEngine {
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(error) => return Err(error),
             };
-            if !attrs_match_repair_candidate(&current, &attr)
-                || self.local.has_local_regular_file_overlay(ino)?
-            {
+            if !attrs_match_repair_candidate(&current, &attr) {
                 continue;
             }
 
