@@ -63,7 +63,7 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 #[cfg(windows)]
 use windows::{
     Win32::{
-        Foundation::{HLOCAL, LocalFree},
+        Foundation::{ERROR_NO_DATA, HLOCAL, LocalFree},
         Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         },

@@ -4,6 +4,26 @@ pub(crate) fn discover_local_sessions() -> Result<Vec<LocalDiagnosticsDiscovery>
     discover_sessions_in(&utils::get_mounts_dir()?, utils::mount_is_active)
 }
 
+fn is_expected_diagnostics_client_disconnect(error: &anyhow::Error) -> bool {
+    // One-shot diagnostics clients close the pipe after their response (or
+    // after their timeout). Windows reports that peer disconnect as
+    // ERROR_NO_DATA instead of clean EOF.
+    #[cfg(windows)]
+    {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.raw_os_error() == Some(ERROR_NO_DATA.0 as i32))
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 pub(super) fn discover_sessions_in(
     dir: &Path,
     is_mount_active: impl Fn(&str) -> Result<bool>,
@@ -222,7 +242,9 @@ pub(super) async fn run_server(
                             let investigation_store = investigation_store.clone();
                             let profiling = profiling.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager, investigation_store, profiling, permit).await {
+                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager, investigation_store, profiling, permit).await
+                                    && !is_expected_diagnostics_client_disconnect(&error)
+                                {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -284,7 +306,9 @@ pub(super) async fn run_server(
                             let investigation_store = investigation_store.clone();
                             let profiling = profiling.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(connected_server, auth_token, source, lease_manager, investigation_store, profiling, permit).await {
+                                if let Err(error) = handle_client(connected_server, auth_token, source, lease_manager, investigation_store, profiling, permit).await
+                                    && !is_expected_diagnostics_client_disconnect(&error)
+                                {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -648,3 +672,19 @@ unsafe impl Send for WindowsSecurityDescriptor {}
 
 #[cfg(windows)]
 unsafe impl Sync for WindowsSecurityDescriptor {}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_client_disconnect_error_232_is_expected() {
+        let disconnect = anyhow::Error::from(std::io::Error::from_raw_os_error(232));
+        let other_pipe_error = anyhow::Error::from(std::io::Error::from_raw_os_error(109));
+
+        assert!(is_expected_diagnostics_client_disconnect(&disconnect));
+        assert!(!is_expected_diagnostics_client_disconnect(
+            &other_pipe_error
+        ));
+    }
+}
