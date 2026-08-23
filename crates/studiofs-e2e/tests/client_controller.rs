@@ -822,6 +822,25 @@ fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn remount_retries_when_mount_process_exits_before_readiness() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let executor = TransientMountExecutor::new();
+    let attempts = Rc::clone(&executor.attempts);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+    controller.force_kill("client-a").unwrap();
+
+    controller
+        .remount("client-a")
+        .expect("remount should retry a transient early mount exit");
+
+    assert_eq!(attempts.get(), 3);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn remount_waits_for_lifecycle_lock_after_stale_cleanup() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mut config = test_config(temp.path());
@@ -1156,6 +1175,60 @@ struct RecordingProcess {
     exit_status: i32,
     exit_requires_kill: bool,
     was_killed: Cell<bool>,
+}
+
+struct TransientMountExecutor {
+    attempts: Rc<Cell<usize>>,
+    readiness_calls: Rc<Cell<usize>>,
+    killed: Rc<Cell<usize>>,
+    wait_calls: Rc<Cell<usize>>,
+}
+
+impl TransientMountExecutor {
+    fn new() -> Self {
+        Self {
+            attempts: Rc::new(Cell::new(0)),
+            readiness_calls: Rc::new(Cell::new(0)),
+            killed: Rc::new(Cell::new(0)),
+            wait_calls: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl ClientProcessExecutor for TransientMountExecutor {
+    fn run(&self, _command: &ClientCommand) -> io::Result<ClientCommandOutput> {
+        Ok(ClientCommandOutput {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    fn spawn(&self, _command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>> {
+        let attempt = self.attempts.get() + 1;
+        self.attempts.set(attempt);
+        let (exit_status, exit_requires_kill) = if attempt == 2 { (1, false) } else { (0, true) };
+        Ok(Box::new(RecordingProcess {
+            pid: attempt as u32,
+            killed: Rc::clone(&self.killed),
+            kill_error_after: Cell::new(None),
+            wait_calls: Rc::clone(&self.wait_calls),
+            try_wait_calls: Cell::new(0),
+            exit_status,
+            exit_requires_kill,
+            was_killed: Cell::new(false),
+        }))
+    }
+
+    fn is_mount_ready(&self, _command: &ClientCommand) -> io::Result<bool> {
+        let readiness_call = self.readiness_calls.get() + 1;
+        self.readiness_calls.set(readiness_call);
+        Ok(
+            self.attempts.get() != 2
+                && self.attempts.get() != 0
+                && readiness_call.is_multiple_of(2),
+        )
+    }
 }
 
 impl ClientProcess for RecordingProcess {

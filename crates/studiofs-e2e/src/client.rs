@@ -986,7 +986,22 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         #[cfg(not(target_os = "macos"))]
         self.executor
             .cleanup_stale_mount_before_remount(&self.mount_command(index)?)?;
-        self.mount_index(index)
+        #[cfg(target_os = "macos")]
+        let was_killed = self.clients[index].spec.state == ClientLifecycleState::Killed;
+        let result = self.mount_index(index);
+        #[cfg(target_os = "macos")]
+        if was_killed
+            && matches!(
+                &result,
+                Err(ClientControllerError::CommandFailed { action, .. }) if action == "mount"
+            )
+        {
+            // A killed macFUSE client can release its lifecycle lock just after the
+            // preflight check. Wait for that late release before retrying the remount.
+            self.wait_for_macos_mount_lock_release(index)?;
+            return self.mount_index(index);
+        }
+        result
     }
 
     /// Unmounts all mounted clients.
