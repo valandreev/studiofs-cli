@@ -123,7 +123,6 @@ enum SingleUploadOutcome {
 enum StaleUploadDisposition {
     Uncovered,
     Requeued,
-    CoveredButNotRequeued,
 }
 
 impl StaleUploadDisposition {
@@ -264,6 +263,7 @@ fn append_uploaded_object_reattach_slices(
 
 trait CachedStorePort: Clone + Send + Sync + 'static {
     fn complete_upload(&self, op: &PendingUpload);
+    fn submit_upload(&self, op: &PendingUpload);
     fn requeue_upload(&self, op: PendingUpload) -> bool;
     fn requeue_rebased_upload(&self, current: &PendingUpload, rebased: PendingUpload) -> bool;
     fn cancel_upload(&self, op: &PendingUpload);
@@ -1023,15 +1023,17 @@ where
         let delay = self.upload_requeue_delay(&rebased);
         rebased.not_before_unix_ms =
             now_unix_millis().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64);
-        if self.coordinator.requeue_rebased_upload(op, rebased) {
+        if self.coordinator.requeue_rebased_upload(op, rebased.clone()) {
             self.shutdown.record_requeue();
             self.policy
                 .debug_pending_inode_state(op.ino, "stale_upload_reattached_requeued");
             StaleUploadDisposition::Requeued
         } else {
+            self.coordinator.submit_upload(&rebased);
+            self.shutdown.record_requeue();
             self.policy
                 .debug_pending_inode_state(op.ino, "stale_upload_covered_requeue_not_applied");
-            StaleUploadDisposition::CoveredButNotRequeued
+            StaleUploadDisposition::Requeued
         }
     }
 
@@ -1072,6 +1074,17 @@ struct VfsCachedStorePort {
 impl CachedStorePort for VfsCachedStorePort {
     fn complete_upload(&self, op: &PendingUpload) {
         self.vfs.cached_store.complete_upload(op);
+    }
+
+    fn submit_upload(&self, op: &PendingUpload) {
+        self.vfs.cached_store.submit_upload_with_payload(
+            op.ino,
+            op.offset,
+            op.object_file_offset,
+            op.object_id,
+            op.content_epoch,
+            op.payload_len,
+        );
     }
 
     fn requeue_upload(&self, op: PendingUpload) -> bool {
@@ -2643,6 +2656,7 @@ mod tests {
         completed: Arc<Mutex<Vec<u64>>>,
         cancelled: Arc<Mutex<Vec<u64>>>,
         requeued: Arc<Mutex<Vec<PendingUpload>>>,
+        submitted: Arc<Mutex<Vec<PendingUpload>>>,
         pending_inodes: FakePendingInodes,
         reject_rebased_requeue: Arc<AtomicBool>,
     }
@@ -2657,6 +2671,10 @@ mod tests {
         fn requeue_upload(&self, op: PendingUpload) -> bool {
             self.requeued.lock().push(op);
             true
+        }
+
+        fn submit_upload(&self, op: &PendingUpload) {
+            self.submitted.lock().push(op.clone());
         }
 
         fn requeue_rebased_upload(&self, _current: &PendingUpload, rebased: PendingUpload) -> bool {
@@ -3992,6 +4010,8 @@ mod tests {
         assert!(coordinator.completed.lock().is_empty());
         assert!(coordinator.cancelled.lock().is_empty());
         assert!(coordinator.requeued.lock().is_empty());
+        assert_eq!(coordinator.submitted.lock().len(), 1);
+        assert_eq!(coordinator.submitted.lock()[0].object_id, op.object_id);
         assert!(local_payloads.removed.lock().is_empty());
         assert!(local_payloads.uploaded.lock().is_empty());
         assert!(local_payloads.upload_stage_removed.lock().is_empty());
