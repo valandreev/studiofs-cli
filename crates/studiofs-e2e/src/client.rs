@@ -1067,7 +1067,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     fn mount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
         let command = self.mount_command(index)?;
-        if self.executor.is_mount_ready(&command)? {
+        let mount_active = self.executor.is_mount_ready(&command)?;
+        #[cfg(target_os = "macos")]
+        let mount_active =
+            mount_active || macos_mount_lock_is_held(&command.client_root, &command.mount_point)?;
+        if mount_active {
             return Err(ClientControllerError::MountPointAlreadyActive {
                 client: command.client,
                 path: command.mount_point,

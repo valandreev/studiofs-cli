@@ -669,6 +669,46 @@ fn mount_rejects_already_active_mount_point_before_spawning() {
     assert!(!calls.borrow().iter().any(|call| call.action == "mount"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn mount_rejects_active_lifecycle_lock_before_spawning() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+
+    let client = &controller.clients()[0];
+    let lock_name = client
+        .mount_point
+        .to_string_lossy()
+        .replace(['\\', '/', ':'], "_")
+        .trim_matches('_')
+        .to_lowercase();
+    let lock_path = client
+        .client_root
+        .join("mounts")
+        .join(format!("{lock_name}.lock"));
+    std::fs::create_dir_all(lock_path.parent().expect("lock parent")).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    let err = controller.mount_all().unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientControllerError::MountPointAlreadyActive { client, .. } if client == "client-a"
+    ));
+    assert!(!calls.borrow().iter().any(|call| call.action == "mount"));
+}
+
 #[test]
 fn system_readiness_does_not_accept_precreated_mount_directory() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
