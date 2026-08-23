@@ -1028,6 +1028,59 @@ fn regular_file_overlay_reflush_preserves_uploaded_payload_state() {
 }
 
 #[test]
+fn concurrent_overlay_upload_acknowledgements_preserve_each_other() {
+    let engine = std::sync::Arc::new(temp_engine());
+    let mut attr = engine
+        .create_file(ROOT_INO, b"concurrent-overlay-acks.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.content_epoch = 1;
+    attr.size = 16 * 4096;
+
+    let slices = (0_u32..16)
+        .map(|index| {
+            SliceRecord::new(
+                SliceId::default(),
+                SliceOrder::default(),
+                SliceRange::new(index * 4096, (index + 1) * 4096).unwrap(),
+                PayloadRef::new_partial(710_000 + u64::from(index), 4096),
+            )
+        })
+        .collect();
+    engine
+        .flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), slices)], Some(&attr))
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(17));
+    let handles: Vec<_> = (0_u32..16)
+        .map(|index| {
+            let engine = engine.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                engine
+                    .mark_regular_file_overlay_object_uploaded_if_matches(
+                        ino,
+                        1,
+                        710_000 + u64::from(index),
+                    )
+                    .unwrap();
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    assert_eq!(
+        engine.get_inode_lifecycle(ino).unwrap().unwrap().state,
+        InodeLifecycleState::PublishReady,
+        "parallel upload acknowledgements must not downgrade earlier Uploaded slices"
+    );
+}
+
+#[test]
 fn regular_file_publication_batch_commits_two_inodes_in_one_transaction() {
     let engine = temp_engine();
     let first = engine

@@ -15,7 +15,7 @@ use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{
-    Arc, Condvar, Mutex, Once, RwLock, RwLockReadGuard, Weak,
+    Arc, Condvar, Mutex, MutexGuard, Once, RwLock, RwLockReadGuard, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::JoinHandle;
@@ -37,6 +37,7 @@ pub struct RedbMetaEngine {
     read_only_db: Option<Arc<ReadOnlyDatabase>>,
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
+    write_txn_lock: Mutex<()>,
     #[cfg(test)]
     allocator_state_write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -230,6 +231,7 @@ pub(crate) struct CounterWriteTransaction<'a> {
 pub(crate) struct RedbWriteTransaction<'a> {
     txn: WriteTransaction,
     _db: RwLockReadGuard<'a, Database>,
+    _write_txn_guard: MutexGuard<'a, ()>,
     write_metrics: &'a MetadataWriteMetrics,
     mutation_started: Instant,
     relaxed_durability: Option<&'a RelaxedDurabilityRuntime>,
@@ -460,6 +462,7 @@ impl RedbWriteTransaction<'_> {
             write_metrics,
             mutation_started,
             relaxed_durability,
+            ..
         } = self;
         let commit_started = Instant::now();
         MetadataWriteMetrics::observe(&write_metrics.mutation, commit_started - mutation_started);
@@ -481,6 +484,7 @@ impl RedbWriteTransaction<'_> {
             write_metrics,
             mutation_started,
             relaxed_durability: _,
+            ..
         } = self;
         // Abort latency itself is intentionally excluded; mutation ends when abort starts,
         // matching commit accounting before the durable commit call.
@@ -512,6 +516,10 @@ impl RedbMetaEngine {
     }
 
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
+        let write_txn_guard = self
+            .write_txn_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("redb write lock poisoned".to_string()))?;
         let db = self.db.as_ref().ok_or_else(|| MetaError::AccessDenied {
             ino: ROOT_INO,
             principal: "snapshot-read-only".to_string(),
@@ -528,6 +536,7 @@ impl RedbMetaEngine {
         Ok(RedbWriteTransaction {
             txn,
             _db: db,
+            _write_txn_guard: write_txn_guard,
             write_metrics: &self.write_metrics,
             mutation_started: Instant::now(),
             relaxed_durability: self.relaxed_durability.as_deref(),
@@ -535,6 +544,10 @@ impl RedbMetaEngine {
     }
 
     pub(crate) fn begin_immediate_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
+        let write_txn_guard = self
+            .write_txn_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("redb write lock poisoned".to_string()))?;
         let db = self.db.as_ref().ok_or_else(|| MetaError::AccessDenied {
             ino: ROOT_INO,
             principal: "snapshot-read-only".to_string(),
@@ -551,6 +564,7 @@ impl RedbMetaEngine {
         Ok(RedbWriteTransaction {
             txn,
             _db: db,
+            _write_txn_guard: write_txn_guard,
             write_metrics: &self.write_metrics,
             mutation_started: Instant::now(),
             relaxed_durability: None,
@@ -631,6 +645,7 @@ impl RedbMetaEngine {
             read_only_db: None,
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
+            write_txn_lock: Mutex::new(()),
             #[cfg(test)]
             allocator_state_write_hook: Mutex::new(None),
         };
@@ -674,6 +689,7 @@ impl RedbMetaEngine {
             read_only_db: Some(Arc::new(db)),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability: None,
+            write_txn_lock: Mutex::new(()),
             #[cfg(test)]
             allocator_state_write_hook: Mutex::new(None),
         })
