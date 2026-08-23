@@ -483,7 +483,6 @@ impl RedbWriteTransaction<'_> {
             _db,
             write_metrics,
             mutation_started,
-            relaxed_durability: _,
             ..
         } = self;
         // Abort latency itself is intentionally excluded; mutation ends when abort starts,
