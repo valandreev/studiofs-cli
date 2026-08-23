@@ -2148,6 +2148,13 @@ fn ready_foreign_overwrite_replaces_larger_same_epoch_protected_base_graph() {
         vec![remote_payload.object_id],
         "ready remote overwrite should replace, not splice into, a larger same-epoch protected graph"
     );
+    assert_eq!(
+        pg.get_attr(file.ino)
+            .expect("load applied serving attr")
+            .size,
+        remote_attr.size,
+        "ready remote overwrite should replace the larger protected serving size"
+    );
 }
 
 #[test]
@@ -2231,6 +2238,63 @@ fn ready_foreign_overwrite_attr_after_separate_publish_replaces_larger_same_epoc
         pg.get_attr(file.ino).expect("load final attr").size,
         270,
         "a late partial ready attr must not restore a larger same-epoch size"
+    );
+}
+
+#[test]
+fn ready_foreign_partial_append_extends_same_epoch_committed_base() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"foreign-partial-append.txt", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 227, 1);
+    let original_payload = PayloadRef::new_partial(77_097, 227);
+    pg.stage_payload_slice(file.ino, 0, &original_payload)
+        .expect("stage original payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 1, &[original_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish original payload"),
+        "original payload should be published"
+    );
+
+    let remote_append_payload = PayloadRef::new_partial(77_098, 223);
+    let remote_append_publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(223, 446).expect("remote append range"),
+                payload: Some(remote_append_payload),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    let mut remote_attr = pg.get_attr(file.ino).expect("load committed attr");
+    remote_attr.size = 446;
+    remote_attr.committed_size = 446;
+    remote_attr.content_epoch = 1;
+    remote_attr.committed_content_epoch = 1;
+    remote_attr.upload_state = UploadState::Ready;
+
+    apply_foreign_batch(
+        &pg,
+        &[
+            remote_append_publish,
+            MetaEvent::SetAttr { attr: remote_attr },
+        ],
+        &OverlayConflictSets::default(),
+        &HashSet::new(),
+    )
+    .expect("apply ready foreign append");
+
+    assert_eq!(
+        pg.get_attr(file.ino).expect("load final attr").size,
+        446,
+        "a ready partial append must extend the same-epoch committed base"
     );
 }
 

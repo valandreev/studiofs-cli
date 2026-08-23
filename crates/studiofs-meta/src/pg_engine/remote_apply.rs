@@ -781,7 +781,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         target_ino: Ino,
         committed_size: u64,
     ) -> bool {
-        if committed_size == 0 {
+        Self::batch_publish_payload_covers_range(batch_events, target_ino, 0, committed_size)
+    }
+
+    fn batch_publish_payload_covers_range(
+        batch_events: &[MetaEvent],
+        target_ino: Ino,
+        required_start: u64,
+        required_end: u64,
+    ) -> bool {
+        if required_end <= required_start {
             return false;
         }
 
@@ -802,7 +811,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     let start = chunk_start.saturating_add(u64::from(slice.range.start));
                     let end = chunk_start
                         .saturating_add(u64::from(slice.range.end))
-                        .min(committed_size);
+                        .min(required_end);
+                    let start = start.max(required_start);
                     if start < end {
                         ranges.push((start, end));
                     }
@@ -811,13 +821,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
-        let mut covered_until = 0;
+        let mut covered_until = required_start;
         for (start, end) in ranges {
             if start > covered_until {
                 return false;
             }
             covered_until = covered_until.max(end);
-            if covered_until >= committed_size {
+            if covered_until >= required_end {
                 return true;
             }
         }
@@ -1147,6 +1157,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
             if current.upload_state == UploadState::Ready
                 && current.content_epoch == current.committed_content_epoch
                 && current.content_epoch == attr.content_epoch
+                && !(attr.committed_size > current.committed_size
+                    && Self::batch_publish_payload_covers_range(
+                        &batch_events,
+                        attr.ino,
+                        current.committed_size,
+                        attr.committed_size,
+                    ))
             {
                 stale_partial_ready_attr_inodes.insert(attr.ino);
             }
