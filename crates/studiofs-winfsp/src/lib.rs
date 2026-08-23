@@ -21,7 +21,11 @@ const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
 const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
 const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
-const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
+// Kernel-mode opens can reuse a stale cache-manager file object after a
+// same-inode published overwrite, bypassing the user-mode Open callback that
+// resolves the current content identity. Keep them disabled unless an
+// operator explicitly opts into the unsafe cache behavior.
+const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = false;
 const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
 const DEFAULT_PERSISTENT_ACLS: bool = false;
 const WIN32_FALSE: i32 = 0;
@@ -752,6 +756,8 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     volume_params.named_streams(false);
     volume_params.read_only_volume(read_only);
     volume_params.post_cleanup_when_modified_only(true);
+    // Re-resolve every open in the user-mode callback so a published
+    // same-inode overwrite cannot reuse stale kernel file data.
     volume_params.allow_open_in_kernel_mode(options.allow_open_in_kernel_mode);
     volume_params.max_component_length(255);
     volume_params.volume_serial_number(0x5354_4644); // "STFD"
@@ -1100,6 +1106,10 @@ mod tests {
         assert_eq!(
             opts.allow_open_in_kernel_mode,
             DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE
+        );
+        assert!(
+            !opts.allow_open_in_kernel_mode,
+            "kernel-mode opens must be opt-in because they can reuse stale same-inode file data"
         );
         assert_eq!(
             opts.flush_and_purge_on_cleanup,

@@ -963,8 +963,21 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     attr.ino,
                     attr.committed_size,
                 );
+            let has_payload_publish = batch_events.iter().any(|event| {
+                matches!(
+                    event,
+                    MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices }
+                        if *ino == attr.ino
+                            && chunk_slices
+                                .iter()
+                                .flat_map(|(_, slices)| slices)
+                                .any(|slice| slice.payload.is_some())
+                )
+            });
             let remote_should_replace_protected_graph = attr.committed_size
                 < current.committed_size
+                && (!has_payload_publish
+                    || (remote_carries_complete_graph && remote_payload_covers_complete_graph))
                 || (remote_carries_complete_graph
                     && remote_payload_covers_complete_graph
                     && (attr.committed_size > current.committed_size
@@ -1025,6 +1038,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 Err(err) => return Err(err),
             };
             if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
+                continue;
+            }
+            if current.size == current.committed_size
+                && current.content_epoch == current.committed_content_epoch
+                && attr.committed_size > current.committed_size
+                && attr.mtime < current.mtime
+                && attr.ctime < current.ctime
+            {
                 continue;
             }
             if attr.upload_state == UploadState::Ready
@@ -1123,6 +1144,31 @@ impl<'a> RemoteApplyCoordinator<'a> {
     ) -> MetaResult<RemoteApplyBatchOutcome> {
         let batch_events =
             self.preserve_published_content_state_for_attr_only_events(batch_events)?;
+        let stale_older_ready_inodes = self.stale_older_ready_regular_file_inodes(&batch_events)?;
+        let batch_events = batch_events
+            .into_iter()
+            .filter(|event| {
+                !Self::event_belongs_to_stale_older_ready_inode(event, &stale_older_ready_inodes)
+            })
+            .collect::<Vec<_>>();
+        let stale_older_updating_inodes =
+            self.stale_older_updating_regular_file_inodes(&batch_events)?;
+        let batch_events = batch_events
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    MetaEvent::SetAttr { attr }
+                        if stale_older_updating_inodes.contains(&attr.ino)
+                )
+            })
+            .collect::<Vec<_>>();
+        if batch_events.is_empty() {
+            return Ok(RemoteApplyBatchOutcome {
+                changed: false,
+                protected_overlay: OverlayConflictSets::default(),
+            });
+        }
         let current_regular_file_conflicts =
             self.current_regular_file_overlay_conflicts_for_batch(&batch_events)?;
         let overlay = Self::merge_overlay_conflicts(overlay, &current_regular_file_conflicts);
@@ -1153,7 +1199,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
             {
                 continue;
             }
-            let current = self.local.get_attr(attr.ino)?;
+            let current = match self.local.get_attr(attr.ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
             if current.upload_state == UploadState::Ready
                 && current.content_epoch == current.committed_content_epoch
                 && current.content_epoch == attr.content_epoch
@@ -1228,7 +1278,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         self.local.apply_replica_serving_state(&serving_events)?;
         if !protected_attr_merges.is_empty() {
             self.local
-                .apply_replica_serving_state(&protected_attr_merges)?;
+                .apply_replica_serving_state_for_protected_attr_merges(&protected_attr_merges)?;
         }
         let grandfathered_attrs = self.grandfather_removed_local_regular_file_attrs(
             &removed_inodes_with_local_regular_file_state,
@@ -1271,6 +1321,87 @@ impl<'a> RemoteApplyCoordinator<'a> {
         })
     }
 
+    fn stale_older_ready_regular_file_inodes(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<HashSet<Ino>> {
+        let mut stale = HashSet::new();
+        for event in batch_events {
+            let MetaEvent::SetAttr { attr } = event else {
+                continue;
+            };
+            if attr.kind != FileType::RegularFile
+                || attr.upload_state != UploadState::Ready
+                || attr.size != attr.committed_size
+                || attr.content_epoch != attr.committed_content_epoch
+            {
+                continue;
+            }
+            let current = match self.local.get_attr(attr.ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            if current.kind == FileType::RegularFile
+                && current.upload_state == UploadState::Ready
+                && current.size == current.committed_size
+                && current.content_epoch == current.committed_content_epoch
+                && attr.committed_size > current.committed_size
+                && attr.mtime < current.mtime
+                && attr.ctime < current.ctime
+            {
+                stale.insert(attr.ino);
+            }
+        }
+        Ok(stale)
+    }
+
+    fn event_belongs_to_stale_older_ready_inode(
+        event: &MetaEvent,
+        stale_inodes: &HashSet<Ino>,
+    ) -> bool {
+        let ino = match event {
+            MetaEvent::SetAttr { attr } => Some(attr.ino),
+            MetaEvent::RemoveAttr { ino }
+            | MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+            | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+            | MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
+            _ => None,
+        };
+        ino.is_some_and(|ino| stale_inodes.contains(&ino))
+    }
+
+    fn stale_older_updating_regular_file_inodes(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<HashSet<Ino>> {
+        let mut stale = HashSet::new();
+        for event in batch_events {
+            let MetaEvent::SetAttr { attr } = event else {
+                continue;
+            };
+            if attr.kind != FileType::RegularFile || attr.upload_state == UploadState::Ready {
+                continue;
+            }
+            let current = match self.local.get_attr(attr.ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            if current.kind == FileType::RegularFile
+                && current.upload_state == UploadState::Ready
+                && current.size == current.committed_size
+                && current.content_epoch == current.committed_content_epoch
+                && attr.mtime < current.mtime
+                && attr.ctime < current.ctime
+                && attr.committed_size > current.committed_size
+            {
+                stale.insert(attr.ino);
+            }
+        }
+        Ok(stale)
+    }
+
     pub(super) fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         if batch_events.is_empty() {
             return Ok(false);
@@ -1278,6 +1409,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
         let batch_events =
             self.preserve_published_content_state_for_attr_only_events(batch_events)?;
+        let stale_self_updating_inodes =
+            self.stale_self_updating_regular_file_inodes(&batch_events)?;
+        let batch_events = batch_events
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    MetaEvent::SetAttr { attr }
+                        if stale_self_updating_inodes.contains(&attr.ino)
+                )
+            })
+            .collect::<Vec<_>>();
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         if partial_publish_inodes.is_empty() {
             self.local.apply_replica_events_to_base(&batch_events)?;
@@ -1325,6 +1468,40 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
         self.local.apply_replica_aux_state(&aux_events)?;
         Ok(true)
+    }
+
+    fn stale_self_updating_regular_file_inodes(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<HashSet<Ino>> {
+        let mut stale = HashSet::new();
+        for event in batch_events {
+            let MetaEvent::SetAttr { attr } = event else {
+                continue;
+            };
+            if attr.kind != FileType::RegularFile || attr.upload_state == UploadState::Ready {
+                continue;
+            }
+            let current = match self.local.get_attr(attr.ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            if current.kind == FileType::RegularFile
+                && current.upload_state == UploadState::Ready
+                && current.size == current.committed_size
+                && current.content_epoch == current.committed_content_epoch
+                && ((attr.mtime < current.mtime
+                    && attr.ctime < current.ctime
+                    && attr.committed_size > current.committed_size)
+                    || (attr.committed_size >= current.committed_size
+                        && attr.content_epoch == current.content_epoch
+                        && attr.committed_content_epoch < current.committed_content_epoch))
+            {
+                stale.insert(attr.ino);
+            }
+        }
+        Ok(stale)
     }
 
     pub(super) fn overlay_conflicts_for_local_range(

@@ -772,6 +772,28 @@ impl RedbMetaEngine {
         &self,
         events: &[crate::events::MetaEvent],
     ) -> MetaResult<()> {
+        self.apply_replica_serving_state_inner(events, false)
+    }
+
+    pub(crate) fn apply_replica_serving_state_for_pending_replay(
+        &self,
+        events: &[crate::events::MetaEvent],
+    ) -> MetaResult<()> {
+        self.apply_replica_serving_state_inner(events, true)
+    }
+
+    pub(crate) fn apply_replica_serving_state_for_protected_attr_merges(
+        &self,
+        events: &[crate::events::MetaEvent],
+    ) -> MetaResult<()> {
+        self.apply_replica_serving_state_inner(events, false)
+    }
+
+    fn apply_replica_serving_state_inner(
+        &self,
+        events: &[crate::events::MetaEvent],
+        reject_stale_ready_growth: bool,
+    ) -> MetaResult<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -781,6 +803,47 @@ impl RedbMetaEngine {
         for event in events {
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
+                    let current = match Self::get_attr_merged_in_write_txn(&txn, attr.ino) {
+                        Ok(current) => Some(current),
+                        Err(MetaError::InodeNotFound(_)) => None,
+                        Err(err) => return Err(err),
+                    };
+                    if reject_stale_ready_growth
+                        && let Some(current) = current.as_ref()
+                        && current.kind == FileType::RegularFile
+                        && current.upload_state == UploadState::Ready
+                        && current.size == current.committed_size
+                        && current.content_epoch == current.committed_content_epoch
+                        && attr.upload_state != UploadState::Ready
+                        && ((attr.mtime < current.mtime
+                            && attr.ctime < current.ctime
+                            && attr.committed_size > current.committed_size)
+                            || (attr.committed_size >= current.committed_size
+                                && attr.content_epoch == current.content_epoch
+                                && attr.committed_content_epoch < current.committed_content_epoch))
+                    {
+                        continue;
+                    }
+                    if reject_stale_ready_growth
+                        && let Some(current) = current.as_ref()
+                        && current.kind == FileType::RegularFile
+                        && current.upload_state == UploadState::Ready
+                        && current.size == current.committed_size
+                        && current.content_epoch == current.committed_content_epoch
+                        && attr.upload_state == UploadState::Ready
+                        && attr.size == attr.committed_size
+                        && attr.content_epoch == current.content_epoch
+                        && attr.size > current.size
+                        && ((attr.mtime < current.mtime && attr.ctime < current.ctime)
+                            || !Self::ready_regular_file_growth_has_payload(
+                                events,
+                                attr.ino,
+                                current.size,
+                                attr.size,
+                            ))
+                    {
+                        continue;
+                    }
                     if let Some(base_attr) =
                         Self::stale_ready_regular_file_base_attr_in_txn(&txn, attr)?
                     {
@@ -788,7 +851,18 @@ impl RedbMetaEngine {
                         let current_is_newer = current.content_epoch > attr.content_epoch
                             || (current.content_epoch == attr.content_epoch
                                 && current.size > attr.size);
-                        if !current_is_newer {
+                        let current_matches_ready_attr = reject_stale_ready_growth
+                            && current.kind == FileType::RegularFile
+                            && current.upload_state == UploadState::Ready
+                            && attr.upload_state == UploadState::Ready
+                            && current.size == attr.size
+                            && current.committed_size == attr.committed_size
+                            && current.content_epoch == attr.content_epoch
+                            && current.committed_content_epoch == attr.committed_content_epoch;
+                        let skip_stale_base = reject_stale_ready_growth
+                            && (current_matches_ready_attr
+                                || (attr.mtime > base_attr.mtime && attr.ctime > base_attr.ctime));
+                        if !current_is_newer && !skip_stale_base {
                             Self::set_inode_mirror_in_txn(&txn, &base_attr)?;
                             Self::clear_regular_file_serving_overlay_in_txn(&txn, attr.ino)?;
                         }
@@ -1142,6 +1216,61 @@ impl RedbMetaEngine {
         }
     }
 
+    fn ready_regular_file_growth_has_payload(
+        events: &[crate::events::MetaEvent],
+        ino: Ino,
+        required_start: u64,
+        required_end: u64,
+    ) -> bool {
+        if required_end <= required_start {
+            return false;
+        }
+
+        let mut ranges = Vec::new();
+        for event in events {
+            let crate::events::MetaEvent::PublishRegularFileBaseSlices {
+                ino: event_ino,
+                chunk_slices,
+            } = event
+            else {
+                continue;
+            };
+            if *event_ino != ino {
+                continue;
+            }
+            for (chunk_id, slices) in chunk_slices {
+                let chunk_start = chunk_start_offset(*chunk_id, DEFAULT_CHUNK_SIZE);
+                for slice in slices {
+                    if slice.payload.is_none() {
+                        continue;
+                    }
+                    let start = chunk_start
+                        .saturating_add(u64::from(slice.range.start))
+                        .max(required_start);
+                    let end = chunk_start
+                        .saturating_add(u64::from(slice.range.end))
+                        .min(required_end);
+                    if start < end {
+                        ranges.push((start, end));
+                    }
+                }
+            }
+        }
+
+        ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+        let mut covered_until = required_start;
+        for (start, end) in ranges {
+            if start > covered_until {
+                return false;
+            }
+            covered_until = covered_until.max(end);
+            if covered_until >= required_end {
+                return true;
+            }
+        }
+        false
+    }
+
     fn stale_ready_regular_file_base_attr_in_txn(
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
@@ -1159,7 +1288,8 @@ impl RedbMetaEngine {
 
         Ok((base_attr.kind == FileType::RegularFile
             && (base_attr.committed_content_epoch > attr.committed_content_epoch
-                || base_attr.committed_size > attr.committed_size))
+                || (base_attr.committed_content_epoch == attr.committed_content_epoch
+                    && base_attr.committed_size > attr.committed_size)))
             .then_some(base_attr))
     }
 

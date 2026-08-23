@@ -308,13 +308,8 @@ fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_a() {
         .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt")
         .expect("local loser rename should be accepted");
 
-    let pg_winner = replica_rename_event(
-        ROOT_INO,
-        b"source.txt",
-        ROOT_INO,
-        b"renamed-b.txt",
-        entry,
-    );
+    let pg_winner =
+        replica_rename_event(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-b.txt", entry);
     engine
         .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
         .unwrap();
@@ -363,13 +358,8 @@ fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_b() {
         .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-b.txt")
         .expect("local loser rename should be accepted");
 
-    let pg_winner = replica_rename_event(
-        ROOT_INO,
-        b"source.txt",
-        ROOT_INO,
-        b"renamed-a.txt",
-        entry,
-    );
+    let pg_winner =
+        replica_rename_event(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt", entry);
     engine
         .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
         .unwrap();
@@ -398,13 +388,19 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
         .rename_atomic(ROOT_INO, b"source-link", ROOT_INO, b"renamed-link")
         .expect("local rename should be accepted");
     engine
-        .set_counter("pgLastFlushedLocalEventSeq", engine.get_counter("nextEventSeq").unwrap())
+        .set_counter(
+            "pgLastFlushedLocalEventSeq",
+            engine.get_counter("nextEventSeq").unwrap(),
+        )
         .unwrap();
     engine
         .unlink(ROOT_INO, b"renamed-link")
         .expect("local unlink should be accepted");
     engine
-        .set_counter("pgLastFlushedLocalEventSeq", engine.get_counter("nextEventSeq").unwrap())
+        .set_counter(
+            "pgLastFlushedLocalEventSeq",
+            engine.get_counter("nextEventSeq").unwrap(),
+        )
         .unwrap();
     assert!(engine.lookup(ROOT_INO, b"renamed-link").is_err());
 
@@ -521,11 +517,7 @@ fn replica_serving_rename_removes_source_even_when_overlay_points_at_other_inode
         .apply_replica_serving_state(std::slice::from_ref(&rename_replace))
         .unwrap();
 
-    assert_only_visible_name(
-        &engine,
-        b"slot-3-renamed.txt",
-        &[b"slot-3.txt".as_slice()],
-    );
+    assert_only_visible_name(&engine, b"slot-3-renamed.txt", &[b"slot-3.txt".as_slice()]);
     let renamed = engine
         .lookup(ROOT_INO, b"slot-3-renamed.txt")
         .expect("lookup renamed target");
@@ -576,13 +568,8 @@ fn replica_base_rename_uses_pg_order_when_source_already_moved_to_prior_winner()
         .apply_replica_serving_state(std::slice::from_ref(&first_winner))
         .unwrap();
 
-    let pg_later_winner = replica_rename_event(
-        ROOT_INO,
-        b"source.txt",
-        ROOT_INO,
-        b"renamed-b.txt",
-        entry,
-    );
+    let pg_later_winner =
+        replica_rename_event(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-b.txt", entry);
     engine
         .apply_replica_events_to_base(std::slice::from_ref(&pg_later_winner))
         .unwrap();
@@ -634,13 +621,8 @@ fn replica_serving_rename_preserves_local_hardlink_while_removing_local_loser() 
         .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt")
         .expect("local loser rename should be accepted");
 
-    let pg_winner = replica_rename_event(
-        ROOT_INO,
-        b"source.txt",
-        ROOT_INO,
-        b"renamed-b.txt",
-        entry,
-    );
+    let pg_winner =
+        replica_rename_event(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-b.txt", entry);
     engine
         .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
         .unwrap();
@@ -684,13 +666,8 @@ fn replica_serving_rename_still_applies_when_source_matches() {
         ])
         .unwrap();
 
-    let remote_rename = replica_rename_event(
-        ROOT_INO,
-        b"source.txt",
-        ROOT_INO,
-        b"renamed-a.txt",
-        entry,
-    );
+    let remote_rename =
+        replica_rename_event(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt", entry);
     engine
         .apply_replica_events_to_base(std::slice::from_ref(&remote_rename))
         .unwrap();
@@ -976,7 +953,13 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
 fn replica_serving_stale_ready_attr_restores_newer_base_version() {
     let engine = temp_engine();
     let file = engine
-        .create_file(ROOT_INO, b"replica-serving-stale-ready.bin", 1000, 1000, 0o644)
+        .create_file(
+            ROOT_INO,
+            b"replica-serving-stale-ready.bin",
+            1000,
+            1000,
+            0o644,
+        )
         .unwrap();
 
     let remote_winner = PayloadRef::new_full(90_003, 227);
@@ -1052,10 +1035,64 @@ fn replica_serving_stale_ready_attr_restores_newer_base_version() {
 }
 
 #[test]
+fn pending_serving_replay_does_not_restore_equal_ready_state_from_larger_base() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"pending-serving-replay-ready.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+
+    let mut ready_attr = engine.get_attr(file.ino).unwrap();
+    ready_attr.size = 223;
+    ready_attr.committed_size = 223;
+    ready_attr.content_epoch = 3;
+    ready_attr.committed_content_epoch = 3;
+    ready_attr.upload_state = UploadState::Ready;
+    engine
+        .apply_replica_events_to_base(&[crate::events::MetaEvent::SetAttr {
+            attr: ready_attr.clone(),
+        }])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[crate::events::MetaEvent::SetAttr {
+            attr: ready_attr.clone(),
+        }])
+        .unwrap();
+
+    let mut larger_base_attr = ready_attr.clone();
+    larger_base_attr.size = 227;
+    larger_base_attr.committed_size = 227;
+    engine
+        .apply_replica_events_to_base(&[crate::events::MetaEvent::SetAttr {
+            attr: larger_base_attr,
+        }])
+        .unwrap();
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&[crate::events::MetaEvent::SetAttr {
+            attr: ready_attr.clone(),
+        }])
+        .unwrap();
+
+    assert_eq!(engine.get_attr(file.ino).unwrap(), ready_attr);
+}
+
+#[test]
 fn replica_serving_base_publish_replaces_stale_overlay_payload() {
     let engine = temp_engine();
     let file = engine
-        .create_file(ROOT_INO, b"replica-serving-base-publish.bin", 1000, 1000, 0o644)
+        .create_file(
+            ROOT_INO,
+            b"replica-serving-base-publish.bin",
+            1000,
+            1000,
+            0o644,
+        )
         .unwrap();
     let mut attr = engine.get_attr(file.ino).unwrap();
     attr.size = u64::from(DEFAULT_BLOCK_SIZE);
@@ -1115,7 +1152,13 @@ fn replica_serving_base_publish_replaces_stale_overlay_payload() {
 fn replica_serving_base_publish_preserves_unpublished_local_overlay() {
     let engine = temp_engine();
     let file = engine
-        .create_file(ROOT_INO, b"replica-serving-local-overlay.bin", 1000, 1000, 0o644)
+        .create_file(
+            ROOT_INO,
+            b"replica-serving-local-overlay.bin",
+            1000,
+            1000,
+            0o644,
+        )
         .unwrap();
     let mut attr = engine.get_attr(file.ino).unwrap();
     attr.size = u64::from(DEFAULT_BLOCK_SIZE);
@@ -1176,7 +1219,13 @@ fn replica_serving_base_publish_preserves_unpublished_local_overlay() {
 fn replica_serving_overlay_replay_preserves_uploaded_payload_state() {
     let engine = temp_engine();
     let mut attr = engine
-        .create_file(ROOT_INO, b"replica-serving-stale-overlay.bin", 1000, 1000, 0o644)
+        .create_file(
+            ROOT_INO,
+            b"replica-serving-stale-overlay.bin",
+            1000,
+            1000,
+            0o644,
+        )
         .unwrap();
     attr.content_epoch = 7;
     attr.size = 8192;
@@ -1631,7 +1680,9 @@ fn replica_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
     engine.set_attr(&attr).unwrap();
 
     let local_tail = PayloadRef::new_partial(93_101, 4096);
-    engine.stage_payload_slice(file.ino, 3, &local_tail).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 3, &local_tail)
+        .unwrap();
     mark_overlay_objects_uploaded(&engine, file.ino, 3, &[local_tail.object_id]);
     assert!(
         engine
@@ -1647,11 +1698,8 @@ fn replica_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
             vec![SliceRecord {
                 slice_id: SliceId(0),
                 order: SliceOrder(0),
-                range: SliceRange::new(
-                    2 * DEFAULT_BLOCK_SIZE,
-                    (2 * DEFAULT_BLOCK_SIZE) + 4096,
-                )
-                .unwrap(),
+                range: SliceRange::new(2 * DEFAULT_BLOCK_SIZE, (2 * DEFAULT_BLOCK_SIZE) + 4096)
+                    .unwrap(),
                 payload: Some(remote_middle),
                 payload_state: PayloadRefState::Published,
             }],
@@ -1689,7 +1737,9 @@ fn replica_aux_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
     engine.set_attr(&attr).unwrap();
 
     let local_tail = PayloadRef::new_partial(93_201, 4096);
-    engine.stage_payload_slice(file.ino, 3, &local_tail).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 3, &local_tail)
+        .unwrap();
     mark_overlay_objects_uploaded(&engine, file.ino, 3, &[local_tail.object_id]);
     assert!(
         engine
@@ -1705,11 +1755,8 @@ fn replica_aux_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
             vec![SliceRecord {
                 slice_id: SliceId(0),
                 order: SliceOrder(0),
-                range: SliceRange::new(
-                    2 * DEFAULT_BLOCK_SIZE,
-                    (2 * DEFAULT_BLOCK_SIZE) + 4096,
-                )
-                .unwrap(),
+                range: SliceRange::new(2 * DEFAULT_BLOCK_SIZE, (2 * DEFAULT_BLOCK_SIZE) + 4096)
+                    .unwrap(),
                 payload: Some(remote_middle),
                 payload_state: PayloadRefState::Published,
             }],
@@ -1747,7 +1794,9 @@ fn replica_base_publish_tombstone_clears_stale_unprotected_range() {
     engine.set_attr(&attr).unwrap();
 
     let stale_payload = PayloadRef::new_full(93_301, DEFAULT_BLOCK_SIZE);
-    engine.stage_payload_slice(file.ino, 0, &stale_payload).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &stale_payload)
+        .unwrap();
     mark_overlay_objects_uploaded(&engine, file.ino, 3, &[stale_payload.object_id]);
     assert!(
         engine
@@ -1788,7 +1837,13 @@ fn replica_base_publish_tombstone_clears_stale_unprotected_range() {
 fn replica_serving_remove_attr_clears_regular_file_overlay_payload() {
     let engine = temp_engine();
     let file = engine
-        .create_file(ROOT_INO, b"replica-serving-remove-attr.bin", 1000, 1000, 0o644)
+        .create_file(
+            ROOT_INO,
+            b"replica-serving-remove-attr.bin",
+            1000,
+            1000,
+            0o644,
+        )
         .unwrap();
     let overlay = PayloadRef::new_full(92_001, DEFAULT_BLOCK_SIZE);
     let overlay_slices = RedbMetaEngine::chunk_slices_for_block(

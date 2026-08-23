@@ -2299,6 +2299,226 @@ fn ready_foreign_partial_append_extends_same_epoch_committed_base() {
 }
 
 #[test]
+fn late_older_foreign_publish_does_not_restore_local_truncated_size() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"late-older-publish.txt", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 275, 2);
+    let original_payload = PayloadRef::new_partial(77_099, 275);
+    pg.stage_payload_slice(file.ino, 0, &original_payload)
+        .expect("stage original payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 2, &[original_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .expect("publish original payload"),
+        "original payload should be published"
+    );
+    let stale_attr = pg.get_attr(file.ino).expect("load original attr");
+
+    set_file_state(&pg, file.ino, 270, 3);
+    let replacement_payload = PayloadRef::new_partial(77_100, 270);
+    pg.stage_payload_slice(file.ino, 0, &replacement_payload)
+        .expect("stage replacement payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 3, &[replacement_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .expect("publish replacement payload"),
+        "replacement payload should be published"
+    );
+    assert_eq!(
+        pg.get_attr(file.ino).expect("load truncated attr").size,
+        270
+    );
+
+    let mut stale_updating_attr = stale_attr.clone();
+    stale_updating_attr.size = 0;
+    stale_updating_attr.content_epoch = 2;
+    stale_updating_attr.committed_content_epoch = 1;
+    stale_updating_attr.upload_state = UploadState::Updating;
+    let protected_overlay = OverlayConflictSets {
+        attr_inodes: HashSet::from([file.ino]),
+        block_inodes: HashSet::from([file.ino]),
+        ..OverlayConflictSets::default()
+    };
+    apply_foreign_batch(
+        &pg,
+        &[MetaEvent::SetAttr {
+            attr: stale_updating_attr,
+        }],
+        &protected_overlay,
+        &HashSet::from([file.ino]),
+    )
+    .expect("apply late older updating attr");
+    let protected_attr = pg.get_attr(file.ino).expect("load protected attr");
+    assert_eq!(protected_attr.size, 270);
+    assert_eq!(protected_attr.committed_size, 270);
+    assert_eq!(protected_attr.upload_state, UploadState::Ready);
+
+    let stale_publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, 275).expect("stale payload range"),
+                payload: Some(original_payload),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    apply_foreign_batch(
+        &pg,
+        &[stale_publish, MetaEvent::SetAttr { attr: stale_attr }],
+        &OverlayConflictSets::default(),
+        &HashSet::new(),
+    )
+    .expect("apply late older foreign publish");
+
+    assert_eq!(
+        pg.get_attr(file.ino).expect("load final attr").size,
+        270,
+        "an older foreign publish must not restore the truncated local size"
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, 270).expect("load final payload"),
+        vec![replacement_payload.object_id],
+        "an older foreign publish must not replace the truncated local payload"
+    );
+}
+
+#[test]
+fn late_older_foreign_updating_attr_does_not_hide_newer_local_ready_state() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"late-older-updating.txt", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 275, 1);
+    let original_payload = PayloadRef::new_partial(77_101, 275);
+    pg.stage_payload_slice(file.ino, 0, &original_payload)
+        .expect("stage original payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 1, &[original_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish original payload")
+    );
+    let stale_attr = pg.get_attr(file.ino).expect("load original attr");
+    pg.local
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+            attr: stale_attr.clone(),
+        }])
+        .expect("acknowledge original base attr");
+
+    set_file_state(&pg, file.ino, 270, 3);
+    let replacement_payload = PayloadRef::new_partial(77_102, 270);
+    pg.stage_payload_slice(file.ino, 0, &replacement_payload)
+        .expect("stage replacement payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 3, &[replacement_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .expect("publish replacement payload")
+    );
+
+    let mut stale_updating_attr = stale_attr;
+    stale_updating_attr.size = 0;
+    stale_updating_attr.committed_size = 275;
+    stale_updating_attr.content_epoch = 2;
+    stale_updating_attr.committed_content_epoch = 1;
+    stale_updating_attr.upload_state = UploadState::Updating;
+    apply_foreign_batch(
+        &pg,
+        &[MetaEvent::SetAttr {
+            attr: stale_updating_attr,
+        }],
+        &OverlayConflictSets::default(),
+        &HashSet::new(),
+    )
+    .expect("apply stale updating attr");
+
+    let attr = pg.get_attr(file.ino).expect("load final attr");
+    assert_eq!(attr.size, 270);
+    assert_eq!(attr.committed_size, 270);
+    assert_eq!(attr.upload_state, UploadState::Ready);
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, 270).expect("load replacement payload"),
+        vec![replacement_payload.object_id]
+    );
+}
+
+#[test]
+fn late_self_updating_attr_does_not_restore_older_base_before_ready_replay() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"late-self-updating.txt", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 275, 1);
+    let original_payload = PayloadRef::new_partial(77_103, 275);
+    pg.stage_payload_slice(file.ino, 0, &original_payload)
+        .expect("stage original payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 1, &[original_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish original payload")
+    );
+    let stale_attr = pg.get_attr(file.ino).expect("load original attr");
+    pg.local
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+            attr: stale_attr.clone(),
+        }])
+        .expect("acknowledge original base attr");
+
+    set_file_state(&pg, file.ino, 270, 3);
+    let replacement_payload = PayloadRef::new_partial(77_104, 270);
+    pg.stage_payload_slice(file.ino, 0, &replacement_payload)
+        .expect("stage replacement payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 3, &[replacement_payload.object_id]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .expect("publish replacement payload")
+    );
+
+    let mut stale_updating_attr = stale_attr;
+    stale_updating_attr.size = 275;
+    stale_updating_attr.committed_size = 275;
+    stale_updating_attr.content_epoch = 3;
+    stale_updating_attr.committed_content_epoch = 1;
+    stale_updating_attr.upload_state = UploadState::Updating;
+    apply_visible_self_batch(
+        &pg,
+        &[MetaEvent::SetAttr {
+            attr: stale_updating_attr,
+        }],
+    )
+    .expect("apply stale self attr");
+    assert_eq!(
+        pg.local
+            .get_base_attr(file.ino)
+            .expect("load base attr")
+            .expect("base attr exists")
+            .upload_state,
+        UploadState::Ready,
+        "a stale self Updating attr must not replace the published base marker"
+    );
+
+    let ready_attr = pg.get_attr(file.ino).expect("load current attr");
+    apply_visible_self_batch(&pg, &[MetaEvent::SetAttr { attr: ready_attr }])
+        .expect("replay current ready attr");
+
+    let attr = pg.get_attr(file.ino).expect("load final attr");
+    assert_eq!(attr.size, 270);
+    assert_eq!(attr.committed_size, 270);
+    assert_eq!(attr.upload_state, UploadState::Ready);
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, 270).expect("load replacement payload"),
+        vec![replacement_payload.object_id]
+    );
+}
+
+#[test]
 fn publish_without_ready_attr_preserves_protected_base_graph() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

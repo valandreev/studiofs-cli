@@ -50,7 +50,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | File info timeout | WinFSP cache-manager mode (`-1`/`max`) by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` |
 | Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
-| Allow open in kernel mode | Enabled by default. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE` |
+| Allow open in kernel mode | Disabled by default to preserve same-inode overwrite coherence. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE=1` |
 | Flush/purge on cleanup | Disabled by default to preserve read-cache pages across close/reopen cycles. Override: `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=1` |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
@@ -60,13 +60,19 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Filesystem name | "StudioFS" |
 
 `STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local payload I/O.
+StudioFS keeps WinFSP kernel-mode opens disabled by default: a kernel-mode open
+can reuse a stale cache-manager file object after a same-inode published
+overwrite and bypass the user-mode `Open` callback that resolves the current
+content identity. `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE=1` is therefore
+an explicit performance/debug override with weaker overwrite-coherence
+guarantees.
 StudioFS disables WinFSP `FlushAndPurgeOnCleanup` by default so read-only
 handles can preserve cache-manager pages across close/reopen cycles.
 Write-capable file handles opt out of the WinFSP/Windows file cache at
 `Create`/`Open` time, while read-only handles keep the WinFSP cache-manager /
 fast-I/O path by default. Regular-file `FileInfo.IndexNumber` includes the
 committed content epoch, so remote same-inode overwrites get a new cache-manager
-identity without globally disabling read caching. Use a bounded
+identity when the open is resolved by user mode. Use a bounded
 `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` value only for targeted multi-client
 invalidation experiments. Set `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=1`
 only for targeted stale-cache investigations.

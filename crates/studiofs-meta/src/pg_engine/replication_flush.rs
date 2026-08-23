@@ -129,7 +129,8 @@ impl PgMetaEngine {
             Self::clear_pending_state(&mut state);
             return Ok(());
         }
-        self.local.apply_replica_serving_state(pending_events)?;
+        self.local
+            .apply_replica_serving_state_for_pending_replay(pending_events)?;
         let projected = RemoteApplyCoordinator::project_local_batch(pending_events);
         if projected.visible_ops == 0 {
             if projected.needs_local_replay {
