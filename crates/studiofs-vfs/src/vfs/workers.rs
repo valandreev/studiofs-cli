@@ -13,6 +13,7 @@ const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
     payloads: HashMap<Ino, Vec<u64>>,
+    entries: HashSet<(Ino, Vec<u8>, Ino)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +182,16 @@ fn metadata_namespace_changed(
     current_snapshot: &HashSet<Ino>,
 ) -> bool {
     token_namespace_changed || previous_snapshot.is_none_or(|previous| previous != current_snapshot)
+}
+
+fn metadata_namespace_entry_changes(
+    previous: &HashSet<(Ino, Vec<u8>, Ino)>,
+    current: &HashSet<(Ino, Vec<u8>, Ino)>,
+) -> HashSet<(Ino, Vec<u8>)> {
+    previous
+        .symmetric_difference(current)
+        .map(|(parent, name, _ino)| (*parent, name.clone()))
+        .collect()
 }
 
 fn metadata_invalidation_fallback_timer(interval: Duration) -> tokio::time::Interval {
@@ -473,6 +484,7 @@ impl StudioVfs {
         let mut seen = HashSet::from([ROOT_INO]);
         let mut stack = vec![ROOT_INO];
         let mut payloads = HashMap::new();
+        let mut namespace_entries = HashSet::new();
 
         while let Some(ino) = stack.pop() {
             let attr = match engine.get_attr(ino) {
@@ -488,6 +500,7 @@ impl StudioVfs {
                         Err(err) => return Err(err),
                     };
                     for entry in entries {
+                        namespace_entries.insert((ino, entry.name.clone(), entry.ino));
                         if seen.insert(entry.ino) {
                             stack.push(entry.ino);
                         }
@@ -512,6 +525,7 @@ impl StudioVfs {
         Ok(MetadataTraversalSnapshot {
             inodes: seen,
             payloads,
+            entries: namespace_entries,
         })
     }
 
@@ -629,6 +643,18 @@ impl StudioVfs {
         }
     }
 
+    pub(super) fn invalidate_kernel_entries(
+        &self,
+        entries: impl IntoIterator<Item = (Ino, Vec<u8>)>,
+    ) {
+        let Some(invalidator) = self.kernel_invalidator() else {
+            return;
+        };
+        for (parent, name) in entries {
+            invalidator.inval_entry(parent, &name);
+        }
+    }
+
     pub(super) fn invalidate_kernel_inode_attrs(&self, inodes: impl IntoIterator<Item = Ino>) {
         let Some(invalidator) = self.kernel_invalidator() else {
             return;
@@ -738,6 +764,7 @@ impl StudioVfs {
         let mut last_namespace_token = None;
         let mut last_metadata_token = None;
         let mut last_snapshot: Option<HashSet<Ino>> = None;
+        let mut last_namespace_entries: Option<HashSet<(Ino, Vec<u8>, Ino)>> = None;
         let mut last_payload_snapshot: Option<HashMap<Ino, Vec<u64>>> = None;
         let mut fallback_timer = metadata_invalidation_fallback_timer(interval);
 
@@ -818,7 +845,24 @@ impl StudioVfs {
                 token_namespace_changed,
                 last_snapshot.as_ref(),
                 &current_snapshot.inodes,
-            );
+            ) || last_namespace_entries
+                .as_ref()
+                .is_some_and(|previous| previous != &current_snapshot.entries);
+
+            let changed_namespace_entries = if namespace_changed {
+                match &last_namespace_entries {
+                    Some(previous) => {
+                        metadata_namespace_entry_changes(previous, &current_snapshot.entries)
+                    }
+                    None => current_snapshot
+                        .entries
+                        .iter()
+                        .map(|(parent, name, _ino)| (*parent, name.clone()))
+                        .collect(),
+                }
+            } else {
+                HashSet::new()
+            };
 
             let changed_payload_inodes = match &last_payload_snapshot {
                 Some(last_payload_snapshot) => Self::changed_metadata_payload_inodes(
@@ -869,6 +913,7 @@ impl StudioVfs {
                     .copied()
                     .chain(changed_payload_inodes.iter().copied()),
             );
+            self.invalidate_kernel_entries(changed_namespace_entries);
             if namespace_changed {
                 self.bump_namespace_epoch();
             }
@@ -876,6 +921,7 @@ impl StudioVfs {
                 self.bump_acl_namespace_epoch();
             }
             last_snapshot = Some(current_snapshot.inodes);
+            last_namespace_entries = Some(current_snapshot.entries);
             last_payload_snapshot = Some(current_snapshot.payloads);
             last_namespace_token = after_namespace_token;
             last_metadata_token = after_metadata_token;
@@ -1981,6 +2027,17 @@ mod tests {
         let current = HashSet::from([ROOT_INO, 10, 20]);
 
         assert!(metadata_namespace_changed(false, Some(&previous), &current));
+    }
+
+    #[test]
+    fn metadata_namespace_entry_replacement_invalidates_the_same_name() {
+        let previous = HashSet::from([(ROOT_INO, b"recovery.bin".to_vec(), 10)]);
+        let current = HashSet::from([(ROOT_INO, b"recovery.bin".to_vec(), 20)]);
+
+        assert_eq!(
+            metadata_namespace_entry_changes(&previous, &current),
+            HashSet::from([(ROOT_INO, b"recovery.bin".to_vec())])
+        );
     }
 
     #[test]

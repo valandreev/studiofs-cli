@@ -288,7 +288,7 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Kernel `congestion_threshold` | macOS: `40` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
-| macOS: cache policy | UBC when the file fits available memory; direct reads otherwise |
+| macOS: cache policy | UBC for fitting read-only files; direct I/O for write-capable or oversized read-only handles |
 | macOS: validated macFUSE | 5.2.0 |
 
 ### macOS cache and I/O policy
@@ -308,6 +308,9 @@ geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
 large sequential media callbacks into smaller requests. StudioFS does not pass
 `noappledouble`: macFUSE handles that option before userspace and can hide
 `.DS_Store`, which Finder/copyfile requires for folder copies.
+Write-capable handles use per-handle `direct_io`: macFUSE's buffered Apple
+copy path can otherwise replace valid large-write buffers before the low-level
+write callback. Read-only handles retain the adaptive UBC policy above.
 The native macOS bridge queues read replies asynchronously. Write callbacks are
 currently acknowledged after the shared VFS accepts the write, while the VFS
 materializes and uploads accepted data in the background. The shared writer

@@ -427,7 +427,9 @@ fn run_manual_recovery(
         summary.post_cut_absent = !snapshot_mount.join(POST_CUT_FILE).exists();
         summary.read_only_failures =
             snapshot_read_only_failures(&snapshot_mount, &snapshot_versioned, &snapshot_recovery);
-        fs::copy(&snapshot_recovery, &recovery)?;
+        // Reuse the snapshot bytes verified above: macOS `fcopyfile` can corrupt
+        // large cross-macFUSE copies before the destination write callback.
+        write_file_sync(&recovery, &snapshot_recovery_bytes)?;
         summary.recovery_copy_performed = true;
         summary.restored_sha256 = bytes_sha256(&fs::read(&recovery)?);
         wait_for_checksum(

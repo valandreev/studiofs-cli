@@ -971,6 +971,9 @@ pub trait KernelInvalidator: Send + Sync {
     /// Invalidate the full kernel cache state for the inode, including attributes and data.
     fn inval_inode(&self, ino: u64);
 
+    /// Invalidate a cached directory entry by parent inode and name.
+    fn inval_entry(&self, _parent: u64, _name: &[u8]) {}
+
     /// Invalidate only kernel attribute cache state associated with the given inode.
     fn inval_inode_attrs(&self, ino: u64) {
         self.inval_inode(ino);

@@ -29,8 +29,8 @@ const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 4 * 1024 * 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-// Bound unique inodes per session; producers apply backpressure instead of
-// dropping invalidations when this finite metadata budget is exhausted.
+// Bound unique invalidation targets per session; producers apply backpressure
+// instead of dropping invalidations when this finite metadata budget is exhausted.
 const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
@@ -244,6 +244,13 @@ pub(crate) mod raw {
             ino: FuseIno,
             off: off_t,
             len: off_t,
+        ) -> c_int;
+        /// Notify the kernel to invalidate a cached directory entry.
+        pub fn fuse_lowlevel_notify_inval_entry(
+            channel: *mut FuseChan,
+            parent: FuseIno,
+            name: *const c_char,
+            namelen: size_t,
         ) -> c_int;
         /// Unmount a FUSE mount point and release its channel.
         pub fn fuse_unmount(mountpoint: *const c_char, channel: *mut FuseChan);
@@ -782,6 +789,24 @@ struct InodeInvalidation {
     data: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntryInvalidation {
+    parent: u64,
+    name: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum InvalidationKey {
+    Inode(u64),
+    Entry { parent: u64, name: Vec<u8> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionInvalidation {
+    Inode(InodeInvalidation),
+    Entry(EntryInvalidation),
+}
+
 struct SessionInvalidationQueue {
     state: ParkingMutex<SessionInvalidationQueueState>,
     wake: Condvar,
@@ -791,8 +816,8 @@ struct SessionInvalidationQueue {
 
 struct SessionInvalidationQueueState {
     closed: bool,
-    pending: VecDeque<u64>,
-    kinds: HashMap<u64, bool>,
+    pending: VecDeque<InvalidationKey>,
+    kinds: HashMap<InvalidationKey, bool>,
     queue_peak: usize,
     coalesced: u64,
     snapshot_generation: u64,
@@ -848,8 +873,24 @@ impl SessionInvalidationQueue {
             .name("studiofs-macfuse-invalidation".to_string())
             .spawn(move || {
                 while let Some(invalidation) = worker_queue.next() {
-                    let (offset, len) = invalidation_range(invalidation.data);
-                    notify_inode_range(channel, &invalidation_state, invalidation.ino, offset, len);
+                    match invalidation {
+                        SessionInvalidation::Inode(invalidation) => {
+                            let (offset, len) = invalidation_range(invalidation.data);
+                            notify_inode_range(
+                                channel,
+                                &invalidation_state,
+                                invalidation.ino,
+                                offset,
+                                len,
+                            );
+                        }
+                        SessionInvalidation::Entry(invalidation) => notify_entry(
+                            channel,
+                            &invalidation_state,
+                            invalidation.parent,
+                            &invalidation.name,
+                        ),
+                    }
                 }
             })?;
         *queue.worker.lock() = Some(worker);
@@ -857,19 +898,33 @@ impl SessionInvalidationQueue {
     }
 
     fn enqueue(&self, ino: u64, data: bool) {
+        self.enqueue_key(InvalidationKey::Inode(ino), data);
+    }
+
+    fn enqueue_entry(&self, parent: u64, name: &[u8]) {
+        self.enqueue_key(
+            InvalidationKey::Entry {
+                parent,
+                name: name.to_vec(),
+            },
+            false,
+        );
+    }
+
+    fn enqueue_key(&self, key: InvalidationKey, data: bool) {
         let mut state = self.state.lock();
         loop {
             if state.closed {
                 return;
             }
-            if let Some(kind) = state.kinds.get_mut(&ino) {
+            if let Some(kind) = state.kinds.get_mut(&key) {
                 *kind |= data;
                 state.coalesced = state.coalesced.saturating_add(1);
                 break;
             }
             if state.pending.len() < MACFUSE_INVALIDATION_QUEUE_CAPACITY {
-                state.kinds.insert(ino, data);
-                state.pending.push_back(ino);
+                state.kinds.insert(key.clone(), data);
+                state.pending.push_back(key.clone());
                 state.queue_peak = state.queue_peak.max(state.pending.len());
                 self.wake.notify_one();
                 break;
@@ -892,16 +947,23 @@ impl SessionInvalidationQueue {
         self.record_metrics(snapshot);
     }
 
-    fn next(&self) -> Option<InodeInvalidation> {
+    fn next(&self) -> Option<SessionInvalidation> {
         let mut state = self.state.lock();
         loop {
-            if let Some(ino) = state.pending.pop_front() {
-                let data = state.kinds.remove(&ino).unwrap_or(false);
+            if let Some(key) = state.pending.pop_front() {
+                let data = state.kinds.remove(&key).unwrap_or(false);
                 self.wake.notify_one();
                 let snapshot = Self::next_metrics_snapshot(&mut state);
                 drop(state);
                 self.record_metrics(snapshot);
-                return Some(InodeInvalidation { ino, data });
+                return Some(match key {
+                    InvalidationKey::Inode(ino) => {
+                        SessionInvalidation::Inode(InodeInvalidation { ino, data })
+                    }
+                    InvalidationKey::Entry { parent, name } => {
+                        SessionInvalidation::Entry(EntryInvalidation { parent, name })
+                    }
+                });
             }
             if state.closed {
                 return None;
@@ -1082,6 +1144,10 @@ impl KernelInvalidator for MacFuseKernelInvalidator {
         self.queue.enqueue(ino, false);
     }
 
+    fn inval_entry(&self, parent: u64, name: &[u8]) {
+        self.queue.enqueue_entry(parent, name);
+    }
+
     fn reset_diagnostics(&self) {
         self.queue.reset_metrics();
     }
@@ -1114,6 +1180,49 @@ fn notify_inode_range(
         debug!(
             ino,
             offset, len, result, "macFUSE inode invalidation failed"
+        );
+    }
+}
+
+fn notify_entry(
+    channel: SessionChannel,
+    state: &SessionInvalidationState,
+    parent: u64,
+    name: &[u8],
+) {
+    let Ok(name) = CString::new(name) else {
+        debug!(
+            parent,
+            name_len = name.len(),
+            "macFUSE entry invalidation skipped for invalid name"
+        );
+        return;
+    };
+    let Some(_active) = state.begin_invalidation() else {
+        debug!(
+            parent,
+            name_len = name.as_bytes().len(),
+            "macFUSE entry invalidation skipped after session shutdown"
+        );
+        return;
+    };
+    // SAFETY: `channel` comes from a mounted macFUSE session. The counted
+    // invalidation guard prevents `Session::drop` from destroying the raw
+    // channel while this FFI call may still use it.
+    let result = unsafe {
+        raw::fuse_lowlevel_notify_inval_entry(
+            channel.0.as_ptr(),
+            parent,
+            name.as_ptr(),
+            name.as_bytes().len(),
+        )
+    };
+    if result != 0 && result != -libc::ENOENT {
+        debug!(
+            parent,
+            name_len = name.as_bytes().len(),
+            result,
+            "macFUSE entry invalidation failed"
         );
     }
 }
@@ -1891,14 +2000,37 @@ mod tests {
         queue.enqueue(8, false);
         queue.enqueue(7, true);
 
-        assert_eq!(queue.next(), Some(InodeInvalidation { ino: 7, data: true }));
         assert_eq!(
             queue.next(),
-            Some(InodeInvalidation {
+            Some(SessionInvalidation::Inode(InodeInvalidation {
+                ino: 7,
+                data: true,
+            }))
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Inode(InodeInvalidation {
                 ino: 8,
                 data: false,
-            })
+            }))
         );
+    }
+
+    #[test]
+    fn session_invalidation_queue_coalesces_entry_requests() {
+        let queue = SessionInvalidationQueue::new();
+
+        queue.enqueue_entry(7, b"recovery.bin");
+        queue.enqueue_entry(7, b"recovery.bin");
+
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Entry(EntryInvalidation {
+                parent: 7,
+                name: b"recovery.bin".to_vec(),
+            }))
+        );
+        assert_eq!(queue.metrics_snapshot().coalesced, 1);
     }
 
     #[test]
@@ -1972,10 +2104,10 @@ mod tests {
 
         assert_eq!(
             queue.next(),
-            Some(InodeInvalidation {
+            Some(SessionInvalidation::Inode(InodeInvalidation {
                 ino: 0,
-                data: false
-            })
+                data: false,
+            }))
         );
         finished_rx
             .recv_timeout(Duration::from_secs(1))

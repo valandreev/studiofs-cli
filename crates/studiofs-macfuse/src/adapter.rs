@@ -387,6 +387,11 @@ impl KernelInvalidator for LiveKernelInvalidator {
             .notify_if_observed(ino, || self.inner.inval_inode_attrs(ino));
     }
 
+    fn inval_entry(&self, parent: u64, name: &[u8]) {
+        self.kernel_inode_liveness
+            .notify_if_observed(parent, || self.inner.inval_entry(parent, name));
+    }
+
     fn reset_diagnostics(&self) {
         self.inner.reset_diagnostics();
     }
@@ -417,6 +422,10 @@ impl KernelInvalidator for OpenCacheKernelInvalidator {
             return;
         }
         self.inner.inval_inode_attrs(ino);
+    }
+
+    fn inval_entry(&self, parent: u64, name: &[u8]) {
+        self.inner.inval_entry(parent, name);
     }
 
     fn reset_diagnostics(&self) {
@@ -2533,7 +2542,8 @@ fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
 pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenCachePolicy {
     let write_capable = posix_open_requests_write(flags, trunc);
     MacFuseOpenCachePolicy {
-        direct_io: false,
+        // Keep write buffers out of macFUSE's corruptible UBC copy path.
+        direct_io: write_capable,
         keep_cache: !write_capable,
         write_capable,
     }
