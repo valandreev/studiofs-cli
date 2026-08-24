@@ -1316,15 +1316,23 @@ fn write_file_sync(path: &Path, payload: &[u8]) -> Result<(), ScenarioError> {
 fn wait_for_checksum(path: &Path, expected: &str, timeout: Duration) -> Result<(), ScenarioError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(payload) = fs::read(path)
-            && bytes_sha256(&payload) == expected
-        {
-            return Ok(());
-        }
+        let observation = match fs::read(path) {
+            Ok(payload) => {
+                let actual = bytes_sha256(&payload);
+                if actual == expected {
+                    return Ok(());
+                }
+                format!("size={} sha256={actual}", payload.len())
+            }
+            Err(error) => format!("read_error={:?}: {error}", error.kind()),
+        };
         if Instant::now() >= deadline {
             return Err(ScenarioError::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("checksum did not converge for {}", path.display()),
+                format!(
+                    "checksum did not converge for {} ({observation})",
+                    path.display()
+                ),
             )));
         }
         thread::sleep(SNAPSHOT_POLL_INTERVAL);
@@ -1468,6 +1476,25 @@ mod tests {
         assert_eq!(
             snapshot_mount_path(&context, "volume").expect("snapshot mount path"),
             PathBuf::from("/tmp/scenario/snapshot-mount/volume")
+        );
+    }
+
+    #[test]
+    fn checksum_timeout_reports_the_last_observed_payload() {
+        let temp = studiofs_test_support::workspace_target_tempdir("snapshot-checksum-");
+        let path = temp.path().join("recover.bin");
+        fs::write(&path, b"wrong").expect("write checksum fixture");
+
+        let error = wait_for_checksum(&path, "expected", Duration::ZERO)
+            .expect_err("mismatched checksum must time out")
+            .to_string();
+
+        assert!(error.contains("size=5"), "unexpected error: {error}");
+        assert!(
+            error.contains(
+                "sha256=8810ad581e59f2bc3928b261707a71308f7e139eb04820366dc4d5c18d980225"
+            ),
+            "unexpected error: {error}"
         );
     }
 }

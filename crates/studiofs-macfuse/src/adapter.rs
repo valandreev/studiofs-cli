@@ -388,8 +388,9 @@ impl KernelInvalidator for LiveKernelInvalidator {
     }
 
     fn inval_entry(&self, parent: u64, name: &[u8]) {
-        self.kernel_inode_liveness
-            .notify_if_observed(parent, || self.inner.inval_entry(parent, name));
+        // A cached or negative dentry can outlive our lookup-reference count.
+        // macFUSE safely returns ENOENT when the kernel no longer knows it.
+        self.inner.inval_entry(parent, name);
     }
 
     fn reset_diagnostics(&self) {
@@ -4492,6 +4493,34 @@ mod tests {
         fn inval_inode(&self, _ino: u64) {}
 
         fn inval_inode_attrs(&self, _ino: u64) {}
+    }
+
+    #[derive(Debug, Default)]
+    struct EntryRecordingKernelInvalidator {
+        entries: ParkingMutex<Vec<(u64, Vec<u8>)>>,
+    }
+
+    impl KernelInvalidator for EntryRecordingKernelInvalidator {
+        fn inval_inode(&self, _ino: u64) {}
+
+        fn inval_inode_attrs(&self, _ino: u64) {}
+
+        fn inval_entry(&self, parent: u64, name: &[u8]) {
+            self.entries.lock().push((parent, name.to_vec()));
+        }
+    }
+
+    #[test]
+    fn entry_invalidation_reaches_kernel_after_parent_lookup_is_forgotten() {
+        let inner = Arc::new(EntryRecordingKernelInvalidator::default());
+        let invalidator = LiveKernelInvalidator {
+            kernel_inode_liveness: Arc::new(KernelInodeLiveness::default()),
+            inner: Arc::clone(&inner) as Arc<dyn KernelInvalidator>,
+        };
+
+        invalidator.inval_entry(42, b"recover.bin");
+
+        assert_eq!(*inner.entries.lock(), vec![(42, b"recover.bin".to_vec())]);
     }
 
     #[test]
