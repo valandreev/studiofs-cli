@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use studiofs_meta::InodeLifecycleState;
 
-use crate::runtime::{MetaExecutor, run_meta};
+use crate::runtime::{MetaExecutor, TimeoutOrCancel, run_meta, run_with_timeout_or_cancel};
 use crate::{VfsError, VfsMeta, VfsResult};
+use tokio_util::sync::CancellationToken;
 
 pub(super) struct CommitCoordinator;
 
@@ -31,6 +32,17 @@ struct EpochPublicationRequest {
     ino: studiofs_meta::Ino,
     content_epoch: u64,
     completion: EpochPublicationCompletion,
+}
+
+async fn remote_object_exists_with_timeout<F, E>(
+    cancel_token: &CancellationToken,
+    timeout: Duration,
+    operation: F,
+) -> TimeoutOrCancel<Result<bool, E>>
+where
+    F: std::future::Future<Output = Result<bool, E>>,
+{
+    run_with_timeout_or_cancel(cancel_token, timeout, operation).await
 }
 
 #[derive(Default)]
@@ -502,24 +514,36 @@ impl CommitCoordinator {
         }
         let visibility_timeout = vfs.publish_visibility_timeout;
         let deadline = tokio::time::Instant::now() + visibility_timeout;
+        let shutdown_token = vfs.state.shutdown.background_shutdown_token.clone();
         loop {
             let mut all_visible = true;
             for object_id in object_ids {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    all_visible = false;
+                    break;
+                }
+                let probe_timeout = crate::vfs::REMOTE_OBJECT_IO_TIMEOUT.min(remaining);
                 let checks = format_object_fragment_keys(&vfs.data_prefix, *object_id)
                     .into_iter()
                     .map(|key| async {
-                        let result = vfs.fetch_scheduler.data_store().exists(&key).await;
+                        let result = remote_object_exists_with_timeout(
+                            &shutdown_token,
+                            probe_timeout,
+                            vfs.fetch_scheduler.data_store().exists(&key),
+                        )
+                        .await;
                         (key, result)
                     });
                 let results = futures::future::join_all(checks).await;
                 for (key, result) in results {
                     match result {
-                        Ok(true) => {}
-                        Ok(false) => {
+                        TimeoutOrCancel::Completed(Ok(true)) => {}
+                        TimeoutOrCancel::Completed(Ok(false)) => {
                             all_visible = false;
                             break;
                         }
-                        Err(err) => {
+                        TimeoutOrCancel::Completed(Err(err)) => {
                             all_visible = false;
                             tracing::debug!(
                                 object_id = *object_id,
@@ -528,6 +552,20 @@ impl CommitCoordinator {
                                 "publish visibility check failed, will retry"
                             );
                             break;
+                        }
+                        TimeoutOrCancel::TimedOut => {
+                            all_visible = false;
+                            tracing::debug!(
+                                object_id = *object_id,
+                                key,
+                                "publish visibility check timed out, will retry"
+                            );
+                            break;
+                        }
+                        TimeoutOrCancel::Cancelled => {
+                            return Err(VfsError::Other(
+                                "publish visibility check cancelled".to_string(),
+                            ));
                         }
                     }
                 }
@@ -570,5 +608,18 @@ mod tests {
                 block_index: 3,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn remote_object_probe_times_out_instead_of_waiting_forever() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let result = remote_object_exists_with_timeout(
+            &shutdown,
+            Duration::from_millis(1),
+            std::future::pending::<Result<bool, ()>>(),
+        )
+        .await;
+
+        assert!(matches!(result, TimeoutOrCancel::TimedOut));
     }
 }
