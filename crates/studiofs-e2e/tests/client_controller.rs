@@ -1177,6 +1177,7 @@ struct RecordingProcess {
     was_killed: Cell<bool>,
 }
 
+#[cfg(target_os = "macos")]
 struct TransientMountExecutor {
     attempts: Rc<Cell<usize>>,
     readiness_calls: Rc<Cell<usize>>,
@@ -1184,6 +1185,7 @@ struct TransientMountExecutor {
     wait_calls: Rc<Cell<usize>>,
 }
 
+#[cfg(target_os = "macos")]
 impl TransientMountExecutor {
     fn new() -> Self {
         Self {
@@ -1195,6 +1197,7 @@ impl TransientMountExecutor {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl ClientProcessExecutor for TransientMountExecutor {
     fn run(&self, _command: &ClientCommand) -> io::Result<ClientCommandOutput> {
         Ok(ClientCommandOutput {
