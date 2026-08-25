@@ -652,6 +652,14 @@ impl FileSessionState {
         })
     }
 
+    pub(super) async fn wait_for_delete_inflight(&self, ino: Ino) {
+        if self.has_delete_inflight(ino) {
+            // A read permit is a fair per-inode barrier: queued and active
+            // Delete writers for this inode complete before it is granted.
+            drop(self.enter_op(ino, FileSessionOperation::Read).await);
+        }
+    }
+
     fn session_is_idle(session: &Arc<FileSessionEntry>) -> bool {
         session.open_handles.load(Ordering::Relaxed) == 0
             && session.queued_ops.load(Ordering::Relaxed) == 0

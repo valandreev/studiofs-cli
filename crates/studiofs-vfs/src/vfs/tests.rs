@@ -1192,6 +1192,68 @@ fn rmdir_waits_for_inflight_child_unlink_before_reporting_not_empty() {
 }
 
 #[test]
+fn rmdir_waits_for_inflight_child_unlink_past_retry_budget() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-inflight-child-unlink-past-budget");
+    rt.block_on(async move {
+        let parent = vfs
+            .mkdir(ROOT_INO, b"parent", 1000, 1000, 0o755)
+            .expect("create parent directory");
+        let child = vfs
+            .create(parent.ino, b"child.txt", 1000, 1000, 0o644)
+            .expect("create child file");
+
+        let child_delete_gate = vfs
+            .state
+            .file_session
+            .enter_op(child.ino, FileSessionOperation::Delete)
+            .await;
+        let unlink_vfs = vfs.clone();
+        let unlink =
+            tokio::task::spawn_blocking(move || unlink_vfs.unlink(parent.ino, b"child.txt"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if vfs
+                    .state
+                    .file_session
+                    .debug_snapshot(child.ino)
+                    .is_some_and(|snapshot| snapshot.queued_ops > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child unlink should queue behind the child delete gate");
+
+        let rmdir_vfs = vfs.clone();
+        let mut rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"parent"));
+        let timed_rmdir = tokio::time::timeout(Duration::from_secs(6), &mut rmdir).await;
+        let (still_waiting, rmdir_result) = match timed_rmdir {
+            Ok(result) => (false, Some(result)),
+            Err(_) => (true, None),
+        };
+
+        drop(child_delete_gate);
+        unlink
+            .await
+            .expect("child unlink task should complete")
+            .expect("child unlink should succeed");
+        let rmdir_result = match rmdir_result {
+            Some(result) => result.expect("rmdir task should complete"),
+            None => rmdir.await.expect("rmdir task should complete"),
+        };
+
+        assert!(
+            still_waiting,
+            "rmdir returned before the in-flight child unlink completed: {rmdir_result:?}"
+        );
+        rmdir_result.expect("rmdir should wait for the in-flight child unlink");
+    });
+}
+
+#[test]
 fn rmdir_waits_for_queued_child_unlink_on_parent_namespace() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-queued-parent-unlink");

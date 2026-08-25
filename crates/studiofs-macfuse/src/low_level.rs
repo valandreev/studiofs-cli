@@ -619,13 +619,17 @@ impl SessionControl {
     }
 
     fn request_exit(&self) -> bool {
-        prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue);
+        self.shutdown_invalidation();
         self.with_live_raw(|raw| {
             // SAFETY: The raw pointer is protected by the control lock, which
             // Session::drop acquires before destroying the session.
             unsafe { (self.exit)(raw) };
         })
         .is_some()
+    }
+
+    fn shutdown_invalidation(&self) -> bool {
+        prepare_session_shutdown(&self.invalidation_state, &self.invalidation_queue)
     }
 
     fn close(&self) {
@@ -752,6 +756,9 @@ impl Session {
         // SAFETY: `self.raw` is a live session owned by this wrapper for the
         // duration of the blocking loop call.
         let result = unsafe { raw::fuse_session_loop(self.raw.as_ptr()) };
+        // An external unmount returns from the loop without going through
+        // SessionControl::request_exit, so stop queued kernel sends here too.
+        self.control.shutdown_invalidation();
         if result == 0 {
             Ok(())
         } else {
@@ -1230,10 +1237,7 @@ fn notify_entry(
 impl Drop for Session {
     fn drop(&mut self) {
         self.control.close();
-        if !prepare_session_shutdown(
-            &self.control.invalidation_state,
-            &self.control.invalidation_queue,
-        ) {
+        if !self.control.shutdown_invalidation() {
             warn!(
                 "macFUSE session shutdown timed out waiting for active kernel invalidation; \
                  leaking raw session handles to avoid use-after-free"
@@ -1968,6 +1972,23 @@ mod tests {
         assert!(
             waiter.join().expect("shutdown waiter should not panic"),
             "shutdown should complete after the active invalidation guard drops"
+        );
+    }
+
+    #[test]
+    fn session_loop_shutdown_closes_invalidation_before_reply_drain() {
+        let control = SessionControl::for_test();
+        control.invalidation_queue.enqueue(7, true);
+
+        control.shutdown_invalidation();
+
+        assert!(
+            control.invalidation_queue.next().is_none(),
+            "session-loop shutdown must discard queued invalidations"
+        );
+        assert!(
+            control.invalidation_state.begin_invalidation().is_none(),
+            "session-loop shutdown must reject new invalidations"
         );
     }
 
