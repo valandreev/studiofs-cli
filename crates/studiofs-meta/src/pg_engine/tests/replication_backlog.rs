@@ -1,5 +1,31 @@
 use super::*;
 use crate::redb_engine::layout::encode_xattr_key;
+use std::sync::Barrier;
+use std::thread;
+
+#[test]
+fn pending_replay_lock_blocks_local_mutation_before_commit() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let pg = Arc::new(pg);
+    let worker_pg = Arc::clone(&pg);
+    let started = Arc::new(Barrier::new(2));
+    let worker_started = Arc::clone(&started);
+    let pending_guard = pg.pending_state.lock().expect("pending_state");
+
+    let worker = thread::spawn(move || {
+        worker_started.wait();
+        worker_pg.create_file(ROOT_INO, b"blocked-during-replay", 0, 0, 0o644)
+    });
+    started.wait();
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        pg.local.lookup(ROOT_INO, b"blocked-during-replay").is_err(),
+        "local mutation must not commit while pending serving-state replay owns the lock"
+    );
+
+    drop(pending_guard);
+    worker.join().unwrap().unwrap();
+}
 
 #[test]
 fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {

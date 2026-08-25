@@ -127,6 +127,13 @@ impl PgMetaEngine {
             .await
         })?;
 
+        // Keep the local event position, serving-state reconcile, and pending
+        // replay atomic with respect to local metadata mutations. The network
+        // query above deliberately stays outside this critical section.
+        let mut pending_state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
@@ -144,7 +151,7 @@ impl PgMetaEngine {
         )?;
         self.persist_replay_position(&outcome)?;
         if outcome.flushed_event_seq.is_some() {
-            self.restore_pending_state_from_local_log()?;
+            self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
         }
         Ok(outcome.changed)
     }
@@ -154,6 +161,10 @@ impl PgMetaEngine {
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
         let mut changed = self.pull_foreign_events_locked(recent_flush)?;
+        let _pending_state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
         let overlay = self.local_overlay_conflicts()?;
         changed |= RemoteApplyCoordinator::new(&self.local).reconcile_recent_flush(
             recent_flush,

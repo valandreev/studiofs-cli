@@ -780,12 +780,20 @@ impl PgMetaEngine {
     where
         F: FnOnce(&RedbMetaEngine) -> MetaResult<T>,
     {
+        // Serving-state replay reads a local event prefix and writes it back to
+        // redb. Keep the local mutation outside that read/apply window so the
+        // replay cannot overwrite a mutation it did not observe.
+        let pending_guard = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
         // `f` is expected to execute one local redb operation that is already
         // atomic at the engine layer (single redb write txn where applicable).
         // This wrapper only tracks local event-seq growth for replication.
         let before_seq = self.local.get_counter("nextEventSeq")?;
         let result = f(&self.local)?;
         let after_seq = self.local.get_counter("nextEventSeq")?;
+        drop(pending_guard);
         if self.mark_pending_after_mutation(before_seq, after_seq)? {
             self.signal_poll_wakeup();
         }

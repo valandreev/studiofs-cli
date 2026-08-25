@@ -133,14 +133,21 @@ impl PgMetaEngine {
     }
 
     pub(super) fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
-        let mut event_start = self.flushed_event_seq.load(Ordering::SeqCst);
-        let event_end = self.local.get_counter("nextEventSeq")?;
         let mut state = self
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        self.restore_pending_state_from_local_log_with_state(&mut state)
+    }
+
+    pub(super) fn restore_pending_state_from_local_log_with_state(
+        &self,
+        state: &mut PendingReplicationState,
+    ) -> MetaResult<()> {
+        let mut event_start = self.flushed_event_seq.load(Ordering::SeqCst);
+        let event_end = self.local.get_counter("nextEventSeq")?;
         if event_end <= event_start {
-            Self::clear_pending_state(&mut state);
+            Self::clear_pending_state(state);
             return Ok(());
         }
 
@@ -154,7 +161,7 @@ impl PgMetaEngine {
         }
         let pending_events = &pending_events[stale_setup_prefix_len..];
         if pending_events.is_empty() {
-            Self::clear_pending_state(&mut state);
+            Self::clear_pending_state(state);
             return Ok(());
         }
         self.local
@@ -171,8 +178,7 @@ impl PgMetaEngine {
                 state.last_mutation_at = Some(now);
                 return Ok(());
             }
-            Self::clear_pending_state(&mut state);
-            drop(state);
+            Self::clear_pending_state(state);
             self.persist_flushed_event_seq(event_end)?;
             return Ok(());
         }
