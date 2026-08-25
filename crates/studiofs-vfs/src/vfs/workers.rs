@@ -185,9 +185,12 @@ fn metadata_namespace_changed(
 }
 
 fn metadata_namespace_entry_changes(
-    previous: &HashSet<(Ino, Vec<u8>, Ino)>,
+    previous: Option<&HashSet<(Ino, Vec<u8>, Ino)>>,
     current: &HashSet<(Ino, Vec<u8>, Ino)>,
 ) -> HashSet<(Ino, Vec<u8>)> {
+    let Some(previous) = previous else {
+        return HashSet::new();
+    };
     previous
         .symmetric_difference(current)
         .map(|(parent, name, _ino)| (*parent, name.clone()))
@@ -850,16 +853,10 @@ impl StudioVfs {
                 .is_some_and(|previous| previous != &current_snapshot.entries);
 
             let changed_namespace_entries = if namespace_changed {
-                match &last_namespace_entries {
-                    Some(previous) => {
-                        metadata_namespace_entry_changes(previous, &current_snapshot.entries)
-                    }
-                    None => current_snapshot
-                        .entries
-                        .iter()
-                        .map(|(parent, name, _ino)| (*parent, name.clone()))
-                        .collect(),
-                }
+                metadata_namespace_entry_changes(
+                    last_namespace_entries.as_ref(),
+                    &current_snapshot.entries,
+                )
             } else {
                 HashSet::new()
             };
@@ -2035,9 +2032,16 @@ mod tests {
         let current = HashSet::from([(ROOT_INO, b"recovery.bin".to_vec(), 20)]);
 
         assert_eq!(
-            metadata_namespace_entry_changes(&previous, &current),
+            metadata_namespace_entry_changes(Some(&previous), &current),
             HashSet::from([(ROOT_INO, b"recovery.bin".to_vec())])
         );
+    }
+
+    #[test]
+    fn initial_metadata_namespace_snapshot_only_establishes_entry_baseline() {
+        let current = HashSet::from([(ROOT_INO, b"recovery.bin".to_vec(), 10)]);
+
+        assert!(metadata_namespace_entry_changes(None, &current).is_empty());
     }
 
     #[test]

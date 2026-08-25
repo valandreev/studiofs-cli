@@ -2509,6 +2509,14 @@ impl StudioVfs {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(());
         }
+        // Serialize directory removal with child namespace mutations. A
+        // nested rmdir holds this parent gate while it waits for its own
+        // children, so an outer rmdir can observe and wait for that work.
+        let _parent_delete_session = self
+            .state
+            .file_session
+            .enter_op(parent, FileSessionOperation::Delete)
+            .await;
         self.wait_for_deferred_namespace_entry(parent, name).await?;
         let meta = self.sync_meta();
         let removed = meta.lookup(parent, name).ok().map(|entry| entry.ino);
