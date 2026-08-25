@@ -56,12 +56,9 @@ const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_PO
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_AVAILABLE_MEMORY_TTL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
-const MACFUSE_RMDIR_RETRY_ATTEMPTS: u16 = 200;
-const MACFUSE_RMDIR_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const MACFUSE_SYMLINK_RETRY_ATTEMPTS: u16 = 200;
 const MACFUSE_SYMLINK_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const MACFUSE_SYMLINK_RETRY_DELAY: Duration = Duration::from_millis(25);
-const MACFUSE_RMDIR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
 const MACOS_UF_HIDDEN: u32 = 0x0000_8000;
@@ -1403,30 +1400,11 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         let existing = self.vfs.lookup(parent, name).ok();
-        let mut retry_attempts = 0;
-        let retry_deadline = Instant::now() + MACFUSE_RMDIR_RETRY_TIMEOUT;
-        let result = loop {
-            match self.vfs.rmdir(parent, name) {
-                Ok(()) => break Ok(()),
-                Err(error)
-                    if matches!(
-                        &error,
-                        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::DirNotEmpty(_))
-                    ) && retry_attempts < MACFUSE_RMDIR_RETRY_ATTEMPTS
-                        && Instant::now() < retry_deadline =>
-                {
-                    retry_attempts += 1;
-                    debug!(
-                        parent,
-                        name = %String::from_utf8_lossy(name),
-                        retry_attempt = retry_attempts,
-                        "macFUSE rmdir waiting for concurrent child deletion"
-                    );
-                    std::thread::sleep(MACFUSE_RMDIR_RETRY_DELAY);
-                }
-                Err(error) => break Err(error),
-            }
-        };
+        // Return ENOTEMPTY promptly when Finder has not issued child deletes
+        // yet. Blocking this callback prevents Finder from enumerating and
+        // deleting the directory contents. VFS rmdir waits for child deletes
+        // that are already in flight before reporting the same error.
+        let result = self.vfs.rmdir(parent, name);
         result
             .inspect(|_| {
                 if let Some(attr) = &existing {
