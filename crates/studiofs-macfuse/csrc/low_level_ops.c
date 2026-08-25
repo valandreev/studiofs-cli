@@ -57,11 +57,13 @@ extern void studiofs_macfuse_setattr_x(fuse_req_t req,
                                        int to_set,
                                        struct fuse_file_info *fi);
 extern void studiofs_macfuse_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
+extern void studiofs_macfuse_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_readdir(fuse_req_t req,
                                      fuse_ino_t ino,
                                      size_t size,
                                      off_t off,
                                      struct fuse_file_info *fi);
+extern void studiofs_macfuse_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_readlink(fuse_req_t req, fuse_ino_t ino);
 extern void studiofs_macfuse_statfs(fuse_req_t req, fuse_ino_t ino);
 extern void studiofs_macfuse_setxattr(fuse_req_t req,
@@ -88,7 +90,9 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .open = studiofs_macfuse_open,
     .read = studiofs_macfuse_read,
     .release = studiofs_macfuse_release,
+    .opendir = studiofs_macfuse_opendir,
     .readdir = studiofs_macfuse_readdir,
+    .releasedir = studiofs_macfuse_releasedir,
     .readlink = studiofs_macfuse_readlink,
     .statfs = studiofs_macfuse_statfs,
     .getxattr = studiofs_macfuse_getxattr,
@@ -115,7 +119,9 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .flush = studiofs_macfuse_flush,
     .fsync = studiofs_macfuse_fsync,
     .release = studiofs_macfuse_release,
+    .opendir = studiofs_macfuse_opendir,
     .readdir = studiofs_macfuse_readdir,
+    .releasedir = studiofs_macfuse_releasedir,
     .readlink = studiofs_macfuse_readlink,
     .statfs = studiofs_macfuse_statfs,
     .setxattr = studiofs_macfuse_setxattr,
@@ -164,6 +170,10 @@ int studiofs_macfuse_low_level_ops_has_rmdir_callback(const struct fuse_lowlevel
 
 int studiofs_macfuse_low_level_ops_has_mknod_callback(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->mknod != NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_directory_callbacks(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->opendir != NULL && ops->readdir != NULL && ops->releasedir != NULL;
 }
 
 void studiofs_macfuse_conn_info_configure(struct fuse_conn_info *conn,

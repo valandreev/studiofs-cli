@@ -44,9 +44,6 @@ use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, r
 
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
-const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
-const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
-const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
 const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
@@ -84,9 +81,8 @@ pub(crate) struct StudioVfsAdapter {
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
-    readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
-    readdir_cache_last_pruned: Mutex<Option<Instant>>,
-    readdir_cache_ready: Condvar,
+    directory_handles: ParkingMutex<HashMap<u64, Arc<Vec<DirEntry>>>>,
+    next_directory_handle: AtomicU64,
     shared: Arc<AdapterSharedState>,
     open_reply_serializer: FuseOpenReplySerializer,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
@@ -938,9 +934,8 @@ impl StudioVfsAdapter {
             read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
-            readdir_cache: Mutex::new(HashMap::new()),
-            readdir_cache_last_pruned: Mutex::new(None),
-            readdir_cache_ready: Condvar::new(),
+            directory_handles: ParkingMutex::new(HashMap::new()),
+            next_directory_handle: AtomicU64::new(1),
             shared: Arc::new(AdapterSharedState {
                 #[cfg(test)]
                 open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
@@ -1089,7 +1084,6 @@ impl StudioVfsAdapter {
             )
             .inspect(|attr| {
                 self.shared.kernel_inode_liveness.observe(attr.ino);
-                self.invalidate_readdir_cache(parent);
             })
             .map_err(|error| vfs_err_to_errno(&error))
     }
@@ -1137,7 +1131,6 @@ impl StudioVfsAdapter {
             }
         }?;
         self.shared.kernel_inode_liveness.observe(attr.ino);
-        self.invalidate_readdir_cache(parent);
         Ok(attr)
     }
 
@@ -1184,7 +1177,6 @@ impl StudioVfsAdapter {
             )
             .map_err(|error| vfs_err_to_errno(&error))?;
         self.remember_named_file_flags(attr.ino, name);
-        self.invalidate_readdir_cache(parent);
         Ok(attr)
     }
 
@@ -1223,7 +1215,6 @@ impl StudioVfsAdapter {
             .inspect(|attr| {
                 self.shared.kernel_inode_liveness.observe(attr.ino);
                 self.remember_named_file_flags(attr.ino, name);
-                self.invalidate_readdir_cache(parent);
             })
             .map_err(|error| vfs_err_to_errno(&error))
     }
@@ -1388,7 +1379,6 @@ impl StudioVfsAdapter {
                     self.clear_file_flags(attr.ino);
                     self.shared.kernel_inode_liveness.close(attr.ino);
                 }
-                self.invalidate_readdir_cache(parent);
             })
             .map(|_| ())
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1411,7 +1401,6 @@ impl StudioVfsAdapter {
                     self.clear_file_flags(attr.ino);
                     self.shared.kernel_inode_liveness.close(attr.ino);
                 }
-                self.invalidate_readdir_cache(parent);
             })
             .map_err(|error| vfs_err_to_errno(&error))
     }
@@ -1519,10 +1508,6 @@ impl StudioVfsAdapter {
                     if attr.kind == FileType::Directory || attr.nlink <= 1 {
                         self.shared.kernel_inode_liveness.close(attr.ino);
                     }
-                }
-                self.invalidate_readdir_cache(parent);
-                if newparent != parent {
-                    self.invalidate_readdir_cache(newparent);
                 }
                 if let Ok(attr) = self.vfs.lookup(newparent, newname) {
                     self.remember_named_file_flags(attr.ino, newname);
@@ -1988,21 +1973,6 @@ impl StudioVfsAdapter {
         Ok(())
     }
 
-    /// Read directory entries from VFS.
-    pub(crate) fn readdir(
-        &self,
-        request: &Request,
-        ino: u64,
-        offset: i64,
-        size: usize,
-    ) -> Result<DirectoryEntryBuffer, i32> {
-        self.readdir_with_push(ino, offset, size, |buffer, name, attr, next_offset| {
-            buffer
-                .push(request, name, attr, next_offset)
-                .map_err(directory_entry_errno)
-        })
-    }
-
     #[cfg(test)]
     pub(crate) fn readdir_for_test(
         &self,
@@ -2010,18 +1980,100 @@ impl StudioVfsAdapter {
         offset: i64,
         size: usize,
     ) -> Result<DirectoryEntryBuffer, i32> {
-        self.readdir_with_push(ino, offset, size, |buffer, name, _attr, next_offset| {
-            buffer
-                .push_for_test(0, name, next_offset)
-                .map_err(directory_entry_errno)
-        })
+        let entries = self
+            .vfs
+            .readdir(ino)
+            .map(Arc::new)
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        self.readdir_from_entries(
+            ino,
+            offset,
+            size,
+            &entries,
+            |buffer, name, _attr, next_offset| {
+                buffer
+                    .push_for_test(0, name, next_offset)
+                    .map_err(directory_entry_errno)
+            },
+        )
     }
 
-    fn readdir_with_push(
+    pub(crate) fn opendir(&self, ino: u64) -> Result<u64, i32> {
+        let entries = self
+            .vfs
+            .readdir(ino)
+            .map(Arc::new)
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        let file_handle = self.next_directory_handle.fetch_add(1, Ordering::Relaxed);
+        self.directory_handles.lock().insert(file_handle, entries);
+        Ok(file_handle)
+    }
+
+    pub(crate) fn releasedir(&self, file_handle: u64) -> Result<(), i32> {
+        self.directory_handles.lock().remove(&file_handle);
+        Ok(())
+    }
+
+    pub(crate) fn readdir_with_handle(
+        &self,
+        request: &Request,
+        ino: u64,
+        file_handle: u64,
+        offset: i64,
+        size: usize,
+    ) -> Result<DirectoryEntryBuffer, i32> {
+        let entries = self
+            .directory_handles
+            .lock()
+            .get(&file_handle)
+            .cloned()
+            .ok_or(libc::EBADF)?;
+        self.readdir_from_entries(
+            ino,
+            offset,
+            size,
+            &entries,
+            |buffer, name, attr, next_offset| {
+                buffer
+                    .push(request, name, attr, next_offset)
+                    .map_err(directory_entry_errno)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn readdir_for_test_with_handle(
+        &self,
+        ino: u64,
+        file_handle: u64,
+        offset: i64,
+        size: usize,
+    ) -> Result<DirectoryEntryBuffer, i32> {
+        let entries = self
+            .directory_handles
+            .lock()
+            .get(&file_handle)
+            .cloned()
+            .ok_or(libc::EBADF)?;
+        self.readdir_from_entries(
+            ino,
+            offset,
+            size,
+            &entries,
+            |buffer, name, _attr, next_offset| {
+                buffer
+                    .push_for_test(0, name, next_offset)
+                    .map_err(directory_entry_errno)
+            },
+        )
+    }
+
+    fn readdir_from_entries(
         &self,
         ino: u64,
         offset: i64,
         size: usize,
+        entries: &[DirEntry],
         mut push: impl FnMut(&mut DirectoryEntryBuffer, &OsStr, &stat, off_t) -> Result<(), i32>,
     ) -> Result<DirectoryEntryBuffer, i32> {
         let mut buffer = DirectoryEntryBuffer::new(size);
@@ -2040,7 +2092,6 @@ impl StudioVfsAdapter {
             idx = 2;
         }
 
-        let entries = self.cached_readdir_entries(ino)?;
         for (i, entry) in entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry_idx = i + 2;
             let attr = self.dir_entry_to_stat(entry);
@@ -2170,163 +2221,6 @@ impl StudioVfsAdapter {
         };
         out
     }
-
-    fn cached_readdir_entries(&self, ino: u64) -> Result<Arc<Vec<DirEntry>>, i32> {
-        let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
-        loop {
-            let now = Instant::now();
-            match cache.get(&ino) {
-                Some(ReaddirCacheEntry::Ready { loaded_at, entries })
-                    if now.saturating_duration_since(*loaded_at) <= READDIR_CACHE_TTL =>
-                {
-                    return Ok(Arc::clone(entries));
-                }
-                Some(ReaddirCacheEntry::Loading) => {
-                    cache = self
-                        .readdir_cache_ready
-                        .wait(cache)
-                        .map_err(|_| libc::EIO)?;
-                }
-                _ => {
-                    if cache.len() >= READDIR_CACHE_PRUNE_THRESHOLD
-                        && self.should_prune_readdir_cache(now)?
-                    {
-                        cache.retain(|_, entry| match entry {
-                            ReaddirCacheEntry::Ready { loaded_at, .. } => {
-                                now.saturating_duration_since(*loaded_at) <= READDIR_CACHE_TTL
-                            }
-                            ReaddirCacheEntry::Loading => true,
-                        });
-                    }
-                    cache.insert(ino, ReaddirCacheEntry::Loading);
-                    break;
-                }
-            }
-        }
-        drop(cache);
-
-        let entries_result = self
-            .vfs
-            .readdir(ino)
-            .map(Arc::new)
-            .map_err(|error| vfs_err_to_errno(&error));
-        let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
-        match entries_result {
-            Ok(entries) => {
-                cache.insert(
-                    ino,
-                    ReaddirCacheEntry::Ready {
-                        loaded_at: Instant::now(),
-                        entries: Arc::clone(&entries),
-                    },
-                );
-                self.readdir_cache_ready.notify_all();
-                Ok(entries)
-            }
-            Err(errno) => {
-                cache.remove(&ino);
-                self.readdir_cache_ready.notify_all();
-                Err(errno)
-            }
-        }
-    }
-
-    fn invalidate_readdir_cache(&self, ino: u64) {
-        if let Ok(mut cache) = self.readdir_cache.lock() {
-            cache.remove(&ino);
-        }
-    }
-
-    fn should_prune_readdir_cache(&self, now: Instant) -> Result<bool, i32> {
-        let mut last_pruned = self
-            .readdir_cache_last_pruned
-            .lock()
-            .map_err(|_| libc::EIO)?;
-        if last_pruned
-            .is_some_and(|last| now.saturating_duration_since(last) < READDIR_CACHE_PRUNE_INTERVAL)
-        {
-            return Ok(false);
-        }
-        *last_pruned = Some(now);
-        Ok(true)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn readdir_cache_entry_count_for_test(&self) -> usize {
-        self.readdir_cache
-            .lock()
-            .expect("readdir cache lock should not be poisoned")
-            .len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fill_expired_readdir_cache_entries_for_test(&self) {
-        let mut cache = self
-            .readdir_cache
-            .lock()
-            .expect("readdir cache lock should not be poisoned");
-        let loaded_at = Instant::now() - READDIR_CACHE_TTL - Duration::from_secs(1);
-        for ino in 10_000..(10_000 + READDIR_CACHE_PRUNE_THRESHOLD as u64) {
-            cache.insert(
-                ino,
-                ReaddirCacheEntry::Ready {
-                    loaded_at,
-                    entries: Arc::new(Vec::new()),
-                },
-            );
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fill_fresh_readdir_cache_entries_for_test(&self) {
-        let mut cache = self
-            .readdir_cache
-            .lock()
-            .expect("readdir cache lock should not be poisoned");
-        let loaded_at = Instant::now();
-        for ino in 20_000..(20_000 + READDIR_CACHE_PRUNE_THRESHOLD as u64) {
-            cache.insert(
-                ino,
-                ReaddirCacheEntry::Ready {
-                    loaded_at,
-                    entries: Arc::new(Vec::new()),
-                },
-            );
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_ready_readdir_cache_loaded_at_for_test(&self, ino: u64, loaded_at: Instant) {
-        let mut cache = self
-            .readdir_cache
-            .lock()
-            .expect("readdir cache lock should not be poisoned");
-        let entries = match cache.remove(&ino) {
-            Some(ReaddirCacheEntry::Ready { entries, .. }) => entries,
-            _ => Arc::new(Vec::new()),
-        };
-        cache.insert(ino, ReaddirCacheEntry::Ready { loaded_at, entries });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn readdir_cache_loaded_at_for_test(&self, ino: u64) -> Option<Instant> {
-        self.readdir_cache
-            .lock()
-            .expect("readdir cache lock should not be poisoned")
-            .get(&ino)
-            .and_then(|entry| match entry {
-                ReaddirCacheEntry::Ready { loaded_at, .. } => Some(*loaded_at),
-                ReaddirCacheEntry::Loading => None,
-            })
-    }
-}
-
-enum ReaddirCacheEntry {
-    Ready {
-        loaded_at: Instant,
-        entries: Arc<Vec<DirEntry>>,
-    },
-    Loading,
 }
 
 pub(crate) struct CallbackState {
@@ -4078,6 +3972,41 @@ pub extern "C" fn studiofs_macfuse_release(
     }
 }
 
+/// macFUSE opendir callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_opendir(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if fi.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    match state.adapter.opendir(ino) {
+        Ok(file_handle) => {
+            let Some(request) = owned_request(req) else {
+                let _ = state.adapter.releasedir(file_handle);
+                return;
+            };
+            if let Err(error) = Reply::new(request).open(OpenReply::new(file_handle)) {
+                warn!(
+                    ino,
+                    file_handle,
+                    ?error,
+                    "macFUSE opendir reply was rejected"
+                );
+                let _ = state.adapter.releasedir(file_handle);
+            }
+        }
+        Err(errno) => reply_callback_error(req, "opendir", errno),
+    }
+}
+
 /// macFUSE readdir callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_readdir(
@@ -4085,16 +4014,25 @@ pub extern "C" fn studiofs_macfuse_readdir(
     ino: raw::FuseIno,
     size: size_t,
     off: off_t,
-    _fi: *mut raw::FuseFileInfo,
+    fi: *mut raw::FuseFileInfo,
 ) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
     };
+    if fi.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for readdir.
+    let file_handle = unsafe { (*fi).fh };
     let Some(request) = owned_request(req) else {
         return;
     };
-    match state.adapter.readdir(&request, ino, off, size) {
+    match state
+        .adapter
+        .readdir_with_handle(&request, ino, file_handle, off, size)
+    {
         Ok(entries) => {
             let _ = Reply::new(request).directory_entries(&entries);
         }
@@ -4102,6 +4040,29 @@ pub extern "C" fn studiofs_macfuse_readdir(
             log_callback_error("readdir", errno);
             let _ = Reply::new(request).error(errno);
         }
+    }
+}
+
+/// macFUSE releasedir callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_releasedir(
+    req: *mut raw::FuseReq,
+    _ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if fi.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for releasedir.
+    let file_handle = unsafe { (*fi).fh };
+    match state.adapter.releasedir(file_handle) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_callback_error(req, "releasedir", errno),
     }
 }
 

@@ -445,6 +445,14 @@ mod tests {
     }
 
     #[test]
+    fn both_studio_vfs_low_level_ops_install_directory_callbacks() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_directory_callbacks());
+        assert!(
+            super::low_level::LowLevelOperations::read_only_studio_vfs().has_directory_callbacks()
+        );
+    }
+
+    #[test]
     fn read_only_mount_uses_restricted_low_level_ops() {
         let read_only_ops = super::studio_vfs_ops_for_read_only(true);
         let writable_ops = super::studio_vfs_ops_for_read_only(false);
@@ -2905,105 +2913,47 @@ mod tests {
     }
 
     #[test]
-    fn read_only_adapter_readdir_reuses_cached_entries_for_chunked_offsets() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-entry-cache")
-                .expect("create VFS fixture");
+    fn adapter_readdir_keeps_chunk_snapshot_after_child_unlink() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-readdir-snapshot-after-unlink",
+        )
+        .expect("create VFS fixture");
         let vfs = fixture.vfs();
         let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
         vfs.create(root, b"alpha.txt", 501, 20, 0o644)
             .expect("create first file");
         vfs.create(root, b"beta.txt", 501, 20, 0o644)
             .expect("create second file");
+        vfs.create(root, b"gamma.txt", 501, 20, 0o644)
+            .expect("create third file");
         let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
 
-        adapter
-            .readdir_for_test(root, 2, 32)
+        let file_handle = adapter.opendir(root).expect("open directory");
+        let first_chunk = adapter
+            .readdir_for_test_with_handle(root, file_handle, 2, 32)
             .expect("first readdir chunk");
+        assert!(
+            first_chunk
+                .as_slice()
+                .windows(b"alpha.txt\0".len())
+                .any(|entry| { entry == b"alpha.txt\0" })
+        );
+
         adapter
-            .readdir_for_test(root, 3, 32)
+            .unlink(root, b"alpha.txt")
+            .expect("unlink first file");
+
+        let second_chunk = adapter
+            .readdir_for_test_with_handle(root, file_handle, 3, 32)
             .expect("second readdir chunk");
-
-        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1);
-    }
-
-    #[test]
-    fn read_only_adapter_readdir_prunes_expired_cache_entries_on_refresh() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-cache-prune")
-                .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
-        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
-            .expect("create first file");
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        adapter.fill_expired_readdir_cache_entries_for_test();
-
-        adapter
-            .readdir_for_test(root, 2, 32)
-            .expect("refresh readdir cache");
-
-        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1);
-    }
-
-    #[test]
-    fn read_only_adapter_readdir_rate_limits_fresh_cache_pruning() {
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-readdir-cache-prune-rate-limit",
-        )
-        .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
-        let first_dir = vfs
-            .mkdir(root, b"first", 501, 20, 0o755)
-            .expect("create first directory");
-        let second_dir = vfs
-            .mkdir(root, b"second", 501, 20, 0o755)
-            .expect("create second directory");
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        adapter.fill_fresh_readdir_cache_entries_for_test();
-
-        adapter
-            .readdir_for_test(first_dir.ino, 2, 32)
-            .expect("populate first readdir cache");
-        let first_miss_count = adapter.readdir_cache_entry_count_for_test();
-        adapter
-            .readdir_for_test(second_dir.ino, 2, 32)
-            .expect("populate second missing readdir cache");
-
-        assert_eq!(first_miss_count, 1025);
-        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1026);
-    }
-
-    #[test]
-    fn read_only_adapter_readdir_refresh_records_fresh_cache_timestamp() {
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-readdir-cache-fresh-timestamp",
-        )
-        .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
-        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
-            .expect("create first file");
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        adapter
-            .readdir_for_test(root, 2, 32)
-            .expect("populate readdir cache");
-        let expired = std::time::Instant::now() - std::time::Duration::from_secs(30);
-        adapter.set_ready_readdir_cache_loaded_at_for_test(root, expired);
-
-        adapter
-            .readdir_for_test(root, 2, 32)
-            .expect("refresh expired readdir cache");
-
-        let refreshed = adapter
-            .readdir_cache_loaded_at_for_test(root)
-            .expect("ready readdir cache entry should exist");
-        assert!(refreshed > expired);
+        assert!(
+            second_chunk
+                .as_slice()
+                .windows(b"beta.txt\0".len())
+                .any(|entry| { entry == b"beta.txt\0" })
+        );
+        adapter.releasedir(file_handle).expect("close directory");
     }
 
     #[test]

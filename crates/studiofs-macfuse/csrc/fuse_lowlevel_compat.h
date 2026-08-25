@@ -102,11 +102,13 @@ struct fuse_lowlevel_ops {
     void (*flush)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     void (*fsync)(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi);
     void (*release)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
+    void (*opendir)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     void (*readdir)(fuse_req_t req,
                     fuse_ino_t ino,
                     size_t size,
                     off_t off,
                     struct fuse_file_info *fi);
+    void (*releasedir)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     void (*readlink)(fuse_req_t req, fuse_ino_t ino);
     void (*statfs)(fuse_req_t req, fuse_ino_t ino);
     void (*setxattr)(fuse_req_t req,
