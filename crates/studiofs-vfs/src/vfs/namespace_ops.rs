@@ -2523,7 +2523,21 @@ impl StudioVfs {
         let mut retry_attempts: u16 = 0;
         let mut settle_attempts: u16 = 0;
         loop {
-            match meta.rmdir(parent, name) {
+            let rmdir_result = if let Some(removed_ino) = removed {
+                // A child unlink/rmdir takes the target directory's Delete
+                // gate. Hold its fair Read barrier across the emptiness
+                // transaction so an already queued child mutation cannot
+                // slip between the in-flight check and meta.rmdir.
+                let _target_namespace_read = self
+                    .state
+                    .file_session
+                    .enter_op(removed_ino, FileSessionOperation::Read)
+                    .await;
+                meta.rmdir(parent, name)
+            } else {
+                meta.rmdir(parent, name)
+            };
+            match rmdir_result {
                 Ok(()) => break,
                 Err(err @ MetaError::DirNotEmpty(_)) => {
                     let Some(removed_ino) = removed else {

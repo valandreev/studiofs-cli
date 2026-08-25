@@ -1338,6 +1338,37 @@ fn rmdir_serializes_with_parent_namespace_delete() {
 }
 
 #[test]
+fn rmdir_waits_for_target_namespace_delete() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-target-delete-gate");
+    rt.block_on(async move {
+        let target = vfs
+            .mkdir(ROOT_INO, b"target", 1000, 1000, 0o755)
+            .expect("create target directory");
+
+        let target_delete_gate = vfs
+            .state
+            .file_session
+            .enter_op(target.ino, FileSessionOperation::Delete)
+            .await;
+        let rmdir_vfs = vfs.clone();
+        let mut rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"target"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut rmdir)
+                .await
+                .is_err(),
+            "rmdir bypassed the target namespace delete gate"
+        );
+
+        drop(target_delete_gate);
+        rmdir
+            .await
+            .expect("rmdir task should complete")
+            .expect("rmdir should succeed after the target delete gate is released");
+    });
+}
+
+#[test]
 fn cleanup_rmdir_retries_when_child_unlink_starts_after_directory_cleanup() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-cleanup-late-child");
