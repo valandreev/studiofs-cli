@@ -17327,6 +17327,48 @@ fn namespace_inode_allocation_calls(vfs: &StudioVfs) -> u64 {
         .calls
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_start_prewarm_namespace_inode_reservation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "linux-start-prewarm");
+    let before = namespace_inode_allocation_calls(&vfs);
+
+    {
+        let _guard = rt.enter();
+        vfs.start().expect("start VFS background workers");
+    }
+
+    assert_eq!(
+        namespace_inode_allocation_calls(&vfs),
+        before + 1,
+        "writable Linux startup should warm one namespace inode batch"
+    );
+
+    let first = vfs
+        .reserve_namespace_ino()
+        .expect("reserve the first post-start namespace inode");
+    assert!(
+        first > ROOT_INO,
+        "the warmed reservation should contain a namespace inode"
+    );
+    assert_eq!(
+        namespace_inode_allocation_calls(&vfs),
+        before + 1,
+        "the first post-start reservation must reuse the warmed batch"
+    );
+
+    {
+        let _guard = rt.enter();
+        vfs.start().expect("second start should be idempotent");
+    }
+    assert_eq!(
+        namespace_inode_allocation_calls(&vfs),
+        before + 1,
+        "idempotent start must not refill the namespace allocator"
+    );
+}
+
 #[test]
 fn namespace_inode_reservation_refills_after_exhaustion() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
