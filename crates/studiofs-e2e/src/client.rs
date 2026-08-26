@@ -986,26 +986,30 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         #[cfg(not(target_os = "macos"))]
         self.executor
             .cleanup_stale_mount_before_remount(&self.mount_command(index)?)?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.mount_index(index)
+        }
         #[cfg(target_os = "macos")]
-        let was_killed = self.clients[index].spec.state == ClientLifecycleState::Killed;
-        #[cfg(target_os = "macos")]
-        let retry_deadline = Instant::now() + self.config.mount_exit_timeout;
-        loop {
-            let result = self.mount_index(index);
-            #[cfg(target_os = "macos")]
-            if was_killed
-                && Instant::now() < retry_deadline
-                && matches!(
-                    &result,
-                    Err(ClientControllerError::CommandFailed { action, .. }) if action == "mount"
-                )
-            {
-                // A killed macFUSE client can release its lifecycle lock just after the
-                // preflight check. Wait for that late release before retrying the remount.
-                self.wait_for_macos_mount_lock_release(index)?;
-                continue;
+        {
+            let was_killed = self.clients[index].spec.state == ClientLifecycleState::Killed;
+            let retry_deadline = Instant::now() + self.config.mount_exit_timeout;
+            loop {
+                let result = self.mount_index(index);
+                if was_killed
+                    && Instant::now() < retry_deadline
+                    && matches!(
+                        &result,
+                        Err(ClientControllerError::CommandFailed { action, .. }) if action == "mount"
+                    )
+                {
+                    // A killed macFUSE client can release its lifecycle lock just after the
+                    // preflight check. Wait for that late release before retrying the remount.
+                    self.wait_for_macos_mount_lock_release(index)?;
+                    continue;
+                }
+                return result;
             }
-            return result;
         }
     }
 
