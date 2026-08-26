@@ -36,10 +36,15 @@ and `cleanup` all pass.
 - [x] (2026-08-26 22:20Z) Chose a Linux-only startup prewarm that reuses the existing namespace reservation queue.
 - [x] (2026-08-26 22:20Z) Wrote and committed the design specification at `docs/superpowers/specs/2026-08-26-linux-namespace-inode-prewarm-design.md`.
 - [x] (2026-08-26 22:20Z) Completed the specification self-review with no placeholders or contradictions.
-- [ ] Write the Linux-gated failing regression test and verify it fails before the production change.
-- [ ] Add the internal reservation prewarm helper and Linux startup hook.
-- [ ] Run focused and package-level Linux tests, scenario 23, and available cross-platform compile checks.
-- [ ] Update this plan with final evidence and retrospective.
+- [x] (2026-08-26 22:23Z) Added the Linux-gated regression test and verified the pre-change RED result (`left: 0`, `right: 1`).
+- [x] (2026-08-26 22:24Z) Added the internal reservation prewarm helper and Linux startup hook; the focused test passed GREEN.
+- [x] (2026-08-26 22:29Z) Ran all 918 `studiofs-vfs` library tests with zero failures.
+- [x] (2026-08-26 22:31Z) Rebuilt release binaries and ran Linux scenario 23; standalone report status was `Passed` with all phases passed.
+- [x] (2026-08-26 22:36Z) Ran the full Linux E2E sweep `1-25`; report status was `Passed`, with scenario 23 passing at `23/25` after scenario 22.
+- [x] (2026-08-26 22:38Z) Ran `cargo check -p studiofs-macfuse`, `cargo check -p studiofs-winfsp`, `cargo fmt --all -- --check`, and `git diff --check`; all exited successfully.
+- [x] (2026-08-26 22:39Z) Checked installed Rust targets; only `x86_64-unknown-linux-gnu` is available, so native macOS/Windows cross-target compilation cannot run in this environment. No Mac/Windows source files changed.
+- [x] (2026-08-26 22:40Z) Completed the independent code review with no remaining findings and verified the final worktree/plan bookkeeping.
+- [x] (2026-08-26 22:40Z) Updated this plan with the final evidence, fixture correction, review result, and retrospective.
 
 ## Surprises & Discoveries
 
@@ -54,6 +59,13 @@ and `cleanup` all pass.
 
 - Observation: `StudioVfs::start()` claims one-shot startup channels before spawning workers, providing a startup seam that runs once and precedes background Redb work.
   Evidence: `crates/studiofs-vfs/src/vfs.rs` calls `claim_channels_for_start()` and then `spawn_startup_workers(channels)`; `reserve_namespace_ino()` is the existing synchronous refill path.
+
+- Observation: One existing timing test assumed that a started VFS always performs
+  an allocator transaction during its next create.
+  Evidence: After startup prewarming, the test failed with one completed
+  allocator call instead of two; changing that test to use the intentionally
+  cold `make_unstarted_test_vfs()` fixture restored its original assertion about
+  the create operation itself.
 
 ## Decision Log
 
@@ -73,11 +85,33 @@ and `cleanup` all pass.
   Rationale: The evidence points to the first allocator refill inside VFS, and changing the bridge route would not remove that refill. Keeping bridge code untouched minimizes Mac/Windows and Linux callback regression risk.
   Date/Author: 2026-08-26 / Codex.
 
+- Decision: Keep `namespace_create_records_one_complete_metadata_timing_sample`
+  on the cold VFS fixture instead of weakening its allocator assertions.
+  Rationale: That test measures the transactions caused by a namespace create;
+  startup prewarming is a separate behavior covered by the new Linux test.
+  Date/Author: 2026-08-26 / Codex.
+
 ## Outcomes & Retrospective
 
-This section is updated after implementation and verification. It must state the
-observed test results, whether scenario 23 passed, whether any platform check
-was unavailable, and any remaining limitation.
+Implementation milestone (2026-08-26): the focused regression test produced the
+expected RED result before the production change (`left: 0`, `right: 1`) and
+then passed GREEN after the change. The five namespace allocator tests passed,
+all 918/918 `studiofs-vfs` library tests passed, and the release build passed.
+Standalone Linux scenario 23 passed through setup, run, validate, and cleanup;
+the full Linux 1–25 sweep passed, with scenario 23 passing at `23/25` after
+scenario 22 and without a timeout increase. Host checks for `studiofs-macfuse`
+and `studiofs-winfsp`, `cargo fmt --all -- --check`, and `git diff --check`
+all passed. Native cross-target compilation was unavailable because only
+`x86_64-unknown-linux-gnu` is installed.
+
+The timing-test fixture was corrected to use the intentionally cold
+`make_unstarted_test_vfs()` fixture, preserving its assertion about the
+transactions caused by the create operation rather than weakening it for
+startup prewarming. The final independent review found no remaining findings.
+The final source diff contains no Mac/Windows source-file changes. The fix
+deliberately does not guarantee that an unavailable allocator becomes
+available; it only moves the first refill out of the Linux FUSE callback and
+preserves the existing mutation error path when warming cannot complete.
 
 ## Context and Orientation
 
@@ -112,7 +146,8 @@ Windows FUSE bridge source needs to be edited.
 
 - Modify: `crates/studiofs-vfs/src/vfs/tests.rs`, immediately after `namespace_inode_allocation_calls()` and before `namespace_inode_reservation_refills_after_exhaustion()`.
 
-- [ ] **Step 1: Write the failing test.** Add this exact test:
+- [x] **Step 1: Write the failing test.** Added the Linux-gated regression test
+  immediately after `namespace_inode_allocation_calls()`.
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -156,17 +191,15 @@ Windows FUSE bridge source needs to be edited.
         );
     }
 
-- [ ] **Step 2: Run the focused test before changing production code.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 2: Run the focused test before changing production code.** From `/home/val/dev/studiofs-cli`, ran:
 
-    cargo test -p studiofs-vfs --lib linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
+    cargo test -p studiofs-vfs --lib vfs::tests::linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
 
-  Expected result before the fix: the test compiles and fails at the first
-  assertion because startup records zero namespace allocations while the
-  assertion expects one. If the test fails to compile for an unrelated reason,
-  fix only the test spelling/import issue before proceeding; do not add
-  production code to bypass the red test.
+  Observed result: the test compiled and failed at the first assertion with
+  `left: 0`, `right: 1`, as expected before the fix.
 
-- [ ] **Step 3: Commit the red test.** Run:
+- [x] **Step 3: Commit the red test.** Committed the regression test with
+  `test: cover Linux namespace allocator startup prewarm`.
 
     git add crates/studiofs-vfs/src/vfs/tests.rs
     git commit -m "test: cover Linux namespace allocator startup prewarm"
@@ -179,7 +212,7 @@ Windows FUSE bridge source needs to be edited.
 
 - Modify: `crates/studiofs-vfs/src/vfs.rs`, in `StudioVfs::start()` after successful startup channel claim and before `spawn_startup_workers(channels)`.
 
-- [ ] **Step 1: Add the internal helper that reuses the existing allocator.** Insert this exact method after `reserve_namespace_ino()` and before `return_reserved_namespace_ino()`:
+- [x] **Step 1: Add the internal helper that reuses the existing allocator.** Added the Linux-gated helper after `reserve_namespace_ino()` and before `return_reserved_namespace_ino()`.
 
     #[cfg(target_os = "linux")]
     pub(super) fn prewarm_namespace_inode_reservation(&self) -> VfsResult<()> {
@@ -192,7 +225,7 @@ Windows FUSE bridge source needs to be edited.
   `NAMESPACE_INODE_BATCH`, or publish a namespace entry. It only exercises the
   existing refill path and returns the reserved ID.
 
-- [ ] **Step 2: Invoke the helper once before workers start.** In
+- [x] **Step 2: Invoke the helper once before workers start.** Added the Linux-gated startup call after channel claim and before worker spawn, retaining warning-based failure handling.
   `StudioVfs::start()`, keep the existing `let Some(channels) = ... else { return
   Ok(()) };` block. Immediately after it, insert:
 
@@ -209,23 +242,24 @@ Windows FUSE bridge source needs to be edited.
   `start()` call returns before this block. Because the read-only return is
   earlier, read-only mounts do not touch the allocator.
 
-- [ ] **Step 3: Run the focused test.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 3: Run the focused test.** From `/home/val/dev/studiofs-cli`, ran:
 
-    cargo test -p studiofs-vfs --lib linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
+    cargo test -p studiofs-vfs --lib vfs::tests::linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
 
-  Expected result: `1 passed; 0 failed`. The test must also confirm that the
-  explicit reservation after startup and the second `start()` call do not
-  increment the allocator count.
+  Observed result: `1 passed; 0 failed`; the explicit reservation and second
+  `start()` call did not increment the allocator count.
 
-- [ ] **Step 4: Run the existing namespace allocator tests.** Run:
+- [x] **Step 4: Run the existing namespace allocator tests.** Ran:
 
     cargo test -p studiofs-vfs --lib namespace_inode -- --nocapture
 
-  Expected result: the Linux prewarm test plus the existing refill, uniqueness,
-  restart-gap, and create/mkdir sharing tests pass. This confirms that returning
-  the warmed inode did not lose or duplicate an ID.
+  Observed result: all five namespace allocator tests passed, confirming that
+  returning the warmed inode did not lose or duplicate an ID.
 
-- [ ] **Step 5: Inspect the diff and commit the implementation.** Run:
+- [x] **Step 5: Inspect the diff and commit the implementation.** Inspected the
+  source diff, confirmed only the Linux-gated helper/startup call and regression
+  test changed, and committed the implementation with
+  `fix: prewarm Linux namespace inode allocator at startup`.
 
     git diff --check
     git diff -- crates/studiofs-vfs/src/vfs/namespace_ops.rs crates/studiofs-vfs/src/vfs.rs crates/studiofs-vfs/src/vfs/tests.rs
@@ -244,16 +278,16 @@ Windows FUSE bridge source needs to be edited.
   `Surprises & Discoveries`, and `Outcomes & Retrospective` sections with the
   actual command results.
 
-- [ ] **Step 1: Run the complete `studiofs-vfs` library tests.** From
+- [x] **Step 1: Run the complete `studiofs-vfs` library tests.** Ran
   `/home/val/dev/studiofs-cli`, run:
 
     cargo test -p studiofs-vfs --lib
 
-  Expected result: Cargo reports the library test target passed with zero
-  failures. If an unrelated existing test is flaky, record its exact name and
-  output before deciding whether a focused rerun is justified.
+  Observed result: 918/918 library tests passed with zero failures.
 
-- [ ] **Step 2: Run scenario 23 on Linux.** Use the release binary and compose
+- [x] **Step 2: Run scenario 23 on Linux.** Ran the release binary with the
+  existing compose infrastructure; standalone scenario 23 passed setup, run,
+  validate, and cleanup without changing the timeout.
   infrastructure already used for the incident:
 
     target/release/studiofs-e2e run mounted-symlink-attribute-convergence --seed 0 --studiofs-bin target/release/studiofs --platform linux-fuse --infra compose --retain on-failure --run-id 20260826T-linux-prewarm-s23
@@ -262,30 +296,29 @@ Windows FUSE bridge source needs to be edited.
 
     cargo build --release -p studiofs -p studiofs-e2e
 
-  Acceptance: the scenario report under
-  `target/e2e-runs/20260826T-linux-prewarm-s23/report.json` has status
-  `Passed`, and its child report records `setup`, `run`, `validate`, and
-  `cleanup` as passed. The run must not require changing the scenario timeout.
+  The scenario report status was `Passed`, and its child report recorded
+  `setup`, `run`, `validate`, and `cleanup` as passed.
 
-- [ ] **Step 3: Run the complete E2E sequence once when the environment allows it.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 3: Run the complete E2E sequence once when the environment allows it.** Ran the complete Linux 1–25 sequence once.
 
     target/release/studiofs-e2e run --scenario 1-25 --seed 0 --studiofs-bin target/release/studiofs --platform linux-fuse --infra compose --retain on-failure --run-id 20260826T-linux-prewarm-full25
 
-  Confirm scenario 23 passes in sequence after scenarios 1–22. Do not repeat
-  the full suite solely to obtain a more favorable result if the first run
-  passes.
+  Observed result: the report status was `Passed`; scenario 23 passed at
+  `23/25` after scenarios 1–22.
 
-- [ ] **Step 4: Check platform compilation without changing platform behavior.** Run the available checks:
+- [x] **Step 4: Check platform compilation without changing platform behavior.** Ran the available checks:
 
     cargo check -p studiofs-macfuse
     cargo check -p studiofs-winfsp
 
-  If a target toolchain or native SDK is unavailable, record the exact Cargo
-  error and use source inspection to confirm the only production additions are
-  guarded by `#[cfg(target_os = "linux")]`. Do not install unrelated SDKs or
-  alter Mac/Windows code as part of this fix.
+  Host checks for both packages passed. Native cross-target compilation was
+  unavailable because only `x86_64-unknown-linux-gnu` is installed; source
+  inspection confirmed the production additions are Linux-gated, and no
+  Mac/Windows source files changed.
 
-- [ ] **Step 5: Verify the final worktree and commit set.** Run:
+- [x] **Step 5: Verify the final worktree and commit set.** Verified the final
+  worktree and commit set, including `cargo fmt --all -- --check` and
+  `git diff --check`; all checks passed and no unrelated files were staged.
 
     git status --short --branch
     git log -3 --oneline
