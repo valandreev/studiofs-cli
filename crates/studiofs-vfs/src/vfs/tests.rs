@@ -13129,7 +13129,11 @@ fn deferred_namespace_written_file_reads_back_after_flush() {
 #[test]
 fn deferred_namespace_written_file_commits_locally_without_explicit_flush() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-written-background-local");
+    // The test observes the local upload queue after deferred materialization.
+    // Keep the long-lived uploader stopped so it cannot consume that queue
+    // before the assertion; the per-inode materializer is spawned by the write
+    // itself and still runs in this unstarted VFS.
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-create-written-background-local");
     let _guard = rt.enter();
     rt.block_on(async {
         let payload = b"background local payload after deferred create";
