@@ -822,7 +822,7 @@ fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn remount_retries_when_mount_process_exits_before_readiness() {
+fn remount_retries_until_mount_process_reaches_readiness() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = TransientMountExecutor::new();
     let attempts = Rc::clone(&executor.attempts);
@@ -836,7 +836,7 @@ fn remount_retries_when_mount_process_exits_before_readiness() {
         .remount("client-a")
         .expect("remount should retry a transient early mount exit");
 
-    assert_eq!(attempts.get(), 3);
+    assert_eq!(attempts.get(), 4);
 }
 
 #[cfg(target_os = "macos")]
@@ -1210,7 +1210,11 @@ impl ClientProcessExecutor for TransientMountExecutor {
     fn spawn(&self, _command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>> {
         let attempt = self.attempts.get() + 1;
         self.attempts.set(attempt);
-        let (exit_status, exit_requires_kill) = if attempt == 2 { (1, false) } else { (0, true) };
+        let (exit_status, exit_requires_kill) = if matches!(attempt, 2 | 3) {
+            (1, false)
+        } else {
+            (0, true)
+        };
         Ok(Box::new(RecordingProcess {
             pid: attempt as u32,
             killed: Rc::clone(&self.killed),
@@ -1226,11 +1230,9 @@ impl ClientProcessExecutor for TransientMountExecutor {
     fn is_mount_ready(&self, _command: &ClientCommand) -> io::Result<bool> {
         let readiness_call = self.readiness_calls.get() + 1;
         self.readiness_calls.set(readiness_call);
-        Ok(
-            self.attempts.get() != 2
-                && self.attempts.get() != 0
-                && readiness_call.is_multiple_of(2),
-        )
+        Ok(!matches!(self.attempts.get(), 2 | 3)
+            && self.attempts.get() != 0
+            && readiness_call.is_multiple_of(2))
     }
 }
 
