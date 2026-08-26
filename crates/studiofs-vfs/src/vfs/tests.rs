@@ -17269,7 +17269,7 @@ fn interrupted_materializer_does_not_orphan_dirty_tail_if_last_waiter_is_cancell
 #[test]
 fn namespace_create_records_one_complete_metadata_timing_sample() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (_rt, vfs, meta) = make_test_vfs(&tmp, "namespace-create-metadata-timing");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "namespace-create-metadata-timing");
     let before = vfs.write_path_observability_snapshot();
 
     vfs.create(ROOT_INO, b"timed-create.txt", 0, 0, 0o644)
