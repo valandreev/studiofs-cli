@@ -4869,6 +4869,14 @@ impl StudioVfs {
             return Ok(());
         };
 
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.prewarm_namespace_inode_reservation() {
+            warn!(
+                error = %error,
+                "failed to prewarm Linux namespace inode reservation; first mutation will retry"
+            );
+        }
+
         let start_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.spawn_startup_workers(channels)
         })) {

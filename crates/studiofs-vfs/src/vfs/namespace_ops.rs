@@ -149,6 +149,13 @@ impl StudioVfs {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn prewarm_namespace_inode_reservation(&self) -> VfsResult<()> {
+        let ino = self.reserve_namespace_ino()?;
+        self.return_reserved_namespace_ino(ino);
+        Ok(())
+    }
+
     fn return_reserved_namespace_ino(&self, ino: Ino) {
         self.state
             .namespace
