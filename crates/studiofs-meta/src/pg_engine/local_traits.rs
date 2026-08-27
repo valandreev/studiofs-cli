@@ -316,6 +316,9 @@ impl MetaGc for PgMetaEngine {
     }
 
     fn add_pending_deletions(&self, entries: &[(u64, i64)]) -> MetaResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         self.mutate(|local| local.add_pending_deletions(entries))
     }
 
