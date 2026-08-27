@@ -581,6 +581,8 @@ impl VfsBootstrap {
                 std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_deferred_materialization_prefetch: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_landing_zone_replay_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 

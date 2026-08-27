@@ -6,7 +6,7 @@ use super::{
     StudioVfs, VfsResult,
 };
 use bytes::Bytes;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -122,28 +122,30 @@ impl StudioVfs {
             .recover_with_data()
             .map_err(VfsError::Io)?;
 
-        let mut remaining_segments = BTreeMap::new();
+        let mut remaining_segments = HashMap::with_capacity(recovered.len());
         for item in &recovered {
             *remaining_segments.entry(item.segment.ino).or_insert(0usize) += 1;
         }
 
         let mut replayed_inodes = BTreeSet::new();
-        for item in recovered {
+        for (replayed_segments, item) in recovered.into_iter().enumerate() {
             let ino = item.segment.ino;
             if let Err(replay_error) = self
-                .write_with_local_sync_policy(
-                    ino,
-                    item.segment.offset,
-                    &item.data,
-                    LocalSyncPolicy::Strict,
-                )
+                .replay_landing_zone_segment(replayed_segments, &item)
                 .await
             {
                 return match self.landing_zone.clear_inodes(&replayed_inodes) {
                     Ok(()) => Err(replay_error),
-                    Err(retire_error) => Err(VfsError::Other(format!(
-                        "landing-zone replay failed: {replay_error}; failed to retire completed inodes: {retire_error}"
-                    ))),
+                    Err(retire_error) => {
+                        warn!(
+                            replay_error = %replay_error,
+                            retire_error = %retire_error,
+                            "failed to retire completed inodes after landing-zone replay error"
+                        );
+                        Err(VfsError::Other(format!(
+                            "landing-zone replay failed: {replay_error}; failed to retire completed inodes: {retire_error}"
+                        )))
+                    }
                 };
             }
 
@@ -161,6 +163,24 @@ impl StudioVfs {
         Ok(())
     }
 
+    async fn replay_landing_zone_segment(
+        &self,
+        _replayed_segments: usize,
+        item: &crate::landing_zone::LandingRecoverySegment,
+    ) -> VfsResult<()> {
+        #[cfg(test)]
+        self.fail_landing_zone_replay_for_test(_replayed_segments)?;
+
+        self.write_with_local_sync_policy(
+            item.segment.ino,
+            item.segment.offset,
+            &item.data,
+            LocalSyncPolicy::Strict,
+        )
+        .await
+        .map(|_| ())
+    }
+
     #[cfg(test)]
     pub(super) fn arm_fail_next_inline_dirty_attr_persist_for_test(&self) {
         self.fail_next_inline_dirty_attr_persist
@@ -171,6 +191,12 @@ impl StudioVfs {
     pub(super) fn arm_fail_next_deferred_materialization_prefetch_for_test(&self) {
         self.fail_next_deferred_materialization_prefetch
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_fail_landing_zone_replay_after_for_test(&self, replayed_segments: usize) {
+        self.fail_landing_zone_replay_after
+            .store(replayed_segments, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -190,6 +216,23 @@ impl StudioVfs {
     #[cfg(not(test))]
     fn fail_inline_dirty_attr_persist_for_test(&self) -> VfsResult<()> {
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_landing_zone_replay_for_test(&self, replayed_segments: usize) -> VfsResult<()> {
+        if self
+            .fail_landing_zone_replay_after
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == replayed_segments
+        {
+            self.fail_landing_zone_replay_after
+                .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            Err(super::VfsError::Other(
+                "simulated landing-zone replay failure".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn suppress_deleted_inode_materialization_error(
