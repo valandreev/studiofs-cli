@@ -830,6 +830,18 @@ pub trait MetaGc: Send + Sync {
     /// The timestamp is used for grace period.
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>;
 
+    /// Add multiple blocks to pending deletions (mark for GC).
+    ///
+    /// The default preserves compatibility for implementations that only
+    /// provide the scalar operation. Backends with a transaction boundary
+    /// should override this method to commit the complete batch atomically.
+    fn add_pending_deletions(&self, entries: &[(u64, i64)]) -> MetaResult<()> {
+        for &(object_id, timestamp) in entries {
+            self.add_pending_deletion(object_id, timestamp)?;
+        }
+        Ok(())
+    }
+
     /// Remove a block from pending deletions (after GC).
     fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()>;
 

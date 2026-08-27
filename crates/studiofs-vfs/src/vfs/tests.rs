@@ -15,7 +15,8 @@ use studiofs_meta::schema::{
     SliceRange, SliceRecord, TimeSpec,
 };
 use studiofs_meta::{
-    FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaNamespace, RedbMetaEngine,
+    FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaGc, MetaNamespace,
+    RedbMetaEngine,
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -12723,6 +12724,95 @@ fn rename_over_existing_target_invalidates_displaced_inode_attr_cache() {
             "rename overwrite must drop stale cache for the deleted target inode"
         );
     });
+}
+
+#[test]
+fn deleted_inode_cleanup_batches_pending_deletions_for_multiple_objects() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deleted-inode-batch-cleanup");
+    let attr = vfs
+        .create(1, b"deleted-inode-batch-cleanup.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let mut file_attr = meta.get_attr(attr.ino).expect("load test attr");
+    file_attr.size = u64::from(DEFAULT_BLOCK_SIZE) * 2;
+    meta.set_attr(&file_attr).expect("set test file size");
+    meta.stage_payload_slice(
+        attr.ino,
+        0,
+        &PayloadRef::new_partial(501, DEFAULT_BLOCK_SIZE),
+    )
+    .expect("stage first payload slice");
+    meta.stage_payload_slice(
+        attr.ino,
+        1,
+        &PayloadRef::new_partial(502, DEFAULT_BLOCK_SIZE),
+    )
+    .expect("stage second payload slice");
+
+    let before = meta.metadata_write_observability();
+    let cleanup = vfs
+        .collect_deleted_inode_cleanup(&vfs.meta(), attr.ino, 0, "test", Vec::new())
+        .expect("collect deleted inode cleanup");
+    let after = meta.metadata_write_observability();
+
+    assert_eq!(cleanup.removed_ids, vec![501, 502]);
+    let pending_ids: Vec<_> = meta
+        .get_pending_deletions()
+        .unwrap()
+        .into_iter()
+        .map(|(object_id, _)| object_id)
+        .collect();
+    assert_eq!(pending_ids, vec![501, 502]);
+    assert_eq!(
+        after.begin_write.calls - before.begin_write.calls,
+        3,
+        "graph removal, pending-deletion batch, and space accounting should each use one transaction"
+    );
+}
+
+#[test]
+fn orphan_deleted_inode_cleanup_batches_pending_deletions_for_multiple_objects() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "orphan-deleted-inode-batch-cleanup");
+    let attr = vfs
+        .create(1, b"orphan-deleted-inode-batch-cleanup.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let mut file_attr = meta.get_attr(attr.ino).expect("load test attr");
+    file_attr.size = u64::from(DEFAULT_BLOCK_SIZE) * 2;
+    meta.set_attr(&file_attr).expect("set test file size");
+    meta.stage_payload_slice(
+        attr.ino,
+        0,
+        &PayloadRef::new_partial(601, DEFAULT_BLOCK_SIZE),
+    )
+    .expect("stage first payload slice");
+    meta.stage_payload_slice(
+        attr.ino,
+        1,
+        &PayloadRef::new_partial(602, DEFAULT_BLOCK_SIZE),
+    )
+    .expect("stage second payload slice");
+
+    let before = meta.metadata_write_observability();
+    let _guard = rt.enter();
+    let cleanup = rt
+        .block_on(vfs.collect_orphan_deleted_inode_cleanup(attr.ino))
+        .expect("collect orphan deleted inode cleanup");
+    let after = meta.metadata_write_observability();
+
+    assert_eq!(cleanup.removed_ids, vec![601, 602]);
+    let pending_ids: Vec<_> = meta
+        .get_pending_deletions()
+        .unwrap()
+        .into_iter()
+        .map(|(object_id, _)| object_id)
+        .collect();
+    assert_eq!(pending_ids, vec![601, 602]);
+    assert_eq!(
+        after.begin_write.calls - before.begin_write.calls,
+        6,
+        "orphan cleanup should use one pending-deletion batch plus its other metadata writes"
+    );
 }
 
 #[test]

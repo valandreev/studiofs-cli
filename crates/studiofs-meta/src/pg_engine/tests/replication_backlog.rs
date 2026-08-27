@@ -28,6 +28,73 @@ fn pending_replay_lock_blocks_local_mutation_before_commit() {
 }
 
 #[test]
+fn pg_pending_deletion_batch_applies_locally_in_one_transaction() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let markers = [(60, 600), (70, 700)];
+    let before = pg.local.metadata_write_observability();
+    let start_seq = pg.local.get_counter("nextEventSeq").unwrap();
+
+    pg.add_pending_deletions(&markers)
+        .expect("apply pending deletion batch through PgMeta");
+
+    let after = pg.local.metadata_write_observability();
+    assert_eq!(
+        after.begin_write.calls - before.begin_write.calls,
+        2,
+        "PgMeta should use one marker batch transaction plus one local-event acknowledgement"
+    );
+    assert_eq!(after.commit.calls - before.commit.calls, 2);
+    assert_eq!(pg.get_pending_deletions().unwrap(), markers.to_vec());
+
+    let end_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let events = pg
+        .local
+        .read_events_range(start_seq, end_seq)
+        .expect("read PgMeta pending deletion events");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            MetaEvent::AddPendingDeletion {
+                object_id: 60,
+                timestamp: 600
+            },
+            MetaEvent::AddPendingDeletion {
+                object_id: 70,
+                timestamp: 700
+            }
+        ]
+    ));
+}
+
+#[test]
+fn pg_empty_pending_deletion_batch_does_not_acquire_pending_state_lock() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let pg = Arc::new(pg);
+    let pending_guard = pg.pending_state.lock().expect("pending_state");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_pg = Arc::clone(&pg);
+
+    let worker = thread::spawn(move || {
+        started_tx.send(()).expect("signal empty batch worker");
+        result_tx
+            .send(worker_pg.add_pending_deletions(&[]))
+            .expect("send empty batch result");
+    });
+
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("empty batch worker should start");
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("empty batch should not wait for pending state")
+        .expect("empty pending deletion batch");
+
+    drop(pending_guard);
+    worker.join().expect("join empty batch worker");
+}
+
+#[test]
 fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.local.get_counter("nextEventSeq").expect("baseline seq");

@@ -41,8 +41,12 @@ impl StudioVfs {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let entries: Vec<_> = removed_ids
+            .iter()
+            .map(|&object_id| (object_id, timestamp))
+            .collect();
+        meta.add_pending_deletions(&entries)?;
         for &object_id in removed_ids {
-            meta.add_pending_deletion(object_id, timestamp)?;
             debug!("marking object {} for deletion ({})", object_id, reason);
         }
         Ok(())
@@ -111,9 +115,11 @@ impl StudioVfs {
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
                 Err(err) => return Err(err),
             };
-            for &object_id in &removed_ids {
-                engine.add_pending_deletion(object_id, timestamp)?;
-            }
+            let entries: Vec<_> = removed_ids
+                .iter()
+                .map(|&object_id| (object_id, timestamp))
+                .collect();
+            engine.add_pending_deletions(&entries)?;
 
             if freed_bytes > 0 {
                 engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, freed_bytes)?;

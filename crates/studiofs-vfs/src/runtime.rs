@@ -506,6 +506,9 @@ impl<M: ?Sized + MetaGc> MetaGc for RuntimeMetaHandle<M> {
     forward_method!(
         fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>
     );
+    forward_method!(
+        fn add_pending_deletions(&self, entries: &[(u64, i64)]) -> MetaResult<()>
+    );
     forward_method!(fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()>);
     forward_method!(fn get_pending_deletions(&self) -> MetaResult<Vec<(u64, i64)>>);
     forward_method!(fn get_pending_deletions_limited(&self, limit: usize) -> MetaResult<Vec<(u64, i64)>>);

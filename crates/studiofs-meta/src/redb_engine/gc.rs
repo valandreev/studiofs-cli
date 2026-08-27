@@ -1,6 +1,37 @@
 use super::*;
 use redb::CompactionError;
 
+impl RedbMetaEngine {
+    pub(super) fn add_pending_deletions_in_txn(
+        txn: &redb::WriteTransaction,
+        entries: &[(u64, i64)],
+    ) -> MetaResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut pending_deletions = txn
+            .open_table(PENDING_DELETIONS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for &(object_id, timestamp) in entries {
+            pending_deletions
+                .insert(object_id, timestamp)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        drop(pending_deletions);
+        for &(object_id, timestamp) in entries {
+            Self::append_event_in_txn(
+                txn,
+                &crate::events::MetaEvent::AddPendingDeletion {
+                    object_id,
+                    timestamp,
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl MetaGc for RedbMetaEngine {
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         let Some(db) = self.db.as_ref() else {
@@ -30,23 +61,16 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
-        let txn = self.begin_write_txn()?;
-        {
-            let mut table = txn
-                .open_table(PENDING_DELETIONS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .insert(object_id, timestamp)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.add_pending_deletions(&[(object_id, timestamp)])
+    }
 
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::AddPendingDeletion {
-                    object_id,
-                    timestamp,
-                },
-            )?;
+    fn add_pending_deletions(&self, entries: &[(u64, i64)]) -> MetaResult<()> {
+        if entries.is_empty() {
+            return Ok(());
         }
+
+        let txn = self.begin_write_txn()?;
+        Self::add_pending_deletions_in_txn(&txn, entries)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
