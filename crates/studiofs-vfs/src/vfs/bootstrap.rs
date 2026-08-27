@@ -551,6 +551,7 @@ impl VfsBootstrap {
             max_xattr_bytes: plan.max_xattr_bytes,
             zeroio_runtime_state_dir: resources.zeroio_runtime_state_dir,
             landing_zone: resources.landing_zone,
+            landing_zone_recovery_gate: tokio::sync::Mutex::new(()),
             handle_table: HandleTable::new(),
             os_cache: Arc::new(Mutex::new(OsCacheState::default())),
             janitor_interval: plan.janitor_interval,
@@ -581,6 +582,8 @@ impl VfsBootstrap {
                 std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_deferred_materialization_prefetch: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_landing_zone_replay_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 

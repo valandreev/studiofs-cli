@@ -3638,6 +3638,7 @@ pub struct StudioVfs {
     max_xattr_bytes: usize,
     zeroio_runtime_state_dir: PathBuf,
     landing_zone: LandingZone,
+    landing_zone_recovery_gate: tokio::sync::Mutex<()>,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
     /// Bounded generation snapshots and active writer participation.
@@ -3675,6 +3676,8 @@ pub struct StudioVfs {
     fail_next_size_change_truncate_after_first_removed_block: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_deferred_materialization_prefetch: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_landing_zone_replay_after: std::sync::atomic::AtomicUsize,
 }
 
 fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {

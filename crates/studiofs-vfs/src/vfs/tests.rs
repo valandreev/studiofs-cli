@@ -11343,6 +11343,187 @@ fn startup_replays_legacy_landed_write_after_restart() {
 }
 
 #[test]
+fn mounted_flush_does_not_retire_landing_zone_while_startup_recovery_is_running() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-664-mounted-recovery");
+    let _guard = rt.enter();
+    let ino = vfs
+        .create(1, b"sfs-664-mounted-recovery.txt", 0, 0, 0o644)
+        .expect("create recovery inode")
+        .ino;
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(b"startup-recovery"),
+        })
+        .expect("accept recovery segment");
+
+    rt.block_on(async {
+        let recovery_gate = vfs
+            .landing_zone_recovery_gate
+            .try_lock()
+            .expect("test should hold the recovery gate before startup");
+        vfs.start().expect("start recovery workers");
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            .await
+            .expect("foreground flush should tolerate deferred landing retirement");
+        vfs.flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("background flush should tolerate deferred landing retirement");
+        assert_eq!(
+            vfs.recover_landing_zone_segments().unwrap().len(),
+            1,
+            "mounted flushes must not retire landing data while startup recovery is gated"
+        );
+
+        drop(recovery_gate);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if vfs.recover_landing_zone_segments().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup recovery did not retire the landing record after the gate opened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+}
+
+#[test]
+fn startup_recovery_retires_only_fully_replayed_inodes_after_failure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-664-partial-recovery");
+    let _guard = rt.enter();
+    let completed_ino = vfs
+        .create(1, b"sfs-664-completed.txt", 0, 0, 0o644)
+        .expect("create completed inode")
+        .ino;
+    let failed_ino = u64::MAX;
+    let first = b"completed-first";
+    let second = b"completed-second";
+
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: completed_ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(first),
+        })
+        .expect("accept first completed segment");
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: completed_ino,
+            fh: 0,
+            offset: first.len() as u64,
+            data: Bytes::from_static(second),
+        })
+        .expect("accept second completed segment");
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: failed_ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(b"unreplayed"),
+        })
+        .expect("accept failing segment");
+
+    assert!(
+        rt.block_on(vfs.recover_landing_zone_for_startup()).is_err(),
+        "recovery should fail when it reaches the unknown inode"
+    );
+
+    drop(vfs);
+    let landing_zone = crate::landing_zone::LandingZone::open(
+        tmp.path()
+            .join("cache")
+            .join("runtime")
+            .join("landing-zone"),
+    )
+    .expect("reopen landing zone");
+    let recovered = landing_zone.recover().expect("recover remaining segments");
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|segment| segment.ino)
+            .collect::<Vec<_>>(),
+        vec![failed_ino],
+        "only the incomplete inode should remain recoverable"
+    );
+}
+
+#[test]
+fn startup_recovery_retains_all_segments_for_partially_replayed_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-664-interleaved-recovery");
+    let _guard = rt.enter();
+    let partial_ino = vfs
+        .create(1, b"sfs-664-partial.txt", 0, 0, 0o644)
+        .expect("create partial inode")
+        .ino;
+    let completed_ino = vfs
+        .create(1, b"sfs-664-completed.txt", 0, 0, 0o644)
+        .expect("create completed inode")
+        .ino;
+    let partial_first = b"partial-first";
+    let completed = b"completed";
+    let partial_second = b"partial-second";
+
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: partial_ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(partial_first),
+        })
+        .expect("accept first partial segment");
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: completed_ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(completed),
+        })
+        .expect("accept completed segment");
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: partial_ino,
+            fh: 0,
+            offset: partial_first.len() as u64,
+            data: Bytes::from_static(partial_second),
+        })
+        .expect("accept second partial segment");
+
+    vfs.arm_fail_landing_zone_replay_after_for_test(2);
+    assert!(
+        rt.block_on(vfs.recover_landing_zone_for_startup()).is_err(),
+        "recovery should fail on the later segment of the partial inode"
+    );
+
+    drop(vfs);
+    let landing_zone = crate::landing_zone::LandingZone::open(
+        tmp.path()
+            .join("cache")
+            .join("runtime")
+            .join("landing-zone"),
+    )
+    .expect("reopen landing zone");
+    let recovered = landing_zone.recover().expect("recover remaining segments");
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|segment| segment.ino)
+            .collect::<Vec<_>>(),
+        vec![partial_ino, partial_ino],
+        "all segments of the incomplete inode should remain recoverable"
+    );
+}
+
+#[test]
 fn drain_lag_pacing_attribution_scales_drain_lag_share_to_actual_wait() {
     assert_eq!(
         super::drain_lag_pacing_attribution_ms(12, 12, Some(4)),

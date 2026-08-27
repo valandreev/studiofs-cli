@@ -3368,6 +3368,9 @@ impl StudioVfs {
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, true)
             .await?;
+        let Ok(_recovery_gate) = self.landing_zone_recovery_gate.try_lock() else {
+            return Ok(());
+        };
         self.landing_zone.clear_inode(ino).map_err(VfsError::Io)?;
         Ok(())
     }
@@ -3381,6 +3384,9 @@ impl StudioVfs {
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, false)
             .await?;
+        let Ok(_recovery_gate) = self.landing_zone_recovery_gate.try_lock() else {
+            return Ok(());
+        };
         self.landing_zone.clear_inode(ino).map_err(VfsError::Io)?;
         Ok(())
     }
