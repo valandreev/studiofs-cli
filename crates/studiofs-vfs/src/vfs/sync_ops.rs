@@ -117,6 +117,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn recover_landing_zone_for_startup(&self) -> VfsResult<()> {
+        let _recovery_gate = self.landing_zone_recovery_gate.lock().await;
         let recovered = self
             .landing_zone
             .recover_with_data()

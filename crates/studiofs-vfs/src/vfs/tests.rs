@@ -11343,6 +11343,58 @@ fn startup_replays_legacy_landed_write_after_restart() {
 }
 
 #[test]
+fn mounted_flush_does_not_retire_landing_zone_while_startup_recovery_is_running() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-664-mounted-recovery");
+    let _guard = rt.enter();
+    let ino = vfs
+        .create(1, b"sfs-664-mounted-recovery.txt", 0, 0, 0o644)
+        .expect("create recovery inode")
+        .ino;
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(b"startup-recovery"),
+        })
+        .expect("accept recovery segment");
+
+    rt.block_on(async {
+        let recovery_gate = vfs
+            .landing_zone_recovery_gate
+            .try_lock()
+            .expect("test should hold the recovery gate before startup");
+        vfs.start().expect("start recovery workers");
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            .await
+            .expect("foreground flush should tolerate deferred landing retirement");
+        vfs.flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("background flush should tolerate deferred landing retirement");
+        assert_eq!(
+            vfs.recover_landing_zone_segments().unwrap().len(),
+            1,
+            "mounted flushes must not retire landing data while startup recovery is gated"
+        );
+
+        drop(recovery_gate);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if vfs.recover_landing_zone_segments().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup recovery did not retire the landing record after the gate opened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+}
+
+#[test]
 fn startup_recovery_retires_only_fully_replayed_inodes_after_failure() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-664-partial-recovery");

@@ -551,6 +551,7 @@ impl VfsBootstrap {
             max_xattr_bytes: plan.max_xattr_bytes,
             zeroio_runtime_state_dir: resources.zeroio_runtime_state_dir,
             landing_zone: resources.landing_zone,
+            landing_zone_recovery_gate: tokio::sync::Mutex::new(()),
             handle_table: HandleTable::new(),
             os_cache: Arc::new(Mutex::new(OsCacheState::default())),
             janitor_interval: plan.janitor_interval,
