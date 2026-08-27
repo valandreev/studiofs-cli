@@ -391,6 +391,68 @@ fn pending_deletions_limited_stops_at_limit() {
 }
 
 #[test]
+fn pending_deletion_batch_commits_all_markers_in_one_transaction_with_one_event_each() {
+    let engine = temp_engine();
+    let markers = [(10, 100), (20, 200), (30, 300)];
+    let before = engine.metadata_write_observability();
+    let start_seq = engine.get_counter("nextEventSeq").unwrap();
+
+    engine
+        .add_pending_deletions(&markers)
+        .expect("commit pending deletion batch");
+
+    let after = engine.metadata_write_observability();
+    assert_eq!(after.begin_write.calls - before.begin_write.calls, 1);
+    assert_eq!(after.commit.calls - before.commit.calls, 1);
+    assert_eq!(engine.get_pending_deletions().unwrap(), markers.to_vec());
+
+    let end_seq = engine.get_counter("nextEventSeq").unwrap();
+    let events = engine
+        .read_events_range(start_seq, end_seq)
+        .expect("read pending deletion events");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            MetaEvent::AddPendingDeletion {
+                object_id: 10,
+                timestamp: 100
+            },
+            MetaEvent::AddPendingDeletion {
+                object_id: 20,
+                timestamp: 200
+            },
+            MetaEvent::AddPendingDeletion {
+                object_id: 30,
+                timestamp: 300
+            }
+        ]
+    ));
+}
+
+#[test]
+fn pending_deletion_batch_rollback_discards_markers_and_events() {
+    let engine = temp_engine();
+    let start_seq = engine.get_counter("nextEventSeq").unwrap();
+    let txn = engine
+        .begin_write_txn()
+        .expect("begin pending deletion txn");
+
+    RedbMetaEngine::add_pending_deletions_in_txn(&txn, &[(40, 400), (50, 500)])
+        .expect("stage pending deletion batch");
+    drop(txn);
+
+    assert!(
+        engine.get_pending_deletions().unwrap().is_empty(),
+        "dropping the transaction must roll back every pending marker"
+    );
+    assert_eq!(
+        engine.get_counter("nextEventSeq").unwrap(),
+        start_seq,
+        "dropping the transaction must roll back its event sequence"
+    );
+}
+
+#[test]
 fn contract_core_harness_runs_ops_and_reopens_with_invariants() {
     let mut fixture =
         ContractCoreFixture::new("redb-contract-harness").expect("create contract fixture");

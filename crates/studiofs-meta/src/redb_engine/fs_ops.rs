@@ -579,26 +579,11 @@ impl<'a> NamespaceDeleteTxn<'a> {
             return Ok(());
         }
 
-        let mut pending_deletions = self
-            .txn
-            .open_table(PENDING_DELETIONS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        for &object_id in object_ids {
-            pending_deletions
-                .insert(object_id, timestamp)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        drop(pending_deletions);
-        for &object_id in object_ids {
-            RedbMetaEngine::append_event_in_txn(
-                self.txn,
-                &crate::events::MetaEvent::AddPendingDeletion {
-                    object_id,
-                    timestamp,
-                },
-            )?;
-        }
-        Ok(())
+        let entries: Vec<_> = object_ids
+            .iter()
+            .map(|&object_id| (object_id, timestamp))
+            .collect();
+        RedbMetaEngine::add_pending_deletions_in_txn(self.txn, &entries)
     }
 
     pub(super) fn append_unlink_events(

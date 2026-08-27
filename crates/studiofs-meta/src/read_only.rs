@@ -352,6 +352,10 @@ where
         Err(read_only_error(ROOT_INO))
     }
 
+    fn add_pending_deletions(&self, _entries: &[(u64, i64)]) -> MetaResult<()> {
+        Err(read_only_error(ROOT_INO))
+    }
+
     fn remove_pending_deletion(&self, _object_id: u64) -> MetaResult<()> {
         Err(read_only_error(ROOT_INO))
     }

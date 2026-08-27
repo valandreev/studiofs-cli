@@ -315,6 +315,10 @@ impl MetaGc for PgMetaEngine {
         self.mutate(|local| local.add_pending_deletion(object_id, timestamp))
     }
 
+    fn add_pending_deletions(&self, entries: &[(u64, i64)]) -> MetaResult<()> {
+        self.mutate(|local| local.add_pending_deletions(entries))
+    }
+
     fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
         self.mutate(|local| local.remove_pending_deletion(object_id))
     }
