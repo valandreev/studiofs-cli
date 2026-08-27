@@ -21,6 +21,19 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn startup_panic_guard_converts_prewarm_panic_to_error() {
+    let result = catch_startup_panic(|| -> VfsResult<()> {
+        panic!("linux prewarm panic");
+    });
+    let error = result.expect_err("startup panic should become a VFS error");
+
+    assert_eq!(
+        error.to_string(),
+        "StudioVfs::start panicked during startup: linux prewarm panic"
+    );
+}
+
 #[tokio::test]
 async fn snapshot_worker_supervisor_restarts_after_worker_error() {
     let attempts = Arc::new(AtomicUsize::new(0));
