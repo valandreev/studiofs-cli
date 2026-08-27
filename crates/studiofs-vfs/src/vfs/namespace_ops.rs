@@ -153,7 +153,14 @@ impl StudioVfs {
     pub(super) fn prewarm_namespace_inode_reservation(&self) -> VfsResult<()> {
         let ino = self.reserve_namespace_ino()?;
         self.return_reserved_namespace_ino(ino);
-        Ok(())
+        #[cfg(test)]
+        self.state
+            .metrics
+            .metadata_sync_barrier_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sync_meta()
+            .sync_local_metadata()
+            .map_err(VfsError::Meta)
     }
 
     fn return_reserved_namespace_ino(&self, ino: Ino) {
