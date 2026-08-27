@@ -742,14 +742,6 @@ struct DirPrefetchState {
 #[cfg(test)]
 type DirAccessTrackerTestHook = Arc<dyn Fn() + Send + Sync>;
 
-#[cfg(test)]
-#[derive(Default)]
-struct DirAccessTrackerTestHooks {
-    child_mapping_cleanup: Mutex<Option<DirAccessTrackerTestHook>>,
-    reverse_mapping_cleanup: Mutex<Option<DirAccessTrackerTestHook>>,
-    lru_victim_selected: Mutex<Option<DirAccessTrackerTestHook>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A directory entry being tracked for sequence-aware prefetching.
 pub struct DirAccessEntry<'a> {
@@ -892,7 +884,7 @@ pub struct DirAccessTracker {
     /// Hard cap for tracked directories to prevent unbounded growth.
     max_tracked_dirs: usize,
     #[cfg(test)]
-    test_hooks: DirAccessTrackerTestHooks,
+    test_hook: Mutex<Option<DirAccessTrackerTestHook>>,
 }
 
 impl DirAccessTracker {
@@ -913,7 +905,7 @@ impl DirAccessTracker {
             threshold,
             max_tracked_dirs: max_tracked_dirs.max(1),
             #[cfg(test)]
-            test_hooks: DirAccessTrackerTestHooks::default(),
+            test_hook: Mutex::new(None),
         }
     }
 
@@ -934,7 +926,7 @@ impl DirAccessTracker {
                 break;
             };
             #[cfg(test)]
-            self.invoke_test_hook(&self.test_hooks.lru_victim_selected);
+            self.invoke_test_hook();
             // The LRU snapshot can become stale while another read touches the directory.
             if let Some((_, victim)) = self.dirs.remove_if(&victim_dir, |_, state| {
                 state.last_touch == observed_last_touch
@@ -952,7 +944,7 @@ impl DirAccessTracker {
             let matches_expected = *current == expected;
             #[cfg(test)]
             if matches_expected {
-                self.invoke_test_hook(&self.test_hooks.child_mapping_cleanup);
+                self.invoke_test_hook();
             }
             matches_expected
         });
@@ -975,7 +967,7 @@ impl DirAccessTracker {
         let touch = self.next_touch();
         if let Some((_, prev)) = self.dirs.remove(&dir_ino) {
             #[cfg(test)]
-            self.invoke_test_hook(&self.test_hooks.reverse_mapping_cleanup);
+            self.invoke_test_hook();
             for child in &prev.children {
                 self.remove_child_mapping_if_same(*child, (dir_ino, prev.readdir_touch));
             }
@@ -1095,7 +1087,7 @@ impl DirAccessTracker {
     pub fn evict_dir(&self, dir_ino: Ino) {
         if let Some((_, state)) = self.dirs.remove(&dir_ino) {
             #[cfg(test)]
-            self.invoke_test_hook(&self.test_hooks.reverse_mapping_cleanup);
+            self.invoke_test_hook();
             for child in &state.children {
                 self.remove_child_mapping_if_same(*child, (dir_ino, state.readdir_touch));
             }
@@ -1103,23 +1095,13 @@ impl DirAccessTracker {
     }
 
     #[cfg(test)]
-    fn set_child_mapping_cleanup_hook(&self, hook: DirAccessTrackerTestHook) {
-        *self.test_hooks.child_mapping_cleanup.lock().unwrap() = Some(hook);
+    fn set_test_hook(&self, hook: DirAccessTrackerTestHook) {
+        *self.test_hook.lock().unwrap() = Some(hook);
     }
 
     #[cfg(test)]
-    fn set_reverse_mapping_cleanup_hook(&self, hook: DirAccessTrackerTestHook) {
-        *self.test_hooks.reverse_mapping_cleanup.lock().unwrap() = Some(hook);
-    }
-
-    #[cfg(test)]
-    fn set_lru_victim_selected_hook(&self, hook: DirAccessTrackerTestHook) {
-        *self.test_hooks.lru_victim_selected.lock().unwrap() = Some(hook);
-    }
-
-    #[cfg(test)]
-    fn invoke_test_hook(&self, hook: &Mutex<Option<DirAccessTrackerTestHook>>) {
-        let hook = hook.lock().unwrap().clone();
+    fn invoke_test_hook(&self) {
+        let hook = self.test_hook.lock().unwrap().clone();
         if let Some(hook) = hook {
             hook();
         }
@@ -1267,7 +1249,7 @@ mod dir_prefetch_tests {
         let cleanup_release = Arc::new(std::sync::Barrier::new(2));
         let started_for_hook = Arc::clone(&cleanup_started);
         let release_for_hook = Arc::clone(&cleanup_release);
-        tracker.set_reverse_mapping_cleanup_hook(Arc::new(move || {
+        tracker.set_test_hook(Arc::new(move || {
             started_for_hook.wait();
             release_for_hook.wait();
         }));
@@ -1299,7 +1281,7 @@ mod dir_prefetch_tests {
         let cleanup_release = Arc::new(std::sync::Barrier::new(2));
         let started_for_hook = Arc::clone(&cleanup_started);
         let release_for_hook = Arc::clone(&cleanup_release);
-        tracker.set_reverse_mapping_cleanup_hook(Arc::new(move || {
+        tracker.set_test_hook(Arc::new(move || {
             started_for_hook.wait();
             release_for_hook.wait();
         }));
@@ -1333,7 +1315,7 @@ mod dir_prefetch_tests {
         let cleanup_release = Arc::new(std::sync::Barrier::new(2));
         let candidate_for_hook = Arc::clone(&cleanup_candidate);
         let release_for_hook = Arc::clone(&cleanup_release);
-        tracker.set_child_mapping_cleanup_hook(Arc::new(move || {
+        tracker.set_test_hook(Arc::new(move || {
             candidate_for_hook.wait();
             release_for_hook.wait();
         }));
@@ -1364,13 +1346,11 @@ mod dir_prefetch_tests {
         if helper_holds_shard_lock {
             cleanup_release.wait();
             allow_refresh.wait();
+            refresh_done.wait();
         } else {
             allow_refresh.wait();
             refresh_done.wait();
             cleanup_release.wait();
-        }
-        if helper_holds_shard_lock {
-            refresh_done.wait();
         }
 
         refresh.join().unwrap();
@@ -1394,7 +1374,7 @@ mod dir_prefetch_tests {
         let selected_for_hook = Arc::clone(&victim_selected);
         let release_for_hook = Arc::clone(&eviction_release);
         let first_selection_for_hook = Arc::clone(&first_selection);
-        tracker.set_lru_victim_selected_hook(Arc::new(move || {
+        tracker.set_test_hook(Arc::new(move || {
             if first_selection_for_hook.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 selected_for_hook.wait();
                 release_for_hook.wait();
