@@ -17333,11 +17333,25 @@ fn linux_start_prewarm_namespace_inode_reservation() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "linux-start-prewarm");
     let before = namespace_inode_allocation_calls(&vfs);
+    let before_barriers = vfs
+        .state
+        .metrics
+        .metadata_sync_barrier_calls
+        .load(AtomicOrdering::Acquire);
 
     {
         let _guard = rt.enter();
         vfs.start().expect("start VFS background workers");
     }
+
+    assert_eq!(
+        vfs.state
+            .metrics
+            .metadata_sync_barrier_calls
+            .load(AtomicOrdering::Acquire),
+        before_barriers + 1,
+        "Linux namespace prewarm should force one immediate local metadata barrier"
+    );
 
     assert_eq!(
         namespace_inode_allocation_calls(&vfs),
