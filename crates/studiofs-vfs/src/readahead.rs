@@ -19,10 +19,10 @@
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use studiofs_meta::types::Ino;
 
@@ -759,10 +759,10 @@ impl<'a> DirAccessEntry<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FrameSequenceKey {
-    prefix: Vec<u8>,
+struct FrameSequenceKey<'a> {
+    prefix: &'a [u8],
     width: usize,
-    suffix: Vec<u8>,
+    suffix: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -783,7 +783,9 @@ struct FrameSequenceIndex {
     positions: HashMap<Ino, FrameSequencePosition>,
 }
 
-fn parse_frame_sequence_member(entry: &DirAccessEntry<'_>) -> Option<(FrameSequenceKey, u64)> {
+fn parse_frame_sequence_member<'a>(
+    entry: &DirAccessEntry<'a>,
+) -> Option<(FrameSequenceKey<'a>, u64)> {
     let name = entry.name;
     let stem_end = name.iter().rposition(|b| *b == b'.').unwrap_or(name.len());
     if stem_end == 0 {
@@ -807,16 +809,16 @@ fn parse_frame_sequence_member(entry: &DirAccessEntry<'_>) -> Option<(FrameSeque
 
     Some((
         FrameSequenceKey {
-            prefix: name[..digit_start].to_vec(),
+            prefix: &name[..digit_start],
             width: stem_end - digit_start,
-            suffix: name[stem_end..].to_vec(),
+            suffix: &name[stem_end..],
         },
         number,
     ))
 }
 
-fn build_sequence_index(entries: &[DirAccessEntry<'_>]) -> FrameSequenceIndex {
-    let mut groups: HashMap<FrameSequenceKey, Vec<FrameSequenceMember>> = HashMap::new();
+fn build_sequence_index<'a>(entries: &[DirAccessEntry<'a>]) -> FrameSequenceIndex {
+    let mut groups: HashMap<FrameSequenceKey<'a>, Vec<FrameSequenceMember>> = HashMap::new();
     for entry in entries {
         if let Some((key, number)) = parse_frame_sequence_member(entry) {
             groups.entry(key).or_default().push(FrameSequenceMember {
@@ -884,7 +886,7 @@ pub struct DirAccessTracker {
     /// Hard cap for tracked directories to prevent unbounded growth.
     max_tracked_dirs: usize,
     #[cfg(test)]
-    test_hook: Mutex<Option<DirAccessTrackerTestHook>>,
+    test_hook: OnceLock<DirAccessTrackerTestHook>,
 }
 
 impl DirAccessTracker {
@@ -905,7 +907,7 @@ impl DirAccessTracker {
             threshold,
             max_tracked_dirs: max_tracked_dirs.max(1),
             #[cfg(test)]
-            test_hook: Mutex::new(None),
+            test_hook: OnceLock::new(),
         }
     }
 
@@ -1096,13 +1098,15 @@ impl DirAccessTracker {
 
     #[cfg(test)]
     fn set_test_hook(&self, hook: DirAccessTrackerTestHook) {
-        *self.test_hook.lock().unwrap() = Some(hook);
+        assert!(
+            self.test_hook.set(hook).is_ok(),
+            "test hook must only be configured once"
+        );
     }
 
     #[cfg(test)]
     fn invoke_test_hook(&self) {
-        let hook = self.test_hook.lock().unwrap().clone();
-        if let Some(hook) = hook {
+        if let Some(hook) = self.test_hook.get().cloned() {
             hook();
         }
     }
