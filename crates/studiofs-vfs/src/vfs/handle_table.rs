@@ -19,6 +19,8 @@ struct HandleCounts {
 struct HandleTableData {
     handles: HashMap<u64, OpenFile>,
     handles_by_inode: HashMap<Ino, HashSet<u64>>,
+    /// Inode -> currently open file descriptor counters.
+    counts: HashMap<Ino, HandleCounts>,
 }
 
 /// Per-VFS handle table tracking all open file descriptors.
@@ -28,8 +30,6 @@ pub(super) struct HandleTable {
     next_fh: AtomicU64,
     /// All open handles: fh -> OpenFile.
     handles: RwLock<HandleTableData>,
-    /// Inode -> currently open file descriptor counters.
-    counts: Mutex<HashMap<Ino, HandleCounts>>,
     /// Inodes that were unlinked while still open (deferred deletion).
     orphans: Mutex<HashSet<Ino>>,
 }
@@ -39,7 +39,6 @@ impl HandleTable {
         Self {
             next_fh: AtomicU64::new(1),
             handles: RwLock::new(HandleTableData::default()),
-            counts: Mutex::new(HashMap::new()),
             orphans: Mutex::new(HashSet::new()),
         }
     }
@@ -61,13 +60,12 @@ impl HandleTable {
         let mut handles = self.handles.write();
         handles.handles.insert(fh, open_file.clone());
         handles.handles_by_inode.entry(ino).or_default().insert(fh);
-        drop(handles);
-        let mut counts = self.counts.lock();
-        let counts_for_inode = counts.entry(ino).or_default();
+        let counts_for_inode = handles.counts.entry(ino).or_default();
         counts_for_inode.open = counts_for_inode.open.saturating_add(1);
         if Self::flags_allow_write(flags) {
             counts_for_inode.write = counts_for_inode.write.saturating_add(1);
         }
+        drop(handles);
         open_file
     }
 
@@ -125,9 +123,8 @@ impl HandleTable {
                 handles.handles_by_inode.remove(&open_file.ino);
             }
         }
-        drop(handles);
-        let mut counts = self.counts.lock();
-        let counts_for_inode = counts
+        let counts_for_inode = handles
+            .counts
             .get_mut(&open_file.ino)
             .expect("inode must exist in counts if handle existed");
         counts_for_inode.open = counts_for_inode.open.saturating_sub(1);
@@ -140,15 +137,16 @@ impl HandleTable {
         }
         let remaining = counts_for_inode.open;
         if counts_for_inode.open == 0 {
-            counts.remove(&open_file.ino);
+            handles.counts.remove(&open_file.ino);
         }
         Some((open_file, remaining))
     }
 
     /// Get the number of open handles for an inode.
     pub(super) fn open_count(&self, ino: Ino) -> u32 {
-        self.counts
-            .lock()
+        self.handles
+            .read()
+            .counts
             .get(&ino)
             .map(|counts| counts.open)
             .unwrap_or(0)
@@ -156,8 +154,9 @@ impl HandleTable {
 
     /// Get the number of write-capable open handles for an inode.
     pub(super) fn write_open_count(&self, ino: Ino) -> u32 {
-        self.counts
-            .lock()
+        self.handles
+            .read()
+            .counts
             .get(&ino)
             .map(|counts| counts.write)
             .unwrap_or(0)
@@ -223,6 +222,75 @@ impl HandleTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn handle_counts_are_stored_with_handle_table_state() {
+        let ht = HandleTable::new();
+        let opened = ht.open(42, OpenFlags::RDWR, None, false);
+
+        {
+            let table = ht.handles.read();
+            let counts = table
+                .counts
+                .get(&42)
+                .expect("open handle must have an inode count");
+            assert_eq!(counts.open, 1);
+            assert_eq!(counts.write, 1);
+        }
+
+        let (_, remaining) = ht.close(opened.fh).expect("opened handle must be closable");
+        assert_eq!(remaining, 0);
+        assert!(!ht.handles.read().counts.contains_key(&42));
+    }
+
+    #[test]
+    fn concurrent_open_and_close_preserve_handle_counts() {
+        for _ in 0..100 {
+            let ht = Arc::new(HandleTable::new());
+            let opener_ht = Arc::clone(&ht);
+            let opener = thread::spawn(move || opener_ht.open(42, OpenFlags::RDWR, None, false));
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while ht.next_fh.load(Ordering::Relaxed) <= 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "open thread did not allocate a handle"
+                );
+                thread::yield_now();
+            }
+
+            let closer_ht = Arc::clone(&ht);
+            let closer = thread::spawn(move || {
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err("timeout");
+                    }
+                    let close_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            closer_ht.close(1)
+                        }));
+                    match close_result {
+                        Ok(Some(_)) => return Ok(()),
+                        Ok(None) => thread::yield_now(),
+                        Err(_) => return Err("panic"),
+                    }
+                }
+            });
+
+            let opened = opener.join().expect("open thread must not panic");
+            match closer.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => panic!("concurrent close failed: {reason}"),
+                Err(_) => panic!("close thread must not panic"),
+            }
+            assert_eq!(ht.open_count(42), 0);
+            assert_eq!(ht.write_open_count(42), 0);
+            assert_eq!(opened.ino, 42);
+        }
+    }
 
     #[test]
     fn test_handle_table_open_close() {
