@@ -11343,6 +11343,68 @@ fn startup_replays_legacy_landed_write_after_restart() {
 }
 
 #[test]
+fn startup_recovery_retires_only_fully_replayed_inodes_after_failure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-664-partial-recovery");
+    let _guard = rt.enter();
+    let completed_ino = vfs
+        .create(1, b"sfs-664-completed.txt", 0, 0, 0o644)
+        .expect("create completed inode")
+        .ino;
+    let failed_ino = u64::MAX;
+    let first = b"completed-first";
+    let second = b"completed-second";
+
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: completed_ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(first),
+        })
+        .expect("accept first completed segment");
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: completed_ino,
+            fh: 0,
+            offset: first.len() as u64,
+            data: Bytes::from_static(second),
+        })
+        .expect("accept second completed segment");
+    vfs.landing_zone
+        .accept(crate::landing_zone::LandingWrite {
+            ino: failed_ino,
+            fh: 0,
+            offset: 0,
+            data: Bytes::from_static(b"unreplayed"),
+        })
+        .expect("accept failing segment");
+
+    assert!(
+        rt.block_on(vfs.recover_landing_zone_for_startup()).is_err(),
+        "recovery should fail when it reaches the unknown inode"
+    );
+
+    drop(vfs);
+    let landing_zone = crate::landing_zone::LandingZone::open(
+        tmp.path()
+            .join("cache")
+            .join("runtime")
+            .join("landing-zone"),
+    )
+    .expect("reopen landing zone");
+    let recovered = landing_zone.recover().expect("recover remaining segments");
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|segment| segment.ino)
+            .collect::<Vec<_>>(),
+        vec![failed_ino],
+        "only the incomplete inode should remain recoverable"
+    );
+}
+
+#[test]
 fn drain_lag_pacing_attribution_scales_drain_lag_share_to_actual_wait() {
     assert_eq!(
         super::drain_lag_pacing_attribution_ms(12, 12, Some(4)),

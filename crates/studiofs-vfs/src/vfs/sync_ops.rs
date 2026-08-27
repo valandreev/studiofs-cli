@@ -6,7 +6,7 @@ use super::{
     StudioVfs, VfsResult,
 };
 use bytes::Bytes;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -116,21 +116,44 @@ impl StudioVfs {
         }));
     }
 
-    async fn recover_landing_zone_for_startup(&self) -> VfsResult<()> {
+    pub(super) async fn recover_landing_zone_for_startup(&self) -> VfsResult<()> {
         let recovered = self
             .landing_zone
             .recover_with_data()
             .map_err(VfsError::Io)?;
+
+        let mut remaining_segments = BTreeMap::new();
+        for item in &recovered {
+            *remaining_segments.entry(item.segment.ino).or_insert(0usize) += 1;
+        }
+
         let mut replayed_inodes = BTreeSet::new();
         for item in recovered {
-            self.write_with_local_sync_policy(
-                item.segment.ino,
-                item.segment.offset,
-                &item.data,
-                LocalSyncPolicy::Strict,
-            )
-            .await?;
-            replayed_inodes.insert(item.segment.ino);
+            let ino = item.segment.ino;
+            if let Err(replay_error) = self
+                .write_with_local_sync_policy(
+                    ino,
+                    item.segment.offset,
+                    &item.data,
+                    LocalSyncPolicy::Strict,
+                )
+                .await
+            {
+                return match self.landing_zone.clear_inodes(&replayed_inodes) {
+                    Ok(()) => Err(replay_error),
+                    Err(retire_error) => Err(VfsError::Other(format!(
+                        "landing-zone replay failed: {replay_error}; failed to retire completed inodes: {retire_error}"
+                    ))),
+                };
+            }
+
+            let remaining = remaining_segments
+                .get_mut(&ino)
+                .expect("every recovered segment has a remaining count");
+            *remaining -= 1;
+            if *remaining == 0 {
+                replayed_inodes.insert(ino);
+            }
         }
         self.landing_zone
             .clear_inodes(&replayed_inodes)
