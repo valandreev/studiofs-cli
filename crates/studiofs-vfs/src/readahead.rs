@@ -19,6 +19,8 @@
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -737,6 +739,9 @@ struct DirPrefetchState {
     last_touch: u64,
 }
 
+#[cfg(test)]
+type DirAccessTrackerTestHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A directory entry being tracked for sequence-aware prefetching.
 pub struct DirAccessEntry<'a> {
@@ -754,10 +759,10 @@ impl<'a> DirAccessEntry<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FrameSequenceKey {
-    prefix: Vec<u8>,
+struct FrameSequenceKey<'a> {
+    prefix: &'a [u8],
     width: usize,
-    suffix: Vec<u8>,
+    suffix: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -778,7 +783,9 @@ struct FrameSequenceIndex {
     positions: HashMap<Ino, FrameSequencePosition>,
 }
 
-fn parse_frame_sequence_member(entry: &DirAccessEntry<'_>) -> Option<(FrameSequenceKey, u64)> {
+fn parse_frame_sequence_member<'a>(
+    entry: &DirAccessEntry<'a>,
+) -> Option<(FrameSequenceKey<'a>, u64)> {
     let name = entry.name;
     let stem_end = name.iter().rposition(|b| *b == b'.').unwrap_or(name.len());
     if stem_end == 0 {
@@ -802,16 +809,16 @@ fn parse_frame_sequence_member(entry: &DirAccessEntry<'_>) -> Option<(FrameSeque
 
     Some((
         FrameSequenceKey {
-            prefix: name[..digit_start].to_vec(),
+            prefix: &name[..digit_start],
             width: stem_end - digit_start,
-            suffix: name[stem_end..].to_vec(),
+            suffix: &name[stem_end..],
         },
         number,
     ))
 }
 
-fn build_sequence_index(entries: &[DirAccessEntry<'_>]) -> FrameSequenceIndex {
-    let mut groups: HashMap<FrameSequenceKey, Vec<FrameSequenceMember>> = HashMap::new();
+fn build_sequence_index<'a>(entries: &[DirAccessEntry<'a>]) -> FrameSequenceIndex {
+    let mut groups: HashMap<FrameSequenceKey<'a>, Vec<FrameSequenceMember>> = HashMap::new();
     for entry in entries {
         if let Some((key, number)) = parse_frame_sequence_member(entry) {
             groups.entry(key).or_default().push(FrameSequenceMember {
@@ -878,6 +885,8 @@ pub struct DirAccessTracker {
     threshold: usize,
     /// Hard cap for tracked directories to prevent unbounded growth.
     max_tracked_dirs: usize,
+    #[cfg(test)]
+    test_hook: OnceLock<DirAccessTrackerTestHook>,
 }
 
 impl DirAccessTracker {
@@ -897,6 +906,8 @@ impl DirAccessTracker {
             access_tick: AtomicU64::new(0),
             threshold,
             max_tracked_dirs: max_tracked_dirs.max(1),
+            #[cfg(test)]
+            test_hook: OnceLock::new(),
         }
     }
 
@@ -908,29 +919,37 @@ impl DirAccessTracker {
 
     fn evict_lru_if_needed(&self) {
         while self.dirs.len() > self.max_tracked_dirs {
-            let Some(victim_dir) = self
+            let Some((victim_dir, observed_last_touch)) = self
                 .dirs
                 .iter()
                 .min_by_key(|entry| entry.last_touch)
-                .map(|entry| *entry.key())
+                .map(|entry| (*entry.key(), entry.last_touch))
             else {
                 break;
             };
-            if let Some((_, victim)) = self.dirs.remove(&victim_dir) {
+            #[cfg(test)]
+            self.invoke_test_hook();
+            // The LRU snapshot can become stale while another read touches the directory.
+            if let Some((_, victim)) = self.dirs.remove_if(&victim_dir, |_, state| {
+                state.last_touch == observed_last_touch
+            }) {
                 for child in &victim.children {
-                    self.child_to_dir.remove(child);
+                    self.remove_child_mapping_if_same(*child, (victim_dir, victim.readdir_touch));
                 }
             }
         }
     }
 
     fn remove_child_mapping_if_same(&self, child_ino: Ino, expected: (Ino, u64)) {
-        if let Some(current) = self.child_to_dir.get(&child_ino)
-            && *current.value() == expected
-        {
-            drop(current);
-            self.child_to_dir.remove(&child_ino);
-        }
+        // Keep the generation check and removal under the same shard lock.
+        self.child_to_dir.remove_if(&child_ino, |_, current| {
+            let matches_expected = *current == expected;
+            #[cfg(test)]
+            if matches_expected {
+                self.invoke_test_hook();
+            }
+            matches_expected
+        });
     }
 
     /// Called after `readdir(dir_ino)` completes.
@@ -949,8 +968,10 @@ impl DirAccessTracker {
     pub fn on_readdir_entries(&self, dir_ino: Ino, entries: Vec<DirAccessEntry<'_>>) {
         let touch = self.next_touch();
         if let Some((_, prev)) = self.dirs.remove(&dir_ino) {
+            #[cfg(test)]
+            self.invoke_test_hook();
             for child in &prev.children {
-                self.child_to_dir.remove(child);
+                self.remove_child_mapping_if_same(*child, (dir_ino, prev.readdir_touch));
             }
         }
         let children: Vec<Ino> = entries.iter().map(|entry| entry.ino).collect();
@@ -1067,9 +1088,26 @@ impl DirAccessTracker {
     /// Remove all state for a directory (e.g. when it is deleted).
     pub fn evict_dir(&self, dir_ino: Ino) {
         if let Some((_, state)) = self.dirs.remove(&dir_ino) {
+            #[cfg(test)]
+            self.invoke_test_hook();
             for child in &state.children {
-                self.child_to_dir.remove(child);
+                self.remove_child_mapping_if_same(*child, (dir_ino, state.readdir_touch));
             }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_test_hook(&self, hook: DirAccessTrackerTestHook) {
+        assert!(
+            self.test_hook.set(hook).is_ok(),
+            "test hook must only be configured once"
+        );
+    }
+
+    #[cfg(test)]
+    fn invoke_test_hook(&self) {
+        if let Some(hook) = self.test_hook.get().cloned() {
+            hook();
         }
     }
 }
@@ -1171,7 +1209,21 @@ mod dir_prefetch_tests {
     }
 
     #[test]
-    fn test_stale_child_mapping_does_not_remove_fresh_mapping() {
+    fn test_matching_child_mapping_is_removed() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir(100, vec![10]);
+        let current = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+
+        tracker.remove_child_mapping_if_same(10, current);
+
+        assert!(
+            tracker.child_to_dir.get(&10).is_none(),
+            "the exact current child mapping should be removed"
+        );
+    }
+
+    #[test]
+    fn test_mismatched_generation_does_not_remove_fresh_mapping() {
         let tracker = DirAccessTracker::new_with_capacity(2, 8);
         tracker.on_readdir(100, vec![10]);
         let stale = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
@@ -1184,8 +1236,173 @@ mod dir_prefetch_tests {
         // Simulate stale cleanup path: must not delete the fresh mapping.
         tracker.remove_child_mapping_if_same(10, stale);
         assert!(
-            tracker.child_to_dir.get(&10).is_some(),
+            tracker
+                .child_to_dir
+                .get(&10)
+                .is_some_and(|current| *current.value() == fresh),
             "fresh mapping must survive stale compare-and-remove"
+        );
+    }
+
+    #[test]
+    fn test_readdir_cleanup_preserves_mapping_reassigned_to_another_directory() {
+        let tracker = Arc::new(DirAccessTracker::new_with_capacity(2, 8));
+        tracker.on_readdir(100, vec![10]);
+
+        let cleanup_started = Arc::new(std::sync::Barrier::new(2));
+        let cleanup_release = Arc::new(std::sync::Barrier::new(2));
+        let started_for_hook = Arc::clone(&cleanup_started);
+        let release_for_hook = Arc::clone(&cleanup_release);
+        tracker.set_test_hook(Arc::new(move || {
+            started_for_hook.wait();
+            release_for_hook.wait();
+        }));
+
+        let refresh_tracker = Arc::clone(&tracker);
+        let refresh = std::thread::spawn(move || {
+            refresh_tracker.on_readdir(100, vec![11]);
+        });
+        cleanup_started.wait();
+
+        tracker.on_readdir(200, vec![10]);
+        let reassigned = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+        cleanup_release.wait();
+
+        refresh.join().unwrap();
+        assert_eq!(
+            tracker.child_to_dir.get(&10).map(|v| *v.value()),
+            Some(reassigned),
+            "refresh cleanup must not remove a mapping reassigned to another directory"
+        );
+    }
+
+    #[test]
+    fn test_evict_dir_cleanup_preserves_mapping_reassigned_to_another_directory() {
+        let tracker = Arc::new(DirAccessTracker::new_with_capacity(2, 8));
+        tracker.on_readdir(100, vec![10]);
+
+        let cleanup_started = Arc::new(std::sync::Barrier::new(2));
+        let cleanup_release = Arc::new(std::sync::Barrier::new(2));
+        let started_for_hook = Arc::clone(&cleanup_started);
+        let release_for_hook = Arc::clone(&cleanup_release);
+        tracker.set_test_hook(Arc::new(move || {
+            started_for_hook.wait();
+            release_for_hook.wait();
+        }));
+
+        let eviction_tracker = Arc::clone(&tracker);
+        let eviction = std::thread::spawn(move || {
+            eviction_tracker.evict_dir(100);
+        });
+        cleanup_started.wait();
+
+        tracker.on_readdir(200, vec![10]);
+        let reassigned = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+        cleanup_release.wait();
+
+        eviction.join().unwrap();
+        assert_eq!(
+            tracker.child_to_dir.get(&10).map(|v| *v.value()),
+            Some(reassigned),
+            "directory eviction must not remove a mapping reassigned to another directory"
+        );
+    }
+
+    #[test]
+    fn test_stale_cleanup_preserves_fresh_mapping_during_concurrent_refresh() {
+        let tracker = Arc::new(DirAccessTracker::new_with_capacity(2, 8));
+        tracker.on_readdir(100, vec![10]);
+        let stale = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+        tracker.dirs.remove(&100);
+
+        let cleanup_candidate = Arc::new(std::sync::Barrier::new(2));
+        let cleanup_release = Arc::new(std::sync::Barrier::new(2));
+        let candidate_for_hook = Arc::clone(&cleanup_candidate);
+        let release_for_hook = Arc::clone(&cleanup_release);
+        tracker.set_test_hook(Arc::new(move || {
+            candidate_for_hook.wait();
+            release_for_hook.wait();
+        }));
+
+        let cleanup_tracker = Arc::clone(&tracker);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_tracker.on_child_read(10);
+        });
+        cleanup_candidate.wait();
+
+        let refresh_started = Arc::new(std::sync::Barrier::new(2));
+        let allow_refresh = Arc::new(std::sync::Barrier::new(2));
+        let refresh_done = Arc::new(std::sync::Barrier::new(2));
+        let refresh_tracker = Arc::clone(&tracker);
+        let refresh_started_for_thread = Arc::clone(&refresh_started);
+        let allow_refresh_for_thread = Arc::clone(&allow_refresh);
+        let refresh_done_for_thread = Arc::clone(&refresh_done);
+        let fresh = (stale.0, stale.1.saturating_add(1));
+        let refresh = std::thread::spawn(move || {
+            refresh_started_for_thread.wait();
+            allow_refresh_for_thread.wait();
+            refresh_tracker.child_to_dir.insert(10, fresh);
+            refresh_done_for_thread.wait();
+        });
+        refresh_started.wait();
+
+        let helper_holds_shard_lock = tracker.child_to_dir.try_get(&10).is_locked();
+        if helper_holds_shard_lock {
+            cleanup_release.wait();
+            allow_refresh.wait();
+            refresh_done.wait();
+        } else {
+            allow_refresh.wait();
+            refresh_done.wait();
+            cleanup_release.wait();
+        }
+
+        refresh.join().unwrap();
+        cleanup.join().unwrap();
+        assert_eq!(
+            tracker.child_to_dir.get(&10).map(|v| *v.value()),
+            Some(fresh),
+            "concurrent refresh must survive stale cleanup"
+        );
+    }
+
+    #[test]
+    fn test_lru_cleanup_does_not_remove_recently_touched_directory() {
+        let tracker = Arc::new(DirAccessTracker::new_with_capacity(2, 1));
+        tracker.on_readdir(100, vec![10]);
+        let original_mapping = tracker.child_to_dir.get(&10).map(|v| *v.value()).unwrap();
+
+        let victim_selected = Arc::new(std::sync::Barrier::new(2));
+        let eviction_release = Arc::new(std::sync::Barrier::new(2));
+        let first_selection = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let selected_for_hook = Arc::clone(&victim_selected);
+        let release_for_hook = Arc::clone(&eviction_release);
+        let first_selection_for_hook = Arc::clone(&first_selection);
+        tracker.set_test_hook(Arc::new(move || {
+            if first_selection_for_hook.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                selected_for_hook.wait();
+                release_for_hook.wait();
+            }
+        }));
+
+        let eviction_tracker = Arc::clone(&tracker);
+        let eviction = std::thread::spawn(move || {
+            eviction_tracker.on_readdir(200, vec![20]);
+        });
+        victim_selected.wait();
+
+        tracker.on_child_read(10);
+        eviction_release.wait();
+        eviction.join().unwrap();
+
+        assert!(
+            tracker.dirs.get(&100).is_some(),
+            "an LRU snapshot must not remove a directory touched after selection"
+        );
+        assert_eq!(
+            tracker.child_to_dir.get(&10).map(|v| *v.value()),
+            Some(original_mapping),
+            "a retained directory must keep its reverse mapping"
         );
     }
 
