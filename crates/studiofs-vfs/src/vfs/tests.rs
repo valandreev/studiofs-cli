@@ -21,6 +21,19 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn startup_panic_guard_converts_prewarm_panic_to_error() {
+    let result = catch_startup_panic(|| -> VfsResult<()> {
+        panic!("linux prewarm panic");
+    });
+    let error = result.expect_err("startup panic should become a VFS error");
+
+    assert_eq!(
+        error.to_string(),
+        "StudioVfs::start panicked during startup: linux prewarm panic"
+    );
+}
+
 #[tokio::test]
 async fn snapshot_worker_supervisor_restarts_after_worker_error() {
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -13129,7 +13142,11 @@ fn deferred_namespace_written_file_reads_back_after_flush() {
 #[test]
 fn deferred_namespace_written_file_commits_locally_without_explicit_flush() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-create-written-background-local");
+    // The test observes the local upload queue after deferred materialization.
+    // Keep the long-lived uploader stopped so it cannot consume that queue
+    // before the assertion; the per-inode materializer is spawned by the write
+    // itself and still runs in this unstarted VFS.
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-create-written-background-local");
     let _guard = rt.enter();
     rt.block_on(async {
         let payload = b"background local payload after deferred create";
@@ -17265,7 +17282,7 @@ fn interrupted_materializer_does_not_orphan_dirty_tail_if_last_waiter_is_cancell
 #[test]
 fn namespace_create_records_one_complete_metadata_timing_sample() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (_rt, vfs, meta) = make_test_vfs(&tmp, "namespace-create-metadata-timing");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "namespace-create-metadata-timing");
     let before = vfs.write_path_observability_snapshot();
 
     vfs.create(ROOT_INO, b"timed-create.txt", 0, 0, 0o644)
@@ -17321,6 +17338,62 @@ fn namespace_inode_allocation_calls(vfs: &StudioVfs) -> u64 {
         .namespace_create
         .inode_allocation
         .calls
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_start_prewarm_namespace_inode_reservation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "linux-start-prewarm");
+    let before = namespace_inode_allocation_calls(&vfs);
+    let before_barriers = vfs
+        .state
+        .metrics
+        .metadata_sync_barrier_calls
+        .load(AtomicOrdering::Acquire);
+
+    {
+        let _guard = rt.enter();
+        vfs.start().expect("start VFS background workers");
+    }
+
+    assert_eq!(
+        vfs.state
+            .metrics
+            .metadata_sync_barrier_calls
+            .load(AtomicOrdering::Acquire),
+        before_barriers + 1,
+        "Linux namespace prewarm should force one immediate local metadata barrier"
+    );
+
+    assert_eq!(
+        namespace_inode_allocation_calls(&vfs),
+        before + 1,
+        "writable Linux startup should warm one namespace inode batch"
+    );
+
+    let first = vfs
+        .reserve_namespace_ino()
+        .expect("reserve the first post-start namespace inode");
+    assert!(
+        first > ROOT_INO,
+        "the warmed reservation should contain a namespace inode"
+    );
+    assert_eq!(
+        namespace_inode_allocation_calls(&vfs),
+        before + 1,
+        "the first post-start reservation must reuse the warmed batch"
+    );
+
+    {
+        let _guard = rt.enter();
+        vfs.start().expect("second start should be idempotent");
+    }
+    assert_eq!(
+        namespace_inode_allocation_calls(&vfs),
+        before + 1,
+        "idempotent start must not refill the namespace allocator"
+    );
 }
 
 #[test]

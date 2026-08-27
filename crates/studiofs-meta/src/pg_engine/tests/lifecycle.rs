@@ -302,27 +302,45 @@ fn prepare_for_close_is_idempotent_when_no_workers_are_running() {
 fn dropping_engine_signals_background_workers_without_waiting() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     let shutdown = engine.background_workers.poll_shutdown();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let (finished_tx, finished_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         while !shutdown.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        finished_tx.send(()).expect("signal worker stop");
+        observed_tx.send(()).expect("signal worker stop");
+        release_rx.recv().expect("release worker");
+        finished_tx.send(()).expect("signal worker finish");
     });
     engine
         .background_workers
         .install_handle(PgBackgroundWorker::Poll, handle)
         .expect("install worker");
 
-    let started = Instant::now();
-    drop(engine);
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "dropping an engine must not wait for a background worker"
-    );
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    let drop_thread = std::thread::spawn(move || {
+        drop(engine);
+        dropped_tx.send(()).expect("signal engine drop");
+    });
+
+    let observed_stop = observed_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+    let dropped_without_waiting =
+        observed_stop && dropped_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+    release_tx.send(()).expect("release background worker");
     finished_rx
         .recv_timeout(Duration::from_secs(1))
-        .expect("background worker should observe drop cancellation");
+        .expect("background worker should finish after release");
+    drop_thread.join().expect("join engine drop thread");
+
+    assert!(
+        observed_stop,
+        "background worker should observe drop cancellation"
+    );
+    assert!(
+        dropped_without_waiting,
+        "dropping an engine must not wait for a background worker"
+    );
 }
 
 #[test]

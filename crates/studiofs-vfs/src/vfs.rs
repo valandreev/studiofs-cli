@@ -3531,6 +3531,19 @@ fn panic_payload_message(panic_payload: &(dyn Any + Send)) -> Cow<'_, str> {
     }
 }
 
+fn catch_startup_panic(startup: impl FnOnce() -> VfsResult<()>) -> VfsResult<()> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(startup)) {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let panic_msg = panic_payload_message(&*panic_payload);
+            error!("StudioVfs::start panicked during startup: {}", panic_msg);
+            Err(VfsError::Other(format!(
+                "StudioVfs::start panicked during startup: {panic_msg}"
+            )))
+        }
+    }
+}
+
 // =============================================================================
 // StudioVfs Implementation
 // =============================================================================
@@ -4869,21 +4882,17 @@ impl StudioVfs {
             return Ok(());
         };
 
-        let start_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.spawn_startup_workers(channels)
-        })) {
-            Ok(result) => result,
-            Err(panic_payload) => {
-                let panic_msg = panic_payload_message(&*panic_payload);
-                error!(
-                    "StudioVfs::start panicked during background startup: {}",
-                    panic_msg
+        let start_result = catch_startup_panic(|| {
+            #[cfg(target_os = "linux")]
+            if let Err(error) = self.prewarm_namespace_inode_reservation() {
+                warn!(
+                    error = %error,
+                    "failed to force Linux namespace inode reservation durable during startup; metadata will sync on next barrier"
                 );
-                Err(VfsError::Other(format!(
-                    "StudioVfs::start panicked during background startup: {panic_msg}"
-                )))
             }
-        };
+
+            self.spawn_startup_workers(channels)
+        });
         self.startup.finish_start(&start_result);
         start_result
     }
