@@ -25,7 +25,7 @@ barrier afterward. Keep its existing assertions that startup allocates one
 batch, that the first reservation reuses it, and that a second start is
 idempotent.
 
-- [ ] **Step 1: Add the barrier assertion.** Insert the following capture before the `start()` call:
+- [x] **Step 1: Add the barrier assertion.** Insert the following capture before the `start()` call:
 
       let before_barriers = vfs
           .state
@@ -44,7 +44,7 @@ idempotent.
           "Linux namespace prewarm should force one immediate local metadata barrier"
       );
 
-- [ ] **Step 2: Run the focused test and confirm RED.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 2: Run the focused test and confirm RED.** From `/home/val/dev/studiofs-cli`, run:
 
       cargo test -p studiofs-vfs --lib vfs::tests::linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
 
@@ -52,7 +52,7 @@ idempotent.
   assertion because the current prewarm performs one allocator transaction but
   no VFS metadata-sync barrier (`left: 0`, `right: 1`).
 
-- [ ] **Step 3: Commit the red test.** Run:
+- [x] **Step 3: Commit the red test.** Run:
 
       git add crates/studiofs-vfs/src/vfs/tests.rs
       git commit -m "test: require durable Linux namespace prewarm"
@@ -88,13 +88,13 @@ optimization behavior. The reservation must be returned even when the barrier
 reports an error, so a successful allocator refill is not lost merely because
 the immediate durability attempt failed.
 
-- [ ] **Step 1: Add the test-only barrier accounting at the startup call site.** Place the counter increment immediately before the synchronous metadata call, guarded with `#[cfg(test)]`, or factor a private helper if that keeps the existing fsync accounting clearer. Do not increment the counter twice for one startup barrier.
+- [x] **Step 1: Add the test-only barrier accounting at the startup call site.** Place the counter increment immediately before the synchronous metadata call, guarded with `#[cfg(test)]`, or factor a private helper if that keeps the existing fsync accounting clearer. Do not increment the counter twice for one startup barrier.
 
-- [ ] **Step 2: Add the synchronous local metadata barrier to the Linux prewarm helper.** Preserve the existing reservation and return order, warning behavior, and Linux compile-time guard.
+- [x] **Step 2: Add the synchronous local metadata barrier to the Linux prewarm helper.** Preserve the existing reservation and return order, warning behavior, and Linux compile-time guard.
 
-- [ ] **Step 3: Run the focused test and confirm GREEN.** Run the same command from Task 1 and expect the test to pass with the batch allocation count unchanged and one startup barrier recorded.
+- [x] **Step 3: Run the focused test and confirm GREEN.** Run the same command from Task 1 and expect the test to pass with the batch allocation count unchanged and one startup barrier recorded.
 
-- [ ] **Step 4: Commit the implementation.** Run:
+- [x] **Step 4: Commit the implementation.** Run:
 
       git add crates/studiofs-vfs/src/vfs/namespace_ops.rs crates/studiofs-vfs/src/vfs.rs
       git commit -m "fix: make Linux namespace prewarm durable"
@@ -105,27 +105,27 @@ the immediate durability attempt failed.
 
 - Test: `crates/studiofs-vfs/src/vfs/tests.rs` and the complete `studiofs-vfs` library test target.
 
-- [ ] **Step 1: Run the namespace allocator test group.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 1: Run the namespace allocator test group.** From `/home/val/dev/studiofs-cli`, run:
 
       cargo test -p studiofs-vfs --lib namespace_inode -- --nocapture
 
   Expect the Linux startup-prewarm, refill, uniqueness, restart-gap, and
   create/mkdir sharing tests to pass.
 
-- [ ] **Step 2: Run the complete VFS library tests.** Run:
+- [x] **Step 2: Run the complete VFS library tests.** Run:
 
       cargo test -p studiofs-vfs --lib
 
   Expect zero test failures.
 
-- [ ] **Step 3: Check formatting and changed-file whitespace.** Run:
+- [x] **Step 3: Check formatting and changed-file whitespace.** Run:
 
       cargo fmt --all -- --check
       git diff --check
 
   Expect both commands to exit successfully.
 
-- [ ] **Step 4: Check host compilation for the unchanged platform bridges.** Run:
+- [x] **Step 4: Check host compilation for the unchanged platform bridges.** Run:
 
       cargo check -p studiofs-macfuse
       cargo check -p studiofs-winfsp
@@ -141,11 +141,11 @@ the immediate durability attempt failed.
 
 - No source files; use retained E2E artifacts under `target/e2e-runs/`.
 
-- [ ] **Step 1: Rebuild the release binaries.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 1: Rebuild the release binaries.** From `/home/val/dev/studiofs-cli`, run:
 
       cargo build --release -p studiofs -p studiofs-e2e
 
-- [ ] **Step 2: Run scenario 22 alone on Linux FUSE.** Run with a new retained run ID:
+- [x] **Step 2: Run scenario 22 alone on Linux FUSE.** Run with a new retained run ID:
 
       target/release/studiofs-e2e run mounted-invalidation-dropout-fallback-convergence --seed 0 --studiofs-bin target/release/studiofs --platform linux-fuse --infra compose --retain always --run-id 20260827T-linux-prewarm-barrier-s22
 
@@ -154,7 +154,7 @@ the immediate durability attempt failed.
   that the first namespace mutation no longer carries the 1.55-second writer
   stall.
 
-- [ ] **Step 3: Run the canonical Linux scenarios 1–25.** Run:
+- [x] **Step 3: Run the canonical Linux scenarios 1–25.** Run:
 
       target/release/studiofs-e2e run --scenario 1-25 --seed 0 --studiofs-bin target/release/studiofs --platform linux-fuse --infra compose --retain always --run-id 20260827T-linux-prewarm-barrier-full25
 
@@ -162,7 +162,17 @@ the immediate durability attempt failed.
   scenario 23 and the remaining scenarios not to be skipped due to
   contamination.
 
-- [ ] **Step 4: Update the living plan with command results and the final retrospective.** Record actual timestamps, test counts, E2E report paths, any environmental limitation, and the final changed-file set in this plan before handing off.
+- [x] **Step 4: Update the living plan with command results and the final retrospective.** Record actual timestamps, test counts, E2E report paths, any environmental limitation, and the final changed-file set in this plan before handing off.
+
+## Execution record and retrospective
+
+- 2026-08-27: the new startup-barrier assertion reproduced the regression (`left: 0`, `right: 1`) before the production edit; commit `c0753809` records the RED test.
+- 2026-08-27: after the Linux-only prewarm barrier was added, the focused test passed; commit `292e09f4` records the implementation.
+- 2026-08-27: namespace allocator tests passed 5/5; the complete `studiofs-vfs` library target passed 918/918; `cargo fmt --all -- --check`, `git diff --check`, `cargo check -p studiofs-macfuse`, and `cargo check -p studiofs-winfsp` all passed.
+- 2026-08-27T07:49–07:50Z: release binaries built successfully. Standalone scenario 22 passed with report `target/e2e-runs/20260827T-linux-prewarm-barrier-s22/report.json`. Client-a observability showed first namespace mutation max `0.447 ms` and FUSE write max `4.298 ms`, versus the prior approximately 1.55-second writer stall.
+- 2026-08-27T07:51–07:55Z: the canonical Linux sweep passed all 25 scenarios, including scenario 22 at `22/25`; report `target/e2e-runs/20260827T-linux-prewarm-barrier-full25/report.json` contains 25 `passed` statuses and no skips.
+- Native macOS and Windows runtime execution was unavailable on this Linux host; their bridge packages passed host `cargo check`, and no macOS or Windows bridge file was changed.
+- Relative to `b6807e63`, the final changed-file set is `crates/studiofs-vfs/src/vfs/namespace_ops.rs`, `crates/studiofs-vfs/src/vfs/tests.rs`, this implementation plan, and the approved design spec. The runtime change is confined to the existing `#[cfg(target_os = "linux")]` prewarm path.
 
 ## Acceptance
 
@@ -172,4 +182,3 @@ test target, formatting, whitespace, and Mac/Windows bridge checks pass; the
 standalone scenario 22 passes on Linux FUSE; and the canonical full Linux
 sweep completes without skipping later scenarios. The source diff must contain
 no Mac or Windows bridge-file edits.
-
