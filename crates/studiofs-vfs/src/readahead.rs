@@ -942,6 +942,9 @@ impl DirAccessTracker {
             // The next loop selects a replacement from the current map. The same
             // loop coalesces registrations that arrive during this batch.
             for (victim_dir, observed_last_touch) in candidates {
+                if self.dirs.len() <= self.max_tracked_dirs {
+                    break;
+                }
                 if let Some((_, victim)) = self.dirs.remove_if(&victim_dir, |_, state| {
                     state.last_touch == observed_last_touch
                 }) {
@@ -1445,6 +1448,45 @@ mod dir_prefetch_tests {
             tracker.child_to_dir.get(&10).map(|v| *v.value()),
             Some(original_mapping),
             "a retained directory must keep its reverse mapping"
+        );
+    }
+
+    #[test]
+    fn test_batched_eviction_rechecks_capacity_after_concurrent_removal() {
+        let mut tracker = DirAccessTracker::new_with_capacity(2, 4);
+        for dir_ino in 100..104 {
+            tracker.on_readdir(dir_ino, Vec::new());
+        }
+        tracker.max_tracked_dirs = 2;
+        let tracker = Arc::new(tracker);
+
+        let selection_started = Arc::new(std::sync::Barrier::new(2));
+        let selection_release = Arc::new(std::sync::Barrier::new(2));
+        let first_selection = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let started_for_hook = Arc::clone(&selection_started);
+        let release_for_hook = Arc::clone(&selection_release);
+        let first_selection_for_hook = Arc::clone(&first_selection);
+        tracker.set_test_hook(Arc::new(move || {
+            if first_selection_for_hook.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                started_for_hook.wait();
+                release_for_hook.wait();
+            }
+        }));
+
+        let eviction_tracker = Arc::clone(&tracker);
+        let eviction = std::thread::spawn(move || {
+            eviction_tracker.evict_lru_if_needed();
+        });
+        selection_started.wait();
+
+        tracker.evict_dir(102);
+        selection_release.wait();
+        eviction.join().unwrap();
+
+        assert_eq!(
+            tracker.debug_tracked_dir_count(),
+            2,
+            "batched eviction must stop after concurrent removal restores capacity"
         );
     }
 
