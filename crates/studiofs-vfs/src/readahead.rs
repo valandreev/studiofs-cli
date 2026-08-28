@@ -79,8 +79,9 @@ struct InodeReadAheadState {
 struct InodeReadAheadStateInner {
     /// Read-ahead normally tracks only the handles currently open on this inode.
     streams: Vec<(u64, ReadState)>,
-    /// Most entries belong to the small active read-ahead window.
-    inflight: Vec<u32>,
+    /// Most entries belong to the small active read-ahead window; membership
+    /// must stay indexed because a worker registers every block in a batch.
+    inflight: HashSet<u32>,
 }
 
 impl Default for InodeReadAheadState {
@@ -88,7 +89,7 @@ impl Default for InodeReadAheadState {
         Self {
             state: Mutex::new(InodeReadAheadStateInner {
                 streams: Vec::with_capacity(4),
-                inflight: Vec::with_capacity(4),
+                inflight: HashSet::with_capacity(4),
             }),
         }
     }
@@ -327,12 +328,7 @@ impl ReadAheadTracker {
     pub fn start_prefetch(&self, ino: Ino, block: u32) -> bool {
         self.with_inode_state(ino, |inode_state| {
             let mut state = inode_state.state.lock();
-            if state.inflight.contains(&block) {
-                false
-            } else {
-                state.inflight.push(block);
-                true
-            }
+            state.inflight.insert(block)
         })
     }
 
@@ -340,13 +336,7 @@ impl ReadAheadTracker {
     pub fn finish_prefetch(&self, ino: Ino, block: u32) {
         let Some(should_cleanup) = self.with_existing_inode_state(ino, |inode_state| {
             let mut state = inode_state.state.lock();
-            if let Some(index) = state
-                .inflight
-                .iter()
-                .position(|candidate| *candidate == block)
-            {
-                state.inflight.swap_remove(index);
-            }
+            state.inflight.remove(&block);
             state.streams.is_empty() && state.inflight.is_empty()
         }) else {
             return;
@@ -658,6 +648,17 @@ mod tests {
             tracker.start_prefetch(1, 5),
             "after finish, should return true again"
         );
+    }
+
+    #[test]
+    fn test_inflight_membership_uses_an_indexed_set() {
+        let tracker = ReadAheadTracker::new(4);
+        assert!(tracker.start_prefetch(1, 5));
+        assert!(!tracker.start_prefetch(1, 5));
+
+        let inode_state = tracker.states.get(&1).expect("in-flight state exists");
+        let state = inode_state.state.lock();
+        let _: &HashSet<u32> = &state.inflight;
     }
 
     #[test]
