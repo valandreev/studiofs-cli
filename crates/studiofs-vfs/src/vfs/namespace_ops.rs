@@ -219,10 +219,6 @@ impl StudioVfs {
             }
     }
 
-    fn deferred_namespace_degraded_error() -> VfsError {
-        VfsError::MetadataPersistenceDegraded
-    }
-
     fn deferred_namespace_admission_error(
         &self,
         inner: &DeferredNamespaceInner,
@@ -240,7 +236,7 @@ impl StudioVfs {
             .degraded
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Some(Self::deferred_namespace_degraded_error());
+            return Some(VfsError::MetadataPersistenceDegraded);
         }
         if inner.backlog_operations >= DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS
             || op_bytes > DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES
