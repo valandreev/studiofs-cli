@@ -161,6 +161,7 @@ WinFSP callback barrier semantics:
 - `RepairRequired` → `STATUS_DISK_CORRUPT_ERROR`
 - `RemoteUnavailable` → `STATUS_BAD_NETWORK_PATH`
 - `Timeout` → `STATUS_IO_TIMEOUT`
+- `MetadataPersistenceDegraded` → `STATUS_IO_DEVICE_ERROR`
 - Other errors → `STATUS_UNEXPECTED_IO_ERROR`
 
 ### Mount Lifecycle

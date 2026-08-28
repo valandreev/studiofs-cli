@@ -33,7 +33,7 @@ use studiofs_vfs::{
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
-use windows::Win32::Foundation::NTSTATUS;
+use windows::Win32::Foundation::{NTSTATUS, STATUS_IO_DEVICE_ERROR};
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
@@ -910,6 +910,9 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
         BridgeVfsErrorKind::XattrValueTooLarge => winfsp::FspError::from(STATUS_EA_TOO_LARGE),
         BridgeVfsErrorKind::InvalidInput => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
         BridgeVfsErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
+        BridgeVfsErrorKind::MetadataPersistenceDegraded => {
+            winfsp::FspError::from(STATUS_IO_DEVICE_ERROR)
+        }
         BridgeVfsErrorKind::TimedOut => winfsp::FspError::from(STATUS_IO_TIMEOUT),
         BridgeVfsErrorKind::RepairRequired => winfsp::FspError::from(STATUS_DISK_CORRUPT_ERROR),
         BridgeVfsErrorKind::RemoteUnavailable => winfsp::FspError::from(STATUS_BAD_NETWORK_PATH),
@@ -2442,15 +2445,16 @@ mod tests {
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PreparedWinfspNotifications,
         READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR,
         STATUS_DISK_CORRUPT_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
-        StudioFsContext, WinfspAsyncCallbackTracker, WinfspInvalidationQueue,
-        WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
-        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
-        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
-        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
-        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
-        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
-        winfsp_regular_file_allocation_size, write_local_sync_policy_from_create_options,
+        STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
+        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
+        WinfspInvalidationQueue, WinfspKernelInvalidator, attr_to_file_info,
+        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
+        hidden_platform_root_path_component, ino_to_windows_path, is_runtime_stats_windows_path,
+        maybe_hide_platform_root_entry, notify_filter_for_kind, open_flags_from_access,
+        resolve_create_callback_kind, resolve_file_size_callback_action,
+        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
+        write_local_sync_policy_from_create_options,
         write_local_sync_policy_from_create_parameters,
     };
     use std::collections::BTreeSet;
@@ -3561,6 +3565,16 @@ mod tests {
         let err = VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let status = vfs_to_winfsp_err(err).to_ntstatus();
         assert_eq!(status, STATUS_ACCESS_DENIED.0);
+    }
+
+    #[test]
+    fn metadata_persistence_degradation_maps_to_io_device_error() {
+        let error = VfsError::MetadataPersistenceDegraded;
+
+        assert_eq!(
+            vfs_to_winfsp_err(error).to_ntstatus(),
+            STATUS_IO_DEVICE_ERROR.0
+        );
     }
 
     #[test]

@@ -13646,13 +13646,10 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
                 rt.handle(),
             )
             .expect_err("permanent deferred persistence failure should degrade shared admission");
-        assert!(matches!(
-            admission_error,
-            VfsError::Meta(MetaError::AccessDenied {
-                actual: AccessLevel::ReadOnly,
-                ..
-            })
-        ));
+        assert!(
+            matches!(&admission_error, VfsError::MetadataPersistenceDegraded),
+            "unexpected admission error: {admission_error:?}"
+        );
     });
 }
 
