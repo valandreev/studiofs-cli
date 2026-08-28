@@ -53,6 +53,9 @@ pub struct ReadAheadPolicy {
 const READ_STATE_IDLE_RESET_US: u64 = 10_000_000; // 10 s
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
 
+#[cfg(test)]
+type ReadAheadTrackerTestHook = Arc<dyn Fn() + Send + Sync>;
+
 // =============================================================================
 // Internal state
 // =============================================================================
@@ -68,22 +71,47 @@ struct ReadState {
     last_read_at_micros: u64,
 }
 
+struct InodeReadAheadState {
+    /// Serializes the small amount of state owned by one inode only.
+    state: Mutex<InodeReadAheadStateInner>,
+}
+
+struct InodeReadAheadStateInner {
+    /// Read-ahead normally tracks only the handles currently open on this inode.
+    streams: Vec<(u64, ReadState)>,
+    /// Most entries belong to the small active read-ahead window.
+    inflight: Vec<u32>,
+}
+
+impl Default for InodeReadAheadState {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(InodeReadAheadStateInner {
+                streams: Vec::with_capacity(4),
+                inflight: Vec::with_capacity(4),
+            }),
+        }
+    }
+}
+
 // =============================================================================
 // ReadAheadTracker
 // =============================================================================
 
 /// Tracks per-inode sequential read patterns and manages in-flight prefetch state.
 pub struct ReadAheadTracker {
-    /// Per-inode state.
-    states: DashMap<ReadStreamKey, ReadState>,
-    /// Blocks that are already being prefetched — avoids duplicate work.
-    inflight: DashMap<(Ino, u32), ()>,
+    /// Per-inode state grouped so full eviction can remove one entry.
+    states: DashMap<Ino, InodeReadAheadState>,
     /// Maximum blocks ahead to fetch when fully ramped-up.
     pub width: u32,
     /// Baseline prefetch width before ramp-up.
     base_width: u32,
     /// Lower bound for prefetch depth once sequential access is detected.
     min_prefetch_on_seq: u32,
+    #[cfg(test)]
+    evict_hook: Option<ReadAheadTrackerTestHook>,
+    #[cfg(test)]
+    evict_stream_hook: Option<ReadAheadTrackerTestHook>,
 }
 
 impl ReadAheadTracker {
@@ -106,6 +134,26 @@ impl ReadAheadTracker {
             .unwrap_or(u64::MAX)
     }
 
+    fn with_inode_state<T, F>(&self, ino: Ino, operation: F) -> T
+    where
+        F: FnOnce(&InodeReadAheadState) -> T,
+    {
+        if let Some(inode_state) = self.states.get(&ino) {
+            return operation(&inode_state);
+        }
+
+        let inode_state = self.states.entry(ino).or_default();
+        operation(&inode_state)
+    }
+
+    fn with_existing_inode_state<T, F>(&self, ino: Ino, operation: F) -> Option<T>
+    where
+        F: FnOnce(&InodeReadAheadState) -> T,
+    {
+        let inode_state = self.states.get(&ino)?;
+        Some(operation(&inode_state))
+    }
+
     fn record_read_with_stamp(
         &self,
         key: ReadStreamKey,
@@ -125,63 +173,83 @@ impl ReadAheadTracker {
             .min_prefetch_on_seq
             .max(base_width)
             .clamp(base_width, max_width);
-        let mut state = self.states.entry(key).or_insert(ReadState {
-            last_block: u32::MAX,
-            sequential_ready: false,
-            current_width: base_width,
-            last_read_at_micros: 0,
-        });
+        self.with_inode_state(key.ino, |inode_state| {
+            let mut state = inode_state.state.lock();
+            let read_state = if let Some(index) = state
+                .streams
+                .iter()
+                .position(|(stream_id, _)| *stream_id == key.stream_id)
+            {
+                &mut state.streams[index].1
+            } else {
+                state.streams.push((
+                    key.stream_id,
+                    ReadState {
+                        last_block: u32::MAX,
+                        sequential_ready: false,
+                        current_width: base_width,
+                        last_read_at_micros: 0,
+                    },
+                ));
+                &mut state
+                    .streams
+                    .last_mut()
+                    .expect("stream was pushed before it was accessed")
+                    .1
+            };
 
-        if state.last_read_at_micros > 0
-            && now_micros.saturating_sub(state.last_read_at_micros) > READ_STATE_IDLE_RESET_US
-        {
-            state.sequential_ready = false;
-            state.current_width = base_width;
-            state.last_block = u32::MAX;
-        }
-
-        // Detect sequential continuation: the new read must start exactly at
-        // the block immediately after where we left off.
-        //
-        // Important for WinFSP/FUSE small reads: many sequential workloads
-        // issue multiple requests within the same block before crossing the
-        // boundary. Re-reads of the same block should not suppress prefetch.
-        let is_same_block = state.last_block != u32::MAX && first_block == state.last_block;
-        let is_sequential =
-            state.last_block != u32::MAX && first_block == state.last_block.saturating_add(1);
-
-        let was_ready = state.sequential_ready;
-        if is_sequential {
-            state.sequential_ready = true;
-            state.current_width = fixed_width;
-        } else if is_same_block {
-            if !state.sequential_ready {
-                state.current_width = base_width;
+            if read_state.last_read_at_micros > 0
+                && now_micros.saturating_sub(read_state.last_read_at_micros)
+                    > READ_STATE_IDLE_RESET_US
+            {
+                read_state.sequential_ready = false;
+                read_state.current_width = base_width;
+                read_state.last_block = u32::MAX;
             }
-        } else {
-            state.sequential_ready = false;
-            state.current_width = base_width;
-        }
 
-        state.last_block = last_block;
-        state.last_read_at_micros = now_micros;
-        let current_width = state.current_width.clamp(base_width, max_width);
-        let sequential_ready = state.sequential_ready;
-        drop(state);
+            // Detect sequential continuation: the new read must start exactly at
+            // the block immediately after where we left off.
+            //
+            // Important for WinFSP/FUSE small reads: many sequential workloads
+            // issue multiple requests within the same block before crossing the
+            // boundary. Re-reads of the same block should not suppress prefetch.
+            let is_same_block =
+                read_state.last_block != u32::MAX && first_block == read_state.last_block;
+            let is_sequential = read_state.last_block != u32::MAX
+                && first_block == read_state.last_block.saturating_add(1);
 
-        if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
-            return Vec::new();
-        }
-        (1..=current_width)
-            .filter_map(|i| {
-                let block = last_block.checked_add(i)?;
-                if self.inflight.contains_key(&(key.ino, block)) {
-                    None // Already in-flight
-                } else {
-                    Some(block)
+            let was_ready = read_state.sequential_ready;
+            if is_sequential {
+                read_state.sequential_ready = true;
+                read_state.current_width = fixed_width;
+            } else if is_same_block {
+                if !read_state.sequential_ready {
+                    read_state.current_width = base_width;
                 }
-            })
-            .collect()
+            } else {
+                read_state.sequential_ready = false;
+                read_state.current_width = base_width;
+            }
+
+            read_state.last_block = last_block;
+            read_state.last_read_at_micros = now_micros;
+            let current_width = read_state.current_width.clamp(base_width, max_width);
+            let sequential_ready = read_state.sequential_ready;
+
+            if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
+                return Vec::new();
+            }
+            (1..=current_width)
+                .filter_map(|i| {
+                    let block = last_block.checked_add(i)?;
+                    if state.inflight.contains(&block) {
+                        None // Already in-flight
+                    } else {
+                        Some(block)
+                    }
+                })
+                .collect()
+        })
     }
 
     /// Create a new tracker.
@@ -208,10 +276,13 @@ impl ReadAheadTracker {
         };
         Self {
             states: DashMap::with_capacity_and_shard_amount(4_096, READAHEAD_DASHMAP_SHARDS),
-            inflight: DashMap::with_capacity_and_shard_amount(16_384, READAHEAD_DASHMAP_SHARDS),
             width,
             base_width,
             min_prefetch_on_seq,
+            #[cfg(test)]
+            evict_hook: None,
+            #[cfg(test)]
+            evict_stream_hook: None,
         }
     }
 
@@ -254,13 +325,35 @@ impl ReadAheadTracker {
     /// proceed with the prefetch).  Returns `false` if the block is already
     /// being fetched by another task.
     pub fn start_prefetch(&self, ino: Ino, block: u32) -> bool {
-        // insert returns the previous value; None means it wasn't present.
-        self.inflight.insert((ino, block), ()).is_none()
+        self.with_inode_state(ino, |inode_state| {
+            let mut state = inode_state.state.lock();
+            if state.inflight.contains(&block) {
+                false
+            } else {
+                state.inflight.push(block);
+                true
+            }
+        })
     }
 
     /// Mark a prefetch as complete, allowing future re-scheduling if needed.
     pub fn finish_prefetch(&self, ino: Ino, block: u32) {
-        self.inflight.remove(&(ino, block));
+        let Some(should_cleanup) = self.with_existing_inode_state(ino, |inode_state| {
+            let mut state = inode_state.state.lock();
+            if let Some(index) = state
+                .inflight
+                .iter()
+                .position(|candidate| *candidate == block)
+            {
+                state.inflight.swap_remove(index);
+            }
+            state.streams.is_empty() && state.inflight.is_empty()
+        }) else {
+            return;
+        };
+        if should_cleanup {
+            self.remove_empty_inode_state(ino);
+        }
     }
 
     /// Return whether a queued prefetch block is still relevant to the current
@@ -270,17 +363,20 @@ impl ReadAheadTracker {
     /// can still be in flight. Dropping those stale tasks improves seek
     /// responsiveness for interactive video playback.
     pub fn is_prefetch_relevant(&self, ino: Ino, block: u32) -> bool {
-        let mut found_stream = false;
-        for state in self.states.iter() {
-            if state.key().ino != ino {
-                continue;
+        let Some(relevant) = self.with_existing_inode_state(ino, |inode_state| {
+            let state = inode_state.state.lock();
+            let mut found_stream = false;
+            for (_, read_state) in &state.streams {
+                found_stream = true;
+                if Self::state_considers_block_relevant(read_state, self.width.max(1), block) {
+                    return true;
+                }
             }
-            found_stream = true;
-            if Self::state_considers_block_relevant(&state, self.width.max(1), block) {
-                return true;
-            }
-        }
-        !found_stream
+            !found_stream
+        }) else {
+            return true;
+        };
+        relevant
     }
 
     /// Check whether a prefetch candidate is still relevant for a specific stream.
@@ -288,22 +384,58 @@ impl ReadAheadTracker {
     /// Returns `true` if the block still sits near the current stream head, or
     /// if the stream is not currently tracked (conservative fallback).
     pub fn stream_prefetch_relevant(&self, key: ReadStreamKey, block: u32) -> bool {
-        let Some(state) = self.states.get(&key) else {
+        let Some(relevant) = self.with_existing_inode_state(key.ino, |inode_state| {
+            let state = inode_state.state.lock();
+            let Some((_, read_state)) = state
+                .streams
+                .iter()
+                .find(|(stream_id, _)| *stream_id == key.stream_id)
+            else {
+                return true;
+            };
+            Self::state_considers_block_relevant(read_state, self.width.max(1), block)
+        }) else {
             return true;
         };
-        Self::state_considers_block_relevant(&state, self.width.max(1), block)
+        relevant
     }
 
     /// Remove cached tracking state for a specific stream key.
     pub fn evict_stream(&self, key: ReadStreamKey) {
-        self.states.remove(&key);
+        let state_after_removal = self.with_existing_inode_state(key.ino, |inode_state| {
+            let mut state = inode_state.state.lock();
+            if let Some(index) = state
+                .streams
+                .iter()
+                .position(|(stream_id, _)| *stream_id == key.stream_id)
+            {
+                state.streams.swap_remove(index);
+            }
+            state.streams.is_empty() && state.inflight.is_empty()
+        });
+        #[cfg(test)]
+        if let Some(hook) = &self.evict_stream_hook {
+            hook();
+        }
+        if let Some(true) = state_after_removal {
+            self.remove_empty_inode_state(key.ino);
+        }
     }
 
     /// Remove all state for an inode (e.g. on file close or delete).
     pub fn evict(&self, ino: Ino) {
-        self.states.retain(|candidate, _| candidate.ino != ino);
-        self.inflight
-            .retain(|(candidate_ino, _), _| *candidate_ino != ino);
+        #[cfg(test)]
+        if let Some(hook) = &self.evict_hook {
+            hook();
+        }
+        self.states.remove(&ino);
+    }
+
+    fn remove_empty_inode_state(&self, ino: Ino) {
+        self.states.remove_if(&ino, |_, inode_state| {
+            let state = inode_state.state.lock();
+            state.streams.is_empty() && state.inflight.is_empty()
+        });
     }
 
     fn state_considers_block_relevant(state: &ReadState, tail_slack: u32, block: u32) -> bool {
@@ -314,14 +446,27 @@ impl ReadAheadTracker {
 
     #[cfg(test)]
     fn debug_width(&self, ino: Ino) -> Option<u32> {
-        self.states
-            .get(&ReadStreamKey { ino, stream_id: 0 })
-            .map(|s| s.current_width)
+        self.states.get(&ino).and_then(|inode_state| {
+            inode_state
+                .state
+                .lock()
+                .streams
+                .iter()
+                .find(|(stream_id, _)| *stream_id == 0)
+                .map(|(_, stream_state)| stream_state.current_width)
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn debug_has_stream(&self, key: ReadStreamKey) -> bool {
-        self.states.contains_key(&key)
+        self.states.get(&key.ino).is_some_and(|inode_state| {
+            inode_state
+                .state
+                .lock()
+                .streams
+                .iter()
+                .any(|(stream_id, _)| *stream_id == key.stream_id)
+        })
     }
 
     #[cfg(test)]
@@ -349,6 +494,9 @@ impl ReadAheadTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn test_no_prefetch_on_first_read() {
@@ -555,6 +703,114 @@ mod tests {
 
         assert!(tracker.debug_has_stream(keep));
         assert!(!tracker.debug_has_stream(drop_key));
+    }
+
+    #[test]
+    fn test_evict_uses_one_inode_scoped_removal() {
+        let mut tracker = ReadAheadTracker::new(8);
+        let observed_passes = Arc::new(AtomicUsize::new(0));
+        let observed_passes_for_hook = Arc::clone(&observed_passes);
+        tracker.evict_hook = Some(Arc::new(move || {
+            observed_passes_for_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        tracker.evict(1);
+
+        assert_eq!(
+            observed_passes.load(Ordering::SeqCst),
+            1,
+            "full eviction should remove one inode entry instead of scanning each global map"
+        );
+    }
+
+    #[test]
+    fn test_evict_clears_selected_inode_only() {
+        let tracker = ReadAheadTracker::new(8);
+        let policy = tracker.default_policy();
+        let selected = ReadStreamKey {
+            ino: 1,
+            stream_id: 11,
+        };
+        let retained = ReadStreamKey {
+            ino: 2,
+            stream_id: 22,
+        };
+
+        let _ = tracker.record_read_for_stream(selected, 0, 0, policy);
+        let _ = tracker.record_read_for_stream(retained, 0, 0, policy);
+        assert!(tracker.start_prefetch(selected.ino, 7));
+        assert!(tracker.start_prefetch(retained.ino, 7));
+
+        tracker.evict(selected.ino);
+
+        assert!(!tracker.debug_has_stream(selected));
+        assert!(tracker.debug_has_stream(retained));
+        assert!(
+            tracker.start_prefetch(selected.ino, 7),
+            "full eviction should clear the selected inode's in-flight blocks"
+        );
+        assert!(
+            !tracker.start_prefetch(retained.ino, 7),
+            "full eviction must not clear another inode's in-flight blocks"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_evict_stream_preserves_new_stream() {
+        let mut tracker = ReadAheadTracker::new(8);
+        let policy = tracker.default_policy();
+        let target = ReadStreamKey {
+            ino: 1,
+            stream_id: 11,
+        };
+        let new_stream = ReadStreamKey {
+            ino: 1,
+            stream_id: 22,
+        };
+        let _ = tracker.record_read_for_stream(target, 0, 0, policy);
+
+        let cleanup_pause = Arc::new(Barrier::new(2));
+        let cleanup_pause_for_hook = Arc::clone(&cleanup_pause);
+        tracker.evict_stream_hook = Some(Arc::new(move || {
+            cleanup_pause_for_hook.wait();
+        }));
+        let tracker = Arc::new(tracker);
+        let recorder_tracker = Arc::clone(&tracker);
+        let recorder_pause = Arc::clone(&cleanup_pause);
+        let recorder = thread::spawn(move || {
+            recorder_pause.wait();
+            let _ = recorder_tracker.record_read_for_stream(new_stream, 0, 0, policy);
+        });
+
+        tracker.evict_stream(target);
+        recorder.join().expect("stream recorder should finish");
+
+        assert!(!tracker.debug_has_stream(target));
+        assert!(
+            tracker.debug_has_stream(new_stream),
+            "a stream recorded during empty-group cleanup must not be removed"
+        );
+    }
+
+    #[test]
+    fn test_evict_stream_preserves_inflight_dedup_until_finish() {
+        let tracker = ReadAheadTracker::new(8);
+        let key = ReadStreamKey {
+            ino: 1,
+            stream_id: 11,
+        };
+        let _ = tracker.record_read_for_stream(key, 0, 0, tracker.default_policy());
+        assert!(tracker.start_prefetch(key.ino, 7));
+
+        tracker.evict_stream(key);
+
+        assert!(!tracker.debug_has_stream(key));
+        assert!(
+            !tracker.start_prefetch(key.ino, 7),
+            "stream eviction must not discard an in-flight inode block"
+        );
+        tracker.finish_prefetch(key.ino, 7);
+        assert!(tracker.start_prefetch(key.ino, 7));
     }
 
     #[test]
