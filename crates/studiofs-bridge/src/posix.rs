@@ -90,6 +90,7 @@ pub fn vfs_err_to_errno(error: &VfsError) -> i32 {
         BridgeVfsErrorKind::XattrValueTooLarge => libc::E2BIG,
         BridgeVfsErrorKind::InvalidInput => libc::EINVAL,
         BridgeVfsErrorKind::PermissionDenied => libc::EACCES,
+        BridgeVfsErrorKind::MetadataPersistenceDegraded => libc::EIO,
         BridgeVfsErrorKind::Retryable => libc::EAGAIN,
         BridgeVfsErrorKind::TimedOut => libc::ETIMEDOUT,
         BridgeVfsErrorKind::RepairRequired => libc::ENOTRECOVERABLE,
@@ -172,6 +173,13 @@ mod tests {
         assert_eq!(vfs_err_to_errno(&repair), libc::ENOTRECOVERABLE);
         assert_eq!(vfs_err_to_errno(&unavailable), libc::EHOSTUNREACH);
         assert_eq!(vfs_err_to_errno(&timeout), libc::ETIMEDOUT);
+    }
+
+    #[test]
+    fn metadata_persistence_degradation_maps_to_io_errno() {
+        let error = VfsError::MetadataPersistenceDegraded;
+
+        assert_eq!(vfs_err_to_errno(&error), libc::EIO);
     }
 
     #[test]

@@ -535,6 +535,10 @@ pub enum VfsError {
     #[error("remote content is still uploading (EAGAIN)")]
     RemoteContentPending,
 
+    /// Metadata persistence is permanently degraded and new mutations are blocked.
+    #[error("metadata persistence is degraded")]
+    MetadataPersistenceDegraded,
+
     /// Rejecting an invalid filename or malformed name.
     #[error("invalid filename: {0}")]
     InvalidName(String),
@@ -7258,6 +7262,16 @@ impl StudioVfs {
 
     /// Ensure current metadata authority allows mutating operations for an inode.
     pub(super) fn enforce_metadata_mutation_authority(&self, ino: Ino) -> VfsResult<()> {
+        if !self.read_only_mount
+            && self
+                .state
+                .namespace
+                .deferred
+                .degraded
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(VfsError::MetadataPersistenceDegraded);
+        }
         if self.metadata_authority_status().allows_new_mutations() {
             return Ok(());
         }

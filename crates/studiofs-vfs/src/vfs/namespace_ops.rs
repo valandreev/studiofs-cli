@@ -219,20 +219,10 @@ impl StudioVfs {
             }
     }
 
-    fn deferred_namespace_degraded_error(ino: Ino) -> VfsError {
-        VfsError::Meta(MetaError::AccessDenied {
-            ino,
-            principal: "deferred-namespace-degraded".to_string(),
-            required: AccessLevel::ReadWrite,
-            actual: AccessLevel::ReadOnly,
-        })
-    }
-
     fn deferred_namespace_admission_error(
         &self,
         inner: &DeferredNamespaceInner,
         op_bytes: usize,
-        ino: Ino,
     ) -> Option<VfsError> {
         if self.shutdown_requested() {
             return Some(VfsError::Other(
@@ -246,7 +236,7 @@ impl StudioVfs {
             .degraded
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Some(Self::deferred_namespace_degraded_error(ino));
+            return Some(VfsError::MetadataPersistenceDegraded);
         }
         if inner.backlog_operations >= DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS
             || op_bytes > DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES
@@ -257,9 +247,9 @@ impl StudioVfs {
         None
     }
 
-    fn ensure_deferred_namespace_admission(&self, op_bytes: usize, ino: Ino) -> VfsResult<()> {
+    fn ensure_deferred_namespace_admission(&self, op_bytes: usize) -> VfsResult<()> {
         let inner = self.state.namespace.deferred.inner.lock();
-        if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes, ino) {
+        if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes) {
             return Err(error);
         }
         Ok(())
@@ -282,8 +272,7 @@ impl StudioVfs {
                     name: String::from_utf8_lossy(&key.name).into_owned(),
                 }));
             }
-            if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes, attr.ino)
-            {
+            if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes) {
                 return Err(error);
             }
             if let Some(key) = key {
@@ -443,6 +432,21 @@ impl StudioVfs {
             .contains_key(&ino)
     }
 
+    /// Return an error when deferred namespace metadata persistence is degraded.
+    pub fn ensure_deferred_namespace_metadata_healthy(&self) -> VfsResult<()> {
+        if !self.read_only_mount
+            && self
+                .state
+                .namespace
+                .deferred
+                .degraded
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(VfsError::MetadataPersistenceDegraded);
+        }
+        Ok(())
+    }
+
     pub(super) fn deferred_namespace_shutdown_error(&self) -> Option<VfsError> {
         if self
             .state
@@ -451,9 +455,7 @@ impl StudioVfs {
             .degraded
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Some(VfsError::Other(
-                "deferred namespace metadata persistence failed".to_string(),
-            ));
+            return Some(VfsError::MetadataPersistenceDegraded);
         }
         let inner = self.state.namespace.deferred.inner.lock();
         let draining = self
@@ -850,7 +852,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
-        self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>(), ino)?;
+        self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>())?;
         let attr = self.setattr_attr_only_deferred_local(ino, args.clone())?;
         self.enqueue_deferred_namespace_op(
             None,
@@ -2244,7 +2246,6 @@ impl StudioVfs {
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
         self.ensure_deferred_namespace_admission(
             std::mem::size_of::<DeferredNamespaceOp>() + name.len(),
-            parent,
         )?;
 
         let ino = self.reserve_namespace_ino()?;
@@ -2348,7 +2349,6 @@ impl StudioVfs {
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
         self.ensure_deferred_namespace_admission(
             std::mem::size_of::<DeferredNamespaceOp>() + name.len(),
-            parent,
         )?;
 
         let ino = self.reserve_namespace_ino()?;

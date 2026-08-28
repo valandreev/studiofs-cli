@@ -28,6 +28,8 @@ pub enum BridgeVfsErrorKind {
     InvalidInput,
     /// Access was denied for the requested operation.
     PermissionDenied,
+    /// Metadata persistence is degraded and new mutations are blocked.
+    MetadataPersistenceDegraded,
     /// The operation can be retried.
     Retryable,
     /// The operation exceeded a timeout.
@@ -66,6 +68,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         VfsError::Io(io_error) => classify_io_error(io_error.kind()),
         VfsError::Join(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
         VfsError::Object(_) | VfsError::BlockNotFound(_, _) => BridgeVfsErrorKind::DataCorruption,
+        VfsError::MetadataPersistenceDegraded => BridgeVfsErrorKind::MetadataPersistenceDegraded,
         VfsError::LocalPayload(local_error) => classify_local_payload_error(local_error),
         VfsError::UploadStage(UploadStageStoreError::Io(io_error)) => {
             classify_io_error(io_error.kind())
@@ -224,6 +227,16 @@ mod tests {
         assert_eq!(
             classify_vfs_error(&denied),
             BridgeVfsErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn classify_metadata_persistence_degradation_as_io_failure() {
+        let degraded = crate::VfsError::MetadataPersistenceDegraded;
+
+        assert_eq!(
+            classify_vfs_error(&degraded),
+            BridgeVfsErrorKind::MetadataPersistenceDegraded
         );
     }
 
