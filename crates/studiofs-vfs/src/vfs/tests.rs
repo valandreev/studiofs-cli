@@ -1543,6 +1543,36 @@ pub(super) fn make_unstarted_test_vfs(
     make_unstarted_test_vfs_with_config(tmp, volume_suffix, VfsConfig::default())
 }
 
+fn make_unstarted_read_only_test_vfs(
+    tmp: &TempDir,
+    volume_suffix: &str,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    let db_path = tmp.path().join("meta.redb");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+    meta.init_root(0, 0).expect("init root");
+
+    let format_info = test_format_info(volume_suffix);
+    meta.set_format_info(&format_info).expect("set format info");
+    let data_config = DataStoreConfig::from(&format_info);
+
+    let cache_dir = tmp.path().join("cache");
+    let rt = Arc::new(Runtime::new().expect("runtime"));
+    let _guard = rt.enter();
+    let vfs = StudioVfs::new_read_only_with_snapshot_mount_fence(
+        meta.clone(),
+        &data_config,
+        cache_dir.to_str().expect("cache dir str"),
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        VfsConfig::default()
+            .try_into()
+            .expect("test VFS config should validate"),
+        Arc::new(|_| Ok(())),
+    )
+    .expect("create read-only vfs");
+    (rt, vfs, meta)
+}
+
 fn make_test_vfs(
     tmp: &TempDir,
     volume_suffix: &str,
@@ -13667,6 +13697,25 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
             matches!(shutdown_error, VfsError::MetadataPersistenceDegraded),
             "unexpected shutdown error: {shutdown_error:?}"
         );
+    });
+}
+
+#[test]
+fn deferred_namespace_degradation_does_not_fail_read_only_flush() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_unstarted_read_only_test_vfs(&tmp, "deferred-namespace-read-only-flush");
+    let _guard = rt.enter();
+    vfs.state
+        .namespace
+        .deferred
+        .degraded
+        .store(true, AtomicOrdering::Release);
+
+    rt.block_on(async {
+        vfs.flush_volatile_writeback_with_outcome(ROOT_INO, 0)
+            .await
+            .expect("read-only flush should ignore deferred namespace degradation");
     });
 }
 

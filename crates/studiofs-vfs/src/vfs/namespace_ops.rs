@@ -434,12 +434,13 @@ impl StudioVfs {
 
     /// Return an error when deferred namespace metadata persistence is degraded.
     pub fn ensure_deferred_namespace_metadata_healthy(&self) -> VfsResult<()> {
-        if self
-            .state
-            .namespace
-            .deferred
-            .degraded
-            .load(std::sync::atomic::Ordering::Acquire)
+        if !self.read_only_mount
+            && self
+                .state
+                .namespace
+                .deferred
+                .degraded
+                .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(VfsError::MetadataPersistenceDegraded);
         }
