@@ -18,7 +18,8 @@
 //! concurrent calls to `record_read()` never schedule duplicate work.
 
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use parking_lot::Mutex;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -885,6 +886,8 @@ pub struct DirAccessTracker {
     threshold: usize,
     /// Hard cap for tracked directories to prevent unbounded growth.
     max_tracked_dirs: usize,
+    /// Serializes slow-path LRU selection across concurrent registrations.
+    eviction_lock: Mutex<()>,
     #[cfg(test)]
     test_hook: OnceLock<DirAccessTrackerTestHook>,
 }
@@ -906,6 +909,7 @@ impl DirAccessTracker {
             access_tick: AtomicU64::new(0),
             threshold,
             max_tracked_dirs: max_tracked_dirs.max(1),
+            eviction_lock: Mutex::new(()),
             #[cfg(test)]
             test_hook: OnceLock::new(),
         }
@@ -918,26 +922,62 @@ impl DirAccessTracker {
     }
 
     fn evict_lru_if_needed(&self) {
-        while self.dirs.len() > self.max_tracked_dirs {
-            let Some((victim_dir, observed_last_touch)) = self
-                .dirs
-                .iter()
-                .min_by_key(|entry| entry.last_touch)
-                .map(|entry| (*entry.key(), entry.last_touch))
-            else {
+        if self.dirs.len() <= self.max_tracked_dirs {
+            return;
+        }
+        let _eviction_guard = self.eviction_lock.lock();
+        loop {
+            let excess = self.dirs.len().saturating_sub(self.max_tracked_dirs);
+            if excess == 0 {
                 break;
-            };
+            }
+            let candidates = self.select_lru_candidates(excess);
+            if candidates.is_empty() {
+                break;
+            }
             #[cfg(test)]
             self.invoke_test_hook();
-            // The LRU snapshot can become stale while another read touches the directory.
-            if let Some((_, victim)) = self.dirs.remove_if(&victim_dir, |_, state| {
-                state.last_touch == observed_last_touch
-            }) {
-                for child in &victim.children {
-                    self.remove_child_mapping_if_same(*child, (victim_dir, victim.readdir_touch));
+
+            // A candidate can become stale while another read touches the directory.
+            // The next loop selects a replacement from the current map. The same
+            // loop coalesces registrations that arrive during this batch.
+            for (victim_dir, observed_last_touch) in candidates {
+                if self.dirs.len() <= self.max_tracked_dirs {
+                    break;
+                }
+                if let Some((_, victim)) = self.dirs.remove_if(&victim_dir, |_, state| {
+                    state.last_touch == observed_last_touch
+                }) {
+                    for child in &victim.children {
+                        self.remove_child_mapping_if_same(
+                            *child,
+                            (victim_dir, victim.readdir_touch),
+                        );
+                    }
                 }
             }
         }
+    }
+
+    fn select_lru_candidates(&self, count: usize) -> Vec<(Ino, u64)> {
+        // Keep the newest selected entry at the top so each replacement leaves
+        // only the oldest `count` entries in the bounded heap.
+        let mut candidates = BinaryHeap::with_capacity(count);
+        for entry in &self.dirs {
+            let candidate = (entry.last_touch, *entry.key());
+            if candidates.len() < count {
+                candidates.push(candidate);
+            } else if candidates.peek().is_some_and(|newest| candidate < *newest) {
+                candidates.pop();
+                candidates.push(candidate);
+            }
+        }
+
+        candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(last_touch, dir_ino)| (dir_ino, last_touch))
+            .collect()
     }
 
     fn remove_child_mapping_if_same(&self, child_ino: Ino, expected: (Ino, u64)) {
@@ -1102,6 +1142,11 @@ impl DirAccessTracker {
             self.test_hook.set(hook).is_ok(),
             "test hook must only be configured once"
         );
+    }
+
+    #[cfg(test)]
+    fn debug_tracked_dir_count(&self) -> usize {
+        self.dirs.len()
     }
 
     #[cfg(test)]
@@ -1403,6 +1448,140 @@ mod dir_prefetch_tests {
             tracker.child_to_dir.get(&10).map(|v| *v.value()),
             Some(original_mapping),
             "a retained directory must keep its reverse mapping"
+        );
+    }
+
+    #[test]
+    fn test_batched_eviction_rechecks_capacity_after_concurrent_removal() {
+        let mut tracker = DirAccessTracker::new_with_capacity(2, 4);
+        for dir_ino in 100..104 {
+            tracker.on_readdir(dir_ino, Vec::new());
+        }
+        tracker.max_tracked_dirs = 2;
+        let tracker = Arc::new(tracker);
+
+        let selection_started = Arc::new(std::sync::Barrier::new(2));
+        let selection_release = Arc::new(std::sync::Barrier::new(2));
+        let first_selection = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let started_for_hook = Arc::clone(&selection_started);
+        let release_for_hook = Arc::clone(&selection_release);
+        let first_selection_for_hook = Arc::clone(&first_selection);
+        tracker.set_test_hook(Arc::new(move || {
+            if first_selection_for_hook.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                started_for_hook.wait();
+                release_for_hook.wait();
+            }
+        }));
+
+        let eviction_tracker = Arc::clone(&tracker);
+        let eviction = std::thread::spawn(move || {
+            eviction_tracker.evict_lru_if_needed();
+        });
+        selection_started.wait();
+
+        tracker.evict_dir(102);
+        selection_release.wait();
+        eviction.join().unwrap();
+
+        assert_eq!(
+            tracker.debug_tracked_dir_count(),
+            2,
+            "batched eviction must stop after concurrent removal restores capacity"
+        );
+    }
+
+    #[test]
+    fn test_oversubscribed_eviction_batches_lru_selection() {
+        let first_dir = 100;
+        let directory_count = 1_024;
+        let mut tracker = DirAccessTracker::new_with_capacity(2, directory_count as usize);
+        for offset in 0..directory_count {
+            tracker.on_readdir(first_dir + offset, Vec::new());
+        }
+        tracker.max_tracked_dirs = 2;
+
+        let selection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let selection_count_for_hook = Arc::clone(&selection_count);
+        tracker.set_test_hook(Arc::new(move || {
+            selection_count_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+
+        tracker.evict_lru_if_needed();
+
+        assert_eq!(
+            tracker.debug_tracked_dir_count(),
+            2,
+            "eviction must reduce the tracker to its configured capacity"
+        );
+        assert_eq!(
+            selection_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one oversubscribed eviction should select all victims in one map scan"
+        );
+        assert!(
+            tracker
+                .dirs
+                .get(&(first_dir + directory_count - 2))
+                .is_some()
+        );
+        assert!(
+            tracker
+                .dirs
+                .get(&(first_dir + directory_count - 1))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_batched_lru_eviction_cleans_all_reverse_mappings() {
+        let mut tracker = DirAccessTracker::new_with_capacity(2, 4);
+        for dir_ino in 100..104 {
+            tracker.on_readdir(dir_ino, vec![dir_ino + 1_000]);
+        }
+        tracker.max_tracked_dirs = 2;
+
+        tracker.evict_lru_if_needed();
+
+        assert_eq!(tracker.debug_tracked_dir_count(), 2);
+        for child_ino in 1_100..1_102 {
+            assert!(
+                tracker.child_to_dir.get(&child_ino).is_none(),
+                "evicted directories must release every reverse mapping"
+            );
+        }
+        for child_ino in 1_102..1_104 {
+            assert!(
+                tracker.child_to_dir.get(&child_ino).is_some(),
+                "retained directories must keep their reverse mappings"
+            );
+        }
+    }
+
+    #[test]
+    fn test_concurrent_registrations_respect_directory_capacity() {
+        let tracker = Arc::new(DirAccessTracker::new_with_capacity(2, 2));
+        let registration_count = 64;
+        let start = Arc::new(std::sync::Barrier::new(registration_count + 1));
+        let handles: Vec<_> = (0..registration_count)
+            .map(|index| {
+                let tracker = Arc::clone(&tracker);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    tracker.on_readdir(10_000 + index as Ino, Vec::new());
+                })
+            })
+            .collect();
+
+        start.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            tracker.debug_tracked_dir_count(),
+            2,
+            "concurrent registrations must leave exactly the configured capacity"
         );
     }
 
