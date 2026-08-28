@@ -1023,6 +1023,7 @@ impl StudioVfs {
         .unwrap_or(ino);
         self.wait_for_deferred_release_inflight(target_ino).await;
         self.ensure_volatile_overlay_metadata_healthy()?;
+        self.ensure_deferred_namespace_metadata_healthy()?;
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
         if self.state.writer_stack.has_dirty_writers(target_ino) {
             self.spawn_deferred_materialization_if_needed(target_ino);

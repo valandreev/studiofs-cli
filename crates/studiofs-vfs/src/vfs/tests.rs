@@ -13650,6 +13650,23 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
             matches!(&admission_error, VfsError::MetadataPersistenceDegraded),
             "unexpected admission error: {admission_error:?}"
         );
+
+        let flush_error = vfs
+            .flush_volatile_writeback_with_outcome(attr.ino, 0)
+            .await
+            .expect_err("deferred namespace degradation must fail an ordinary flush");
+        assert!(
+            matches!(&flush_error, VfsError::MetadataPersistenceDegraded),
+            "unexpected flush error: {flush_error:?}"
+        );
+
+        let shutdown_error = vfs
+            .deferred_namespace_shutdown_error()
+            .expect("deferred namespace degradation must remain visible to barriers");
+        assert!(
+            matches!(shutdown_error, VfsError::MetadataPersistenceDegraded),
+            "unexpected shutdown error: {shutdown_error:?}"
+        );
     });
 }
 

@@ -432,6 +432,20 @@ impl StudioVfs {
             .contains_key(&ino)
     }
 
+    /// Return an error when deferred namespace metadata persistence is degraded.
+    pub fn ensure_deferred_namespace_metadata_healthy(&self) -> VfsResult<()> {
+        if self
+            .state
+            .namespace
+            .deferred
+            .degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(VfsError::MetadataPersistenceDegraded);
+        }
+        Ok(())
+    }
+
     pub(super) fn deferred_namespace_shutdown_error(&self) -> Option<VfsError> {
         if self
             .state
@@ -440,9 +454,7 @@ impl StudioVfs {
             .degraded
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Some(VfsError::Other(
-                "deferred namespace metadata persistence failed".to_string(),
-            ));
+            return Some(VfsError::MetadataPersistenceDegraded);
         }
         let inner = self.state.namespace.deferred.inner.lock();
         let draining = self

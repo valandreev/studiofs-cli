@@ -65,6 +65,9 @@ impl<'a> WinfspHandleDrainFacade<'a> {
 
     pub(super) fn flush(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
         self.context.vfs.note_winfsp_flush_callback();
+        self.context
+            .vfs
+            .ensure_deferred_namespace_metadata_healthy()?;
         let flushed = if self.requires_flush_barrier(ino) {
             self.with_flush_gate(ino, || {
                 if !self.requires_flush_barrier(ino) {
