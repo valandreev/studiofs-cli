@@ -4399,6 +4399,7 @@ fn pg_backed_flock_blocks_conflicting_peer_until_unlock() {
         &writer_db,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open writer pg meta");
@@ -4406,6 +4407,7 @@ fn pg_backed_flock_blocks_conflicting_peer_until_unlock() {
         &remote_db,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open remote pg meta");

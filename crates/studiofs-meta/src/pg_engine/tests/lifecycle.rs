@@ -392,6 +392,7 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
         &path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     );
 
@@ -455,6 +456,7 @@ fn repair_startup_keeps_recovery_marker_when_remote_sync_fails() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     );
     assert!(
@@ -973,10 +975,108 @@ fn test_pg_checkpoint_repairs_missing_remote_format_info() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn command_pool_capacity_is_bounded_by_configured_pool_size() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _pool_env = set_test_env_value("STUDIOFS_PG_POOL_SIZE", None);
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-command-pool-capacity");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            pg_pool_size: 1,
+        },
+    )
+    .expect("open pg engine with one command-pool slot");
+
+    let before = engine.command_pool_stats();
+    let pool = engine.command_pool.clone();
+    let command_timeout = Duration::from_secs(5);
+    let (first_result, second_result, observed_wait) = engine
+        .run_async(async move {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+            let first_pool = pool.clone();
+            let first = tokio::spawn(async move {
+                PgMetaEngine::with_postgres_client_timeout(
+                    first_pool,
+                    command_timeout,
+                    "pool capacity first command",
+                    move |_client| {
+                        Box::pin(async move {
+                            started_tx.send(()).expect("signal first command checkout");
+                            release_rx.await.expect("release first command checkout");
+                            Ok::<(), MetaError>(())
+                        })
+                    },
+                )
+                .await
+            });
+
+            started_rx
+                .await
+                .expect("first command should acquire a pool slot");
+
+            let second_pool = pool.clone();
+            let second = tokio::spawn(async move {
+                PgMetaEngine::with_postgres_client_timeout(
+                    second_pool,
+                    command_timeout,
+                    "pool capacity second command",
+                    |_client| Box::pin(async { Ok::<(), MetaError>(()) }),
+                )
+                .await
+            });
+
+            let observed_wait = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if pool.stats().checkout_waits > before.checkout_waits {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+
+            release_tx.send(()).expect("release first command checkout");
+            let first_result = first.await.expect("join first command");
+            let second_result = second.await.expect("join second command");
+            Ok((first_result, second_result, observed_wait))
+        })
+        .expect("run pool capacity test commands");
+
+    assert!(first_result.is_ok(), "first command should complete");
+    assert!(second_result.is_ok(), "second command should complete");
+    assert!(
+        observed_wait,
+        "second command should wait for the sole pool slot"
+    );
+
+    let after = engine.command_pool_stats();
+    assert_eq!(
+        after.max_size, 1,
+        "configured command-pool size should be preserved"
+    );
+    assert_eq!(
+        after.total, 1,
+        "one-slot pool should retain one reusable connection"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let _pool_env = set_test_env_value("STUDIOFS_PG_POOL_SIZE", None);
 
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
@@ -986,11 +1086,16 @@ fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            pg_pool_size: 2,
         },
     )
     .expect("open pg engine");
 
     let before = engine.command_pool_stats();
+    assert_eq!(
+        before.max_size, 2,
+        "explicit command-pool size should be applied to the opened engine"
+    );
     engine
         .remote_metadata_head_version()
         .expect("first metadata head query");
@@ -1035,6 +1140,7 @@ fn command_pool_discards_client_after_application_error() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open pg engine");

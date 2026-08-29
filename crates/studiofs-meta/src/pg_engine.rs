@@ -21,6 +21,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+/// Default maximum number of PostgreSQL command connections per client.
+pub const DEFAULT_PG_POOL_SIZE: usize = 4;
+
+const PG_POOL_SIZE_ENV_VAR: &str = "STUDIOFS_PG_POOL_SIZE";
+
 #[cfg(test)]
 thread_local! {
     static TEST_ENV_OVERRIDES: std::cell::RefCell<HashMap<&'static str, Option<String>>> =
@@ -60,9 +65,33 @@ impl Drop for TestEnvGuard {
 
 #[cfg(test)]
 fn set_test_env(key: &'static str, value: &str) -> TestEnvGuard {
-    let previous = TEST_ENV_OVERRIDES
-        .with(|overrides| overrides.borrow_mut().insert(key, Some(value.to_string())));
+    set_test_env_value(key, Some(value))
+}
+
+#[cfg(test)]
+fn set_test_env_value(key: &'static str, value: Option<&str>) -> TestEnvGuard {
+    let previous = TEST_ENV_OVERRIDES.with(|overrides| {
+        overrides
+            .borrow_mut()
+            .insert(key, value.map(str::to_string))
+    });
     TestEnvGuard { key, previous }
+}
+
+fn resolve_pg_pool_size(configured: usize) -> MetaResult<usize> {
+    let pool_size = match pg_env_var(PG_POOL_SIZE_ENV_VAR) {
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            MetaError::Storage(format!("{PG_POOL_SIZE_ENV_VAR} must be a positive integer"))
+        })?,
+        None => configured,
+    };
+
+    if pool_size == 0 {
+        return Err(MetaError::Storage(
+            "postgres command pool size must be greater than zero".to_string(),
+        ));
+    }
+    Ok(pool_size)
 }
 
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
@@ -262,6 +291,7 @@ impl PgSnapshotBackend {
             ));
         }
         let connect_timeout = PgMetaEngine::default_connect_timeout();
+        let pool_size = resolve_pg_pool_size(DEFAULT_PG_POOL_SIZE)?;
         Ok(Arc::new(Self {
             postgres_url: postgres_url.to_string(),
             volume_id,
@@ -270,7 +300,8 @@ impl PgSnapshotBackend {
                 postgres_url.to_string(),
                 connect_timeout,
                 connect_timeout,
-            )),
+                pool_size,
+            )?),
         }))
     }
 }
@@ -280,12 +311,16 @@ impl PgSnapshotBackend {
 pub struct PgOpenOptions {
     /// Whether to start background polling and lock-worker threads immediately.
     pub background_poll: bool,
+    /// Maximum number of PostgreSQL command connections for this client.
+    /// `STUDIOFS_PG_POOL_SIZE` overrides this value when set.
+    pub pg_pool_size: usize,
 }
 
 impl Default for PgOpenOptions {
     fn default() -> Self {
         Self {
             background_poll: true,
+            pg_pool_size: DEFAULT_PG_POOL_SIZE,
         }
     }
 }
@@ -568,6 +603,7 @@ impl PgMetaEngine {
                 "metadata.postgres.url must not be empty".to_string(),
             ));
         }
+        let pool_size = resolve_pg_pool_size(options.pg_pool_size)?;
 
         let poll_secs = pg_env_var("STUDIOFS_PG_SYNC_POLL_SECS")
             .and_then(|v| v.parse::<u64>().ok())
@@ -637,7 +673,8 @@ impl PgMetaEngine {
                 pg.url.clone(),
                 connect_timeout,
                 connect_timeout,
-            )),
+                pool_size,
+            )?),
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             remote_runtime: runtime::PgRemoteRuntime::new("studiofs-pg-remote-runtime")?,

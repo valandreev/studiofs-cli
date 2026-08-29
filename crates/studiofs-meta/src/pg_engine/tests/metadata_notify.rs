@@ -118,6 +118,7 @@ fn test_pg_metadata_notify_listener_start_syncs_missed_change() {
         &db_b,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open b without listener");

@@ -81,6 +81,7 @@ fn sfs623_recovery_trusted_state_allocates_offline_after_reopen() {
         dir.path().join("meta.redb"),
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("reopen PgMetaEngine with PostgreSQL unavailable");
@@ -235,6 +236,7 @@ fn sfs623_recovery_overflow_keeps_authority_read_only_until_reopen() {
         dir.path().join("meta.redb"),
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("reopen engine with the surviving allocator tail");
@@ -258,6 +260,7 @@ fn sfs623_recovery_untrustworthy_state_is_read_only_offline() {
         dir.path().join("meta.redb"),
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open known metadata view with PostgreSQL unavailable");

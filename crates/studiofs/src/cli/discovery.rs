@@ -180,6 +180,7 @@ fn create_local_snapshot(
         &db_path,
         MetaOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )?;
     drop(primed_engine);

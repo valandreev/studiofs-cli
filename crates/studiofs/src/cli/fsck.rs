@@ -561,6 +561,7 @@ where
         &db_path,
         MetaOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )?;
     let format_info = meta.get_format_info()?;

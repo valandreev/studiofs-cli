@@ -26,6 +26,7 @@ fn policy_set_load_cancel_uses_generation_cas() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");
@@ -119,6 +120,7 @@ fn concurrent_initial_policy_sets_allocate_distinct_generations() {
         &db_path_a,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open first postgres engine");
@@ -126,6 +128,7 @@ fn concurrent_initial_policy_sets_allocate_distinct_generations() {
         &db_path_b,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open second postgres engine");
@@ -167,6 +170,7 @@ fn policy_slot_claim_and_job_insert_are_one_transaction() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");
@@ -253,6 +257,7 @@ fn snapshot_job_claim_renew_release_is_fenced() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");
@@ -346,6 +351,7 @@ fn concurrent_release_and_expired_claim_preserve_fencing() {
         &db_path_a,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open first postgres engine");
@@ -353,6 +359,7 @@ fn concurrent_release_and_expired_claim_preserve_fencing() {
         &db_path_b,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open second postgres engine");
@@ -429,6 +436,7 @@ fn snapshot_publish_ready_stores_all_payload_proofs() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");

@@ -226,6 +226,7 @@ fn bootstrap_defers_while_a_snapshot_is_creating() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");
@@ -254,6 +255,7 @@ fn snapshot_cut_and_mount_lease_control_object_protection() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");
@@ -356,6 +358,7 @@ fn uploaded_fragment_reconciliation_is_bounded_and_leased() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");
@@ -475,6 +478,7 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres engine");

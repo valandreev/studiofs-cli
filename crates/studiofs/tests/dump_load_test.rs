@@ -294,6 +294,7 @@ async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
             &db_path,
             MetaOpenOptions {
                 background_poll: false,
+                ..Default::default()
             },
         )
         .expect("open meta engine");
@@ -352,6 +353,7 @@ async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: 
             &db_path,
             MetaOpenOptions {
                 background_poll: false,
+                ..Default::default()
             },
         )
         .expect("open discovered meta");

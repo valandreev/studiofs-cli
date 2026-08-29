@@ -21,6 +21,7 @@ fn test_pg_file_lock_lease_blocks_peer_until_release() {
         &db_a,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open a");
@@ -28,6 +29,7 @@ fn test_pg_file_lock_lease_blocks_peer_until_release() {
         &db_b,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open b");
@@ -89,6 +91,7 @@ fn test_pg_file_lock_first_acquire_serializes_concurrent_racers() {
         &db_a,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open a");
@@ -96,6 +99,7 @@ fn test_pg_file_lock_first_acquire_serializes_concurrent_racers() {
         &db_b,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open b");
@@ -161,6 +165,7 @@ fn test_pg_open_rejects_missing_file_lock_lease_table() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     ) {
         Ok(_) => panic!("open must reject a volume missing file_lock_leases"),
@@ -188,6 +193,7 @@ fn test_pg_foreground_file_lock_does_not_repair_missing_schema() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open pg engine with complete schema");
@@ -223,6 +229,7 @@ fn test_pg_file_lock_lease_expires_for_peer() {
         &db_a,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open a");
@@ -230,6 +237,7 @@ fn test_pg_file_lock_lease_expires_for_peer() {
         &db_b,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open b");
@@ -280,6 +288,7 @@ fn test_pg_file_lock_lease_renew_keeps_peer_blocked() {
         &db_a,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open a");
@@ -287,6 +296,7 @@ fn test_pg_file_lock_lease_renew_keeps_peer_blocked() {
         &db_b,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open b");
