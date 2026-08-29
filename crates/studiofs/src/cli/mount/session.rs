@@ -1889,6 +1889,7 @@ fn open_live_mount_meta(name: &str, meta_dir: &Path) -> anyhow::Result<OpenedLiv
         &db_path,
         MetaOpenOptions {
             background_poll: metadata_background_poll_enabled(),
+            ..Default::default()
         },
     )?;
     let format_info = read_live_mount_format_info(name, source_meta.as_ref())?;

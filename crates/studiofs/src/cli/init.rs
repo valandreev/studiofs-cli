@@ -131,12 +131,14 @@ EXAMPLES:
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
 RUNTIME POLICY:
-  PG batching / sync cadence is configured per client at mount/runtime, not
-  stored in the volume. Use environment variables such as:
+  PG batching / sync cadence and command-pool capacity are configured per
+  client at mount/runtime, not stored in the volume. Use environment variables
+  such as:
     STUDIOFS_PG_FLUSH_INTERVAL_SECS
     STUDIOFS_PG_FLUSH_OPS_THRESHOLD
     STUDIOFS_PG_FLUSH_IDLE_MS
     STUDIOFS_PG_SYNC_POLL_SECS
+    STUDIOFS_PG_POOL_SIZE
 ")]
 pub(crate) struct InitArgs {
     /// Disk name (used in object paths like `<name>/objects`)
@@ -611,6 +613,7 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
         &db_path,
         MetaOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )?;
     drop(primed_engine);

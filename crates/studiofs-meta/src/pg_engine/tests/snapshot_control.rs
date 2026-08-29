@@ -401,6 +401,7 @@ fn mount_renewal_is_fenced_by_active_cleanup_claim() {
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open PostgreSQL metadata engine");

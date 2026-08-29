@@ -433,6 +433,7 @@ Persisted in `FormatInfo`:
 
 Not persisted in the volume format:
 - PG flush cadence / op thresholds
+- PostgreSQL command-pool capacity
 - client-local metadata-cache defaults / invalidation cadence
 
 ## Client Runtime Defaults
@@ -441,6 +442,15 @@ Not persisted in the volume format:
 - `STUDIOFS_PG_FLUSH_OPS_THRESHOLD = 500`
 - `STUDIOFS_PG_FLUSH_IDLE_MS = 5000`
 - `STUDIOFS_PG_SYNC_POLL_SECS = 2`
+- `STUDIOFS_PG_POOL_SIZE = 4`
+
+`STUDIOFS_PG_POOL_SIZE` is a positive-integer per-client runtime override within
+the runtime semaphore capacity. It takes precedence over
+`MetaOpenOptions::pg_pool_size` and
+`PgOpenOptions::pg_pool_size`; those runtime fields default to four. The value
+is not persisted in the volume metadata schema. Size the aggregate of all
+client pools below PostgreSQL `max_connections`, leaving headroom for
+administrative and other server connections.
 
 ## Base + Overlay Design
 

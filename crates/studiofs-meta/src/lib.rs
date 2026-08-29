@@ -50,7 +50,7 @@ pub use events::MetaEvent;
 pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,
 };
-pub use pg_engine::{PgMetaEngine, PgOpenOptions, PgSnapshotBackend};
+pub use pg_engine::{DEFAULT_PG_POOL_SIZE, PgMetaEngine, PgOpenOptions, PgSnapshotBackend};
 pub use pg_transport::connect_studiofs_postgres;
 pub use read_only::ReadOnlyMetaEngine;
 pub use redb_engine::RedbMetaEngine;
@@ -85,12 +85,17 @@ pub fn open_read_only_snapshot_meta(
 pub struct MetaOpenOptions {
     /// Whether remote-backed engines may start background polling workers.
     pub background_poll: bool,
+    /// Maximum number of PostgreSQL command connections for this client.
+    /// Values above the runtime semaphore capacity are rejected.
+    /// `STUDIOFS_PG_POOL_SIZE` overrides this value when set.
+    pub pg_pool_size: usize,
 }
 
 impl Default for MetaOpenOptions {
     fn default() -> Self {
         Self {
             background_poll: true,
+            pg_pool_size: DEFAULT_PG_POOL_SIZE,
         }
     }
 }
@@ -124,6 +129,7 @@ pub fn open_meta_engine_with_options(
                 path,
                 PgOpenOptions {
                     background_poll: options.background_poll,
+                    pg_pool_size: options.pg_pool_size,
                 },
             )?;
             let pg_info = pg.get_format_info()?;
@@ -178,6 +184,7 @@ pub fn open_meta_engine_with_options(
                     path,
                     PgOpenOptions {
                         background_poll: options.background_poll,
+                        pg_pool_size: options.pg_pool_size,
                     },
                 )?;
                 Ok(pg)
@@ -204,6 +211,7 @@ mod tests {
             &path,
             MetaOpenOptions {
                 background_poll: false,
+                ..Default::default()
             },
         )
         .expect("open missing metadata path");

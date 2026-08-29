@@ -12,6 +12,10 @@ use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
+// Tokio reserves three bits in its permit counter; this mirrors its private
+// Semaphore::MAX_PERMITS limit in the pinned Tokio release.
+const TOKIO_MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
+
 type RuntimeJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(super) type PgClientFuture<'a, T> = Pin<Box<dyn Future<Output = MetaResult<T>> + Send + 'a>>;
 
@@ -57,6 +61,7 @@ pub(super) struct PgConnectionPool {
 
 #[cfg(test)]
 pub(super) struct PgConnectionPoolStats {
+    pub(super) max_size: usize,
     pub(super) connection_creations: u64,
     pub(super) checkouts: u64,
     pub(super) checkout_waits: u64,
@@ -116,30 +121,40 @@ impl Drop for PooledPgConnection {
 }
 
 impl PgConnectionPool {
-    const DEFAULT_MAX_SIZE: usize = 4;
-
     pub(super) fn new(
         postgres_url: String,
         connect_timeout: Duration,
         checkout_timeout: Duration,
-    ) -> Self {
-        Self {
+        max_size: usize,
+    ) -> MetaResult<Self> {
+        if max_size == 0 {
+            return Err(MetaError::Storage(
+                "postgres command pool size must be greater than zero".to_string(),
+            ));
+        }
+        if max_size > TOKIO_MAX_SEMAPHORE_PERMITS {
+            return Err(MetaError::Storage(format!(
+                "postgres command pool size exceeds Tokio semaphore maximum ({TOKIO_MAX_SEMAPHORE_PERMITS})"
+            )));
+        }
+        Ok(Self {
             postgres_url,
             connect_timeout,
             checkout_timeout,
-            max_size: Self::DEFAULT_MAX_SIZE,
-            active_slots: Arc::new(Semaphore::new(Self::DEFAULT_MAX_SIZE)),
+            max_size,
+            active_slots: Arc::new(Semaphore::new(max_size)),
             state: Arc::new(Mutex::new(PgConnectionPoolState::default())),
             connection_creations: AtomicU64::new(0),
             checkouts: AtomicU64::new(0),
             checkout_waits: AtomicU64::new(0),
             discarded: AtomicU64::new(0),
-        }
+        })
     }
 
     #[cfg(test)]
     pub(super) fn stats(&self) -> PgConnectionPoolStats {
         PgConnectionPoolStats {
+            max_size: self.max_size,
             connection_creations: self.connection_creations.load(Ordering::Relaxed),
             checkouts: self.checkouts.load(Ordering::Relaxed),
             checkout_waits: self.checkout_waits.load(Ordering::Relaxed),
@@ -587,11 +602,15 @@ mod tests {
             .enable_all()
             .build()
             .expect("build runtime");
-        let pool = Arc::new(PgConnectionPool::new(
-            "postgres://10.255.255.1:5432/studiofs".to_string(),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-        ));
+        let pool = Arc::new(
+            PgConnectionPool::new(
+                "postgres://10.255.255.1:5432/studiofs".to_string(),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                4,
+            )
+            .expect("non-zero command pool size"),
+        );
 
         let result = runtime.block_on(pool.checkout("unit test connect timeout"));
 
@@ -609,11 +628,15 @@ mod tests {
             .enable_all()
             .build()
             .expect("build runtime");
-        let pool = Arc::new(PgConnectionPool::new(
-            "postgres://10.255.255.1:5432/studiofs".to_string(),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        ));
+        let pool = Arc::new(
+            PgConnectionPool::new(
+                "postgres://10.255.255.1:5432/studiofs".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                4,
+            )
+            .expect("non-zero command pool size"),
+        );
 
         runtime.block_on(async {
             let checkout_pool = pool.clone();
@@ -646,5 +669,35 @@ mod tests {
                 "dropping a checkout future must release its reserved total slot"
             );
         });
+    }
+
+    #[test]
+    fn command_pool_rejects_zero_capacity() {
+        let result = PgConnectionPool::new(
+            "postgres://127.0.0.1:1/studiofs".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            0,
+        );
+
+        assert!(
+            result.is_err(),
+            "a command pool must have a positive capacity"
+        );
+    }
+
+    #[test]
+    fn command_pool_rejects_capacity_above_semaphore_limit() {
+        let result = PgConnectionPool::new(
+            "postgres://127.0.0.1:1/studiofs".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            usize::MAX,
+        );
+
+        assert!(
+            result.is_err(),
+            "a command pool must reject capacities above Tokio's semaphore limit"
+        );
     }
 }

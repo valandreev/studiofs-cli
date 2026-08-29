@@ -40,6 +40,7 @@ fn open_pg_fixture(
         &db_path,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open postgres metadata engine");
@@ -216,6 +217,7 @@ fn reconstructs_exact_cut_and_excludes_later_events() {
         &claimant_db,
         PgOpenOptions {
             background_poll: false,
+            ..Default::default()
         },
     )
     .expect("open claimant metadata engine");
