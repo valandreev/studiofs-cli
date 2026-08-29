@@ -1870,11 +1870,8 @@ fn deterministic_run_seed(run_id: &str) -> u64 {
     hash
 }
 
-fn deterministic_write_seed(item: &WorkFile, run_seed: u64, stream_id: Option<usize>) -> u64 {
-    run_seed
-        .wrapping_add(item.index as u64)
-        .wrapping_add(123)
-        .wrapping_add(stream_id.unwrap_or_default() as u64)
+fn deterministic_write_seed(item: &WorkFile, run_seed: u64) -> u64 {
+    run_seed.wrapping_add(item.index as u64).wrapping_add(123)
 }
 
 async fn write_deterministic_file_with_buffer(
@@ -2421,7 +2418,7 @@ async fn run_filesystem_writes(
                 write_deterministic_file_with_buffer(
                     &item.path,
                     item.size,
-                    deterministic_write_seed(item, write_options.run_seed, None),
+                    deterministic_write_seed(item, write_options.run_seed),
                     write_options.chunk_size,
                     &mut scratch,
                 )
@@ -2505,7 +2502,7 @@ async fn run_filesystem_reads(
                 let _permit = permit;
 
                 let validation = MountedReadValidation {
-                    seed: deterministic_write_seed(item, read_options.run_seed, None),
+                    seed: deterministic_write_seed(item, read_options.run_seed),
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
@@ -2601,7 +2598,7 @@ async fn run_filesystem_read_operations(
                 let _permit = permit;
 
                 let validation = MountedReadValidation {
-                    seed: deterministic_write_seed(item, read_options.run_seed, None),
+                    seed: deterministic_write_seed(item, read_options.run_seed),
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
@@ -2678,7 +2675,7 @@ async fn run_filesystem_writes_sequential_streams(
                 write_deterministic_file_with_buffer(
                     &item.path,
                     item.size,
-                    deterministic_write_seed(item, write_options.run_seed, Some(stream_id)),
+                    deterministic_write_seed(item, write_options.run_seed),
                     write_options.chunk_size,
                     &mut scratch,
                 )
@@ -2751,7 +2748,7 @@ async fn run_filesystem_reads_sequential_streams(
                     .map_err(|e| anyhow!("filesystem sequential read semaphore closed: {e}"))?;
                 let _permit = permit;
                 let validation = MountedReadValidation {
-                    seed: deterministic_write_seed(item, read_options.run_seed, Some(stream_id)),
+                    seed: deterministic_write_seed(item, read_options.run_seed),
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
@@ -4113,6 +4110,17 @@ mod tests {
             write_chunk_size: 16,
         });
         assert_ne!(different, first.as_slice());
+    }
+
+    #[test]
+    fn deterministic_write_seed_is_independent_of_stream_assignment() {
+        let item = WorkFile {
+            path: PathBuf::from("Z:/bench/file.bin"),
+            size: 1,
+            index: 7,
+        };
+
+        assert_eq!(deterministic_write_seed(&item, 11), 11 + 7 + 123);
     }
 
     #[test]
