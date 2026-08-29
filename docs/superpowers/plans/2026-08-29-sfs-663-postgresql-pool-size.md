@@ -65,7 +65,8 @@ capacity regression observed a blocked second checkout with a one-slot pool;
 the existing cancellation tests and repeated-query connection-reuse regression
 also passed. `STUDIOFS_TEST_PG_DSN` was available, so both ignored PostgreSQL
 pool regressions ran; no environment-dependent validation gap remains. No
-follow-up is required within SFS-663.
+review follow-up is required within SFS-663 after the invalid environment-value
+diagnostic was corrected.
 
 ## Context and Orientation
 
@@ -179,3 +180,4 @@ The default for both structs is `pg_pool_size = 4`. The private resolver in `pg_
 2026-08-29 09:17 +03:00 — Added the first red tests. The expected compile failures confirmed the new option field, resolver, default constant, and fallible pool-constructor contract are not present in the baseline.
 2026-08-29 10:15 +03:00 — Completed implementation and focused verification. Documentation, CLI help, option propagation, resolver tests, pool-capacity blocking, cancellation, and connection reuse all have recorded passing evidence; the complete change set is ready to commit.
 2026-08-29 10:20 +03:00 — Committed the complete change set with message `feat: make postgres pool size a client runtime setting`.
+2026-08-29 — Verified the attached code review against current callers and contracts. Corrected the zero-value environment error to identify STUDIOFS_PG_POOL_SIZE; deferred options-API, type, builder, and polling suggestions as out of scope or contrary to the existing concurrency test contract.

@@ -114,6 +114,18 @@ fn pg_pool_size_rejects_malformed_environment_override() {
 }
 
 #[test]
+fn pg_pool_size_environment_override_rejects_zero_with_variable_name() {
+    let _env = set_test_env("STUDIOFS_PG_POOL_SIZE", "0");
+
+    let error = resolve_pg_pool_size(4).expect_err("zero environment override must be rejected");
+
+    assert!(
+        error.to_string().contains("STUDIOFS_PG_POOL_SIZE"),
+        "zero override errors should identify the environment variable: {error}"
+    );
+}
+
+#[test]
 fn pg_snapshot_backend_uses_pool_size_override() {
     let _env = set_test_env("STUDIOFS_PG_POOL_SIZE", "9");
 

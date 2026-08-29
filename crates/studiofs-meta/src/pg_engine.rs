@@ -79,19 +79,24 @@ fn set_test_env_value(key: &'static str, value: Option<&str>) -> TestEnvGuard {
 }
 
 fn resolve_pg_pool_size(configured: usize) -> MetaResult<usize> {
-    let pool_size = match pg_env_var(PG_POOL_SIZE_ENV_VAR) {
-        Some(value) => value.parse::<usize>().map_err(|_| {
+    if let Some(value) = pg_env_var(PG_POOL_SIZE_ENV_VAR) {
+        let pool_size = value.parse::<usize>().map_err(|_| {
             MetaError::Storage(format!("{PG_POOL_SIZE_ENV_VAR} must be a positive integer"))
-        })?,
-        None => configured,
-    };
+        })?;
+        if pool_size == 0 {
+            return Err(MetaError::Storage(format!(
+                "{PG_POOL_SIZE_ENV_VAR} must be a positive integer"
+            )));
+        }
+        return Ok(pool_size);
+    }
 
-    if pool_size == 0 {
+    if configured == 0 {
         return Err(MetaError::Storage(
             "postgres command pool size must be greater than zero".to_string(),
         ));
     }
-    Ok(pool_size)
+    Ok(configured)
 }
 
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
