@@ -622,7 +622,8 @@ PostgreSQL metadata invalidation uses push-plus-poll behavior:
   metadata listener reconnect and sync attempts.
 - `STUDIOFS_PG_POOL_SIZE` sets the per-client PostgreSQL command-pool capacity;
   it defaults to `4` and overrides the runtime option field when present.
-  Values must be positive integers; zero or malformed values fail startup.
+  Values must be positive integers within the runtime semaphore capacity; zero,
+  malformed, or oversized values fail startup.
   Budget the sum of all client pool sizes below PostgreSQL `max_connections`,
   with headroom for administrative and other server connections.
 - Lock lease notifications stay on `studiofs_lock_vol_<volume_id>` and are not

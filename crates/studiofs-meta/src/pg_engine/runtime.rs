@@ -12,6 +12,10 @@ use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
+// Tokio reserves three bits in its permit counter; this mirrors its private
+// Semaphore::MAX_PERMITS limit in the pinned Tokio release.
+const TOKIO_MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
+
 type RuntimeJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(super) type PgClientFuture<'a, T> = Pin<Box<dyn Future<Output = MetaResult<T>> + Send + 'a>>;
 
@@ -127,6 +131,11 @@ impl PgConnectionPool {
             return Err(MetaError::Storage(
                 "postgres command pool size must be greater than zero".to_string(),
             ));
+        }
+        if max_size > TOKIO_MAX_SEMAPHORE_PERMITS {
+            return Err(MetaError::Storage(format!(
+                "postgres command pool size exceeds Tokio semaphore maximum ({TOKIO_MAX_SEMAPHORE_PERMITS})"
+            )));
         }
         Ok(Self {
             postgres_url,
@@ -674,6 +683,21 @@ mod tests {
         assert!(
             result.is_err(),
             "a command pool must have a positive capacity"
+        );
+    }
+
+    #[test]
+    fn command_pool_rejects_capacity_above_semaphore_limit() {
+        let result = PgConnectionPool::new(
+            "postgres://127.0.0.1:1/studiofs".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            usize::MAX,
+        );
+
+        assert!(
+            result.is_err(),
+            "a command pool must reject capacities above Tokio's semaphore limit"
         );
     }
 }

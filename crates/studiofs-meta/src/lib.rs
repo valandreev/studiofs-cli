@@ -86,6 +86,7 @@ pub struct MetaOpenOptions {
     /// Whether remote-backed engines may start background polling workers.
     pub background_poll: bool,
     /// Maximum number of PostgreSQL command connections for this client.
+    /// Values above the runtime semaphore capacity are rejected.
     /// `STUDIOFS_PG_POOL_SIZE` overrides this value when set.
     pub pg_pool_size: usize,
 }

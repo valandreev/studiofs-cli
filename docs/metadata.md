@@ -444,8 +444,9 @@ Not persisted in the volume format:
 - `STUDIOFS_PG_SYNC_POLL_SECS = 2`
 - `STUDIOFS_PG_POOL_SIZE = 4`
 
-`STUDIOFS_PG_POOL_SIZE` is a positive-integer per-client runtime override. It
-takes precedence over `MetaOpenOptions::pg_pool_size` and
+`STUDIOFS_PG_POOL_SIZE` is a positive-integer per-client runtime override within
+the runtime semaphore capacity. It takes precedence over
+`MetaOpenOptions::pg_pool_size` and
 `PgOpenOptions::pg_pool_size`; those runtime fields default to four. The value
 is not persisted in the volume metadata schema. Size the aggregate of all
 client pools below PostgreSQL `max_connections`, leaving headroom for

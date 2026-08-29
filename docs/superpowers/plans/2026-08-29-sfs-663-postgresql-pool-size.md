@@ -24,6 +24,7 @@ The behavior is visible through focused unit tests for default/override/validati
 - [x] (2026-08-29 09:40 +03:00) Propagated the new field through all existing option literals, added the one-slot capacity regression, and extended connection-reuse assertions.
 - [x] (2026-08-29 10:15 +03:00) Updated metadata/configuration documentation and `studiofs init` help; focused unit, ignored PostgreSQL, compile-only, formatting, check, clippy, and diff validation passed.
 - [x] (2026-08-29 10:20 +03:00) Committed the complete SFS-663 change set with message `feat: make postgres pool size a client runtime setting`.
+- [x] (2026-08-29) Verified the follow-up review finding against Tokio 1.49 and rejected capacities above its private semaphore limit before construction.
 
 ## Surprises & Discoveries
 
@@ -55,8 +56,8 @@ The behavior is visible through focused unit tests for default/override/validati
 ## Outcomes & Retrospective
 
 The runtime option field and shared resolver now provide a default pool size of
-four, apply a positive-integer `STUDIOFS_PG_POOL_SIZE` override, reject zero and
-malformed values, and feed the resolved value into both the command-pool limit
+four, apply a positive-integer `STUDIOFS_PG_POOL_SIZE` override, reject zero,
+malformed, or oversized values, and feed the resolved value into both the command-pool limit
 and semaphore. `PgMetaEngine` and standalone `PgSnapshotBackend` use the same
 resolver, while persisted `PostgresConfig` remains unchanged. The focused unit
 tests passed for defaults, explicit values, environment precedence, validation,
@@ -84,7 +85,7 @@ diagnostic was corrected.
 
 First add red tests in the metadata crate. The resolver tests will assert default four, environment override precedence over an explicit option, and rejection of zero/malformed values. A direct pool-constructor test will assert that zero cannot create a semaphore. Run those tests before adding the implementation and record the expected missing-function or signature failures.
 
-Then add `DEFAULT_PG_POOL_SIZE = 4`, `pg_pool_size: usize` to both runtime option structs, and a private resolver that reads `STUDIOFS_PG_POOL_SIZE`, parses a positive `usize`, or uses the option value after the same positive check. The resolver must be called by `PgMetaEngine::open_with_options` and `PgSnapshotBackend::open`; `open_meta_engine_with_options` must copy the field from `MetaOpenOptions` into `PgOpenOptions`. `PgConnectionPool::new` will accept the resolved size, reject zero, return `MetaResult<Self>`, and use that value for both `max_size` and `Semaphore::new`. Its test stats will expose the configured maximum so the integration test can verify propagation without adding production observability.
+Then add `DEFAULT_PG_POOL_SIZE = 4`, `pg_pool_size: usize` to both runtime option structs, and a private resolver that reads `STUDIOFS_PG_POOL_SIZE`, parses a positive `usize`, or uses the option value after the same positive check. The resolver must be called by `PgMetaEngine::open_with_options` and `PgSnapshotBackend::open`; `open_meta_engine_with_options` must copy the field from `MetaOpenOptions` into `PgOpenOptions`. `PgConnectionPool::new` will accept the resolved size, reject zero and values above Tokio's semaphore limit, return `MetaResult<Self>`, and use that value for both `max_size` and `Semaphore::new`. Its test stats will expose the configured maximum so the integration test can verify propagation without adding production observability.
 
 Update every existing `MetaOpenOptions` and `PgOpenOptions` literal with `..Default::default()` or an explicit field where the test needs a non-default size. Keep all existing runtime behavior unchanged for callers that use defaults. Update the shared unit fixture and direct pool constructors for the fallible constructor signature.
 
@@ -170,7 +171,7 @@ At completion, `crates/studiofs-meta/src/lib.rs` must expose:
         pub pg_pool_size: usize,
     }
 
-The default for both structs is `pg_pool_size = 4`. The private resolver in `pg_engine.rs` must accept the explicit `usize` and return `MetaResult<usize>`, applying `STUDIOFS_PG_POOL_SIZE` first and rejecting values that are not positive integers. `PgConnectionPool::new` in `runtime.rs` must accept `max_size: usize`, return `MetaResult<Self>`, reject zero, set `max_size` to that value, and initialize `active_slots` with `Semaphore::new(max_size)`.
+The default for both structs is `pg_pool_size = 4`. The private resolver in `pg_engine.rs` must accept the explicit `usize` and return `MetaResult<usize>`, applying `STUDIOFS_PG_POOL_SIZE` first and rejecting values that are not positive integers. `PgConnectionPool::new` in `runtime.rs` must accept `max_size: usize`, return `MetaResult<Self>`, reject zero or values above Tokio's semaphore limit before construction, set `max_size` to that value, and initialize `active_slots` with `Semaphore::new(max_size)`.
 
 `PgMetaEngine::open_with_options` and `PgSnapshotBackend::open` remain the existing public entry points; neither adds pool size to persisted `PostgresConfig`. The implementation continues to use `tokio-postgres` clients and the existing `tokio` runtime, with no new dependency.
 
@@ -181,3 +182,4 @@ The default for both structs is `pg_pool_size = 4`. The private resolver in `pg_
 2026-08-29 10:15 +03:00 — Completed implementation and focused verification. Documentation, CLI help, option propagation, resolver tests, pool-capacity blocking, cancellation, and connection reuse all have recorded passing evidence; the complete change set is ready to commit.
 2026-08-29 10:20 +03:00 — Committed the complete change set with message `feat: make postgres pool size a client runtime setting`.
 2026-08-29 — Verified the attached code review against current callers and contracts. Corrected the zero-value environment error to identify STUDIOFS_PG_POOL_SIZE; deferred options-API, type, builder, and polling suggestions as out of scope or contrary to the existing concurrency test contract.
+2026-08-29 — Verified the follow-up review finding against Tokio 1.49. Added a bounded capacity check before semaphore construction and a regression test for oversized pool sizes.
