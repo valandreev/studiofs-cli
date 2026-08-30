@@ -2881,6 +2881,49 @@ mod open_cache_snapshot_tests {
 
         assert_eq!(read, payload);
     }
+
+    #[test]
+    fn read_after_volatile_flush_and_release_preserves_local_data() {
+        let fixture = ContractVfsFixture::new("macfuse-read-after-volatile-release")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                CONTRACT_ROOT_INO,
+                b"read-after-volatile-release.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let payload = vec![0xB7; 256 * 1024];
+
+        let writer = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open write-capable file");
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, &payload)
+            .expect("write payload");
+        adapter
+            .flush(attr.ino, writer.file_handle())
+            .expect("volatile flush payload");
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer");
+
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader immediately after release");
+        let read = adapter
+            .read(attr.ino, reader.file_handle(), 0, payload.len() as u32)
+            .expect("read should preserve locally accepted bytes");
+
+        assert_eq!(read, payload);
+        adapter
+            .release(attr.ino, reader.file_handle())
+            .expect("release reader");
+    }
 }
 
 fn bridge_attr_to_stat(attr: &BridgeFileAttr) -> stat {

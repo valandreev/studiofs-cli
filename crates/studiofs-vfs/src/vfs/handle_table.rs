@@ -114,9 +114,30 @@ impl HandleTable {
     }
 
     /// Close a file handle. Returns `(ino, remaining_open_count)`.
+    #[cfg(test)]
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
+        self.close_with(fh, |_, _| {})
+    }
+
+    /// Close a file handle, invoking `before_remove` while the table lock still
+    /// makes the handle and its last-handle status visible.
+    pub(super) fn close_with<F>(&self, fh: u64, before_remove: F) -> Option<(OpenFile, u32)>
+    where
+        F: FnOnce(&OpenFile, u32),
+    {
         let mut handles = self.handles.write();
-        let open_file = handles.handles.remove(&fh)?;
+        let open_file = handles.handles.get(&fh)?;
+        let remaining = handles
+            .counts
+            .get(&open_file.ino)
+            .expect("inode must exist in counts if handle existed")
+            .open
+            .saturating_sub(1);
+        before_remove(open_file, remaining);
+        let open_file = handles
+            .handles
+            .remove(&fh)
+            .expect("handle must remain present while the table is locked");
         if let Some(handle_ids) = handles.handles_by_inode.get_mut(&open_file.ino) {
             handle_ids.remove(&fh);
             if handle_ids.is_empty() {
@@ -135,7 +156,7 @@ impl HandleTable {
             );
             counts_for_inode.write = counts_for_inode.write.saturating_sub(1);
         }
-        let remaining = counts_for_inode.open;
+        debug_assert_eq!(counts_for_inode.open, remaining);
         if counts_for_inode.open == 0 {
             handles.counts.remove(&open_file.ino);
         }
@@ -244,6 +265,20 @@ mod tests {
         let (_, remaining) = ht.close(opened.fh).expect("opened handle must be closable");
         assert_eq!(remaining, 0);
         assert!(!ht.handles.read().counts.contains_key(&42));
+    }
+
+    #[test]
+    fn close_with_calls_last_handle_callback_before_removing_handle() {
+        let ht = HandleTable::new();
+        let opened = ht.open(42, OpenFlags::RDWR, None, false);
+
+        let closed = ht.close_with(opened.fh, |open_file, remaining| {
+            assert_eq!(open_file.fh, opened.fh);
+            assert_eq!(remaining, 0);
+        });
+
+        assert!(closed.is_some());
+        assert!(ht.get(opened.fh).is_none());
     }
 
     #[test]

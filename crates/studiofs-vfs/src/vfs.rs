@@ -5949,18 +5949,35 @@ impl StudioVfs {
                 .read_into(object_id, data_offset, out)
         });
         self.record_local_cache_io_timing(timing);
-        if let Some(read) = result {
+        let primary_read = if let Some(read) = result {
             if read > out.len() {
                 return Err(VfsError::Other(format!(
                     "local backend returned oversized read: object_id={object_id}, read={read}, out_len={}",
                     out.len()
                 )));
             }
-            self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);
-            Ok(Some(read))
+            if read == out.len() {
+                self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);
+                return Ok(Some(read));
+            }
+            Some(read)
         } else {
-            Ok(None)
+            None
+        };
+        if let Some(payload) = self.upload_stage_get_async(object_id).await? {
+            if data_offset >= payload.len() {
+                return Ok(Some(0));
+            }
+            let available = payload.len() - data_offset;
+            let read = available.min(out.len());
+            out[..read].copy_from_slice(&payload[data_offset..data_offset + read]);
+            self.record_foreground_local_payload_read(read as u64, 0);
+            return Ok(Some(read));
         }
+        if let Some(read) = primary_read {
+            self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);
+        }
+        Ok(primary_read)
     }
 
     async fn payload_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {

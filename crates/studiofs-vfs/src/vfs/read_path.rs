@@ -2077,7 +2077,7 @@ mod tests {
     use std::any::Any;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
     use std::time::Instant;
     use studiofs_cache::local::{
         LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
@@ -2190,6 +2190,7 @@ mod tests {
         get_calls: AtomicU64,
         read_into_calls: AtomicU64,
         advise_will_need_calls: AtomicU64,
+        force_short_read: AtomicBool,
     }
 
     impl CountingLocalPayloadBackend {
@@ -2199,6 +2200,7 @@ mod tests {
                 get_calls: AtomicU64::new(0),
                 read_into_calls: AtomicU64::new(0),
                 advise_will_need_calls: AtomicU64::new(0),
+                force_short_read: AtomicBool::new(false),
             }
         }
 
@@ -2220,6 +2222,10 @@ mod tests {
         fn advise_will_need_calls(&self) -> u64 {
             self.advise_will_need_calls.load(AtomicOrdering::Relaxed)
         }
+
+        fn set_force_short_read(&self, force: bool) {
+            self.force_short_read.store(force, AtomicOrdering::Relaxed);
+        }
     }
 
     impl LocalPayloadBackend for CountingLocalPayloadBackend {
@@ -2234,7 +2240,12 @@ mod tests {
 
         fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
             self.read_into_calls.fetch_add(1, AtomicOrdering::Relaxed);
-            self.inner.read_into(object_id, data_offset, out)
+            let read = self.inner.read_into(object_id, data_offset, out);
+            if self.force_short_read.load(AtomicOrdering::Relaxed) {
+                read.map(|read| read.min(1))
+            } else {
+                read
+            }
         }
 
         fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
@@ -2495,6 +2506,83 @@ mod tests {
                 s3_gets_before,
                 "prefetch must not query S3 for a payload that remains in the upload stage"
             );
+        });
+    }
+
+    #[test]
+    fn pending_extent_read_uses_upload_stage_after_primary_eviction() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-pending-upload-stage");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_003;
+            let data = Bytes::from_static(b"pending extent upload stage");
+            vfs.local_payload_backend()
+                .put(object_id, data.as_ref(), false)
+                .expect("persist local payload");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_id])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_id)
+                .await
+                .expect("evict primary local payload");
+
+            assert!(
+                DataReader::has_local_payload_for_read(&vfs, object_id),
+                "pending extent setup must retain a readable local stage"
+            );
+            let segment = ReadSegment {
+                range: read_range(0, data.len() as u64),
+                source: ReadSegmentSource::PendingExtent {
+                    object_id,
+                    block_offset: 0,
+                },
+            };
+            let mut out = vec![0; data.len()];
+
+            DataReader::assemble_into(&vfs, 0, &[segment], &mut out)
+                .await
+                .expect("pending extent read should resolve the staged payload");
+
+            assert_eq!(out, data);
+        });
+    }
+
+    #[test]
+    fn pending_extent_read_uses_upload_stage_after_short_primary_read() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-pending-upload-stage-short");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_004;
+            let data = Bytes::from_static(b"pending extent survives a short primary read");
+            vfs.local_payload_backend()
+                .put(object_id, data.as_ref(), false)
+                .expect("persist local payload");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_id])
+                .expect("link payload into upload stage");
+            counting_backend.set_force_short_read(true);
+
+            let segment = ReadSegment {
+                range: read_range(0, data.len() as u64),
+                source: ReadSegmentSource::PendingExtent {
+                    object_id,
+                    block_offset: 0,
+                },
+            };
+            let mut out = vec![0; data.len()];
+
+            DataReader::assemble_into(&vfs, 0, &[segment], &mut out)
+                .await
+                .expect("pending extent read should recover from staged payload");
+
+            assert_eq!(out, data);
         });
     }
 

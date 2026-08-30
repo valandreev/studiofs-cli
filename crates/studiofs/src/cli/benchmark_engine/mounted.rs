@@ -96,6 +96,7 @@ const PHASE_UPLOAD_DRAIN_WAIT: &str = "upload-drain-wait";
 const PHASE_POST_UPLOAD_READ: &str = "post-upload-read";
 const PHASE_STAT: &str = "stat";
 const PHASE_HOT_READ: &str = "hot-read";
+const PHASE_LARGE_HOT_READ_BEST4: &str = "large-hot-read-best4";
 const PHASE_PSEUDO_RANDOM_READ: &str = "pseudo-random-read";
 const PHASE_SEQUENTIAL_MEDIUM_READ: &str = "sequential-medium-read";
 const LEGACY_POST_UPLOAD_READ_FALLBACK_REASON: &str =
@@ -2191,6 +2192,33 @@ fn best_read_phases(mut phases: Vec<TimedPhaseTelemetry>, count: usize) -> Timed
     TimedPhaseTelemetry { telemetry, wall }
 }
 
+fn public_read_phase_reports(
+    observation: &PendingUploadObservation,
+    phases: &PublicBenchReadPhaseTelemetry,
+    pending_uploads_after: usize,
+) -> Vec<MountedLocalFirstReadPhaseReport> {
+    [
+        (PHASE_HOT_READ, &phases.hot_read),
+        (PHASE_LARGE_HOT_READ_BEST4, &phases.large_hot_read_best4),
+        (PHASE_PSEUDO_RANDOM_READ, &phases.pseudo_random_read),
+        (PHASE_SEQUENTIAL_MEDIUM_READ, &phases.sequential_medium_read),
+    ]
+    .into_iter()
+    .map(|(phase, timed)| MountedLocalFirstReadPhaseReport {
+        phase: phase.to_string(),
+        wait_target: observation.target.label().to_string(),
+        target_state_observed: observation.observed,
+        valid_for_target: observation.observed,
+        required_pending_uploads: observation.required_pending_uploads,
+        wait_ms: 0.0,
+        pending_uploads_before: observation.pending_uploads,
+        pending_uploads_after,
+        validation_message: pending_upload_validation_message(observation),
+        results: phase_telemetry_to_report(&timed.telemetry, timed.wall),
+    })
+    .collect()
+}
+
 fn operation_log_targets(files: &[WorkFile]) -> Arc<[Arc<str>]> {
     files
         .iter()
@@ -3449,6 +3477,31 @@ pub(crate) async fn run_mounted_end_to_end(
                                 )
                                 .await;
 
+                            let public_read_phase_result = PublicBenchReadPhaseResult {
+                                telemetry: PublicBenchReadPhaseTelemetry {
+                                    first_read,
+                                    hot_read,
+                                    large_hot_read_best4,
+                                    pseudo_random_read,
+                                    sequential_medium_read,
+                                },
+                                runtime_stats_after_first_read,
+                                runtime_stats_after_hot_read,
+                                runtime_stats_after_pseudo_random_read,
+                                runtime_stats_after_sequential_medium_read,
+                                runtime_stats_warnings: public_runtime_stats_warnings,
+                            };
+                            let pending_uploads_after =
+                                scan_pending_uploads(metrics_path, mount_pid, Some(upload_dir))
+                                    .await?;
+                            let mut comparison_phases =
+                                vec![during_phase, drain_phase, first_phase];
+                            comparison_phases.extend(public_read_phase_reports(
+                                &idle_observation,
+                                &public_read_phase_result.telemetry,
+                                pending_uploads_after,
+                            ));
+
                             let final_snapshot = match metrics_path {
                                 Some(path) => {
                                     read_write_path_observability_snapshot(path, mount_pid).await?
@@ -3460,23 +3513,10 @@ pub(crate) async fn run_mounted_end_to_end(
                                 MountedLocalFirstReadComparisonReport {
                                     cache_path: cache_path.display().to_string(),
                                     upload_dir: upload_dir.display().to_string(),
-                                    phases: vec![during_phase, drain_phase, first_phase],
+                                    phases: comparison_phases,
                                 },
                                 final_snapshot,
-                                PublicBenchReadPhaseResult {
-                                    telemetry: PublicBenchReadPhaseTelemetry {
-                                        first_read,
-                                        hot_read,
-                                        large_hot_read_best4,
-                                        pseudo_random_read,
-                                        sequential_medium_read,
-                                    },
-                                    runtime_stats_after_first_read,
-                                    runtime_stats_after_hot_read,
-                                    runtime_stats_after_pseudo_random_read,
-                                    runtime_stats_after_sequential_medium_read,
-                                    runtime_stats_warnings: public_runtime_stats_warnings,
-                                },
+                                public_read_phase_result,
                             ))
                         },
                     )
@@ -4006,6 +4046,35 @@ mod tests {
             report.workload.large_file_size_bytes,
             4 * 1024 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn operational_read_phase_reports_retain_all_public_read_phases() {
+        let observation = PendingUploadObservation {
+            target: PendingUploadTarget::Idle,
+            observed: true,
+            required_pending_uploads: 0,
+            waited: Duration::from_millis(25),
+            pending_uploads: 0,
+        };
+        let phases = test_public_read_phases();
+
+        let reports = public_read_phase_reports(&observation, &phases, 0);
+
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                PHASE_HOT_READ,
+                "large-hot-read-best4",
+                PHASE_PSEUDO_RANDOM_READ,
+                PHASE_SEQUENTIAL_MEDIUM_READ,
+            ]
+        );
+        assert!(reports.iter().all(|report| report.valid_for_target));
+        assert!(reports.iter().all(|report| report.results.operations > 0));
     }
 
     #[test]

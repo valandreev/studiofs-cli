@@ -5,8 +5,10 @@
 This document is the checked-in source of truth for the macFUSE FSKit backend
 contract and the legacy macOS baseline required before SFS-669, SFS-671, and
 SFS-672. It records the contract and the reproducible measurement procedure;
-it does not implement an FSKit provider, change `StudioVfs`, change metadata,
-change S3/cache semantics, or remove the production backend.
+it does not implement an FSKit provider, change metadata or S3/cache semantics,
+or remove the production backend. The preflight did require a narrow local VFS
+release/read correctness repair, recorded below; it adds no foreground remote
+wait.
 
 The selected host for this baseline is the current Apple Silicon Mac:
 
@@ -95,6 +97,41 @@ options, and macFUSE version. A version change invalidates the comparison.
   handle is dropped. This isolates the observed failure to the local
   materialization/release visibility boundary, not PostgreSQL latency.
 - 2026-08-30: A missing metric is recorded as unavailable, never as zero.
+- 2026-08-30: Reproduced the close/read race at the shared VFS seam. A
+  write-capable handle can be closed by the kernel after the next reader has
+  already opened the inode; registering the release barrier only after handle
+  removal leaves that reader ahead of local materialization. A staged upload
+  payload can also outlive an evicted or short primary local read.
+- 2026-08-30: Added the narrow local repair: release registers the local
+  barrier while the handle table still exposes last-handle state, retains it
+  while materialization is in flight, and reads fall back to the local upload
+  stage after a short/evicted primary read. The barrier is local and does not
+  await PostgreSQL, S3, or metadata replication.
+- 2026-08-30: The release `devbench` control with 1000 small files plus one
+  256MiB file completed all content-validated read phases successfully. The
+  report is `target/perf/sfs-668-devbench-1000-full/report.json`; only the
+  optional 1000MiB/s write-throughput target remains below threshold.
+- 2026-08-30: The release single-file 4GiB `devbench` control completed
+  during-upload, first, hot, large-hot, and pseudo-random reads with strict
+  content validation and no mismatch/EOF. Its report is
+  `target/perf/sfs-668-devbench-4g-single/report.json`; its write-throughput
+  and peak-RSS diagnostics do not meet the optional gate.
+- 2026-08-30: The clean five-run 256MiB operational matrix completed with all
+  read phases and content checks valid. The full public `studiofs bench`
+  workload was retried after the repair but did not produce a terminal report:
+  the client stalled in FUSE open/close while diagnostics connections were
+  saturated, so that run is non-qualifying rather than a correctness result.
+- 2026-08-30: A combined 1000-small-file plus 4GiB `devbench` control also did
+  not reach read validation. The client blocked in FUSE `close` while the
+  daemon sample stayed in serial `getattr` work that decodes all regular-file
+  chunk states into nested `BTreeMap`s; `mdworker` processes were active on the
+  host, consistent with host metadata-indexing pressure. The run was stopped
+  after SIGINT failed to unblock it and is excluded from baseline data. It
+  produced no mismatch/EOF and no evidence of a foreground PostgreSQL wait.
+- 2026-08-30: The first post-repair standalone `dd conv=fsync` probe could not
+  create its exact probe directory: `mkdir` blocked in mounted FUSE before
+  `dd` started or any bytes were timed. No fsync sample was accepted; the
+  metric remains unavailable rather than zero.
 
 ## Surprises and discoveries
 
@@ -120,17 +157,27 @@ options, and macFUSE version. A version change invalidates the comparison.
    baseline. Process provenance is part of the measurement contract and must
    be checked before interpreting throughput or callback latency.
 7. The mounted benchmark writer calls `flush()` and then drops the file. The
-   legacy adapter maps that flush to volatile writeback, while last-handle
-   release schedules its local barrier asynchronously. A following open/read
-   can therefore reach the local metadata path before the deferred barrier is
-   registered or complete. The `studiofs-bench` `sync_all` control passes at
-   1GiB, while the equivalent volatile `devbench` workload fails with a
-   zero-filled first block. This is a local close/read correctness seam, not
-   a PostgreSQL round trip.
-8. The `devbench` engine executes the public first/hot/random/medium phases
-   when a cache path is available, but its report only persists those phase
-   metrics for `studiofs bench`. Operational `devbench` reports must not be
-   presented as a complete public phase baseline.
+   legacy adapter maps that flush to volatile writeback, while the kernel can
+   deliver the next open before the writer's release callback. The repaired
+   release path registers a local barrier before removing the handle and keeps
+   it through in-flight materialization; the read path also consults the local
+   upload stage after a short or evicted primary read. This is a local
+   close/read correctness seam, not a PostgreSQL round trip.
+8. The `studiofs-bench` `sync_all` control passes at 1GiB, and the repaired
+   volatile `devbench` controls pass at 256MiB with 1000 small files and at
+   4GiB with one file. The full public run still needs a clean terminal report
+   before it can be accepted as the primary baseline.
+9. The `devbench` engine executes the public first/hot/random/medium phases
+   when a cache path is available, and its mounted report now retains those
+   phase metrics. A report with a zero-file optional phase is still not a
+   successful sample for that workload.
+10. The combined 1000-small-file plus 4GiB control separates a client-side FUSE
+    close wait from payload correctness: the client did not reach reads, while
+    the daemon was servicing expensive metadata reconstruction. This is
+    non-qualifying host/FUSE pressure evidence, not a PostgreSQL-latency result.
+11. A standalone fsync probe can be blocked before the timed syscall by the
+    same mounted metadata pressure. The absence of a sample is therefore an
+    unavailable measurement, not evidence of zero fsync latency.
 
 ## Decision log
 
@@ -143,6 +190,7 @@ options, and macFUSE version. A version change invalidates the comparison.
 | Treat unsupported FSKit capabilities as explicit parity blockers | Silent degradation would violate correctness and make SFS-672 incomparable. |
 | Require five successful runs per mandatory workload | One point estimate cannot distinguish a win from host noise. |
 | Use a reduced operational matrix on this test volume | The reference 1GB/1000-file end-to-end write profile is too long for five repetitions; the selected matrix isolates a reproducible workload while writer-stack/cache behavior is investigated. |
+| Keep the local release/read repair in this preflight | The observed zero-filled read was a correctness failure at the shared VFS seam; deferring it to FSKit would leave the legacy contract unverified. The repair adds no foreground remote wait and preserves the metadata, payload, cache, and replication contracts. |
 
 ## Local-first metadata boundary and observed foreground path
 
@@ -186,19 +234,25 @@ tokio::fs::File::flush()
 
 `flush_volatile_writeback_with_outcome` waits for an already registered
 deferred release, checks local metadata health, and schedules materialization;
-it is intentionally not the strict `fsync_fh` barrier. The release callback
-registers and executes its last-handle local barrier in a background task.
-`read_into_fh` waits for a registered release barrier, but it cannot wait for a
-release callback that the kernel has not delivered yet. This is consistent with
-the observed preflight failures: the read can see a file whose local state is
-not yet represented by a materialized first block.
+it is intentionally not the strict `fsync_fh` barrier. The repaired release
+path invokes its decision callback while the handle table still exposes the
+closing handle and its remaining-handle count. It registers the local barrier
+for a final release and for a write-capable release with pending local state,
+then retains that barrier while materialization is in flight. `read_into_fh`
+waits for the registered barrier even when the reader was opened before the
+writer's release callback arrived.
 
-The control result is narrow and reproducible: `studiofs-bench` calls
-`sync_all` and passes at 1GiB; the volatile `devbench` path fails at 1GiB and
-at the public ~4.2GiB size. No production VFS, metadata, S3, or replication
-change is part of SFS-668. The baseline remains blocked on deciding whether
-the contract requires a synchronous close/read guarantee or whether the
-volatile benchmark must establish an explicit local barrier before validation.
+`payload_store_read_into_async` first uses the hot upload memory and primary
+local payload. If that read is short or absent, it falls back to the local
+upload-stage payload before returning. That closes the second local visibility
+gap without turning a read into a PostgreSQL or S3 request.
+
+The control result is now narrow and reproducible: `studiofs-bench` calls
+`sync_all` and passes at 1GiB; the repaired volatile `devbench` path passes
+strict content validation with 1000 small files plus a 256MiB file and with a
+single 4GiB file, including reads while upload is active. The local correctness
+gate is green for these controls. The full public workload still has no valid
+terminal report, so the primary performance baseline remains open.
 
 ## Current legacy macFUSE architecture
 
@@ -481,30 +535,38 @@ not sufficient if a material regression or correctness failure is present.
 | `studiofs-bench` 64MiB / 100 files / release / `--no-batch-fsync` | Passed | Supplemental sequential control; report `studiofs-bench-report-1788039141-0.json`. |
 | `studiofs bench` public workload / release | Failed on large file 001080 at offset 0: expected `0x5f`, got `0x00` | Correctness preflight failure; excluded. |
 | 1GiB large file / 1000 small files / `devbench` / release | Failed on large file 000000 at offset 0: expected `0x86`, got `0x00` | Correctness preflight failure; excluded. |
+| 256MiB large file / 1000 small files / `devbench` / release after local repair | 1001 files; all during-upload, first, hot, large-hot, and pseudo-random phases content-valid; no mismatch/EOF | Correctness control; write target not met; report `target/perf/sfs-668-devbench-1000-full/report.json`. |
+| 4GiB single file / `devbench` / release after local repair | All content-validated read phases passed; no mismatch/EOF | Correctness/size control; write and RSS targets not met; report `target/perf/sfs-668-devbench-4g-single/report.json`. |
+| 4GiB single file / `studiofs-bench` / release | Two mounted streaming passes completed with batch fsync | Throughput-only control; it does not validate payload content; report `target/perf/sfs-668-studiofs-bench-4g/studiofs-bench-report-1788065947-0.json`. |
+| `studiofs bench` public workload / release after local repair | Write completed, but read stalled in FUSE open/close under diagnostics socket saturation; no terminal report | Non-qualifying harness/observability run; excluded, not a correctness failure. |
+| 1000 small files + 4GiB large file / `devbench` / release after local repair | Did not reach read validation; client blocked in FUSE `close` while daemon serviced serial `getattr`/regular-file chunk-state reconstruction; no mismatch/EOF | Non-qualifying host/FUSE metadata-pressure run; excluded, not a PostgreSQL or correctness failure. Run `8030d02b-a61b-4e4a-adb2-80fdd0c1d980`; no terminal report. |
+| Standalone 64MiB `dd conv=fsync` probe / release after local repair | Probe directory creation blocked in mounted FUSE before `dd` started | No timing sample accepted; unavailable, not zero. |
 | `studiofs-bench` 1GiB / single file / release / batch fsync | Passed | Strict-sync control; report `target/perf/sfs-668-public/studiofs-bench-report-1788039842-0.json`. |
 | `studiofs-bench` 1GiB / single file / release / `--no-batch-fsync` | Passed | Strict-sync control; report `target/perf/sfs-668-public/studiofs-bench-report-1788039826-0.json`. |
 
 ### Five-run matrix
 
-Populate this table only from the five raw `report.json` files and the
-flush/fsync probe in `target/perf/sfs-668-legacy-256m`. A row with a missing
-sample is incomplete, not zero.
+Populate this table only from the five raw `report.json` files and a matching
+flush/fsync probe in `target/perf`. A row with a missing sample is incomplete,
+not zero. The values below are from the clean post-repair matrix at
+`target/perf/sfs-668-post-fix-256m-clean/macos-bench-validation-20260830-040948`.
 
 | Workload | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median | Sample variance | Status |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| cold sequential read (`first-read`, MiB/s) | 351.42 | 666.50 | 439.33 | 455.55 | 766.74 | 455.55 | 30038.84 | pass in operational matrix |
-| warm repeated sequential read | pending | pending | pending | pending | pending | pending | pending | pending |
-| random read | pending | pending | pending | pending | pending | pending | pending | pending |
-| large-file read throughput (MiB/s) | 322.96 | 576.31 | 907.34 | 494.02 | 546.49 | 546.49 | 45299.19 | pass in operational matrix |
-| write throughput (MiB/s) | 360.49 | 344.81 | 366.93 | 371.10 | 338.72 | 360.49 | 197.66 | pass in operational matrix |
-| flush/fsync latency (64MiB write+`fsync(2)`, s) | 0.17 | 0.25 | 0.15 | 0.16 | 0.15 | 0.16 | 0.00178 | pass; strict local probe |
-| metadata-heavy directory traversal/file-open (stat p95, ms) | 0.116 | 1.229 | 0.104 | 0.086 | 0.132 | 0.116 | 0.25 | pass in operational matrix |
+| cold sequential read (`first-read`, MiB/s) | 1858.3469 | 1422.6459 | 1500.6913 | 988.7105 | 1614.2301 | 1500.6913 | 101549.942746 | pass in operational matrix |
+| warm repeated sequential read (`hot-read`, MiB/s) | 2633.1726 | 1148.0529 | 1417.8162 | 2598.6532 | 1553.0263 | 1553.0263 | 484879.516640 | pass in operational matrix |
+| random read (`pseudo-random-read`, MiB/s) | 82.9873 | 156.9003 | 156.4072 | 156.6612 | 148.4474 | 156.4072 | 1038.455307 | pass in operational matrix |
+| large-file read throughput (`large-hot-read-best4`, MiB/s) | 15587.6971 | 15271.5777 | 15313.7903 | 15119.8309 | 15803.2210 | 15313.7903 | 74597.201032 | pass in operational matrix |
+| write throughput (MiB/s) | 437.8385 | 379.3777 | 409.3612 | 400.9029 | 384.5633 | 400.9029 | 538.690350 | correctness pass; optional write target not met |
+| flush/fsync latency (64MiB write+`fsync(2)`, s) | pending | pending | pending | pending | pending | pending | pending | unavailable for this post-repair set |
+| metadata-heavy directory traversal/file-open (stat p95, ms) | 8.2157 | 0.0790 | 0.1153 | 0.0926 | 0.0893 | 0.0926 | 13.192370 | pass in operational matrix |
 
-The baseline remains `INCOMPLETE` until this table has five successful values
-per row, public phase telemetry is retained, the standalone flush/fsync probe
-has five valid samples, and the correctness gate is green. The currently
-filled rows are operational-matrix evidence only; the public workload failure
-and local close/read barrier decision remain open.
+The local correctness baseline is now confirmed for the selected operational
+matrix and the two size controls. The primary legacy performance baseline
+remains `INCOMPLETE` until the public workload has a valid terminal report and
+the standalone flush/fsync probe has five valid samples. The five-run matrix is
+operational evidence, not an FSKit A/B result; the optional write-throughput
+target is below threshold and Windows validation is unavailable on this host.
 
 ## Validation and acceptance checklist
 
@@ -522,13 +584,17 @@ and local close/read barrier decision remain open.
 - [x] Fixed command, reference `1GB`/`1000` profile, selected operational
       matrix, artifact path, five-run policy, and reduction formula are
       checked in.
-- [ ] Five successful legacy repetitions with median/variance for every
-      mandatory workload.
-- [x] A valid standalone flush/fsync latency sample for every repetition.
+- [ ] Five successful public legacy repetitions with median/variance for every
+      mandatory workload. The selected operational matrix has five
+      correctness-clean repetitions, but the public post-repair run has no
+      valid terminal report.
+- [ ] A valid standalone flush/fsync latency sample for every repetition in
+      the post-repair artifact set.
 - [ ] FSKit A/B and zero-copy implementation; these belong to SFS-669 and
       SFS-671, with the decision gate in SFS-672.
-- [x] no production backend removal or shared VFS/meta/S3/cache contract
-      change is part of SFS-668.
+- [x] no production backend removal, metadata/S3/cache semantic change, or
+      foreground remote wait was added. The narrow local VFS release/read
+      correctness repair is explicitly documented above.
 
 The focused executable contract check is:
 
@@ -569,7 +635,11 @@ shared-contract requirement and is not claimed as validated here.
 ## Outcome and retrospective
 
 SFS-668 now has a checked-in contract, an explicit compatibility boundary, a
-version-pinned legacy measurement procedure, and a test that fails when those
-surfaces disappear from the source-of-truth document. The current operational
-baseline is intentionally still incomplete until the selected five-run matrix
-and standalone barrier probe produce valid, correctness-clean artifacts.
+version-pinned legacy measurement procedure, a local correctness repair with
+focused regression coverage, and a test that fails when those surfaces
+disappear from the source-of-truth document. The selected five-run operational
+matrix and the 256MiB/1000-file plus 4GiB correctness controls are green. The
+primary public performance baseline remains open because its post-repair runs
+did not produce a valid terminal report: the exact public run and the combined
+control were blocked in host/FUSE metadata pressure before a qualifying read
+result. The post-repair flush/fsync probe is also unavailable.
