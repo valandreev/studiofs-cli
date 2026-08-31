@@ -998,7 +998,6 @@ impl StudioVfs {
                 }
                 let vfs = Arc::clone(self);
                 self.track_background_task(runtime.spawn(async move {
-                    tokio::task::yield_now().await;
                     vfs.wait_for_deferred_materialization_inflight(ino).await;
                     drop(barrier);
                     drop(guard);

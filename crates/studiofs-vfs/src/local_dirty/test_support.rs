@@ -1374,6 +1374,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_pending_local_dirty_block_read_spans_skips_missing_local_extent() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "snapshot-pending-block-missing");
+        let ino = 82;
+        let block_index = 0;
+        let object_id = 8_006;
+
+        vfs.replace_pending_local_dirty_payload(
+            ino,
+            block_index,
+            PendingPayload::local_extent(object_id, 4),
+        );
+
+        assert!(
+            vfs.snapshot_pending_local_dirty_block_read_spans(ino, 0, 4)
+                .is_empty(),
+            "missing local extents must not panic or claim a non-readable span"
+        );
+    }
+
+    #[test]
     fn assign_reserved_object_ids_reuses_existing_ids_and_stores_new_ones() {
         let ino = 42;
         let mut pending = std::collections::HashMap::from([

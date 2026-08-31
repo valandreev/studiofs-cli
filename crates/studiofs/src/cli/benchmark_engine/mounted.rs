@@ -2204,17 +2204,20 @@ fn public_read_phase_reports(
         (PHASE_SEQUENTIAL_MEDIUM_READ, &phases.sequential_medium_read),
     ]
     .into_iter()
-    .map(|(phase, timed)| MountedLocalFirstReadPhaseReport {
-        phase: phase.to_string(),
-        wait_target: observation.target.label().to_string(),
-        target_state_observed: observation.observed,
-        valid_for_target: observation.observed,
-        required_pending_uploads: observation.required_pending_uploads,
-        wait_ms: 0.0,
-        pending_uploads_before: observation.pending_uploads,
-        pending_uploads_after,
-        validation_message: pending_upload_validation_message(observation),
-        results: phase_telemetry_to_report(&timed.telemetry, timed.wall),
+    .map(|(phase, timed)| {
+        let results = phase_telemetry_to_report(&timed.telemetry, timed.wall);
+        MountedLocalFirstReadPhaseReport {
+            phase: phase.to_string(),
+            wait_target: observation.target.label().to_string(),
+            target_state_observed: observation.observed,
+            valid_for_target: observation.observed && results.operations > 0,
+            required_pending_uploads: observation.required_pending_uploads,
+            wait_ms: 0.0,
+            pending_uploads_before: observation.pending_uploads,
+            pending_uploads_after,
+            validation_message: pending_upload_validation_message(observation),
+            results,
+        }
     })
     .collect()
 }
@@ -4075,6 +4078,31 @@ mod tests {
         );
         assert!(reports.iter().all(|report| report.valid_for_target));
         assert!(reports.iter().all(|report| report.results.operations > 0));
+    }
+
+    #[test]
+    fn zero_operation_read_phase_is_not_valid_for_target() {
+        let observation = PendingUploadObservation {
+            target: PendingUploadTarget::Idle,
+            observed: true,
+            required_pending_uploads: 0,
+            waited: Duration::from_millis(25),
+            pending_uploads: 0,
+        };
+        let mut phases = test_public_read_phases();
+        phases.pseudo_random_read = TimedPhaseTelemetry {
+            telemetry: PhaseTelemetry::default(),
+            wall: Duration::ZERO,
+        };
+
+        let reports = public_read_phase_reports(&observation, &phases, 0);
+        let report = reports
+            .iter()
+            .find(|report| report.phase == PHASE_PSEUDO_RANDOM_READ)
+            .expect("pseudo-random phase report");
+
+        assert_eq!(report.results.operations, 0);
+        assert!(!report.valid_for_target);
     }
 
     #[test]

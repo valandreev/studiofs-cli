@@ -3211,12 +3211,16 @@ impl StudioVfs {
                 let object_id = block
                     .local_extent_id()
                     .expect("local extent pending payload must have an object id");
-                assert!(
-                    self.local_payload_backend.contains(object_id)
-                        || self.cached_store.has_staged_upload(object_id)
-                        || self.cached_store.get_hot_upload(object_id).is_some(),
-                    "local payload missing during dirty read span resolution"
-                );
+                if !self.local_payload_backend.contains(object_id)
+                    && !self.cached_store.has_staged_upload(object_id)
+                    && self.cached_store.get_hot_upload(object_id).is_none()
+                {
+                    warn!(
+                        object_id,
+                        ino, "local payload missing during dirty read span resolution"
+                    );
+                    continue;
+                }
                 let block_start =
                     u64::from(*block_index).saturating_mul(u64::from(self.block_size));
                 let block_end = block_start.saturating_add(block.logical_len() as u64);

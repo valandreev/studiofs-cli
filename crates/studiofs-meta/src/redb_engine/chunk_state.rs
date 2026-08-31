@@ -96,6 +96,16 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::regular_file_chunk_states_for_inode_in_opened_table(&table, ino)
+    }
+
+    pub(super) fn regular_file_chunk_states_for_inode_in_opened_table<T>(
+        table: &T,
+        ino: Ino,
+    ) -> MetaResult<BTreeMap<ChunkId, RegularFileChunkState>>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
         let prefix = regular_file_chunk_prefix(ino);
         let mut chunks = BTreeMap::new();
         for row in table
@@ -116,21 +126,36 @@ impl RedbMetaEngine {
         txn: &redb::ReadTransaction,
         ino: Ino,
     ) -> MetaResult<bool> {
-        let overlay = Self::regular_file_chunk_states_for_inode_in_read_txn(
-            txn,
-            REGULAR_FILE_OVERLAY_TABLE,
+        let overlay_table = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_table = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::regular_file_overlay_differs_from_base_in_opened_tables(
+            &overlay_table,
+            &base_table,
             ino,
-        )?;
+        )
+    }
+
+    pub(super) fn regular_file_overlay_differs_from_base_in_opened_tables<TOverlay, TBase>(
+        overlay_table: &TOverlay,
+        base_table: &TBase,
+        ino: Ino,
+    ) -> MetaResult<bool>
+    where
+        TOverlay: ReadableTable<&'static [u8], &'static [u8]>,
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let overlay =
+            Self::regular_file_chunk_states_for_inode_in_opened_table(overlay_table, ino)?;
         let overlay_signature = Self::regular_file_graph_signature(&overlay);
         if overlay_signature.is_empty() {
             return Ok(false);
         }
 
-        let base = Self::regular_file_chunk_states_for_inode_in_read_txn(
-            txn,
-            REGULAR_FILE_BASE_TABLE,
-            ino,
-        )?;
+        let base = Self::regular_file_chunk_states_for_inode_in_opened_table(base_table, ino)?;
         Ok(overlay_signature != Self::regular_file_graph_signature(&base))
     }
 

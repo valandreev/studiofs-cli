@@ -559,6 +559,20 @@ impl RedbMetaEngine {
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
+        Self::local_overlay_attr_inode_from_opened_tables(&current, &base, &tombstones, ino)
+    }
+
+    fn local_overlay_attr_inode_from_opened_tables<TCurrent, TBase, TTombstones>(
+        current: &TCurrent,
+        base: &TBase,
+        tombstones: &TTombstones,
+        ino: Ino,
+    ) -> MetaResult<bool>
+    where
+        TCurrent: ReadableTable<u64, &'static [u8]>,
+        TBase: ReadableTable<u64, &'static [u8]>,
+        TTombstones: ReadableTable<u64, u8>,
+    {
         if tombstones
             .get(ino)
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -742,10 +756,40 @@ impl MetaInodes for RedbMetaEngine {
             return Ok(Vec::new());
         }
         let txn = self.begin_read_txn()?;
+        let current = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_chunks = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_chunks = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut attrs = Vec::with_capacity(inos.len());
         for &ino in inos {
-            let prefer_current = Self::prefer_current_attr_for_inode_from_txn(&txn, ino)?;
-            match Self::resolve_attr_with_preference_in_read_snapshot(&txn, ino, prefer_current) {
+            let prefer_current = Self::regular_file_overlay_differs_from_base_in_opened_tables(
+                &overlay_chunks,
+                &base_chunks,
+                ino,
+            )? || Self::local_overlay_attr_inode_from_opened_tables(
+                &current,
+                &base,
+                &tombstones,
+                ino,
+            )?;
+            match Self::resolve_attr_from_opened_tables(
+                &base,
+                &current,
+                &tombstones,
+                ino,
+                prefer_current,
+            ) {
                 Ok(attr) => attrs.push(attr),
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(err) => return Err(err),
