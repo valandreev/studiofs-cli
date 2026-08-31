@@ -97,18 +97,13 @@ impl RedbMetaEngine {
             return Ok(Some(stored_lifecycle));
         }
 
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-        let attr = match Self::resolve_attr_in_read_snapshot(
-            &txn,
-            ino,
-            &overlay_block_inodes,
-            &overlay_attr_inodes,
-        ) {
-            Ok(attr) => attr,
-            Err(MetaError::InodeNotFound(_)) => return Ok(Some(stored_lifecycle)),
-            Err(error) => return Err(error),
-        };
+        let prefer_current = Self::prefer_current_attr_for_inode_from_txn(&txn, ino)?;
+        let attr =
+            match Self::resolve_attr_with_preference_in_read_snapshot(&txn, ino, prefer_current) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => return Ok(Some(stored_lifecycle)),
+                Err(error) => return Err(error),
+            };
         if attr.kind != FileType::RegularFile {
             return Ok(Some(stored_lifecycle));
         }
@@ -550,6 +545,51 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
+    fn local_overlay_attr_inode_from_txn(
+        txn: &redb::ReadTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        let current = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        if tombstones
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+
+        let current = current
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = base
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(match (current, base) {
+            (Some(current), Some(base)) => current.value() != base.value(),
+            (Some(_), None) => true,
+            (None, _) => false,
+        })
+    }
+
+    fn prefer_current_attr_for_inode_from_txn(
+        txn: &redb::ReadTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        Ok(
+            Self::regular_file_overlay_differs_from_base_in_read_txn(txn, ino)?
+                || Self::local_overlay_attr_inode_from_txn(txn, ino)?,
+        )
+    }
+
     pub(super) fn local_overlay_attr_inodes_from_txn(
         txn: &redb::ReadTransaction,
     ) -> MetaResult<HashSet<Ino>> {
@@ -572,6 +612,17 @@ impl RedbMetaEngine {
         overlay_block_inodes: &HashSet<Ino>,
         overlay_attr_inodes: &HashSet<Ino>,
     ) -> MetaResult<InodeAttr> {
+        let prefer_current =
+            overlay_attr_inodes.contains(&ino) || overlay_block_inodes.contains(&ino);
+
+        Self::resolve_attr_with_preference_in_read_snapshot(txn, ino, prefer_current)
+    }
+
+    fn resolve_attr_with_preference_in_read_snapshot(
+        txn: &redb::ReadTransaction,
+        ino: Ino,
+        prefer_current: bool,
+    ) -> MetaResult<InodeAttr> {
         let current = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -581,9 +632,6 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let prefer_current =
-            overlay_attr_inodes.contains(&ino) || overlay_block_inodes.contains(&ino);
 
         Self::resolve_attr_from_opened_tables(&base, &current, &tombstones, ino, prefer_current)
     }
@@ -677,9 +725,8 @@ impl MetaInodes for RedbMetaEngine {
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
         let txn = self.begin_read_txn()?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
-        Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
+        let prefer_current = Self::prefer_current_attr_for_inode_from_txn(&txn, ino)?;
+        Self::resolve_attr_with_preference_in_read_snapshot(&txn, ino, prefer_current)
     }
 
     fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
@@ -695,16 +742,10 @@ impl MetaInodes for RedbMetaEngine {
             return Ok(Vec::new());
         }
         let txn = self.begin_read_txn()?;
-        let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
-        let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
         let mut attrs = Vec::with_capacity(inos.len());
         for &ino in inos {
-            match Self::resolve_attr_in_read_snapshot(
-                &txn,
-                ino,
-                &overlay_block_inodes,
-                &overlay_attr_inodes,
-            ) {
+            let prefer_current = Self::prefer_current_attr_for_inode_from_txn(&txn, ino)?;
+            match Self::resolve_attr_with_preference_in_read_snapshot(&txn, ino, prefer_current) {
                 Ok(attr) => attrs.push(attr),
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(err) => return Err(err),

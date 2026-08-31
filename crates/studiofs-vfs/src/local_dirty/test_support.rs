@@ -1293,6 +1293,87 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_pending_dirty_slice_read_spans_uses_upload_stage_after_primary_eviction() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "snapshot-pending-stage");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let ino = 80;
+            let block_index = 4;
+            let object_id = 8_004;
+            let data = Bytes::from_static(b"staged local payload");
+
+            vfs.payload_store_put_async(object_id, data.clone(), false)
+                .await
+                .expect("persist local payload");
+            vfs.cached_store
+                .link_upload_stage_batch(&[object_id])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_id)
+                .await
+                .expect("evict primary local payload");
+
+            vfs.state
+                .local_dirty
+                .pending_chunk_slices
+                .lock()
+                .entry(ino)
+                .or_default()
+                .entry(0)
+                .or_default()
+                .push(PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(100, 106).expect("slice range"),
+                    block_index,
+                    2,
+                    7,
+                    object_id,
+                    0,
+                ));
+
+            let spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, 102, 4);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].object_id, Some(object_id));
+            assert_eq!(spans[0].block_offset, 2);
+            assert_eq!(spans[0].data, Bytes::new());
+        });
+    }
+
+    #[test]
+    fn snapshot_pending_local_dirty_block_read_spans_uses_upload_stage_after_primary_eviction() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "snapshot-pending-block-stage");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let ino = 81;
+            let block_index = 0;
+            let object_id = 8_005;
+            let data = Bytes::from_static(b"staged local payload");
+
+            vfs.payload_store_put_async(object_id, data.clone(), false)
+                .await
+                .expect("persist local payload");
+            vfs.cached_store
+                .link_upload_stage_batch(&[object_id])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_id)
+                .await
+                .expect("evict primary local payload");
+            vfs.replace_pending_local_dirty_payload(
+                ino,
+                block_index,
+                PendingPayload::local_extent(object_id, data.len()),
+            );
+
+            let spans =
+                vfs.snapshot_pending_local_dirty_block_read_spans(ino, 0, data.len() as u64);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].object_id, Some(object_id));
+            assert_eq!(spans[0].block_offset, 0);
+            assert_eq!(spans[0].data, Bytes::new());
+        });
+    }
+
+    #[test]
     fn assign_reserved_object_ids_reuses_existing_ids_and_stores_new_ones() {
         let ino = 42;
         let mut pending = std::collections::HashMap::from([

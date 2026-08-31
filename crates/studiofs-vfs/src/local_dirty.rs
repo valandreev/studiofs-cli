@@ -3120,7 +3120,10 @@ impl StudioVfs {
             };
 
             let (data, object_id) = if let Some(object_id) = slice.object_id {
-                if !self.local_payload_backend.contains(object_id) {
+                if !self.local_payload_backend.contains(object_id)
+                    && !self.cached_store.has_staged_upload(object_id)
+                    && self.cached_store.get_hot_upload(object_id).is_none()
+                {
                     continue;
                 }
                 (Bytes::new(), Some(object_id))
@@ -3209,7 +3212,9 @@ impl StudioVfs {
                     .local_extent_id()
                     .expect("local extent pending payload must have an object id");
                 assert!(
-                    self.local_payload_backend.contains(object_id),
+                    self.local_payload_backend.contains(object_id)
+                        || self.cached_store.has_staged_upload(object_id)
+                        || self.cached_store.get_hot_upload(object_id).is_some(),
                     "local payload missing during dirty read span resolution"
                 );
                 let block_start =

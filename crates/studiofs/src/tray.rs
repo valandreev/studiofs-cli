@@ -66,6 +66,7 @@ mod supported {
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
     const DIAGNOSTICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
     const DIAGNOSTICS_STARTUP_GRACE: Duration = Duration::from_secs(5);
+    const DAEMON_LOG_STEM_ENV: &str = "STUDIOFS_DAEMON_LOG_STEM";
     const IDLE_CYCLE: Duration = Duration::from_millis(4400);
     const ACTIVE_CYCLE: Duration = Duration::from_millis(1200);
 
@@ -583,7 +584,10 @@ mod supported {
     }
 
     pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {
-        if args.should_detach() {
+        if should_skip_tray(
+            args.should_detach(),
+            std::env::var_os(DAEMON_LOG_STEM_ENV).is_some(),
+        ) {
             return args.dispatch();
         }
 
@@ -677,6 +681,10 @@ mod supported {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("mount thread panicked")),
         }
+    }
+
+    fn should_skip_tray(detach: bool, daemon_process: bool) -> bool {
+        detach || daemon_process
     }
 
     #[cfg(target_os = "macos")]
@@ -908,6 +916,13 @@ mod supported {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn daemon_reexec_skips_tray_without_detach_flag() {
+            assert!(should_skip_tray(true, false));
+            assert!(should_skip_tray(false, true));
+            assert!(!should_skip_tray(false, false));
+        }
 
         #[test]
         fn activity_mode_is_active_for_pending_uploads() {

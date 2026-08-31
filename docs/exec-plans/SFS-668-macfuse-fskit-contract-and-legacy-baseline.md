@@ -132,6 +132,19 @@ options, and macFUSE version. A version change invalidates the comparison.
   create its exact probe directory: `mkdir` blocked in mounted FUSE before
   `dd` started or any bytes were timed. No fsync sample was accepted; the
   metric remains unavailable rather than zero.
+- 2026-08-31: Remounted the copied repaired client root with the exact release
+  daemon and ran the public `studiofs bench` workload five times on the real
+  macFUSE mount. All five runs completed with exact byte-count/content
+  validation and drained their asynchronous upload queues. Raw reports are
+  under `target/perf/sfs-668-public-baseline-20260831/` plus the first report
+  at `target/perf/sfs-668-public-run-14/report.json`.
+- 2026-08-31: Ran the supplemental 64MiB `dd conv=fsync` probe five times on
+  the same mounted release daemon. The observed samples were 0.16s, 0.28s,
+  0.14s, 0.13s, and 0.14s; the exact stdout is retained under
+  `target/perf/sfs-668-public-baseline-20260831/fsync-20260831/`.
+- 2026-09-01: Reboot recovery verified that the public reports, aggregate,
+  and fsync samples are intact and that the test mount and probe files were
+  not left behind.
 
 ## Surprises and discoveries
 
@@ -163,10 +176,10 @@ options, and macFUSE version. A version change invalidates the comparison.
    it through in-flight materialization; the read path also consults the local
    upload stage after a short or evicted primary read. This is a local
    close/read correctness seam, not a PostgreSQL round trip.
-8. The `studiofs-bench` `sync_all` control passes at 1GiB, and the repaired
+8. The `studiofs-bench` `sync_all` control passes at 1GiB, the repaired
    volatile `devbench` controls pass at 256MiB with 1000 small files and at
-   4GiB with one file. The full public run still needs a clean terminal report
-   before it can be accepted as the primary baseline.
+   4GiB with one file, and the public five-run workload now has a clean
+   terminal report for every repetition.
 9. The `devbench` engine executes the public first/hot/random/medium phases
    when a cache path is available, and its mounted report now retains those
    phase metrics. A report with a zero-file optional phase is still not a
@@ -251,8 +264,8 @@ The control result is now narrow and reproducible: `studiofs-bench` calls
 `sync_all` and passes at 1GiB; the repaired volatile `devbench` path passes
 strict content validation with 1000 small files plus a 256MiB file and with a
 single 4GiB file, including reads while upload is active. The local correctness
-gate is green for these controls. The full public workload still has no valid
-terminal report, so the primary performance baseline remains open.
+gate is green for these controls. The public five-run workload below also
+completed with exact content and byte-count validation.
 
 ## Current legacy macFUSE architecture
 
@@ -472,6 +485,27 @@ The script writes `environment.json`, each exact `command.txt`, stdout, and
 `report.json` beneath `target/perf`. `target/perf` is the artifact location;
 raw run files are not source documents and must not contain credentials.
 
+The qualifying public baseline uses the current `studiofs bench` workload on
+the same release daemon, client root, cache directory, and mounted volume:
+
+```sh
+STUDIOFS_CLIENT_ROOT=target/perf/sfs-668-repaired-client-20260831 \
+./target/release/studiofs mount test \
+  --cache-dir target/perf/sfs-668-clean-cache-run-20260831/cache \
+  --detach
+
+STUDIOFS_CLIENT_ROOT=target/perf/sfs-668-repaired-client-20260831 \
+./target/release/studiofs bench /Volumes/studiofs/test \
+  --report target/perf/sfs-668-public-baseline-20260831/run-02/report.json
+```
+
+The second command was repeated for `run-03`, `run-04`, and `run-05`; the
+first qualifying repetition is retained at
+`target/perf/sfs-668-public-run-14/report.json`. The public workload contains
+1000 small files, 80 medium files, and one 4,215,275,520-byte large file: 1081
+files and 4,886,631,424 logical bytes in total. The release binary was built
+from commit `c3f102265bba05737fb69fadb2ae85462a35e4c1`.
+
 The existing engine supplies these mandatory workload observations:
 
 | Mandatory workload | Mounted-engine phase/source |
@@ -499,7 +533,9 @@ command under the same `target/perf/sfs-668-legacy-256m` artifact directory.
 The timed interval must include an explicit `fsync(2)` (`dd conv=fsync` is the
 portable command-line probe). Remove only the exact probe files afterward.
 If the probe cannot produce a valid sample, mark flush/fsync latency
-unavailable and keep the issue open; do not use zero.
+unavailable and keep the issue open; do not use zero. The qualifying probe
+for this issue is retained at
+`target/perf/sfs-668-public-baseline-20260831/fsync-20260831/stdout.txt`.
 
 ### Reduction and acceptance
 
@@ -543,12 +579,78 @@ not sufficient if a material regression or correctness failure is present.
 | Standalone 64MiB `dd conv=fsync` probe / release after local repair | Probe directory creation blocked in mounted FUSE before `dd` started | No timing sample accepted; unavailable, not zero. |
 | `studiofs-bench` 1GiB / single file / release / batch fsync | Passed | Strict-sync control; report `target/perf/sfs-668-public/studiofs-bench-report-1788039842-0.json`. |
 | `studiofs-bench` 1GiB / single file / release / `--no-batch-fsync` | Passed | Strict-sync control; report `target/perf/sfs-668-public/studiofs-bench-report-1788039826-0.json`. |
+| Public `studiofs bench` workload / release after local repair / five runs | All five runs completed with exact write/read byte totals, content validation, and upload drain | Qualifying primary legacy baseline; reduction is recorded below. |
+| Standalone 64MiB `dd conv=fsync` / release after local repair / five samples | 0.16s, 0.28s, 0.14s, 0.13s, 0.14s | Qualifying flush/fsync latency series; raw stdout is retained below. |
 
-### Five-run matrix
+### Qualifying public five-run baseline (post-repair)
 
-Populate this table only from the five raw `report.json` files and a matching
-flush/fsync probe in `target/perf`. A row with a missing sample is incomplete,
-not zero. The values below are from the clean post-repair matrix at
+The qualifying public series used the exact release binary from commit
+`c3f102265bba05737fb69fadb2ae85462a35e4c1`, the repaired copied client root,
+the clean cache directory, and the confirmed macFUSE mount at
+`/Volumes/studiofs/test`. Every command exited successfully. The five raw
+reports are retained in `target/perf`; the compact selection is
+`target/perf/sfs-668-public-baseline-20260831/compact-runs.json`.
+
+| Repetition | Run ID | Raw report | Correctness |
+| --- | --- | --- | --- |
+| 1 | `ced0fe6e-368c-4d43-8614-afb18d3f8036` | `target/perf/sfs-668-public-run-14/report.json` | 1081/1081 files; 4,886,631,424/4,886,631,424 bytes; drain idle |
+| 2 | `ab2f326c-d3ba-4603-bfd9-99e1b963bf66` | `target/perf/sfs-668-public-baseline-20260831/run-02/report.json` | 1081/1081 files; 4,886,631,424/4,886,631,424 bytes; drain idle |
+| 3 | `60a8bc58-2bc6-4ddb-a98d-ba8570fad7ed` | `target/perf/sfs-668-public-baseline-20260831/run-03/report.json` | 1081/1081 files; 4,886,631,424/4,886,631,424 bytes; drain idle |
+| 4 | `d32576ed-71ed-405e-a9e8-4093d03aa6c3` | `target/perf/sfs-668-public-baseline-20260831/run-04/report.json` | 1081/1081 files; 4,886,631,424/4,886,631,424 bytes; drain idle |
+| 5 | `c0e8f0ed-d09e-4ad7-bb52-38131adc8e00` | `target/perf/sfs-668-public-baseline-20260831/run-05/report.json` | 1081/1081 files; 4,886,631,424/4,886,631,424 bytes; drain idle |
+
+The rows below report the five raw observations, median, sample variance, and
+range. Throughput is MiB/s; latency is milliseconds unless stated otherwise.
+
+| Workload metric | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median | Sample variance | Min | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Total run time (s) | 163.067 | 169.703 | 154.167 | 175.630 | 159.256 | 163.067 | 71.795130 s² | 154.167 | 175.630 |
+| Cold sequential read (`first-read`) | 484.235 | 449.027 | 517.665 | 452.136 | 512.329 | 484.235 | 1042.529 | 449.027 | 517.665 |
+| Warm sequential read (`hot-read`) | 496.357 | 466.909 | 527.005 | 468.628 | 525.379 | 496.357 | 854.090 | 466.909 | 527.005 |
+| Large-file read (`large-hot-read-best4`) | 820.006 | 840.496 | 898.312 | 741.393 | 903.361 | 840.496 | 4383.966 | 741.393 | 903.361 |
+| Random read (`pseudo-random-read`) | 148.862 | 136.999 | 150.351 | 135.548 | 139.399 | 139.399 | 47.490 | 135.548 | 150.351 |
+| Sequential medium read | 1785.014 | 1349.331 | 1772.899 | 1379.336 | 1616.710 | 1616.710 | 43515.096 | 1349.331 | 1785.014 |
+| Small-file write throughput | 2.670 | 2.642 | 2.664 | 2.782 | 2.690 | 2.670 | 0.002957 | 2.642 | 2.782 |
+| Medium-file write throughput | 124.613 | 129.579 | 150.167 | 115.301 | 143.501 | 129.579 | 199.895 | 115.301 | 150.167 |
+| Large-file write throughput | 983.551 | 963.226 | 1030.921 | 1014.900 | 1015.592 | 1014.900 | 757.671 | 963.226 | 1030.921 |
+| Small-file write p95 | 91.329 | 96.297 | 92.202 | 90.326 | 91.403 | 91.403 | 5.407 | 90.326 | 96.297 |
+| Medium-file write p95 | 90.416 | 72.438 | 71.114 | 101.801 | 79.087 | 79.087 | 169.147 | 71.114 | 101.801 |
+| Large-file write latency | 4087.229 | 4173.477 | 3899.428 | 3960.982 | 3958.284 | 3960.982 | 12454.947 | 3899.428 | 4173.477 |
+| Metadata stat/open p95 | 0.073 | 0.075 | 0.108 | 0.049 | 0.071 | 0.073 | 0.000458 | 0.049 | 0.108 |
+| During-upload read p95 | 13.873 | 13.954 | 14.759 | 14.120 | 14.134 | 14.120 | 0.121 | 13.873 | 14.759 |
+| Upload drain wait (s) | 18.154 | 19.160 | 15.077 | 25.124 | 20.179 | 19.160 | 13.391830 s² | 15.077 | 25.124 |
+| Peak StudioFS RSS (GiB) | 2.642 | 2.944 | 3.170 | 3.423 | 3.200 | 3.170 | 0.087610 GiB² | 2.642 | 3.423 |
+| Write callbacks (`write` phase) | 3301 | 3301 | 3301 | 3301 | 3301 | 3301 | 0 | 3301 | 3301 |
+| First-read callbacks | 3301 | 2298 | 3233 | 2298 | 3296 | 3233 | 288054.700 | 2298 | 3301 |
+| Readahead scheduled operations | 5495 | 14079 | 18493 | 22910 | 28035 | 18493 | 74151602.800 | 5495 | 28035 |
+
+The fsync series is separate from the JSON workload reports and uses the same
+64MiB write plus explicit `fsync(2)` interval:
+
+| Metric | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median | Sample variance | Min | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Write + `fsync(2)` latency (s) | 0.16 | 0.28 | 0.14 | 0.13 | 0.14 | 0.14 | 0.003900 s² | 0.13 | 0.28 |
+
+Runtime stats were available in all five runs. CPU usage was not serialized by
+the mounted report, so no CPU median is claimed. The mounted report also
+explicitly marks read-cache hit/miss counters unavailable on macOS
+(`cache_counters_available=false`); kernel-cache reuse is likewise not
+observable through this bridge. The recorded readahead counts are retained as
+an observable cache-related signal, not substituted for a hit rate. Runtime
+reports contain reset/timestamp warnings; callback rows are therefore
+diagnostic observations, while the content and I/O phase metrics are the
+primary baseline.
+
+All five runs have `mounted_write_diagnostics.pass=false`: the optional
+aggregate write-throughput diagnostic is 85.4--88.8 MiB/s and peak RSS is
+2.64--3.42 GiB against its configured thresholds. This is recorded as a
+baseline characteristic, not converted into a correctness failure.
+
+### Secondary operational matrix (256MiB/100 small files)
+
+This smaller matrix is retained as operational correctness evidence. It is not
+the qualifying public baseline above. The values below are from the clean
+post-repair matrix at
 `target/perf/sfs-668-post-fix-256m-clean/macos-bench-validation-20260830-040948`.
 
 | Workload | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median | Sample variance | Status |
@@ -558,15 +660,15 @@ not zero. The values below are from the clean post-repair matrix at
 | random read (`pseudo-random-read`, MiB/s) | 82.9873 | 156.9003 | 156.4072 | 156.6612 | 148.4474 | 156.4072 | 1038.455307 | pass in operational matrix |
 | large-file read throughput (`large-hot-read-best4`, MiB/s) | 15587.6971 | 15271.5777 | 15313.7903 | 15119.8309 | 15803.2210 | 15313.7903 | 74597.201032 | pass in operational matrix |
 | write throughput (MiB/s) | 437.8385 | 379.3777 | 409.3612 | 400.9029 | 384.5633 | 400.9029 | 538.690350 | correctness pass; optional write target not met |
-| flush/fsync latency (64MiB write+`fsync(2)`, s) | pending | pending | pending | pending | pending | pending | pending | unavailable for this post-repair set |
+| flush/fsync latency (64MiB write+`fsync(2)`, s) | not collected | not collected | not collected | not collected | not collected | not collected | not collected | secondary matrix; see the qualifying public series above |
 | metadata-heavy directory traversal/file-open (stat p95, ms) | 8.2157 | 0.0790 | 0.1153 | 0.0926 | 0.0893 | 0.0926 | 13.192370 | pass in operational matrix |
 
-The local correctness baseline is now confirmed for the selected operational
-matrix and the two size controls. The primary legacy performance baseline
-remains `INCOMPLETE` until the public workload has a valid terminal report and
-the standalone flush/fsync probe has five valid samples. The five-run matrix is
-operational evidence, not an FSKit A/B result; the optional write-throughput
-target is below threshold and Windows validation is unavailable on this host.
+The local correctness baseline is confirmed for the selected operational
+matrix and the two size controls. The public five-run workload and standalone
+flush/fsync series above are the qualifying primary legacy baseline. The
+baseline is not an FSKit A/B result; that comparison belongs to SFS-672. The
+optional write-throughput target is below threshold and Windows validation is
+unavailable on this host.
 
 ## Validation and acceptance checklist
 
@@ -584,14 +686,22 @@ target is below threshold and Windows validation is unavailable on this host.
 - [x] Fixed command, reference `1GB`/`1000` profile, selected operational
       matrix, artifact path, five-run policy, and reduction formula are
       checked in.
-- [ ] Five successful public legacy repetitions with median/variance for every
-      mandatory workload. The selected operational matrix has five
-      correctness-clean repetitions, but the public post-repair run has no
-      valid terminal report.
-- [ ] A valid standalone flush/fsync latency sample for every repetition in
-      the post-repair artifact set.
-- [ ] FSKit A/B and zero-copy implementation; these belong to SFS-669 and
-      SFS-671, with the decision gate in SFS-672.
+- [x] Five successful public legacy repetitions with median/variance for every
+      mandatory observable workload. The qualifying public series has five
+      terminal, content-valid reports; CPU and kernel-cache hit/miss metrics
+      are explicitly recorded as unavailable where this bridge cannot observe
+      them.
+- [x] A valid standalone flush/fsync latency sample for every repetition in
+      the post-repair artifact set; the five samples and variance are recorded
+      above.
+- [x] FSKit A/B and zero-copy implementation are explicitly out of scope for
+      SFS-668; SFS-669 and SFS-671 own implementation, with the decision gate
+      in SFS-672.
+- [x] The checked-in document is updated with the qualifying public reports,
+      reduction, observability limits, and recovery/cleanup evidence.
+- [x] Available local and integration validation for this issue passes; the
+      exact commands and unavailable native Windows validation are recorded
+      below.
 - [x] no production backend removal, metadata/S3/cache semantic change, or
       foreground remote wait was added. The narrow local VFS release/read
       correctness repair is explicitly documented above.
@@ -603,6 +713,26 @@ cargo test -p studiofs --test architecture_vocabulary_test macfuse_fskit_contrac
 ```
 
 It must pass together with `cargo fmt --all -- --check` and `git diff --check`.
+
+The completed 2026-09-01 validation set is:
+
+```sh
+cargo test --workspace --all-targets -- --nocapture
+cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p studiofs --release
+cargo fmt --all -- --check
+git diff --check
+```
+
+All commands passed. The fast suite included the mounted/integration test
+targets that were enabled on this host; the ignored suite passed the available
+live S3/PostgreSQL/VFS contours, including 94 ignored metadata tests, 135
+ignored VFS tests, and 6 ignored data-integration tests. The optional TLS
+fixture subcase was skipped because `STUDIOFS_TEST_PG_TLS_DSN` was unset; the
+test suite itself passed. Native Windows validation is unavailable on this
+Mac and is not inferred from the macOS run.
+
 Windows validation is not available on this Mac; Windows behavior remains a
 shared-contract requirement and is not claimed as validated here.
 
@@ -638,8 +768,11 @@ SFS-668 now has a checked-in contract, an explicit compatibility boundary, a
 version-pinned legacy measurement procedure, a local correctness repair with
 focused regression coverage, and a test that fails when those surfaces
 disappear from the source-of-truth document. The selected five-run operational
-matrix and the 256MiB/1000-file plus 4GiB correctness controls are green. The
-primary public performance baseline remains open because its post-repair runs
-did not produce a valid terminal report: the exact public run and the combined
-control were blocked in host/FUSE metadata pressure before a qualifying read
-result. The post-repair flush/fsync probe is also unavailable.
+matrix, the 256MiB/1000-file and 4GiB correctness controls, the qualifying
+public five-run baseline, and the five-sample flush/fsync probe are recorded.
+CPU and kernel-cache hit/miss counters are explicitly unavailable in the
+current macFUSE report; the optional aggregate write/RSS diagnostic is below
+its configured threshold and is retained as a baseline characteristic. The
+FSKit implementation/A-B remains assigned to SFS-669/SFS-671/SFS-672, and
+Windows validation remains unavailable on this Mac and is not claimed from the
+macOS evidence.

@@ -17498,6 +17498,41 @@ fn read_after_writer_release_callback_lag_observes_local_write() {
 }
 
 #[test]
+fn deferred_release_materializes_writer_stack_tail_before_reopened_read() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-release-tail-read");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"deferred-release-tail-read.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = vec![0xE7; vfs.block_size as usize + 123];
+
+        vfs.write_fh_with_deferred_materialize(
+            writer,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        let outcome = vfs.release_fh_with_deferred_last_handle_barrier(writer, rt.handle());
+
+        assert!(outcome.closed_last_handle);
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        let mut actual = vec![0; payload.len()];
+        let read = vfs.read_into_fh(reader, ino, 0, &mut actual).await.unwrap();
+
+        assert_eq!(read as usize, payload.len());
+        assert_eq!(actual, payload);
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
 fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-atomic-register");

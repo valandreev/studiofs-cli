@@ -369,6 +369,15 @@ impl StudioVfs {
     /// Deferred materialization drains buffered writer-stack data into the local dirty-state
     /// persistence path in the background, while the inode still has open handles.
     pub(super) fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
+        let runtime = tokio::runtime::Handle::current();
+        self.spawn_deferred_materialization_if_needed_on(ino, &runtime);
+    }
+
+    pub(super) fn spawn_deferred_materialization_if_needed_on(
+        self: &Arc<Self>,
+        ino: Ino,
+        runtime: &tokio::runtime::Handle,
+    ) {
         if self.disable_background_slab_flush {
             return;
         }
@@ -390,7 +399,7 @@ impl StudioVfs {
         else {
             return;
         };
-        self.start_deferred_materialization_task(entry, guard);
+        self.start_deferred_materialization_task(entry, guard, runtime);
     }
 
     pub(super) async fn run_deferred_materialization_pass(
@@ -571,9 +580,10 @@ impl StudioVfs {
         self: &Arc<Self>,
         entry: DeferredInodeGateEntry,
         guard: tokio::sync::OwnedSemaphorePermit,
+        runtime: &tokio::runtime::Handle,
     ) {
         let vfs = Arc::clone(self);
-        self.track_background_task(tokio::spawn(async move {
+        self.track_background_task(runtime.spawn(async move {
             let _guard = guard;
             let ino = entry.ino;
             // Local-dirty drains mutate the inode's pending payload/slice
@@ -668,7 +678,8 @@ impl StudioVfs {
         let Some((next_entry, next_guard)) = next_task else {
             return;
         };
-        self.start_deferred_materialization_task(next_entry, next_guard);
+        let runtime = tokio::runtime::Handle::current();
+        self.start_deferred_materialization_task(next_entry, next_guard, &runtime);
     }
 
     /// Release a file handle.
@@ -983,7 +994,7 @@ impl StudioVfs {
                 (deferred_release_ino, deferred_release_barrier)
             {
                 if self.inode_has_local_dirty_state(ino) {
-                    self.spawn_deferred_materialization_if_needed(ino);
+                    self.spawn_deferred_materialization_if_needed_on(ino, runtime);
                 }
                 let vfs = Arc::clone(self);
                 self.track_background_task(runtime.spawn(async move {

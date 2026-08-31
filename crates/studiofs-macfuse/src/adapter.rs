@@ -2924,6 +2924,47 @@ mod open_cache_snapshot_tests {
             .release(attr.ino, reader.file_handle())
             .expect("release reader");
     }
+
+    #[test]
+    fn large_write_without_fsync_is_visible_after_writer_release() {
+        let fixture = ContractVfsFixture::new("macfuse-large-write-release-read")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                CONTRACT_ROOT_INO,
+                b"large-write-release-read.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let chunk = vec![0xC3; 8 * 1024 * 1024];
+
+        let writer = adapter.open(attr.ino, libc::O_WRONLY).expect("open writer");
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, &chunk)
+            .expect("write first chunk");
+        adapter
+            .write(attr.ino, writer.file_handle(), chunk.len() as i64, &chunk)
+            .expect("write second chunk");
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader before writer release");
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer");
+
+        let read = adapter
+            .read(attr.ino, reader.file_handle(), 0, (chunk.len() * 2) as u32)
+            .expect("read locally accepted bytes");
+
+        assert_eq!(read, [chunk.as_slice(), chunk.as_slice()].concat());
+        adapter
+            .release(attr.ino, reader.file_handle())
+            .expect("release reader");
+    }
 }
 
 fn bridge_attr_to_stat(attr: &BridgeFileAttr) -> stat {

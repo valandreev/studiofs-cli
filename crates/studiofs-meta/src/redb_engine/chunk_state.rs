@@ -112,6 +112,28 @@ impl RedbMetaEngine {
         Ok(chunks)
     }
 
+    pub(super) fn regular_file_overlay_differs_from_base_in_read_txn(
+        txn: &redb::ReadTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        let overlay = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let overlay_signature = Self::regular_file_graph_signature(&overlay);
+        if overlay_signature.is_empty() {
+            return Ok(false);
+        }
+
+        let base = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        Ok(overlay_signature != Self::regular_file_graph_signature(&base))
+    }
+
     pub(super) fn has_regular_file_chunk_rows_in_write_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,

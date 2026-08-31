@@ -239,6 +239,51 @@ fn test_getattr_falls_back_to_base_when_no_local_overlay() {
 }
 
 #[test]
+fn test_get_attr_does_not_decode_unrelated_regular_file_chunk_rows() {
+    let engine = temp_engine();
+    let target = engine
+        .create_file(ROOT_INO, b"target.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let unrelated_key = encode_regular_file_chunk_key(target.ino + 1, ChunkId(0));
+    let invalid_chunk_state = [0xff];
+
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(REGULAR_FILE_OVERLAY_TABLE)
+        .unwrap()
+        .insert(unrelated_key.as_slice(), invalid_chunk_state.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+
+    let loaded = engine
+        .get_attr(target.ino)
+        .expect("get_attr must not decode another inode's chunk rows");
+    assert_eq!(loaded.ino, target.ino);
+}
+
+#[test]
+fn test_get_attrs_batch_does_not_decode_unrelated_regular_file_chunk_rows() {
+    let engine = temp_engine();
+    let target = engine
+        .create_file(ROOT_INO, b"target-batch.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let unrelated_key = encode_regular_file_chunk_key(target.ino + 1, ChunkId(0));
+    let invalid_chunk_state = [0xff];
+
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(REGULAR_FILE_OVERLAY_TABLE)
+        .unwrap()
+        .insert(unrelated_key.as_slice(), invalid_chunk_state.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+
+    let attrs = engine
+        .get_attrs_batch(&[target.ino])
+        .expect("get_attrs_batch must not decode another inode's chunk rows");
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].ino, target.ino);
+}
+
+#[test]
 fn test_get_attr_merged_in_write_txn_matches_read_get_attr() {
     let source = temp_engine();
     let base_file = source
