@@ -584,10 +584,7 @@ mod supported {
     }
 
     pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {
-        if should_skip_tray(
-            args.should_detach(),
-            std::env::var_os(DAEMON_LOG_STEM_ENV).is_some(),
-        ) {
+        if args.should_detach() || std::env::var_os(DAEMON_LOG_STEM_ENV).is_some() {
             return args.dispatch();
         }
 
@@ -681,10 +678,6 @@ mod supported {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("mount thread panicked")),
         }
-    }
-
-    fn should_skip_tray(detach: bool, daemon_process: bool) -> bool {
-        detach || daemon_process
     }
 
     #[cfg(target_os = "macos")]
@@ -916,13 +909,6 @@ mod supported {
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        #[test]
-        fn daemon_reexec_skips_tray_without_detach_flag() {
-            assert!(should_skip_tray(true, false));
-            assert!(should_skip_tray(false, true));
-            assert!(!should_skip_tray(false, false));
-        }
 
         #[test]
         fn activity_mode_is_active_for_pending_uploads() {
