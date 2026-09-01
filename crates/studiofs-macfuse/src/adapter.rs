@@ -1161,6 +1161,18 @@ impl StudioVfsAdapter {
         Ok((attr, open, guard))
     }
 
+    pub(crate) fn create_for_fskit(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+        flags: i32,
+    ) -> Result<(InodeAttr, OpenReply), i32> {
+        let attr = self.create_attr(parent, name, mode)?;
+        let open = self.open_created_attr(&attr, flags)?;
+        Ok((attr, open))
+    }
+
     fn create_attr(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
@@ -1250,7 +1262,7 @@ impl StudioVfsAdapter {
         self.open_reply_serializer.lock(ino)
     }
 
-    fn reject_prepared_open(&self, ino: u64, fh: u64) {
+    pub(crate) fn reject_prepared_open(&self, ino: u64, fh: u64) {
         debug!(ino, fh, "macFUSE rolls back rejected open reply");
         self.vfs.abort_os_cache_open(fh);
         #[cfg(test)]
@@ -1617,6 +1629,77 @@ impl StudioVfsAdapter {
                     .vfs
                     .record_fuse_read_callback(size_usize, started.elapsed(), true);
                 Err(vfs_err_to_errno(&error))
+            }
+        }
+    }
+
+    pub(crate) async fn read_for_fskit(
+        &self,
+        ino: u64,
+        file_handle: u64,
+        offset: u64,
+        size: u32,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<u8>, i32> {
+        let state = ReadExecutionState {
+            vfs: Arc::clone(&self.vfs),
+            shared: Arc::clone(&self.shared),
+            runtime_stats_handles: Arc::clone(&self.runtime_stats_handles),
+        };
+        let size = read_execution_size(size, self.read_queue_byte_limit);
+        let started = Instant::now();
+        let cancellation = ReadCancellationToken {
+            token: cancellation,
+        };
+        let mut read_guard = AsyncReadTaskGuard::new(size, &state.shared, &state.vfs);
+        if cancellation.is_cancelled() {
+            read_guard.finish_with(AsyncReadOutcome::Canceled);
+            return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
+        }
+        let _permit = match acquire_read_admission(
+            &state.shared.read_admission,
+            size,
+            &read_guard.shared.read_diagnostics,
+            &cancellation,
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(errno) => {
+                let outcome = if errno == MACFUSE_READ_INTERRUPTED_ERRNO {
+                    AsyncReadOutcome::Canceled
+                } else {
+                    AsyncReadOutcome::Failed
+                };
+                read_guard.finish_with(outcome);
+                return Err(errno);
+            }
+        };
+        match Self::perform_read(
+            &state,
+            ReadExecutionRequest {
+                ino,
+                file_handle,
+                offset,
+                size,
+            },
+            started,
+            cancellation,
+        )
+        .await
+        {
+            Ok(bytes) => {
+                read_guard.finish_with(AsyncReadOutcome::Completed);
+                Ok(bytes.to_vec())
+            }
+            Err(errno) => {
+                let outcome = if errno == MACFUSE_READ_INTERRUPTED_ERRNO {
+                    AsyncReadOutcome::Canceled
+                } else {
+                    AsyncReadOutcome::Failed
+                };
+                read_guard.finish_with(outcome);
+                Err(errno)
             }
         }
     }
@@ -2014,6 +2097,17 @@ impl StudioVfsAdapter {
         Ok(())
     }
 
+    pub(crate) fn directory_entries_for_fskit(
+        &self,
+        file_handle: u64,
+    ) -> Result<Arc<Vec<DirEntry>>, i32> {
+        self.directory_handles
+            .lock()
+            .get(&file_handle)
+            .cloned()
+            .ok_or(libc::EBADF)
+    }
+
     pub(crate) fn readdir_with_handle(
         &self,
         request: &Request,
@@ -2172,7 +2266,7 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    fn attr_to_stat(&self, attr: &InodeAttr) -> stat {
+    pub(crate) fn attr_to_stat(&self, attr: &InodeAttr) -> stat {
         let mut stat = bridge_attr_to_stat(&to_bridge_attr(
             attr,
             self.mount_uid,
@@ -2200,6 +2294,10 @@ impl StudioVfsAdapter {
         if name == MACOS_DS_STORE_NAME {
             self.file_flags.lock().insert(ino, MACOS_UF_HIDDEN);
         }
+    }
+
+    pub(crate) fn remember_fskit_file_flags(&self, ino: u64, flags: u32) {
+        self.file_flags.lock().insert(ino, flags);
     }
 
     fn clear_file_flags(&self, ino: u64) {
@@ -2248,6 +2346,14 @@ impl CallbackState {
     pub(crate) fn wait_for_reply_tasks(&self) {
         self.adapter.reply_tasks.wait_for_idle();
     }
+
+    pub(crate) fn adapter(&self) -> Arc<StudioVfsAdapter> {
+        Arc::clone(&self.adapter)
+    }
+
+    pub(crate) fn track_reply_task(&self) -> ReplyTaskGuard {
+        self.adapter.reply_tasks.track()
+    }
 }
 
 #[derive(Default)]
@@ -2256,7 +2362,7 @@ pub(crate) struct ReplyTaskTracker {
     idle: Condvar,
 }
 
-struct ReplyTaskGuard {
+pub(crate) struct ReplyTaskGuard {
     tracker: Arc<ReplyTaskTracker>,
 }
 

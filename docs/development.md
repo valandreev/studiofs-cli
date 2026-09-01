@@ -18,7 +18,7 @@ studiofs-cli/
   │   ├── studiofs-data/      # S3 object I/O
   │   ├── studiofs-cache/     # L1/L2 cache
   │   ├── studiofs-vfs/       # filesystem core
-  │   ├── studiofs-macfuse/   # macOS native bridge stub
+  │   ├── studiofs-macfuse/   # macOS low-level + experimental FSKit bridge
   │   ├── studiofs-linux-fuse/# Linux libfuse3 low-level bridge
   │   ├── studiofs-winfsp/    # Windows bridge
   │   └── studiofs-e2e/       # real mounted E2E runner
@@ -49,11 +49,14 @@ S3-compatible backend.
 cargo build --release
 ```
 
-On macOS, `crates/studiofs-macfuse` still requires real macFUSE headers for
-Cargo builds and tests. The C shim includes an editor-only compatibility header
-so workspace diagnostics stay usable when `fuse_lowlevel.h` is absent, but the
-actual build continues to fail fast unless the system headers are discoverable
-via `pkg-config fuse` or standard Homebrew include locations.
+On macOS, `crates/studiofs-macfuse` requires real macFUSE headers for Cargo
+builds and tests. The experimental FSKit path also links
+`MFMount.framework`; the build fails fast when that framework is not installed.
+Set `STUDIOFS_MFMOUNT_FRAMEWORK_DIR` to the framework parent directory when the
+installation is outside the default macFUSE location. The C shim includes an
+editor-only compatibility header so workspace diagnostics stay usable when
+`fuse_lowlevel.h` is absent, but the actual legacy build still requires headers
+discoverable via `pkg-config fuse` or standard Homebrew include locations.
 
 ## Checks
 

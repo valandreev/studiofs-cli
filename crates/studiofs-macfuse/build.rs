@@ -4,6 +4,9 @@
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
+use std::path::Path;
+
+#[cfg(target_os = "macos")]
 const MACFUSE_FALLBACK_INCLUDE_DIRS: &[&str] = &[
     "/opt/homebrew/include/osxfuse",
     "/usr/local/include/osxfuse",
@@ -11,6 +14,10 @@ const MACFUSE_FALLBACK_INCLUDE_DIRS: &[&str] = &[
 
 #[cfg(target_os = "macos")]
 const MACFUSE_FALLBACK_LIB_DIRS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib"];
+#[cfg(target_os = "macos")]
+const MFMOUNT_FRAMEWORK_ENV: &str = "STUDIOFS_MFMOUNT_FRAMEWORK_DIR";
+#[cfg(target_os = "macos")]
+const DEFAULT_MFMOUNT_FRAMEWORK_DIR: &str = "/Library/Filesystems/macfuse.fs/Contents/Frameworks";
 
 #[cfg(not(target_os = "macos"))]
 fn main() {}
@@ -22,7 +29,9 @@ fn main() {
     }
 
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed={MFMOUNT_FRAMEWORK_ENV}");
     println!("cargo:rerun-if-changed=csrc/low_level_ops.c");
+    link_mfmount_framework();
     let mut build = cc::Build::new();
     build.file("csrc/low_level_ops.c");
     build.define("_FILE_OFFSET_BITS", "64");
@@ -51,6 +60,27 @@ fn main() {
         add_macfuse_fallback_link_search_dirs();
     }
     build.compile("studiofs_macfuse_low_level_ops");
+}
+
+#[cfg(target_os = "macos")]
+fn link_mfmount_framework() {
+    let framework_dir = std::env::var(MFMOUNT_FRAMEWORK_ENV)
+        .unwrap_or_else(|_| DEFAULT_MFMOUNT_FRAMEWORK_DIR.to_string());
+    let framework_dir = Path::new(&framework_dir);
+    let header = framework_dir.join("MFMount.framework/Headers/MFMount.h");
+    let binary = framework_dir.join("MFMount.framework/MFMount");
+    if !header.is_file() || !binary.is_file() {
+        panic!(
+            "macFUSE FSKit backend requires MFMount.framework at '{}'; set {} to its parent directory",
+            framework_dir.display(),
+            MFMOUNT_FRAMEWORK_ENV
+        );
+    }
+    println!(
+        "cargo:rustc-link-search=framework={}",
+        framework_dir.display()
+    );
+    println!("cargo:rustc-link-lib=framework=MFMount");
 }
 
 #[cfg(target_os = "macos")]

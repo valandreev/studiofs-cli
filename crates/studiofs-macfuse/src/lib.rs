@@ -4,8 +4,8 @@
 
 //! macOS native bridge boundary for StudioFS.
 //!
-//! This crate intentionally exposes only the mount request and serve API while
-//! the low-level macFUSE session layer is still being built.
+//! The default mount path uses the low-level macFUSE session API. An explicit
+//! experimental FSKit path uses `MFMount.framework` and the same VFS adapter.
 
 use std::io;
 use std::path::PathBuf;
@@ -24,6 +24,7 @@ pub mod probe;
 pub mod low_level;
 
 mod adapter;
+mod fskit;
 
 /// Request used by the CLI backend router to launch the macOS bridge.
 pub struct MacFuseMountRequest {
@@ -198,7 +199,7 @@ impl Drop for SignalWatcher {
 }
 
 fn spawn_signal_watcher(
-    exit_handle: low_level::SessionExitHandle,
+    request_exit: impl FnOnce() + Send + 'static,
     signal_handling: SignalHandling,
     unmount_signal: Option<MacFuseUnmountSignal>,
 ) -> io::Result<SignalWatcher> {
@@ -225,7 +226,7 @@ fn spawn_signal_watcher(
             {
                 let _ = handlers.take();
             }
-            exit_handle.request_exit();
+            request_exit();
         })?;
     Ok(SignalWatcher {
         stop,
@@ -268,8 +269,14 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         )
     }?;
     SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    let _signal_watcher =
-        spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
+    let exit_handle = session.exit_handle();
+    let _signal_watcher = spawn_signal_watcher(
+        move || {
+            exit_handle.request_exit();
+        },
+        signal_handling,
+        unmount_signal,
+    )?;
     session.attach_invalidation_metrics(&vfs);
     vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
     let result = session.run();
@@ -281,6 +288,11 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     drop(session);
     drop(callback_state);
     result
+}
+
+/// Start serving the experimental native macFUSE FSKit bridge.
+pub fn mount_with_fskit_request(request: MacFuseMountRequest) -> io::Result<()> {
+    fskit::mount_with_request(request)
 }
 
 fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperations {
@@ -514,6 +526,111 @@ mod tests {
         session.request_exit();
         drop(session);
         std::fs::remove_dir(mount_point).expect("remove macFUSE smoke mount point");
+    }
+
+    #[test]
+    fn fskit_mounted_lookup_open_read_unmount_smoke_is_gated() {
+        if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-fskit-mounted-read-callback",
+        )
+        .expect("create VFS fixture");
+        let file_name = b"fskit-read.bin";
+        let payload = b"hello from macFUSE FSKit";
+        let attr = fixture
+            .vfs()
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                file_name,
+                501,
+                20,
+                0o644,
+            )
+            .expect("create FSKit smoke file");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().write(attr.ino, 0, payload))
+            .expect("seed FSKit smoke payload");
+
+        let mount_point = std::env::current_dir()
+            .expect("resolve FSKit smoke checkout")
+            .join("target")
+            .join(format!("studiofs-fskit-read-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&mount_point);
+        std::fs::create_dir_all(&mount_point).expect("create FSKit smoke mount point");
+        let unmount_signal = super::MacFuseUnmountSignal::new();
+        let request = super::MacFuseMountRequest {
+            vfs: fixture.vfs(),
+            runtime_handle: fixture.runtime().handle().clone(),
+            mount_point: mount_point.clone(),
+            volume_name: "StudioFS FSKit Read Smoke".into(),
+            read_only: true,
+            run_in_foreground: true,
+            signal_handling: super::SignalHandling::Disabled,
+            unmount_signal: Some(unmount_signal.clone()),
+        };
+        let mount = std::thread::spawn(move || super::mount_with_fskit_request(request));
+        let target = mount_point.join(std::str::from_utf8(file_name).unwrap());
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            // A kernel lookup can block while the FSKit provider is activating;
+            // probe it in a child so a failed provider cannot hang this test.
+            let mut probe = std::process::Command::new("/usr/bin/stat")
+                .args(["-f", "%i"])
+                .arg(&target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start FSKit readiness probe");
+            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let ready = loop {
+                if let Some(status) = probe.try_wait().expect("poll FSKit readiness probe") {
+                    break status.success();
+                }
+                if std::time::Instant::now() >= probe_deadline {
+                    probe.kill().expect("stop hung FSKit readiness probe");
+                    probe.wait().expect("reap hung FSKit readiness probe");
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            if ready {
+                break;
+            }
+            if mount.is_finished() {
+                let result = mount.join().expect("join FSKit mount thread");
+                panic!("FSKit smoke mount exited before readiness: {result:?}");
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                unmount_signal.request_unmount();
+                let _ = mount.join();
+                panic!("FSKit smoke mount did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            std::fs::read(&target).expect("read through FSKit mount"),
+            payload
+        );
+        unmount_signal.request_unmount();
+        mount
+            .join()
+            .expect("join FSKit mount thread")
+            .expect("unmount FSKit read smoke");
+        std::fs::remove_dir(&mount_point).expect("remove FSKit smoke mount point");
+
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("FSKit mounted VFS shutdown should succeed");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("repeated FSKit mounted VFS shutdown should succeed");
     }
 
     #[test]
