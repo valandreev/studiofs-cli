@@ -5935,12 +5935,7 @@ impl StudioVfs {
         out: &mut [u8],
     ) -> VfsResult<Option<usize>> {
         if let Some(payload) = self.upload_hot_get(object_id) {
-            if data_offset >= payload.len() {
-                return Ok(Some(0));
-            }
-            let available = payload.len() - data_offset;
-            let read = available.min(out.len());
-            out[..read].copy_from_slice(&payload[data_offset..data_offset + read]);
+            let read = Self::copy_payload_range(&payload, data_offset, out);
             self.record_foreground_local_payload_read(read as u64, 0);
             return Ok(Some(read));
         }
@@ -5949,18 +5944,53 @@ impl StudioVfs {
                 .read_into(object_id, data_offset, out)
         });
         self.record_local_cache_io_timing(timing);
-        if let Some(read) = result {
+        let primary_read = if let Some(read) = result {
             if read > out.len() {
                 return Err(VfsError::Other(format!(
                     "local backend returned oversized read: object_id={object_id}, read={read}, out_len={}",
                     out.len()
                 )));
             }
-            self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);
-            Ok(Some(read))
+            if read == out.len() {
+                self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);
+                return Ok(Some(read));
+            }
+            Some(read)
         } else {
-            Ok(None)
+            None
+        };
+        let staged_payload = match primary_read {
+            None => self.upload_stage_get_async(object_id).await?,
+            Some(read) if read < out.len() => self.upload_stage_get_async(object_id).await?,
+            _ => None,
+        };
+        if let Some(payload) = staged_payload {
+            let staged_read = payload
+                .get(data_offset..)
+                .map_or(0, |payload| payload.len().min(out.len()));
+            let staged_is_no_worse = match primary_read {
+                None => true,
+                Some(primary_read) => staged_read >= primary_read,
+            };
+            if staged_is_no_worse {
+                let read = Self::copy_payload_range(&payload, data_offset, out);
+                self.record_foreground_local_payload_read(read as u64, 0);
+                return Ok(Some(read));
+            }
         }
+        if let Some(read) = primary_read {
+            self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);
+        }
+        Ok(primary_read)
+    }
+
+    fn copy_payload_range(payload: &[u8], data_offset: usize, out: &mut [u8]) -> usize {
+        let Some(payload) = payload.get(data_offset..) else {
+            return 0;
+        };
+        let read = payload.len().min(out.len());
+        out[..read].copy_from_slice(&payload[..read]);
+        read
     }
 
     async fn payload_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {

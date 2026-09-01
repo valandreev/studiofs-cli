@@ -78,6 +78,24 @@ struct PendingUploadObservation {
     pending_uploads: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PendingUploadScanContext<'a> {
+    metrics_path: Option<&'a Path>,
+    expected_publisher_pid: u32,
+    upload_dir: Option<&'a Path>,
+}
+
+impl PendingUploadScanContext<'_> {
+    async fn scan(self) -> Result<usize> {
+        scan_pending_uploads(
+            self.metrics_path,
+            self.expected_publisher_pid,
+            self.upload_dir,
+        )
+        .await
+    }
+}
+
 const MOUNTED_MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const OPERATOR_WRITE_THROUGHPUT_TARGET_BYTES_PER_SEC: f64 = 1_000.0 * 1024.0 * 1024.0;
 const OPERATOR_RSS_PEAK_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -96,6 +114,7 @@ const PHASE_UPLOAD_DRAIN_WAIT: &str = "upload-drain-wait";
 const PHASE_POST_UPLOAD_READ: &str = "post-upload-read";
 const PHASE_STAT: &str = "stat";
 const PHASE_HOT_READ: &str = "hot-read";
+const PHASE_LARGE_HOT_READ_BEST4: &str = "large-hot-read-best4";
 const PHASE_PSEUDO_RANDOM_READ: &str = "pseudo-random-read";
 const PHASE_SEQUENTIAL_MEDIUM_READ: &str = "sequential-medium-read";
 const LEGACY_POST_UPLOAD_READ_FALLBACK_REASON: &str =
@@ -133,6 +152,8 @@ struct MeasuredMountedPhaseResult {
 struct TimedPhaseTelemetry {
     telemetry: PhaseTelemetry,
     wall: Duration,
+    pending_uploads_before: usize,
+    pending_uploads_after: usize,
 }
 
 struct PublicBenchReadPhaseTelemetry {
@@ -1870,11 +1891,8 @@ fn deterministic_run_seed(run_id: &str) -> u64 {
     hash
 }
 
-fn deterministic_write_seed(item: &WorkFile, run_seed: u64, stream_id: Option<usize>) -> u64 {
-    run_seed
-        .wrapping_add(item.index as u64)
-        .wrapping_add(123)
-        .wrapping_add(stream_id.unwrap_or_default() as u64)
+fn deterministic_write_seed(item: &WorkFile, run_seed: u64) -> u64 {
+    run_seed.wrapping_add(item.index as u64).wrapping_add(123)
 }
 
 async fn write_deterministic_file_with_buffer(
@@ -2170,7 +2188,26 @@ async fn run_mounted_read_operations(
     Ok(TimedPhaseTelemetry {
         telemetry: telemetry?,
         wall: started.elapsed(),
+        pending_uploads_before: 0,
+        pending_uploads_after: 0,
     })
+}
+
+async fn run_mounted_read_operations_with_pending_uploads(
+    label: &'static str,
+    params: &BenchmarkConfig,
+    workload_files: MountedWorkloadFiles,
+    operations: Vec<MountedReadOperation>,
+    size_class_bounds: SizeClassBounds,
+    pending_uploads: PendingUploadScanContext<'_>,
+) -> Result<TimedPhaseTelemetry> {
+    let pending_uploads_before = pending_uploads.scan().await?;
+    let mut phase =
+        run_mounted_read_operations(label, params, workload_files, operations, size_class_bounds)
+            .await?;
+    phase.pending_uploads_before = pending_uploads_before;
+    phase.pending_uploads_after = pending_uploads.scan().await?;
+    Ok(phase)
 }
 
 fn best_read_phases(mut phases: Vec<TimedPhaseTelemetry>, count: usize) -> TimedPhaseTelemetry {
@@ -2191,7 +2228,41 @@ fn best_read_phases(mut phases: Vec<TimedPhaseTelemetry>, count: usize) -> Timed
         telemetry += &phase.telemetry;
         wall += phase.wall;
     }
-    TimedPhaseTelemetry { telemetry, wall }
+    TimedPhaseTelemetry {
+        telemetry,
+        wall,
+        pending_uploads_before: 0,
+        pending_uploads_after: 0,
+    }
+}
+
+fn public_read_phase_reports(
+    observation: &PendingUploadObservation,
+    phases: &PublicBenchReadPhaseTelemetry,
+) -> Vec<MountedLocalFirstReadPhaseReport> {
+    [
+        (PHASE_HOT_READ, &phases.hot_read),
+        (PHASE_LARGE_HOT_READ_BEST4, &phases.large_hot_read_best4),
+        (PHASE_PSEUDO_RANDOM_READ, &phases.pseudo_random_read),
+        (PHASE_SEQUENTIAL_MEDIUM_READ, &phases.sequential_medium_read),
+    ]
+    .into_iter()
+    .map(|(phase, timed)| {
+        let results = phase_telemetry_to_report(&timed.telemetry, timed.wall);
+        MountedLocalFirstReadPhaseReport {
+            phase: phase.to_string(),
+            wait_target: observation.target.label().to_string(),
+            target_state_observed: observation.observed,
+            valid_for_target: observation.observed && results.operations > 0,
+            required_pending_uploads: observation.required_pending_uploads,
+            wait_ms: 0.0,
+            pending_uploads_before: timed.pending_uploads_before,
+            pending_uploads_after: timed.pending_uploads_after,
+            validation_message: pending_upload_validation_message(observation),
+            results,
+        }
+    })
+    .collect()
 }
 
 fn operation_log_targets(files: &[WorkFile]) -> Arc<[Arc<str>]> {
@@ -2421,7 +2492,7 @@ async fn run_filesystem_writes(
                 write_deterministic_file_with_buffer(
                     &item.path,
                     item.size,
-                    deterministic_write_seed(item, write_options.run_seed, None),
+                    deterministic_write_seed(item, write_options.run_seed),
                     write_options.chunk_size,
                     &mut scratch,
                 )
@@ -2505,7 +2576,7 @@ async fn run_filesystem_reads(
                 let _permit = permit;
 
                 let validation = MountedReadValidation {
-                    seed: deterministic_write_seed(item, read_options.run_seed, None),
+                    seed: deterministic_write_seed(item, read_options.run_seed),
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
@@ -2601,7 +2672,7 @@ async fn run_filesystem_read_operations(
                 let _permit = permit;
 
                 let validation = MountedReadValidation {
-                    seed: deterministic_write_seed(item, read_options.run_seed, None),
+                    seed: deterministic_write_seed(item, read_options.run_seed),
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
@@ -2678,7 +2749,7 @@ async fn run_filesystem_writes_sequential_streams(
                 write_deterministic_file_with_buffer(
                     &item.path,
                     item.size,
-                    deterministic_write_seed(item, write_options.run_seed, Some(stream_id)),
+                    deterministic_write_seed(item, write_options.run_seed),
                     write_options.chunk_size,
                     &mut scratch,
                 )
@@ -2751,7 +2822,7 @@ async fn run_filesystem_reads_sequential_streams(
                     .map_err(|e| anyhow!("filesystem sequential read semaphore closed: {e}"))?;
                 let _permit = permit;
                 let validation = MountedReadValidation {
-                    seed: deterministic_write_seed(item, read_options.run_seed, Some(stream_id)),
+                    seed: deterministic_write_seed(item, read_options.run_seed),
                     write_chunk_size: read_options.write_chunk_size,
                 };
                 let start = Instant::now();
@@ -3256,6 +3327,11 @@ pub(crate) async fn run_mounted_end_to_end(
                         metrics_path,
                         |portable_profile| async move {
                             let mut public_runtime_stats_warnings = Vec::new();
+                            let pending_upload_scan = PendingUploadScanContext {
+                                metrics_path,
+                                expected_publisher_pid: mount_pid,
+                                upload_dir: Some(upload_dir),
+                            };
                             let pending_uploads_before =
                                 scan_pending_uploads(metrics_path, mount_pid, Some(upload_dir))
                                     .await?;
@@ -3303,7 +3379,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                 "cache benchmark phase start"
                             );
                             portable_profile.set_phase(PHASE_FIRST_READ);
-                            let first_read = run_mounted_read_operations(
+                            let first_read = run_mounted_read_operations_with_pending_uploads(
                                 "StudioFS bench first read",
                                 params,
                                 post_workload_files.clone(),
@@ -3313,6 +3389,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                     size_class_bounds,
                                 ),
                                 size_class_bounds,
+                                pending_upload_scan,
                             )
                             .await?;
                             let runtime_stats_after_first_read = capture_runtime_stats_snapshot(
@@ -3328,13 +3405,8 @@ pub(crate) async fn run_mounted_end_to_end(
                                 valid_for_target: idle_observation.observed,
                                 required_pending_uploads: idle_observation.required_pending_uploads,
                                 wait_ms: 0.0,
-                                pending_uploads_before: idle_observation.pending_uploads,
-                                pending_uploads_after: scan_pending_uploads(
-                                    metrics_path,
-                                    mount_pid,
-                                    Some(upload_dir),
-                                )
-                                .await?,
+                                pending_uploads_before: first_read.pending_uploads_before,
+                                pending_uploads_after: first_read.pending_uploads_after,
                                 validation_message: pending_upload_validation_message(
                                     &idle_observation,
                                 ),
@@ -3351,7 +3423,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                 "cache benchmark phase start"
                             );
                             portable_profile.set_phase(PHASE_HOT_READ);
-                            let hot_read = run_mounted_read_operations(
+                            let hot_read = run_mounted_read_operations_with_pending_uploads(
                                 "StudioFS bench hot read",
                                 params,
                                 post_workload_files.clone(),
@@ -3361,6 +3433,7 @@ pub(crate) async fn run_mounted_end_to_end(
                                     size_class_bounds,
                                 ),
                                 size_class_bounds,
+                                pending_upload_scan,
                             )
                             .await?;
                             let runtime_stats_after_hot_read = capture_runtime_stats_snapshot(
@@ -3370,6 +3443,8 @@ pub(crate) async fn run_mounted_end_to_end(
                             )
                             .await;
 
+                            let large_hot_read_pending_uploads_before =
+                                pending_upload_scan.scan().await?;
                             let mut large_hot_reads =
                                 Vec::with_capacity(PUBLIC_BENCH_LARGE_HOT_READ_RUNS);
                             for run_index in 0..PUBLIC_BENCH_LARGE_HOT_READ_RUNS {
@@ -3395,8 +3470,14 @@ pub(crate) async fn run_mounted_end_to_end(
                                     .await?,
                                 );
                             }
-                            let large_hot_read_best4 =
+                            let large_hot_read_pending_uploads_after =
+                                pending_upload_scan.scan().await?;
+                            let mut large_hot_read_best4 =
                                 best_read_phases(large_hot_reads, PUBLIC_BENCH_LARGE_HOT_READ_BEST);
+                            large_hot_read_best4.pending_uploads_before =
+                                large_hot_read_pending_uploads_before;
+                            large_hot_read_best4.pending_uploads_after =
+                                large_hot_read_pending_uploads_after;
 
                             tracing::info!(
                                 target: "studiofs.cache.profile",
@@ -3405,18 +3486,20 @@ pub(crate) async fn run_mounted_end_to_end(
                                 "cache benchmark phase start"
                             );
                             portable_profile.set_phase(PHASE_PSEUDO_RANDOM_READ);
-                            let pseudo_random_read = run_mounted_read_operations(
-                                "StudioFS bench pseudo-random read",
-                                params,
-                                post_workload_files.clone(),
-                                public_bench_read_operations(
-                                    PublicBenchReadPhaseKind::PseudoRandom,
-                                    &post_workload_files.files,
+                            let pseudo_random_read =
+                                run_mounted_read_operations_with_pending_uploads(
+                                    "StudioFS bench pseudo-random read",
+                                    params,
+                                    post_workload_files.clone(),
+                                    public_bench_read_operations(
+                                        PublicBenchReadPhaseKind::PseudoRandom,
+                                        &post_workload_files.files,
+                                        size_class_bounds,
+                                    ),
                                     size_class_bounds,
-                                ),
-                                size_class_bounds,
-                            )
-                            .await?;
+                                    pending_upload_scan,
+                                )
+                                .await?;
                             let runtime_stats_after_pseudo_random_read =
                                 capture_runtime_stats_snapshot(
                                     runtime_stats_path_ref,
@@ -3432,18 +3515,20 @@ pub(crate) async fn run_mounted_end_to_end(
                                 "cache benchmark phase start"
                             );
                             portable_profile.set_phase(PHASE_SEQUENTIAL_MEDIUM_READ);
-                            let sequential_medium_read = run_mounted_read_operations(
-                                "StudioFS bench sequential medium read",
-                                params,
-                                post_workload_files.clone(),
-                                public_bench_read_operations(
-                                    PublicBenchReadPhaseKind::SequentialMedium,
-                                    &post_workload_files.files,
+                            let sequential_medium_read =
+                                run_mounted_read_operations_with_pending_uploads(
+                                    "StudioFS bench sequential medium read",
+                                    params,
+                                    post_workload_files.clone(),
+                                    public_bench_read_operations(
+                                        PublicBenchReadPhaseKind::SequentialMedium,
+                                        &post_workload_files.files,
+                                        size_class_bounds,
+                                    ),
                                     size_class_bounds,
-                                ),
-                                size_class_bounds,
-                            )
-                            .await?;
+                                    pending_upload_scan,
+                                )
+                                .await?;
                             let runtime_stats_after_sequential_medium_read =
                                 capture_runtime_stats_snapshot(
                                     runtime_stats_path_ref,
@@ -3451,6 +3536,27 @@ pub(crate) async fn run_mounted_end_to_end(
                                     &mut public_runtime_stats_warnings,
                                 )
                                 .await;
+
+                            let public_read_phase_result = PublicBenchReadPhaseResult {
+                                telemetry: PublicBenchReadPhaseTelemetry {
+                                    first_read,
+                                    hot_read,
+                                    large_hot_read_best4,
+                                    pseudo_random_read,
+                                    sequential_medium_read,
+                                },
+                                runtime_stats_after_first_read,
+                                runtime_stats_after_hot_read,
+                                runtime_stats_after_pseudo_random_read,
+                                runtime_stats_after_sequential_medium_read,
+                                runtime_stats_warnings: public_runtime_stats_warnings,
+                            };
+                            let mut comparison_phases =
+                                vec![during_phase, drain_phase, first_phase];
+                            comparison_phases.extend(public_read_phase_reports(
+                                &idle_observation,
+                                &public_read_phase_result.telemetry,
+                            ));
 
                             let final_snapshot = match metrics_path {
                                 Some(path) => {
@@ -3463,23 +3569,10 @@ pub(crate) async fn run_mounted_end_to_end(
                                 MountedLocalFirstReadComparisonReport {
                                     cache_path: cache_path.display().to_string(),
                                     upload_dir: upload_dir.display().to_string(),
-                                    phases: vec![during_phase, drain_phase, first_phase],
+                                    phases: comparison_phases,
                                 },
                                 final_snapshot,
-                                PublicBenchReadPhaseResult {
-                                    telemetry: PublicBenchReadPhaseTelemetry {
-                                        first_read,
-                                        hot_read,
-                                        large_hot_read_best4,
-                                        pseudo_random_read,
-                                        sequential_medium_read,
-                                    },
-                                    runtime_stats_after_first_read,
-                                    runtime_stats_after_hot_read,
-                                    runtime_stats_after_pseudo_random_read,
-                                    runtime_stats_after_sequential_medium_read,
-                                    runtime_stats_warnings: public_runtime_stats_warnings,
-                                },
+                                public_read_phase_result,
                             ))
                         },
                     )
@@ -3896,6 +3989,8 @@ mod tests {
         TimedPhaseTelemetry {
             telemetry,
             wall: Duration::from_millis(10),
+            pending_uploads_before: 0,
+            pending_uploads_after: 0,
         }
     }
 
@@ -4012,6 +4107,77 @@ mod tests {
     }
 
     #[test]
+    fn operational_read_phase_reports_retain_all_public_read_phases() {
+        let observation = PendingUploadObservation {
+            target: PendingUploadTarget::Idle,
+            observed: true,
+            required_pending_uploads: 0,
+            waited: Duration::from_millis(25),
+            pending_uploads: 0,
+        };
+        let mut phases = test_public_read_phases();
+        phases.hot_read.pending_uploads_before = 4;
+        phases.hot_read.pending_uploads_after = 3;
+        phases.large_hot_read_best4.pending_uploads_before = 3;
+        phases.large_hot_read_best4.pending_uploads_after = 2;
+        phases.pseudo_random_read.pending_uploads_before = 2;
+        phases.pseudo_random_read.pending_uploads_after = 1;
+        phases.sequential_medium_read.pending_uploads_before = 1;
+        phases.sequential_medium_read.pending_uploads_after = 0;
+
+        let reports = public_read_phase_reports(&observation, &phases);
+
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                PHASE_HOT_READ,
+                "large-hot-read-best4",
+                PHASE_PSEUDO_RANDOM_READ,
+                PHASE_SEQUENTIAL_MEDIUM_READ,
+            ]
+        );
+        assert!(reports.iter().all(|report| report.valid_for_target));
+        assert!(reports.iter().all(|report| report.results.operations > 0));
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| (report.pending_uploads_before, report.pending_uploads_after,))
+                .collect::<Vec<_>>(),
+            vec![(4, 3), (3, 2), (2, 1), (1, 0)]
+        );
+    }
+
+    #[test]
+    fn zero_operation_read_phase_is_not_valid_for_target() {
+        let observation = PendingUploadObservation {
+            target: PendingUploadTarget::Idle,
+            observed: true,
+            required_pending_uploads: 0,
+            waited: Duration::from_millis(25),
+            pending_uploads: 0,
+        };
+        let mut phases = test_public_read_phases();
+        phases.pseudo_random_read = TimedPhaseTelemetry {
+            telemetry: PhaseTelemetry::default(),
+            wall: Duration::ZERO,
+            pending_uploads_before: 0,
+            pending_uploads_after: 0,
+        };
+
+        let reports = public_read_phase_reports(&observation, &phases);
+        let report = reports
+            .iter()
+            .find(|report| report.phase == PHASE_PSEUDO_RANDOM_READ)
+            .expect("pseudo-random phase report");
+
+        assert_eq!(report.results.operations, 0);
+        assert!(!report.valid_for_target);
+    }
+
+    #[test]
     fn public_bench_large_file_size_falls_back_to_max_workload_size_when_bounds_are_custom() {
         let workload = WorkloadPlan {
             sizes: vec![1024, 5 * 1024 * 1024, 4 * 1024 * 1024 * 1024],
@@ -4113,6 +4279,17 @@ mod tests {
             write_chunk_size: 16,
         });
         assert_ne!(different, first.as_slice());
+    }
+
+    #[test]
+    fn deterministic_write_seed_is_independent_of_stream_assignment() {
+        let item = WorkFile {
+            path: PathBuf::from("Z:/bench/file.bin"),
+            size: 1,
+            index: 7,
+        };
+
+        assert_eq!(deterministic_write_seed(&item, 11), 11 + 7 + 123);
     }
 
     #[test]

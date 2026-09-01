@@ -96,6 +96,16 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::regular_file_chunk_states_for_inode_in_opened_table(&table, ino)
+    }
+
+    pub(super) fn regular_file_chunk_states_for_inode_in_opened_table<T>(
+        table: &T,
+        ino: Ino,
+    ) -> MetaResult<BTreeMap<ChunkId, RegularFileChunkState>>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
         let prefix = regular_file_chunk_prefix(ino);
         let mut chunks = BTreeMap::new();
         for row in table
@@ -112,14 +122,51 @@ impl RedbMetaEngine {
         Ok(chunks)
     }
 
-    pub(super) fn has_regular_file_chunk_rows_in_write_txn(
-        txn: &redb::WriteTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
+    pub(super) fn regular_file_overlay_differs_from_base_in_read_txn(
+        txn: &redb::ReadTransaction,
         ino: Ino,
     ) -> MetaResult<bool> {
-        let table = txn
-            .open_table(table_def)
+        let overlay_table = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_table = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::regular_file_overlay_differs_from_base_in_opened_tables(
+            &overlay_table,
+            &base_table,
+            ino,
+        )
+    }
+
+    pub(super) fn regular_file_overlay_differs_from_base_in_opened_tables<TOverlay, TBase>(
+        overlay_table: &TOverlay,
+        base_table: &TBase,
+        ino: Ino,
+    ) -> MetaResult<bool>
+    where
+        TOverlay: ReadableTable<&'static [u8], &'static [u8]>,
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        if !Self::has_regular_file_chunk_rows_in_opened_table(overlay_table, ino)? {
+            return Ok(false);
+        }
+
+        let overlay =
+            Self::regular_file_chunk_states_for_inode_in_opened_table(overlay_table, ino)?;
+        let overlay_signature = Self::regular_file_graph_signature(&overlay);
+        if overlay_signature.is_empty() {
+            return Ok(false);
+        }
+
+        let base = Self::regular_file_chunk_states_for_inode_in_opened_table(base_table, ino)?;
+        Ok(overlay_signature != Self::regular_file_graph_signature(&base))
+    }
+
+    fn has_regular_file_chunk_rows_in_opened_table<T>(table: &T, ino: Ino) -> MetaResult<bool>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
         let prefix = regular_file_chunk_prefix(ino);
         let mut iter = table
             .range(prefix.as_ref()..)
@@ -133,6 +180,17 @@ impl RedbMetaEngine {
         }
     }
 
+    pub(super) fn has_regular_file_chunk_rows_in_write_txn(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::has_regular_file_chunk_rows_in_opened_table(&table, ino)
+    }
+
     pub(super) fn has_regular_file_chunk_rows_in_read_txn(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -141,17 +199,7 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let prefix = regular_file_chunk_prefix(ino);
-        let mut iter = table
-            .range(prefix.as_ref()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match iter.next() {
-            Some(row) => {
-                let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                Ok(key.value().starts_with(prefix.as_ref()))
-            }
-            None => Ok(false),
-        }
+        Self::has_regular_file_chunk_rows_in_opened_table(&table, ino)
     }
 
     /// Build a data-only signature for a regular-file chunk graph.

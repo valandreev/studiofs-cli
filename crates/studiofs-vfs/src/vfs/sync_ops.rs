@@ -2,8 +2,8 @@ use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino, InodeAttr,
     LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, MetaUploadState,
-    OpenFile, OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy,
-    StudioVfs, VfsResult,
+    OpenFile, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
+    VfsResult,
 };
 use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap};
@@ -369,6 +369,15 @@ impl StudioVfs {
     /// Deferred materialization drains buffered writer-stack data into the local dirty-state
     /// persistence path in the background, while the inode still has open handles.
     pub(super) fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
+        let runtime = tokio::runtime::Handle::current();
+        self.spawn_deferred_materialization_if_needed_on(ino, &runtime);
+    }
+
+    pub(super) fn spawn_deferred_materialization_if_needed_on(
+        self: &Arc<Self>,
+        ino: Ino,
+        runtime: &tokio::runtime::Handle,
+    ) {
         if self.disable_background_slab_flush {
             return;
         }
@@ -390,7 +399,7 @@ impl StudioVfs {
         else {
             return;
         };
-        self.start_deferred_materialization_task(entry, guard);
+        self.start_deferred_materialization_task(entry, guard, runtime);
     }
 
     pub(super) async fn run_deferred_materialization_pass(
@@ -571,9 +580,10 @@ impl StudioVfs {
         self: &Arc<Self>,
         entry: DeferredInodeGateEntry,
         guard: tokio::sync::OwnedSemaphorePermit,
+        runtime: &tokio::runtime::Handle,
     ) {
         let vfs = Arc::clone(self);
-        self.track_background_task(tokio::spawn(async move {
+        self.track_background_task(runtime.spawn(async move {
             let _guard = guard;
             let ino = entry.ino;
             // Local-dirty drains mutate the inode's pending payload/slice
@@ -668,7 +678,8 @@ impl StudioVfs {
         let Some((next_entry, next_guard)) = next_task else {
             return;
         };
-        self.start_deferred_materialization_task(next_entry, next_guard);
+        let runtime = tokio::runtime::Handle::current();
+        self.start_deferred_materialization_task(next_entry, next_guard, &runtime);
     }
 
     /// Release a file handle.
@@ -691,9 +702,20 @@ impl StudioVfs {
         self.release_fh_with_outcome(fh).await.map(|_| ())
     }
 
-    fn close_handle_for_release(&self, fh: u64) -> Option<HandleReleaseContext> {
-        self.state.writer_stack.mark_closed(fh);
-        let Some((open_file, remaining)) = self.handle_table.close(fh) else {
+    fn close_handle_for_release<F>(
+        &self,
+        fh: u64,
+        before_handle_close: F,
+    ) -> Option<HandleReleaseContext>
+    where
+        F: FnOnce(&OpenFile, u32),
+    {
+        let Some((open_file, remaining)) =
+            self.handle_table.close_with(fh, |open_file, remaining| {
+                self.state.writer_stack.mark_closed(open_file.fh);
+                before_handle_close(open_file, remaining);
+            })
+        else {
             debug!("release_fh: unknown fh={}", fh);
             return None;
         };
@@ -774,13 +796,16 @@ impl StudioVfs {
             return LastHandleReleaseAction::OrphanCleanup;
         }
 
-        if !self.inode_has_local_dirty_state(ino) {
+        // Materialization clears the writer-stack dirty byte count before it
+        // installs the resulting local overlay. Keep the release barrier for
+        // that interval so a reader cannot observe the pre-overlay metadata.
+        if !self.inode_has_local_dirty_state(ino)
+            && !self.state.deferred_materialize_inflight.contains(ino)
+        {
             return LastHandleReleaseAction::Clean;
         }
 
-        let sticky_error_policy = if context.open_file.flags.contains(OpenFlags::WRONLY)
-            || context.open_file.flags.contains(OpenFlags::RDWR)
-        {
+        let sticky_error_policy = if Self::open_flags_allow_write(context.open_file.flags) {
             StickyErrorPolicy::Report
         } else {
             StickyErrorPolicy::Ignore
@@ -909,7 +934,7 @@ impl StudioVfs {
     /// Release a handle and report whether this close owned the actual
     /// last-handle path, plus whether it had to drain local dirty state there.
     pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
-        let Some(context) = self.close_handle_for_release(fh) else {
+        let Some(context) = self.close_handle_for_release(fh, |_, _| {}) else {
             // Non-final handle closes stop here and never enter the
             // last-handle drain path, so any error returned by this method
             // necessarily comes from the final release flow below.
@@ -947,7 +972,34 @@ impl StudioVfs {
         fh: u64,
         runtime: &tokio::runtime::Handle,
     ) -> ReleaseFhOutcome {
-        let Some(context) = self.close_handle_for_release(fh) else {
+        let mut deferred_release_barrier = None;
+        let mut deferred_release_ino = None;
+        let Some(context) = self.close_handle_for_release(fh, |open_file, remaining| {
+            let local_state_pending = self.inode_has_local_dirty_state(open_file.ino)
+                || self
+                    .state
+                    .deferred_materialize_inflight
+                    .contains(open_file.ino);
+            let write_capable = Self::open_flags_allow_write(open_file.flags);
+            if remaining == 0 || (write_capable && local_state_pending) {
+                deferred_release_ino = Some(open_file.ino);
+                deferred_release_barrier =
+                    Some(self.register_deferred_release_barrier(open_file.ino));
+            }
+        }) else {
+            if let (Some(ino), Some((barrier, guard))) =
+                (deferred_release_ino, deferred_release_barrier)
+            {
+                if self.inode_has_local_dirty_state(ino) {
+                    self.spawn_deferred_materialization_if_needed_on(ino, runtime);
+                }
+                let vfs = Arc::clone(self);
+                self.track_background_task(runtime.spawn(async move {
+                    vfs.wait_for_deferred_materialization_inflight(ino).await;
+                    drop(barrier);
+                    drop(guard);
+                }));
+            }
             return ReleaseFhOutcome::default();
         };
         let ino = context.ino;
@@ -957,6 +1009,10 @@ impl StudioVfs {
             action,
             LastHandleReleaseAction::Clean | LastHandleReleaseAction::IgnoredEntry
         ) {
+            if let Some((barrier, guard)) = deferred_release_barrier {
+                drop(barrier);
+                drop(guard);
+            }
             self.state.file_session.gc_if_idle(ino);
             return ReleaseFhOutcome {
                 closed_last_handle: true,
@@ -969,7 +1025,8 @@ impl StudioVfs {
             ..
         } = context;
         let vfs = Arc::clone(self);
-        let (barrier, guard) = self.register_deferred_release_barrier(ino);
+        let (barrier, guard) = deferred_release_barrier
+            .expect("last-handle deferred release must register its barrier before close");
         self.track_background_task(runtime.spawn(async move {
             let _os_cache_writer_lease = os_cache_writer_lease;
             let _os_cache_foreground_read_lease = os_cache_foreground_read_lease;

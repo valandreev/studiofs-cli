@@ -510,6 +510,23 @@ impl RedbMetaEngine {
         Err(MetaError::InodeNotFound(ino))
     }
 
+    pub(super) fn resolve_attr_from_opened_values(
+        base: Option<&[u8]>,
+        current: Option<&[u8]>,
+        ino: Ino,
+        prefer_current: bool,
+    ) -> MetaResult<InodeAttr> {
+        let encoded = if prefer_current {
+            current.or(base)
+        } else {
+            base.or(current)
+        };
+        encoded
+            .map(decode)
+            .transpose()?
+            .ok_or(MetaError::InodeNotFound(ino))
+    }
+
     pub(super) fn lookup_in_write_table(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,

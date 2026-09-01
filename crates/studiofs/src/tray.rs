@@ -66,6 +66,7 @@ mod supported {
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
     const DIAGNOSTICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
     const DIAGNOSTICS_STARTUP_GRACE: Duration = Duration::from_secs(5);
+    const DAEMON_LOG_STEM_ENV: &str = "STUDIOFS_DAEMON_LOG_STEM";
     const IDLE_CYCLE: Duration = Duration::from_millis(4400);
     const ACTIVE_CYCLE: Duration = Duration::from_millis(1200);
 
@@ -583,7 +584,7 @@ mod supported {
     }
 
     pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {
-        if args.should_detach() {
+        if args.should_detach() || std::env::var_os(DAEMON_LOG_STEM_ENV).is_some() {
             return args.dispatch();
         }
 

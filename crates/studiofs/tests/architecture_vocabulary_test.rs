@@ -1912,6 +1912,87 @@ fn fuse3_macos_candidate_report_covers_sfs487_proof_gate() {
 }
 
 #[test]
+fn macfuse_fskit_contract_and_legacy_baseline_covers_sfs668_gate() {
+    let doc = read_workspace_file(
+        "docs/exec-plans/SFS-668-macfuse-fskit-contract-and-legacy-baseline.md",
+    );
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-668",
+        "Define the macFUSE FSKit backend contract and record the legacy macOS performance baseline",
+        "macFUSE 5.3.3",
+        "macOS 15.4",
+        "MFMount.framework",
+        "MFChannelCreate",
+        "MFMount",
+        "MFChannelCopyNextMessage",
+        "MFMessageGetBodyBuffers",
+        "MFMessageGetReplyBuffer",
+        "MFChannelSendMessage",
+        "MFChannelInterrupt",
+        "FUSE_DARWIN_REPLY_BUF",
+        "FUSE_DARWIN_PAYLOAD_BUF",
+        "fuse_in_header",
+        "fuse_out_header",
+        "fuse_reply_buf_out",
+        "FUSE_INIT",
+        "fuse_lowlevel_notify_inval_inode",
+        "fuse_lowlevel_notify_inval_entry",
+        "notification API is not supported",
+        "mount points outside /Volumes",
+        "files are always opened read/write",
+        "fuse_context_t",
+        "local-first write visibility",
+        "flush/fsync/release",
+        "ResourceFork",
+        "kernel invalidation",
+        "STUDIOFS_MOUNT_BACKEND=macfuse",
+        "studiofs devbench",
+        "studiofs bench",
+        "validate-bench-macos.sh",
+        "--runs 5",
+        "1GB",
+        "4MB",
+        "128KB",
+        "1000",
+        "target/perf",
+        "runtime_stats",
+        "fuse_callbacks",
+        "cache_pipeline",
+        "mounted_memory",
+        "sample variance",
+        "cold sequential read",
+        "warm repeated sequential read",
+        "random read",
+        "large-file read throughput",
+        "write throughput",
+        "flush/fsync latency",
+        "metadata-heavy directory traversal/file-open",
+        "median",
+        "variance",
+        "same host",
+        "no production backend removal",
+        "SFS-669",
+        "SFS-671",
+        "SFS-672",
+        "cargo test -p studiofs --test architecture_vocabulary_test macfuse_fskit_contract_and_legacy_baseline_covers_sfs668_gate -- --nocapture",
+        "https://github.com/macfuse/macfuse/wiki/FUSE-Backends",
+        "https://github.com/macfuse/macfuse/releases",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-668 macFUSE FSKit contract and baseline is missing required decision-gate surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
     let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
     let required_terms = [
