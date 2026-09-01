@@ -5959,16 +5959,21 @@ impl StudioVfs {
         } else {
             None
         };
-        let should_try_upload_stage = match primary_read {
-            None => true,
-            Some(read) => read < out.len() && self.upload_stage_contains_async(object_id).await?,
+        let staged_payload = match primary_read {
+            None => self.upload_stage_get_async(object_id).await?,
+            Some(read) if read < out.len() => self.upload_stage_get_async(object_id).await?,
+            _ => None,
         };
-        if should_try_upload_stage
-            && let Some(payload) = self.upload_stage_get_async(object_id).await?
-        {
+        if let Some(payload) = staged_payload {
             let read = Self::copy_payload_range(&payload, data_offset, out);
-            self.record_foreground_local_payload_read(read as u64, 0);
-            return Ok(Some(read));
+            let primary_is_no_better = match primary_read {
+                None => true,
+                Some(primary_read) => read >= primary_read,
+            };
+            if primary_is_no_better {
+                self.record_foreground_local_payload_read(read as u64, 0);
+                return Ok(Some(read));
+            }
         }
         if let Some(read) = primary_read {
             self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);

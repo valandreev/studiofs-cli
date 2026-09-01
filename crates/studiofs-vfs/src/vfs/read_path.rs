@@ -2586,6 +2586,41 @@ mod tests {
         });
     }
 
+    #[test]
+    fn payload_read_keeps_primary_bytes_when_staged_range_is_empty() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, _meta) =
+            make_unstarted_test_vfs(&tmp, "read-pending-upload-stage-stale-short");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_005;
+            vfs.local_payload_backend()
+                .put(object_id, b"short", false)
+                .expect("persist initial local payload");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_id])
+                .expect("link initial payload into upload stage");
+            vfs.local_payload_backend()
+                .put(object_id, b"primary payload", false)
+                .expect("replace primary local payload");
+            counting_backend.set_force_short_read(true);
+
+            let mut out = [0_u8; 4];
+            let read = vfs
+                .payload_store_read_into_async(object_id, 5, &mut out)
+                .await
+                .expect("payload read should preserve the primary result");
+
+            assert_eq!(read, Some(1));
+            assert_eq!(&out[..1], b"r");
+        });
+    }
+
     fn mark_all_overlay_objects_uploaded(
         vfs: &Arc<StudioVfs>,
         meta: &Arc<RedbMetaEngine>,

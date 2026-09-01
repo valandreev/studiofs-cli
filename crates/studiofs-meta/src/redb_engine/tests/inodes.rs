@@ -284,6 +284,41 @@ fn test_get_attrs_batch_does_not_decode_unrelated_regular_file_chunk_rows() {
 }
 
 #[test]
+fn test_attr_overlay_short_circuits_malformed_chunk_overlay() {
+    let source = temp_engine();
+    let file = source
+        .create_file(ROOT_INO, b"attr-overlay-before-chunks.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let snapshot = source.export_snapshot().unwrap();
+
+    let engine = temp_engine();
+    engine.import_snapshot(&snapshot).unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.mode = 0o600;
+    engine.set_attr(&attr).unwrap();
+
+    let invalid_chunk_key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
+    let invalid_chunk_state = [0xff];
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(REGULAR_FILE_OVERLAY_TABLE)
+        .unwrap()
+        .insert(invalid_chunk_key.as_slice(), invalid_chunk_state.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(
+        engine.get_attr(file.ino).unwrap().mode,
+        0o600,
+        "attr overlay should avoid decoding chunk overlay rows"
+    );
+    let attrs = engine
+        .get_attrs_batch(&[file.ino])
+        .expect("batch attr resolution should short-circuit chunk overlay decoding");
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].mode, 0o600);
+}
+
+#[test]
 fn test_get_attr_merged_in_write_txn_matches_read_get_attr() {
     let source = temp_engine();
     let base_file = source

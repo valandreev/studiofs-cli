@@ -17456,6 +17456,52 @@ fn deferred_release_keeps_barrier_while_materializer_is_in_flight() {
 }
 
 #[test]
+fn deferred_release_cancellation_drops_barrier_and_guard() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "release-cancellation-drops-guards");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-cancellation-drops-guards.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(fh, ino, 0, b"dirty").await.unwrap();
+        let (materializer, materializer_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should reserve the materialization gate");
+
+        let outcome = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
+        assert!(outcome.closed_last_handle);
+        assert!(vfs.state.deferred_release_inflight.contains(ino));
+
+        let handle = vfs
+            .state
+            .shutdown
+            .background_tasks
+            .lock()
+            .pop()
+            .expect("release should track its background task");
+        handle.abort();
+        assert!(
+            handle
+                .await
+                .expect_err("aborted release task")
+                .is_cancelled()
+        );
+        assert!(
+            !vfs.state.deferred_release_inflight.contains(ino),
+            "cancelling the release task must drop its barrier"
+        );
+
+        drop(materializer_guard);
+        drop(materializer);
+    });
+}
+
+#[test]
 fn read_after_writer_release_callback_lag_observes_local_write() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "release-callback-lag-read");

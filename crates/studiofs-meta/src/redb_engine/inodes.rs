@@ -598,10 +598,8 @@ impl RedbMetaEngine {
         txn: &redb::ReadTransaction,
         ino: Ino,
     ) -> MetaResult<bool> {
-        Ok(
-            Self::regular_file_overlay_differs_from_base_in_read_txn(txn, ino)?
-                || Self::local_overlay_attr_inode_from_txn(txn, ino)?,
-        )
+        Ok(Self::local_overlay_attr_inode_from_txn(txn, ino)?
+            || Self::regular_file_overlay_differs_from_base_in_read_txn(txn, ino)?)
     }
 
     pub(super) fn local_overlay_attr_inodes_from_txn(
@@ -773,20 +771,36 @@ impl MetaInodes for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut attrs = Vec::with_capacity(inos.len());
         for &ino in inos {
-            let prefer_current = Self::regular_file_overlay_differs_from_base_in_opened_tables(
-                &overlay_chunks,
-                &base_chunks,
-                ino,
-            )? || Self::local_overlay_attr_inode_from_opened_tables(
-                &current,
-                &base,
-                &tombstones,
-                ino,
-            )?;
-            match Self::resolve_attr_from_opened_tables(
-                &base,
-                &current,
-                &tombstones,
+            if tombstones
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some()
+            {
+                continue;
+            }
+            let current = current
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let base = base
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_overlay = match (&current, &base) {
+                (Some(current), Some(base)) => current.value() != base.value(),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            let prefer_current = if attr_overlay {
+                true
+            } else {
+                Self::regular_file_overlay_differs_from_base_in_opened_tables(
+                    &overlay_chunks,
+                    &base_chunks,
+                    ino,
+                )?
+            };
+            match Self::resolve_attr_from_opened_values(
+                base.as_ref().map(|value| value.value()),
+                current.as_ref().map(|value| value.value()),
                 ino,
                 prefer_current,
             ) {

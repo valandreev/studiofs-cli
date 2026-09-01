@@ -2960,7 +2960,9 @@ mod open_cache_snapshot_tests {
             .read(attr.ino, reader.file_handle(), 0, (chunk.len() * 2) as u32)
             .expect("read locally accepted bytes");
 
-        assert_eq!(read, [chunk.as_slice(), chunk.as_slice()].concat());
+        assert_eq!(read.len(), chunk.len() * 2);
+        assert_eq!(&read[..chunk.len()], chunk.as_slice());
+        assert_eq!(&read[chunk.len()..], chunk.as_slice());
         adapter
             .release(attr.ino, reader.file_handle())
             .expect("release reader");
