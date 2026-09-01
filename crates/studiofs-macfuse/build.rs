@@ -31,7 +31,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed={MFMOUNT_FRAMEWORK_ENV}");
     println!("cargo:rerun-if-changed=csrc/low_level_ops.c");
-    link_mfmount_framework();
+    println!("cargo:rustc-check-cfg=cfg(studiofs_fskit)");
+    if link_mfmount_framework() {
+        println!("cargo:rustc-cfg=studiofs_fskit");
+    }
     let mut build = cc::Build::new();
     build.file("csrc/low_level_ops.c");
     build.define("_FILE_OFFSET_BITS", "64");
@@ -63,24 +66,26 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn link_mfmount_framework() {
+fn link_mfmount_framework() -> bool {
     let framework_dir = std::env::var(MFMOUNT_FRAMEWORK_ENV)
         .unwrap_or_else(|_| DEFAULT_MFMOUNT_FRAMEWORK_DIR.to_string());
     let framework_dir = Path::new(&framework_dir);
     let header = framework_dir.join("MFMount.framework/Headers/MFMount.h");
     let binary = framework_dir.join("MFMount.framework/MFMount");
     if !header.is_file() || !binary.is_file() {
-        panic!(
-            "macFUSE FSKit backend requires MFMount.framework at '{}'; set {} to its parent directory",
+        println!(
+            "cargo:warning=MFMount.framework not found at '{}'; experimental FSKit backend is disabled; set {} to its parent directory to enable it",
             framework_dir.display(),
             MFMOUNT_FRAMEWORK_ENV
         );
+        return false;
     }
     println!(
         "cargo:rustc-link-search=framework={}",
         framework_dir.display()
     );
     println!("cargo:rustc-link-lib=framework=MFMount");
+    true
 }
 
 #[cfg(target_os = "macos")]

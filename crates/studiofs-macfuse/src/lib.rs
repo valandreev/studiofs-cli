@@ -24,6 +24,7 @@ pub mod probe;
 pub mod low_level;
 
 mod adapter;
+#[cfg(studiofs_fskit)]
 mod fskit;
 
 /// Request used by the CLI backend router to launch the macOS bridge.
@@ -183,6 +184,7 @@ fn signal_handlers_for_policy(
 struct SignalWatcher {
     stop: Arc<AtomicBool>,
     handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
+    wake: std::thread::Thread,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -192,6 +194,7 @@ impl Drop for SignalWatcher {
         if let Ok(mut handlers) = self.handlers.lock() {
             let _ = handlers.take();
         }
+        self.wake.unpark();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -216,7 +219,7 @@ fn spawn_signal_watcher(
                     .as_ref()
                     .is_some_and(MacFuseUnmountSignal::is_requested)
             {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::park_timeout(std::time::Duration::from_millis(100));
             }
             if watcher_stop.load(Ordering::Acquire) {
                 return;
@@ -228,9 +231,11 @@ fn spawn_signal_watcher(
             }
             request_exit();
         })?;
+    let wake = thread.thread().clone();
     Ok(SignalWatcher {
         stop,
         handlers,
+        wake,
         thread: Some(thread),
     })
 }
@@ -291,8 +296,18 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
 }
 
 /// Start serving the experimental native macFUSE FSKit bridge.
+#[cfg(studiofs_fskit)]
 pub fn mount_with_fskit_request(request: MacFuseMountRequest) -> io::Result<()> {
     fskit::mount_with_request(request)
+}
+
+/// Report that the experimental native macFUSE FSKit bridge is unavailable.
+#[cfg(not(studiofs_fskit))]
+pub fn mount_with_fskit_request(_request: MacFuseMountRequest) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "macFUSE FSKit backend requires MFMount.framework; install macFUSE or set STUDIOFS_MFMOUNT_FRAMEWORK_DIR",
+    ))
 }
 
 fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperations {
@@ -529,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(studiofs_fskit)]
     fn fskit_mounted_lookup_open_read_unmount_smoke_is_gated() {
         if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
             return;

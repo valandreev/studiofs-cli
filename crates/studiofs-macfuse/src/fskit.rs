@@ -358,17 +358,17 @@ struct MessageBody {
     bytes: Vec<u8>,
 }
 
-fn parse_message_body(bytes: &[u8]) -> Result<MessageBody, i32> {
-    let header: FuseInHeader = read_copy(bytes, 0)?;
+fn parse_message_body(bytes: Vec<u8>) -> Result<MessageBody, (i32, Vec<u8>)> {
+    let header: FuseInHeader = match read_copy(&bytes, 0) {
+        Ok(header) => header,
+        Err(errno) => return Err((errno, bytes)),
+    };
     if usize::try_from(header.len).ok() != Some(bytes.len())
         || header.len < size_of::<FuseInHeader>() as u32
     {
-        return Err(libc::EINVAL);
+        return Err((libc::EINVAL, bytes));
     }
-    Ok(MessageBody {
-        header,
-        bytes: bytes.to_vec(),
-    })
+    Ok(MessageBody { header, bytes })
 }
 
 fn read_copy<T: Copy>(bytes: &[u8], offset: usize) -> Result<T, i32> {
@@ -983,9 +983,9 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        let body = match parse_message_body(&bytes) {
+        let body = match parse_message_body(bytes) {
             Ok(body) => body,
-            Err(errno) => {
+            Err((errno, bytes)) => {
                 if let Ok(header) = read_copy::<FuseInHeader>(&bytes, 0) {
                     let request = FsKitRequest::new(message, MessageBody { header, bytes }, sender);
                     let _ = request.reply_error(errno);
@@ -1470,7 +1470,7 @@ impl FsKitDispatcher {
     }
 
     fn symlink(&self, request: FsKitRequest) {
-        let (target, name) =
+        let (name, target) =
             match parse_two_c_strings(&request.body.bytes, size_of::<FuseInHeader>()) {
                 Ok(names) => (names.0.to_vec(), names.1.to_vec()),
                 Err(errno) => {
@@ -2078,7 +2078,18 @@ mod tests {
         let mut body = vec![0_u8; size_of::<FuseInHeader>()];
         body[..4].copy_from_slice(&39_u32.to_ne_bytes());
 
-        assert!(parse_message_body(&body).is_err());
+        assert!(parse_message_body(body).is_err());
+    }
+
+    #[test]
+    fn symlink_payload_order_is_name_then_target() {
+        let mut body = vec![0_u8; size_of::<FuseInHeader>()];
+        body.extend_from_slice(b"link\0target\0");
+
+        let (name, target) =
+            parse_two_c_strings(&body, size_of::<FuseInHeader>()).expect("parse symlink payload");
+        assert_eq!(name, b"link");
+        assert_eq!(target, b"target");
     }
 
     #[test]

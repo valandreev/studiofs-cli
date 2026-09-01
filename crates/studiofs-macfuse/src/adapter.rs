@@ -1161,6 +1161,7 @@ impl StudioVfsAdapter {
         Ok((attr, open, guard))
     }
 
+    #[cfg(studiofs_fskit)]
     pub(crate) fn create_for_fskit(
         &self,
         parent: u64,
@@ -1633,6 +1634,7 @@ impl StudioVfsAdapter {
         }
     }
 
+    #[cfg(studiofs_fskit)]
     pub(crate) async fn read_for_fskit(
         &self,
         ino: u64,
@@ -2097,6 +2099,7 @@ impl StudioVfsAdapter {
         Ok(())
     }
 
+    #[cfg(studiofs_fskit)]
     pub(crate) fn directory_entries_for_fskit(
         &self,
         file_handle: u64,
@@ -2296,6 +2299,7 @@ impl StudioVfsAdapter {
         }
     }
 
+    #[cfg(studiofs_fskit)]
     pub(crate) fn remember_fskit_file_flags(&self, ino: u64, flags: u32) {
         self.file_flags.lock().insert(ino, flags);
     }
@@ -2347,10 +2351,12 @@ impl CallbackState {
         self.adapter.reply_tasks.wait_for_idle();
     }
 
+    #[cfg(studiofs_fskit)]
     pub(crate) fn adapter(&self) -> Arc<StudioVfsAdapter> {
         Arc::clone(&self.adapter)
     }
 
+    #[cfg(studiofs_fskit)]
     pub(crate) fn track_reply_task(&self) -> ReplyTaskGuard {
         self.adapter.reply_tasks.track()
     }

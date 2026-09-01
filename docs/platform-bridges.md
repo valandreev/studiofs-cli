@@ -49,7 +49,9 @@ mount diagnostics/status as `macFUSE-FSKit`.
 This initial path is intentionally limited: mount points must be below
 `/Volumes`, macOS 15.4+ and macFUSE 5.3.3+ are required, and the framework must
 be installed under `/Library/Filesystems/macfuse.fs/Contents/Frameworks` or
-the parent path supplied through `STUDIOFS_MFMOUNT_FRAMEWORK_DIR`. Because the
+the parent path supplied through `STUDIOFS_MFMOUNT_FRAMEWORK_DIR`; if it is not
+available, the package still builds the legacy bridge and rejects the FSKit
+selector as unsupported. Because the
 FSKit notification API is not used here, the transport passes `novncache` and
 uses direct I/O as the explicit coherence fallback. The zero-copy negotiation
 and full semantic parity work remain separate follow-up tickets.

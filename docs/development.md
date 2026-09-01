@@ -50,13 +50,14 @@ cargo build --release
 ```
 
 On macOS, `crates/studiofs-macfuse` requires real macFUSE headers for Cargo
-builds and tests. The experimental FSKit path also links
-`MFMount.framework`; the build fails fast when that framework is not installed.
-Set `STUDIOFS_MFMOUNT_FRAMEWORK_DIR` to the framework parent directory when the
-installation is outside the default macFUSE location. The C shim includes an
-editor-only compatibility header so workspace diagnostics stay usable when
-`fuse_lowlevel.h` is absent, but the actual legacy build still requires headers
-discoverable via `pkg-config fuse` or standard Homebrew include locations.
+builds and tests. The experimental FSKit path links `MFMount.framework` when it
+is installed; otherwise the legacy bridge remains available and selecting FSKit
+returns an unsupported-backend error. Set `STUDIOFS_MFMOUNT_FRAMEWORK_DIR` to
+the framework parent directory when the installation is outside the default
+macFUSE location. The C shim includes an editor-only compatibility header so
+workspace diagnostics stay usable when `fuse_lowlevel.h` is absent, but the
+actual legacy build still requires headers discoverable via `pkg-config fuse` or
+standard Homebrew include locations.
 
 ## Checks
 
