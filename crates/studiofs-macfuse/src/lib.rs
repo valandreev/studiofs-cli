@@ -2584,6 +2584,27 @@ mod tests {
     }
 
     #[test]
+    fn adapter_lookup_remembers_file_flag_overlay_for_ds_store() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-file-flags-lookup",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b".DS_Store", 501, 20, 0o644)
+            .expect("create hidden Finder metadata file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        adapter
+            .lookup(root, b".DS_Store")
+            .expect("lookup hidden Finder metadata file");
+
+        assert!(adapter.file_flags_contains_for_test(attr.ino));
+    }
+
+    #[test]
     fn final_unlink_blocks_kernel_notification_from_late_write_completion() {
         #[derive(Default)]
         struct RecordingInvalidator {

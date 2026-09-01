@@ -1048,7 +1048,10 @@ impl StudioVfsAdapter {
     pub(crate) fn lookup(&self, parent: u64, name: &[u8]) -> Result<InodeAttr, i32> {
         self.vfs
             .lookup(parent, name)
-            .inspect(|attr| self.shared.kernel_inode_liveness.observe(attr.ino))
+            .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
+                self.remember_named_file_flags(attr.ino, name);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 

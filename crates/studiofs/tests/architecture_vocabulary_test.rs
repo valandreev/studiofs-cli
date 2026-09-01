@@ -1460,7 +1460,7 @@ fn configuration_contracts_match_executable_defaults() {
             contains_doc_term(
                 &mount_backend,
                 &normalized_mount_backend,
-                "Some(value) if value.eq_ignore_ascii_case(\"macfuse\") => Box::new(MacFuseMountBackend)",
+                "Some(value) if value.eq_ignore_ascii_case(\"legacy\") || value.eq_ignore_ascii_case(\"macfuse\") => { Box::new(MacFuseMountBackend) }",
             ),
         ),
         (
@@ -1468,7 +1468,7 @@ fn configuration_contracts_match_executable_defaults() {
             contains_doc_term(
                 &configuration,
                 &normalized_configuration,
-                "On macOS, the native macFUSE bridge is the default mount backend.",
+                "On macOS, the legacy native macFUSE bridge is the default mount backend.",
             ),
         ),
         (

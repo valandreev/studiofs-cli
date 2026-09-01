@@ -411,6 +411,11 @@ fn parse_two_c_strings(bytes: &[u8], offset: usize) -> Result<(&[u8], &[u8]), i3
     Ok((first, second))
 }
 
+fn checked_slice(bytes: &[u8], offset: usize, size: usize) -> Result<&[u8], i32> {
+    let end = offset.checked_add(size).ok_or(libc::EINVAL)?;
+    bytes.get(offset..end).ok_or(libc::EINVAL)
+}
+
 fn errno_error(errno: i32) -> io::Error {
     io::Error::from_raw_os_error(if errno == 0 { libc::EIO } else { errno.abs() })
 }
@@ -1181,14 +1186,10 @@ impl FsKitDispatcher {
         };
         let payload_offset = size_of::<FuseInHeader>() + size_of::<FuseWriteIn>();
         let size = input.size as usize;
-        let data = match request
-            .body
-            .bytes
-            .get(payload_offset..payload_offset + size)
-        {
-            Some(data) => data.to_vec(),
-            None => {
-                let _ = request.reply_error(libc::EINVAL);
+        let data = match checked_slice(&request.body.bytes, payload_offset, size) {
+            Ok(data) => data.to_vec(),
+            Err(errno) => {
+                let _ = request.reply_error(errno);
                 return;
             }
         };
@@ -1677,12 +1678,20 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        let value_offset = name_offset + name.len() + 1;
-        let value_end = value_offset.saturating_add(input.size as usize);
-        let value = match request.body.bytes.get(value_offset..value_end) {
-            Some(value) => value,
+        let value_offset = match name_offset
+            .checked_add(name.len())
+            .and_then(|offset| offset.checked_add(1))
+        {
+            Some(offset) => offset,
             None => {
                 let _ = request.reply_error(libc::EINVAL);
+                return;
+            }
+        };
+        let value = match checked_slice(&request.body.bytes, value_offset, input.size as usize) {
+            Ok(value) => value,
+            Err(errno) => {
+                let _ = request.reply_error(errno);
                 return;
             }
         };
@@ -1962,7 +1971,7 @@ fn statfs_out_from_statvfs(stats: libc::statvfs) -> FuseStatfsOut {
             files: stats.f_files as u64,
             ffree: stats.f_ffree as u64,
             bsize: stats.f_bsize as u32,
-            namelen: stats.f_namemax as u32,
+            namelen: u32::try_from(stats.f_namemax).unwrap_or(u32::MAX),
             frsize: stats.f_frsize as u32,
             padding: 0,
             spare: [0; 6],
@@ -2090,6 +2099,24 @@ mod tests {
             parse_two_c_strings(&body, size_of::<FuseInHeader>()).expect("parse symlink payload");
         assert_eq!(name, b"link");
         assert_eq!(target, b"target");
+    }
+
+    #[test]
+    fn checked_slice_rejects_overflow_and_out_of_bounds() {
+        let bytes = [0_u8, 1, 2, 3];
+        let payload = checked_slice(&bytes, 1, 2).expect("valid payload");
+
+        assert_eq!(payload, &[1, 2]);
+        assert_eq!(checked_slice(&bytes, usize::MAX, 1), Err(libc::EINVAL));
+        assert_eq!(checked_slice(&bytes, 3, 2), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn statfs_name_limit_saturates_to_wire_width() {
+        let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
+        stats.f_namemax = (u32::MAX as libc::c_ulong) + 1;
+
+        assert_eq!(statfs_out_from_statvfs(stats).st.namelen, u32::MAX);
     }
 
     #[test]
