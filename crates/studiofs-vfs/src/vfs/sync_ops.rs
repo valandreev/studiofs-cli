@@ -2,8 +2,8 @@ use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino, InodeAttr,
     LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, MetaUploadState,
-    OpenFile, OpenFlags, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy,
-    StudioVfs, VfsResult,
+    OpenFile, PrefetchedWriterStackObjectIds, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
+    VfsResult,
 };
 use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap};
@@ -805,9 +805,7 @@ impl StudioVfs {
             return LastHandleReleaseAction::Clean;
         }
 
-        let sticky_error_policy = if context.open_file.flags.contains(OpenFlags::WRONLY)
-            || context.open_file.flags.contains(OpenFlags::RDWR)
-        {
+        let sticky_error_policy = if Self::open_flags_allow_write(context.open_file.flags) {
             StickyErrorPolicy::Report
         } else {
             StickyErrorPolicy::Ignore
@@ -982,8 +980,7 @@ impl StudioVfs {
                     .state
                     .deferred_materialize_inflight
                     .contains(open_file.ino);
-            let write_capable = open_file.flags.contains(OpenFlags::WRONLY)
-                || open_file.flags.contains(OpenFlags::RDWR);
+            let write_capable = Self::open_flags_allow_write(open_file.flags);
             if remaining == 0 || (write_capable && local_state_pending) {
                 deferred_release_ino = Some(open_file.ino);
                 deferred_release_barrier =

@@ -2587,6 +2587,34 @@ mod tests {
     }
 
     #[test]
+    fn payload_read_does_not_overwrite_primary_bytes_with_shorter_stage() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-pending-upload-stage-shorter");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_006;
+            vfs.local_payload_backend()
+                .put(object_id, b"xy", false)
+                .expect("persist staged payload");
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_id])
+                .expect("link staged payload");
+            vfs.local_payload_backend()
+                .put(object_id, b"abc", false)
+                .expect("replace primary local payload");
+
+            let mut out = [0_u8; 4];
+            let read = vfs
+                .payload_store_read_into_async(object_id, 0, &mut out)
+                .await
+                .expect("payload read should preserve the primary result");
+
+            assert_eq!(read, Some(3));
+            assert_eq!(&out[..3], b"abc");
+        });
+    }
+
+    #[test]
     fn payload_read_keeps_primary_bytes_when_staged_range_is_empty() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, mut vfs, _meta) =

@@ -587,11 +587,18 @@ impl RedbMetaEngine {
         let base = base
             .get(ino)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(match (current, base) {
-            (Some(current), Some(base)) => current.value() != base.value(),
+        Ok(Self::attr_differs_from_base(
+            current.as_ref().map(|value| value.value()),
+            base.as_ref().map(|value| value.value()),
+        ))
+    }
+
+    fn attr_differs_from_base(current: Option<&[u8]>, base: Option<&[u8]>) -> bool {
+        match (current, base) {
+            (Some(current), Some(base)) => current != base,
             (Some(_), None) => true,
             (None, _) => false,
-        })
+        }
     }
 
     fn prefer_current_attr_for_inode_from_txn(
@@ -784,11 +791,10 @@ impl MetaInodes for RedbMetaEngine {
             let base = base
                 .get(ino)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let attr_overlay = match (&current, &base) {
-                (Some(current), Some(base)) => current.value() != base.value(),
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
+            let attr_overlay = Self::attr_differs_from_base(
+                current.as_ref().map(|value| value.value()),
+                base.as_ref().map(|value| value.value()),
+            );
             let prefer_current = if attr_overlay {
                 true
             } else {

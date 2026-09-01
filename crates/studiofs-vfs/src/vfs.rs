@@ -5965,12 +5965,15 @@ impl StudioVfs {
             _ => None,
         };
         if let Some(payload) = staged_payload {
-            let read = Self::copy_payload_range(&payload, data_offset, out);
-            let primary_is_no_better = match primary_read {
+            let staged_read = payload
+                .get(data_offset..)
+                .map_or(0, |payload| payload.len().min(out.len()));
+            let staged_is_no_worse = match primary_read {
                 None => true,
-                Some(primary_read) => read >= primary_read,
+                Some(primary_read) => staged_read >= primary_read,
             };
-            if primary_is_no_better {
+            if staged_is_no_worse {
+                let read = Self::copy_payload_range(&payload, data_offset, out);
                 self.record_foreground_local_payload_read(read as u64, 0);
                 return Ok(Some(read));
             }

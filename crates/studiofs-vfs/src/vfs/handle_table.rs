@@ -44,7 +44,9 @@ impl HandleTable {
     }
 
     fn flags_allow_write(flags: OpenFlags) -> bool {
-        flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
+        flags.contains(OpenFlags::WRONLY)
+            || flags.contains(OpenFlags::RDWR)
+            || flags.contains(OpenFlags::APPEND)
     }
 
     /// Allocate a new file handle and register it.
@@ -394,5 +396,15 @@ mod tests {
 
         assert!(ht.take_orphan(42));
         assert!(!ht.take_orphan(42));
+    }
+
+    #[test]
+    fn append_handle_counts_as_write_capable() {
+        let ht = HandleTable::new();
+        let handle = ht.open(10, OpenFlags::APPEND, None, true);
+
+        assert_eq!(ht.write_open_count(10), 1);
+        ht.close(handle.fh).expect("append handle should close");
+        assert_eq!(ht.write_open_count(10), 0);
     }
 }
