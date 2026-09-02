@@ -33,7 +33,9 @@ SFS-672 performance comparison remain separate issues.
       cargo test -p studiofs-macfuse: 162 tests passed.
 - [x] (2026-09-02) Confirmed the staged design and first milestone with the
       user.
-- [ ] Write, self-review, and commit this design document.
+- [x] Write, self-review, and commit this design document (`6fae39d2`).
+- [x] Write the implementation plan in
+      docs/superpowers/plans/2026-09-02-sfs-670-hardlink-fskit-invalidation.md.
 - [ ] Add RED tests for the first hardlink and invalidation milestone.
 - [ ] Implement the smallest production change that makes those tests pass.
 - [ ] Sweep the remaining SFS-670 operations through shared mounted scenarios.
