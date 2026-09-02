@@ -1035,6 +1035,41 @@ fn read_reply_uses_transport_buffer(payload: &[u8], requested_size: u32) -> bool
     !payload.is_empty() || requested_size == 0
 }
 
+fn spawn_blocking_reply_task<G, F>(runtime_handle: &Handle, task_guard: G, operation: F)
+where
+    G: Send + 'static,
+    F: FnOnce() + Send + 'static,
+{
+    std::mem::drop(runtime_handle.spawn_blocking(move || {
+        let _task_guard = task_guard;
+        operation();
+    }));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FsKitXattrResponse {
+    Size(usize),
+    Value(Vec<u8>),
+}
+
+fn getxattr_response(
+    value: &[u8],
+    position: usize,
+    requested_size: u32,
+) -> Result<FsKitXattrResponse, i32> {
+    if requested_size == 0 {
+        return Ok(FsKitXattrResponse::Size(
+            crate::adapter::xattr_size_from_position(value.len(), position),
+        ));
+    }
+    let value = crate::adapter::xattr_value_from_position(value, position);
+    if value.len() > requested_size as usize {
+        Err(libc::ERANGE)
+    } else {
+        Ok(FsKitXattrResponse::Value(value.to_vec()))
+    }
+}
+
 type CancellationMap = Arc<Mutex<std::collections::HashMap<u64, Arc<CancellationToken>>>>;
 
 struct CancellationGuard {
@@ -1214,8 +1249,8 @@ impl FsKitDispatcher {
         match self.adapter.open(header.nodeid, input.flags as i32) {
             Ok(open) => {
                 let file_handle = open.file_handle();
-                // FSKit notifications are unavailable in this slice. Force
-                // direct I/O and keep novncache as the explicit fallback.
+                // Keep direct I/O for the current owned-buffer path; SFS-671
+                // owns negotiated zero-copy and future cache-policy changes.
                 let result = request.reply_struct(FuseOpenOut {
                     fh: file_handle,
                     open_flags: FOPEN_DIRECT_IO,
@@ -1543,12 +1578,19 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        match self.adapter.rmdir(request.header().nodeid, &name) {
-            Ok(()) => self.empty_success(request),
-            Err(errno) => {
-                let _ = request.reply_error(errno);
+        let parent = request.header().nodeid;
+        let adapter = Arc::clone(&self.adapter);
+        let task_guard = self.callback_state.track_reply_task();
+        spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
+            match adapter.rmdir(parent, &name) {
+                Ok(()) => {
+                    let _ = request.reply_bytes(Vec::new());
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                }
             }
-        }
+        });
     }
 
     fn rename(&self, request: FsKitRequest) {
@@ -1621,18 +1663,20 @@ impl FsKitDispatcher {
                     return;
                 }
             };
-        match self
-            .adapter
-            .symlink(request.header().nodeid, &name, &target)
-        {
-            Ok(attr) => {
-                let _ = request
-                    .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+        let parent = request.header().nodeid;
+        let adapter = Arc::clone(&self.adapter);
+        let task_guard = self.callback_state.track_reply_task();
+        spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
+            match adapter.symlink(parent, &name, &target) {
+                Ok(attr) => {
+                    let _ = request
+                        .reply_struct(entry_from_stat(attr.ino, adapter.attr_to_stat(&attr)));
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                }
             }
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-            }
-        }
+        });
     }
 
     fn create(&self, request: FsKitRequest) {
@@ -1855,10 +1899,6 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        if input.position != 0 {
-            let _ = request.reply_error(libc::ENOTSUP);
-            return;
-        }
         let name = match parse_c_string(
             &request.body.bytes,
             size_of::<FuseInHeader>() + size_of::<FuseGetxattrIn>(),
@@ -1880,15 +1920,19 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        if input.size == 0 {
-            let _ = request.reply_struct(FuseXattrOut {
-                size: value.len() as u32,
-                padding: 0,
-            });
-        } else if value.len() > input.size as usize {
-            let _ = request.reply_error(libc::ERANGE);
-        } else {
-            let _ = request.reply_bytes(value);
+        match getxattr_response(&value, input.position as usize, input.size) {
+            Ok(FsKitXattrResponse::Size(size)) => {
+                let _ = request.reply_struct(FuseXattrOut {
+                    size: size as u32,
+                    padding: 0,
+                });
+            }
+            Ok(FsKitXattrResponse::Value(value)) => {
+                let _ = request.reply_bytes(value);
+            }
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+            }
         }
     }
 
@@ -2584,5 +2628,62 @@ mod tests {
     fn fskit_setattr_accepts_lock_owner_modifier() {
         assert!(setattr_flags_supported(FATTR_LOCKOWNER));
         assert!(!setattr_flags_supported(1 << 10));
+    }
+
+    #[test]
+    fn fskit_getxattr_preserves_legacy_position_contract() {
+        let value = b"fork-payload";
+
+        assert_eq!(
+            getxattr_response(value, 5, 0).expect("size query should succeed"),
+            FsKitXattrResponse::Size(value.len() - 5)
+        );
+        assert_eq!(
+            getxattr_response(value, 5, 32).expect("positioned read should succeed"),
+            FsKitXattrResponse::Value(value[5..].to_vec())
+        );
+        assert_eq!(
+            getxattr_response(value, value.len() + 1, 32)
+                .expect("past-end positioned read should succeed"),
+            FsKitXattrResponse::Value(Vec::new())
+        );
+        assert_eq!(getxattr_response(value, 0, 4), Err(libc::ERANGE));
+    }
+
+    #[test]
+    fn fskit_blocking_namespace_work_runs_off_dispatch_thread() {
+        let runtime = tokio::runtime::Runtime::new().expect("create test runtime");
+        let handle = runtime.handle().clone();
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (returned_sender, returned_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            spawn_blocking_reply_task(&handle, (), move || {
+                entered_sender
+                    .send(std::thread::current().id())
+                    .expect("signal blocking task entry");
+                release_receiver
+                    .recv()
+                    .expect("wait for blocking task release");
+            });
+            returned_sender
+                .send(std::thread::current().id())
+                .expect("signal dispatch thread returned");
+        });
+
+        let dispatch_thread = returned_receiver.recv_timeout(std::time::Duration::from_secs(1));
+        let entered_thread = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered_receiver).await
+        });
+        let release_result = release_sender.send(());
+        let worker_result = worker.join();
+
+        let dispatch_thread = dispatch_thread.expect("dispatch thread must return");
+        let entered_thread = entered_thread
+            .expect("blocking namespace work should start")
+            .expect("blocking task should report entry");
+        release_result.expect("release blocking task");
+        worker_result.expect("join blocking task caller");
+        assert_ne!(dispatch_thread, entered_thread);
     }
 }

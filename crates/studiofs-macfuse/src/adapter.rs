@@ -4561,11 +4561,11 @@ fn reply_xattr_size(req: *mut raw::FuseReq, value_len: usize) {
     let _ = Reply::new(request).xattr_size(value_len);
 }
 
-fn xattr_size_from_position(value_len: usize, position: usize) -> usize {
+pub(crate) fn xattr_size_from_position(value_len: usize, position: usize) -> usize {
     value_len.saturating_sub(position)
 }
 
-fn xattr_value_from_position(value: &[u8], position: usize) -> &[u8] {
+pub(crate) fn xattr_value_from_position(value: &[u8], position: usize) -> &[u8] {
     value.get(position..).unwrap_or(&[])
 }
 

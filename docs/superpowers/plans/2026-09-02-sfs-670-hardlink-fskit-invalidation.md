@@ -304,7 +304,7 @@ seconds. The test was stopped to avoid leaving a live mount attempt; the
 target mount directory and child processes were clean afterward. This host
 therefore provides no native FSKit pass/fail result for the mounted scenario.
 
-### Task 6: Final verification and handoff
+### Task 6: First-milestone verification and handoff
 
 - [x] Run `cargo fmt --all -- --check`.
 - [x] Run `git diff --check`.
@@ -321,6 +321,26 @@ fresh dependency rebuild. Strict `cargo clippy --all-targets --all-features
 --locked -- -D warnings` passed; the ordinary full test suite and formatting/
 diff checks passed.
 
+### Follow-up parity slice (2026-09-03)
+
+- [x] Align FSKit positioned `getxattr` reads with the legacy adapter helpers,
+      preserving size queries, remaining-value reads, past-end reads, and
+      `ERANGE` handling.
+- [x] Route FSKit `rmdir` and `symlink` through the existing tracked blocking
+      reply-task lifecycle so the dispatcher loop is not held by VFS waits.
+- [x] Add focused RED/green coverage for the xattr response contract and the
+      blocking-task dispatch seam.
+- [x] Refresh the FSKit direct-I/O comment and platform bridge documentation;
+      the legacy backend and Windows bridge remain untouched.
+- [ ] Run a native mounted FSKit proof for this slice when an approved,
+      responsive provider is available; the current Mac still cannot provide
+      that evidence.
+
+Focused validation:
+
+    cargo test -p studiofs-macfuse fskit_getxattr_preserves_legacy_position_contract -- --nocapture
+    cargo test -p studiofs-macfuse fskit_blocking_namespace_work_runs_off_dispatch_thread -- --nocapture
+
 ## Plan self-review
 
 - The tasks cover the approved first milestone: shared hardlink semantics,
@@ -328,9 +348,9 @@ diff checks passed.
   ordering, and a mounted proof boundary.
 - Every production slice has a named RED test, an exact focused command, and a
   minimal implementation location.
-- The plan intentionally leaves the remaining full parity matrix—xattrs,
-  Finder metadata/provenance, open-unlink, remote-change mounted scenarios,
-  and broader read-only/shutdown sweeps—for the next evidence-driven slice;
-  it does not weaken those requirements.
+- The plan intentionally leaves the remaining full parity matrix—Finder
+  metadata/provenance, open-unlink, remote-change mounted scenarios, and
+  broader read-only/shutdown sweeps—for later evidence-driven slices; it does
+  not weaken those requirements.
 - No new dependency, platform-wide abstraction, Windows edit, or SFS-671
   zero-copy work is planned.

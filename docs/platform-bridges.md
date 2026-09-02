@@ -57,7 +57,10 @@ channel, including separate full-inode, attribute-only, and directory-entry
 payloads. The existing `novncache` and per-handle direct-I/O choices remain
 explicit cache safeguards; FSKit invalidation is no longer a logging-only
 fallback. Hardlink requests are translated through the shared
-`StudioVfsAdapter` in both macFUSE operation transports. The zero-copy
+`StudioVfsAdapter` in both macFUSE operation transports. Positioned FSKit
+`getxattr` reads preserve the legacy `position` and `ERANGE` contract, while
+potentially waiting `rmdir` and `symlink` callbacks run as tracked blocking
+reply tasks instead of occupying the FSKit dispatcher loop. The zero-copy
 negotiation and the remaining full semantic parity matrix remain separate
 follow-up work.
 

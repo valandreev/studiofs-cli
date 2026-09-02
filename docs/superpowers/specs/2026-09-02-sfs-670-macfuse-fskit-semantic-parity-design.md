@@ -40,11 +40,15 @@ SFS-672 performance comparison remain separate issues.
       milestone.
 - [x] (2026-09-03) Implement the smallest production change that makes those
       tests pass.
+- [x] (2026-09-03) Align positioned FSKit `getxattr` reads with the legacy
+      xattr response contract.
+- [x] (2026-09-03) Move potentially waiting FSKit `rmdir` and `symlink`
+      callbacks onto tracked blocking reply tasks.
 - [ ] Sweep the remaining SFS-670 operations through shared mounted scenarios.
 - [x] (2026-09-03) Run focused validation and update the bridge documentation;
       native FSKit mount evidence remains unavailable on this host.
-- [ ] Record the final first-milestone evidence in Linear after the working
-      tree is committed.
+- [x] (2026-09-03) Record the first-milestone evidence in Linear in English;
+      the posted comment includes the unavailable native FSKit boundary.
 
 ## Surprises & Discoveries
 
@@ -366,6 +370,13 @@ First milestone evidence (2026-09-03):
     fskit_invalidator_tolerates_a_closed_control -> 1 passed
     STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1 ... fskit_mounted_hardlink_and_invalidation_smoke_is_gated
       unavailable: MFMount helper stayed blocked before readiness; target cleanup verified
+
+Follow-up parity evidence (2026-09-03):
+
+    fskit_getxattr_preserves_legacy_position_contract -> 1 passed
+    fskit_blocking_namespace_work_runs_off_dispatch_thread -> 1 passed
+    Native FSKit mounted validation remains unavailable on this host; no
+    Windows validation is claimed.
 
 The code knowledge graph is ready for the current commit. The planned Rust
 files have no recorded coverage issue; the fallback C header has a
