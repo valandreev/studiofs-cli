@@ -1731,6 +1731,8 @@ impl FsKitDispatcher {
                 }
             }
         };
+        // FSKit file flags describe the successfully applied attribute state;
+        // do not cache them when the requested setattr failed.
         if input.valid & FATTR_FLAGS != 0 {
             self.adapter
                 .remember_fskit_file_flags(header.nodeid, input.flags);
@@ -2124,6 +2126,8 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         mount_point,
         volume_name,
         read_only,
+        // CLI daemonization is handled before the backend is invoked. Once
+        // here, the FSKit session always runs synchronously until unmount.
         run_in_foreground: _,
         signal_handling,
         unmount_signal,
