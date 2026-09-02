@@ -332,6 +332,55 @@ mod tests {
     use studiofs_meta::MetaFsOps;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
 
+    #[cfg(studiofs_fskit)]
+    fn wait_for_fskit_mount_ready(
+        mount: std::thread::JoinHandle<std::io::Result<()>>,
+        target: &std::path::Path,
+        unmount_signal: &super::MacFuseUnmountSignal,
+        timeout: std::time::Duration,
+        mount_label: &str,
+    ) -> std::thread::JoinHandle<std::io::Result<()>> {
+        let ready_deadline = std::time::Instant::now() + timeout;
+        loop {
+            // A kernel lookup can block while the FSKit provider is activating;
+            // probe it in a child so a failed provider cannot hang this test.
+            let mut probe = std::process::Command::new("/usr/bin/stat")
+                .args(["-f", "%i"])
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start FSKit readiness probe");
+            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let ready = loop {
+                if let Some(status) = probe.try_wait().expect("poll FSKit readiness probe") {
+                    break status.success();
+                }
+                if std::time::Instant::now() >= probe_deadline {
+                    probe.kill().expect("stop hung FSKit readiness probe");
+                    probe.wait().expect("reap hung FSKit readiness probe");
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            if ready {
+                break;
+            }
+            if mount.is_finished() {
+                let result = mount.join().expect("join FSKit mount thread");
+                panic!("{mount_label} mount exited before readiness: {result:?}");
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                unmount_signal.request_unmount();
+                let _ = mount.join();
+                panic!("{mount_label} mount did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        mount
+    }
+
     #[test]
     fn callback_file_info_snapshot_is_independent_from_callback_pointer() {
         let mut raw = super::low_level::raw::FuseFileInfo::for_test(0x20, 7, true, false);
@@ -598,43 +647,13 @@ mod tests {
         };
         let mount = std::thread::spawn(move || super::mount_with_fskit_request(request));
         let target = mount_point.join(std::str::from_utf8(file_name).unwrap());
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            // A kernel lookup can block while the FSKit provider is activating;
-            // probe it in a child so a failed provider cannot hang this test.
-            let mut probe = std::process::Command::new("/usr/bin/stat")
-                .args(["-f", "%i"])
-                .arg(&target)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("start FSKit readiness probe");
-            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            let ready = loop {
-                if let Some(status) = probe.try_wait().expect("poll FSKit readiness probe") {
-                    break status.success();
-                }
-                if std::time::Instant::now() >= probe_deadline {
-                    probe.kill().expect("stop hung FSKit readiness probe");
-                    probe.wait().expect("reap hung FSKit readiness probe");
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
-            if ready {
-                break;
-            }
-            if mount.is_finished() {
-                let result = mount.join().expect("join FSKit mount thread");
-                panic!("FSKit smoke mount exited before readiness: {result:?}");
-            }
-            if std::time::Instant::now() >= ready_deadline {
-                unmount_signal.request_unmount();
-                let _ = mount.join();
-                panic!("FSKit smoke mount did not become ready");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let mount = wait_for_fskit_mount_ready(
+            mount,
+            &target,
+            &unmount_signal,
+            std::time::Duration::from_secs(3),
+            "FSKit smoke",
+        );
 
         assert_eq!(
             std::fs::read(&target).expect("read through FSKit mount"),
@@ -707,41 +726,13 @@ mod tests {
         let mount = std::thread::spawn(move || super::mount_with_fskit_request(request));
         let source = mount_point.join(std::str::from_utf8(source_name).unwrap());
         let alias = mount_point.join("fskit-hardlink-alias.bin");
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let mut probe = std::process::Command::new("/usr/bin/stat")
-                .args(["-f", "%i"])
-                .arg(&source)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("start FSKit hardlink readiness probe");
-            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            let ready = loop {
-                if let Some(status) = probe.try_wait().expect("poll FSKit readiness probe") {
-                    break status.success();
-                }
-                if std::time::Instant::now() >= probe_deadline {
-                    probe.kill().expect("stop hung FSKit readiness probe");
-                    probe.wait().expect("reap hung FSKit readiness probe");
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
-            if ready {
-                break;
-            }
-            if mount.is_finished() {
-                let result = mount.join().expect("join FSKit hardlink mount thread");
-                panic!("FSKit hardlink mount exited before readiness: {result:?}");
-            }
-            if std::time::Instant::now() >= ready_deadline {
-                unmount_signal.request_unmount();
-                let _ = mount.join();
-                panic!("FSKit hardlink mount did not become ready");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let mount = wait_for_fskit_mount_ready(
+            mount,
+            &source,
+            &unmount_signal,
+            std::time::Duration::from_secs(5),
+            "FSKit hardlink",
+        );
 
         std::fs::hard_link(&source, &alias).expect("create hardlink through FSKit mount");
         assert_eq!(
