@@ -3616,6 +3616,45 @@ pub extern "C" fn studiofs_macfuse_rename(
     }
 }
 
+/// macFUSE hard-link callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_link(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    newparent: raw::FuseIno,
+    newname: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if newname.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for link callbacks.
+    let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
+    match state.adapter.link(ino, newparent, newname) {
+        Ok(attr) => {
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let _ = Reply::new(request).entry(&entry);
+            }
+        }
+        Err(errno) => {
+            warn!(
+                ino,
+                newparent,
+                newname = %String::from_utf8_lossy(newname),
+                errno,
+                "macFUSE link callback returned error"
+            );
+            reply_error(req, errno);
+        }
+    }
+}
+
 /// macFUSE open callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_open(

@@ -472,6 +472,12 @@ mod tests {
     }
 
     #[test]
+    fn writable_studio_vfs_low_level_ops_install_link_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_link_callback());
+        assert!(!super::low_level::LowLevelOperations::read_only_studio_vfs().has_link_callback());
+    }
+
+    #[test]
     fn both_studio_vfs_low_level_ops_install_directory_callbacks() {
         assert!(super::low_level::LowLevelOperations::studio_vfs().has_directory_callbacks());
         assert!(

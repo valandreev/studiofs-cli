@@ -77,6 +77,10 @@ struct fuse_lowlevel_ops {
                    const char *name,
                    fuse_ino_t newparent,
                    const char *newname);
+    void (*link)(fuse_req_t req,
+                 fuse_ino_t ino,
+                 fuse_ino_t newparent,
+                 const char *newname);
     void (*setattr)(fuse_req_t req,
                     fuse_ino_t ino,
                     struct stat *attr,
