@@ -2454,7 +2454,7 @@ mod tests {
             .expect("inode invalidation payload should decode");
         assert_eq!((payload.ino, payload.off, payload.len), (42, -1, 0));
 
-        let entry = invalidation_entry_bytes(7, b"alias").expect("entry fits");
+        let entry = invalidation_entry_bytes(7, b"\xC3\xA9").expect("entry fits");
         let entry_header =
             read_copy::<FuseOutHeader>(&entry, 0).expect("entry invalidation header should decode");
         assert_eq!(entry_header.len as usize, entry.len());
@@ -2462,10 +2462,10 @@ mod tests {
         let entry_payload =
             read_copy::<FuseNotifyInvalEntryOut>(&entry, size_of::<FuseOutHeader>())
                 .expect("entry invalidation payload should decode");
-        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 5));
+        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 2));
         assert_eq!(
             &entry[size_of::<FuseOutHeader>() + size_of::<FuseNotifyInvalEntryOut>()..],
-            b"alias"
+            b"\xC3\xA9"
         );
     }
 
