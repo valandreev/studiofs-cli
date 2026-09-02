@@ -10,8 +10,8 @@ translate OS-specific filesystem callbacks into `StudioVfs` method calls.
 │   studiofs-winfsp    │     │   studiofs-macfuse    │
 │   (Windows only)     │     │   (macOS only)        │
 ├──────────────────────┤     ├──────────────────────┤
-│  winfsp crate (0.12) │     │  macFUSE low-level   │
-│  FileSystemContext    │     │  callback API        │
+│  winfsp crate (0.12) │     │  low-level + FSKit   │
+│  FileSystemContext    │     │  callback transports │
 ├──────────────────────┤     ├──────────────────────┤
 │     StudioVfs        │     │     StudioVfs         │
 └──────────────────────┘     └──────────────────────┘
@@ -27,6 +27,38 @@ Path walks are centralized in VFS `NamespaceResolver`:
 - WinFSP uses `NamespacePathStyle::Windows` for full-path and parent resolution.
 - macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
 - Bridge-local namespace traversal should not bypass VFS runtime filtering.
+
+## macOS backend selection
+
+The default macOS backend is the existing low-level macFUSE bridge. Select it
+explicitly with `STUDIOFS_MOUNT_BACKEND=legacy` or
+`STUDIOFS_MOUNT_BACKEND=macfuse`. The experimental native FSKit transport is
+opt-in:
+
+```bash
+STUDIOFS_MOUNT_BACKEND=fskit studiofs mount <volume> /Volumes/<name>
+```
+
+The FSKit path uses macFUSE `MFMount.framework` and does not open `/dev/fuse` or
+call the legacy libfuse session/reply APIs. It reuses the existing
+`StudioVfsAdapter`, keeps the received message alive until its reply is sent,
+interrupts the channel for signals and explicit unmount, and drains callback
+workers before releasing the channel. The selected backend name is included in
+mount diagnostics/status as `macFUSE-FSKit`.
+
+This initial path is intentionally limited: mount points must be below
+`/Volumes`, macOS 15.4+ and macFUSE 5.3.3+ are required, and the framework must
+be installed under `/Library/Filesystems/macfuse.fs/Contents/Frameworks` or
+the parent path supplied through `STUDIOFS_MFMOUNT_FRAMEWORK_DIR`; if it is not
+available, the package still builds the legacy bridge and rejects the FSKit
+selector as unsupported. Because the
+FSKit notification API is not used here, the transport passes `novncache` and
+uses direct I/O as the explicit coherence fallback. The zero-copy negotiation
+and full semantic parity work remain separate follow-up tickets.
+
+The real mounted smoke is separately gated with
+`STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1`; it requires an approved and working FSKit
+extension on the host.
 
 ## WinFSP Bridge (`studiofs-winfsp`)
 

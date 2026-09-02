@@ -4,8 +4,8 @@
 
 //! macOS native bridge boundary for StudioFS.
 //!
-//! This crate intentionally exposes only the mount request and serve API while
-//! the low-level macFUSE session layer is still being built.
+//! The default mount path uses the low-level macFUSE session API. An explicit
+//! experimental FSKit path uses `MFMount.framework` and the same VFS adapter.
 
 use std::io;
 use std::path::PathBuf;
@@ -24,6 +24,8 @@ pub mod probe;
 pub mod low_level;
 
 mod adapter;
+#[cfg(studiofs_fskit)]
+mod fskit;
 
 /// Request used by the CLI backend router to launch the macOS bridge.
 pub struct MacFuseMountRequest {
@@ -182,6 +184,7 @@ fn signal_handlers_for_policy(
 struct SignalWatcher {
     stop: Arc<AtomicBool>,
     handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
+    wake: std::thread::Thread,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -191,6 +194,7 @@ impl Drop for SignalWatcher {
         if let Ok(mut handlers) = self.handlers.lock() {
             let _ = handlers.take();
         }
+        self.wake.unpark();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -198,7 +202,7 @@ impl Drop for SignalWatcher {
 }
 
 fn spawn_signal_watcher(
-    exit_handle: low_level::SessionExitHandle,
+    request_exit: impl FnOnce() + Send + 'static,
     signal_handling: SignalHandling,
     unmount_signal: Option<MacFuseUnmountSignal>,
 ) -> io::Result<SignalWatcher> {
@@ -215,7 +219,7 @@ fn spawn_signal_watcher(
                     .as_ref()
                     .is_some_and(MacFuseUnmountSignal::is_requested)
             {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::park_timeout(std::time::Duration::from_millis(100));
             }
             if watcher_stop.load(Ordering::Acquire) {
                 return;
@@ -225,11 +229,13 @@ fn spawn_signal_watcher(
             {
                 let _ = handlers.take();
             }
-            exit_handle.request_exit();
+            request_exit();
         })?;
+    let wake = thread.thread().clone();
     Ok(SignalWatcher {
         stop,
         handlers,
+        wake,
         thread: Some(thread),
     })
 }
@@ -268,8 +274,14 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         )
     }?;
     SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    let _signal_watcher =
-        spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
+    let exit_handle = session.exit_handle();
+    let _signal_watcher = spawn_signal_watcher(
+        move || {
+            exit_handle.request_exit();
+        },
+        signal_handling,
+        unmount_signal,
+    )?;
     session.attach_invalidation_metrics(&vfs);
     vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
     let result = session.run();
@@ -281,6 +293,21 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     drop(session);
     drop(callback_state);
     result
+}
+
+/// Start serving the experimental native macFUSE FSKit bridge.
+#[cfg(studiofs_fskit)]
+pub fn mount_with_fskit_request(request: MacFuseMountRequest) -> io::Result<()> {
+    fskit::mount_with_request(request)
+}
+
+/// Report that the experimental native macFUSE FSKit bridge is unavailable.
+#[cfg(not(studiofs_fskit))]
+pub fn mount_with_fskit_request(_request: MacFuseMountRequest) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "macFUSE FSKit backend requires MFMount.framework; install macFUSE or set STUDIOFS_MFMOUNT_FRAMEWORK_DIR",
+    ))
 }
 
 fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperations {
@@ -514,6 +541,112 @@ mod tests {
         session.request_exit();
         drop(session);
         std::fs::remove_dir(mount_point).expect("remove macFUSE smoke mount point");
+    }
+
+    #[test]
+    #[cfg(studiofs_fskit)]
+    fn fskit_mounted_lookup_open_read_unmount_smoke_is_gated() {
+        if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-fskit-mounted-read-callback",
+        )
+        .expect("create VFS fixture");
+        let file_name = b"fskit-read.bin";
+        let payload = b"hello from macFUSE FSKit";
+        let attr = fixture
+            .vfs()
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                file_name,
+                501,
+                20,
+                0o644,
+            )
+            .expect("create FSKit smoke file");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().write(attr.ino, 0, payload))
+            .expect("seed FSKit smoke payload");
+
+        let mount_point = std::env::current_dir()
+            .expect("resolve FSKit smoke checkout")
+            .join("target")
+            .join(format!("studiofs-fskit-read-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&mount_point);
+        std::fs::create_dir_all(&mount_point).expect("create FSKit smoke mount point");
+        let unmount_signal = super::MacFuseUnmountSignal::new();
+        let request = super::MacFuseMountRequest {
+            vfs: fixture.vfs(),
+            runtime_handle: fixture.runtime().handle().clone(),
+            mount_point: mount_point.clone(),
+            volume_name: "StudioFS FSKit Read Smoke".into(),
+            read_only: true,
+            run_in_foreground: true,
+            signal_handling: super::SignalHandling::Disabled,
+            unmount_signal: Some(unmount_signal.clone()),
+        };
+        let mount = std::thread::spawn(move || super::mount_with_fskit_request(request));
+        let target = mount_point.join(std::str::from_utf8(file_name).unwrap());
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            // A kernel lookup can block while the FSKit provider is activating;
+            // probe it in a child so a failed provider cannot hang this test.
+            let mut probe = std::process::Command::new("/usr/bin/stat")
+                .args(["-f", "%i"])
+                .arg(&target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start FSKit readiness probe");
+            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let ready = loop {
+                if let Some(status) = probe.try_wait().expect("poll FSKit readiness probe") {
+                    break status.success();
+                }
+                if std::time::Instant::now() >= probe_deadline {
+                    probe.kill().expect("stop hung FSKit readiness probe");
+                    probe.wait().expect("reap hung FSKit readiness probe");
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            if ready {
+                break;
+            }
+            if mount.is_finished() {
+                let result = mount.join().expect("join FSKit mount thread");
+                panic!("FSKit smoke mount exited before readiness: {result:?}");
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                unmount_signal.request_unmount();
+                let _ = mount.join();
+                panic!("FSKit smoke mount did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            std::fs::read(&target).expect("read through FSKit mount"),
+            payload
+        );
+        unmount_signal.request_unmount();
+        mount
+            .join()
+            .expect("join FSKit mount thread")
+            .expect("unmount FSKit read smoke");
+        std::fs::remove_dir(&mount_point).expect("remove FSKit smoke mount point");
+
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("FSKit mounted VFS shutdown should succeed");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("repeated FSKit mounted VFS shutdown should succeed");
     }
 
     #[test]
@@ -2451,6 +2584,91 @@ mod tests {
     }
 
     #[test]
+    fn adapter_lookup_remembers_file_flag_overlay_for_ds_store() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-file-flags-lookup",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b".DS_Store", 501, 20, 0o644)
+            .expect("create hidden Finder metadata file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        adapter
+            .lookup(root, b".DS_Store")
+            .expect("lookup hidden Finder metadata file");
+
+        assert!(adapter.file_flags_contains_for_test(attr.ino));
+    }
+
+    #[test]
+    fn adapter_forget_clears_file_flag_overlay_after_last_lookup() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-file-flags-forget",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b".DS_Store", 501, 20, 0o644)
+            .expect("create hidden Finder metadata file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        adapter
+            .lookup(root, b".DS_Store")
+            .expect("lookup hidden Finder metadata file");
+        adapter
+            .lookup(root, b".DS_Store")
+            .expect("repeat lookup hidden Finder metadata file");
+        assert!(adapter.file_flags_contains_for_test(attr.ino));
+
+        adapter.forget(attr.ino, 1);
+        assert!(adapter.file_flags_contains_for_test(attr.ino));
+
+        adapter.forget(attr.ino, 1);
+
+        assert!(!adapter.file_flags_contains_for_test(attr.ino));
+    }
+
+    #[test]
+    fn adapter_access_honors_requested_mask_and_read_only_policy() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-access-mask")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b"read-only", 501, 20, 0o444)
+            .expect("create read-only file");
+        let no_search_dir = vfs
+            .mkdir(root, b"no-search", 501, 20, 0o644)
+            .expect("create directory without search permission");
+        let runtime_handle = fixture.runtime().handle().clone();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(Arc::clone(&vfs), runtime_handle.clone());
+
+        assert_eq!(adapter.access(attr.ino, libc::F_OK), Ok(()));
+        assert_eq!(adapter.access(attr.ino, libc::R_OK), Ok(()));
+        assert_eq!(adapter.access(attr.ino, libc::W_OK), Err(libc::EACCES));
+        assert_eq!(adapter.access(attr.ino, libc::X_OK), Err(libc::EACCES));
+        assert_eq!(
+            adapter.access(no_search_dir.ino, libc::X_OK),
+            Err(libc::EACCES)
+        );
+
+        let read_only_adapter =
+            super::adapter::StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, true);
+        assert_eq!(
+            read_only_adapter.access(attr.ino, libc::W_OK),
+            Err(libc::EROFS)
+        );
+    }
+
+    #[test]
     fn final_unlink_blocks_kernel_notification_from_late_write_completion() {
         #[derive(Default)]
         struct RecordingInvalidator {
@@ -2910,6 +3128,32 @@ mod tests {
             .expect("full readdir buffer should return a partial success");
 
         assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    #[cfg(studiofs_fskit)]
+    fn fskit_directory_handle_tracks_parent_inode() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-fskit-directory-parent",
+        )
+        .expect("create VFS fixture");
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let child = fixture
+            .vfs()
+            .mkdir(root, b"child", 501, 20, 0o755)
+            .expect("create child directory");
+        let adapter = super::adapter::StudioVfsAdapter::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+        );
+
+        let file_handle = adapter.opendir(child.ino).expect("open child directory");
+        let handle = adapter
+            .directory_entries_for_fskit(file_handle)
+            .expect("get FSKit directory handle");
+
+        assert_eq!(handle.parent_ino, root);
+        adapter.releasedir(file_handle).expect("close directory");
     }
 
     #[test]
