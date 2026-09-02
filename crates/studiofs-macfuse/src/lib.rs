@@ -2644,6 +2644,9 @@ mod tests {
         let attr = vfs
             .create(root, b"read-only", 501, 20, 0o444)
             .expect("create read-only file");
+        let no_search_dir = vfs
+            .mkdir(root, b"no-search", 501, 20, 0o644)
+            .expect("create directory without search permission");
         let runtime_handle = fixture.runtime().handle().clone();
         let adapter =
             super::adapter::StudioVfsAdapter::new(Arc::clone(&vfs), runtime_handle.clone());
@@ -2652,6 +2655,10 @@ mod tests {
         assert_eq!(adapter.access(attr.ino, libc::R_OK), Ok(()));
         assert_eq!(adapter.access(attr.ino, libc::W_OK), Err(libc::EACCES));
         assert_eq!(adapter.access(attr.ino, libc::X_OK), Err(libc::EACCES));
+        assert_eq!(
+            adapter.access(no_search_dir.ino, libc::X_OK),
+            Err(libc::EACCES)
+        );
 
         let read_only_adapter =
             super::adapter::StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, true);

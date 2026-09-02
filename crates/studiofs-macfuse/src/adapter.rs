@@ -1089,7 +1089,7 @@ impl StudioVfsAdapter {
         let mode = attr.st_mode as u32;
         let readable = mode & 0o444 != 0;
         let writable = mode & 0o222 != 0;
-        let executable = mode & 0o111 != 0 || mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
+        let executable = mode & 0o111 != 0;
         if (mask & libc::R_OK == 0 || readable)
             && (mask & libc::W_OK == 0 || writable)
             && (mask & libc::X_OK == 0 || executable)

@@ -562,7 +562,7 @@ fn normalize_errno(errno: Option<i32>) -> i32 {
 }
 
 fn setattr_flags_supported(valid: u32) -> bool {
-    valid & !FATTR_SUPPORTED == 0
+    (valid & !FATTR_SUPPORTED) == 0
 }
 
 #[derive(Debug)]
