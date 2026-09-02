@@ -39,6 +39,7 @@ const FUSE_MKDIR: u32 = 9;
 const FUSE_UNLINK: u32 = 10;
 const FUSE_RMDIR: u32 = 11;
 const FUSE_RENAME: u32 = 12;
+const FUSE_LINK: u32 = 13;
 const FUSE_OPEN: u32 = 14;
 const FUSE_READ: u32 = 15;
 const FUSE_WRITE: u32 = 16;
@@ -59,6 +60,9 @@ const FUSE_ACCESS: u32 = 34;
 const FUSE_CREATE: u32 = 35;
 const FUSE_INTERRUPT: u32 = 36;
 const FUSE_DESTROY: u32 = 38;
+
+const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
 
 const MF_MOUNT_RESULT_UNSUPPORTED_OS_VERSION: i32 = 1;
 const MF_MOUNT_RESULT_HELPER_TOOLS_FAILED: i32 = 2;
@@ -133,6 +137,22 @@ struct FuseOutHeader {
     len: u32,
     error: i32,
     unique: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FuseNotifyInvalInodeOut {
+    ino: u64,
+    off: i64,
+    len: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FuseNotifyInvalEntryOut {
+    parent: u64,
+    namelen: u32,
+    padding: u32,
 }
 
 #[repr(C)]
@@ -306,6 +326,12 @@ struct FuseMknodIn {
 #[derive(Clone, Copy, Debug)]
 struct FuseRenameIn {
     newdir: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FuseLinkIn {
+    oldnodeid: u64,
 }
 
 #[repr(C)]
@@ -1099,6 +1125,7 @@ impl FsKitDispatcher {
             FUSE_UNLINK => self.unlink(request),
             FUSE_RMDIR => self.rmdir(request),
             FUSE_RENAME => self.rename(request),
+            FUSE_LINK => self.link(request),
             FUSE_SYMLINK => self.symlink(request),
             FUSE_CREATE => self.create(request),
             FUSE_ACCESS => self.access(request),
@@ -1553,6 +1580,38 @@ impl FsKitDispatcher {
         }
     }
 
+    fn link(&self, request: FsKitRequest) {
+        let input = match request.operation::<FuseLinkIn>(size_of::<FuseInHeader>()) {
+            Ok(input) => input,
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+                return;
+            }
+        };
+        let name = match parse_c_string(
+            &request.body.bytes,
+            size_of::<FuseInHeader>() + size_of::<FuseLinkIn>(),
+        ) {
+            Ok(name) => name.to_vec(),
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+                return;
+            }
+        };
+        match self
+            .adapter
+            .link(input.oldnodeid, request.header().nodeid, &name)
+        {
+            Ok(attr) => {
+                let _ = request
+                    .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+            }
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+            }
+        }
+    }
+
     fn symlink(&self, request: FsKitRequest) {
         let (name, target) =
             match parse_two_c_strings(&request.body.bytes, size_of::<FuseInHeader>()) {
@@ -1920,25 +1979,70 @@ impl FsKitDispatcher {
     }
 }
 
-struct FsKitKernelInvalidator;
+fn invalidation_inode_bytes(ino: u64, off: i64, len: i64) -> Vec<u8> {
+    let payload = encode_copy(FuseNotifyInvalInodeOut { ino, off, len });
+    let total = size_of::<FuseOutHeader>() + payload.len();
+    let header = encode_copy(FuseOutHeader {
+        len: total as u32,
+        error: FUSE_NOTIFY_INVAL_INODE,
+        unique: 0,
+    });
+    [header, payload].concat()
+}
+
+fn invalidation_entry_bytes(parent: u64, name: &[u8]) -> Result<Vec<u8>, i32> {
+    let namelen = u32::try_from(name.len()).map_err(|_| libc::EOVERFLOW)?;
+    let payload = encode_copy(FuseNotifyInvalEntryOut {
+        parent,
+        namelen,
+        padding: 0,
+    });
+    let total = size_of::<FuseOutHeader>()
+        .checked_add(payload.len())
+        .and_then(|total| total.checked_add(name.len()))
+        .ok_or(libc::EOVERFLOW)?;
+    let header = encode_copy(FuseOutHeader {
+        len: u32::try_from(total).map_err(|_| libc::EOVERFLOW)?,
+        error: FUSE_NOTIFY_INVAL_ENTRY,
+        unique: 0,
+    });
+    let mut frame = [header, payload].concat();
+    frame.extend_from_slice(name);
+    Ok(frame)
+}
+
+struct FsKitKernelInvalidator {
+    control: Arc<FsKitControl>,
+}
+
+impl FsKitKernelInvalidator {
+    fn send_frame(&self, frame: Vec<u8>) {
+        let buffer = iovec {
+            iov_base: frame.as_ptr().cast_mut().cast(),
+            iov_len: frame.len(),
+        };
+        if let Err(error) = self.control.send(std::slice::from_ref(&buffer)) {
+            debug!(?error, "FSKit kernel invalidation could not be sent");
+        }
+    }
+}
 
 impl studiofs_vfs::KernelInvalidator for FsKitKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        debug!(
-            ino,
-            "FSKit inode invalidation covered by novncache/direct I/O fallback"
-        );
+        self.send_frame(invalidation_inode_bytes(ino, 0, 0));
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        debug!(
-            ino,
-            "FSKit attribute invalidation covered by novncache/direct I/O fallback"
-        );
+        self.send_frame(invalidation_inode_bytes(ino, -1, 0));
     }
 
     fn inval_entry(&self, parent: u64, name: &[u8]) {
-        debug!(parent, name = %String::from_utf8_lossy(name), "FSKit entry invalidation covered by novncache fallback");
+        match invalidation_entry_bytes(parent, name) {
+            Ok(frame) => self.send_frame(frame),
+            Err(errno) => {
+                debug!(parent, errno, "FSKit entry invalidation name is too large");
+            }
+        }
     }
 }
 
@@ -2152,7 +2256,11 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         signal_handling,
         unmount_signal,
     )?;
-    vfs.set_kernel_invalidator(callback_state.kernel_invalidator(Arc::new(FsKitKernelInvalidator)));
+    vfs.set_kernel_invalidator(callback_state.kernel_invalidator(Arc::new(
+        FsKitKernelInvalidator {
+            control: Arc::clone(&session.control),
+        },
+    )));
     let result = session.run(&dispatcher);
     drop(signal_watcher);
     dispatcher.cancel_pending();
@@ -2166,6 +2274,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_vfs::KernelInvalidator;
 
     #[test]
     fn message_parser_rejects_a_body_length_that_does_not_match_the_header() {
@@ -2307,6 +2416,72 @@ mod tests {
         assert_eq!(input.newdir, 77);
         assert_eq!(name, b"old");
         assert_eq!(new_name, b"new");
+    }
+
+    #[test]
+    fn fskit_link_request_uses_the_fuse_wire_layout() {
+        assert_eq!(FUSE_LINK, 13);
+        assert_eq!(size_of::<FuseLinkIn>(), size_of::<u64>());
+
+        let mut bytes = vec![0_u8; size_of::<FuseInHeader>()];
+        bytes.extend_from_slice(&77_u64.to_ne_bytes());
+        bytes.extend_from_slice(b"alias\0");
+        let len = u32::try_from(bytes.len()).expect("link body length");
+        bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
+
+        let body = parse_message_body(bytes).expect("parse link body");
+        let input = read_copy::<FuseLinkIn>(&body.bytes, size_of::<FuseInHeader>())
+            .expect("parse link input");
+        let name = parse_c_string(
+            &body.bytes,
+            size_of::<FuseInHeader>() + size_of::<FuseLinkIn>(),
+        )
+        .expect("parse link name");
+
+        assert_eq!(input.oldnodeid, 77);
+        assert_eq!(name, b"alias");
+    }
+
+    #[test]
+    fn fskit_invalidation_frames_match_fuse_wire_layout() {
+        let inode = invalidation_inode_bytes(42, -1, 0);
+        let header =
+            read_copy::<FuseOutHeader>(&inode, 0).expect("inode invalidation header should decode");
+        assert_eq!(header.len as usize, inode.len());
+        assert_eq!(header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(header.unique, 0);
+        let payload = read_copy::<FuseNotifyInvalInodeOut>(&inode, size_of::<FuseOutHeader>())
+            .expect("inode invalidation payload should decode");
+        assert_eq!((payload.ino, payload.off, payload.len), (42, -1, 0));
+
+        let entry = invalidation_entry_bytes(7, b"alias").expect("entry fits");
+        let entry_header =
+            read_copy::<FuseOutHeader>(&entry, 0).expect("entry invalidation header should decode");
+        assert_eq!(entry_header.len as usize, entry.len());
+        assert_eq!(entry_header.error, FUSE_NOTIFY_INVAL_ENTRY);
+        let entry_payload =
+            read_copy::<FuseNotifyInvalEntryOut>(&entry, size_of::<FuseOutHeader>())
+                .expect("entry invalidation payload should decode");
+        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 5));
+        assert_eq!(
+            &entry[size_of::<FuseOutHeader>() + size_of::<FuseNotifyInvalEntryOut>()..],
+            b"alias"
+        );
+    }
+
+    #[test]
+    fn fskit_invalidator_tolerates_a_closed_control() {
+        let control = Arc::new(FsKitControl {
+            channel: Mutex::new(None),
+            send_lock: Mutex::new(()),
+            stop_requested: AtomicBool::new(false),
+            mounted: AtomicBool::new(false),
+        });
+        let invalidator = FsKitKernelInvalidator { control };
+
+        invalidator.inval_inode(42);
+        invalidator.inval_inode_attrs(42);
+        invalidator.inval_entry(7, b"alias");
     }
 
     #[test]
