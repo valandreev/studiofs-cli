@@ -4594,7 +4594,7 @@ fn xattr_name_list_len(names: &[Vec<u8>]) -> usize {
     names.iter().map(|name| name.len() + 1).sum()
 }
 
-fn xattr_not_found_errno() -> i32 {
+pub(crate) fn xattr_not_found_errno() -> i32 {
     libc::ENOATTR
 }
 

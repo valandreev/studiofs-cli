@@ -1046,27 +1046,16 @@ where
     }));
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum FsKitXattrResponse {
-    Size(usize),
-    Value(Vec<u8>),
-}
-
-fn getxattr_response(
+fn getxattr_value_response(
     value: &[u8],
     position: usize,
     requested_size: u32,
-) -> Result<FsKitXattrResponse, i32> {
-    if requested_size == 0 {
-        return Ok(FsKitXattrResponse::Size(
-            crate::adapter::xattr_size_from_position(value.len(), position),
-        ));
-    }
+) -> Result<Vec<u8>, i32> {
     let value = crate::adapter::xattr_value_from_position(value, position);
     if value.len() > requested_size as usize {
         Err(libc::ERANGE)
     } else {
-        Ok(FsKitXattrResponse::Value(value.to_vec()))
+        Ok(value.to_vec())
     }
 }
 
@@ -1909,10 +1898,30 @@ impl FsKitDispatcher {
                 return;
             }
         };
+        if input.size == 0 {
+            let value_size = match self.adapter.get_xattr_size(request.header().nodeid, &name) {
+                Ok(Some(value_size)) => value_size,
+                Ok(None) => {
+                    let _ = request.reply_error(crate::adapter::xattr_not_found_errno());
+                    return;
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                    return;
+                }
+            };
+            let size =
+                crate::adapter::xattr_size_from_position(value_size, input.position as usize);
+            let _ = request.reply_struct(FuseXattrOut {
+                size: size as u32,
+                padding: 0,
+            });
+            return;
+        }
         let value = match self.adapter.get_xattr(request.header().nodeid, &name) {
             Ok(Some(value)) => value,
             Ok(None) => {
-                let _ = request.reply_error(libc::ENODATA);
+                let _ = request.reply_error(crate::adapter::xattr_not_found_errno());
                 return;
             }
             Err(errno) => {
@@ -1920,14 +1929,8 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        match getxattr_response(&value, input.position as usize, input.size) {
-            Ok(FsKitXattrResponse::Size(size)) => {
-                let _ = request.reply_struct(FuseXattrOut {
-                    size: size as u32,
-                    padding: 0,
-                });
-            }
-            Ok(FsKitXattrResponse::Value(value)) => {
+        match getxattr_value_response(&value, input.position as usize, input.size) {
+            Ok(value) => {
                 let _ = request.reply_bytes(value);
             }
             Err(errno) => {
@@ -2009,10 +2012,7 @@ impl FsKitDispatcher {
     }
 
     fn unsupported(&self, request: FsKitRequest, operation: &'static str) {
-        debug!(
-            operation,
-            "macFUSE FSKit operation is outside the SFS-669 slice"
-        );
+        debug!(operation, "macFUSE FSKit operation is not implemented");
         let _ = request.reply_error(libc::ENOSYS);
     }
 
@@ -2635,19 +2635,24 @@ mod tests {
         let value = b"fork-payload";
 
         assert_eq!(
-            getxattr_response(value, 5, 0).expect("size query should succeed"),
-            FsKitXattrResponse::Size(value.len() - 5)
+            crate::adapter::xattr_size_from_position(value.len(), 5),
+            value.len() - 5
         );
         assert_eq!(
-            getxattr_response(value, 5, 32).expect("positioned read should succeed"),
-            FsKitXattrResponse::Value(value[5..].to_vec())
+            getxattr_value_response(value, 5, 32).expect("positioned read should succeed"),
+            value[5..].to_vec()
         );
         assert_eq!(
-            getxattr_response(value, value.len() + 1, 32)
+            getxattr_value_response(value, value.len() + 1, 32)
                 .expect("past-end positioned read should succeed"),
-            FsKitXattrResponse::Value(Vec::new())
+            Vec::<u8>::new()
         );
-        assert_eq!(getxattr_response(value, 0, 4), Err(libc::ERANGE));
+        assert_eq!(getxattr_value_response(value, 0, 4), Err(libc::ERANGE));
+    }
+
+    #[test]
+    fn fskit_missing_xattr_uses_macos_attribute_errno() {
+        assert_eq!(crate::adapter::xattr_not_found_errno(), libc::ENOATTR);
     }
 
     #[test]

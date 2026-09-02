@@ -58,11 +58,11 @@ payloads. The existing `novncache` and per-handle direct-I/O choices remain
 explicit cache safeguards; FSKit invalidation is no longer a logging-only
 fallback. Hardlink requests are translated through the shared
 `StudioVfsAdapter` in both macFUSE operation transports. Positioned FSKit
-`getxattr` reads preserve the legacy `position` and `ERANGE` contract, while
-potentially waiting `rmdir` and `symlink` callbacks run as tracked blocking
-reply tasks instead of occupying the FSKit dispatcher loop. The zero-copy
-negotiation and the remaining full semantic parity matrix remain separate
-follow-up work.
+`getxattr` reads preserve the legacy `position`, size-query, `ENOATTR`, and
+`ERANGE` contract, while potentially waiting `rmdir` and `symlink` callbacks
+run as tracked blocking reply tasks instead of occupying the FSKit dispatcher
+loop. The zero-copy negotiation and the remaining full semantic parity matrix
+remain separate follow-up work.
 
 The real mounted smoke is separately gated with
 `STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1`; it requires an approved and working FSKit

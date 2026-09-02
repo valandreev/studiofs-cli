@@ -323,15 +323,16 @@ diff checks passed.
 
 ### Follow-up parity slice (2026-09-03)
 
-- [x] Align FSKit positioned `getxattr` reads with the legacy adapter helpers,
-      preserving size queries, remaining-value reads, past-end reads, and
-      `ERANGE` handling.
+- [x] Align FSKit `getxattr` with the legacy adapter helpers, preserving size
+      queries, positioned remaining-value reads, past-end reads, macOS
+      `ENOATTR`, and `ERANGE` handling.
 - [x] Route FSKit `rmdir` and `symlink` through the existing tracked blocking
       reply-task lifecycle so the dispatcher loop is not held by VFS waits.
 - [x] Add focused RED/green coverage for the xattr response contract and the
       blocking-task dispatch seam.
-- [x] Refresh the FSKit direct-I/O comment and platform bridge documentation;
-      the legacy backend and Windows bridge remain untouched.
+- [x] Refresh the FSKit direct-I/O/unsupported-operation comments and platform
+      bridge documentation; the legacy backend and Windows bridge remain
+      untouched.
 - [ ] Run a native mounted FSKit proof for this slice when an approved,
       responsive provider is available; the current Mac still cannot provide
       that evidence.
@@ -339,6 +340,7 @@ diff checks passed.
 Focused validation:
 
     cargo test -p studiofs-macfuse fskit_getxattr_preserves_legacy_position_contract -- --nocapture
+    cargo test -p studiofs-macfuse fskit_missing_xattr_uses_macos_attribute_errno -- --nocapture
     cargo test -p studiofs-macfuse fskit_blocking_namespace_work_runs_off_dispatch_thread -- --nocapture
 
 ## Plan self-review

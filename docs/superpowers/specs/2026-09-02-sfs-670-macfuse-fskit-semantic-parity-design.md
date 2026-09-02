@@ -41,7 +41,8 @@ SFS-672 performance comparison remain separate issues.
 - [x] (2026-09-03) Implement the smallest production change that makes those
       tests pass.
 - [x] (2026-09-03) Align positioned FSKit `getxattr` reads with the legacy
-      xattr response contract.
+      xattr response contract, including size-only queries and macOS
+      `ENOATTR` for missing values.
 - [x] (2026-09-03) Move potentially waiting FSKit `rmdir` and `symlink`
       callbacks onto tracked blocking reply tasks.
 - [ ] Sweep the remaining SFS-670 operations through shared mounted scenarios.
@@ -374,6 +375,7 @@ First milestone evidence (2026-09-03):
 Follow-up parity evidence (2026-09-03):
 
     fskit_getxattr_preserves_legacy_position_contract -> 1 passed
+    fskit_missing_xattr_uses_macos_attribute_errno -> 1 passed
     fskit_blocking_namespace_work_runs_off_dispatch_thread -> 1 passed
     Native FSKit mounted validation remains unavailable on this host; no
     Windows validation is claimed.
