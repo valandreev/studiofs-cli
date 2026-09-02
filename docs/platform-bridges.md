@@ -46,15 +46,20 @@ interrupts the channel for signals and explicit unmount, and drains callback
 workers before releasing the channel. The selected backend name is included in
 mount diagnostics/status as `macFUSE-FSKit`.
 
-This initial path is intentionally limited: mount points must be below
-`/Volumes`, macOS 15.4+ and macFUSE 5.3.3+ are required, and the framework must
-be installed under `/Library/Filesystems/macfuse.fs/Contents/Frameworks` or
-the parent path supplied through `STUDIOFS_MFMOUNT_FRAMEWORK_DIR`; if it is not
-available, the package still builds the legacy bridge and rejects the FSKit
-selector as unsupported. Because the
-FSKit notification API is not used here, the transport passes `novncache` and
-uses direct I/O as the explicit coherence fallback. The zero-copy negotiation
-and full semantic parity work remain separate follow-up tickets.
+This path is intentionally opt-in: mount points must be below `/Volumes`, macOS
+15.4+ and macFUSE 5.3.3+ are required, and the framework must be installed
+under `/Library/Filesystems/macfuse.fs/Contents/Frameworks` or the parent path
+supplied through `STUDIOFS_MFMOUNT_FRAMEWORK_DIR`; if it is not available, the
+package still builds the legacy bridge and rejects the FSKit selector as
+unsupported. The bridge now installs a concrete kernel invalidator that sends
+FUSE `INVAL_INODE` and `INVAL_ENTRY` frames through the existing MFMount
+channel, including separate full-inode, attribute-only, and directory-entry
+payloads. The existing `novncache` and per-handle direct-I/O choices remain
+explicit cache safeguards; FSKit invalidation is no longer a logging-only
+fallback. Hardlink requests are translated through the shared
+`StudioVfsAdapter` in both macFUSE operation transports. The zero-copy
+negotiation and the remaining full semantic parity matrix remain separate
+follow-up work.
 
 The real mounted smoke is separately gated with
 `STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1`; it requires an approved and working FSKit

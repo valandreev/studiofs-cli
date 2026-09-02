@@ -36,11 +36,15 @@ SFS-672 performance comparison remain separate issues.
 - [x] Write, self-review, and commit this design document (`6fae39d2`).
 - [x] Write the implementation plan in
       docs/superpowers/plans/2026-09-02-sfs-670-hardlink-fskit-invalidation.md.
-- [ ] Add RED tests for the first hardlink and invalidation milestone.
-- [ ] Implement the smallest production change that makes those tests pass.
+- [x] (2026-09-03) Add RED tests for the first hardlink and invalidation
+      milestone.
+- [x] (2026-09-03) Implement the smallest production change that makes those
+      tests pass.
 - [ ] Sweep the remaining SFS-670 operations through shared mounted scenarios.
-- [ ] Run focused validation, update the bridge documentation, and record
-      evidence in this plan and Linear.
+- [x] (2026-09-03) Run focused validation and update the bridge documentation;
+      native FSKit mount evidence remains unavailable on this host.
+- [ ] Record the final first-milestone evidence in Linear after the working
+      tree is committed.
 
 ## Surprises & Discoveries
 
@@ -66,6 +70,12 @@ SFS-672 performance comparison remain separate issues.
   planned files are macOS-specific except for the already-existing shared VFS
   link operation. No Windows source change is expected, and a macOS run is not
   presented as a native Windows mount validation.
+- The focused bridge suite passes with 168 tests. An explicit
+  `STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1` run reached the MFMount helper but did not
+  become ready; the test was stopped after the helper remained blocked for
+  more than 60 seconds, and the generated target mount directory was clean
+  afterward. This is unavailable native FSKit validation, not a passing mount
+  result.
 
 ## Decision Log
 
@@ -345,6 +355,17 @@ Initial evidence:
     Linear: SFS-670, In Progress, branch feature/sfs-670-reach-full-filesystem-semantic-parity-on-the-macfuse-fskit
     Baseline: cargo test -p studiofs-macfuse -> 162 passed, 0 failed
     FSKit install: /Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework
+
+First milestone evidence (2026-09-03):
+
+    cargo test -p studiofs-macfuse -> 168 passed, 0 failed
+    adapter_link_preserves_inode_and_increments_link_count -> 1 passed
+    writable_studio_vfs_low_level_ops_install_link_callback -> 1 passed
+    fskit_link_request_uses_the_fuse_wire_layout -> 1 passed
+    fskit_invalidation_frames_match_fuse_wire_layout -> 1 passed
+    fskit_invalidator_tolerates_a_closed_control -> 1 passed
+    STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1 ... fskit_mounted_hardlink_and_invalidation_smoke_is_gated
+      unavailable: MFMount helper stayed blocked before readiness; target cleanup verified
 
 The code knowledge graph is ready for the current commit. The planned Rust
 files have no recorded coverage issue; the fallback C header has a

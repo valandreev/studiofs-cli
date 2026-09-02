@@ -322,6 +322,8 @@ fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperation
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(studiofs_fskit)]
+    use std::os::unix::fs::MetadataExt;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -653,6 +655,124 @@ mod tests {
             .runtime()
             .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
             .expect("repeated FSKit mounted VFS shutdown should succeed");
+    }
+
+    #[test]
+    #[cfg(studiofs_fskit)]
+    fn fskit_mounted_hardlink_and_invalidation_smoke_is_gated() {
+        if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-fskit-mounted-hardlink",
+        )
+        .expect("create VFS fixture");
+        let source_name = b"fskit-hardlink-source.bin";
+        let source_attr = fixture
+            .vfs()
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                source_name,
+                501,
+                20,
+                0o644,
+            )
+            .expect("create FSKit hardlink source");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().write(source_attr.ino, 0, b"before"))
+            .expect("seed FSKit hardlink source");
+
+        let mount_point = std::env::current_dir()
+            .expect("resolve FSKit hardlink checkout")
+            .join("target")
+            .join(format!(
+                "studiofs-fskit-hardlink-smoke-{}",
+                std::process::id()
+            ));
+        let _ = std::fs::remove_dir(&mount_point);
+        std::fs::create_dir_all(&mount_point).expect("create FSKit hardlink mount point");
+        let unmount_signal = super::MacFuseUnmountSignal::new();
+        let request = super::MacFuseMountRequest {
+            vfs: fixture.vfs(),
+            runtime_handle: fixture.runtime().handle().clone(),
+            mount_point: mount_point.clone(),
+            volume_name: "StudioFS FSKit Hardlink Smoke".into(),
+            read_only: false,
+            run_in_foreground: true,
+            signal_handling: super::SignalHandling::Disabled,
+            unmount_signal: Some(unmount_signal.clone()),
+        };
+        let mount = std::thread::spawn(move || super::mount_with_fskit_request(request));
+        let source = mount_point.join(std::str::from_utf8(source_name).unwrap());
+        let alias = mount_point.join("fskit-hardlink-alias.bin");
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut probe = std::process::Command::new("/usr/bin/stat")
+                .args(["-f", "%i"])
+                .arg(&source)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start FSKit hardlink readiness probe");
+            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let ready = loop {
+                if let Some(status) = probe.try_wait().expect("poll FSKit readiness probe") {
+                    break status.success();
+                }
+                if std::time::Instant::now() >= probe_deadline {
+                    probe.kill().expect("stop hung FSKit readiness probe");
+                    probe.wait().expect("reap hung FSKit readiness probe");
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            if ready {
+                break;
+            }
+            if mount.is_finished() {
+                let result = mount.join().expect("join FSKit hardlink mount thread");
+                panic!("FSKit hardlink mount exited before readiness: {result:?}");
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                unmount_signal.request_unmount();
+                let _ = mount.join();
+                panic!("FSKit hardlink mount did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        std::fs::hard_link(&source, &alias).expect("create hardlink through FSKit mount");
+        assert_eq!(
+            std::fs::metadata(&source)
+                .expect("stat FSKit hardlink source")
+                .ino(),
+            std::fs::metadata(&alias)
+                .expect("stat FSKit hardlink alias")
+                .ino()
+        );
+        std::fs::write(&source, b"after").expect("write through FSKit mount");
+        assert_eq!(
+            std::fs::read(&alias).expect("read updated FSKit hardlink alias"),
+            b"after"
+        );
+
+        unmount_signal.request_unmount();
+        mount
+            .join()
+            .expect("join FSKit hardlink mount thread")
+            .expect("unmount FSKit hardlink smoke");
+        std::fs::remove_dir(&mount_point).expect("remove FSKit hardlink mount point");
+
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("FSKit hardlink VFS shutdown should succeed");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
+            .expect("repeated FSKit hardlink VFS shutdown should succeed");
     }
 
     #[test]

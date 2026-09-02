@@ -68,6 +68,11 @@ Design: `docs/superpowers/specs/2026-09-02-sfs-670-macfuse-fskit-semantic-parity
 
 ### Task 1: Expose shared hardlink semantics through `StudioVfsAdapter`
 
+- [x] Add the contract-fixture RED test.
+- [x] Route the adapter method to `StudioVfs::link` with read-only and liveness
+      behavior.
+- [x] Run the focused adapter test green.
+
 Files: `crates/studiofs-macfuse/src/adapter.rs`,
 `crates/studiofs-macfuse/src/lib.rs`.
 
@@ -121,6 +126,10 @@ filter; it must pass.
 
 ### Task 2: Wire the legacy macFUSE link callback
 
+- [x] Add the writable/read-only ABI capability test.
+- [x] Add the C table/helper, fallback layout field, Rust helper, and callback.
+- [x] Run the focused ABI test green.
+
 Files: `crates/studiofs-macfuse/src/adapter.rs`,
 `crates/studiofs-macfuse/src/low_level.rs`,
 `crates/studiofs-macfuse/csrc/low_level_ops.c`,
@@ -131,8 +140,8 @@ Add the ABI regression test before adding the helper:
 
     #[test]
     fn writable_studio_vfs_low_level_ops_install_link_callback() {
-        assert!(LowLevelOperations::writable().has_link_callback());
-        assert!(!LowLevelOperations::read_only().has_link_callback());
+        assert!(LowLevelOperations::studio_vfs().has_link_callback());
+        assert!(!LowLevelOperations::read_only_studio_vfs().has_link_callback());
     }
 
 Run:
@@ -149,6 +158,11 @@ newparent, name)`, and reply with the existing `Entry` wrapper or errno.
 Re-run the ABI test and Task 1's adapter filter.
 
 ### Task 3: Dispatch `FUSE_LINK` through the FSKit backend
+
+- [x] Add the wire-layout RED test.
+- [x] Add `FUSE_LINK`, `FuseLinkIn`, dispatch, checked name parsing, and entry
+      reply.
+- [x] Run the focused protocol test green.
 
 File: `crates/studiofs-macfuse/src/fskit.rs` and its existing test module.
 
@@ -195,6 +209,11 @@ tests.
 
 ### Task 4: Replace the FSKit no-op invalidator with FUSE notification frames
 
+- [x] Add the frame-layout RED test and closed-control lifecycle test.
+- [x] Encode inode/entry notifications and send complete frames through the
+      retained, serialized FSKit control.
+- [x] Install the invalidator and preserve teardown ordering.
+
 File: `crates/studiofs-macfuse/src/fskit.rs` and its existing test module.
 
 Add a pure frame-layout test before changing the invalidator:
@@ -214,7 +233,7 @@ Add a pure frame-layout test before changing the invalidator:
         .expect("inode invalidation payload should decode");
         assert_eq!((payload.ino, payload.off, payload.len), (42, -1, 0));
 
-        let entry = invalidation_entry_bytes(7, b"alias").expect("entry fits");
+        let entry = invalidation_entry_bytes(7, b"\xC3\xA9").expect("entry fits");
         let entry_header = read_copy::<FuseOutHeader>(&entry, 0)
             .expect("entry invalidation header should decode");
         assert_eq!(entry_header.len as usize, entry.len());
@@ -224,10 +243,10 @@ Add a pure frame-layout test before changing the invalidator:
             size_of::<FuseOutHeader>(),
         )
         .expect("entry invalidation payload should decode");
-        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 5));
+        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 2));
         assert_eq!(
             &entry[size_of::<FuseOutHeader>() + size_of::<FuseNotifyInvalEntryOut>()..],
-            b"alias"
+            b"\xC3\xA9"
         );
     }
 
@@ -249,6 +268,12 @@ wait and control close ordering.
 Re-run the frame-layout test and the existing control-lock/cancellation tests.
 
 ### Task 5: Prove the bridge seam and document the validation boundary
+
+- [x] Add the gated writable hardlink/invalidation mounted scenario.
+- [ ] Complete a real native FSKit mounted run on a host with a responsive,
+      approved provider.
+- [x] Update the bridge documentation with the implementation and validation
+      boundary.
 
 Files: `crates/studiofs-macfuse/src/lib.rs`,
 `docs/platform-bridges.md`.
@@ -272,6 +297,12 @@ Run the focused suite:
 Update `docs/platform-bridges.md` to describe the implemented frame transport,
 the unchanged legacy default, and the exact distinction between unit/protocol
 proof and a native mounted FSKit run. Do not state that Windows was validated.
+
+Native validation result (2026-09-03): the explicit mounted command reached the
+MFMount helper, but the helper stayed blocked before readiness for more than 60
+seconds. The test was stopped to avoid leaving a live mount attempt; the
+target mount directory and child processes were clean afterward. This host
+therefore provides no native FSKit pass/fail result for the mounted scenario.
 
 ### Task 6: Final verification and handoff
 
