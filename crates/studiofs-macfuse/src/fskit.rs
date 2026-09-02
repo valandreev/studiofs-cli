@@ -216,6 +216,13 @@ struct FuseOpenIn {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+struct FuseAccessIn {
+    mask: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 struct FuseOpenOut {
     fh: u64,
     open_flags: u32,
@@ -299,8 +306,6 @@ struct FuseMknodIn {
 #[derive(Clone, Copy, Debug)]
 struct FuseRenameIn {
     newdir: u64,
-    flags: u32,
-    padding: u32,
 }
 
 #[repr(C)]
@@ -964,17 +969,14 @@ fn send_read_bytes(
     payload: &[u8],
     requested_size: u32,
 ) -> io::Result<()> {
+    if !read_reply_uses_transport_buffer(payload, requested_size) {
+        return send_bytes(sender, message, unique, payload);
+    }
     let (reply_buffer, capacity) = match message.reply_buffer() {
         Ok(buffer) => buffer,
         Err(_) => return send_error(sender, message, unique, libc::EIO),
     };
     if capacity > 0 {
-        // macFUSE 5.3.3's FSKit extension cannot consume a zero-length
-        // reply-buffer READ safely. Return EIO rather than risking the whole
-        // mounted volume when a non-empty request races EOF.
-        if payload.is_empty() && requested_size > 0 {
-            return send_error(sender, message, unique, libc::EIO);
-        }
         if payload.len() > capacity || payload.len() > u32::MAX as usize {
             return send_error(sender, message, unique, libc::EIO);
         }
@@ -1001,6 +1003,10 @@ fn send_read_bytes(
         return sender.send_message(message, &buffers);
     }
     send_bytes(sender, message, unique, payload)
+}
+
+fn read_reply_uses_transport_buffer(payload: &[u8], requested_size: u32) -> bool {
+    !payload.is_empty() || requested_size == 0
 }
 
 type CancellationMap = Arc<Mutex<std::collections::HashMap<u64, Arc<CancellationToken>>>>;
@@ -1615,8 +1621,18 @@ impl FsKitDispatcher {
     }
 
     fn access(&self, request: FsKitRequest) {
-        match self.adapter.getattr(request.header().nodeid) {
-            Ok(_) => self.empty_success(request),
+        let input = match request.operation::<FuseAccessIn>(size_of::<FuseInHeader>()) {
+            Ok(input) => input,
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+                return;
+            }
+        };
+        match self
+            .adapter
+            .access(request.header().nodeid, input.mask as i32)
+        {
+            Ok(()) => self.empty_success(request),
             Err(errno) => {
                 let _ = request.reply_error(errno);
             }
@@ -2263,6 +2279,54 @@ mod tests {
         assert_eq!(size_of::<FuseAttrOut>(), 120);
         assert_eq!(size_of::<FuseReadIn>(), 40);
         assert_eq!(size_of::<FuseWriteIn>(), 40);
+    }
+
+    #[test]
+    fn rename_request_keeps_names_after_the_eight_byte_header() {
+        assert_eq!(size_of::<FuseRenameIn>(), size_of::<u64>());
+
+        let mut bytes = vec![0_u8; size_of::<FuseInHeader>()];
+        bytes.extend_from_slice(&77_u64.to_ne_bytes());
+        bytes.extend_from_slice(b"old\0new\0");
+        let len = u32::try_from(bytes.len()).expect("rename body length");
+        bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
+
+        let body = parse_message_body(bytes).expect("parse rename body");
+        let input = read_copy::<FuseRenameIn>(&body.bytes, size_of::<FuseInHeader>())
+            .expect("parse rename input");
+        let (name, new_name) = parse_two_c_strings(
+            &body.bytes,
+            size_of::<FuseInHeader>() + size_of::<FuseRenameIn>(),
+        )
+        .expect("parse rename names");
+
+        assert_eq!(input.newdir, 77);
+        assert_eq!(name, b"old");
+        assert_eq!(new_name, b"new");
+    }
+
+    #[test]
+    fn access_request_preserves_its_requested_mask() {
+        assert_eq!(size_of::<FuseAccessIn>(), size_of::<u64>());
+
+        let mut bytes = vec![0_u8; size_of::<FuseInHeader>()];
+        bytes.extend_from_slice(&(libc::W_OK as u32).to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        let len = u32::try_from(bytes.len()).expect("access body length");
+        bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
+
+        let body = parse_message_body(bytes).expect("parse access body");
+        let input = read_copy::<FuseAccessIn>(&body.bytes, size_of::<FuseInHeader>())
+            .expect("parse access input");
+
+        assert_eq!(input.mask, libc::W_OK as u32);
+    }
+
+    #[test]
+    fn eof_read_uses_the_regular_success_reply_path() {
+        assert!(!read_reply_uses_transport_buffer(&[], 4096));
+        assert!(read_reply_uses_transport_buffer(&[], 0));
+        assert!(read_reply_uses_transport_buffer(&[1], 4096));
     }
 
     #[test]

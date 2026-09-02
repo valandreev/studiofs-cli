@@ -1078,6 +1078,28 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    pub(crate) fn access(&self, ino: u64, mask: i32) -> Result<(), i32> {
+        let attr = self.getattr(ino)?;
+        if mask == libc::F_OK {
+            return Ok(());
+        }
+        if self.read_only && mask & libc::W_OK != 0 {
+            return Err(libc::EROFS);
+        }
+        let mode = attr.st_mode as u32;
+        let readable = mode & 0o444 != 0;
+        let writable = mode & 0o222 != 0;
+        let executable = mode & 0o111 != 0 || mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
+        if (mask & libc::R_OK == 0 || readable)
+            && (mask & libc::W_OK == 0 || writable)
+            && (mask & libc::X_OK == 0 || executable)
+        {
+            Ok(())
+        } else {
+            Err(libc::EACCES)
+        }
+    }
+
     /// Create a directory.
     pub(crate) fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
         if self.read_only {

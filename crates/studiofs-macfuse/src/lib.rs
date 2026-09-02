@@ -2635,6 +2635,33 @@ mod tests {
     }
 
     #[test]
+    fn adapter_access_honors_requested_mask_and_read_only_policy() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-access-mask")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b"read-only", 501, 20, 0o444)
+            .expect("create read-only file");
+        let runtime_handle = fixture.runtime().handle().clone();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(Arc::clone(&vfs), runtime_handle.clone());
+
+        assert_eq!(adapter.access(attr.ino, libc::F_OK), Ok(()));
+        assert_eq!(adapter.access(attr.ino, libc::R_OK), Ok(()));
+        assert_eq!(adapter.access(attr.ino, libc::W_OK), Err(libc::EACCES));
+        assert_eq!(adapter.access(attr.ino, libc::X_OK), Err(libc::EACCES));
+
+        let read_only_adapter =
+            super::adapter::StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, true);
+        assert_eq!(
+            read_only_adapter.access(attr.ino, libc::W_OK),
+            Err(libc::EROFS)
+        );
+    }
+
+    #[test]
     fn final_unlink_blocks_kernel_notification_from_late_write_completion() {
         #[derive(Default)]
         struct RecordingInvalidator {
