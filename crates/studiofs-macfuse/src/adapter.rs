@@ -81,7 +81,7 @@ pub(crate) struct StudioVfsAdapter {
     read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
-    directory_handles: ParkingMutex<HashMap<u64, Arc<Vec<DirEntry>>>>,
+    directory_handles: ParkingMutex<HashMap<u64, Arc<DirectoryHandle>>>,
     next_directory_handle: AtomicU64,
     shared: Arc<AdapterSharedState>,
     open_reply_serializer: FuseOpenReplySerializer,
@@ -89,6 +89,11 @@ pub(crate) struct StudioVfsAdapter {
     read_queue_byte_limit: u32,
     next_runtime_stats_fh: AtomicU64,
     runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
+}
+
+pub(crate) struct DirectoryHandle {
+    pub(crate) parent_ino: u64,
+    pub(crate) entries: Vec<DirEntry>,
 }
 
 #[derive(Debug)]
@@ -187,13 +192,13 @@ impl KernelInodeLiveness {
         }
     }
 
-    fn forget(&self, ino: u64, nlookup: u64) {
+    fn forget(&self, ino: u64, nlookup: u64) -> bool {
         if ino == ROOT_INO || nlookup == 0 {
-            return;
+            return false;
         }
         loop {
             let Some(state) = self.current(ino) else {
-                return;
+                return false;
             };
             let mut count = state.lock();
             if !self.is_current(ino, &state) {
@@ -203,10 +208,11 @@ impl KernelInodeLiveness {
                 *count = 0;
                 self.observed
                     .remove_if(&ino, |_, current| Arc::ptr_eq(current, &state));
+                return true;
             } else {
                 *count -= nlookup;
+                return false;
             }
-            return;
         }
     }
 
@@ -1056,7 +1062,9 @@ impl StudioVfsAdapter {
     }
 
     pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
-        self.shared.kernel_inode_liveness.forget(ino, nlookup);
+        if self.shared.kernel_inode_liveness.forget(ino, nlookup) {
+            self.clear_file_flags(ino);
+        }
     }
 
     /// Get inode attributes.
@@ -2061,6 +2069,13 @@ impl StudioVfsAdapter {
         Ok(())
     }
 
+    fn directory_parent(&self, ino: u64) -> Result<u64, i32> {
+        self.vfs
+            .getattr(ino)
+            .map(|attr| if attr.parent == 0 { ino } else { attr.parent })
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     #[cfg(test)]
     pub(crate) fn readdir_for_test(
         &self,
@@ -2068,13 +2083,14 @@ impl StudioVfsAdapter {
         offset: i64,
         size: usize,
     ) -> Result<DirectoryEntryBuffer, i32> {
+        let parent_ino = self.directory_parent(ino)?;
         let entries = self
             .vfs
             .readdir(ino)
-            .map(Arc::new)
             .map_err(|error| vfs_err_to_errno(&error))?;
         self.readdir_from_entries(
             ino,
+            parent_ino,
             offset,
             size,
             &entries,
@@ -2087,13 +2103,19 @@ impl StudioVfsAdapter {
     }
 
     pub(crate) fn opendir(&self, ino: u64) -> Result<u64, i32> {
+        let parent_ino = self.directory_parent(ino)?;
         let entries = self
             .vfs
             .readdir(ino)
-            .map(Arc::new)
             .map_err(|error| vfs_err_to_errno(&error))?;
         let file_handle = self.next_directory_handle.fetch_add(1, Ordering::Relaxed);
-        self.directory_handles.lock().insert(file_handle, entries);
+        self.directory_handles.lock().insert(
+            file_handle,
+            Arc::new(DirectoryHandle {
+                parent_ino,
+                entries,
+            }),
+        );
         Ok(file_handle)
     }
 
@@ -2106,7 +2128,7 @@ impl StudioVfsAdapter {
     pub(crate) fn directory_entries_for_fskit(
         &self,
         file_handle: u64,
-    ) -> Result<Arc<Vec<DirEntry>>, i32> {
+    ) -> Result<Arc<DirectoryHandle>, i32> {
         self.directory_handles
             .lock()
             .get(&file_handle)
@@ -2130,9 +2152,10 @@ impl StudioVfsAdapter {
             .ok_or(libc::EBADF)?;
         self.readdir_from_entries(
             ino,
+            entries.parent_ino,
             offset,
             size,
-            &entries,
+            &entries.entries,
             |buffer, name, attr, next_offset| {
                 buffer
                     .push(request, name, attr, next_offset)
@@ -2157,9 +2180,10 @@ impl StudioVfsAdapter {
             .ok_or(libc::EBADF)?;
         self.readdir_from_entries(
             ino,
+            entries.parent_ino,
             offset,
             size,
-            &entries,
+            &entries.entries,
             |buffer, name, _attr, next_offset| {
                 buffer
                     .push_for_test(0, name, next_offset)
@@ -2171,6 +2195,7 @@ impl StudioVfsAdapter {
     fn readdir_from_entries(
         &self,
         ino: u64,
+        parent_ino: u64,
         offset: i64,
         size: usize,
         entries: &[DirEntry],
@@ -2179,6 +2204,7 @@ impl StudioVfsAdapter {
         let mut buffer = DirectoryEntryBuffer::new(size);
         let mut idx = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
         let dir_attr = minimal_dir_stat(ino);
+        let parent_attr = minimal_dir_stat(parent_ino);
         if idx == 0 {
             if !push_or_finish(&mut buffer, OsStr::new("."), &dir_attr, 1, &mut push)? {
                 return Ok(buffer);
@@ -2186,7 +2212,7 @@ impl StudioVfsAdapter {
             idx = 1;
         }
         if idx == 1 {
-            if !push_or_finish(&mut buffer, OsStr::new(".."), &dir_attr, 2, &mut push)? {
+            if !push_or_finish(&mut buffer, OsStr::new(".."), &parent_attr, 2, &mut push)? {
                 return Ok(buffer);
             }
             idx = 2;

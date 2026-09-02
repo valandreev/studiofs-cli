@@ -60,6 +60,11 @@ const FUSE_CREATE: u32 = 35;
 const FUSE_INTERRUPT: u32 = 36;
 const FUSE_DESTROY: u32 = 38;
 
+const MF_MOUNT_RESULT_UNSUPPORTED_OS_VERSION: i32 = 1;
+const MF_MOUNT_RESULT_HELPER_TOOLS_FAILED: i32 = 2;
+const MF_MOUNT_RESULT_EXTENSION_NOT_FOUND: i32 = 3;
+const MF_MOUNT_RESULT_APPROVAL_REQUIRED: i32 = 4;
+
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
 const FATTR_GID: u32 = 1 << 2;
@@ -565,23 +570,28 @@ impl FsKitControl {
     }
 
     fn request_exit(&self) {
+        self.request_exit_with(|| {
+            let Some(channel) = self.retained_channel() else {
+                return;
+            };
+            // SAFETY: the channel remains owned and open under the control state.
+            let interrupted = unsafe { MFChannelInterrupt(channel.as_ptr()) };
+            if !interrupted {
+                let errno = last_errno();
+                if !matches!(errno, libc::EINTR | libc::ENODEV | libc::EINVAL) {
+                    warn!(errno, "macFUSE FSKit channel interrupt failed");
+                }
+            }
+        });
+    }
+
+    fn request_exit_with(&self, interrupt: impl FnOnce()) {
         self.stop_requested.store(true, Ordering::Release);
         if !self.mounted.load(Ordering::Acquire) {
             self.close();
             return;
         }
-        let _send_lock = self.send_lock.lock();
-        let Some(channel) = self.retained_channel() else {
-            return;
-        };
-        // SAFETY: the channel remains owned and open under the control state.
-        let interrupted = unsafe { MFChannelInterrupt(channel.as_ptr()) };
-        if !interrupted {
-            let errno = last_errno();
-            if !matches!(errno, libc::EINTR | libc::ENODEV | libc::EINVAL) {
-                warn!(errno, "macFUSE FSKit channel interrupt failed");
-            }
-        }
+        interrupt();
     }
 
     fn mark_mounted(&self) {
@@ -767,16 +777,18 @@ fn mount_options(volume_name: &str) -> io::Result<CString> {
 
 fn mount_result_error(result: i32) -> io::Error {
     match result {
-        1 => io::Error::new(
+        MF_MOUNT_RESULT_UNSUPPORTED_OS_VERSION => io::Error::new(
             io::ErrorKind::Unsupported,
             "MFMount rejected FSKit: macOS version is unsupported",
         ),
-        2 => io::Error::other("MFMount could not install the required helper tools"),
-        3 => io::Error::new(
+        MF_MOUNT_RESULT_HELPER_TOOLS_FAILED => {
+            io::Error::other("MFMount could not install the required helper tools")
+        }
+        MF_MOUNT_RESULT_EXTENSION_NOT_FOUND => io::Error::new(
             io::ErrorKind::NotFound,
             "MFMount could not find the macFUSE filesystem extension",
         ),
-        4 => io::Error::new(
+        MF_MOUNT_RESULT_APPROVAL_REQUIRED => io::Error::new(
             io::ErrorKind::PermissionDenied,
             "MFMount requires macFUSE filesystem-extension approval",
         ),
@@ -1299,7 +1311,13 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        match encode_dirents(header.nodeid, input.offset, input.size as usize, &entries) {
+        match encode_dirents(
+            header.nodeid,
+            entries.parent_ino,
+            input.offset,
+            input.size as usize,
+            &entries.entries,
+        ) {
             Ok(bytes) => {
                 let _ = request.reply_bytes(bytes);
             }
@@ -1981,6 +1999,7 @@ fn statfs_out_from_statvfs(stats: libc::statvfs) -> FuseStatfsOut {
 
 fn encode_dirents(
     ino: u64,
+    parent_ino: u64,
     offset: u64,
     size: usize,
     entries: &[DirEntry],
@@ -2013,7 +2032,7 @@ fn encode_dirents(
         index = 1;
     }
     if index == 1 {
-        if !push(ino, b"..", libc::DT_DIR as u32, 2)? {
+        if !push(parent_ino, b"..", libc::DT_DIR as u32, 2)? {
             return Ok(output);
         }
         index = 2;
@@ -2112,6 +2131,31 @@ mod tests {
     }
 
     #[test]
+    fn request_exit_does_not_wait_for_send_lock() {
+        // SAFETY: this test-only channel is never passed to an FFI call.
+        let control = FsKitControl::new(NonNull::dangling());
+        control.mark_mounted();
+        let send_guard = control.send_lock.lock();
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker_control = Arc::clone(&control);
+        let worker = std::thread::spawn(move || {
+            worker_control.request_exit_with(|| {
+                done_sender
+                    .send(())
+                    .expect("report request exit completion");
+            });
+        });
+
+        let completed = done_receiver
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_ok();
+        drop(send_guard);
+        worker.join().expect("join request exit worker");
+
+        assert!(completed, "request_exit waited for the send lock");
+    }
+
+    #[test]
     fn statfs_name_limit_saturates_to_wire_width() {
         let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
         stats.f_namemax = (u32::MAX as libc::c_ulong) + 1;
@@ -2137,11 +2181,24 @@ mod tests {
             ino: 42,
             kind: FileType::RegularFile,
         }];
-        let all = encode_dirents(1, 0, 1024, &entries).expect("encode directory");
+        let all = encode_dirents(1, 1, 0, 1024, &entries).expect("encode directory");
         assert_eq!(all.len() % 8, 0);
-        let resumed = encode_dirents(1, 2, 1024, &entries).expect("resume directory");
+        let resumed = encode_dirents(1, 1, 2, 1024, &entries).expect("resume directory");
         assert_eq!(resumed.len() % 8, 0);
         assert!(resumed.len() < all.len());
+    }
+
+    #[test]
+    fn directory_records_use_parent_inode_for_dot_dot() {
+        let output = encode_dirents(42, 7, 0, 1024, &[]).expect("encode directory");
+        let dot_record_len = align8(size_of::<u64>() * 2 + size_of::<u32>() * 2 + 1);
+        let parent_ino = u64::from_ne_bytes(
+            output[dot_record_len..dot_record_len + size_of::<u64>()]
+                .try_into()
+                .expect("read dot-dot inode"),
+        );
+
+        assert_eq!(parent_ino, 7);
     }
 
     #[test]

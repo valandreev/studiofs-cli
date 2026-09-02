@@ -2605,6 +2605,36 @@ mod tests {
     }
 
     #[test]
+    fn adapter_forget_clears_file_flag_overlay_after_last_lookup() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-file-flags-forget",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b".DS_Store", 501, 20, 0o644)
+            .expect("create hidden Finder metadata file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        adapter
+            .lookup(root, b".DS_Store")
+            .expect("lookup hidden Finder metadata file");
+        adapter
+            .lookup(root, b".DS_Store")
+            .expect("repeat lookup hidden Finder metadata file");
+        assert!(adapter.file_flags_contains_for_test(attr.ino));
+
+        adapter.forget(attr.ino, 1);
+        assert!(adapter.file_flags_contains_for_test(attr.ino));
+
+        adapter.forget(attr.ino, 1);
+
+        assert!(!adapter.file_flags_contains_for_test(attr.ino));
+    }
+
+    #[test]
     fn final_unlink_blocks_kernel_notification_from_late_write_completion() {
         #[derive(Default)]
         struct RecordingInvalidator {
@@ -3064,6 +3094,32 @@ mod tests {
             .expect("full readdir buffer should return a partial success");
 
         assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    #[cfg(studiofs_fskit)]
+    fn fskit_directory_handle_tracks_parent_inode() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-fskit-directory-parent",
+        )
+        .expect("create VFS fixture");
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let child = fixture
+            .vfs()
+            .mkdir(root, b"child", 501, 20, 0o755)
+            .expect("create child directory");
+        let adapter = super::adapter::StudioVfsAdapter::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+        );
+
+        let file_handle = adapter.opendir(child.ino).expect("open child directory");
+        let handle = adapter
+            .directory_entries_for_fskit(file_handle)
+            .expect("get FSKit directory handle");
+
+        assert_eq!(handle.parent_ino, root);
+        adapter.releasedir(file_handle).expect("close directory");
     }
 
     #[test]
