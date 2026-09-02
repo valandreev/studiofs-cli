@@ -80,6 +80,8 @@ fn link_mfmount_framework() -> bool {
         );
         return false;
     }
+    println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo:rerun-if-changed={}", binary.display());
     println!(
         "cargo:rustc-link-search=framework={}",
         framework_dir.display()

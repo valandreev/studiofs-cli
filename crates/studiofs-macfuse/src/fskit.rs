@@ -74,10 +74,25 @@ const FATTR_MTIME: u32 = 1 << 5;
 const FATTR_FH: u32 = 1 << 6;
 const FATTR_ATIME_NOW: u32 = 1 << 7;
 const FATTR_MTIME_NOW: u32 = 1 << 8;
+const FATTR_LOCKOWNER: u32 = 1 << 9;
 const FATTR_BKUPTIME: u32 = 1 << 30;
 const FATTR_CRTIME: u32 = 1 << 28;
 const FATTR_CHGTIME: u32 = 1 << 29;
 const FATTR_FLAGS: u32 = 1 << 31;
+const FATTR_SUPPORTED: u32 = FATTR_MODE
+    | FATTR_UID
+    | FATTR_GID
+    | FATTR_SIZE
+    | FATTR_ATIME
+    | FATTR_MTIME
+    | FATTR_FH
+    | FATTR_ATIME_NOW
+    | FATTR_MTIME_NOW
+    | FATTR_LOCKOWNER
+    | FATTR_BKUPTIME
+    | FATTR_CHGTIME
+    | FATTR_CRTIME
+    | FATTR_FLAGS;
 
 #[link(name = "MFMount", kind = "framework")]
 unsafe extern "C" {
@@ -531,9 +546,18 @@ impl FsKitMessage {
 }
 
 fn last_errno() -> i32 {
-    io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(libc::EIO)
+    normalize_errno(io::Error::last_os_error().raw_os_error())
+}
+
+fn normalize_errno(errno: Option<i32>) -> i32 {
+    match errno {
+        Some(0) | None => libc::EIO,
+        Some(errno) => errno,
+    }
+}
+
+fn setattr_flags_supported(valid: u32) -> bool {
+    valid & !FATTR_SUPPORTED == 0
 }
 
 #[derive(Debug)]
@@ -799,6 +823,10 @@ fn mount_result_error(result: i32) -> io::Error {
     }
 }
 
+fn opcode_allows_reply(opcode: u32) -> bool {
+    !matches!(opcode, FUSE_FORGET | FUSE_DESTROY | FUSE_INTERRUPT)
+}
+
 struct FsKitRequest {
     message: Option<FsKitMessage>,
     body: MessageBody,
@@ -830,6 +858,10 @@ impl FsKitRequest {
 
     fn reply_error(mut self, errno: i32) -> io::Result<()> {
         let message = self.take_message()?;
+        if !opcode_allows_reply(self.header().opcode) {
+            drop(message);
+            return Ok(());
+        }
         send_error(&self.sender, message, self.header().unique, errno)
     }
 
@@ -863,6 +895,9 @@ impl Drop for FsKitRequest {
         let Some(message) = self.message.take() else {
             return;
         };
+        if !opcode_allows_reply(self.header().opcode) {
+            return;
+        }
         let _ = send_error(&self.sender, message, self.header().unique, libc::EIO);
     }
 }
@@ -968,12 +1003,32 @@ fn send_read_bytes(
     send_bytes(sender, message, unique, payload)
 }
 
+type CancellationMap = Arc<Mutex<std::collections::HashMap<u64, Arc<CancellationToken>>>>;
+
+struct CancellationGuard {
+    cancellations: CancellationMap,
+    unique: u64,
+    token: Arc<CancellationToken>,
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        let mut cancellations = self.cancellations.lock();
+        if cancellations
+            .get(&self.unique)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.token))
+        {
+            cancellations.remove(&self.unique);
+        }
+    }
+}
+
 struct FsKitDispatcher {
     callback_state: Arc<CallbackState>,
     adapter: Arc<StudioVfsAdapter>,
     runtime_handle: Handle,
     control: Arc<FsKitControl>,
-    cancellations: Arc<Mutex<std::collections::HashMap<u64, CancellationToken>>>,
+    cancellations: CancellationMap,
 }
 
 impl FsKitDispatcher {
@@ -1153,30 +1208,34 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        let cancellation = CancellationToken::new();
+        let cancellation = Arc::new(CancellationToken::new());
         if let Some(previous) = self
             .cancellations
             .lock()
-            .insert(header.unique, cancellation.clone())
+            .insert(header.unique, Arc::clone(&cancellation))
         {
             previous.cancel();
         }
-        let cancellations = Arc::clone(&self.cancellations);
         let adapter = Arc::clone(&self.adapter);
         let task_guard = self.callback_state.track_reply_task();
+        let cancellation_guard = CancellationGuard {
+            cancellations: Arc::clone(&self.cancellations),
+            unique: header.unique,
+            token: Arc::clone(&cancellation),
+        };
         let requested_size = input.size;
         self.runtime_handle.spawn(async move {
             let _task_guard = task_guard;
+            let _cancellation_guard = cancellation_guard;
             let result = adapter
                 .read_for_fskit(
                     header.nodeid,
                     input.fh,
                     input.offset,
                     input.size,
-                    cancellation.clone(),
+                    cancellation.as_ref().clone(),
                 )
                 .await;
-            cancellations.lock().remove(&header.unique);
             let reply = match result {
                 Ok(bytes) => request.reply_read(bytes, requested_size),
                 Err(errno) => request.reply_error(errno),
@@ -1573,20 +1632,7 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        let accepted = FATTR_MODE
-            | FATTR_UID
-            | FATTR_GID
-            | FATTR_SIZE
-            | FATTR_ATIME
-            | FATTR_MTIME
-            | FATTR_FH
-            | FATTR_ATIME_NOW
-            | FATTR_MTIME_NOW
-            | FATTR_BKUPTIME
-            | FATTR_CHGTIME
-            | FATTR_CRTIME
-            | FATTR_FLAGS;
-        if input.valid & !accepted != 0 {
+        if !setattr_flags_supported(input.valid) {
             let _ = request.reply_error(libc::ENOTSUP);
             return;
         }
@@ -2156,6 +2202,51 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_guard_does_not_remove_a_replacement_read() {
+        let cancellations = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let first = Arc::new(CancellationToken::new());
+        cancellations.lock().insert(7, Arc::clone(&first));
+        let first_guard = CancellationGuard {
+            cancellations: Arc::clone(&cancellations),
+            unique: 7,
+            token: Arc::clone(&first),
+        };
+
+        let second = Arc::new(CancellationToken::new());
+        cancellations.lock().insert(7, Arc::clone(&second));
+        drop(first_guard);
+        assert!(
+            cancellations
+                .lock()
+                .get(&7)
+                .is_some_and(|current| Arc::ptr_eq(current, &second))
+        );
+
+        let second_guard = CancellationGuard {
+            cancellations: Arc::clone(&cancellations),
+            unique: 7,
+            token: second,
+        };
+        drop(second_guard);
+        assert!(cancellations.lock().is_empty());
+    }
+
+    #[test]
+    fn one_way_opcodes_never_get_implicit_error_replies() {
+        for opcode in [FUSE_FORGET, FUSE_DESTROY, FUSE_INTERRUPT] {
+            assert!(!opcode_allows_reply(opcode));
+        }
+        assert!(opcode_allows_reply(FUSE_LOOKUP));
+    }
+
+    #[test]
+    fn zero_or_missing_errno_falls_back_to_io_error() {
+        assert_eq!(normalize_errno(None), libc::EIO);
+        assert_eq!(normalize_errno(Some(0)), libc::EIO);
+        assert_eq!(normalize_errno(Some(libc::EINVAL)), libc::EINVAL);
+    }
+
+    #[test]
     fn statfs_name_limit_saturates_to_wire_width() {
         let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
         stats.f_namemax = (u32::MAX as libc::c_ulong) + 1;
@@ -2244,5 +2335,11 @@ mod tests {
             Ok(TimeSpec::Omit)
         ));
         assert_eq!(time_to_nanos(u64::MAX, 0), Err(libc::EOVERFLOW));
+    }
+
+    #[test]
+    fn fskit_setattr_accepts_lock_owner_modifier() {
+        assert!(setattr_flags_supported(FATTR_LOCKOWNER));
+        assert!(!setattr_flags_supported(1 << 10));
     }
 }
