@@ -306,14 +306,20 @@ therefore provides no native FSKit pass/fail result for the mounted scenario.
 
 ### Task 6: Final verification and handoff
 
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `git diff --check`.
-- [ ] Run `cargo test -p studiofs-macfuse` once all focused tests are green.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `git diff --check`.
+- [x] Run `cargo test -p studiofs-macfuse` once all focused tests are green.
 - [ ] Rebuild the exact release binary only if a mounted scenario is run with
       `--studiofs-bin`; otherwise do not claim mounted release validation.
-- [ ] Inspect `git diff`, confirm no Windows bridge files changed, and update
+- [x] Inspect `git diff`, confirm no Windows bridge files changed, and update
       the SFS-670 Linear issue in English with results and unavailable native
       validation boundaries.
+
+The strict `RUSTFLAGS="-D warnings" cargo test -p studiofs-macfuse` attempt was
+stopped after `rustc` remained inactive for more than three minutes during a
+fresh dependency rebuild. Strict `cargo clippy --all-targets --all-features
+--locked -- -D warnings` passed; the ordinary full test suite and formatting/
+diff checks passed.
 
 ## Plan self-review
 
