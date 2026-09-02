@@ -1167,6 +1167,19 @@ impl StudioVfsAdapter {
         Ok(attr)
     }
 
+    /// Create a hard link to an existing inode.
+    pub(crate) fn link(&self, ino: u64, newparent: u64, newname: &[u8]) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .link(ino, newparent, newname)
+            .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
+            })
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     /// Create and open a regular file.
     #[cfg(test)]
     pub(crate) fn create(

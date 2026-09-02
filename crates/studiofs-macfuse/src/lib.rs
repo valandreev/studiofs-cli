@@ -850,6 +850,44 @@ mod tests {
     }
 
     #[test]
+    fn adapter_link_preserves_inode_and_increments_link_count() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-link")
+                .expect("fixture should initialize");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let source = vfs
+            .create(root, b"link-source.txt", 501, 20, 0o644)
+            .expect("source should be created");
+        let before = vfs.getattr(source.ino).expect("source should exist");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let linked = adapter
+            .link(source.ino, root, b"link-alias.txt")
+            .expect("hardlink should succeed");
+
+        assert_eq!(linked.ino, source.ino);
+        assert_eq!(linked.nlink, before.nlink + 1);
+        assert_eq!(
+            vfs.lookup(root, b"link-alias.txt")
+                .expect("alias should exist")
+                .ino,
+            source.ino
+        );
+
+        let read_only = super::adapter::StudioVfsAdapter::new_with_read_only(
+            vfs,
+            fixture.runtime().handle().clone(),
+            true,
+        );
+        assert_eq!(
+            read_only.link(source.ino, root, b"read-only-alias.txt"),
+            Err(libc::EROFS)
+        );
+    }
+
+    #[test]
     fn read_only_adapter_read_lets_vfs_handle_eof_without_pre_clamp_getattr() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-eof-no-preclamp")
