@@ -343,6 +343,77 @@ Focused validation:
     cargo test -p studiofs-macfuse fskit_missing_xattr_uses_macos_attribute_errno -- --nocapture
     cargo test -p studiofs-macfuse fskit_blocking_namespace_work_runs_off_dispatch_thread -- --nocapture
 
+### Follow-up FSKit startup and cancellation repair (2026-09-04)
+
+The earlier mount-result gate was based on the MFMount documentation's
+sequential example. A minimal C probe against the installed macFUSE 5.3.3
+on macOS 26.6.2 disproved that ordering for local mounts: it received
+`FUSE_INIT` (opcode 26) before `MFMount()` returned. Returning a diagnostic
+`ENOSYS` reply made `MFMount()` return an error in 1.582 seconds; leaving the
+request unread kept the call blocked despite a successful XPC connection.
+The Rust gate therefore introduced a circular wait and has been removed.
+
+The earlier send-port error was not sufficient evidence of a broken host:
+the three-second smoke deadline requested cancellation before the cold
+framework/helper startup finished. `request_exit` closed the endpoint while
+`MFMount()` was still using it. Cancellation now records the stop request,
+continues startup dispatch, and performs a normal unmount when mount completes.
+Sequentially consistent flag operations prevent completion and cancellation
+from both missing each other. A failed mount still closes the channel to
+wake the receiver and propagate the mount error.
+
+- [x] Replace the incorrect ordering test with a socket-backed MFChannel test
+      that sends a real INIT frame through `FsKitSession::run` while the mount
+      result is pending, checks the reply, and checks mount-error propagation.
+- [x] Observe RED: `INIT was blocked by pending mount`.
+- [x] Add cancellation coverage and observe RED:
+      `cancellation destroyed the pending mount endpoint`.
+- [x] Restore concurrent startup dispatch and defer early cancellation cleanup.
+- [x] Run library regressions, native read/unmount and hardlink/invalidation
+      smokes, formatting, and warnings-as-errors.
+
+The first successful native read exposed a second protocol defect: `DESTROY`
+was incorrectly classified as one-way. macFUSE's `do_destroy` sends an empty
+success reply. Without it, FSKit remained in `deactivateVolume` and `unmount(2)`
+waited indefinitely. The transport regression observed RED (`UnexpectedEof`)
+before the reply was implemented. DESTROY now replies and closes the transport;
+interrupting from the dispatch thread itself could lose the wakeup before its
+next receive. Shutdown calls normal `unmount(2)` while dispatch is still alive,
+serializes racing cancellation/completion requests, and propagates unmount
+errors. A pre-cancelled native mount also verifies that no volume is left behind.
+
+Two independent test-host effects were isolated without increasing deadlines:
+
+- Mounting below the external `/Volumes/Storage` failed with an explicit
+  `SystemPolicyRemovableVolumes` / `file-mount` denial for `fskitd` (EPERM).
+  Native validation used a separate `target` directory on the internal volume,
+  under `/Volumes/studiofs`. No TCC permissions or security settings were changed.
+- `MFMount` calls `NSBundle`, which scanned the large Cargo `target/debug/deps`
+  directory. A sample captured `CFBundleGetMainBundle` / `__getdirentries64`;
+  a run took 130.20 seconds and hit the unchanged three-second smoke deadline.
+  Copying the same executable into an isolated directory removed this delay.
+
+Final native command, run from that isolated internal-volume directory using a
+copy of the executable printed by `cargo test -p studiofs-macfuse --lib --no-run`:
+
+    STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1 ./macfuse-tests-final tests::fskit_ --test-threads=1 --nocapture
+
+Result: 16 passed, 0 failed in 5.46 seconds, including real pre-cancelled mount,
+mount/lookup/open/read/unmount, and hardlink/write/read-alias/unmount tests.
+The native startup deadlines remain three and five seconds. The warnings gate
+`cargo clippy -p studiofs-macfuse --all-targets --all-features --locked -- -D warnings`
+also passed. This proves these mounted scenarios, not the entire parity matrix
+or mounting beneath a TCC-protected external volume.
+
+Final library run: 175 passed, 0 failed in 4.56 seconds (native gates unset;
+native evidence is the separate run above). `cargo fmt --all -- --check` and
+`git diff --check` passed. No diagnostic mounts remained after validation;
+temporary probe sources, samples, executable copies, and empty test mount
+directories from this investigation were removed.
+
+Native results below must come from explicitly gated runs. Windows remains
+outside this Mac's validation scope. The legacy backend remains the default.
+
 ## Plan self-review
 
 - The tasks cover the approved first milestone: shared hardlink semantics,

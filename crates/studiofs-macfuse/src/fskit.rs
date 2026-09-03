@@ -103,7 +103,8 @@ unsafe extern "C" {
     fn MFRetain(reference: *mut c_void) -> *mut c_void;
     fn MFRelease(reference: *mut c_void);
     fn MFChannelCreate() -> *mut c_void;
-    fn MFChannelInterrupt(channel: *mut c_void) -> bool;
+    #[cfg(test)]
+    fn MFChannelCreateWithDeviceFileDescriptor(fd: i32) -> *mut c_void;
     fn MFChannelCopyNextMessage(channel: *mut c_void) -> *mut c_void;
     fn MFChannelSendMessage(channel: *mut c_void, buffers: *const iovec, count: usize) -> isize;
     fn MFChannelClose(channel: *mut c_void) -> bool;
@@ -597,22 +598,27 @@ struct FsKitControl {
     send_lock: Mutex<()>,
     stop_requested: AtomicBool,
     mounted: AtomicBool,
+    mount_point: Option<CString>,
+    unmount_started: AtomicBool,
+    unmount_error: Mutex<Option<io::Error>>,
 }
 
 // Channel lifetime is guarded by the channel mutex plus per-operation retained
-// references. Sends and close are serialized; MFChannelInterrupt may run from
-// the signal worker while the receive loop is blocked, as documented by
-// MFMount.
+// references. Sends and close are serialized. Unmount runs on the mount or
+// signal worker while the dispatcher remains available to answer DESTROY.
 unsafe impl Send for FsKitControl {}
 unsafe impl Sync for FsKitControl {}
 
 impl FsKitControl {
-    fn new(channel: NonNull<c_void>) -> Arc<Self> {
+    fn new(channel: NonNull<c_void>, mount_point: Option<CString>) -> Arc<Self> {
         Arc::new(Self {
             channel: Mutex::new(Some(channel)),
             send_lock: Mutex::new(()),
             stop_requested: AtomicBool::new(false),
             mounted: AtomicBool::new(false),
+            mount_point,
+            unmount_started: AtomicBool::new(false),
+            unmount_error: Mutex::new(None),
         })
     }
 
@@ -625,32 +631,43 @@ impl FsKitControl {
     }
 
     fn request_exit(&self) {
-        self.request_exit_with(|| {
-            let Some(channel) = self.retained_channel() else {
-                return;
-            };
-            // SAFETY: the channel remains owned and open under the control state.
-            let interrupted = unsafe { MFChannelInterrupt(channel.as_ptr()) };
-            if !interrupted {
-                let errno = last_errno();
-                if !matches!(errno, libc::EINTR | libc::ENODEV | libc::EINVAL) {
-                    warn!(errno, "macFUSE FSKit channel interrupt failed");
-                }
-            }
-        });
+        self.request_exit_with(|| self.unmount());
     }
 
-    fn request_exit_with(&self, interrupt: impl FnOnce()) {
-        self.stop_requested.store(true, Ordering::Release);
-        if !self.mounted.load(Ordering::Acquire) {
-            self.close();
-            return;
+    fn request_exit_with(&self, unmount: impl FnOnce()) {
+        // MFMount still needs its endpoint and INIT replies while mounting.
+        // SeqCst pairs with mark_mounted so cancellation cannot be missed by
+        // both threads when mount completion and unmount race.
+        self.stop_requested.store(true, Ordering::SeqCst);
+        if self.mounted.load(Ordering::SeqCst) {
+            unmount();
         }
-        interrupt();
     }
 
     fn mark_mounted(&self) {
-        self.mounted.store(true, Ordering::Release);
+        self.mounted.store(true, Ordering::SeqCst);
+        if self.stop_requested.load(Ordering::SeqCst) {
+            self.unmount();
+        }
+    }
+
+    fn unmount(&self) {
+        // Completion and cancellation can both arrive here. Only one worker
+        // may unmount; the other must not close its still-active transport.
+        if self.unmount_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(mount_point) = &self.mount_point {
+            // SAFETY: the immutable, NUL-terminated path lives for this call.
+            // Keep the dispatcher alive for flush/release/DESTROY callbacks.
+            if unsafe { libc::unmount(mount_point.as_ptr(), 0) } != 0 {
+                let error = io::Error::last_os_error();
+                if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) {
+                    *self.unmount_error.lock() = Some(error);
+                }
+            }
+        }
+        self.close();
     }
 
     fn send(&self, buffers: &[iovec]) -> io::Result<()> {
@@ -729,7 +746,7 @@ impl FsKitSession {
                 io::Error::last_os_error()
             ))
         })?;
-        let control = FsKitControl::new(channel);
+        let control = FsKitControl::new(channel, Some(mount_point.clone()));
         let mount_channel = FsKitChannelRef::retain(channel);
         let (mount_sender, mount_result) = mpsc::channel();
         let mount_control = Arc::clone(&control);
@@ -751,7 +768,7 @@ impl FsKitSession {
                 }
                 let _ = mount_sender.send(if result == 0 { Ok(()) } else { Err(result) });
                 if result != 0 {
-                    mount_control.request_exit();
+                    mount_control.close();
                 }
             })
             .map_err(|error| {
@@ -766,6 +783,8 @@ impl FsKitSession {
     }
 
     fn run(&self, dispatcher: &FsKitDispatcher) -> io::Result<()> {
+        // macFUSE 5.3.3 local mounts send INIT before MFMount returns. Keep
+        // dispatching during startup or mount and receive wait on each other.
         let mut mounted = false;
         loop {
             match self.mount_result.try_recv() {
@@ -855,7 +874,7 @@ fn mount_result_error(result: i32) -> io::Error {
 }
 
 fn opcode_allows_reply(opcode: u32) -> bool {
-    !matches!(opcode, FUSE_FORGET | FUSE_DESTROY | FUSE_INTERRUPT)
+    !matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT)
 }
 
 struct FsKitRequest {
@@ -2003,8 +2022,11 @@ impl FsKitDispatcher {
     }
 
     fn destroy(&self, request: FsKitRequest) {
-        request.no_reply();
-        self.control.request_exit();
+        let _ = request.reply_bytes(Vec::new());
+        // DESTROY is terminal. Interrupting here would precede the next
+        // receive and lose its wakeup on the dispatch thread itself.
+        self.control.mounted.store(false, Ordering::SeqCst);
+        self.control.close();
     }
 
     fn empty_success(&self, request: FsKitRequest) {
@@ -2281,7 +2303,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         unmount_signal,
     } = request;
     crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    let session = FsKitSession::mount(&mount_point, &volume_name)?;
+    let mut session = FsKitSession::mount(&mount_point, &volume_name)?;
     let callback_state = Arc::new(CallbackState::new(
         Arc::clone(&vfs),
         runtime_handle.clone(),
@@ -2312,7 +2334,18 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
     callback_state.wait_for_reply_tasks();
     drop(dispatcher);
     session.control.close();
-    result
+    if let Some(worker) = session.mount_thread.take() {
+        worker
+            .join()
+            .map_err(|_| io::Error::other("FSKit mount worker panicked"))?;
+    }
+    let unmount_result = session
+        .control
+        .unmount_error
+        .lock()
+        .take()
+        .map_or(Ok(()), Err);
+    result.and(unmount_result)
 }
 
 #[cfg(test)]
@@ -2352,7 +2385,7 @@ mod tests {
     #[test]
     fn request_exit_does_not_wait_for_send_lock() {
         // SAFETY: this test-only channel is never passed to an FFI call.
-        let control = FsKitControl::new(NonNull::dangling());
+        let control = FsKitControl::new(NonNull::dangling(), None);
         control.mark_mounted();
         let send_guard = control.send_lock.lock();
         let (done_sender, done_receiver) = mpsc::channel();
@@ -2372,6 +2405,136 @@ mod tests {
         worker.join().expect("join request exit worker");
 
         assert!(completed, "request_exit waited for the send lock");
+    }
+
+    #[test]
+    fn request_exit_during_mount_defers_channel_close_until_mount_finishes() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (server, _peer) = UnixStream::pair().expect("create FUSE transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        control.request_exit();
+        let retained_until_mounted = control.channel.lock().is_some();
+        control.mark_mounted();
+        let closed_after_mount = control.channel.lock().is_none();
+        control.close();
+
+        assert!(
+            retained_until_mounted,
+            "cancellation destroyed the pending mount endpoint"
+        );
+        assert!(closed_after_mount, "cancelled mount left the channel open");
+    }
+
+    #[test]
+    fn fskit_destroy_replies_before_closing_transport() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-destroy")
+                .expect("create fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        control.mark_mounted();
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+        let mut frame = vec![0_u8; size_of::<FuseInHeader>()];
+        frame[..4].copy_from_slice(&(size_of::<FuseInHeader>() as u32).to_ne_bytes());
+        frame[4..8].copy_from_slice(&FUSE_DESTROY.to_ne_bytes());
+        frame[8..16].copy_from_slice(&17_u64.to_ne_bytes());
+        peer.write_all(&frame).expect("send DESTROY");
+        let retained = control.retained_channel().expect("retain channel");
+        dispatcher.dispatch(FsKitMessage::receive(&retained).expect("receive DESTROY"));
+        let closed = control.channel.lock().is_none();
+        control.close();
+        let mut reply = [0_u8; size_of::<FuseOutHeader>()];
+        peer.read_exact(&mut reply)
+            .expect("DESTROY requires a reply");
+        let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode reply");
+        assert_eq!((header.unique, header.error), (17, 0));
+        assert!(
+            closed,
+            "DESTROY left the next receive able to block forever"
+        );
+    }
+
+    #[test]
+    fn fskit_run_answers_init_before_mount_completes() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-mount-order")
+                .expect("create VFS fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound INIT reply wait");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let (mount_sender, mount_receiver) = mpsc::channel();
+        let session = FsKitSession {
+            control: Arc::clone(&control),
+            mount_result: mount_receiver,
+            mount_thread: None,
+        };
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            control,
+        );
+        let worker = std::thread::spawn(move || session.run(&dispatcher));
+        let mut init = vec![0_u8; size_of::<FuseInHeader>() + size_of::<FuseInitIn>()];
+        let len = init.len() as u32;
+        init[..4].copy_from_slice(&len.to_ne_bytes());
+        init[4..8].copy_from_slice(&FUSE_INIT.to_ne_bytes());
+        init[8..16].copy_from_slice(&1_u64.to_ne_bytes());
+        init[40..44].copy_from_slice(&FUSE_KERNEL_VERSION.to_ne_bytes());
+        init[44..48].copy_from_slice(&FUSE_KERNEL_MINOR_VERSION.to_ne_bytes());
+        peer.write_all(&init)
+            .expect("send INIT while mount is pending");
+        let mut reply = [0_u8; size_of::<FuseOutHeader>() + size_of::<FuseInitOut>()];
+        let received = peer.read_exact(&mut reply);
+
+        // Unblock either implementation before asserting, including the broken
+        // one that waits for MFMount while MFMount waits for the INIT reply.
+        mount_sender
+            .send(Err(MF_MOUNT_RESULT_APPROVAL_REQUIRED))
+            .expect("finish simulated mount");
+        peer.shutdown(std::net::Shutdown::Both).expect("close peer");
+        let result = worker.join().expect("join run worker");
+        assert!(
+            received.is_ok(),
+            "INIT was blocked by pending mount: {received:?}"
+        );
+        let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode reply");
+        assert_eq!((header.unique, header.error), (1, 0));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -2406,10 +2569,11 @@ mod tests {
 
     #[test]
     fn one_way_opcodes_never_get_implicit_error_replies() {
-        for opcode in [FUSE_FORGET, FUSE_DESTROY, FUSE_INTERRUPT] {
+        for opcode in [FUSE_FORGET, FUSE_INTERRUPT] {
             assert!(!opcode_allows_reply(opcode));
         }
         assert!(opcode_allows_reply(FUSE_LOOKUP));
+        assert!(opcode_allows_reply(FUSE_DESTROY));
     }
 
     #[test]
@@ -2520,6 +2684,9 @@ mod tests {
             send_lock: Mutex::new(()),
             stop_requested: AtomicBool::new(false),
             mounted: AtomicBool::new(false),
+            mount_point: None,
+            unmount_started: AtomicBool::new(false),
+            unmount_error: Mutex::new(None),
         });
         let invalidator = FsKitKernelInvalidator { control };
 

@@ -678,6 +678,37 @@ mod tests {
 
     #[test]
     #[cfg(studiofs_fskit)]
+    fn fskit_cancelled_mount_leaves_no_volume_is_gated() {
+        if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-fskit-cancelled-mount",
+        )
+        .expect("create fixture");
+        let mount_point = std::env::current_dir()
+            .expect("resolve test directory")
+            .join("target")
+            .join(format!("studiofs-fskit-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let signal = super::MacFuseUnmountSignal::new();
+        signal.request_unmount();
+        super::mount_with_fskit_request(super::MacFuseMountRequest {
+            vfs: fixture.vfs(),
+            runtime_handle: fixture.runtime().handle().clone(),
+            mount_point: mount_point.clone(),
+            volume_name: "StudioFS FSKit Cancel Smoke".into(),
+            read_only: true,
+            run_in_foreground: true,
+            signal_handling: super::SignalHandling::Disabled,
+            unmount_signal: Some(signal),
+        })
+        .expect("complete cancelled mount");
+        std::fs::remove_dir(mount_point).expect("cancelled mount must leave no mounted volume");
+    }
+
+    #[test]
+    #[cfg(studiofs_fskit)]
     fn fskit_mounted_hardlink_and_invalidation_smoke_is_gated() {
         if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
             return;
