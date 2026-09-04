@@ -601,7 +601,6 @@ struct FsKitControl {
     channel: Mutex<Option<NonNull<c_void>>>,
     send_lock: Mutex<()>,
     stop_requested: AtomicBool,
-    mounted: AtomicBool,
     mount_point: Option<CString>,
     unmount_started: AtomicBool,
     unmount_error: Mutex<Option<io::Error>>,
@@ -619,7 +618,6 @@ impl FsKitControl {
             channel: Mutex::new(Some(channel)),
             send_lock: Mutex::new(()),
             stop_requested: AtomicBool::new(false),
-            mounted: AtomicBool::new(false),
             mount_point,
             unmount_started: AtomicBool::new(false),
             unmount_error: Mutex::new(None),
@@ -654,7 +652,6 @@ impl FsKitControl {
     }
 
     fn mark_mounted(&self) {
-        self.mounted.store(true, Ordering::SeqCst);
         if self.stop_requested.load(Ordering::SeqCst) {
             self.unmount();
         }
@@ -2053,7 +2050,6 @@ impl FsKitDispatcher {
         let _ = request.reply_bytes(Vec::new());
         // DESTROY is terminal. Interrupting here would precede the next
         // receive and lose its wakeup on the dispatch thread itself.
-        self.control.mounted.store(false, Ordering::SeqCst);
         self.control.close();
     }
 
@@ -2832,7 +2828,6 @@ mod tests {
             channel: Mutex::new(None),
             send_lock: Mutex::new(()),
             stop_requested: AtomicBool::new(false),
-            mounted: AtomicBool::new(false),
             mount_point: None,
             unmount_started: AtomicBool::new(false),
             unmount_error: Mutex::new(None),
