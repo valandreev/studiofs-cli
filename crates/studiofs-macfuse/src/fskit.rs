@@ -11,6 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
 };
+use std::time::{Duration, Instant};
 
 use libc::iovec;
 use parking_lot::Mutex;
@@ -70,6 +71,7 @@ const MF_MOUNT_RESULT_HELPER_TOOLS_FAILED: i32 = 2;
 const MF_MOUNT_RESULT_EXTENSION_NOT_FOUND: i32 = 3;
 const MF_MOUNT_RESULT_APPROVAL_REQUIRED: i32 = 4;
 const FS_KIT_RECEIVE_POLL_MS: i32 = 100;
+const FS_KIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -607,8 +609,8 @@ struct FsKitControl {
 }
 
 // Channel lifetime is guarded by the channel mutex plus per-operation retained
-// references. Sends and close are serialized. Unmount runs on the mount or
-// signal worker while the dispatcher remains available to answer DESTROY.
+// references. Sends and close are serialized. The session keeps the channel
+// open until the dispatcher answers the terminal DESTROY request.
 unsafe impl Send for FsKitControl {}
 unsafe impl Sync for FsKitControl {}
 
@@ -634,8 +636,8 @@ impl FsKitControl {
 
     fn request_exit(&self) {
         // MFMount still needs its endpoint and INIT replies while mounting.
-        // SeqCst pairs with mark_mounted so cancellation cannot be missed by
-        // both threads when mount completion and unmount race.
+        // SeqCst makes the stop request visible to the session loop even when
+        // mount completion and cancellation race.
         self.stop_requested.store(true, Ordering::SeqCst);
         // macFUSE 5.3.3 added an explicit wakeup for blocked receives. Keep
         // the actual unmount on the regular session thread, like the low-level
@@ -651,15 +653,9 @@ impl FsKitControl {
         }
     }
 
-    fn mark_mounted(&self) {
-        if self.stop_requested.load(Ordering::SeqCst) {
-            self.unmount();
-        }
-    }
-
     fn unmount(&self) {
-        // Completion and cancellation can both arrive here. Only one worker
-        // may unmount; the other must not close its still-active transport.
+        // Completion, cancellation, and drop can all arrive here. Only one
+        // caller may issue the system unmount; the session owns channel close.
         if self.unmount_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -668,12 +664,21 @@ impl FsKitControl {
             // Keep the dispatcher alive for flush/release/DESTROY callbacks.
             if unsafe { libc::unmount(mount_point.as_ptr(), 0) } != 0 {
                 let error = io::Error::last_os_error();
+                let error = if error.raw_os_error() == Some(libc::EBUSY) {
+                    // macOS can retain active vnode references while the
+                    // kernel is already tearing the FUSE session down.
+                    if unsafe { libc::unmount(mount_point.as_ptr(), libc::MNT_FORCE) } == 0 {
+                        return;
+                    }
+                    io::Error::last_os_error()
+                } else {
+                    error
+                };
                 if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) {
                     *self.unmount_error.lock() = Some(error);
                 }
             }
         }
-        self.close();
     }
 
     fn send(&self, buffers: &[iovec]) -> io::Result<()> {
@@ -769,9 +774,6 @@ impl FsKitSession {
                         true,
                     )
                 };
-                if result == 0 {
-                    mount_control.mark_mounted();
-                }
                 let _ = mount_sender.send(if result == 0 { Ok(()) } else { Err(result) });
                 if result != 0 {
                     mount_control.close();
@@ -792,6 +794,7 @@ impl FsKitSession {
         // macFUSE 5.3.3 local mounts send INIT before MFMount returns. Keep
         // dispatching during startup or mount and receive wait on each other.
         let mut mounted = false;
+        let mut shutdown_deadline = None;
         loop {
             match self.mount_result.try_recv() {
                 Ok(Ok(())) => mounted = true,
@@ -804,6 +807,19 @@ impl FsKitSession {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
+            if self.control.is_stopping() {
+                let deadline = shutdown_deadline
+                    .get_or_insert_with(|| Instant::now() + FS_KIT_SHUTDOWN_TIMEOUT);
+                if mounted {
+                    self.control.unmount();
+                }
+                if Instant::now() >= *deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "FSKit shutdown did not receive DESTROY before the deadline",
+                    ));
+                }
+            }
             let Some(channel) = self.control.retained_channel() else {
                 return Ok(());
             };
@@ -815,14 +831,14 @@ impl FsKitSession {
             let ready =
                 unsafe { MFChannelWaitForNextMessage(channel.as_ptr(), FS_KIT_RECEIVE_POLL_MS) };
             if ready == 0 {
-                if self.control.is_stopping() {
-                    return Ok(());
-                }
                 continue;
             }
             if ready < 0 {
                 let errno = last_errno();
-                if self.control.is_stopping() || matches!(errno, libc::EINTR | libc::ENODEV) {
+                if self.control.is_stopping() {
+                    continue;
+                }
+                if matches!(errno, libc::EINTR | libc::ENODEV) {
                     return Ok(());
                 }
                 return Err(errno_error(errno));
@@ -840,7 +856,10 @@ impl FsKitSession {
                     Err(mpsc::TryRecvError::Disconnected) => {}
                 }
                 let errno = last_errno();
-                if self.control.is_stopping() || matches!(errno, libc::EINTR | libc::ENODEV) {
+                if self.control.is_stopping() {
+                    continue;
+                }
+                if matches!(errno, libc::EINTR | libc::ENODEV) {
                     return Ok(());
                 }
                 return Err(errno_error(errno));
@@ -942,9 +961,14 @@ impl FsKitRequest {
         send_error(&self.sender, message, self.header().unique, errno)
     }
 
-    fn reply_bytes(mut self, payload: Vec<u8>) -> io::Result<()> {
+    fn reply_bytes(mut self, payload: impl AsRef<[u8]>) -> io::Result<()> {
         let message = self.take_message()?;
-        send_bytes(&self.sender, message, self.header().unique, &payload)
+        send_bytes(
+            &self.sender,
+            message,
+            self.header().unique,
+            payload.as_ref(),
+        )
     }
 
     fn reply_read(mut self, payload: Vec<u8>, requested_size: u32) -> io::Result<()> {
@@ -1096,12 +1120,12 @@ fn getxattr_value_response(
     value: &[u8],
     position: usize,
     requested_size: u32,
-) -> Result<Vec<u8>, i32> {
+) -> Result<&[u8], i32> {
     let value = crate::adapter::xattr_value_from_position(value, position);
     if value.len() > requested_size as usize {
         Err(libc::ERANGE)
     } else {
-        Ok(value.to_vec())
+        Ok(value)
     }
 }
 
@@ -1673,18 +1697,20 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        match self
-            .adapter
-            .link(input.oldnodeid, request.header().nodeid, &name)
-        {
-            Ok(attr) => {
-                let _ = request
-                    .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+        let parent = request.header().nodeid;
+        let adapter = Arc::clone(&self.adapter);
+        let task_guard = self.callback_state.track_reply_task();
+        spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
+            match adapter.link(input.oldnodeid, parent, &name) {
+                Ok(attr) => {
+                    let _ = request
+                        .reply_struct(entry_from_stat(attr.ino, adapter.attr_to_stat(&attr)));
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                }
             }
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-            }
-        }
+        });
     }
 
     fn symlink(&self, request: FsKitRequest) {
@@ -2373,8 +2399,8 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
     dispatcher.cancel_pending();
     vfs.clear_kernel_invalidator();
     callback_state.wait_for_reply_tasks();
-    drop(dispatcher);
     session.control.unmount();
+    drop(dispatcher);
     session.control.close();
     if let Some(worker) = session.mount_thread.take() {
         worker
@@ -2436,7 +2462,6 @@ mod tests {
             NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
                 .expect("create channel");
         let control = FsKitControl::new(channel, None);
-        control.mark_mounted();
         let ready = Arc::new(Barrier::new(2));
         let receiver_control = Arc::clone(&control);
         let receiver_ready = Arc::clone(&ready);
@@ -2478,7 +2503,7 @@ mod tests {
     }
 
     #[test]
-    fn request_exit_during_mount_defers_channel_close_until_mount_finishes() {
+    fn request_exit_keeps_channel_open_until_session_finishes_mount() {
         use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
@@ -2490,15 +2515,85 @@ mod tests {
         let control = FsKitControl::new(channel, None);
         control.request_exit();
         let retained_until_mounted = control.channel.lock().is_some();
-        control.mark_mounted();
-        let closed_after_mount = control.channel.lock().is_none();
+        let open_after_mount = control.channel.lock().is_some();
         control.close();
 
         assert!(
             retained_until_mounted,
             "cancellation destroyed the pending mount endpoint"
         );
-        assert!(closed_after_mount, "cancelled mount left the channel open");
+        assert!(
+            open_after_mount,
+            "cancelled mount closed the channel before DESTROY"
+        );
+    }
+
+    #[test]
+    fn fskit_run_keeps_dispatcher_alive_until_destroy_after_unmount_request() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-unmount")
+                .expect("create VFS fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound DESTROY reply wait");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let (mount_sender, mount_receiver) = mpsc::channel();
+        let session = FsKitSession {
+            control: Arc::clone(&control),
+            mount_result: mount_receiver,
+            mount_thread: None,
+        };
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = session.run(&dispatcher);
+            done_sender.send(result).expect("report session result");
+        });
+
+        control.request_exit();
+        mount_sender
+            .send(Ok(()))
+            .expect("report successful mount before DESTROY");
+        assert!(
+            done_receiver
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "session stopped before the terminal DESTROY request"
+        );
+
+        let mut destroy = vec![0_u8; size_of::<FuseInHeader>()];
+        destroy[..4].copy_from_slice(&(size_of::<FuseInHeader>() as u32).to_ne_bytes());
+        destroy[4..8].copy_from_slice(&FUSE_DESTROY.to_ne_bytes());
+        destroy[8..16].copy_from_slice(&23_u64.to_ne_bytes());
+        peer.write_all(&destroy).expect("send DESTROY");
+
+        done_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("session should finish after DESTROY")
+            .expect("DESTROY shutdown should succeed");
+        worker.join().expect("join session worker");
+
+        let mut reply = [0_u8; size_of::<FuseOutHeader>()];
+        peer.read_exact(&mut reply)
+            .expect("DESTROY requires a reply");
+        let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode DESTROY reply");
+        assert_eq!((header.unique, header.error), (23, 0));
     }
 
     #[test]
@@ -2516,7 +2611,6 @@ mod tests {
             NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
                 .expect("create channel");
         let control = FsKitControl::new(channel, None);
-        control.mark_mounted();
         let dispatcher = FsKitDispatcher::new(
             Arc::new(CallbackState::new(
                 fixture.vfs(),
@@ -2761,7 +2855,6 @@ mod tests {
             NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
                 .expect("create channel");
         let control = FsKitControl::new(channel, None);
-        control.mark_mounted();
         let invalidator = FsKitKernelInvalidator {
             control: Arc::clone(&control),
         };
@@ -2974,12 +3067,12 @@ mod tests {
         );
         assert_eq!(
             getxattr_value_response(value, 5, 32).expect("positioned read should succeed"),
-            value[5..].to_vec()
+            &value[5..]
         );
         assert_eq!(
             getxattr_value_response(value, value.len() + 1, 32)
                 .expect("past-end positioned read should succeed"),
-            Vec::<u8>::new()
+            &b""[..]
         );
         assert_eq!(getxattr_value_response(value, 0, 4), Err(libc::ERANGE));
     }

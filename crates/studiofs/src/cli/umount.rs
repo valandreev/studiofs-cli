@@ -239,6 +239,7 @@ fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<
             }
             if Instant::now() > deadline {
                 let _ = child.kill();
+                let _ = child.wait();
                 anyhow::bail!("{bin} -u did not finish within {}s", timeout.as_secs());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -296,6 +297,7 @@ fn run_macos_unmount_command(
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
+            let _ = child.wait();
             anyhow::bail!(
                 "{program} {} {mount_point} did not finish within {} ms",
                 args.join(" "),

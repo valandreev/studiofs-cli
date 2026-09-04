@@ -2073,15 +2073,10 @@ fn macos_mount_is_active_with(
 
 #[cfg(target_os = "macos")]
 fn macos_mount_table_contains_mount_point(mount_table: &[u8], expected: &Path) -> bool {
-    String::from_utf8_lossy(mount_table).lines().any(|line| {
-        let Some((_, mounted)) = line.rsplit_once(" on ") else {
-            return false;
-        };
-        let Some((mounted, _)) = mounted.split_once(" (") else {
-            return false;
-        };
-        Path::new(mounted).components().eq(expected.components())
-    })
+    let marker = format!(" on {} (", expected.display());
+    String::from_utf8_lossy(mount_table)
+        .lines()
+        .any(|line| line.contains(&marker))
 }
 
 #[cfg(target_os = "macos")]
@@ -2689,6 +2684,18 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
                 || Ok(mount_table.to_vec())
             )
             .expect("probe child path")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mount_activity_probe_handles_mountpoint_delimiters() {
+        let mount_point = Path::new("/Volumes/studiofs/on (call)/projectfs");
+        let mount_table = b"macfuse on /Volumes/studiofs/on (call)/projectfs (macfuse, local)\n";
+
+        assert!(
+            macos_mount_is_active_with(mount_point, || Ok(mount_table.to_vec()))
+                .expect("probe mount table")
         );
     }
 
