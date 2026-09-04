@@ -461,6 +461,61 @@ slice.
 SFS-670 remains open for that parity matrix and code review; no Linear status,
 commit, or push was changed by this implementation.
 
+### Mounted parity root configuration (2026-09-04)
+
+The shared `studiofs-e2e` mounted contour now reads the host mount root from
+the repository `.env` key `STUDIOFS_E2E_MOUNT_ROOT`. A process environment
+value is retained as a one-run override. Each client owns a child path below
+the configured root, while reports and client metadata remain in the normal
+`target/e2e-runs/<run-id>` sandbox. The stand's internal root is:
+
+    STUDIOFS_E2E_MOUNT_ROOT=/Volumes/studiofs
+
+The full legacy-vs-FSKit scenario sweep is still pending a clean native host
+after the previous FSKit kernel handoff left uninterruptible stale processes;
+the current implementation does not count that contaminated run as parity
+evidence.
+
+### Bounded macOS stale-mount probe (2026-09-04)
+
+The first post-reboot FSKit parity batch reproduced a second lifecycle defect:
+the PostgreSQL outage hook force-killed a client and then blocked forever in
+`fs::metadata()` while probing its stale FSKit mountpoint. A short macOS sample
+confirmed the runner was stuck in the kernel `stat` path. The runner now reads
+the `/sbin/mount` table through the existing bounded command helper for macOS
+readiness and stale-mount cleanup, with a five-second probe limit. The focused
+mount-table regression passes; the affected native run must be repeated after
+another reboot because the old runner and its FSKit workers remain in kernel
+state.
+
+### FSKit graceful teardown and current host blocker (2026-09-05)
+
+The FSKit session now uses macFUSE 5.3.3's `MFChannelInterrupt()` to wake a
+blocked receive without entering native unmount from the signal watcher. The
+regular session path performs the unmount while the dispatcher is still alive,
+and the focused regression proves that cancellation does not wait on the reply
+send lock. The macFUSE library suite and warnings-as-errors check pass with
+this change.
+
+A fresh native `studiofs-e2e` PostgreSQL-outage run, started after a clean
+reboot from the internal `/Volumes/studiofs` root, reached the mounted phase
+and force-killed the client, but failed during stale-mount cleanup. The bounded
+attempts to read `/sbin/mount` and to run `umount -f`, `umount`, and
+`diskutil unmount force` all timed out; the resulting `fskit_agent` and
+uninterruptible helper processes required another reboot to clear. The
+retained report is:
+
+    target/e2e-runs/sfs-670-fskit-postgres-outage-20260905-postreboot3/report.json
+
+This is an external macFUSE 5.3.3 crash/handoff blocker, not evidence that the
+FSKit operation dispatcher lacks the requested operation mappings. It matches
+the stale-mount-after-termination failure reported upstream in
+[macFUSE issue #1180](https://github.com/macfuse/macfuse/issues/1180). Full
+FSKit mounted parity, including crash/restart and the remaining remote
+create/update/rename/unlink matrix, remains open until a clean host can run the
+same contour to completion. SFS-670 remains open and no Linear status was
+changed.
+
 ## Plan self-review
 
 - The tasks cover the approved first milestone: shared hardlink semantics,

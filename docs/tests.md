@@ -303,6 +303,20 @@ required artifact names, report schema, preflight gates, cleanup safety rules,
 and the smoke-first scenario rollout. Real E2E runs stay outside the default
 fast suite.
 
+On macOS, configure the host mount root in the repository `.env` before running
+mounted scenarios:
+
+```dotenv
+STUDIOFS_E2E_MOUNT_ROOT=/Volumes/studiofs
+```
+
+The runner creates one child per logical client below that root, while logs,
+metadata, and reports remain in `target/e2e-runs/<run-id>`. A process
+environment value may override the `.env` value for one run. The configured
+root must be an absolute path on an internal volume; do not use a removable
+`/Volumes/Storage` path as native FSKit evidence because macOS TCC can deny
+`fskitd` there.
+
 Initial runner commands:
 
 ```powershell
@@ -375,6 +389,15 @@ rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
 and readdir/stat while mutations are in flight. The overwrite/read scenario
 records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
 `namespace-collision-summary.json`, and `validation.json`.
+
+On macOS, mounted readiness and stale-mount cleanup read the `/sbin/mount`
+table through a bounded helper instead of calling `stat` on the candidate
+FSKit mountpoint. A stale FSKit vnode can block filesystem metadata calls after
+its worker exits; such a timeout remains a failed run and is not treated as a
+clean mount. Graceful FSKit teardown uses the MFMount channel interrupt before
+the normal unmount path. macFUSE 5.3.3 can still leave the handoff stuck after
+an abrupt client kill; if `/sbin/mount`, `umount`, or `diskutil unmount` blocks,
+reboot the host before another native run and retain the failed report.
 
 `mounted-sparse-file-range-convergence` is a deliberate post-1-16 promotion
 scenario. It uses a bounded sparse file, validates zero-filled holes,

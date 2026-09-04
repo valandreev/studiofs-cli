@@ -27,6 +27,7 @@ const FUSE_KERNEL_MINOR_VERSION: u32 = 19;
 const FUSE_ASYNC_READ: u32 = 1 << 0;
 const FUSE_BIG_WRITES: u32 = 1 << 5;
 const FOPEN_DIRECT_IO: u32 = 1 << 0;
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
@@ -68,6 +69,7 @@ const MF_MOUNT_RESULT_UNSUPPORTED_OS_VERSION: i32 = 1;
 const MF_MOUNT_RESULT_HELPER_TOOLS_FAILED: i32 = 2;
 const MF_MOUNT_RESULT_EXTENSION_NOT_FOUND: i32 = 3;
 const MF_MOUNT_RESULT_APPROVAL_REQUIRED: i32 = 4;
+const FS_KIT_RECEIVE_POLL_MS: i32 = 100;
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -106,6 +108,8 @@ unsafe extern "C" {
     #[cfg(test)]
     fn MFChannelCreateWithDeviceFileDescriptor(fd: i32) -> *mut c_void;
     fn MFChannelCopyNextMessage(channel: *mut c_void) -> *mut c_void;
+    fn MFChannelInterrupt(channel: *mut c_void) -> bool;
+    fn MFChannelWaitForNextMessage(channel: *mut c_void, timeout: i32) -> i32;
     fn MFChannelSendMessage(channel: *mut c_void, buffers: *const iovec, count: usize) -> isize;
     fn MFChannelClose(channel: *mut c_void) -> bool;
     fn MFMessageGetBodySize(message: *mut c_void) -> isize;
@@ -631,16 +635,21 @@ impl FsKitControl {
     }
 
     fn request_exit(&self) {
-        self.request_exit_with(|| self.unmount());
-    }
-
-    fn request_exit_with(&self, unmount: impl FnOnce()) {
         // MFMount still needs its endpoint and INIT replies while mounting.
         // SeqCst pairs with mark_mounted so cancellation cannot be missed by
         // both threads when mount completion and unmount race.
         self.stop_requested.store(true, Ordering::SeqCst);
-        if self.mounted.load(Ordering::SeqCst) {
-            unmount();
+        // macFUSE 5.3.3 added an explicit wakeup for blocked receives. Keep
+        // the actual unmount on the regular session thread, like the low-level
+        // backend, so the signal watcher never enters a blocking system call.
+        let Some(channel) = self.retained_channel() else {
+            return;
+        };
+        // SAFETY: the retained channel remains valid for this synchronous FFI
+        // call. The framework documents this as the wakeup for blocked receive
+        // operations and it does not close the channel.
+        unsafe {
+            let _ = MFChannelInterrupt(channel.as_ptr());
         }
     }
 
@@ -801,6 +810,26 @@ impl FsKitSession {
             let Some(channel) = self.control.retained_channel() else {
                 return Ok(());
             };
+            // Keep a bounded fallback in case an older or damaged transport
+            // ignores MFChannelInterrupt().
+            // SAFETY: the retained channel stays alive for this synchronous
+            // wait, and the timeout bounds the call before the reference is
+            // released.
+            let ready =
+                unsafe { MFChannelWaitForNextMessage(channel.as_ptr(), FS_KIT_RECEIVE_POLL_MS) };
+            if ready == 0 {
+                if self.control.is_stopping() {
+                    return Ok(());
+                }
+                continue;
+            }
+            if ready < 0 {
+                let errno = last_errno();
+                if self.control.is_stopping() || matches!(errno, libc::EINTR | libc::ENODEV) {
+                    return Ok(());
+                }
+                return Err(errno_error(errno));
+            }
             let Some(message) = FsKitMessage::receive(&channel) else {
                 match self.mount_result.try_recv() {
                     Ok(Ok(())) => {}
@@ -827,6 +856,7 @@ impl FsKitSession {
 impl Drop for FsKitSession {
     fn drop(&mut self) {
         self.control.request_exit();
+        self.control.unmount();
         self.control.close();
         if let Some(mount_thread) = self.mount_thread.take() {
             let _ = mount_thread.join();
@@ -1257,11 +1287,9 @@ impl FsKitDispatcher {
         match self.adapter.open(header.nodeid, input.flags as i32) {
             Ok(open) => {
                 let file_handle = open.file_handle();
-                // Keep direct I/O for the current owned-buffer path; SFS-671
-                // owns negotiated zero-copy and future cache-policy changes.
                 let result = request.reply_struct(FuseOpenOut {
                     fh: file_handle,
-                    open_flags: FOPEN_DIRECT_IO,
+                    open_flags: fskit_open_flags(open),
                     padding: 0,
                 });
                 if result.is_err() {
@@ -1490,7 +1518,7 @@ impl FsKitDispatcher {
     fn readlink(&self, request: FsKitRequest) {
         match self.adapter.readlink(request.header().nodeid) {
             Ok(target) => {
-                let _ = request.reply_bytes(target);
+                let _ = request.reply_bytes(readlink_reply_payload(target));
             }
             Err(errno) => {
                 let _ = request.reply_error(errno);
@@ -1718,7 +1746,7 @@ impl FsKitDispatcher {
                     encode_copy(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
                 let open = encode_copy(FuseOpenOut {
                     fh: file_handle,
-                    open_flags: FOPEN_DIRECT_IO,
+                    open_flags: fskit_open_flags(open),
                     padding: 0,
                 });
                 if request.reply_bytes([entry, open].concat()).is_err() {
@@ -2154,11 +2182,28 @@ fn setattr_time(
 }
 
 fn time_to_nanos(seconds: u64, nanos: u32) -> Result<i64, i32> {
+    if nanos >= 1_000_000_000 {
+        return Err(libc::EINVAL);
+    }
     let seconds = i64::try_from(seconds).map_err(|_| libc::EOVERFLOW)?;
     seconds
         .checked_mul(1_000_000_000)
         .and_then(|seconds| seconds.checked_add(i64::from(nanos)))
         .ok_or(libc::EOVERFLOW)
+}
+
+fn readlink_reply_payload(mut target: Vec<u8>) -> Vec<u8> {
+    target.push(0);
+    target
+}
+
+fn fskit_open_flags(open: low_level::OpenReply) -> u32 {
+    (if open.direct_io() { FOPEN_DIRECT_IO } else { 0 })
+        | (if open.keep_cache() {
+            FOPEN_KEEP_CACHE
+        } else {
+            0
+        })
 }
 
 fn args_have_values(args: &SetattrArgs) -> bool {
@@ -2333,6 +2378,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
     vfs.clear_kernel_invalidator();
     callback_state.wait_for_reply_tasks();
     drop(dispatcher);
+    session.control.unmount();
     session.control.close();
     if let Some(worker) = session.mount_thread.take() {
         worker
@@ -2383,28 +2429,56 @@ mod tests {
     }
 
     #[test]
-    fn request_exit_does_not_wait_for_send_lock() {
-        // SAFETY: this test-only channel is never passed to an FFI call.
-        let control = FsKitControl::new(NonNull::dangling(), None);
+    fn request_exit_interrupts_blocked_receive_without_waiting_for_send_lock() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Barrier;
+
+        let (server, peer) = UnixStream::pair().expect("create FUSE transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
         control.mark_mounted();
+        let ready = Arc::new(Barrier::new(2));
+        let receiver_control = Arc::clone(&control);
+        let receiver_ready = Arc::clone(&ready);
+        let receiver = std::thread::spawn(move || {
+            let channel = receiver_control
+                .retained_channel()
+                .expect("retain receive channel");
+            receiver_ready.wait();
+            // SAFETY: the retained channel stays alive for this receive call.
+            let result = unsafe { MFChannelWaitForNextMessage(channel.as_ptr(), -1) };
+            let errno = io::Error::last_os_error().raw_os_error();
+            (result == -1, errno)
+        });
+        ready.wait();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
         let send_guard = control.send_lock.lock();
         let (done_sender, done_receiver) = mpsc::channel();
-        let worker_control = Arc::clone(&control);
-        let worker = std::thread::spawn(move || {
-            worker_control.request_exit_with(|| {
-                done_sender
-                    .send(())
-                    .expect("report request exit completion");
-            });
+        let request_control = Arc::clone(&control);
+        let requester = std::thread::spawn(move || {
+            request_control.request_exit();
+            done_sender
+                .send(())
+                .expect("report request exit completion");
         });
-
-        let completed = done_receiver
-            .recv_timeout(std::time::Duration::from_millis(250))
-            .is_ok();
+        assert!(
+            done_receiver
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_ok(),
+            "request_exit waited for the send lock"
+        );
         drop(send_guard);
-        worker.join().expect("join request exit worker");
-
-        assert!(completed, "request_exit waited for the send lock");
+        requester.join().expect("join request thread");
+        let (interrupted, errno) = receiver.join().expect("join receive thread");
+        assert!(interrupted, "interrupt should fail the blocked wait");
+        assert_eq!(errno, Some(libc::EINTR));
+        drop(peer);
+        control.close();
     }
 
     #[test]
@@ -2831,6 +2905,19 @@ mod tests {
     }
 
     #[test]
+    fn fskit_open_reply_preserves_cache_flags() {
+        let cached = low_level::OpenReply::new(1).with_keep_cache(true);
+        let direct = low_level::OpenReply::new(2).with_direct_io(true);
+        let both = low_level::OpenReply::new(3)
+            .with_direct_io(true)
+            .with_keep_cache(true);
+
+        assert_eq!(fskit_open_flags(cached), FOPEN_KEEP_CACHE);
+        assert_eq!(fskit_open_flags(direct), FOPEN_DIRECT_IO);
+        assert_eq!(fskit_open_flags(both), FOPEN_DIRECT_IO | FOPEN_KEEP_CACHE);
+    }
+
+    #[test]
     fn fskit_mount_preflight_rejects_paths_outside_volumes() {
         let result = FsKitSession::mount(Path::new("/tmp/studiofs-fskit-test"), "StudioFS");
 
@@ -2864,6 +2951,16 @@ mod tests {
             Ok(TimeSpec::Omit)
         ));
         assert_eq!(time_to_nanos(u64::MAX, 0), Err(libc::EOVERFLOW));
+    }
+
+    #[test]
+    fn fskit_setattr_time_rejects_noncanonical_nanoseconds() {
+        assert_eq!(time_to_nanos(1, 1_000_000_000), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn fskit_readlink_reply_payload_is_nul_terminated() {
+        assert_eq!(readlink_reply_payload(b"target".to_vec()), b"target\0");
     }
 
     #[test]

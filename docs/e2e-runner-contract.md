@@ -68,6 +68,7 @@ Required initial run flags and environment:
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
 | `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. |
 | `STUDIOFS_E2E_COMPOSE_FILE` | Optional environment override for the compose file path. Defaults to `docker/compose.e2e.yml` discovered from the current directory or executable location. |
+| `STUDIOFS_E2E_MOUNT_ROOT` | macOS mounted runs only. Canonical host setting from the repository `.env`; each client mount is created below `<root>/<client>/<volume>`. The value must be an absolute path on an internal volume. A process environment value overrides `.env` for one run. |
 | `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
 
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
@@ -350,7 +351,8 @@ does not recurse through symlinked directories.
 Mounted multi-client scenarios use the `studiofs-e2e::client` controller to
 create isolated logical clients in `artifacts/clients/<client>/`. Each client
 gets a dedicated `STUDIOFS_CLIENT_ROOT`, local metadata path
-`client-root/meta/<volume>/<volume>.db`, cache directory, mount point,
+`client-root/meta/<volume>/<volume>.db`, cache directory, and mount point below
+the configured `STUDIOFS_E2E_MOUNT_ROOT` (or the default sandbox root),
 stdout/stderr logs, tracing log stem, and lifecycle state.
 
 The controller bootstraps the first client with `studiofs init`, discovers the
@@ -361,9 +363,11 @@ kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
 Crash-style remounts do not run `studiofs umount` for the killed client. Linux
 mounted runs require `/dev/fuse`, `fusermount3`, and the system libfuse3
-runtime; missing mount prerequisites fail preflight explicitly. Other platforms
-keep the existing remount path unless a platform-specific stale-mount cleanup
-is added.
+runtime; missing mount prerequisites fail preflight explicitly. On macOS,
+readiness and stale-mount cleanup use the bounded `/sbin/mount` table probe;
+they must not `stat` a candidate FSKit mountpoint because a stale vnode can
+block that metadata call after worker termination. Other platforms keep the
+existing remount path unless a platform-specific stale-mount cleanup is added.
 
 `basic-multi-client-smoke` uses the first three default clients. It initializes
 three peer remote volumes, one from each client, then discovers each peer-owned

@@ -248,7 +248,65 @@ fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<
     Err(err).context("detach FUSE mount with umount2; fusermount not found")
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<()> {
+    detach_unix_mount_with(mount_point, timeout, run_macos_unmount_command)
+}
+
+#[cfg(target_os = "macos")]
+fn detach_unix_mount_with(
+    mount_point: &str,
+    timeout: std::time::Duration,
+    run: impl FnOnce(&str, &str, &[&str], std::time::Duration) -> Result<()>,
+) -> Result<()> {
+    run(mount_point, "/sbin/umount", &["-f"], timeout)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_unmount_command(
+    mount_point: &str,
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .arg(mount_point)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("start {program} {}", args.join(" ")))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for {program} {}", args.join(" ")))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "{program} {} {mount_point} exited with status {status}",
+                args.join(" ")
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            anyhow::bail!(
+                "{program} {} {mount_point} did not finish within {} ms",
+                args.join(" "),
+                timeout.as_millis()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 fn detach_unix_mount(_mount_point: &str, _timeout: std::time::Duration) -> Result<()> {
     Ok(())
 }
@@ -569,6 +627,44 @@ mod tests {
             *unix_event_log().lock().unwrap(),
             vec!["detach", "signal"],
             "FUSE mount must be detached before the mount process receives SIGTERM"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unmount_detach_requests_a_forced_native_unmount() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        type UnmountCall = (String, String, Vec<String>, Duration);
+
+        let call: Mutex<Option<UnmountCall>> = Mutex::new(None);
+        let result = detach_unix_mount_with(
+            "/Volumes/studiofs/test-volume",
+            Duration::from_secs(7),
+            |mount_point, program, args, timeout| {
+                *call.lock().unwrap() = Some((
+                    mount_point.to_owned(),
+                    program.to_owned(),
+                    args.iter().map(|arg| (*arg).to_owned()).collect(),
+                    timeout,
+                ));
+                Ok(())
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "forced native unmount should be requested: {result:?}"
+        );
+        assert_eq!(
+            *call.lock().unwrap(),
+            Some((
+                "/Volumes/studiofs/test-volume".to_owned(),
+                "/sbin/umount".to_owned(),
+                vec!["-f".to_owned()],
+                Duration::from_secs(7),
+            ))
         );
     }
 }

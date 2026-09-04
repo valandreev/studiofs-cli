@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::client::{
     ClientControllerConfig, ClientControllerError, DEFAULT_CLIENT_NAMES,
     cleanup_stale_mount_before_remount, client_cache_dir, client_mount_point, client_root_dir,
+    configured_mount_root_from_environment,
 };
 use crate::infra::{
     COMPOSE_PROJECT_PREFIX, CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl,
@@ -1161,11 +1162,8 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
         .iter()
         .map(|client| client_root_dir(input.sandbox, client))
         .collect();
-    let mount_roots: Vec<_> = DEFAULT_CLIENT_NAMES
-        .iter()
-        .map(|client| client_mount_point(input.sandbox, client))
-        .collect();
     let probe_host_environment = input.studiofs_bin.is_some() || input.compose_stack.is_some();
+    let mount_roots = report_mount_roots(input.sandbox, probe_host_environment);
     let ownership = if probe_host_environment {
         path_ownership_reports(&client_roots, &mount_roots)
     } else {
@@ -1198,6 +1196,27 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
             .then(detect_macfuse_version)
             .flatten(),
     }
+}
+
+fn report_mount_roots(sandbox: &Path, probe_host_environment: bool) -> Vec<PathBuf> {
+    if probe_host_environment {
+        match configured_mount_root_from_environment() {
+            Ok(Some(root)) => {
+                return DEFAULT_CLIENT_NAMES
+                    .iter()
+                    .map(|client| root.join(client))
+                    .collect();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("studiofs-e2e: could not read configured mount root for report: {error}")
+            }
+        }
+    }
+    DEFAULT_CLIENT_NAMES
+        .iter()
+        .map(|client| client_mount_point(sandbox, client))
+        .collect()
 }
 
 struct EnvironmentOwnership {
@@ -2050,6 +2069,7 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
         return Ok(Vec::new());
     }
 
+    let configured_mount_root = configured_mount_root_from_environment()?;
     let mut mount_points = BTreeSet::new();
     for entry in fs::read_dir(clients_dir)? {
         let entry = entry?;
@@ -2083,7 +2103,14 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
                 continue;
             }
         };
-        if metadata.mount_point.starts_with(sandbox) {
+        let client_mount_root = configured_mount_root
+            .as_ref()
+            .and_then(|root| client_dir.file_name().map(|name| root.join(name)));
+        if metadata.mount_point.starts_with(sandbox)
+            || client_mount_root
+                .as_ref()
+                .is_some_and(|root| metadata.mount_point.starts_with(root))
+        {
             mount_points.insert(metadata.mount_point);
         }
     }

@@ -84,6 +84,33 @@ blocked by macOS TCC for `fskitd`; such a run is not a passing FSKit result.
 Windows validation is outside this macOS test boundary, and the remaining
 foreign create/update/rename/unlink parity matrix remains a follow-up.
 
+Mounted multi-client parity runs use the existing `studiofs-e2e` contour. Set
+the host-specific root in the repository `.env`:
+
+```dotenv
+STUDIOFS_E2E_MOUNT_ROOT=/Volumes/studiofs
+```
+
+The runner mounts each client below `<root>/<client>/<volume>` and keeps
+artifacts under `target/e2e-runs/<run-id>`. `STUDIOFS_E2E_MOUNT_ROOT` in the
+process environment may override `.env` for a one-off run. Run the same
+scenario selection once with `STUDIOFS_MOUNT_BACKEND=legacy` and once with
+`STUDIOFS_MOUNT_BACKEND=fskit`; the backend selector is intentionally separate
+from the mount-root setting.
+
+On macOS, the mounted runner uses a bounded `/sbin/mount` table probe for
+readiness and stale-mount cleanup. It does not `stat` an FSKit mountpoint after
+worker termination, because a stale vnode can block that call indefinitely.
+
+Graceful FSKit teardown now interrupts the MFMount receive wait and performs
+the native unmount on the regular session path. This does not make abrupt
+process termination safe: on macFUSE 5.3.3 a killed FSKit client can leave a
+stale mount handoff in the kernel and make `/sbin/mount`, `umount`, or
+`diskutil unmount` block until reboot. Such a crash/restart run is a failed
+native validation, not a skipped or passing scenario. The full mounted parity
+matrix must therefore be rerun from a clean host after the macFUSE handoff is
+fixed or upgraded.
+
 ## WinFSP Bridge (`studiofs-winfsp`)
 
 ### Requirements
