@@ -2678,6 +2678,81 @@ mod tests {
     }
 
     #[test]
+    fn fskit_invalidator_sends_frames_over_live_channel() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound invalidation frame wait");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        control.mark_mounted();
+        let invalidator = FsKitKernelInvalidator {
+            control: Arc::clone(&control),
+        };
+
+        invalidator.inval_inode(42);
+        invalidator.inval_inode_attrs(42);
+        invalidator.inval_entry(7, b"\xC3\xA9");
+
+        let read_frame = |peer: &mut UnixStream| {
+            let mut header_bytes = [0_u8; size_of::<FuseOutHeader>()];
+            peer.read_exact(&mut header_bytes)
+                .expect("read invalidation frame header");
+            let header = read_copy::<FuseOutHeader>(&header_bytes, 0)
+                .expect("decode invalidation frame header");
+            assert!(header.len as usize >= size_of::<FuseOutHeader>());
+            let mut frame = header_bytes.to_vec();
+            let mut body = vec![0_u8; header.len as usize - size_of::<FuseOutHeader>()];
+            peer.read_exact(&mut body)
+                .expect("read invalidation frame body");
+            frame.extend_from_slice(&body);
+            frame
+        };
+
+        let inode = read_frame(&mut peer);
+        let inode_header = read_copy::<FuseOutHeader>(&inode, 0).expect("decode inode frame");
+        let inode_payload =
+            read_copy::<FuseNotifyInvalInodeOut>(&inode, size_of::<FuseOutHeader>())
+                .expect("decode inode invalidation payload");
+        assert_eq!(inode_header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(
+            (inode_payload.ino, inode_payload.off, inode_payload.len),
+            (42, 0, 0)
+        );
+
+        let attrs = read_frame(&mut peer);
+        let attrs_header = read_copy::<FuseOutHeader>(&attrs, 0).expect("decode attrs frame");
+        let attrs_payload =
+            read_copy::<FuseNotifyInvalInodeOut>(&attrs, size_of::<FuseOutHeader>())
+                .expect("decode attribute invalidation payload");
+        assert_eq!(attrs_header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(
+            (attrs_payload.ino, attrs_payload.off, attrs_payload.len),
+            (42, -1, 0)
+        );
+
+        let entry = read_frame(&mut peer);
+        let entry_header = read_copy::<FuseOutHeader>(&entry, 0).expect("decode entry frame");
+        let entry_payload =
+            read_copy::<FuseNotifyInvalEntryOut>(&entry, size_of::<FuseOutHeader>())
+                .expect("decode entry invalidation payload");
+        assert_eq!(entry_header.error, FUSE_NOTIFY_INVAL_ENTRY);
+        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 2));
+        assert_eq!(
+            &entry[size_of::<FuseOutHeader>() + size_of::<FuseNotifyInvalEntryOut>()..],
+            b"\xC3\xA9"
+        );
+
+        control.close();
+    }
+
+    #[test]
     fn fskit_invalidator_tolerates_a_closed_control() {
         let control = Arc::new(FsKitControl {
             channel: Mutex::new(None),

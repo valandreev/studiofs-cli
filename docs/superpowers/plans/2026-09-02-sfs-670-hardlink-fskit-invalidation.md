@@ -59,8 +59,10 @@ Design: `docs/superpowers/specs/2026-09-02-sfs-670-macfuse-fskit-semantic-parity
   layout field.
 - `crates/studiofs-macfuse/src/fskit.rs`: link request decoding/dispatch and
   concrete invalidation frame encoding/sending.
-- `crates/studiofs-macfuse/src/lib.rs`: adapter, ABI, protocol, and gated
-  mounted-surface tests.
+- `crates/studiofs-macfuse/src/lib.rs`: public mount-request API and
+  adapter/ABI/protocol tests.
+- `crates/studiofs-macfuse/tests/fskit_mount_sanity.rs`: ignored native FSKit
+  mount, cancellation, hardlink, and bounded-cleanup tests.
 - `docs/platform-bridges.md`: document the implemented FSKit notification
   transport and the validation boundary.
 
@@ -210,6 +212,8 @@ tests.
 ### Task 4: Replace the FSKit no-op invalidator with FUSE notification frames
 
 - [x] Add the frame-layout RED test and closed-control lifecycle test.
+- [x] Add a live-channel delivery regression for inode, attribute, and entry
+      invalidation frames.
 - [x] Encode inode/entry notifications and send complete frames through the
       retained, serialized FSKit control.
 - [x] Install the invalidator and preserve teardown ordering.
@@ -269,22 +273,22 @@ Re-run the frame-layout test and the existing control-lock/cancellation tests.
 
 ### Task 5: Prove the bridge seam and document the validation boundary
 
-- [x] Add the gated writable hardlink/invalidation mounted scenario.
-- [ ] Complete a real native FSKit mounted run on a host with a responsive,
-      approved provider.
+- [x] Add the ignored writable hardlink/unlink mounted scenario.
+- [x] Complete a real native FSKit mounted run on an internal volume with a
+      responsive, approved provider.
 - [x] Update the bridge documentation with the implementation and validation
       boundary.
 
 Files: `crates/studiofs-macfuse/src/lib.rs`,
+`crates/studiofs-macfuse/tests/fskit_mount_sanity.rs`,
 `docs/platform-bridges.md`.
 
-Extend the existing opt-in FSKit mounted smoke coverage with one gated
-writable scenario that creates a file, creates a hardlink, verifies both
-names resolve to the same inode, and exercises the invalidation path after a
-local mutation. Keep the existing environment gate and unmount cleanup. Run
-the focused mounted test with the required explicit environment; if this Mac
-cannot provide a real FSKit mount, record it as unavailable rather than
-turning the gate into a pass.
+Keep the native FSKit mounted scenarios in a dedicated ignored integration
+test. The writable scenario creates a file, creates a hardlink, verifies both
+names resolve to the same inode, removes one name, checks `ENOENT` for the
+removed path, and keeps the remaining hardlink readable. The test uses the
+public mount-request builder, a PID-scoped mountpoint, and bounded cleanup;
+there is no environment-only test gate.
 
 Run the focused suite:
 
@@ -292,17 +296,18 @@ Run the focused suite:
     cargo test -p studiofs-macfuse writable_studio_vfs_low_level_ops_install_link_callback -- --nocapture
     cargo test -p studiofs-macfuse fskit_link_request_uses_the_fuse_wire_layout -- --nocapture
     cargo test -p studiofs-macfuse fskit_invalidation_frames_match_fuse_wire_layout -- --nocapture
-    cargo test -p studiofs-macfuse fskit_mounted_hardlink_and_invalidation_smoke_is_gated -- --nocapture
+    STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- --ignored --nocapture --test-threads=1
 
 Update `docs/platform-bridges.md` to describe the implemented frame transport,
 the unchanged legacy default, and the exact distinction between unit/protocol
 proof and a native mounted FSKit run. Do not state that Windows was validated.
 
-Native validation result (2026-09-03): the explicit mounted command reached the
-MFMount helper, but the helper stayed blocked before readiness for more than 60
-seconds. The test was stopped to avoid leaving a live mount attempt; the
-target mount directory and child processes were clean afterward. This host
-therefore provides no native FSKit pass/fail result for the mounted scenario.
+Historical native validation result (2026-09-03, before the internal-volume
+rerun): the explicit mounted command reached the MFMount helper, but the
+helper stayed blocked before readiness for more than 60 seconds. The test was
+stopped to avoid leaving a live mount attempt; the target mount directory and
+child processes were clean afterward. The review-blocker cleanup below records
+the later successful internal-volume run.
 
 ### Task 6: First-milestone verification and handoff
 
@@ -393,8 +398,9 @@ Two independent test-host effects were isolated without increasing deadlines:
   a run took 130.20 seconds and hit the unchanged three-second smoke deadline.
   Copying the same executable into an isolated directory removed this delay.
 
-Final native command, run from that isolated internal-volume directory using a
-copy of the executable printed by `cargo test -p studiofs-macfuse --lib --no-run`:
+The pre-cleanup native command, run from that isolated internal-volume
+directory using a copy of the executable printed by `cargo test -p
+studiofs-macfuse --lib --no-run`, was:
 
     STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1 ./macfuse-tests-final tests::fskit_ --test-threads=1 --nocapture
 
@@ -411,8 +417,49 @@ native evidence is the separate run above). `cargo fmt --all -- --check` and
 temporary probe sources, samples, executable copies, and empty test mount
 directories from this investigation were removed.
 
-Native results below must come from explicitly gated runs. Windows remains
+Native results below must come from explicitly requested ignored runs. Windows remains
 outside this Mac's validation scope. The legacy backend remains the default.
+
+## Review-blocker cleanup (2026-09-04)
+
+- [x] Move the three native FSKit scenarios to
+      `tests/fskit_mount_sanity.rs` behind
+      `cfg(all(target_os = "macos", studiofs_fskit))` and `#[ignore]`; remove
+      the old `STUDIOFS_RUN_FSKIT_MOUNT_TESTS` gate.
+- [x] Add `MacFuseMountRequest::with_unmount_signal` so integration tests use
+      the public mount-request API.
+- [x] Share one readiness loop and bounded worker polling path. A readiness or
+      cleanup timeout requests unmount, waits two seconds, and terminates the
+      isolated native test process with a diagnostic if the worker remains
+      alive; no FSKit worker is detached.
+- [x] Add a live-channel invalidator regression covering inode, attribute, and
+      entry notification frames over
+      `MFChannelCreateWithDeviceFileDescriptor`. The RED check was observed
+      with a temporary no-op invalidator and the implementation was restored
+      before verification.
+- [x] Rename the mounted hardlink test to reflect local hardlink/unlink
+      coverage and check the removed name is `ENOENT` while the alias remains
+      readable.
+- [x] Document the internal-volume launch command and the TCC/Windows
+      validation boundary in `docs/tests.md` and `docs/platform-bridges.md`.
+
+Native validation command:
+
+    STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- --ignored --nocapture --test-threads=1
+
+Result on macOS 26.6.2 with macFUSE 5.3.3: 3 passed, 0 failed in 34.13s.
+The run used the internal `/Volumes/studiofs` volume, and a read-only check
+found no remaining test mountpoints or FSKit mounts. The first sandboxed
+attempt failed before FSKit because the execution sandbox could not create the
+internal mountpoint; the successful result used the approved native host
+permission. This is mounted evidence for these three scenarios only. A
+removable `/Volumes/Storage` root remains a TCC-sensitive validation boundary,
+Windows remains unvalidated on this Mac, and the full foreign
+create/update/rename/unlink mounted parity matrix remains the next SFS-670
+slice.
+
+SFS-670 remains open for that parity matrix and code review; no Linear status,
+commit, or push was changed by this implementation.
 
 ## Plan self-review
 

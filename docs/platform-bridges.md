@@ -64,9 +64,25 @@ run as tracked blocking reply tasks instead of occupying the FSKit dispatcher
 loop. The zero-copy negotiation and the remaining full semantic parity matrix
 remain separate follow-up work.
 
-The real mounted smoke is separately gated with
-`STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1`; it requires an approved and working FSKit
-extension on the host.
+Native FSKit mount sanity is kept out of the default library gate as an ignored
+integration test. Run it only with an approved provider and an internal volume
+mount root, for example:
+
+```bash
+STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation \
+cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The test binary owns only PID-scoped mountpoints and polls the FSKit worker
+after requesting unmount. A worker that misses the fixed cleanup window makes
+the isolated native test process fail with a diagnostic; it is never detached.
+The library live-channel regression proves that the concrete invalidator sends
+inode, attribute, and entry frames, while the ignored tests are the separate
+proof of mounted behavior. Removable roots such as `/Volumes/Storage` may be
+blocked by macOS TCC for `fskitd`; such a run is not a passing FSKit result.
+Windows validation is outside this macOS test boundary, and the remaining
+foreign create/update/rename/unlink parity matrix remains a follow-up.
 
 ## WinFSP Bridge (`studiofs-winfsp`)
 

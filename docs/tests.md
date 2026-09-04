@@ -227,6 +227,7 @@ Local loopback examples remain available as development/test examples.
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
 | Linux libfuse3 mount | `cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1` |
 | macFUSE read/cache report fields | `cargo test -p studiofs-macfuse repeated_read_report_records_callback_distribution_and_cache_interpretation -- --nocapture` |
+| macFUSE FSKit native mount sanity | `STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- --ignored --nocapture --test-threads=1` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
 ### Local-first VFS fast checks (no S3)
@@ -265,6 +266,33 @@ dummy-endpoint contract.
 
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the
 complete smoke-test strategy, CI integration, and self-hosted runner contract.
+
+### macOS FSKit native mount sanity
+
+The native FSKit scenarios live in
+`crates/studiofs-macfuse/tests/fskit_mount_sanity.rs`. They are compiled only
+when macOS and `MFMount.framework` are available and are marked `#[ignore]`
+because they require a real host mount. Run them explicitly with a mount root
+on an internal volume:
+
+```bash
+STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation \
+cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The three scenarios cover FSKit read/unmount, pre-cancelled mount cleanup, and
+local hardlink unlink semantics. Each test uses a PID-scoped mountpoint and
+bounded worker cleanup; a worker that remains alive after the cleanup window
+fails the isolated native test process instead of being detached. The live
+channel invalidator check is a non-mounted library test and proves delivery of
+inode, attribute, and entry notification frames separately from native mount
+evidence.
+
+Do not use a removable `/Volumes/Storage` root as native evidence: macOS TCC
+can deny `fskitd` there even when the Rust process can access the checkout.
+These checks validate the macOS bridge only; they do not validate Windows or
+the remaining foreign create/update/rename/unlink parity matrix.
 
 ### Real mounted E2E runner contract
 

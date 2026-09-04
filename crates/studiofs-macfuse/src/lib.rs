@@ -76,6 +76,12 @@ impl MacFuseMountRequest {
         self.signal_handling = signal_handling;
         self
     }
+
+    /// Set a caller-owned signal for requesting graceful unmount.
+    pub fn with_unmount_signal(mut self, unmount_signal: MacFuseUnmountSignal) -> Self {
+        self.unmount_signal = Some(unmount_signal);
+        self
+    }
 }
 
 /// Controls whether StudioFS owns process-global macFUSE shutdown signals.
@@ -322,8 +328,6 @@ fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperation
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
-    #[cfg(studiofs_fskit)]
-    use std::os::unix::fs::MetadataExt;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -331,55 +335,6 @@ mod tests {
 
     use studiofs_meta::MetaFsOps;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
-
-    #[cfg(studiofs_fskit)]
-    fn wait_for_fskit_mount_ready(
-        mount: std::thread::JoinHandle<std::io::Result<()>>,
-        target: &std::path::Path,
-        unmount_signal: &super::MacFuseUnmountSignal,
-        timeout: std::time::Duration,
-        mount_label: &str,
-    ) -> std::thread::JoinHandle<std::io::Result<()>> {
-        let ready_deadline = std::time::Instant::now() + timeout;
-        loop {
-            // A kernel lookup can block while the FSKit provider is activating;
-            // probe it in a child so a failed provider cannot hang this test.
-            let mut probe = std::process::Command::new("/usr/bin/stat")
-                .args(["-f", "%i"])
-                .arg(target)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("start FSKit readiness probe");
-            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            let ready = loop {
-                if let Some(status) = probe.try_wait().expect("poll FSKit readiness probe") {
-                    break status.success();
-                }
-                if std::time::Instant::now() >= probe_deadline {
-                    probe.kill().expect("stop hung FSKit readiness probe");
-                    probe.wait().expect("reap hung FSKit readiness probe");
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
-            if ready {
-                break;
-            }
-            if mount.is_finished() {
-                let result = mount.join().expect("join FSKit mount thread");
-                panic!("{mount_label} mount exited before readiness: {result:?}");
-            }
-            if std::time::Instant::now() >= ready_deadline {
-                unmount_signal.request_unmount();
-                let _ = mount.join();
-                panic!("{mount_label} mount did not become ready");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        mount
-    }
 
     #[test]
     fn callback_file_info_snapshot_is_independent_from_callback_pointer() {
@@ -598,203 +553,6 @@ mod tests {
         session.request_exit();
         drop(session);
         std::fs::remove_dir(mount_point).expect("remove macFUSE smoke mount point");
-    }
-
-    #[test]
-    #[cfg(studiofs_fskit)]
-    fn fskit_mounted_lookup_open_read_unmount_smoke_is_gated() {
-        if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
-            return;
-        }
-
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-fskit-mounted-read-callback",
-        )
-        .expect("create VFS fixture");
-        let file_name = b"fskit-read.bin";
-        let payload = b"hello from macFUSE FSKit";
-        let attr = fixture
-            .vfs()
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                file_name,
-                501,
-                20,
-                0o644,
-            )
-            .expect("create FSKit smoke file");
-        fixture
-            .runtime()
-            .block_on(fixture.vfs().write(attr.ino, 0, payload))
-            .expect("seed FSKit smoke payload");
-
-        let mount_point = std::env::current_dir()
-            .expect("resolve FSKit smoke checkout")
-            .join("target")
-            .join(format!("studiofs-fskit-read-smoke-{}", std::process::id()));
-        let _ = std::fs::remove_dir(&mount_point);
-        std::fs::create_dir_all(&mount_point).expect("create FSKit smoke mount point");
-        let unmount_signal = super::MacFuseUnmountSignal::new();
-        let request = super::MacFuseMountRequest {
-            vfs: fixture.vfs(),
-            runtime_handle: fixture.runtime().handle().clone(),
-            mount_point: mount_point.clone(),
-            volume_name: "StudioFS FSKit Read Smoke".into(),
-            read_only: true,
-            run_in_foreground: true,
-            signal_handling: super::SignalHandling::Disabled,
-            unmount_signal: Some(unmount_signal.clone()),
-        };
-        let mount = std::thread::spawn(move || super::mount_with_fskit_request(request));
-        let target = mount_point.join(std::str::from_utf8(file_name).unwrap());
-        let mount = wait_for_fskit_mount_ready(
-            mount,
-            &target,
-            &unmount_signal,
-            std::time::Duration::from_secs(3),
-            "FSKit smoke",
-        );
-
-        assert_eq!(
-            std::fs::read(&target).expect("read through FSKit mount"),
-            payload
-        );
-        unmount_signal.request_unmount();
-        mount
-            .join()
-            .expect("join FSKit mount thread")
-            .expect("unmount FSKit read smoke");
-        std::fs::remove_dir(&mount_point).expect("remove FSKit smoke mount point");
-
-        fixture
-            .runtime()
-            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
-            .expect("FSKit mounted VFS shutdown should succeed");
-        fixture
-            .runtime()
-            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
-            .expect("repeated FSKit mounted VFS shutdown should succeed");
-    }
-
-    #[test]
-    #[cfg(studiofs_fskit)]
-    fn fskit_cancelled_mount_leaves_no_volume_is_gated() {
-        if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
-            return;
-        }
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-fskit-cancelled-mount",
-        )
-        .expect("create fixture");
-        let mount_point = std::env::current_dir()
-            .expect("resolve test directory")
-            .join("target")
-            .join(format!("studiofs-fskit-cancel-{}", std::process::id()));
-        std::fs::create_dir_all(&mount_point).expect("create mount point");
-        let signal = super::MacFuseUnmountSignal::new();
-        signal.request_unmount();
-        super::mount_with_fskit_request(super::MacFuseMountRequest {
-            vfs: fixture.vfs(),
-            runtime_handle: fixture.runtime().handle().clone(),
-            mount_point: mount_point.clone(),
-            volume_name: "StudioFS FSKit Cancel Smoke".into(),
-            read_only: true,
-            run_in_foreground: true,
-            signal_handling: super::SignalHandling::Disabled,
-            unmount_signal: Some(signal),
-        })
-        .expect("complete cancelled mount");
-        std::fs::remove_dir(mount_point).expect("cancelled mount must leave no mounted volume");
-    }
-
-    #[test]
-    #[cfg(studiofs_fskit)]
-    fn fskit_mounted_hardlink_and_invalidation_smoke_is_gated() {
-        if std::env::var("STUDIOFS_RUN_FSKIT_MOUNT_TESTS").as_deref() != Ok("1") {
-            return;
-        }
-
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-fskit-mounted-hardlink",
-        )
-        .expect("create VFS fixture");
-        let source_name = b"fskit-hardlink-source.bin";
-        let source_attr = fixture
-            .vfs()
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                source_name,
-                501,
-                20,
-                0o644,
-            )
-            .expect("create FSKit hardlink source");
-        fixture
-            .runtime()
-            .block_on(fixture.vfs().write(source_attr.ino, 0, b"before"))
-            .expect("seed FSKit hardlink source");
-
-        let mount_point = std::env::current_dir()
-            .expect("resolve FSKit hardlink checkout")
-            .join("target")
-            .join(format!(
-                "studiofs-fskit-hardlink-smoke-{}",
-                std::process::id()
-            ));
-        let _ = std::fs::remove_dir(&mount_point);
-        std::fs::create_dir_all(&mount_point).expect("create FSKit hardlink mount point");
-        let unmount_signal = super::MacFuseUnmountSignal::new();
-        let request = super::MacFuseMountRequest {
-            vfs: fixture.vfs(),
-            runtime_handle: fixture.runtime().handle().clone(),
-            mount_point: mount_point.clone(),
-            volume_name: "StudioFS FSKit Hardlink Smoke".into(),
-            read_only: false,
-            run_in_foreground: true,
-            signal_handling: super::SignalHandling::Disabled,
-            unmount_signal: Some(unmount_signal.clone()),
-        };
-        let mount = std::thread::spawn(move || super::mount_with_fskit_request(request));
-        let source = mount_point.join(std::str::from_utf8(source_name).unwrap());
-        let alias = mount_point.join("fskit-hardlink-alias.bin");
-        let mount = wait_for_fskit_mount_ready(
-            mount,
-            &source,
-            &unmount_signal,
-            std::time::Duration::from_secs(5),
-            "FSKit hardlink",
-        );
-
-        std::fs::hard_link(&source, &alias).expect("create hardlink through FSKit mount");
-        assert_eq!(
-            std::fs::metadata(&source)
-                .expect("stat FSKit hardlink source")
-                .ino(),
-            std::fs::metadata(&alias)
-                .expect("stat FSKit hardlink alias")
-                .ino()
-        );
-        std::fs::write(&source, b"after").expect("write through FSKit mount");
-        assert_eq!(
-            std::fs::read(&alias).expect("read updated FSKit hardlink alias"),
-            b"after"
-        );
-
-        unmount_signal.request_unmount();
-        mount
-            .join()
-            .expect("join FSKit hardlink mount thread")
-            .expect("unmount FSKit hardlink smoke");
-        std::fs::remove_dir(&mount_point).expect("remove FSKit hardlink mount point");
-
-        fixture
-            .runtime()
-            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
-            .expect("FSKit hardlink VFS shutdown should succeed");
-        fixture
-            .runtime()
-            .block_on(fixture.vfs().shutdown(std::time::Duration::ZERO))
-            .expect("repeated FSKit hardlink VFS shutdown should succeed");
     }
 
     #[test]
