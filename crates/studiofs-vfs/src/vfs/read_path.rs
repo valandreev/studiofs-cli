@@ -1151,11 +1151,22 @@ pub(super) struct PreparedForegroundRead {
 struct ReadMetadataResolver<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
+    attr_observation: u64,
 }
 
 impl<'a> ReadMetadataResolver<'a> {
     fn new(vfs: &'a StudioVfs, ino: Ino) -> Self {
-        Self { vfs, ino }
+        let attr_observation = vfs
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .observation_generation;
+        Self {
+            vfs,
+            ino,
+            attr_observation,
+        }
     }
 
     fn resolve_attr_sync(&self) -> VfsResult<InodeAttr> {
@@ -1443,12 +1454,18 @@ impl<'a> ReadMetadataResolver<'a> {
                 .remove(self.ino);
             return;
         }
-        self.vfs.state.namespace.attr_read_cache.lock().put(
-            self.ino,
-            attr.clone(),
-            ATTR_CACHE_TTL,
-            Instant::now(),
-        );
+        self.vfs
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .put_observed(
+                self.ino,
+                attr.clone(),
+                ATTR_CACHE_TTL,
+                Instant::now(),
+                self.attr_observation,
+            );
     }
 
     fn clear_stale_state(&self) {
@@ -2066,6 +2083,45 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_invalidation_rejects_inflight_attribute_observation() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-observation");
+        let _guard = rt.enter();
+        for intent in [
+            InvalidationIntent::Attributes { ino: ROOT_INO },
+            InvalidationIntent::Reset,
+        ] {
+            vfs.state.namespace.attr_read_cache.lock().remove(ROOT_INO);
+            let resolver = ReadMetadataResolver::new(&vfs, ROOT_INO);
+            let attr = meta
+                .get_attr(ROOT_INO)
+                .expect("read attributes before retirement");
+            vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+                generation: 1,
+                intents: vec![intent],
+            });
+            resolver.cache_attr(&attr);
+            assert!(
+                !vfs.state
+                    .namespace
+                    .attr_read_cache
+                    .lock()
+                    .contains(ROOT_INO)
+            );
+            let current = ReadMetadataResolver::new(&vfs, ROOT_INO);
+            current.cache_attr(&attr);
+            assert!(
+                vfs.state
+                    .namespace
+                    .attr_read_cache
+                    .lock()
+                    .contains(ROOT_INO)
+            );
+        }
+    }
+
     use super::super::local_dirty::PendingPayload;
     use super::super::*;
     use super::{

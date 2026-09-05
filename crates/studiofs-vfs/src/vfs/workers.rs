@@ -481,6 +481,77 @@ impl StudioVfs {
         self.kernel_invalidator.read().clone()
     }
 
+    /// Retire the local cached view before handing committed scopes to the bridge.
+    /// Content remains subject to the same active-writer protection as legacy
+    /// invalidation; the commit generation is not a new open-handle version.
+    pub(super) fn apply_semantic_invalidation_batch(
+        &self,
+        mut batch: studiofs_meta::coherence::InvalidationBatch,
+    ) {
+        use crate::coherence::InvalidationAcceptance;
+        use studiofs_meta::coherence::InvalidationIntent;
+
+        let mut deferred = false;
+        batch.intents.retain(|intent| {
+            match intent {
+                InvalidationIntent::Attributes { ino } | InvalidationIntent::Content { ino } => {
+                    self.invalidate_attr_read_cache([*ino]);
+                    let full = matches!(intent, InvalidationIntent::Content { .. });
+                    if full {
+                        self.retire_os_cache_inode(*ino);
+                    }
+                    if self.should_skip_kernel_invalidation_for_active_open(*ino, full) {
+                        deferred = true;
+                        return false;
+                    }
+                }
+                InvalidationIntent::Entry { parent, name, .. } => {
+                    self.dentry_cache_invalidate(*parent, name);
+                    self.bump_namespace_for_parents([*parent]);
+                }
+                InvalidationIntent::Directory { ino } => {
+                    self.dentry_cache_invalidate_parent(*ino);
+                    self.invalidate_attr_read_cache([*ino]);
+                    self.bump_namespace_for_parents([*ino]);
+                }
+                InvalidationIntent::Reset => {
+                    self.bump_namespace_epoch();
+                    self.invalidate_attr_read_cache(self.runtime_namespace_invalidation_inodes());
+                }
+            }
+            true
+        });
+        self.bump_acl_namespace_epoch();
+        if deferred {
+            debug!(
+                generation = batch.generation,
+                "semantic invalidation deferred for active writer; generation coverage incomplete"
+            );
+        }
+        let Some(invalidator) = self.kernel_invalidator() else {
+            return;
+        };
+        if batch.intents.is_empty() {
+            return;
+        }
+        match invalidator.invalidate_batch(&batch, !deferred) {
+            InvalidationAcceptance::Queued => {}
+            acceptance => {
+                debug!(
+                    generation = batch.generation,
+                    ?acceptance,
+                    "semantic invalidation not fully admitted; existing cache policy unchanged"
+                );
+            }
+        }
+    }
+
+    pub(super) fn drain_semantic_invalidations(&self) {
+        for batch in self.sync_meta().take_invalidation_batches() {
+            self.apply_semantic_invalidation_batch(batch);
+        }
+    }
+
     fn collect_metadata_snapshot<M: ?Sized + JanitorMeta>(
         engine: &M,
     ) -> MetaResult<MetadataTraversalSnapshot> {
@@ -690,6 +761,20 @@ impl StudioVfs {
         }
     }
 
+    /// Protect accepted local state when a native bridge can only invalidate
+    /// attributes together with content. A true result requires the bridge to
+    /// defer delivery and leaves the ordinary handle-release retry armed.
+    pub fn defer_kernel_invalidation_for_active_writer(&self, ino: Ino) -> bool {
+        if self.should_skip_kernel_invalidation_for_active_open(ino, true) {
+            return true;
+        }
+        if self.inode_has_local_dirty_state(ino) {
+            self.deferred_kernel_invalidations.insert(ino);
+            return true;
+        }
+        false
+    }
+
     pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino) {
         if self.kernel_invalidator().is_none() {
             return;
@@ -708,6 +793,8 @@ impl StudioVfs {
         inodes: impl IntoIterator<Item = Ino>,
     ) -> Vec<Ino> {
         let mut cache = self.state.namespace.attr_read_cache.lock();
+        // Reset must reject in-flight observations even when no entry is cached yet.
+        cache.retire_observations();
         let mut read_plan_cache = self.state.read.published_read_plan_cache.lock();
         let mut removed = Vec::new();
         for ino in inodes {
@@ -782,6 +869,9 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
+            // Local commits must not wait for a remote poll to finish before
+            // their already-visible state can invalidate the mounted cache.
+            self.drain_semantic_invalidations();
             let meta = self.meta.clone();
             let previous_namespace_token = last_namespace_token.clone();
             let previous_metadata_token = last_metadata_token.clone();
@@ -807,6 +897,9 @@ impl StudioVfs {
                 ))
             })
             .await;
+            // Earlier transactions may have committed even if the remaining
+            // remote sync failed or did not advance its public version token.
+            self.drain_semantic_invalidations();
             let Ok((
                 _before_namespace,
                 after_namespace_token,

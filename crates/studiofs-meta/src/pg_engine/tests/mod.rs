@@ -418,6 +418,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         .expect("enable remote namespace visibility filter");
     let flushed_event_seq = local.get_counter("nextEventSeq").expect("nextEventSeq");
 
+    let metadata_invalidation_notify = Arc::clone(&local.invalidation_notify);
     let engine = PgMetaEngine {
         local,
         postgres_url: "postgres://127.0.0.1:1/studiofs".to_string(),
@@ -460,7 +461,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         lock_workers_enabled: false,
         lock_worker_start_lock: Mutex::new(()),
         background_workers: PgBackgroundWorkers::new(),
-        metadata_invalidation_notify: Arc::new(tokio::sync::Notify::new()),
+        metadata_invalidation_notify,
         metadata_notify_received: AtomicU64::new(0),
         metadata_notify_reconnects: AtomicU64::new(0),
         metadata_fallback_poll_discoveries: AtomicU64::new(0),

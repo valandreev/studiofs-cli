@@ -1239,12 +1239,14 @@ impl AttrReadCacheMetrics {
 #[derive(Debug)]
 struct AttrReadCache {
     inner: TwoTierCache<Ino, InodeAttr, AttrReadCachePolicy>,
+    observation_generation: u64,
 }
 
 impl AttrReadCache {
     fn new(entry_budget: usize, byte_budget: usize) -> Self {
         Self {
             inner: TwoTierCache::new(entry_budget, byte_budget, AttrReadCachePolicy),
+            observation_generation: 0,
         }
     }
 
@@ -1283,7 +1285,25 @@ impl AttrReadCache {
     }
 
     fn remove(&mut self, ino: Ino) -> bool {
+        self.retire_observations();
         self.inner.remove(&ino)
+    }
+
+    fn retire_observations(&mut self) {
+        self.observation_generation = self.observation_generation.saturating_add(1);
+    }
+
+    fn put_observed(
+        &mut self,
+        ino: Ino,
+        attr: InodeAttr,
+        ttl: Duration,
+        now: Instant,
+        observed: u64,
+    ) {
+        if observed == self.observation_generation && observed != u64::MAX {
+            self.put(ino, attr, ttl, now);
+        }
     }
 
     fn keys(&self) -> Vec<Ino> {

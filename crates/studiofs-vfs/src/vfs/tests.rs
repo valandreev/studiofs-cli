@@ -1435,7 +1435,154 @@ async fn epoch_finalizer_shutdown_cancels_in_flight_work() {
 struct RecordingKernelInvalidator {
     data_seen: parking_lot::Mutex<Vec<Ino>>,
     attr_seen: parking_lot::Mutex<Vec<Ino>>,
+    entries_seen: parking_lot::Mutex<Vec<(Ino, Vec<u8>)>>,
     reset_requested: AtomicBool,
+}
+
+#[test]
+fn semantic_invalidation_legacy_adapter_explicitly_reports_unsupported() {
+    use crate::coherence::InvalidationAcceptance;
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+    let invalidator = RecordingKernelInvalidator::default();
+    assert_eq!(
+        invalidator.invalidate_batch(
+            &InvalidationBatch {
+                generation: 1,
+                intents: vec![InvalidationIntent::Entry {
+                    parent: 1,
+                    name: b"missing".to_vec(),
+                    ancestors: None,
+                    ino: None
+                }],
+            },
+            true
+        ),
+        InvalidationAcceptance::Unsupported
+    );
+}
+
+#[test]
+fn semantic_invalidation_falls_back_without_losing_content_or_attributes() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-fallback");
+    let _guard = rt.enter();
+    let invalidator = Arc::new(RecordingKernelInvalidator::default());
+    vfs.set_kernel_invalidator(invalidator.clone());
+    vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+        generation: 1,
+        intents: vec![
+            InvalidationIntent::Content { ino: 42 },
+            InvalidationIntent::Attributes { ino: 43 },
+        ],
+    });
+    assert_eq!(invalidator.snapshot(), vec![42]);
+    assert_eq!(invalidator.attr_snapshot(), vec![43]);
+}
+
+#[test]
+fn semantic_invalidation_drains_committed_names_through_runtime_port() {
+    use studiofs_meta::MetaReplication;
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "semantic-runtime");
+    let _guard = rt.enter();
+    let invalidator = Arc::new(RecordingKernelInvalidator::default());
+    vfs.set_kernel_invalidator(invalidator.clone());
+    meta.apply_replica_serving_state(&[studiofs_meta::MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"old-name".to_vec(),
+    }])
+    .expect("apply committed remote removal");
+    vfs.drain_semantic_invalidations();
+    assert!(
+        invalidator
+            .entries_seen
+            .lock()
+            .contains(&(ROOT_INO, b"old-name".to_vec()))
+    );
+    assert!(meta.take_invalidation_batches().is_empty());
+}
+
+#[test]
+fn semantic_invalidation_rejects_lookup_observations_from_before_commit() {
+    use studiofs_meta::{DirEntryValue, MetaEvent};
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "semantic-observation");
+    let _guard = rt.enter();
+    let name = b"observed-name";
+    // Split the callback at the actual metadata-read/cache-admission boundary.
+    // No background worker or scheduler timing can move retirement outside it.
+    let absent_token = vfs.namespace_cache_token_for_parent(ROOT_INO);
+    assert!(matches!(
+        meta.lookup(ROOT_INO, name),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    meta.apply_replica_serving_state(&[MetaEvent::AddEntry {
+        parent: ROOT_INO,
+        name: name.to_vec(),
+        entry: DirEntryValue {
+            ino: 1234,
+            kind: FileType::RegularFile,
+        },
+    }])
+    .expect("commit binding");
+    vfs.drain_semantic_invalidations();
+    vfs.dentry_cache_insert_observed(ROOT_INO, name, DentryCacheValue::Negative, absent_token);
+    assert!(vfs.dentry_cache_lookup(ROOT_INO, name).is_none());
+
+    let present_token = vfs.namespace_cache_token_for_parent(ROOT_INO);
+    let entry = meta.lookup(ROOT_INO, name).expect("read committed binding");
+    vfs.dentry_cache_insert_observed(
+        ROOT_INO,
+        name,
+        DentryCacheValue::Positive(entry.ino),
+        present_token,
+    );
+    assert!(matches!(
+        vfs.dentry_cache_lookup(ROOT_INO, name),
+        Some(DentryCacheValue::Positive(1234))
+    ));
+    meta.apply_replica_serving_state(&[MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: name.to_vec(),
+    }])
+    .expect("commit removal");
+    vfs.drain_semantic_invalidations();
+    vfs.dentry_cache_insert_observed(
+        ROOT_INO,
+        name,
+        DentryCacheValue::Positive(entry.ino),
+        present_token,
+    );
+    assert!(vfs.dentry_cache_lookup(ROOT_INO, name).is_none());
+}
+
+#[test]
+fn semantic_invalidation_preserves_active_writer_until_release() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"writer", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+        vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+            generation: 7,
+            intents: vec![InvalidationIntent::Content { ino: attr.ino }],
+        });
+        assert!(
+            invalidator.snapshot().is_empty(),
+            "active writer must retain its OS content"
+        );
+        vfs.release_fh(fh).await.expect("release");
+        assert_eq!(invalidator.snapshot(), vec![attr.ino]);
+    });
 }
 
 impl RecordingKernelInvalidator {
@@ -1449,6 +1596,9 @@ impl RecordingKernelInvalidator {
 }
 
 impl KernelInvalidator for RecordingKernelInvalidator {
+    fn inval_entry(&self, parent: Ino, name: &[u8]) {
+        self.entries_seen.lock().push((parent, name.to_vec()));
+    }
     fn inval_inode(&self, ino: Ino) {
         self.data_seen.lock().push(ino);
     }

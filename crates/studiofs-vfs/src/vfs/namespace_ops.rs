@@ -1724,15 +1724,26 @@ impl StudioVfs {
             return Err(Self::ignored_entry_not_found(parent, name));
         }
 
+        let observed = self.namespace_cache_token_for_parent(parent);
         let entry = match self.sync_meta().lookup(parent, name) {
             Ok(entry) => entry,
             Err(MetaError::EntryNotFound { .. }) => {
-                self.dentry_cache_insert_negative(parent, name);
+                self.dentry_cache_insert_observed(
+                    parent,
+                    name,
+                    DentryCacheValue::Negative,
+                    observed,
+                );
                 return Err(Self::ignored_entry_not_found(parent, name));
             }
             Err(err) => return Err(VfsError::Meta(err)),
         };
-        self.dentry_cache_insert_positive(parent, name, entry.ino);
+        self.dentry_cache_insert_observed(
+            parent,
+            name,
+            DentryCacheValue::Positive(entry.ino),
+            observed,
+        );
         if let Err(err) = self.enforce_access(entry.ino, AccessLevel::ReadOnly) {
             if matches!(err, VfsError::Meta(MetaError::InodeNotFound(_))) {
                 self.heal_orphaned_dentry(parent, name, Some(entry.ino));
@@ -1776,6 +1787,13 @@ impl StudioVfs {
         }
 
         let meta = self.sync_meta();
+        let observed = self.namespace_cache_token_for_parent(ino);
+        let attr_observation = self
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .observation_generation;
         let mut entries = meta.readdir(ino)?;
         if ino == super::ROOT_INO {
             entries.retain(|entry| {
@@ -1830,7 +1848,13 @@ impl StudioVfs {
             let mut attr_cache = self.state.namespace.attr_read_cache.lock();
             for entry in &entries {
                 if let Some(attr) = attrs_by_ino.get(&entry.ino) {
-                    attr_cache.put(entry.ino, attr.clone(), ATTR_CACHE_TTL, now);
+                    attr_cache.put_observed(
+                        entry.ino,
+                        attr.clone(),
+                        ATTR_CACHE_TTL,
+                        now,
+                        attr_observation,
+                    );
                 } else {
                     attr_cache.remove(entry.ino);
                 }
@@ -1875,7 +1899,12 @@ impl StudioVfs {
             if !confirmed_entry_inos.contains(&entry.ino) {
                 continue;
             }
-            self.dentry_cache_insert_positive(ino, &entry.name, entry.ino);
+            self.dentry_cache_insert_observed(
+                ino,
+                &entry.name,
+                DentryCacheValue::Positive(entry.ino),
+                observed,
+            );
         }
 
         let file_children: Vec<DirAccessEntry<'_>> = entries

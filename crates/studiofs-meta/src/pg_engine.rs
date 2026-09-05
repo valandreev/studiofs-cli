@@ -658,6 +658,7 @@ impl PgMetaEngine {
             } else {
                 restored_flushed_event_seq
             };
+        let metadata_invalidation_notify = Arc::clone(&local.invalidation_notify);
         let engine = Arc::new(Self {
             local,
             postgres_url: pg.url.clone(),
@@ -696,7 +697,7 @@ impl PgMetaEngine {
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
             background_workers: PgBackgroundWorkers::new(),
-            metadata_invalidation_notify: Arc::new(tokio::sync::Notify::new()),
+            metadata_invalidation_notify,
             metadata_notify_received: AtomicU64::new(0),
             metadata_notify_reconnects: AtomicU64::new(0),
             metadata_fallback_poll_discoveries: AtomicU64::new(0),
