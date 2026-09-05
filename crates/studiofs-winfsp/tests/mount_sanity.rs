@@ -17,6 +17,9 @@
 //! workspace root (or environment variables) for online/storage configuration.
 #![cfg(windows)]
 
+#[path = "mount_sanity/metadata_baseline.rs"]
+mod metadata_baseline;
+
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -73,6 +76,10 @@ fn workspace_dotenv_var(key: &str) -> Option<String> {
 
 fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
     load_test_env();
+    test_online_env_var_without_loading_env(primary, legacy, default)
+}
+
+fn test_online_env_var_without_loading_env(primary: &str, legacy: &str, default: &str) -> String {
     std::env::var(primary)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -570,27 +577,32 @@ fn require_online_upload_backend(test_name: &str) -> bool {
 }
 
 fn test_format_info(volume_suffix: &str) -> FormatInfo {
+    load_test_env();
+    test_format_info_without_loading_env(volume_suffix)
+}
+
+fn test_format_info_without_loading_env(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("winfsp-mount-test-{volume_suffix}-{}", std::process::id());
     FormatInfo {
         format_version: CURRENT_FORMAT_VERSION,
         name: volume_name.clone(),
         uuid: format!("winfsp-mount-test-uuid-{volume_suffix}"),
-        endpoint: test_online_env_var(
+        endpoint: test_online_env_var_without_loading_env(
             "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
             "STUDIOFS_S3_ENDPOINT",
             "http://127.0.0.1:9000",
         ),
-        bucket: test_online_env_var(
+        bucket: test_online_env_var_without_loading_env(
             "STUDIOFS_TEST_ONLINE_S3_BUCKET",
             "STUDIOFS_S3_BUCKET",
             "studiofs-test",
         ),
-        access_key: test_online_env_var(
+        access_key: test_online_env_var_without_loading_env(
             "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
             "STUDIOFS_S3_ACCESS_KEY",
             "studiofs",
         ),
-        secret_key: test_online_env_var(
+        secret_key: test_online_env_var_without_loading_env(
             "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
             "STUDIOFS_S3_SECRET_KEY",
             "studiofs123",
@@ -610,11 +622,19 @@ fn make_test_vfs(
     volume_suffix: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Arc<StudioVfs> {
+    let format_info = test_format_info(volume_suffix);
+    make_test_vfs_with_format_info(tmp, format_info, rt)
+}
+
+fn make_test_vfs_with_format_info(
+    tmp: &tempfile::TempDir,
+    format_info: FormatInfo,
+    rt: &tokio::runtime::Runtime,
+) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
     meta.init_root(0, 0).expect("init root");
 
-    let format_info = test_format_info(volume_suffix);
     meta.set_format_info(&format_info).expect("set format info");
     let data_config = DataStoreConfig::from(&format_info);
 

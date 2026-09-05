@@ -212,6 +212,11 @@ Local loopback examples remain available as development/test examples.
 
 ## Command Matrix
 
+The isolated Windows metadata workload and its measured callback baseline are
+documented in [SFS-675 Windows metadata baseline](perf/sfs-675-windows-metadata-baseline.md).
+Run that ignored test by its exact name; it installs a process-wide callback
+subscriber and requires an explicitly selected unused WinFSP drive.
+
 | Scope | Command |
 |---|---|
 | Workspace lint inheritance guard | `cargo test -p studiofs --test architecture_vocabulary_test workspace_members_inherit_workspace_lints` |
