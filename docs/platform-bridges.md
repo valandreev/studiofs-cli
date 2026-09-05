@@ -46,19 +46,70 @@ interrupts the channel for signals and explicit unmount, and drains callback
 workers before releasing the channel. The selected backend name is included in
 mount diagnostics/status as `macFUSE-FSKit`.
 
-This initial path is intentionally limited: mount points must be below
-`/Volumes`, macOS 15.4+ and macFUSE 5.3.3+ are required, and the framework must
-be installed under `/Library/Filesystems/macfuse.fs/Contents/Frameworks` or
-the parent path supplied through `STUDIOFS_MFMOUNT_FRAMEWORK_DIR`; if it is not
-available, the package still builds the legacy bridge and rejects the FSKit
-selector as unsupported. Because the
-FSKit notification API is not used here, the transport passes `novncache` and
-uses direct I/O as the explicit coherence fallback. The zero-copy negotiation
-and full semantic parity work remain separate follow-up tickets.
+This path is intentionally opt-in: mount points must be below `/Volumes`, macOS
+15.4+ and macFUSE 5.3.3+ are required, and the framework must be installed
+under `/Library/Filesystems/macfuse.fs/Contents/Frameworks` or the parent path
+supplied through `STUDIOFS_MFMOUNT_FRAMEWORK_DIR`; if it is not available, the
+package still builds the legacy bridge and rejects the FSKit selector as
+unsupported. The bridge now installs a concrete kernel invalidator that sends
+FUSE `INVAL_INODE` and `INVAL_ENTRY` frames through the existing MFMount
+channel, including separate full-inode, attribute-only, and directory-entry
+payloads. The existing `novncache` and per-handle direct-I/O choices remain
+explicit cache safeguards; FSKit invalidation is no longer a logging-only
+fallback. Hardlink requests are translated through the shared
+`StudioVfsAdapter` in both macFUSE operation transports. Positioned FSKit
+`getxattr` reads preserve the legacy `position`, size-query, `ENOATTR`, and
+`ERANGE` contract, while potentially waiting `rmdir` and `symlink` callbacks
+run as tracked blocking reply tasks instead of occupying the FSKit dispatcher
+loop. The zero-copy negotiation and the remaining full semantic parity matrix
+remain separate follow-up work.
 
-The real mounted smoke is separately gated with
-`STUDIOFS_RUN_FSKIT_MOUNT_TESTS=1`; it requires an approved and working FSKit
-extension on the host.
+Native FSKit mount sanity is kept out of the default library gate as an ignored
+integration test. Run it only with an approved provider and an internal volume
+mount root, for example:
+
+```bash
+STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation \
+cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The test binary owns only PID-scoped mountpoints and polls the FSKit worker
+after requesting unmount. A worker that misses the fixed cleanup window makes
+the isolated native test process fail with a diagnostic; it is never detached.
+The library live-channel regression proves that the concrete invalidator sends
+inode, attribute, and entry frames, while the ignored tests are the separate
+proof of mounted behavior. Removable roots such as `/Volumes/Storage` may be
+blocked by macOS TCC for `fskitd`; such a run is not a passing FSKit result.
+Windows validation is outside this macOS test boundary, and the remaining
+foreign create/update/rename/unlink parity matrix remains a follow-up.
+
+Mounted multi-client parity runs use the existing `studiofs-e2e` contour. Set
+the host-specific root in the repository `.env`:
+
+```dotenv
+STUDIOFS_E2E_MOUNT_ROOT=/Volumes/studiofs
+```
+
+The runner mounts each client below `<root>/<client>/<volume>` and keeps
+artifacts under `target/e2e-runs/<run-id>`. `STUDIOFS_E2E_MOUNT_ROOT` in the
+process environment may override `.env` for a one-off run. Run the same
+scenario selection once with `STUDIOFS_MOUNT_BACKEND=legacy` and once with
+`STUDIOFS_MOUNT_BACKEND=fskit`; the backend selector is intentionally separate
+from the mount-root setting.
+
+On macOS, the mounted runner uses a bounded `/sbin/mount` table probe for
+readiness and stale-mount cleanup. It does not `stat` an FSKit mountpoint after
+worker termination, because a stale vnode can block that call indefinitely.
+
+Graceful FSKit teardown now interrupts the MFMount receive wait and performs
+the native unmount on the regular session path. This does not make abrupt
+process termination safe: on macFUSE 5.3.3 a killed FSKit client can leave a
+stale mount handoff in the kernel and make `/sbin/mount`, `umount`, or
+`diskutil unmount` block until reboot. Such a crash/restart run is a failed
+native validation, not a skipped or passing scenario. The full mounted parity
+matrix must therefore be rerun from a clean host after the macFUSE handoff is
+fixed or upgraded.
 
 ## WinFSP Bridge (`studiofs-winfsp`)
 

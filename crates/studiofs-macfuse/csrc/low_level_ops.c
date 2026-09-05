@@ -29,6 +29,10 @@ extern void studiofs_macfuse_rename(fuse_req_t req,
                                     const char *name,
                                     fuse_ino_t newparent,
                                     const char *newname);
+extern void studiofs_macfuse_link(fuse_req_t req,
+                                   fuse_ino_t ino,
+                                   fuse_ino_t newparent,
+                                   const char *newname);
 extern void studiofs_macfuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_read(fuse_req_t req,
                                   fuse_ino_t ino,
@@ -111,6 +115,7 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .unlink = studiofs_macfuse_unlink,
     .rmdir = studiofs_macfuse_rmdir,
     .rename = studiofs_macfuse_rename,
+    .link = studiofs_macfuse_link,
     .setattr = studiofs_macfuse_setattr,
     .setattr_x = studiofs_macfuse_setattr_x,
     .open = studiofs_macfuse_open,
@@ -170,6 +175,10 @@ int studiofs_macfuse_low_level_ops_has_rmdir_callback(const struct fuse_lowlevel
 
 int studiofs_macfuse_low_level_ops_has_mknod_callback(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->mknod != NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_link_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->link != NULL;
 }
 
 int studiofs_macfuse_low_level_ops_has_directory_callbacks(const struct fuse_lowlevel_ops *ops) {

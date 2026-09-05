@@ -11,6 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
 };
+use std::time::{Duration, Instant};
 
 use libc::iovec;
 use parking_lot::Mutex;
@@ -27,6 +28,7 @@ const FUSE_KERNEL_MINOR_VERSION: u32 = 19;
 const FUSE_ASYNC_READ: u32 = 1 << 0;
 const FUSE_BIG_WRITES: u32 = 1 << 5;
 const FOPEN_DIRECT_IO: u32 = 1 << 0;
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 const FUSE_LOOKUP: u32 = 1;
 const FUSE_FORGET: u32 = 2;
@@ -39,6 +41,7 @@ const FUSE_MKDIR: u32 = 9;
 const FUSE_UNLINK: u32 = 10;
 const FUSE_RMDIR: u32 = 11;
 const FUSE_RENAME: u32 = 12;
+const FUSE_LINK: u32 = 13;
 const FUSE_OPEN: u32 = 14;
 const FUSE_READ: u32 = 15;
 const FUSE_WRITE: u32 = 16;
@@ -60,10 +63,15 @@ const FUSE_CREATE: u32 = 35;
 const FUSE_INTERRUPT: u32 = 36;
 const FUSE_DESTROY: u32 = 38;
 
+const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
+
 const MF_MOUNT_RESULT_UNSUPPORTED_OS_VERSION: i32 = 1;
 const MF_MOUNT_RESULT_HELPER_TOOLS_FAILED: i32 = 2;
 const MF_MOUNT_RESULT_EXTENSION_NOT_FOUND: i32 = 3;
 const MF_MOUNT_RESULT_APPROVAL_REQUIRED: i32 = 4;
+const FS_KIT_RECEIVE_POLL_MS: i32 = 100;
+const FS_KIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 const FATTR_MODE: u32 = 1 << 0;
 const FATTR_UID: u32 = 1 << 1;
@@ -99,8 +107,11 @@ unsafe extern "C" {
     fn MFRetain(reference: *mut c_void) -> *mut c_void;
     fn MFRelease(reference: *mut c_void);
     fn MFChannelCreate() -> *mut c_void;
-    fn MFChannelInterrupt(channel: *mut c_void) -> bool;
+    #[cfg(test)]
+    fn MFChannelCreateWithDeviceFileDescriptor(fd: i32) -> *mut c_void;
     fn MFChannelCopyNextMessage(channel: *mut c_void) -> *mut c_void;
+    fn MFChannelInterrupt(channel: *mut c_void) -> bool;
+    fn MFChannelWaitForNextMessage(channel: *mut c_void, timeout: i32) -> i32;
     fn MFChannelSendMessage(channel: *mut c_void, buffers: *const iovec, count: usize) -> isize;
     fn MFChannelClose(channel: *mut c_void) -> bool;
     fn MFMessageGetBodySize(message: *mut c_void) -> isize;
@@ -133,6 +144,22 @@ struct FuseOutHeader {
     len: u32,
     error: i32,
     unique: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FuseNotifyInvalInodeOut {
+    ino: u64,
+    off: i64,
+    len: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FuseNotifyInvalEntryOut {
+    parent: u64,
+    namelen: u32,
+    padding: u32,
 }
 
 #[repr(C)]
@@ -306,6 +333,12 @@ struct FuseMknodIn {
 #[derive(Clone, Copy, Debug)]
 struct FuseRenameIn {
     newdir: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FuseLinkIn {
+    oldnodeid: u64,
 }
 
 #[repr(C)]
@@ -565,28 +598,51 @@ fn setattr_flags_supported(valid: u32) -> bool {
     (valid & !FATTR_SUPPORTED) == 0
 }
 
-#[derive(Debug)]
 struct FsKitControl {
     channel: Mutex<Option<NonNull<c_void>>>,
     send_lock: Mutex<()>,
     stop_requested: AtomicBool,
-    mounted: AtomicBool,
+    mount_point: Option<CString>,
+    unmount_started: AtomicBool,
+    unmount_error: Mutex<Option<io::Error>>,
+    #[cfg(test)]
+    unmount_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 // Channel lifetime is guarded by the channel mutex plus per-operation retained
-// references. Sends and close are serialized; MFChannelInterrupt may run from
-// the signal worker while the receive loop is blocked, as documented by
-// MFMount.
+// references. Sends and close are serialized. The session keeps the channel
+// open until the dispatcher answers the terminal DESTROY request.
 unsafe impl Send for FsKitControl {}
 unsafe impl Sync for FsKitControl {}
 
 impl FsKitControl {
-    fn new(channel: NonNull<c_void>) -> Arc<Self> {
+    fn new(channel: NonNull<c_void>, mount_point: Option<CString>) -> Arc<Self> {
         Arc::new(Self {
             channel: Mutex::new(Some(channel)),
             send_lock: Mutex::new(()),
             stop_requested: AtomicBool::new(false),
-            mounted: AtomicBool::new(false),
+            mount_point,
+            unmount_started: AtomicBool::new(false),
+            unmount_error: Mutex::new(None),
+            #[cfg(test)]
+            unmount_hook: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_unmount_hook(
+        channel: NonNull<c_void>,
+        mount_point: Option<CString>,
+        unmount_hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            channel: Mutex::new(Some(channel)),
+            send_lock: Mutex::new(()),
+            stop_requested: AtomicBool::new(false),
+            mount_point,
+            unmount_started: AtomicBool::new(false),
+            unmount_error: Mutex::new(None),
+            unmount_hook: Some(unmount_hook),
         })
     }
 
@@ -599,32 +655,54 @@ impl FsKitControl {
     }
 
     fn request_exit(&self) {
-        self.request_exit_with(|| {
-            let Some(channel) = self.retained_channel() else {
-                return;
-            };
-            // SAFETY: the channel remains owned and open under the control state.
-            let interrupted = unsafe { MFChannelInterrupt(channel.as_ptr()) };
-            if !interrupted {
-                let errno = last_errno();
-                if !matches!(errno, libc::EINTR | libc::ENODEV | libc::EINVAL) {
-                    warn!(errno, "macFUSE FSKit channel interrupt failed");
-                }
-            }
-        });
+        // MFMount still needs its endpoint and INIT replies while mounting.
+        // SeqCst makes the stop request visible to the session loop even when
+        // mount completion and cancellation race.
+        self.stop_requested.store(true, Ordering::SeqCst);
+        // macFUSE 5.3.3 added an explicit wakeup for blocked receives. The
+        // session starts native unmount on its worker after observing this flag.
+        let Some(channel) = self.retained_channel() else {
+            return;
+        };
+        // SAFETY: the retained channel remains valid for this synchronous FFI
+        // call. The framework documents this as the wakeup for blocked receive
+        // operations and it does not close the channel.
+        unsafe {
+            let _ = MFChannelInterrupt(channel.as_ptr());
+        }
     }
 
-    fn request_exit_with(&self, interrupt: impl FnOnce()) {
-        self.stop_requested.store(true, Ordering::Release);
-        if !self.mounted.load(Ordering::Acquire) {
-            self.close();
+    fn unmount(&self) {
+        // Completion, cancellation, and drop can all arrive here. Only one
+        // caller may issue the system unmount; the session owns channel close.
+        if self.unmount_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        interrupt();
-    }
-
-    fn mark_mounted(&self) {
-        self.mounted.store(true, Ordering::Release);
+        #[cfg(test)]
+        if let Some(hook) = &self.unmount_hook {
+            hook();
+            return;
+        }
+        if let Some(mount_point) = &self.mount_point {
+            // SAFETY: the immutable, NUL-terminated path lives for this call.
+            // Keep the dispatcher alive for flush/release/DESTROY callbacks.
+            if unsafe { libc::unmount(mount_point.as_ptr(), 0) } != 0 {
+                let error = io::Error::last_os_error();
+                let error = if error.raw_os_error() == Some(libc::EBUSY) {
+                    // macOS can retain active vnode references while the
+                    // kernel is already tearing the FUSE session down.
+                    if unsafe { libc::unmount(mount_point.as_ptr(), libc::MNT_FORCE) } == 0 {
+                        return;
+                    }
+                    io::Error::last_os_error()
+                } else {
+                    error
+                };
+                if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) {
+                    *self.unmount_error.lock() = Some(error);
+                }
+            }
+        }
     }
 
     fn send(&self, buffers: &[iovec]) -> io::Result<()> {
@@ -683,6 +761,7 @@ struct FsKitSession {
     control: Arc<FsKitControl>,
     mount_result: Receiver<Result<(), i32>>,
     mount_thread: Option<std::thread::JoinHandle<()>>,
+    unmount_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FsKitSession {
@@ -703,7 +782,7 @@ impl FsKitSession {
                 io::Error::last_os_error()
             ))
         })?;
-        let control = FsKitControl::new(channel);
+        let control = FsKitControl::new(channel, Some(mount_point.clone()));
         let mount_channel = FsKitChannelRef::retain(channel);
         let (mount_sender, mount_result) = mpsc::channel();
         let mount_control = Arc::clone(&control);
@@ -720,12 +799,9 @@ impl FsKitSession {
                         true,
                     )
                 };
-                if result == 0 {
-                    mount_control.mark_mounted();
-                }
                 let _ = mount_sender.send(if result == 0 { Ok(()) } else { Err(result) });
                 if result != 0 {
-                    mount_control.request_exit();
+                    mount_control.close();
                 }
             })
             .map_err(|error| {
@@ -736,11 +812,55 @@ impl FsKitSession {
             control,
             mount_result,
             mount_thread: Some(mount_thread),
+            unmount_thread: None,
         })
     }
 
-    fn run(&self, dispatcher: &FsKitDispatcher) -> io::Result<()> {
+    fn start_unmount(&mut self) -> io::Result<()> {
+        if self.unmount_thread.is_some() {
+            return Ok(());
+        }
+        let control = Arc::clone(&self.control);
+        let worker = std::thread::Builder::new()
+            .name("macfuse-fskit-unmount".into())
+            .spawn(move || control.unmount())
+            .map_err(|error| {
+                io::Error::other(format!("failed to start FSKit unmount worker: {error}"))
+            })?;
+        self.unmount_thread = Some(worker);
+        Ok(())
+    }
+
+    fn wait_for_unmount(&mut self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(worker) = self.unmount_thread.as_ref() else {
+                return Ok(());
+            };
+            if worker.is_finished() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FSKit native unmount worker did not finish before the deadline",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let Some(worker) = self.unmount_thread.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| io::Error::other("FSKit unmount worker panicked"))
+    }
+
+    fn run(&mut self, dispatcher: &FsKitDispatcher) -> io::Result<()> {
+        // macFUSE 5.3.3 local mounts send INIT before MFMount returns. Keep
+        // dispatching during startup or mount and receive wait on each other.
         let mut mounted = false;
+        let mut shutdown_deadline = None;
         loop {
             match self.mount_result.try_recv() {
                 Ok(Ok(())) => mounted = true,
@@ -753,9 +873,42 @@ impl FsKitSession {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
+            if self.control.is_stopping() {
+                let deadline = shutdown_deadline
+                    .get_or_insert_with(|| Instant::now() + FS_KIT_SHUTDOWN_TIMEOUT);
+                if mounted {
+                    self.start_unmount()?;
+                }
+                if Instant::now() >= *deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "FSKit shutdown did not receive DESTROY before the deadline",
+                    ));
+                }
+            }
             let Some(channel) = self.control.retained_channel() else {
                 return Ok(());
             };
+            // Keep a bounded fallback in case an older or damaged transport
+            // ignores MFChannelInterrupt().
+            // SAFETY: the retained channel stays alive for this synchronous
+            // wait, and the timeout bounds the call before the reference is
+            // released.
+            let ready =
+                unsafe { MFChannelWaitForNextMessage(channel.as_ptr(), FS_KIT_RECEIVE_POLL_MS) };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0 {
+                let errno = last_errno();
+                if self.control.is_stopping() {
+                    continue;
+                }
+                if matches!(errno, libc::EINTR | libc::ENODEV) {
+                    return Ok(());
+                }
+                return Err(errno_error(errno));
+            }
             let Some(message) = FsKitMessage::receive(&channel) else {
                 match self.mount_result.try_recv() {
                     Ok(Ok(())) => {}
@@ -769,7 +922,10 @@ impl FsKitSession {
                     Err(mpsc::TryRecvError::Disconnected) => {}
                 }
                 let errno = last_errno();
-                if self.control.is_stopping() || matches!(errno, libc::EINTR | libc::ENODEV) {
+                if self.control.is_stopping() {
+                    continue;
+                }
+                if matches!(errno, libc::EINTR | libc::ENODEV) {
                     return Ok(());
                 }
                 return Err(errno_error(errno));
@@ -782,7 +938,17 @@ impl FsKitSession {
 impl Drop for FsKitSession {
     fn drop(&mut self) {
         self.control.request_exit();
+        let _ = self.start_unmount();
+        // The normal path waits before closing; Drop must stay bounded if the
+        // native syscall is stuck in the kernel.
         self.control.close();
+        if let Some(unmount_thread) = self.unmount_thread.take() {
+            if unmount_thread.is_finished() {
+                let _ = unmount_thread.join();
+            } else {
+                warn!("FSKit unmount worker did not finish before session drop");
+            }
+        }
         if let Some(mount_thread) = self.mount_thread.take() {
             let _ = mount_thread.join();
         }
@@ -829,7 +995,7 @@ fn mount_result_error(result: i32) -> io::Error {
 }
 
 fn opcode_allows_reply(opcode: u32) -> bool {
-    !matches!(opcode, FUSE_FORGET | FUSE_DESTROY | FUSE_INTERRUPT)
+    !matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT)
 }
 
 struct FsKitRequest {
@@ -870,9 +1036,14 @@ impl FsKitRequest {
         send_error(&self.sender, message, self.header().unique, errno)
     }
 
-    fn reply_bytes(mut self, payload: Vec<u8>) -> io::Result<()> {
+    fn reply_bytes(mut self, payload: impl AsRef<[u8]>) -> io::Result<()> {
         let message = self.take_message()?;
-        send_bytes(&self.sender, message, self.header().unique, &payload)
+        send_bytes(
+            &self.sender,
+            message,
+            self.header().unique,
+            payload.as_ref(),
+        )
     }
 
     fn reply_read(mut self, payload: Vec<u8>, requested_size: u32) -> io::Result<()> {
@@ -1009,6 +1180,30 @@ fn read_reply_uses_transport_buffer(payload: &[u8], requested_size: u32) -> bool
     !payload.is_empty() || requested_size == 0
 }
 
+fn spawn_blocking_reply_task<G, F>(runtime_handle: &Handle, task_guard: G, operation: F)
+where
+    G: Send + 'static,
+    F: FnOnce() + Send + 'static,
+{
+    std::mem::drop(runtime_handle.spawn_blocking(move || {
+        let _task_guard = task_guard;
+        operation();
+    }));
+}
+
+fn getxattr_value_response(
+    value: &[u8],
+    position: usize,
+    requested_size: u32,
+) -> Result<&[u8], i32> {
+    let value = crate::adapter::xattr_value_from_position(value, position);
+    if value.len() > requested_size as usize {
+        Err(libc::ERANGE)
+    } else {
+        Ok(value)
+    }
+}
+
 type CancellationMap = Arc<Mutex<std::collections::HashMap<u64, Arc<CancellationToken>>>>;
 
 struct CancellationGuard {
@@ -1099,6 +1294,7 @@ impl FsKitDispatcher {
             FUSE_UNLINK => self.unlink(request),
             FUSE_RMDIR => self.rmdir(request),
             FUSE_RENAME => self.rename(request),
+            FUSE_LINK => self.link(request),
             FUSE_SYMLINK => self.symlink(request),
             FUSE_CREATE => self.create(request),
             FUSE_ACCESS => self.access(request),
@@ -1187,11 +1383,9 @@ impl FsKitDispatcher {
         match self.adapter.open(header.nodeid, input.flags as i32) {
             Ok(open) => {
                 let file_handle = open.file_handle();
-                // FSKit notifications are unavailable in this slice. Force
-                // direct I/O and keep novncache as the explicit fallback.
                 let result = request.reply_struct(FuseOpenOut {
                     fh: file_handle,
-                    open_flags: FOPEN_DIRECT_IO,
+                    open_flags: fskit_open_flags(open),
                     padding: 0,
                 });
                 if result.is_err() {
@@ -1420,7 +1614,7 @@ impl FsKitDispatcher {
     fn readlink(&self, request: FsKitRequest) {
         match self.adapter.readlink(request.header().nodeid) {
             Ok(target) => {
-                let _ = request.reply_bytes(target);
+                let _ = request.reply_bytes(readlink_reply_payload(target));
             }
             Err(errno) => {
                 let _ = request.reply_error(errno);
@@ -1516,12 +1710,19 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        match self.adapter.rmdir(request.header().nodeid, &name) {
-            Ok(()) => self.empty_success(request),
-            Err(errno) => {
-                let _ = request.reply_error(errno);
+        let parent = request.header().nodeid;
+        let adapter = Arc::clone(&self.adapter);
+        let task_guard = self.callback_state.track_reply_task();
+        spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
+            match adapter.rmdir(parent, &name) {
+                Ok(()) => {
+                    let _ = request.reply_bytes(Vec::new());
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                }
             }
-        }
+        });
     }
 
     fn rename(&self, request: FsKitRequest) {
@@ -1553,6 +1754,40 @@ impl FsKitDispatcher {
         }
     }
 
+    fn link(&self, request: FsKitRequest) {
+        let input = match request.operation::<FuseLinkIn>(size_of::<FuseInHeader>()) {
+            Ok(input) => input,
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+                return;
+            }
+        };
+        let name = match parse_c_string(
+            &request.body.bytes,
+            size_of::<FuseInHeader>() + size_of::<FuseLinkIn>(),
+        ) {
+            Ok(name) => name.to_vec(),
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+                return;
+            }
+        };
+        let parent = request.header().nodeid;
+        let adapter = Arc::clone(&self.adapter);
+        let task_guard = self.callback_state.track_reply_task();
+        spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
+            match adapter.link(input.oldnodeid, parent, &name) {
+                Ok(attr) => {
+                    let _ = request
+                        .reply_struct(entry_from_stat(attr.ino, adapter.attr_to_stat(&attr)));
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                }
+            }
+        });
+    }
+
     fn symlink(&self, request: FsKitRequest) {
         let (name, target) =
             match parse_two_c_strings(&request.body.bytes, size_of::<FuseInHeader>()) {
@@ -1562,18 +1797,20 @@ impl FsKitDispatcher {
                     return;
                 }
             };
-        match self
-            .adapter
-            .symlink(request.header().nodeid, &name, &target)
-        {
-            Ok(attr) => {
-                let _ = request
-                    .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+        let parent = request.header().nodeid;
+        let adapter = Arc::clone(&self.adapter);
+        let task_guard = self.callback_state.track_reply_task();
+        spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
+            match adapter.symlink(parent, &name, &target) {
+                Ok(attr) => {
+                    let _ = request
+                        .reply_struct(entry_from_stat(attr.ino, adapter.attr_to_stat(&attr)));
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                }
             }
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-            }
-        }
+        });
     }
 
     fn create(&self, request: FsKitRequest) {
@@ -1607,7 +1844,7 @@ impl FsKitDispatcher {
                     encode_copy(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
                 let open = encode_copy(FuseOpenOut {
                     fh: file_handle,
-                    open_flags: FOPEN_DIRECT_IO,
+                    open_flags: fskit_open_flags(open),
                     padding: 0,
                 });
                 if request.reply_bytes([entry, open].concat()).is_err() {
@@ -1796,10 +2033,6 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        if input.position != 0 {
-            let _ = request.reply_error(libc::ENOTSUP);
-            return;
-        }
         let name = match parse_c_string(
             &request.body.bytes,
             size_of::<FuseInHeader>() + size_of::<FuseGetxattrIn>(),
@@ -1810,10 +2043,30 @@ impl FsKitDispatcher {
                 return;
             }
         };
+        if input.size == 0 {
+            let value_size = match self.adapter.get_xattr_size(request.header().nodeid, &name) {
+                Ok(Some(value_size)) => value_size,
+                Ok(None) => {
+                    let _ = request.reply_error(crate::adapter::xattr_not_found_errno());
+                    return;
+                }
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                    return;
+                }
+            };
+            let size =
+                crate::adapter::xattr_size_from_position(value_size, input.position as usize);
+            let _ = request.reply_struct(FuseXattrOut {
+                size: size as u32,
+                padding: 0,
+            });
+            return;
+        }
         let value = match self.adapter.get_xattr(request.header().nodeid, &name) {
             Ok(Some(value)) => value,
             Ok(None) => {
-                let _ = request.reply_error(libc::ENODATA);
+                let _ = request.reply_error(crate::adapter::xattr_not_found_errno());
                 return;
             }
             Err(errno) => {
@@ -1821,15 +2074,13 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        if input.size == 0 {
-            let _ = request.reply_struct(FuseXattrOut {
-                size: value.len() as u32,
-                padding: 0,
-            });
-        } else if value.len() > input.size as usize {
-            let _ = request.reply_error(libc::ERANGE);
-        } else {
-            let _ = request.reply_bytes(value);
+        match getxattr_value_response(&value, input.position as usize, input.size) {
+            Ok(value) => {
+                let _ = request.reply_bytes(value);
+            }
+            Err(errno) => {
+                let _ = request.reply_error(errno);
+            }
         }
     }
 
@@ -1897,8 +2148,10 @@ impl FsKitDispatcher {
     }
 
     fn destroy(&self, request: FsKitRequest) {
-        request.no_reply();
-        self.control.request_exit();
+        let _ = request.reply_bytes(Vec::new());
+        // DESTROY is terminal. Interrupting here would precede the next
+        // receive and lose its wakeup on the dispatch thread itself.
+        self.control.close();
     }
 
     fn empty_success(&self, request: FsKitRequest) {
@@ -1906,10 +2159,7 @@ impl FsKitDispatcher {
     }
 
     fn unsupported(&self, request: FsKitRequest, operation: &'static str) {
-        debug!(
-            operation,
-            "macFUSE FSKit operation is outside the SFS-669 slice"
-        );
+        debug!(operation, "macFUSE FSKit operation is not implemented");
         let _ = request.reply_error(libc::ENOSYS);
     }
 
@@ -1920,25 +2170,70 @@ impl FsKitDispatcher {
     }
 }
 
-struct FsKitKernelInvalidator;
+fn invalidation_inode_bytes(ino: u64, off: i64, len: i64) -> Vec<u8> {
+    let payload = encode_copy(FuseNotifyInvalInodeOut { ino, off, len });
+    let total = size_of::<FuseOutHeader>() + payload.len();
+    let header = encode_copy(FuseOutHeader {
+        len: total as u32,
+        error: FUSE_NOTIFY_INVAL_INODE,
+        unique: 0,
+    });
+    [header, payload].concat()
+}
+
+fn invalidation_entry_bytes(parent: u64, name: &[u8]) -> Result<Vec<u8>, i32> {
+    let namelen = u32::try_from(name.len()).map_err(|_| libc::EOVERFLOW)?;
+    let payload = encode_copy(FuseNotifyInvalEntryOut {
+        parent,
+        namelen,
+        padding: 0,
+    });
+    let total = size_of::<FuseOutHeader>()
+        .checked_add(payload.len())
+        .and_then(|total| total.checked_add(name.len()))
+        .ok_or(libc::EOVERFLOW)?;
+    let header = encode_copy(FuseOutHeader {
+        len: u32::try_from(total).map_err(|_| libc::EOVERFLOW)?,
+        error: FUSE_NOTIFY_INVAL_ENTRY,
+        unique: 0,
+    });
+    let mut frame = [header, payload].concat();
+    frame.extend_from_slice(name);
+    Ok(frame)
+}
+
+struct FsKitKernelInvalidator {
+    control: Arc<FsKitControl>,
+}
+
+impl FsKitKernelInvalidator {
+    fn send_frame(&self, frame: Vec<u8>) {
+        let buffer = iovec {
+            iov_base: frame.as_ptr().cast_mut().cast(),
+            iov_len: frame.len(),
+        };
+        if let Err(error) = self.control.send(std::slice::from_ref(&buffer)) {
+            debug!(?error, "FSKit kernel invalidation could not be sent");
+        }
+    }
+}
 
 impl studiofs_vfs::KernelInvalidator for FsKitKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        debug!(
-            ino,
-            "FSKit inode invalidation covered by novncache/direct I/O fallback"
-        );
+        self.send_frame(invalidation_inode_bytes(ino, 0, 0));
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        debug!(
-            ino,
-            "FSKit attribute invalidation covered by novncache/direct I/O fallback"
-        );
+        self.send_frame(invalidation_inode_bytes(ino, -1, 0));
     }
 
     fn inval_entry(&self, parent: u64, name: &[u8]) {
-        debug!(parent, name = %String::from_utf8_lossy(name), "FSKit entry invalidation covered by novncache fallback");
+        match invalidation_entry_bytes(parent, name) {
+            Ok(frame) => self.send_frame(frame),
+            Err(errno) => {
+                debug!(parent, errno, "FSKit entry invalidation name is too large");
+            }
+        }
     }
 }
 
@@ -1984,11 +2279,28 @@ fn setattr_time(
 }
 
 fn time_to_nanos(seconds: u64, nanos: u32) -> Result<i64, i32> {
+    if nanos >= 1_000_000_000 {
+        return Err(libc::EINVAL);
+    }
     let seconds = i64::try_from(seconds).map_err(|_| libc::EOVERFLOW)?;
     seconds
         .checked_mul(1_000_000_000)
         .and_then(|seconds| seconds.checked_add(i64::from(nanos)))
         .ok_or(libc::EOVERFLOW)
+}
+
+fn readlink_reply_payload(mut target: Vec<u8>) -> Vec<u8> {
+    target.push(0);
+    target
+}
+
+fn fskit_open_flags(open: low_level::OpenReply) -> u32 {
+    (if open.direct_io() { FOPEN_DIRECT_IO } else { 0 })
+        | (if open.keep_cache() {
+            FOPEN_KEEP_CACHE
+        } else {
+            0
+        })
 }
 
 fn args_have_values(args: &SetattrArgs) -> bool {
@@ -2133,7 +2445,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         unmount_signal,
     } = request;
     crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    let session = FsKitSession::mount(&mount_point, &volume_name)?;
+    let mut session = FsKitSession::mount(&mount_point, &volume_name)?;
     let callback_state = Arc::new(CallbackState::new(
         Arc::clone(&vfs),
         runtime_handle.clone(),
@@ -2152,20 +2464,41 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         signal_handling,
         unmount_signal,
     )?;
-    vfs.set_kernel_invalidator(callback_state.kernel_invalidator(Arc::new(FsKitKernelInvalidator)));
+    vfs.set_kernel_invalidator(callback_state.kernel_invalidator(Arc::new(
+        FsKitKernelInvalidator {
+            control: Arc::clone(&session.control),
+        },
+    )));
     let result = session.run(&dispatcher);
     drop(signal_watcher);
     dispatcher.cancel_pending();
     vfs.clear_kernel_invalidator();
     callback_state.wait_for_reply_tasks();
+    let unmount_result = session
+        .start_unmount()
+        .and_then(|_| session.wait_for_unmount(FS_KIT_SHUTDOWN_TIMEOUT))
+        .and_then(|_| {
+            session
+                .control
+                .unmount_error
+                .lock()
+                .take()
+                .map_or(Ok(()), Err)
+        });
     drop(dispatcher);
     session.control.close();
-    result
+    if let Some(worker) = session.mount_thread.take() {
+        worker
+            .join()
+            .map_err(|_| io::Error::other("FSKit mount worker panicked"))?;
+    }
+    result.and(unmount_result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_vfs::KernelInvalidator;
 
     #[test]
     fn message_parser_rejects_a_body_length_that_does_not_match_the_header() {
@@ -2197,28 +2530,333 @@ mod tests {
     }
 
     #[test]
-    fn request_exit_does_not_wait_for_send_lock() {
-        // SAFETY: this test-only channel is never passed to an FFI call.
-        let control = FsKitControl::new(NonNull::dangling());
-        control.mark_mounted();
+    fn request_exit_interrupts_blocked_receive_without_waiting_for_send_lock() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Barrier;
+
+        let (server, peer) = UnixStream::pair().expect("create FUSE transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let ready = Arc::new(Barrier::new(2));
+        let receiver_control = Arc::clone(&control);
+        let receiver_ready = Arc::clone(&ready);
+        let receiver = std::thread::spawn(move || {
+            let channel = receiver_control
+                .retained_channel()
+                .expect("retain receive channel");
+            receiver_ready.wait();
+            // SAFETY: the retained channel stays alive for this receive call.
+            let result = unsafe { MFChannelWaitForNextMessage(channel.as_ptr(), -1) };
+            let errno = io::Error::last_os_error().raw_os_error();
+            (result == -1, errno)
+        });
+        ready.wait();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
         let send_guard = control.send_lock.lock();
         let (done_sender, done_receiver) = mpsc::channel();
-        let worker_control = Arc::clone(&control);
+        let request_control = Arc::clone(&control);
+        let requester = std::thread::spawn(move || {
+            request_control.request_exit();
+            done_sender
+                .send(())
+                .expect("report request exit completion");
+        });
+        assert!(
+            done_receiver
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_ok(),
+            "request_exit waited for the send lock"
+        );
+        drop(send_guard);
+        requester.join().expect("join request thread");
+        let (interrupted, errno) = receiver.join().expect("join receive thread");
+        assert!(interrupted, "interrupt should fail the blocked wait");
+        assert_eq!(errno, Some(libc::EINTR));
+        drop(peer);
+        control.close();
+    }
+
+    #[test]
+    fn request_exit_keeps_channel_open_until_session_finishes_mount() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (server, _peer) = UnixStream::pair().expect("create FUSE transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        control.request_exit();
+        let retained_until_mounted = control.channel.lock().is_some();
+        let open_after_mount = control.channel.lock().is_some();
+        control.close();
+
+        assert!(
+            retained_until_mounted,
+            "cancellation destroyed the pending mount endpoint"
+        );
+        assert!(
+            open_after_mount,
+            "cancelled mount closed the channel before DESTROY"
+        );
+    }
+
+    #[test]
+    fn fskit_run_keeps_dispatcher_alive_until_destroy_after_unmount_request() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-unmount")
+                .expect("create VFS fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound DESTROY reply wait");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let (mount_sender, mount_receiver) = mpsc::channel();
+        let mut session = FsKitSession {
+            control: Arc::clone(&control),
+            mount_result: mount_receiver,
+            mount_thread: None,
+            unmount_thread: None,
+        };
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+        let (done_sender, done_receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            worker_control.request_exit_with(|| {
-                done_sender
-                    .send(())
-                    .expect("report request exit completion");
-            });
+            let result = session.run(&dispatcher);
+            done_sender.send(result).expect("report session result");
         });
 
-        let completed = done_receiver
-            .recv_timeout(std::time::Duration::from_millis(250))
-            .is_ok();
-        drop(send_guard);
-        worker.join().expect("join request exit worker");
+        control.request_exit();
+        mount_sender
+            .send(Ok(()))
+            .expect("report successful mount before DESTROY");
+        assert!(
+            done_receiver
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "session stopped before the terminal DESTROY request"
+        );
 
-        assert!(completed, "request_exit waited for the send lock");
+        let mut destroy = vec![0_u8; size_of::<FuseInHeader>()];
+        destroy[..4].copy_from_slice(&(size_of::<FuseInHeader>() as u32).to_ne_bytes());
+        destroy[4..8].copy_from_slice(&FUSE_DESTROY.to_ne_bytes());
+        destroy[8..16].copy_from_slice(&23_u64.to_ne_bytes());
+        peer.write_all(&destroy).expect("send DESTROY");
+
+        done_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("session should finish after DESTROY")
+            .expect("DESTROY shutdown should succeed");
+        worker.join().expect("join session worker");
+
+        let mut reply = [0_u8; size_of::<FuseOutHeader>()];
+        peer.read_exact(&mut reply)
+            .expect("DESTROY requires a reply");
+        let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode DESTROY reply");
+        assert_eq!((header.unique, header.error), (23, 0));
+    }
+
+    #[test]
+    fn fskit_run_dispatches_destroy_while_native_unmount_is_blocked() {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-unmount-worker")
+                .expect("create VFS fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let release_receiver = Arc::new(Mutex::new(release_receiver));
+        let hook_release_receiver = Arc::clone(&release_receiver);
+        let unmount_hook = Arc::new(move || {
+            entered_sender.send(()).expect("report unmount start");
+            hook_release_receiver
+                .lock()
+                .recv()
+                .expect("release blocked unmount worker");
+        });
+        let control = FsKitControl::new_with_unmount_hook(channel, None, unmount_hook);
+        let (mount_sender, mount_receiver) = mpsc::channel();
+        let mut session = FsKitSession {
+            control: Arc::clone(&control),
+            mount_result: mount_receiver,
+            mount_thread: None,
+            unmount_thread: None,
+        };
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = session.run(&dispatcher);
+            done_sender.send(result).expect("report session result");
+        });
+
+        control.request_exit();
+        mount_sender
+            .send(Ok(()))
+            .expect("report successful mount before DESTROY");
+        let entered = entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+
+        let mut destroy = vec![0_u8; size_of::<FuseInHeader>()];
+        destroy[..4].copy_from_slice(&(size_of::<FuseInHeader>() as u32).to_ne_bytes());
+        destroy[4..8].copy_from_slice(&FUSE_DESTROY.to_ne_bytes());
+        destroy[8..16].copy_from_slice(&29_u64.to_ne_bytes());
+        let destroy_sent = peer.write_all(&destroy).is_ok();
+        let session_finished_while_unmount_blocked = done_receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+
+        let _ = release_sender.send(());
+        worker.join().expect("join session worker");
+
+        assert!(entered, "native unmount worker did not start");
+        assert!(destroy_sent, "send DESTROY");
+        assert!(
+            session_finished_while_unmount_blocked,
+            "session dispatcher blocked behind native unmount"
+        );
+    }
+
+    #[test]
+    fn fskit_destroy_replies_before_closing_transport() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-destroy")
+                .expect("create fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+        let mut frame = vec![0_u8; size_of::<FuseInHeader>()];
+        frame[..4].copy_from_slice(&(size_of::<FuseInHeader>() as u32).to_ne_bytes());
+        frame[4..8].copy_from_slice(&FUSE_DESTROY.to_ne_bytes());
+        frame[8..16].copy_from_slice(&17_u64.to_ne_bytes());
+        peer.write_all(&frame).expect("send DESTROY");
+        let retained = control.retained_channel().expect("retain channel");
+        dispatcher.dispatch(FsKitMessage::receive(&retained).expect("receive DESTROY"));
+        let closed = control.channel.lock().is_none();
+        control.close();
+        let mut reply = [0_u8; size_of::<FuseOutHeader>()];
+        peer.read_exact(&mut reply)
+            .expect("DESTROY requires a reply");
+        let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode reply");
+        assert_eq!((header.unique, header.error), (17, 0));
+        assert!(
+            closed,
+            "DESTROY left the next receive able to block forever"
+        );
+    }
+
+    #[test]
+    fn fskit_run_answers_init_before_mount_completes() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-mount-order")
+                .expect("create VFS fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound INIT reply wait");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let (mount_sender, mount_receiver) = mpsc::channel();
+        let mut session = FsKitSession {
+            control: Arc::clone(&control),
+            mount_result: mount_receiver,
+            mount_thread: None,
+            unmount_thread: None,
+        };
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            control,
+        );
+        let worker = std::thread::spawn(move || session.run(&dispatcher));
+        let mut init = vec![0_u8; size_of::<FuseInHeader>() + size_of::<FuseInitIn>()];
+        let len = init.len() as u32;
+        init[..4].copy_from_slice(&len.to_ne_bytes());
+        init[4..8].copy_from_slice(&FUSE_INIT.to_ne_bytes());
+        init[8..16].copy_from_slice(&1_u64.to_ne_bytes());
+        init[40..44].copy_from_slice(&FUSE_KERNEL_VERSION.to_ne_bytes());
+        init[44..48].copy_from_slice(&FUSE_KERNEL_MINOR_VERSION.to_ne_bytes());
+        peer.write_all(&init)
+            .expect("send INIT while mount is pending");
+        let mut reply = [0_u8; size_of::<FuseOutHeader>() + size_of::<FuseInitOut>()];
+        let received = peer.read_exact(&mut reply);
+
+        // Unblock either implementation before asserting, including the broken
+        // one that waits for MFMount while MFMount waits for the INIT reply.
+        mount_sender
+            .send(Err(MF_MOUNT_RESULT_APPROVAL_REQUIRED))
+            .expect("finish simulated mount");
+        peer.shutdown(std::net::Shutdown::Both).expect("close peer");
+        let result = worker.join().expect("join run worker");
+        assert!(
+            received.is_ok(),
+            "INIT was blocked by pending mount: {received:?}"
+        );
+        let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode reply");
+        assert_eq!((header.unique, header.error), (1, 0));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -2253,10 +2891,11 @@ mod tests {
 
     #[test]
     fn one_way_opcodes_never_get_implicit_error_replies() {
-        for opcode in [FUSE_FORGET, FUSE_DESTROY, FUSE_INTERRUPT] {
+        for opcode in [FUSE_FORGET, FUSE_INTERRUPT] {
             assert!(!opcode_allows_reply(opcode));
         }
         assert!(opcode_allows_reply(FUSE_LOOKUP));
+        assert!(opcode_allows_reply(FUSE_DESTROY));
     }
 
     #[test]
@@ -2307,6 +2946,149 @@ mod tests {
         assert_eq!(input.newdir, 77);
         assert_eq!(name, b"old");
         assert_eq!(new_name, b"new");
+    }
+
+    #[test]
+    fn fskit_link_request_uses_the_fuse_wire_layout() {
+        assert_eq!(FUSE_LINK, 13);
+        assert_eq!(size_of::<FuseLinkIn>(), size_of::<u64>());
+
+        let mut bytes = vec![0_u8; size_of::<FuseInHeader>()];
+        bytes.extend_from_slice(&77_u64.to_ne_bytes());
+        bytes.extend_from_slice(b"alias\0");
+        let len = u32::try_from(bytes.len()).expect("link body length");
+        bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
+
+        let body = parse_message_body(bytes).expect("parse link body");
+        let input = read_copy::<FuseLinkIn>(&body.bytes, size_of::<FuseInHeader>())
+            .expect("parse link input");
+        let name = parse_c_string(
+            &body.bytes,
+            size_of::<FuseInHeader>() + size_of::<FuseLinkIn>(),
+        )
+        .expect("parse link name");
+
+        assert_eq!(input.oldnodeid, 77);
+        assert_eq!(name, b"alias");
+    }
+
+    #[test]
+    fn fskit_invalidation_frames_match_fuse_wire_layout() {
+        let inode = invalidation_inode_bytes(42, -1, 0);
+        let header =
+            read_copy::<FuseOutHeader>(&inode, 0).expect("inode invalidation header should decode");
+        assert_eq!(header.len as usize, inode.len());
+        assert_eq!(header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(header.unique, 0);
+        let payload = read_copy::<FuseNotifyInvalInodeOut>(&inode, size_of::<FuseOutHeader>())
+            .expect("inode invalidation payload should decode");
+        assert_eq!((payload.ino, payload.off, payload.len), (42, -1, 0));
+
+        let entry = invalidation_entry_bytes(7, b"\xC3\xA9").expect("entry fits");
+        let entry_header =
+            read_copy::<FuseOutHeader>(&entry, 0).expect("entry invalidation header should decode");
+        assert_eq!(entry_header.len as usize, entry.len());
+        assert_eq!(entry_header.error, FUSE_NOTIFY_INVAL_ENTRY);
+        let entry_payload =
+            read_copy::<FuseNotifyInvalEntryOut>(&entry, size_of::<FuseOutHeader>())
+                .expect("entry invalidation payload should decode");
+        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 2));
+        assert_eq!(
+            &entry[size_of::<FuseOutHeader>() + size_of::<FuseNotifyInvalEntryOut>()..],
+            b"\xC3\xA9"
+        );
+    }
+
+    #[test]
+    fn fskit_invalidator_sends_frames_over_live_channel() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound invalidation frame wait");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let invalidator = FsKitKernelInvalidator {
+            control: Arc::clone(&control),
+        };
+
+        invalidator.inval_inode(42);
+        invalidator.inval_inode_attrs(42);
+        invalidator.inval_entry(7, b"\xC3\xA9");
+
+        let read_frame = |peer: &mut UnixStream| {
+            let mut header_bytes = [0_u8; size_of::<FuseOutHeader>()];
+            peer.read_exact(&mut header_bytes)
+                .expect("read invalidation frame header");
+            let header = read_copy::<FuseOutHeader>(&header_bytes, 0)
+                .expect("decode invalidation frame header");
+            assert!(header.len as usize >= size_of::<FuseOutHeader>());
+            let mut frame = header_bytes.to_vec();
+            let mut body = vec![0_u8; header.len as usize - size_of::<FuseOutHeader>()];
+            peer.read_exact(&mut body)
+                .expect("read invalidation frame body");
+            frame.extend_from_slice(&body);
+            frame
+        };
+
+        let inode = read_frame(&mut peer);
+        let inode_header = read_copy::<FuseOutHeader>(&inode, 0).expect("decode inode frame");
+        let inode_payload =
+            read_copy::<FuseNotifyInvalInodeOut>(&inode, size_of::<FuseOutHeader>())
+                .expect("decode inode invalidation payload");
+        assert_eq!(inode_header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(
+            (inode_payload.ino, inode_payload.off, inode_payload.len),
+            (42, 0, 0)
+        );
+
+        let attrs = read_frame(&mut peer);
+        let attrs_header = read_copy::<FuseOutHeader>(&attrs, 0).expect("decode attrs frame");
+        let attrs_payload =
+            read_copy::<FuseNotifyInvalInodeOut>(&attrs, size_of::<FuseOutHeader>())
+                .expect("decode attribute invalidation payload");
+        assert_eq!(attrs_header.error, FUSE_NOTIFY_INVAL_INODE);
+        assert_eq!(
+            (attrs_payload.ino, attrs_payload.off, attrs_payload.len),
+            (42, -1, 0)
+        );
+
+        let entry = read_frame(&mut peer);
+        let entry_header = read_copy::<FuseOutHeader>(&entry, 0).expect("decode entry frame");
+        let entry_payload =
+            read_copy::<FuseNotifyInvalEntryOut>(&entry, size_of::<FuseOutHeader>())
+                .expect("decode entry invalidation payload");
+        assert_eq!(entry_header.error, FUSE_NOTIFY_INVAL_ENTRY);
+        assert_eq!((entry_payload.parent, entry_payload.namelen), (7, 2));
+        assert_eq!(
+            &entry[size_of::<FuseOutHeader>() + size_of::<FuseNotifyInvalEntryOut>()..],
+            b"\xC3\xA9"
+        );
+
+        control.close();
+    }
+
+    #[test]
+    fn fskit_invalidator_tolerates_a_closed_control() {
+        let control = Arc::new(FsKitControl {
+            channel: Mutex::new(None),
+            send_lock: Mutex::new(()),
+            stop_requested: AtomicBool::new(false),
+            mount_point: None,
+            unmount_started: AtomicBool::new(false),
+            unmount_error: Mutex::new(None),
+            unmount_hook: None,
+        });
+        let invalidator = FsKitKernelInvalidator { control };
+
+        invalidator.inval_inode(42);
+        invalidator.inval_inode_attrs(42);
+        invalidator.inval_entry(7, b"alias");
     }
 
     #[test]
@@ -2370,6 +3152,19 @@ mod tests {
     }
 
     #[test]
+    fn fskit_open_reply_preserves_cache_flags() {
+        let cached = low_level::OpenReply::new(1).with_keep_cache(true);
+        let direct = low_level::OpenReply::new(2).with_direct_io(true);
+        let both = low_level::OpenReply::new(3)
+            .with_direct_io(true)
+            .with_keep_cache(true);
+
+        assert_eq!(fskit_open_flags(cached), FOPEN_KEEP_CACHE);
+        assert_eq!(fskit_open_flags(direct), FOPEN_DIRECT_IO);
+        assert_eq!(fskit_open_flags(both), FOPEN_DIRECT_IO | FOPEN_KEEP_CACHE);
+    }
+
+    #[test]
     fn fskit_mount_preflight_rejects_paths_outside_volumes() {
         let result = FsKitSession::mount(Path::new("/tmp/studiofs-fskit-test"), "StudioFS");
 
@@ -2406,8 +3201,80 @@ mod tests {
     }
 
     #[test]
+    fn fskit_setattr_time_rejects_noncanonical_nanoseconds() {
+        assert_eq!(time_to_nanos(1, 1_000_000_000), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn fskit_readlink_reply_payload_is_nul_terminated() {
+        assert_eq!(readlink_reply_payload(b"target".to_vec()), b"target\0");
+    }
+
+    #[test]
     fn fskit_setattr_accepts_lock_owner_modifier() {
         assert!(setattr_flags_supported(FATTR_LOCKOWNER));
         assert!(!setattr_flags_supported(1 << 10));
+    }
+
+    #[test]
+    fn fskit_getxattr_preserves_legacy_position_contract() {
+        let value = b"fork-payload";
+
+        assert_eq!(
+            crate::adapter::xattr_size_from_position(value.len(), 5),
+            value.len() - 5
+        );
+        assert_eq!(
+            getxattr_value_response(value, 5, 32).expect("positioned read should succeed"),
+            &value[5..]
+        );
+        assert_eq!(
+            getxattr_value_response(value, value.len() + 1, 32)
+                .expect("past-end positioned read should succeed"),
+            &b""[..]
+        );
+        assert_eq!(getxattr_value_response(value, 0, 4), Err(libc::ERANGE));
+    }
+
+    #[test]
+    fn fskit_missing_xattr_uses_macos_attribute_errno() {
+        assert_eq!(crate::adapter::xattr_not_found_errno(), libc::ENOATTR);
+    }
+
+    #[test]
+    fn fskit_blocking_namespace_work_runs_off_dispatch_thread() {
+        let runtime = tokio::runtime::Runtime::new().expect("create test runtime");
+        let handle = runtime.handle().clone();
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (returned_sender, returned_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            spawn_blocking_reply_task(&handle, (), move || {
+                entered_sender
+                    .send(std::thread::current().id())
+                    .expect("signal blocking task entry");
+                release_receiver
+                    .recv()
+                    .expect("wait for blocking task release");
+            });
+            returned_sender
+                .send(std::thread::current().id())
+                .expect("signal dispatch thread returned");
+        });
+
+        let dispatch_thread = returned_receiver.recv_timeout(std::time::Duration::from_secs(1));
+        let entered_thread = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered_receiver).await
+        });
+        let release_result = release_sender.send(());
+        let worker_result = worker.join();
+
+        let dispatch_thread = dispatch_thread.expect("dispatch thread must return");
+        let entered_thread = entered_thread
+            .expect("blocking namespace work should start")
+            .expect("blocking task should report entry");
+        release_result.expect("release blocking task");
+        worker_result.expect("join blocking task caller");
+        assert_ne!(dispatch_thread, entered_thread);
     }
 }

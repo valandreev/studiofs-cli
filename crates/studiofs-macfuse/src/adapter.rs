@@ -1167,6 +1167,19 @@ impl StudioVfsAdapter {
         Ok(attr)
     }
 
+    /// Create a hard link to an existing inode.
+    pub(crate) fn link(&self, ino: u64, newparent: u64, newname: &[u8]) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .link(ino, newparent, newname)
+            .inspect(|attr| {
+                self.shared.kernel_inode_liveness.observe(attr.ino);
+            })
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     /// Create and open a regular file.
     #[cfg(test)]
     pub(crate) fn create(
@@ -3603,6 +3616,45 @@ pub extern "C" fn studiofs_macfuse_rename(
     }
 }
 
+/// macFUSE hard-link callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_link(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    newparent: raw::FuseIno,
+    newname: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if newname.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for link callbacks.
+    let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
+    match state.adapter.link(ino, newparent, newname) {
+        Ok(attr) => {
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let _ = Reply::new(request).entry(&entry);
+            }
+        }
+        Err(errno) => {
+            warn!(
+                ino,
+                newparent,
+                newname = %String::from_utf8_lossy(newname),
+                errno,
+                "macFUSE link callback returned error"
+            );
+            reply_error(req, errno);
+        }
+    }
+}
+
 /// macFUSE open callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_open(
@@ -4509,11 +4561,11 @@ fn reply_xattr_size(req: *mut raw::FuseReq, value_len: usize) {
     let _ = Reply::new(request).xattr_size(value_len);
 }
 
-fn xattr_size_from_position(value_len: usize, position: usize) -> usize {
+pub(crate) fn xattr_size_from_position(value_len: usize, position: usize) -> usize {
     value_len.saturating_sub(position)
 }
 
-fn xattr_value_from_position(value: &[u8], position: usize) -> &[u8] {
+pub(crate) fn xattr_value_from_position(value: &[u8], position: usize) -> &[u8] {
     value.get(position..).unwrap_or(&[])
 }
 
@@ -4542,7 +4594,7 @@ fn xattr_name_list_len(names: &[Vec<u8>]) -> usize {
     names.iter().map(|name| name.len() + 1).sum()
 }
 
-fn xattr_not_found_errno() -> i32 {
+pub(crate) fn xattr_not_found_errno() -> i32 {
     libc::ENOATTR
 }
 

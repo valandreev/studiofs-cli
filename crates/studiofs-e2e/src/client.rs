@@ -33,11 +33,14 @@ const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 const MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
 const MACOS_DISKUTIL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(target_os = "macos")]
+const MACOS_MOUNT_TABLE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
 const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
+const E2E_MOUNT_ROOT_ENV: &str = "STUDIOFS_E2E_MOUNT_ROOT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Shared configuration used to create and run a multi-client controller.
@@ -106,6 +109,10 @@ impl ClientControllerConfig {
         scenario_name: &str,
     ) -> Result<Self, ClientControllerError> {
         let env_file = load_dotenv_values()?;
+        let mount_points = configured_mount_points(
+            optional_external_env(&env_file, E2E_MOUNT_ROOT_ENV).as_deref(),
+            DEFAULT_CLIENT_NAMES,
+        )?;
         let sanitized_run_id = sanitize_dns_label(run_id);
         let scenario = sanitize_dns_label(scenario_name);
         let volume_stem = prefixed_dns_name(
@@ -129,7 +136,7 @@ impl ClientControllerConfig {
             mount_ready_timeout: Duration::from_secs(30),
             mount_exit_timeout: Duration::from_secs(60),
             poll_interval: Duration::from_millis(100),
-            mount_points: Vec::new(),
+            mount_points,
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
         })
@@ -143,6 +150,7 @@ impl ClientControllerConfig {
         scenario_name: Option<&str>,
         ports: &[ServicePort],
     ) -> Result<Self, ClientControllerError> {
+        let env_file = load_dotenv_values()?;
         let postgres = service_port(ports, "postgres")?;
         let rustfs = service_port(ports, "rustfs")?;
         let sanitized_run_id = sanitize_dns_label(run_id);
@@ -161,6 +169,10 @@ impl ClientControllerConfig {
             &volume_stem_input,
             S3_BUCKET_NAME_MAX_CHARS,
         );
+        let mount_points = configured_mount_points(
+            optional_external_env(&env_file, E2E_MOUNT_ROOT_ENV).as_deref(),
+            DEFAULT_CLIENT_NAMES,
+        )?;
         Ok(Self {
             studiofs_bin,
             sandbox,
@@ -179,7 +191,7 @@ impl ClientControllerConfig {
             mount_ready_timeout: Duration::from_secs(30),
             mount_exit_timeout: default_compose_mount_exit_timeout(),
             poll_interval: Duration::from_millis(100),
-            mount_points: Vec::new(),
+            mount_points,
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
         })
@@ -580,6 +592,12 @@ pub enum ClientControllerError {
         /// Provided client name string that failed validation.
         String,
     ),
+    /// Configured macOS E2E mount root was not an absolute path.
+    #[error("configured E2E mount root must be absolute: {0}")]
+    InvalidMountRoot(
+        /// Mount root path read from `.env` or the process environment.
+        PathBuf,
+    ),
     /// Unknown client name was requested.
     #[error("unknown E2E client: {0}")]
     UnknownClient(
@@ -710,11 +728,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
 
         self.clients.clear();
+        let mount_root = configured_mount_root_from_environment()?;
         for (index, name) in names.iter().enumerate() {
-            let spec = self.create_client_spec(index, name)?;
+            let spec = self.create_client_spec(index, name, mount_root.as_deref())?;
             self.clients.push(ClientRuntime {
                 spec,
                 process: None,
+                mount_root: mount_root.clone(),
             });
         }
         Ok(())
@@ -930,7 +950,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .map(|runtime| runtime.spec.name.clone())
             .collect::<Vec<_>>();
         for (index, name) in names.iter().enumerate() {
-            self.clients[index].spec = self.create_client_volume_spec(index, name, volume_name)?;
+            let mount_root = self.clients[index].mount_root.clone();
+            self.clients[index].spec =
+                self.create_client_volume_spec(index, name, volume_name, mount_root.as_deref())?;
         }
         Ok(())
     }
@@ -1122,7 +1144,10 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         self.clients[index].spec.process_id = Some(process_id);
         self.clients[index].spec.state = ClientLifecycleState::Mounted;
-        write_mount_metadata(&self.clients[index].spec)?;
+        write_mount_metadata(
+            &self.clients[index].spec,
+            self.clients[index].mount_root.as_deref(),
+        )?;
         self.clients[index].process = Some(process);
         Ok(())
     }
@@ -1277,8 +1302,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         &self,
         index: usize,
         name: &str,
+        mount_root: Option<&Path>,
     ) -> Result<ClientSpec, ClientControllerError> {
-        self.create_client_volume_spec(index, name, &self.config.volume_name)
+        self.create_client_volume_spec(index, name, &self.config.volume_name, mount_root)
     }
 
     fn create_client_volume_spec(
@@ -1286,6 +1312,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         index: usize,
         name: &str,
         volume_name: &str,
+        mount_root: Option<&Path>,
     ) -> Result<ClientSpec, ClientControllerError> {
         let mount_point = self
             .config
@@ -1298,7 +1325,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         fs::create_dir_all(&spec.client_root)?;
         fs::create_dir_all(&spec.cache_dir)?;
         fs::create_dir_all(&spec.mount_metadata_dir)?;
-        write_mount_metadata(&spec)?;
+        write_mount_metadata(&spec, mount_root)?;
         if should_create_mount_point_dir(&spec.mount_point, &spec.mount_metadata_dir) {
             fs::create_dir_all(&spec.mount_point)?;
         }
@@ -1469,6 +1496,7 @@ impl<E> Drop for MultiClientController<E> {
 struct ClientRuntime {
     spec: ClientSpec,
     process: Option<Box<dyn ClientProcess>>,
+    mount_root: Option<PathBuf>,
 }
 
 fn ensure_success(
@@ -1510,6 +1538,41 @@ fn load_dotenv_values() -> Result<BTreeMap<String, String>, ClientControllerErro
         values.insert(key.to_string(), normalize_external_env_value(value));
     }
     Ok(values)
+}
+
+pub(crate) fn configured_mount_root_from_environment()
+-> Result<Option<PathBuf>, ClientControllerError> {
+    let env_file = load_dotenv_values()?;
+    configured_mount_root(optional_external_env(&env_file, E2E_MOUNT_ROOT_ENV).as_deref())
+}
+
+fn configured_mount_points(
+    value: Option<&str>,
+    clients: &[&str],
+) -> Result<Vec<PathBuf>, ClientControllerError> {
+    let Some(root) = configured_mount_root(value)? else {
+        return Ok(Vec::new());
+    };
+    Ok(clients.iter().map(|client| root.join(client)).collect())
+}
+
+fn configured_mount_root(value: Option<&str>) -> Result<Option<PathBuf>, ClientControllerError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !path.is_absolute() {
+            return Err(ClientControllerError::InvalidMountRoot(path));
+        }
+        Ok(Some(path))
+    }
 }
 
 fn find_dotenv_path() -> Result<Option<PathBuf>, ClientControllerError> {
@@ -1880,10 +1943,14 @@ fn verify_local_metadata_db_records(
     Ok(())
 }
 
-fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> {
+fn write_mount_metadata(
+    spec: &ClientSpec,
+    mount_root: Option<&Path>,
+) -> Result<(), ClientControllerError> {
     let payload = serde_json::json!({
         "client": spec.name,
         "mount_point": spec.mount_point.display().to_string(),
+        "mount_root": mount_root.map(|path| path.display().to_string()),
         "process_id": spec.process_id,
     });
     fs::write(
@@ -1967,7 +2034,7 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     Ok(mountinfo_contains_mount_point(&mountinfo, path))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1987,8 +2054,43 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+    macos_mount_is_active(path)
+}
+
+#[cfg(target_os = "macos")]
 fn macos_mount_is_active(mount_point: &Path) -> io::Result<bool> {
-    mount_point_is_active(mount_point)
+    // A stale FSKit vnode can block fs::metadata forever after its worker exits.
+    // Read the mount table instead, and keep the probe itself bounded.
+    let output =
+        run_macos_command_with_timeout("/sbin/mount", &[], None, MACOS_MOUNT_TABLE_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "/sbin/mount exited with {}; stderr: {}",
+            output.status.code().unwrap_or(-1),
+            diagnostic_excerpt(&String::from_utf8_lossy(&output.stderr))
+        )));
+    }
+    macos_mount_is_active_with(mount_point, || Ok(output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_is_active_with(
+    mount_point: &Path,
+    list_mounts: impl FnOnce() -> io::Result<Vec<u8>>,
+) -> io::Result<bool> {
+    Ok(macos_mount_table_contains_mount_point(
+        &list_mounts()?,
+        mount_point,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_table_contains_mount_point(mount_table: &[u8], expected: &Path) -> bool {
+    let marker = format!(" on {} (", expected.display());
+    String::from_utf8_lossy(mount_table)
+        .lines()
+        .any(|line| line.contains(&marker))
 }
 
 #[cfg(target_os = "macos")]
@@ -2194,14 +2296,26 @@ fn run_macos_unmount_attempt_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> io::Result<std::process::Output> {
+    run_macos_command_with_timeout(program, args, Some(path), timeout)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    path: Option<&Path>,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
     let mut stdout_file = create_macos_unmount_output_file("stdout")?;
     let mut stderr_file = create_macos_unmount_output_file("stderr")?;
     let mut command = Command::new(program);
     command
         .args(args)
-        .arg(path)
         .stdout(Stdio::from(stdout_file.try_clone()?))
         .stderr(Stdio::from(stderr_file.try_clone()?));
+    if let Some(path) = path {
+        command.arg(path);
+    }
     ChildJob::prepare_command(&mut command)?;
     let mut child = command.spawn()?;
     let job = match ChildJob::assign_to_child(&child) {
@@ -2212,6 +2326,9 @@ fn run_macos_unmount_attempt_with_timeout(
             return Err(error);
         }
     };
+    let target = path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_owned());
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -2232,7 +2349,7 @@ fn run_macos_unmount_attempt_with_timeout(
             if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
                 let _ = job.force_kill();
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
             }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -2240,7 +2357,7 @@ fn run_macos_unmount_attempt_with_timeout(
                     "{} {} {} timed out after {} ms",
                     program,
                     args.join(" "),
-                    path.display(),
+                    target,
                     timeout.as_millis()
                 ),
             ));
@@ -2493,6 +2610,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mount_metadata_persists_the_external_mount_root() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let spec = client_spec_for(
+            temp.path(),
+            "projectfs",
+            "client-a",
+            PathBuf::from("/Volumes/studiofs-review/client-a/projectfs"),
+        );
+        fs::create_dir_all(&spec.mount_metadata_dir).unwrap();
+
+        write_mount_metadata(&spec, Some(Path::new("/Volumes/studiofs-review"))).unwrap();
+
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(spec.mount_metadata_dir.join("mount-point.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["mount_root"],
+            serde_json::Value::String("/Volumes/studiofs-review".to_string())
+        );
+    }
+
+    #[test]
     fn canonical_local_metadata_db_path_errors_include_client_and_path() {
         let path = Path::new("missing-client-root")
             .join("meta")
@@ -2561,6 +2701,38 @@ mod tests {
                 .iter()
                 .any(|(program, args, _)| *program == "umount" && *args == ["-f"]),
             "macOS stale mount cleanup should fall back to forced umount"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mount_activity_probe_matches_exact_mount_table_entry() {
+        let mount_point = Path::new("/Volumes/studiofs/client-a/projectfs");
+        let mount_table = b"/dev/disk5s1 on /Volumes/Storage (apfs, local)\n\\
+macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
+
+        assert!(
+            macos_mount_is_active_with(mount_point, || Ok(mount_table.to_vec()))
+                .expect("probe mount table")
+        );
+        assert!(
+            !macos_mount_is_active_with(
+                Path::new("/Volumes/studiofs/client-a/projectfs/child"),
+                || Ok(mount_table.to_vec())
+            )
+            .expect("probe child path")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mount_activity_probe_handles_mountpoint_delimiters() {
+        let mount_point = Path::new("/Volumes/studiofs/on (call)/projectfs");
+        let mount_table = b"macfuse on /Volumes/studiofs/on (call)/projectfs (macfuse, local)\n";
+
+        assert!(
+            macos_mount_is_active_with(mount_point, || Ok(mount_table.to_vec()))
+                .expect("probe mount table")
         );
     }
 
@@ -2739,6 +2911,33 @@ mod tests {
             normalize_external_env_value("\"<https://s3.example.test>\""),
             "https://s3.example.test"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_mount_root_assigns_one_external_root_per_client() {
+        let mount_points =
+            configured_mount_points(Some("/Volumes/studiofs"), &["client-a", "client-b"]).unwrap();
+
+        assert_eq!(
+            mount_points,
+            [
+                PathBuf::from("/Volumes/studiofs/client-a"),
+                PathBuf::from("/Volumes/studiofs/client-b"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_mount_root_requires_an_absolute_path() {
+        let error = configured_mount_points(Some("target/e2e-mounts"), &["client-a"]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClientControllerError::InvalidMountRoot(path)
+                if path == Path::new("target/e2e-mounts")
+        ));
     }
 
     #[test]

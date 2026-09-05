@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::client::{
     ClientControllerConfig, ClientControllerError, DEFAULT_CLIENT_NAMES,
     cleanup_stale_mount_before_remount, client_cache_dir, client_mount_point, client_root_dir,
+    configured_mount_root_from_environment,
 };
 use crate::infra::{
     COMPOSE_PROJECT_PREFIX, CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl,
@@ -1161,11 +1162,8 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
         .iter()
         .map(|client| client_root_dir(input.sandbox, client))
         .collect();
-    let mount_roots: Vec<_> = DEFAULT_CLIENT_NAMES
-        .iter()
-        .map(|client| client_mount_point(input.sandbox, client))
-        .collect();
     let probe_host_environment = input.studiofs_bin.is_some() || input.compose_stack.is_some();
+    let mount_roots = report_mount_roots(input.sandbox, probe_host_environment);
     let ownership = if probe_host_environment {
         path_ownership_reports(&client_roots, &mount_roots)
     } else {
@@ -1198,6 +1196,27 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
             .then(detect_macfuse_version)
             .flatten(),
     }
+}
+
+fn report_mount_roots(sandbox: &Path, probe_host_environment: bool) -> Vec<PathBuf> {
+    if probe_host_environment {
+        match configured_mount_root_from_environment() {
+            Ok(Some(root)) => {
+                return DEFAULT_CLIENT_NAMES
+                    .iter()
+                    .map(|client| root.join(client))
+                    .collect();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("studiofs-e2e: could not read configured mount root for report: {error}")
+            }
+        }
+    }
+    DEFAULT_CLIENT_NAMES
+        .iter()
+        .map(|client| client_mount_point(sandbox, client))
+        .collect()
 }
 
 struct EnvironmentOwnership {
@@ -2025,6 +2044,8 @@ fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, Runn
 #[derive(Debug, Deserialize)]
 struct RunnerClientMountMetadata {
     mount_point: PathBuf,
+    #[serde(default)]
+    mount_root: Option<PathBuf>,
 }
 
 fn cleanup_runner_owned_mount_points_before_removal(sandbox: &Path) -> Result<(), RunnerError> {
@@ -2083,7 +2104,12 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
                 continue;
             }
         };
-        if metadata.mount_point.starts_with(sandbox) {
+        if metadata.mount_point.starts_with(sandbox)
+            || metadata
+                .mount_root
+                .as_deref()
+                .is_some_and(|root| root.is_absolute() && metadata.mount_point.starts_with(root))
+        {
             mount_points.insert(metadata.mount_point);
         }
     }
@@ -3573,6 +3599,34 @@ plain child stderr\n",
         let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
 
         assert_eq!(mount_points, vec![mount_a, mount_b]);
+    }
+
+    #[test]
+    fn clean_uses_mount_root_persisted_in_metadata_after_environment_changes() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let sandbox = temp.path().join("e2e-runs").join("persisted-root-run");
+        let mount_root = PathBuf::from("/Volumes").join(format!(
+            "studiofs-sfs-670-{}",
+            temp.path().file_name().unwrap().to_string_lossy()
+        ));
+        let mount_point = mount_root.join("client-a/projectfs");
+        let mount_metadata_dir = sandbox.join("artifacts/clients/client-a/mount");
+        fs::create_dir_all(&mount_metadata_dir).unwrap();
+        fs::write(
+            mount_metadata_dir.join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-a",
+                "mount_point": mount_point,
+                "mount_root": mount_root,
+                "process_id": 101
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_point]);
     }
 
     #[test]

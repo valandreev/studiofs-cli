@@ -227,6 +227,7 @@ Local loopback examples remain available as development/test examples.
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
 | Linux libfuse3 mount | `cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1` |
 | macFUSE read/cache report fields | `cargo test -p studiofs-macfuse repeated_read_report_records_callback_distribution_and_cache_interpretation -- --nocapture` |
+| macFUSE FSKit native mount sanity | `STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- --ignored --nocapture --test-threads=1` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
 ### Local-first VFS fast checks (no S3)
@@ -266,6 +267,33 @@ dummy-endpoint contract.
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the
 complete smoke-test strategy, CI integration, and self-hosted runner contract.
 
+### macOS FSKit native mount sanity
+
+The native FSKit scenarios live in
+`crates/studiofs-macfuse/tests/fskit_mount_sanity.rs`. They are compiled only
+when macOS and `MFMount.framework` are available and are marked `#[ignore]`
+because they require a real host mount. Run them explicitly with a mount root
+on an internal volume:
+
+```bash
+STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation \
+cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The three scenarios cover FSKit read/unmount, pre-cancelled mount cleanup, and
+local hardlink unlink semantics. Each test uses a PID-scoped mountpoint and
+bounded worker cleanup; a worker that remains alive after the cleanup window
+fails the isolated native test process instead of being detached. The live
+channel invalidator check is a non-mounted library test and proves delivery of
+inode, attribute, and entry notification frames separately from native mount
+evidence.
+
+Do not use a removable `/Volumes/Storage` root as native evidence: macOS TCC
+can deny `fskitd` there even when the Rust process can access the checkout.
+These checks validate the macOS bridge only; they do not validate Windows or
+the remaining foreign create/update/rename/unlink parity matrix.
+
 ### Real mounted E2E runner contract
 
 The real E2E runner lives in the `studiofs-e2e` workspace crate and must follow
@@ -274,6 +302,20 @@ runner crate boundary, CLI shape, `target/e2e-runs/<run-id>` sandbox layout,
 required artifact names, report schema, preflight gates, cleanup safety rules,
 and the smoke-first scenario rollout. Real E2E runs stay outside the default
 fast suite.
+
+On macOS, configure the host mount root in the repository `.env` before running
+mounted scenarios:
+
+```dotenv
+STUDIOFS_E2E_MOUNT_ROOT=/Volumes/studiofs
+```
+
+The runner creates one child per logical client below that root, while logs,
+metadata, and reports remain in `target/e2e-runs/<run-id>`. A process
+environment value may override the `.env` value for one run. The configured
+root must be an absolute path on an internal volume; do not use a removable
+`/Volumes/Storage` path as native FSKit evidence because macOS TCC can deny
+`fskitd` there.
 
 Initial runner commands:
 
@@ -347,6 +389,15 @@ rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
 and readdir/stat while mutations are in flight. The overwrite/read scenario
 records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
 `namespace-collision-summary.json`, and `validation.json`.
+
+On macOS, mounted readiness and stale-mount cleanup read the `/sbin/mount`
+table through a bounded helper instead of calling `stat` on the candidate
+FSKit mountpoint. A stale FSKit vnode can block filesystem metadata calls after
+its worker exits; such a timeout remains a failed run and is not treated as a
+clean mount. Graceful FSKit teardown uses the MFMount channel interrupt before
+the normal unmount path. macFUSE 5.3.3 can still leave the handoff stuck after
+an abrupt client kill; if `/sbin/mount`, `umount`, or `diskutil unmount` blocks,
+reboot the host before another native run and retain the failed report.
 
 `mounted-sparse-file-range-convergence` is a deliberate post-1-16 promotion
 scenario. It uses a bounded sparse file, validates zero-filled holes,

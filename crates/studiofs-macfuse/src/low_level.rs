@@ -285,6 +285,8 @@ unsafe extern "C" {
     fn studiofs_macfuse_low_level_ops_has_mknod_callback(ops: *const raw::FuseLowLevelOps)
     -> c_int;
     #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_link_callback(ops: *const raw::FuseLowLevelOps) -> c_int;
+    #[cfg(test)]
     fn studiofs_macfuse_low_level_ops_has_directory_callbacks(
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
@@ -425,6 +427,12 @@ impl LowLevelOperations {
     pub(crate) fn has_mknod_callback(self) -> bool {
         // SAFETY: The C shim only inspects callback pointers in a static table.
         unsafe { studiofs_macfuse_low_level_ops_has_mknod_callback(self.raw) != 0 }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_link_callback(self) -> bool {
+        // SAFETY: The C shim only inspects a callback pointer in a static table.
+        unsafe { studiofs_macfuse_low_level_ops_has_link_callback(self.raw) != 0 }
     }
 
     #[cfg(test)]
