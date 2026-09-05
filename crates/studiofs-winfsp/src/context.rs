@@ -1643,6 +1643,7 @@ impl FileSystemContext for StudioFsContext {
         security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
+        trace!(target: "studiofs_winfsp::metadata_baseline::get_security_by_name", "callback entry");
         if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1676,6 +1677,7 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        trace!(target: "studiofs_winfsp::metadata_baseline::open", "callback entry");
         let open_flags = open_flags_from_access(granted_access, create_options);
         let raw_create_options = current_winfsp_create_options(create_options);
         let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
@@ -1731,6 +1733,7 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn close(&self, context: Self::FileContext) {
+        trace!(target: "studiofs_winfsp::metadata_baseline::close", "callback entry");
         if winfsp_read_cache_diagnostics_enabled() {
             let (read_callbacks, read_callback_bytes) = context.read_callback_snapshot();
             info!(
@@ -1839,6 +1842,7 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        trace!(target: "studiofs_winfsp::metadata_baseline::get_file_info", "callback entry");
         if self.vfs.is_runtime_stats_file_ino(context.ino) {
             *file_info = attr_to_file_info(&self.vfs.runtime_stats_file_attr());
             return Ok(());
@@ -2023,6 +2027,7 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
         // On first call (no marker), populate the DirBuffer with all entries.
+        trace!(target: "studiofs_winfsp::metadata_baseline::read_directory", "callback entry");
         if marker.is_none() {
             let lock = context.dir_buffer.acquire(true, None)?;
             self.populate_directory_buffer(context, &lock)?;
@@ -2057,6 +2062,7 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
+        trace!(target: "studiofs_winfsp::metadata_baseline::cleanup", "callback entry");
         // Current dirty-handle ordering is:
         //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
         //

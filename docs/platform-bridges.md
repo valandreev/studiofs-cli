@@ -5,6 +5,11 @@ translate OS-specific filesystem callbacks into `StudioVfs` method calls.
 
 ## Overview
 
+The [shared metadata-cache coherence contract](metadata-cache-coherence.md)
+defines invalidation intents, health and policy semantics for the Windows-first
+cache work. Its [Windows baseline](perf/sfs-675-windows-metadata-baseline.md)
+records current behavior and the separate promotion requirements.
+
 ```
 ┌──────────────────────┐     ┌──────────────────────┐
 │   studiofs-winfsp    │     │   studiofs-macfuse    │
