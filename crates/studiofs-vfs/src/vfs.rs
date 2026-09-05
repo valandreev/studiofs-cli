@@ -1311,6 +1311,14 @@ impl AttrReadCache {
     }
 
     fn retire_inode_observation(&mut self, ino: Ino) {
+        if !self.inode_observation_generations.contains_key(&ino)
+            && self.inode_observation_generations.len() >= self.inner.entry_budget.max(1)
+        {
+            // Evicting a token without knowing whether a reader still holds it
+            // would allow an old result to repopulate the cache. A conservative
+            // global epoch keeps the map bounded while preserving that barrier.
+            self.retire_observations();
+        }
         let generation = self.inode_observation_generations.entry(ino).or_default();
         *generation = generation.saturating_add(1);
     }

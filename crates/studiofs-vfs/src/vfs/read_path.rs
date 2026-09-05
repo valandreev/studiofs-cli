@@ -1164,7 +1164,7 @@ impl<'a> ReadMetadataResolver<'a> {
         }
     }
 
-    fn resolve_attr_sync(&self) -> VfsResult<InodeAttr> {
+    fn resolve_attr_sync(&mut self) -> VfsResult<InodeAttr> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
         }
@@ -1177,7 +1177,7 @@ impl<'a> ReadMetadataResolver<'a> {
         self.load_attr_from_meta_sync()
     }
 
-    async fn resolve_attr(&self) -> VfsResult<InodeAttr> {
+    async fn resolve_attr(&mut self) -> VfsResult<InodeAttr> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
         }
@@ -1190,7 +1190,7 @@ impl<'a> ReadMetadataResolver<'a> {
         self.load_attr_from_meta().await
     }
 
-    async fn resolve_for_read(&self, offset: u64, buffer_len: u64) -> VfsResult<ReadMetadata> {
+    async fn resolve_for_read(&mut self, offset: u64, buffer_len: u64) -> VfsResult<ReadMetadata> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(ReadMetadata {
                 attr,
@@ -1329,7 +1329,7 @@ impl<'a> ReadMetadataResolver<'a> {
         Ok(Some(dirty_attr))
     }
 
-    fn cached_attr(&self) -> VfsResult<Option<InodeAttr>> {
+    fn cached_attr(&mut self) -> VfsResult<Option<InodeAttr>> {
         let cached_attr = self
             .vfs
             .state
@@ -1373,12 +1373,13 @@ impl<'a> ReadMetadataResolver<'a> {
                 remote_attr.committed_content_epoch,
                 false,
             );
+            self.refresh_attr_observation();
         }
         self.cache_attr(&remote_attr);
         Ok(Some(remote_attr))
     }
 
-    async fn cached_attr_async(&self) -> VfsResult<Option<InodeAttr>> {
+    async fn cached_attr_async(&mut self) -> VfsResult<Option<InodeAttr>> {
         let Some(cached_attr) = self
             .vfs
             .state
@@ -1427,9 +1428,20 @@ impl<'a> ReadMetadataResolver<'a> {
                 remote_attr.committed_content_epoch,
                 false,
             );
+            self.refresh_attr_observation();
         }
         self.cache_attr(&remote_attr);
         Ok(Some(remote_attr))
+    }
+
+    fn refresh_attr_observation(&mut self) {
+        self.attr_observation = self
+            .vfs
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .observation(self.ino);
     }
 
     fn cache_attr(&self, attr: &InodeAttr) {
@@ -2150,6 +2162,17 @@ mod tests {
         let cache = vfs.state.namespace.attr_read_cache.lock();
         assert!(!cache.contains(first.ino));
         assert!(cache.contains(second.ino));
+    }
+
+    #[test]
+    fn attr_observation_tokens_remain_bounded_by_cache_capacity() {
+        let mut cache = AttrReadCache::new(2, 1024);
+        cache.remove(1);
+        cache.remove(2);
+        cache.remove(3);
+
+        assert!(cache.inode_observation_generations.len() <= 2);
+        assert_eq!(cache.observation_generation, 1);
     }
 
     use super::super::local_dirty::PendingPayload;
