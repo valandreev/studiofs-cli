@@ -178,6 +178,24 @@ fn send_unix_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(unix)]
+fn reap_child_with_timeout(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(unix)]
 fn unmount_unix(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -> Result<()> {
     use std::time::Duration;
 
@@ -239,7 +257,7 @@ fn detach_unix_mount(mount_point: &str, timeout: std::time::Duration) -> Result<
             }
             if Instant::now() > deadline {
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = reap_child_with_timeout(&mut child, CHILD_REAP_TIMEOUT);
                 anyhow::bail!("{bin} -u did not finish within {}s", timeout.as_secs());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -297,7 +315,7 @@ fn run_macos_unmount_command(
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = reap_child_with_timeout(&mut child, CHILD_REAP_TIMEOUT);
             anyhow::bail!(
                 "{program} {} {mount_point} did not finish within {} ms",
                 args.join(" "),
@@ -630,6 +648,32 @@ mod tests {
             vec!["detach", "signal"],
             "FUSE mount must be detached before the mount process receives SIGTERM"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_reap_timeout_is_bounded() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("start long-lived child");
+        let started = Instant::now();
+
+        let reaped = reap_child_with_timeout(&mut child, Duration::ZERO);
+
+        assert!(
+            !reaped,
+            "running child should not be reaped with zero timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "bounded reap exceeded its zero-timeout budget"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "macos")]

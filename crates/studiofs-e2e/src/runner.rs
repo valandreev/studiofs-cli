@@ -2044,6 +2044,8 @@ fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, Runn
 #[derive(Debug, Deserialize)]
 struct RunnerClientMountMetadata {
     mount_point: PathBuf,
+    #[serde(default)]
+    mount_root: Option<PathBuf>,
 }
 
 fn cleanup_runner_owned_mount_points_before_removal(sandbox: &Path) -> Result<(), RunnerError> {
@@ -2069,7 +2071,6 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
         return Ok(Vec::new());
     }
 
-    let configured_mount_root = configured_mount_root_from_environment()?;
     let mut mount_points = BTreeSet::new();
     for entry in fs::read_dir(clients_dir)? {
         let entry = entry?;
@@ -2103,13 +2104,11 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
                 continue;
             }
         };
-        let client_mount_root = configured_mount_root
-            .as_ref()
-            .and_then(|root| client_dir.file_name().map(|name| root.join(name)));
         if metadata.mount_point.starts_with(sandbox)
-            || client_mount_root
-                .as_ref()
-                .is_some_and(|root| metadata.mount_point.starts_with(root))
+            || metadata
+                .mount_root
+                .as_deref()
+                .is_some_and(|root| root.is_absolute() && metadata.mount_point.starts_with(root))
         {
             mount_points.insert(metadata.mount_point);
         }
@@ -3600,6 +3599,34 @@ plain child stderr\n",
         let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
 
         assert_eq!(mount_points, vec![mount_a, mount_b]);
+    }
+
+    #[test]
+    fn clean_uses_mount_root_persisted_in_metadata_after_environment_changes() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let sandbox = temp.path().join("e2e-runs").join("persisted-root-run");
+        let mount_root = PathBuf::from("/Volumes").join(format!(
+            "studiofs-sfs-670-{}",
+            temp.path().file_name().unwrap().to_string_lossy()
+        ));
+        let mount_point = mount_root.join("client-a/projectfs");
+        let mount_metadata_dir = sandbox.join("artifacts/clients/client-a/mount");
+        fs::create_dir_all(&mount_metadata_dir).unwrap();
+        fs::write(
+            mount_metadata_dir.join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-a",
+                "mount_point": mount_point,
+                "mount_root": mount_root,
+                "process_id": 101
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_point]);
     }
 
     #[test]

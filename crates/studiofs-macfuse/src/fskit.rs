@@ -598,7 +598,6 @@ fn setattr_flags_supported(valid: u32) -> bool {
     (valid & !FATTR_SUPPORTED) == 0
 }
 
-#[derive(Debug)]
 struct FsKitControl {
     channel: Mutex<Option<NonNull<c_void>>>,
     send_lock: Mutex<()>,
@@ -606,6 +605,8 @@ struct FsKitControl {
     mount_point: Option<CString>,
     unmount_started: AtomicBool,
     unmount_error: Mutex<Option<io::Error>>,
+    #[cfg(test)]
+    unmount_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 // Channel lifetime is guarded by the channel mutex plus per-operation retained
@@ -623,6 +624,25 @@ impl FsKitControl {
             mount_point,
             unmount_started: AtomicBool::new(false),
             unmount_error: Mutex::new(None),
+            #[cfg(test)]
+            unmount_hook: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_unmount_hook(
+        channel: NonNull<c_void>,
+        mount_point: Option<CString>,
+        unmount_hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            channel: Mutex::new(Some(channel)),
+            send_lock: Mutex::new(()),
+            stop_requested: AtomicBool::new(false),
+            mount_point,
+            unmount_started: AtomicBool::new(false),
+            unmount_error: Mutex::new(None),
+            unmount_hook: Some(unmount_hook),
         })
     }
 
@@ -639,9 +659,8 @@ impl FsKitControl {
         // SeqCst makes the stop request visible to the session loop even when
         // mount completion and cancellation race.
         self.stop_requested.store(true, Ordering::SeqCst);
-        // macFUSE 5.3.3 added an explicit wakeup for blocked receives. Keep
-        // the actual unmount on the regular session thread, like the low-level
-        // backend, so the signal watcher never enters a blocking system call.
+        // macFUSE 5.3.3 added an explicit wakeup for blocked receives. The
+        // session starts native unmount on its worker after observing this flag.
         let Some(channel) = self.retained_channel() else {
             return;
         };
@@ -657,6 +676,11 @@ impl FsKitControl {
         // Completion, cancellation, and drop can all arrive here. Only one
         // caller may issue the system unmount; the session owns channel close.
         if self.unmount_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.unmount_hook {
+            hook();
             return;
         }
         if let Some(mount_point) = &self.mount_point {
@@ -737,6 +761,7 @@ struct FsKitSession {
     control: Arc<FsKitControl>,
     mount_result: Receiver<Result<(), i32>>,
     mount_thread: Option<std::thread::JoinHandle<()>>,
+    unmount_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FsKitSession {
@@ -787,10 +812,51 @@ impl FsKitSession {
             control,
             mount_result,
             mount_thread: Some(mount_thread),
+            unmount_thread: None,
         })
     }
 
-    fn run(&self, dispatcher: &FsKitDispatcher) -> io::Result<()> {
+    fn start_unmount(&mut self) -> io::Result<()> {
+        if self.unmount_thread.is_some() {
+            return Ok(());
+        }
+        let control = Arc::clone(&self.control);
+        let worker = std::thread::Builder::new()
+            .name("macfuse-fskit-unmount".into())
+            .spawn(move || control.unmount())
+            .map_err(|error| {
+                io::Error::other(format!("failed to start FSKit unmount worker: {error}"))
+            })?;
+        self.unmount_thread = Some(worker);
+        Ok(())
+    }
+
+    fn wait_for_unmount(&mut self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(worker) = self.unmount_thread.as_ref() else {
+                return Ok(());
+            };
+            if worker.is_finished() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FSKit native unmount worker did not finish before the deadline",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let Some(worker) = self.unmount_thread.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| io::Error::other("FSKit unmount worker panicked"))
+    }
+
+    fn run(&mut self, dispatcher: &FsKitDispatcher) -> io::Result<()> {
         // macFUSE 5.3.3 local mounts send INIT before MFMount returns. Keep
         // dispatching during startup or mount and receive wait on each other.
         let mut mounted = false;
@@ -811,7 +877,7 @@ impl FsKitSession {
                 let deadline = shutdown_deadline
                     .get_or_insert_with(|| Instant::now() + FS_KIT_SHUTDOWN_TIMEOUT);
                 if mounted {
-                    self.control.unmount();
+                    self.start_unmount()?;
                 }
                 if Instant::now() >= *deadline {
                     return Err(io::Error::new(
@@ -872,8 +938,17 @@ impl FsKitSession {
 impl Drop for FsKitSession {
     fn drop(&mut self) {
         self.control.request_exit();
-        self.control.unmount();
+        let _ = self.start_unmount();
+        // The normal path waits before closing; Drop must stay bounded if the
+        // native syscall is stuck in the kernel.
         self.control.close();
+        if let Some(unmount_thread) = self.unmount_thread.take() {
+            if unmount_thread.is_finished() {
+                let _ = unmount_thread.join();
+            } else {
+                warn!("FSKit unmount worker did not finish before session drop");
+            }
+        }
         if let Some(mount_thread) = self.mount_thread.take() {
             let _ = mount_thread.join();
         }
@@ -2399,7 +2474,17 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
     dispatcher.cancel_pending();
     vfs.clear_kernel_invalidator();
     callback_state.wait_for_reply_tasks();
-    session.control.unmount();
+    let unmount_result = session
+        .start_unmount()
+        .and_then(|_| session.wait_for_unmount(FS_KIT_SHUTDOWN_TIMEOUT))
+        .and_then(|_| {
+            session
+                .control
+                .unmount_error
+                .lock()
+                .take()
+                .map_or(Ok(()), Err)
+        });
     drop(dispatcher);
     session.control.close();
     if let Some(worker) = session.mount_thread.take() {
@@ -2407,12 +2492,6 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
             .join()
             .map_err(|_| io::Error::other("FSKit mount worker panicked"))?;
     }
-    let unmount_result = session
-        .control
-        .unmount_error
-        .lock()
-        .take()
-        .map_or(Ok(()), Err);
     result.and(unmount_result)
 }
 
@@ -2546,10 +2625,11 @@ mod tests {
                 .expect("create channel");
         let control = FsKitControl::new(channel, None);
         let (mount_sender, mount_receiver) = mpsc::channel();
-        let session = FsKitSession {
+        let mut session = FsKitSession {
             control: Arc::clone(&control),
             mount_result: mount_receiver,
             mount_thread: None,
+            unmount_thread: None,
         };
         let dispatcher = FsKitDispatcher::new(
             Arc::new(CallbackState::new(
@@ -2594,6 +2674,83 @@ mod tests {
             .expect("DESTROY requires a reply");
         let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode DESTROY reply");
         assert_eq!((header.unique, header.error), (23, 0));
+    }
+
+    #[test]
+    fn fskit_run_dispatches_destroy_while_native_unmount_is_blocked() {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-unmount-worker")
+                .expect("create VFS fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let release_receiver = Arc::new(Mutex::new(release_receiver));
+        let hook_release_receiver = Arc::clone(&release_receiver);
+        let unmount_hook = Arc::new(move || {
+            entered_sender.send(()).expect("report unmount start");
+            hook_release_receiver
+                .lock()
+                .recv()
+                .expect("release blocked unmount worker");
+        });
+        let control = FsKitControl::new_with_unmount_hook(channel, None, unmount_hook);
+        let (mount_sender, mount_receiver) = mpsc::channel();
+        let mut session = FsKitSession {
+            control: Arc::clone(&control),
+            mount_result: mount_receiver,
+            mount_thread: None,
+            unmount_thread: None,
+        };
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                true,
+            )),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = session.run(&dispatcher);
+            done_sender.send(result).expect("report session result");
+        });
+
+        control.request_exit();
+        mount_sender
+            .send(Ok(()))
+            .expect("report successful mount before DESTROY");
+        let entered = entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+
+        let mut destroy = vec![0_u8; size_of::<FuseInHeader>()];
+        destroy[..4].copy_from_slice(&(size_of::<FuseInHeader>() as u32).to_ne_bytes());
+        destroy[4..8].copy_from_slice(&FUSE_DESTROY.to_ne_bytes());
+        destroy[8..16].copy_from_slice(&29_u64.to_ne_bytes());
+        let destroy_sent = peer.write_all(&destroy).is_ok();
+        let session_finished_while_unmount_blocked = done_receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+
+        let _ = release_sender.send(());
+        worker.join().expect("join session worker");
+
+        assert!(entered, "native unmount worker did not start");
+        assert!(destroy_sent, "send DESTROY");
+        assert!(
+            session_finished_while_unmount_blocked,
+            "session dispatcher blocked behind native unmount"
+        );
     }
 
     #[test]
@@ -2658,10 +2815,11 @@ mod tests {
                 .expect("create channel");
         let control = FsKitControl::new(channel, None);
         let (mount_sender, mount_receiver) = mpsc::channel();
-        let session = FsKitSession {
+        let mut session = FsKitSession {
             control: Arc::clone(&control),
             mount_result: mount_receiver,
             mount_thread: None,
+            unmount_thread: None,
         };
         let dispatcher = FsKitDispatcher::new(
             Arc::new(CallbackState::new(
@@ -2924,6 +3082,7 @@ mod tests {
             mount_point: None,
             unmount_started: AtomicBool::new(false),
             unmount_error: Mutex::new(None),
+            unmount_hook: None,
         });
         let invalidator = FsKitKernelInvalidator { control };
 

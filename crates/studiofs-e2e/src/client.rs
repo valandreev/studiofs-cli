@@ -728,11 +728,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
 
         self.clients.clear();
+        let mount_root = configured_mount_root_from_environment()?;
         for (index, name) in names.iter().enumerate() {
-            let spec = self.create_client_spec(index, name)?;
+            let spec = self.create_client_spec(index, name, mount_root.as_deref())?;
             self.clients.push(ClientRuntime {
                 spec,
                 process: None,
+                mount_root: mount_root.clone(),
             });
         }
         Ok(())
@@ -948,7 +950,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .map(|runtime| runtime.spec.name.clone())
             .collect::<Vec<_>>();
         for (index, name) in names.iter().enumerate() {
-            self.clients[index].spec = self.create_client_volume_spec(index, name, volume_name)?;
+            let mount_root = self.clients[index].mount_root.clone();
+            self.clients[index].spec =
+                self.create_client_volume_spec(index, name, volume_name, mount_root.as_deref())?;
         }
         Ok(())
     }
@@ -1140,7 +1144,10 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         self.clients[index].spec.process_id = Some(process_id);
         self.clients[index].spec.state = ClientLifecycleState::Mounted;
-        write_mount_metadata(&self.clients[index].spec)?;
+        write_mount_metadata(
+            &self.clients[index].spec,
+            self.clients[index].mount_root.as_deref(),
+        )?;
         self.clients[index].process = Some(process);
         Ok(())
     }
@@ -1295,8 +1302,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         &self,
         index: usize,
         name: &str,
+        mount_root: Option<&Path>,
     ) -> Result<ClientSpec, ClientControllerError> {
-        self.create_client_volume_spec(index, name, &self.config.volume_name)
+        self.create_client_volume_spec(index, name, &self.config.volume_name, mount_root)
     }
 
     fn create_client_volume_spec(
@@ -1304,6 +1312,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         index: usize,
         name: &str,
         volume_name: &str,
+        mount_root: Option<&Path>,
     ) -> Result<ClientSpec, ClientControllerError> {
         let mount_point = self
             .config
@@ -1316,7 +1325,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         fs::create_dir_all(&spec.client_root)?;
         fs::create_dir_all(&spec.cache_dir)?;
         fs::create_dir_all(&spec.mount_metadata_dir)?;
-        write_mount_metadata(&spec)?;
+        write_mount_metadata(&spec, mount_root)?;
         if should_create_mount_point_dir(&spec.mount_point, &spec.mount_metadata_dir) {
             fs::create_dir_all(&spec.mount_point)?;
         }
@@ -1487,6 +1496,7 @@ impl<E> Drop for MultiClientController<E> {
 struct ClientRuntime {
     spec: ClientSpec,
     process: Option<Box<dyn ClientProcess>>,
+    mount_root: Option<PathBuf>,
 }
 
 fn ensure_success(
@@ -1933,10 +1943,14 @@ fn verify_local_metadata_db_records(
     Ok(())
 }
 
-fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> {
+fn write_mount_metadata(
+    spec: &ClientSpec,
+    mount_root: Option<&Path>,
+) -> Result<(), ClientControllerError> {
     let payload = serde_json::json!({
         "client": spec.name,
         "mount_point": spec.mount_point.display().to_string(),
+        "mount_root": mount_root.map(|path| path.display().to_string()),
         "process_id": spec.process_id,
     });
     fs::write(
@@ -2594,6 +2608,29 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_metadata_persists_the_external_mount_root() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let spec = client_spec_for(
+            temp.path(),
+            "projectfs",
+            "client-a",
+            PathBuf::from("/Volumes/studiofs-review/client-a/projectfs"),
+        );
+        fs::create_dir_all(&spec.mount_metadata_dir).unwrap();
+
+        write_mount_metadata(&spec, Some(Path::new("/Volumes/studiofs-review"))).unwrap();
+
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(spec.mount_metadata_dir.join("mount-point.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["mount_root"],
+            serde_json::Value::String("/Volumes/studiofs-review".to_string())
+        );
+    }
 
     #[test]
     fn canonical_local_metadata_db_path_errors_include_client_and_path() {
