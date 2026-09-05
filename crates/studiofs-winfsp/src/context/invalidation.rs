@@ -176,8 +176,6 @@ struct WinfspInvalidationQueueState {
     coalesced: u64,
     snapshot_generation: u64,
     notification_batches_in_flight: usize,
-    #[cfg(test)]
-    waiting_producers: usize,
 }
 
 /// Bounded, coalescing queue shared by WinFSP invalidation producers and the
@@ -185,7 +183,6 @@ struct WinfspInvalidationQueueState {
 #[derive(Debug)]
 pub struct WinfspInvalidationQueue {
     state: Mutex<WinfspInvalidationQueueState>,
-    not_full: Condvar,
     quiescent: Condvar,
     metrics_vfs: Weak<StudioVfs>,
 }
@@ -195,7 +192,6 @@ impl WinfspInvalidationQueue {
     pub fn new(vfs: &Arc<StudioVfs>) -> Arc<Self> {
         let queue = Arc::new(Self {
             state: Mutex::new(WinfspInvalidationQueueState::default()),
-            not_full: Condvar::new(),
             quiescent: Condvar::new(),
             metrics_vfs: Arc::downgrade(vfs),
         });
@@ -229,10 +225,13 @@ impl WinfspInvalidationQueue {
             filter,
         };
         let mut state = self.state.lock();
-        // Retry runs on the sole consumer: never wait for this same consumer to drain.
-        if state.closed
-            || (!state.pending.contains(&key)
-                && state.pending.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY)
+        if state.closed {
+            state.delivery.failed_notifications =
+                state.delivery.failed_notifications.saturating_add(1);
+            return;
+        }
+        if !state.pending.contains(&key)
+            && state.pending.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY
         {
             state.delivery.failed_notifications =
                 state.delivery.failed_notifications.saturating_add(1);
@@ -263,7 +262,7 @@ impl WinfspInvalidationQueue {
         state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
     }
 
-    fn defer_for_writer(&self, vfs: &StudioVfs, path: &str) -> bool {
+    pub(super) fn defer_for_writer(&self, vfs: &StudioVfs, path: &str) -> bool {
         let deferred = match vfs
             .namespace_resolver(NamespacePathStyle::Windows)
             .resolve_path(path)
@@ -273,7 +272,7 @@ impl WinfspInvalidationQueue {
                 studiofs_meta::MetaError::EntryNotFound { .. }
                 | studiofs_meta::MetaError::InodeNotFound(_),
             )) => false,
-            Err(_) => true,
+            Err(_) => false,
         };
         if deferred {
             let mut state = self.state.lock();
@@ -355,7 +354,41 @@ impl WinfspInvalidationQueue {
         let mut targets = Vec::new();
         let mut keys = HashSet::new();
         let mut writer_deferred = false;
-        for intent in &batch.intents {
+        let mut entry_targets_by_index = HashMap::new();
+        let mut entry_paths_by_ino: HashMap<Ino, Vec<(String, FileType)>> = HashMap::new();
+        for (index, intent) in batch.intents.iter().enumerate() {
+            let InvalidationIntent::Entry {
+                parent,
+                name,
+                ancestors,
+                ino: entry_ino,
+            } = intent
+            else {
+                continue;
+            };
+            match resolve_entry_notification_targets(
+                &vfs,
+                *parent,
+                name,
+                ancestors.as_ref(),
+                *entry_ino,
+            ) {
+                Ok(entry_targets) => {
+                    for (ino, path, kind, _, _) in &entry_targets {
+                        entry_paths_by_ino
+                            .entry(*ino)
+                            .or_default()
+                            .push((path.clone(), *kind));
+                    }
+                    entry_targets_by_index.insert(index, entry_targets);
+                }
+                Err(failure) if acceptance != InvalidationAcceptance::Failed => {
+                    acceptance = failure;
+                }
+                Err(_) => {}
+            }
+        }
+        for (index, intent) in batch.intents.iter().enumerate() {
             let mut add = |ino, path: String, kind, action, filter| {
                 if self.defer_inode_writer(&vfs, ino) || self.defer_for_writer(&vfs, &path) {
                     writer_deferred = true;
@@ -388,64 +421,12 @@ impl WinfspInvalidationQueue {
             let result = (|| {
                 match intent {
                     InvalidationIntent::Reset => return Err(InvalidationAcceptance::Unsupported),
-                    InvalidationIntent::Entry {
-                        parent,
-                        name,
-                        ancestors,
-                        ino: entry_ino,
-                    } => {
-                        let current_parent = ino_to_windows_path(&vfs, *parent);
-                        let parent_path = if let Some(components) = ancestors {
-                            let mut path = "\\".to_string();
-                            for component in components {
-                                path = append_entry_path(&path, component)
-                                    .ok_or(InvalidationAcceptance::Failed)?;
-                            }
-                            path
-                        } else {
-                            current_parent
-                                .clone()
-                                .ok_or(InvalidationAcceptance::Failed)?
-                        };
-                        let path = append_entry_path(&parent_path, name)
+                    InvalidationIntent::Entry { .. } => {
+                        let entry_targets = entry_targets_by_index
+                            .get(&index)
                             .ok_or(InvalidationAcceptance::Failed)?;
-                        let current_entry = match vfs.meta().lookup(*parent, name) {
-                            Ok(entry) => Some(entry),
-                            Err(
-                                studiofs_meta::MetaError::EntryNotFound { .. }
-                                | studiofs_meta::MetaError::InodeNotFound(_),
-                            ) => None,
-                            Err(_) => return Err(InvalidationAcceptance::Failed),
-                        };
-                        let historical = current_parent.as_ref() != Some(&parent_path);
-                        let (ino, kind, action) = match &current_entry {
-                            Some(entry) if !historical => (
-                                entry_ino.unwrap_or(entry.ino),
-                                entry.kind,
-                                FILE_ACTION_MODIFIED,
-                            ),
-                            Some(entry) => (
-                                entry_ino.unwrap_or(entry.ino),
-                                entry.kind,
-                                FILE_ACTION_REMOVED,
-                            ),
-                            _ => (
-                                entry_ino.unwrap_or(0),
-                                FileType::RegularFile,
-                                FILE_ACTION_REMOVED,
-                            ),
-                        };
-                        // Native WinFSP purges content regardless of filter; filters
-                        // select change reports, not the strength of invalidation.
-                        let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
-                        add(ino, path, kind, action, filter)?;
-                        if historical
-                            && let (Some(parent_path), Some(entry)) =
-                                (current_parent, current_entry)
-                        {
-                            let path = append_entry_path(&parent_path, name)
-                                .ok_or(InvalidationAcceptance::Failed)?;
-                            add(entry.ino, path, entry.kind, FILE_ACTION_MODIFIED, filter)?;
+                        for (ino, path, kind, action, filter) in entry_targets {
+                            add(*ino, path.clone(), *kind, *action, *filter)?;
                         }
                     }
                     InvalidationIntent::Attributes { ino }
@@ -464,8 +445,19 @@ impl WinfspInvalidationQueue {
                             }
                             _ => FILE_NOTIFY_CHANGE_ATTRIBUTES,
                         };
-                        for path in inode_notification_paths(&vfs, *ino, attr.kind, attr.nlink)? {
-                            add(*ino, path, attr.kind, FILE_ACTION_MODIFIED, filter)?;
+                        let paths = if let Some(paths) = entry_paths_by_ino.get(ino) {
+                            paths.clone()
+                        } else if attr.kind == FileType::Directory || attr.nlink <= 1 {
+                            vec![(
+                                ino_to_windows_path(&vfs, *ino)
+                                    .ok_or(InvalidationAcceptance::Failed)?,
+                                attr.kind,
+                            )]
+                        } else {
+                            return Err(InvalidationAcceptance::Failed);
+                        };
+                        for (path, kind) in paths {
+                            add(*ino, path, kind, FILE_ACTION_MODIFIED, filter)?;
                         }
                     }
                 }
@@ -498,31 +490,23 @@ impl WinfspInvalidationQueue {
         state: &mut parking_lot::MutexGuard<'_, WinfspInvalidationQueueState>,
         key: NotificationKey,
     ) -> bool {
-        loop {
-            if state.closed {
-                return false;
-            }
-            if state.pending.contains(&key) {
-                state.coalesced = state.coalesced.saturating_add(1);
-                return true;
-            }
-            if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
-                state.pending.insert(key.clone());
-                state.order.push_back(key);
-                state.queue_peak = state.queue_peak.max(state.pending.len());
-                return true;
-            }
-            #[cfg(test)]
-            {
-                state.waiting_producers = state.waiting_producers.saturating_add(1);
-                self.not_full.notify_all();
-            }
-            self.not_full.wait(state);
-            #[cfg(test)]
-            {
-                state.waiting_producers = state.waiting_producers.saturating_sub(1);
-            }
+        if state.closed {
+            state.delivery.failed_notifications =
+                state.delivery.failed_notifications.saturating_add(1);
+            return false;
         }
+        if state.pending.contains(&key) {
+            state.coalesced = state.coalesced.saturating_add(1);
+            return true;
+        }
+        if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
+            state.pending.insert(key.clone());
+            state.order.push_back(key);
+            state.queue_peak = state.queue_peak.max(state.pending.len());
+            return true;
+        }
+        state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
+        false
     }
 
     #[cfg(test)]
@@ -545,10 +529,10 @@ impl WinfspInvalidationQueue {
         mark_notification_in_flight: bool,
     ) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
         let mut state = self.state.lock();
-        let mut inodes: Vec<_> = state.order.drain(..).collect();
+        let order = std::mem::take(&mut state.order);
         state.pending.clear();
-        let targets = inodes
-            .drain(..)
+        let targets = order
+            .into_iter()
             .map(|key| {
                 let ino = match &key {
                     NotificationKey::Inode(ino) | NotificationKey::Path { ino, .. } => *ino,
@@ -560,7 +544,6 @@ impl WinfspInvalidationQueue {
             state.notification_batches_in_flight =
                 state.notification_batches_in_flight.saturating_add(1);
         }
-        self.not_full.notify_all();
         self.quiescent.notify_all();
         let snapshot = (!targets.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
@@ -593,7 +576,6 @@ impl WinfspInvalidationQueue {
     pub(crate) fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
-        self.not_full.notify_all();
         self.quiescent.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
@@ -625,18 +607,6 @@ impl WinfspInvalidationQueue {
         state.notification_batches_in_flight =
             state.notification_batches_in_flight.saturating_sub(1);
         self.quiescent.notify_all();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn wait_until_producer_blocked(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut state = self.state.lock();
-        while state.waiting_producers == 0 {
-            if self.not_full.wait_until(&mut state, deadline).timed_out() {
-                return state.waiting_producers > 0;
-            }
-        }
-        true
     }
 
     fn next_metrics_snapshot(
@@ -675,49 +645,69 @@ fn append_entry_path(parent: &str, name: &[u8]) -> Option<String> {
     Some(format!("{}\\{}", parent.trim_end_matches('\\'), name))
 }
 
-fn inode_notification_paths(
+type EntryNotificationTarget = (Ino, String, FileType, u32, u32);
+
+fn resolve_entry_notification_targets(
     vfs: &StudioVfs,
-    ino: Ino,
-    kind: FileType,
-    nlink: u32,
-) -> Result<Vec<String>, InvalidationAcceptance> {
-    if kind == FileType::Directory || nlink <= 1 {
-        return ino_to_windows_path(vfs, ino)
-            .map(|path| vec![path])
-            .ok_or(InvalidationAcceptance::Failed);
-    }
-    // The metadata port has no reverse alias index. Enumerate the local serving
-    // namespace with a fixed work bound; incomplete coverage rejects the batch.
-    let mut directories = VecDeque::from([(studiofs_meta::ROOT_INO, "\\".to_string())]);
-    let mut seen = HashSet::new();
-    let mut inspected = 0usize;
-    let mut paths = Vec::new();
-    while let Some((parent, parent_path)) = directories.pop_front() {
-        if !seen.insert(parent) {
-            continue;
+    parent: Ino,
+    name: &[u8],
+    ancestors: Option<&Vec<Vec<u8>>>,
+    entry_ino: Option<Ino>,
+) -> Result<Vec<EntryNotificationTarget>, InvalidationAcceptance> {
+    let current_parent = ino_to_windows_path(vfs, parent);
+    let historical_parent = if let Some(components) = ancestors {
+        let mut path = "\\".to_string();
+        for component in components {
+            path = append_entry_path(&path, component).ok_or(InvalidationAcceptance::Failed)?;
         }
-        for entry in vfs
-            .readdir(parent)
-            .map_err(|_| InvalidationAcceptance::Failed)?
-        {
-            inspected += 1;
-            if inspected > WINFSP_INVALIDATION_QUEUE_CAPACITY {
-                return Err(InvalidationAcceptance::Failed);
-            }
-            let path = append_entry_path(&parent_path, &entry.name)
-                .ok_or(InvalidationAcceptance::Failed)?;
-            if entry.ino == ino {
-                paths.push(path.clone());
-                if paths.len() == nlink as usize {
-                    return Ok(paths);
-                }
-            }
-            if entry.kind == FileType::Directory {
-                directories.push_back((entry.ino, path));
-            }
-        }
+        path
+    } else {
+        current_parent
+            .clone()
+            .ok_or(InvalidationAcceptance::Failed)?
+    };
+    let historical_path =
+        append_entry_path(&historical_parent, name).ok_or(InvalidationAcceptance::Failed)?;
+    let current_entry = match vfs.meta().lookup(parent, name) {
+        Ok(entry) => Some(entry),
+        Err(
+            studiofs_meta::MetaError::EntryNotFound { .. }
+            | studiofs_meta::MetaError::InodeNotFound(_),
+        ) => None,
+        Err(_) => return Err(InvalidationAcceptance::Failed),
+    };
+    let historical = current_parent.as_ref() != Some(&historical_parent);
+    let (ino, kind, action) = match &current_entry {
+        Some(entry) if !historical => (
+            entry_ino.unwrap_or(entry.ino),
+            entry.kind,
+            FILE_ACTION_MODIFIED,
+        ),
+        Some(entry) => (
+            entry_ino.unwrap_or(entry.ino),
+            entry.kind,
+            FILE_ACTION_REMOVED,
+        ),
+        _ => (
+            entry_ino.unwrap_or(0),
+            FileType::RegularFile,
+            FILE_ACTION_REMOVED,
+        ),
+    };
+    let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
+    let mut targets = vec![(ino, historical_path, kind, action, filter)];
+    if historical && let (Some(current_parent), Some(entry)) = (current_parent, current_entry) {
+        let current_path =
+            append_entry_path(&current_parent, name).ok_or(InvalidationAcceptance::Failed)?;
+        targets.push((
+            entry.ino,
+            current_path,
+            entry.kind,
+            FILE_ACTION_MODIFIED,
+            filter,
+        ));
     }
-    Err(InvalidationAcceptance::Failed)
+    Ok(targets)
 }
 
 /// Bridges VFS metadata invalidation to WinFSP's

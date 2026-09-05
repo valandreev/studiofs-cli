@@ -5058,7 +5058,7 @@ mod tests {
     }
 
     #[test]
-    fn winfsp_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
+    fn winfsp_invalidation_queue_drops_distinct_inode_at_capacity_without_blocking() {
         let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-backpressure");
         let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
         for ino in 0..capacity as u64 {
@@ -5073,53 +5073,47 @@ mod tests {
         });
 
         assert!(
-            queue.wait_until_producer_blocked(std::time::Duration::from_secs(1)),
-            "producer should enter the full-queue wait"
-        );
-        assert!(
             finished_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "a distinct inode must wait while the bounded queue is full"
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok(),
+            "a full queue must not block a foreground producer"
         );
-
-        assert_eq!(queue.drain().len(), capacity);
-        finished_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .expect("draining the queue should release the producer");
         producer.join().expect("test producer should join");
-        assert_eq!(queue.drain(), vec![capacity as u64]);
+        assert_eq!(queue.drain().len(), capacity);
+        assert_eq!(queue.delivery_snapshot().failed_notifications, 1);
     }
 
     #[test]
-    fn winfsp_invalidation_queue_close_wakes_blocked_producer() {
+    fn winfsp_invalidation_queue_push_after_close_is_nonblocking() {
         let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-close");
-        let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
-        for ino in 0..capacity as u64 {
-            queue.push(ino);
-        }
+        queue.close();
 
         let producer_queue = Arc::clone(&queue);
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
-            producer_queue.push(capacity as u64);
+            producer_queue.push(1);
             finished_tx.send(()).expect("test producer finished");
         });
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("closed queue should reject producer immediately");
+        producer.join().expect("test producer should join");
+        assert_eq!(queue.delivery_snapshot().failed_notifications, 1);
+    }
+
+    #[test]
+    fn defer_for_writer_drops_unresolvable_path_instead_of_retrying() {
+        let (_tmp, vfs, _ctx, queue) = make_test_context("invalid-writer-path");
+        let file = vfs
+            .create(ROOT_INO, b"regular", 0, 0, 0o644)
+            .expect("create file");
+
         assert!(
-            queue.wait_until_producer_blocked(std::time::Duration::from_secs(1)),
-            "producer should enter the full-queue wait"
+            !queue.defer_for_writer(&vfs, r"\regular\child"),
+            "a path-resolution error must not be treated as an active writer"
         );
-
-        queue.close();
-
-        let finished = finished_rx.recv_timeout(std::time::Duration::from_secs(1));
-        if finished.is_err() {
-            queue.drain();
-        }
-        producer
-            .join()
-            .expect("closed queue should release producer");
-        finished.expect("closed queue should wake blocked producer");
+        assert_eq!(queue.delivery_snapshot().deferred_notifications, 0);
+        assert_eq!(file.kind, FileType::RegularFile);
     }
 
     #[test]
@@ -5477,6 +5471,18 @@ mod tests {
                 &InvalidationBatch {
                     generation: 1,
                     intents: vec![
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"first".to_vec(),
+                            ancestors: Some(vec![]),
+                            ino: Some(file.ino),
+                        },
+                        InvalidationIntent::Entry {
+                            parent: dir.ino,
+                            name: b"second".to_vec(),
+                            ancestors: Some(vec![b"nested".to_vec()]),
+                            ino: Some(file.ino),
+                        },
                         InvalidationIntent::Attributes { ino: file.ino },
                         InvalidationIntent::Content { ino: file.ino },
                     ]
@@ -5486,7 +5492,7 @@ mod tests {
             InvalidationAcceptance::Queued
         );
         let prepared = ctx.should_notify().expect("aliases prepared");
-        assert_eq!(prepared.len(), 4);
+        assert_eq!(prepared.len(), 6);
         for path in [r"\first", r"\nested\second"] {
             assert!(
                 prepared.iter().any(|event| event.path == path

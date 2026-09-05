@@ -104,7 +104,7 @@ impl InvalidationJournal {
         self.generation = self.generation.saturating_add(1);
         if self.count + pending.intents.len() > MAX_INVALIDATION_INTENTS
             || pending.bytes > MAX_INVALIDATION_BYTES.saturating_sub(self.bytes)
-            || pending.intents.contains(&InvalidationIntent::Reset)
+            || matches!(pending.intents.first(), Some(InvalidationIntent::Reset))
         {
             self.batches.clear();
             self.count = 0;

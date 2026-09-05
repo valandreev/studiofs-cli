@@ -1788,12 +1788,6 @@ impl StudioVfs {
 
         let meta = self.sync_meta();
         let observed = self.namespace_cache_token_for_parent(ino);
-        let attr_observation = self
-            .state
-            .namespace
-            .attr_read_cache
-            .lock()
-            .observation_generation;
         let mut entries = meta.readdir(ino)?;
         if ino == super::ROOT_INO {
             entries.retain(|entry| {
@@ -1831,6 +1825,13 @@ impl StudioVfs {
                 .map(|entry| entry.ino)
                 .take(self.readdir_attr_batch_max_inodes)
                 .collect::<Vec<_>>();
+            let attr_observations = {
+                let attr_cache = self.state.namespace.attr_read_cache.lock();
+                entries
+                    .iter()
+                    .map(|entry| (entry.ino, attr_cache.observation(entry.ino)))
+                    .collect::<HashMap<_, _>>()
+            };
             let mut attrs = Vec::new();
             let attr_batch_len = self
                 .readdir_attr_batch_chunk
@@ -1848,13 +1849,15 @@ impl StudioVfs {
             let mut attr_cache = self.state.namespace.attr_read_cache.lock();
             for entry in &entries {
                 if let Some(attr) = attrs_by_ino.get(&entry.ino) {
-                    attr_cache.put_observed(
-                        entry.ino,
-                        attr.clone(),
-                        ATTR_CACHE_TTL,
-                        now,
-                        attr_observation,
-                    );
+                    if let Some(observation) = attr_observations.get(&entry.ino).copied() {
+                        attr_cache.put_observed(
+                            entry.ino,
+                            attr.clone(),
+                            ATTR_CACHE_TTL,
+                            now,
+                            observation,
+                        );
+                    }
                 } else {
                     attr_cache.remove(entry.ino);
                 }

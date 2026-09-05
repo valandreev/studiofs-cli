@@ -1876,6 +1876,40 @@ mod tests {
     }
 
     #[test]
+    fn readdir_dangling_entry_does_not_reject_later_observed_attrs() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-observation-after-dangling");
+        let dangling = vfs
+            .create(ROOT_INO, b"a-dangling.txt", 1000, 1000, 0o644)
+            .expect("create dangling file");
+        let surviving = vfs
+            .create(ROOT_INO, b"z-surviving.txt", 1000, 1000, 0o644)
+            .expect("create surviving file");
+        vfs.getattr(dangling.ino)
+            .expect("prime dangling attr cache");
+        vfs.getattr(surviving.ino)
+            .expect("prime surviving attr cache");
+        meta.remove_attr(dangling.ino)
+            .expect("remove attr while leaving dentry behind");
+        vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .remove(surviving.ino);
+
+        vfs.readdir(ROOT_INO).expect("readdir root");
+
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(surviving.ino),
+            "a dangling entry must not invalidate later observations in the same readdir"
+        );
+    }
+
+    #[test]
     fn rmdir_heals_dangling_children_before_empty_check() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "rmdir-dangling-child");

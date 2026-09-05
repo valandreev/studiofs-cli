@@ -492,13 +492,17 @@ impl StudioVfs {
         use studiofs_meta::coherence::InvalidationIntent;
 
         let mut deferred = false;
+        let mut attr_inodes = HashSet::new();
+        let mut full_content_inodes = HashSet::new();
+        let mut namespace_parents = HashSet::new();
+        let mut reset = false;
         batch.intents.retain(|intent| {
             match intent {
                 InvalidationIntent::Attributes { ino } | InvalidationIntent::Content { ino } => {
-                    self.invalidate_attr_read_cache([*ino]);
+                    attr_inodes.insert(*ino);
                     let full = matches!(intent, InvalidationIntent::Content { .. });
                     if full {
-                        self.retire_os_cache_inode(*ino);
+                        full_content_inodes.insert(*ino);
                     }
                     if self.should_skip_kernel_invalidation_for_active_open(*ino, full) {
                         deferred = true;
@@ -507,20 +511,33 @@ impl StudioVfs {
                 }
                 InvalidationIntent::Entry { parent, name, .. } => {
                     self.dentry_cache_invalidate(*parent, name);
-                    self.bump_namespace_for_parents([*parent]);
+                    namespace_parents.insert(*parent);
                 }
                 InvalidationIntent::Directory { ino } => {
                     self.dentry_cache_invalidate_parent(*ino);
-                    self.invalidate_attr_read_cache([*ino]);
-                    self.bump_namespace_for_parents([*ino]);
+                    attr_inodes.insert(*ino);
+                    namespace_parents.insert(*ino);
                 }
                 InvalidationIntent::Reset => {
-                    self.bump_namespace_epoch();
-                    self.invalidate_attr_read_cache(self.runtime_namespace_invalidation_inodes());
+                    reset = true;
                 }
             }
             true
         });
+        if reset {
+            self.bump_namespace_epoch();
+            self.retire_all_attr_read_observations();
+            attr_inodes.extend(self.runtime_namespace_invalidation_inodes());
+        }
+        if !attr_inodes.is_empty() {
+            self.invalidate_attr_read_cache(attr_inodes);
+        }
+        for ino in full_content_inodes {
+            self.retire_os_cache_inode(ino);
+        }
+        if !namespace_parents.is_empty() {
+            self.bump_namespace_for_parents(namespace_parents);
+        }
         self.bump_acl_namespace_epoch();
         if deferred {
             debug!(
@@ -793,8 +810,6 @@ impl StudioVfs {
         inodes: impl IntoIterator<Item = Ino>,
     ) -> Vec<Ino> {
         let mut cache = self.state.namespace.attr_read_cache.lock();
-        // Reset must reject in-flight observations even when no entry is cached yet.
-        cache.retire_observations();
         let mut read_plan_cache = self.state.read.published_read_plan_cache.lock();
         let mut removed = Vec::new();
         for ino in inodes {
@@ -805,6 +820,14 @@ impl StudioVfs {
             }
         }
         removed
+    }
+
+    pub(super) fn retire_all_attr_read_observations(&self) {
+        self.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .retire_observations();
     }
 
     pub(super) fn read_cache_invalidation_set(

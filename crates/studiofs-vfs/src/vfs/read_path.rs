@@ -1151,17 +1151,12 @@ pub(super) struct PreparedForegroundRead {
 struct ReadMetadataResolver<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
-    attr_observation: u64,
+    attr_observation: super::AttrReadObservation,
 }
 
 impl<'a> ReadMetadataResolver<'a> {
     fn new(vfs: &'a StudioVfs, ino: Ino) -> Self {
-        let attr_observation = vfs
-            .state
-            .namespace
-            .attr_read_cache
-            .lock()
-            .observation_generation;
+        let attr_observation = vfs.state.namespace.attr_read_cache.lock().observation(ino);
         Self {
             vfs,
             ino,
@@ -2120,6 +2115,41 @@ mod tests {
                     .contains(ROOT_INO)
             );
         }
+    }
+
+    #[test]
+    fn targeted_attribute_invalidation_keeps_unrelated_observation_admissible() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-observation-per-inode");
+        let _guard = rt.enter();
+        let first = vfs
+            .create(ROOT_INO, b"first", 0, 0, 0o644)
+            .expect("create first");
+        let second = vfs
+            .create(ROOT_INO, b"second", 0, 0, 0o644)
+            .expect("create second");
+        vfs.state.namespace.attr_read_cache.lock().remove(first.ino);
+        vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .remove(second.ino);
+        let first_resolver = ReadMetadataResolver::new(&vfs, first.ino);
+        let second_resolver = ReadMetadataResolver::new(&vfs, second.ino);
+        let first_attr = meta.get_attr(first.ino).expect("read first attr");
+        let second_attr = meta.get_attr(second.ino).expect("read second attr");
+
+        vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+            generation: 1,
+            intents: vec![InvalidationIntent::Attributes { ino: first.ino }],
+        });
+        first_resolver.cache_attr(&first_attr);
+        second_resolver.cache_attr(&second_attr);
+
+        let cache = vfs.state.namespace.attr_read_cache.lock();
+        assert!(!cache.contains(first.ino));
+        assert!(cache.contains(second.ino));
     }
 
     use super::super::local_dirty::PendingPayload;
