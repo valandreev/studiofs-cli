@@ -3605,7 +3605,12 @@ plain child stderr\n",
     fn clean_uses_mount_root_persisted_in_metadata_after_environment_changes() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let sandbox = temp.path().join("e2e-runs").join("persisted-root-run");
-        let mount_root = PathBuf::from("/Volumes").join(format!(
+        let mount_root_base = if cfg!(windows) {
+            PathBuf::from("Z:\\")
+        } else {
+            PathBuf::from("/Volumes")
+        };
+        let mount_root = mount_root_base.join(format!(
             "studiofs-sfs-670-{}",
             temp.path().file_name().unwrap().to_string_lossy()
         ));
