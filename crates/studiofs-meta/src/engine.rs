@@ -986,6 +986,11 @@ pub trait MetaReplication: Send + Sync {
         None
     }
 
+    /// Drain committed invalidation scopes for the single mounted cache consumer.
+    fn take_invalidation_batches(&self) -> Vec<crate::coherence::InvalidationBatch> {
+        Vec::new()
+    }
+
     /// Best-effort diagnostics for push-plus-poll metadata invalidation.
     fn metadata_invalidation_diagnostics(&self) -> MetadataInvalidationDiagnostics {
         MetadataInvalidationDiagnostics::default()

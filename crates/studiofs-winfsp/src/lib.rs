@@ -11,7 +11,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-pub use context::{StudioFsContext, WinfspInvalidationQueue, WinfspKernelInvalidator};
+pub use context::{
+    StudioFsContext, WinfspDeliverySnapshot, WinfspInvalidationQueue, WinfspKernelInvalidator,
+};
 use thiserror::Error;
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 

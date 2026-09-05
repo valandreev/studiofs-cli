@@ -5,7 +5,9 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
 use studiofs_meta::{FileType, Ino};
+use studiofs_vfs::coherence::InvalidationAcceptance;
 use studiofs_vfs::{KernelInvalidator, NamespacePathStyle, StudioVfs, VfsFuseInvalidationSnapshot};
 use tracing::{debug, trace, warn};
 use winfsp::filesystem::WideNameInfo;
@@ -21,7 +23,7 @@ pub(super) const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
 pub(super) const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
 pub(super) const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
 pub(super) const FILE_ACTION_REMOVED: u32 = 0x0000_0002;
-/// Maximum number of distinct inode invalidations retained by WinFSP.
+/// Maximum number of distinct notification targets retained by WinFSP.
 pub const WINFSP_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 
 pub(super) fn notify_filter_for_kind(kind: FileType) -> u32 {
@@ -103,12 +105,18 @@ impl Drop for PreparedWinfspNotifications {
             // Requeue the batch so a transient begin failure cannot leave
             // the OS cache permanently stale.
             if !self.published {
+                {
+                    let mut state = queue.state.lock();
+                    state.delivery.retried_batches =
+                        state.delivery.retried_batches.saturating_add(1);
+                }
                 for notification in &self.notifications {
                     queue.push_path(
                         notification.ino,
                         notification.path.clone(),
                         notification.kind,
                         notification.action,
+                        notification.info.filter,
                     );
                 }
             }
@@ -117,25 +125,57 @@ impl Drop for PreparedWinfspNotifications {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum NotificationKey {
+    Inode(Ino),
+    Path {
+        ino: Ino,
+        path: String,
+        action: u32,
+        filter: u32,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+/// Queue acceptance and native submission diagnostics; submission is not delivery.
+pub struct WinfspDeliverySnapshot {
+    /// Highest generation fully accepted into the bounded queue.
+    pub queued_generation: Option<u64>,
+    /// Native delivery is unobservable through winfsp::Notifier and remains unknown.
+    pub delivered_generation: Option<u64>,
+    /// Batches rejected due to capacity, closure, or unresolved targets.
+    pub failed_batches: u64,
+    /// Batches containing unsupported reset requests.
+    pub unsupported_batches: u64,
+    /// Notifications submitted to a native API that discards its status.
+    pub submitted_notifications: u64,
+    /// Prepared batches retried because NotifyBegin did not accept them.
+    pub retried_batches: u64,
+    /// Targets that could not be prepared or retained for retry.
+    pub failed_notifications: u64,
+    /// Native purges suppressed to preserve an active local writer.
+    pub deferred_notifications: u64,
+}
+
 #[derive(Debug)]
 struct WinfspInvalidationOverride {
     path: String,
     kind: FileType,
     action: u32,
+    filter: u32,
 }
 
 #[derive(Debug, Default)]
 struct WinfspInvalidationQueueState {
     closed: bool,
-    order: VecDeque<Ino>,
-    pending: HashSet<Ino>,
-    path_overrides: HashMap<Ino, WinfspInvalidationOverride>,
+    order: VecDeque<NotificationKey>,
+    pending: HashSet<NotificationKey>,
+    path_overrides: HashMap<NotificationKey, WinfspInvalidationOverride>,
+    delivery: WinfspDeliverySnapshot,
     queue_peak: usize,
     coalesced: u64,
     snapshot_generation: u64,
     notification_batches_in_flight: usize,
-    #[cfg(test)]
-    waiting_producers: usize,
 }
 
 /// Bounded, coalescing queue shared by WinFSP invalidation producers and the
@@ -143,7 +183,6 @@ struct WinfspInvalidationQueueState {
 #[derive(Debug)]
 pub struct WinfspInvalidationQueue {
     state: Mutex<WinfspInvalidationQueueState>,
-    not_full: Condvar,
     quiescent: Condvar,
     metrics_vfs: Weak<StudioVfs>,
 }
@@ -153,7 +192,6 @@ impl WinfspInvalidationQueue {
     pub fn new(vfs: &Arc<StudioVfs>) -> Arc<Self> {
         let queue = Arc::new(Self {
             state: Mutex::new(WinfspInvalidationQueueState::default()),
-            not_full: Condvar::new(),
             quiescent: Condvar::new(),
             metrics_vfs: Arc::downgrade(vfs),
         });
@@ -168,7 +206,7 @@ impl WinfspInvalidationQueue {
     pub(crate) fn push(&self, ino: Ino) {
         let snapshot = {
             let mut state = self.state.lock();
-            if self.push_locked(&mut state, ino) {
+            if self.push_locked(&mut state, NotificationKey::Inode(ino)) {
                 Some(Self::next_metrics_snapshot(&mut state))
             } else {
                 None
@@ -179,66 +217,307 @@ impl WinfspInvalidationQueue {
         }
     }
 
-    fn push_path(&self, ino: Ino, path: String, kind: FileType, action: u32) {
-        let snapshot = {
-            let mut state = self.state.lock();
-            if state.closed {
-                None
-            } else {
-                state
-                    .path_overrides
-                    .insert(ino, WinfspInvalidationOverride { path, kind, action });
-                self.push_locked(&mut state, ino)
-                    .then(|| Self::next_metrics_snapshot(&mut state))
-            }
+    fn push_path(&self, ino: Ino, path: String, kind: FileType, action: u32, filter: u32) {
+        let key = NotificationKey::Path {
+            ino,
+            path: path.clone(),
+            action,
+            filter,
         };
-        if let Some(snapshot) = snapshot {
-            self.record_metrics(snapshot);
+        let mut state = self.state.lock();
+        if state.closed {
+            state.delivery.failed_notifications =
+                state.delivery.failed_notifications.saturating_add(1);
+            return;
         }
+        if !state.pending.contains(&key)
+            && state.pending.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY
+        {
+            state.delivery.failed_notifications =
+                state.delivery.failed_notifications.saturating_add(1);
+            return;
+        }
+        state.path_overrides.insert(
+            key.clone(),
+            WinfspInvalidationOverride {
+                path,
+                kind,
+                action,
+                filter,
+            },
+        );
+        self.push_locked(&mut state, key);
+        let snapshot = Self::next_metrics_snapshot(&mut state);
+        drop(state);
+        self.record_metrics(snapshot);
+    }
+
+    /// Returns local acceptance and native submission diagnostics.
+    pub fn delivery_snapshot(&self) -> WinfspDeliverySnapshot {
+        self.state.lock().delivery
+    }
+
+    fn record_failed_notification(&self) {
+        let mut state = self.state.lock();
+        state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
+    }
+
+    pub(super) fn defer_for_writer(&self, vfs: &StudioVfs, path: &str) -> bool {
+        let deferred = match vfs
+            .namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_path(path)
+        {
+            Ok(attr) => vfs.defer_kernel_invalidation_for_active_writer(attr.ino),
+            Err(studiofs_vfs::VfsError::Meta(
+                studiofs_meta::MetaError::EntryNotFound { .. }
+                | studiofs_meta::MetaError::InodeNotFound(_),
+            )) => false,
+            Err(_) => false,
+        };
+        if deferred {
+            let mut state = self.state.lock();
+            state.delivery.deferred_notifications =
+                state.delivery.deferred_notifications.saturating_add(1);
+        }
+        deferred
+    }
+
+    fn defer_inode_writer(&self, vfs: &StudioVfs, ino: Ino) -> bool {
+        if !vfs.defer_kernel_invalidation_for_active_writer(ino) {
+            return false;
+        }
+        let mut state = self.state.lock();
+        state.delivery.deferred_notifications =
+            state.delivery.deferred_notifications.saturating_add(1);
+        true
+    }
+
+    fn enqueue_batch(
+        &self,
+        batch: &InvalidationBatch,
+        generation_complete: bool,
+    ) -> InvalidationAcceptance {
+        let (targets, acceptance) = self.resolve_batch(batch);
+        let mut state = self.state.lock();
+        if state.closed {
+            state.delivery.failed_batches = state.delivery.failed_batches.saturating_add(1);
+            return InvalidationAcceptance::Failed;
+        }
+        let additional = targets
+            .iter()
+            .filter(|(key, _)| !state.pending.contains(key))
+            .count();
+        if state.pending.len().saturating_add(additional) > WINFSP_INVALIDATION_QUEUE_CAPACITY {
+            state.delivery.failed_batches = state.delivery.failed_batches.saturating_add(1);
+            return InvalidationAcceptance::Failed;
+        }
+        match acceptance {
+            InvalidationAcceptance::Failed => {
+                state.delivery.failed_batches = state.delivery.failed_batches.saturating_add(1)
+            }
+            InvalidationAcceptance::Unsupported => {
+                state.delivery.unsupported_batches =
+                    state.delivery.unsupported_batches.saturating_add(1)
+            }
+            InvalidationAcceptance::Queued => (),
+        }
+        for (key, target) in targets {
+            state.path_overrides.insert(key.clone(), target);
+            self.push_locked(&mut state, key);
+        }
+        if generation_complete && acceptance == InvalidationAcceptance::Queued {
+            state.delivery.queued_generation = Some(
+                state
+                    .delivery
+                    .queued_generation
+                    .unwrap_or(0)
+                    .max(batch.generation),
+            );
+        }
+        let snapshot = Self::next_metrics_snapshot(&mut state);
+        drop(state);
+        self.record_metrics(snapshot);
+        acceptance
+    }
+
+    fn resolve_batch(
+        &self,
+        batch: &InvalidationBatch,
+    ) -> (
+        Vec<(NotificationKey, WinfspInvalidationOverride)>,
+        InvalidationAcceptance,
+    ) {
+        let Some(vfs) = self.metrics_vfs.upgrade() else {
+            return (Vec::new(), InvalidationAcceptance::Failed);
+        };
+        let mut acceptance = InvalidationAcceptance::Queued;
+        let mut targets = Vec::new();
+        let mut keys = HashSet::new();
+        let mut writer_deferred = false;
+        let mut entry_targets_by_index = HashMap::new();
+        let mut entry_paths_by_ino: HashMap<Ino, Vec<(String, FileType)>> = HashMap::new();
+        for (index, intent) in batch.intents.iter().enumerate() {
+            let InvalidationIntent::Entry {
+                parent,
+                name,
+                ancestors,
+                ino: entry_ino,
+            } = intent
+            else {
+                continue;
+            };
+            match resolve_entry_notification_targets(
+                &vfs,
+                *parent,
+                name,
+                ancestors.as_ref(),
+                *entry_ino,
+            ) {
+                Ok(entry_targets) => {
+                    for (ino, path, kind, _, _) in &entry_targets {
+                        entry_paths_by_ino
+                            .entry(*ino)
+                            .or_default()
+                            .push((path.clone(), *kind));
+                    }
+                    entry_targets_by_index.insert(index, entry_targets);
+                }
+                Err(failure) if acceptance != InvalidationAcceptance::Failed => {
+                    acceptance = failure;
+                }
+                Err(_) => {}
+            }
+        }
+        for (index, intent) in batch.intents.iter().enumerate() {
+            let mut add = |ino, path: String, kind, action, filter| {
+                if self.defer_inode_writer(&vfs, ino) || self.defer_for_writer(&vfs, &path) {
+                    writer_deferred = true;
+                }
+                if path.encode_utf16().count() >= 512 || path.contains('\0') {
+                    return Err(InvalidationAcceptance::Failed);
+                }
+                let key = NotificationKey::Path {
+                    ino,
+                    path: path.clone(),
+                    action,
+                    filter,
+                };
+                if !keys.contains(&key) && keys.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY {
+                    return Err(InvalidationAcceptance::Failed);
+                }
+                if keys.insert(key.clone()) {
+                    targets.push((
+                        key,
+                        WinfspInvalidationOverride {
+                            path,
+                            kind,
+                            action,
+                            filter,
+                        },
+                    ));
+                }
+                Ok(())
+            };
+            let result = (|| {
+                match intent {
+                    InvalidationIntent::Reset => return Err(InvalidationAcceptance::Unsupported),
+                    InvalidationIntent::Entry { .. } => {
+                        let entry_targets = entry_targets_by_index
+                            .get(&index)
+                            .ok_or(InvalidationAcceptance::Failed)?;
+                        for (ino, path, kind, action, filter) in entry_targets {
+                            add(*ino, path.clone(), *kind, *action, *filter)?;
+                        }
+                    }
+                    InvalidationIntent::Attributes { ino }
+                    | InvalidationIntent::Content { ino }
+                    | InvalidationIntent::Directory { ino } => {
+                        let attr = vfs
+                            .meta()
+                            .get_attr(*ino)
+                            .map_err(|_| InvalidationAcceptance::Failed)?;
+                        let filter = match intent {
+                            InvalidationIntent::Content { .. } => {
+                                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE
+                            }
+                            InvalidationIntent::Directory { .. } => {
+                                FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME
+                            }
+                            _ => FILE_NOTIFY_CHANGE_ATTRIBUTES,
+                        };
+                        let paths = if let Some(paths) = entry_paths_by_ino.get(ino) {
+                            paths.clone()
+                        } else if attr.kind == FileType::Directory || attr.nlink <= 1 {
+                            vec![(
+                                ino_to_windows_path(&vfs, *ino)
+                                    .ok_or(InvalidationAcceptance::Failed)?,
+                                attr.kind,
+                            )]
+                        } else {
+                            return Err(InvalidationAcceptance::Failed);
+                        };
+                        for (path, kind) in paths {
+                            add(*ino, path, kind, FILE_ACTION_MODIFIED, filter)?;
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(failure) = result
+                && acceptance != InvalidationAcceptance::Failed
+            {
+                acceptance = failure;
+            }
+        }
+        if writer_deferred {
+            acceptance = InvalidationAcceptance::Failed;
+        }
+        (targets, acceptance)
     }
 
     pub(crate) fn push_deleted_path(&self, ino: Ino, path: String, kind: FileType) {
-        self.push_path(ino, path, kind, FILE_ACTION_REMOVED);
+        self.push_path(
+            ino,
+            path,
+            kind,
+            FILE_ACTION_REMOVED,
+            notify_filter_for_kind(kind),
+        );
     }
 
     fn push_locked(
         &self,
         state: &mut parking_lot::MutexGuard<'_, WinfspInvalidationQueueState>,
-        ino: Ino,
+        key: NotificationKey,
     ) -> bool {
-        loop {
-            if state.closed {
-                return false;
-            }
-            if state.pending.contains(&ino) {
-                state.coalesced = state.coalesced.saturating_add(1);
-                return true;
-            }
-            if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
-                state.pending.insert(ino);
-                state.order.push_back(ino);
-                state.queue_peak = state.queue_peak.max(state.pending.len());
-                return true;
-            }
-            #[cfg(test)]
-            {
-                state.waiting_producers = state.waiting_producers.saturating_add(1);
-                self.not_full.notify_all();
-            }
-            self.not_full.wait(state);
-            #[cfg(test)]
-            {
-                state.waiting_producers = state.waiting_producers.saturating_sub(1);
-            }
+        if state.closed {
+            state.delivery.failed_notifications =
+                state.delivery.failed_notifications.saturating_add(1);
+            return false;
         }
+        if state.pending.contains(&key) {
+            state.coalesced = state.coalesced.saturating_add(1);
+            return true;
+        }
+        if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
+            state.pending.insert(key.clone());
+            state.order.push_back(key);
+            state.queue_peak = state.queue_peak.max(state.pending.len());
+            return true;
+        }
+        state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
+        false
     }
 
     #[cfg(test)]
     pub(crate) fn drain(&self) -> Vec<Ino> {
-        self.drain_targets(false)
+        let mut inodes: Vec<_> = self
+            .drain_targets(false)
             .into_iter()
             .map(|(ino, _)| ino)
-            .collect()
+            .collect();
+        inodes.sort_unstable();
+        inodes
     }
 
     fn drain_for_notify(&self) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
@@ -250,21 +529,25 @@ impl WinfspInvalidationQueue {
         mark_notification_in_flight: bool,
     ) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
         let mut state = self.state.lock();
-        let mut inodes: Vec<_> = state.order.drain(..).collect();
+        let order = std::mem::take(&mut state.order);
         state.pending.clear();
-        let mut targets = inodes
-            .drain(..)
-            .map(|ino| (ino, state.path_overrides.remove(&ino)))
+        let targets = order
+            .into_iter()
+            .map(|key| {
+                let ino = match &key {
+                    NotificationKey::Inode(ino) | NotificationKey::Path { ino, .. } => *ino,
+                };
+                (ino, state.path_overrides.remove(&key))
+            })
             .collect::<Vec<_>>();
         if mark_notification_in_flight && !targets.is_empty() {
             state.notification_batches_in_flight =
                 state.notification_batches_in_flight.saturating_add(1);
         }
-        self.not_full.notify_all();
         self.quiescent.notify_all();
         let snapshot = (!targets.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
-        targets.sort_unstable_by_key(|(ino, _)| *ino);
+        // Keep insertion order for old/new namespace names. Legacy test drains sort separately.
         if let Some(snapshot) = snapshot {
             self.record_metrics(snapshot);
         }
@@ -276,7 +559,7 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         let mut changed = false;
         for ino in inodes {
-            changed |= self.push_locked(&mut state, ino);
+            changed |= self.push_locked(&mut state, NotificationKey::Inode(ino));
         }
         let snapshot = changed.then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
@@ -293,7 +576,6 @@ impl WinfspInvalidationQueue {
     pub(crate) fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
-        self.not_full.notify_all();
         self.quiescent.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
@@ -327,18 +609,6 @@ impl WinfspInvalidationQueue {
         self.quiescent.notify_all();
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_until_producer_blocked(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut state = self.state.lock();
-        while state.waiting_producers == 0 {
-            if self.not_full.wait_until(&mut state, deadline).timed_out() {
-                return state.waiting_producers > 0;
-            }
-        }
-        true
-    }
-
     fn next_metrics_snapshot(
         state: &mut WinfspInvalidationQueueState,
     ) -> VfsFuseInvalidationSnapshot {
@@ -367,6 +637,79 @@ pub(super) fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
         .path_for_inode(ino)
 }
 
+fn append_entry_path(parent: &str, name: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(name).ok()?;
+    if name.is_empty() || name.contains(['\\', '/', '\0']) || name == "." || name == ".." {
+        return None;
+    }
+    Some(format!("{}\\{}", parent.trim_end_matches('\\'), name))
+}
+
+type EntryNotificationTarget = (Ino, String, FileType, u32, u32);
+
+fn resolve_entry_notification_targets(
+    vfs: &StudioVfs,
+    parent: Ino,
+    name: &[u8],
+    ancestors: Option<&Vec<Vec<u8>>>,
+    entry_ino: Option<Ino>,
+) -> Result<Vec<EntryNotificationTarget>, InvalidationAcceptance> {
+    let current_parent = ino_to_windows_path(vfs, parent);
+    let historical_parent = if let Some(components) = ancestors {
+        let mut path = "\\".to_string();
+        for component in components {
+            path = append_entry_path(&path, component).ok_or(InvalidationAcceptance::Failed)?;
+        }
+        path
+    } else {
+        current_parent
+            .clone()
+            .ok_or(InvalidationAcceptance::Failed)?
+    };
+    let historical_path =
+        append_entry_path(&historical_parent, name).ok_or(InvalidationAcceptance::Failed)?;
+    let current_entry = match vfs.meta().lookup(parent, name) {
+        Ok(entry) => Some(entry),
+        Err(
+            studiofs_meta::MetaError::EntryNotFound { .. }
+            | studiofs_meta::MetaError::InodeNotFound(_),
+        ) => None,
+        Err(_) => return Err(InvalidationAcceptance::Failed),
+    };
+    let historical = current_parent.as_ref() != Some(&historical_parent);
+    let (ino, kind, action) = match &current_entry {
+        Some(entry) if !historical => (
+            entry_ino.unwrap_or(entry.ino),
+            entry.kind,
+            FILE_ACTION_MODIFIED,
+        ),
+        Some(entry) => (
+            entry_ino.unwrap_or(entry.ino),
+            entry.kind,
+            FILE_ACTION_REMOVED,
+        ),
+        _ => (
+            entry_ino.unwrap_or(0),
+            FileType::RegularFile,
+            FILE_ACTION_REMOVED,
+        ),
+    };
+    let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
+    let mut targets = vec![(ino, historical_path, kind, action, filter)];
+    if historical && let (Some(current_parent), Some(entry)) = (current_parent, current_entry) {
+        let current_path =
+            append_entry_path(&current_parent, name).ok_or(InvalidationAcceptance::Failed)?;
+        targets.push((
+            entry.ino,
+            current_path,
+            entry.kind,
+            FILE_ACTION_MODIFIED,
+            filter,
+        ));
+    }
+    Ok(targets)
+}
+
 /// Bridges VFS metadata invalidation to WinFSP's
 /// `FspFileSystemNotify` mechanism.
 ///
@@ -385,6 +728,13 @@ impl WinfspKernelInvalidator {
 }
 
 impl KernelInvalidator for WinfspKernelInvalidator {
+    fn invalidate_batch(
+        &self,
+        batch: &InvalidationBatch,
+        generation_complete: bool,
+    ) -> InvalidationAcceptance {
+        self.queue.enqueue_batch(batch, generation_complete)
+    }
     fn inval_inode(&self, ino: u64) {
         self.queue.push(ino);
     }
@@ -404,24 +754,44 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
         let meta = self.vfs.meta();
         let mut notifications = Vec::with_capacity(targets.len());
         for (ino, path_override) in targets {
-            let (path, kind, action) = if let Some(path_override) = path_override {
-                (path_override.path, path_override.kind, path_override.action)
+            let (path, kind, action, filter) = if let Some(path_override) = path_override {
+                (
+                    path_override.path,
+                    path_override.kind,
+                    path_override.action,
+                    path_override.filter,
+                )
             } else {
                 let Some(path) = ino_to_windows_path(&self.vfs, ino) else {
                     trace!(ino, "skipping notify - inode no longer resolvable");
+                    self.invalidation_queue.record_failed_notification();
                     continue;
                 };
                 let kind = meta
                     .get_attr(ino)
                     .map(|a| a.kind)
                     .unwrap_or(FileType::RegularFile);
-                (path, kind, FILE_ACTION_MODIFIED)
+                (
+                    path,
+                    kind,
+                    FILE_ACTION_MODIFIED,
+                    notify_filter_for_kind(kind),
+                )
             };
 
-            let Some(info) = build_notify_info_with_action(&path, kind, action) else {
+            if self.invalidation_queue.defer_inode_writer(&self.vfs, ino)
+                || self.invalidation_queue.defer_for_writer(&self.vfs, &path)
+            {
+                self.invalidation_queue
+                    .push_path(ino, path, kind, action, filter);
+                continue;
+            }
+            let Some(mut info) = build_notify_info_with_action(&path, kind, action) else {
                 warn!(ino, path, "notify path too long, skipping");
+                self.invalidation_queue.record_failed_notification();
                 continue;
             };
+            info.filter = filter;
             notifications.push(PreparedWinfspNotify {
                 ino,
                 path,
@@ -442,14 +812,37 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
     }
 
     fn notify(&self, mut notifications: PreparedWinfspNotifications, notifier: &Notifier) {
+        let mut submitted = 0u64;
         for notification in notifications.iter() {
+            if self
+                .invalidation_queue
+                .defer_inode_writer(&self.vfs, notification.ino)
+                || self
+                    .invalidation_queue
+                    .defer_for_writer(&self.vfs, &notification.path)
+            {
+                self.invalidation_queue.push_path(
+                    notification.ino,
+                    notification.path.clone(),
+                    notification.kind,
+                    notification.action,
+                    notification.info.filter,
+                );
+                continue;
+            }
             notifier.notify(&notification.info);
+            submitted = submitted.saturating_add(1);
             debug!(
                 ino = notification.ino,
                 path = %notification.path,
                 "WinFSP notify sent"
             );
         }
+        let mut state = self.invalidation_queue.state.lock();
+        state.delivery.submitted_notifications = state
+            .delivery
+            .submitted_notifications
+            .saturating_add(submitted);
         notifications.published = true;
     }
 }

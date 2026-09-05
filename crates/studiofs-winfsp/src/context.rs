@@ -22,7 +22,7 @@ use invalidation::{
     FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
     FILE_NOTIFY_CHANGE_SIZE, build_notify_info, ino_to_windows_path, notify_filter_for_kind,
 };
-pub use invalidation::{WinfspInvalidationQueue, WinfspKernelInvalidator};
+pub use invalidation::{WinfspDeliverySnapshot, WinfspInvalidationQueue, WinfspKernelInvalidator};
 use parking_lot::{Condvar, Mutex};
 use plans::{CreateCallbackPlan, RenameCallbackPlan};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
@@ -5058,7 +5058,7 @@ mod tests {
     }
 
     #[test]
-    fn winfsp_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
+    fn winfsp_invalidation_queue_drops_distinct_inode_at_capacity_without_blocking() {
         let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-backpressure");
         let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
         for ino in 0..capacity as u64 {
@@ -5073,53 +5073,47 @@ mod tests {
         });
 
         assert!(
-            queue.wait_until_producer_blocked(std::time::Duration::from_secs(1)),
-            "producer should enter the full-queue wait"
-        );
-        assert!(
             finished_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "a distinct inode must wait while the bounded queue is full"
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok(),
+            "a full queue must not block a foreground producer"
         );
-
-        assert_eq!(queue.drain().len(), capacity);
-        finished_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .expect("draining the queue should release the producer");
         producer.join().expect("test producer should join");
-        assert_eq!(queue.drain(), vec![capacity as u64]);
+        assert_eq!(queue.drain().len(), capacity);
+        assert_eq!(queue.delivery_snapshot().failed_notifications, 1);
     }
 
     #[test]
-    fn winfsp_invalidation_queue_close_wakes_blocked_producer() {
+    fn winfsp_invalidation_queue_push_after_close_is_nonblocking() {
         let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-close");
-        let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
-        for ino in 0..capacity as u64 {
-            queue.push(ino);
-        }
+        queue.close();
 
         let producer_queue = Arc::clone(&queue);
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
-            producer_queue.push(capacity as u64);
+            producer_queue.push(1);
             finished_tx.send(()).expect("test producer finished");
         });
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("closed queue should reject producer immediately");
+        producer.join().expect("test producer should join");
+        assert_eq!(queue.delivery_snapshot().failed_notifications, 1);
+    }
+
+    #[test]
+    fn defer_for_writer_drops_unresolvable_path_instead_of_retrying() {
+        let (_tmp, vfs, _ctx, queue) = make_test_context("invalid-writer-path");
+        let file = vfs
+            .create(ROOT_INO, b"regular", 0, 0, 0o644)
+            .expect("create file");
+
         assert!(
-            queue.wait_until_producer_blocked(std::time::Duration::from_secs(1)),
-            "producer should enter the full-queue wait"
+            !queue.defer_for_writer(&vfs, r"\regular\child"),
+            "a path-resolution error must not be treated as an active writer"
         );
-
-        queue.close();
-
-        let finished = finished_rx.recv_timeout(std::time::Duration::from_secs(1));
-        if finished.is_err() {
-            queue.drain();
-        }
-        producer
-            .join()
-            .expect("closed queue should release producer");
-        finished.expect("closed queue should wake blocked producer");
+        assert_eq!(queue.delivery_snapshot().deferred_notifications, 0);
+        assert_eq!(file.kind, FileType::RegularFile);
     }
 
     #[test]
@@ -5146,7 +5140,8 @@ mod tests {
                 .iter()
                 .map(|notification| notification.ino)
                 .collect::<Vec<_>>(),
-            vec![alpha.ino, beta.ino]
+            vec![beta.ino, alpha.ino],
+            "notification order follows first enqueue rather than inode number"
         );
         assert!(
             queue.is_empty(),
@@ -5266,6 +5261,422 @@ mod tests {
         );
         assert_eq!(queue.drain(), vec![file.ino]);
         assert!(queue.wait_for_quiescence(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn semantic_unlinked_writer_retains_old_path_until_release() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, vfs, ctx, queue) = make_test_context("semantic-unlinked-writer");
+        let file = vfs.create(ROOT_INO, b"old", 0, 0, 0o644).expect("create");
+        let fh = vfs
+            .open_file(file.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        vfs.unlink(ROOT_INO, b"old").expect("unlink");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 8,
+                    intents: vec![InvalidationIntent::Entry {
+                        parent: ROOT_INO,
+                        name: b"old".to_vec(),
+                        ancestors: Some(vec![]),
+                        ino: Some(file.ino)
+                    },]
+                },
+                true
+            ),
+            InvalidationAcceptance::Failed
+        );
+        assert!(ctx.should_notify().is_none());
+        assert!(!queue.is_empty());
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release");
+        let prepared = ctx.should_notify().expect("old path retained for release");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].ino, file.ino);
+        assert_eq!(prepared[0].path, r"\old");
+        assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
+        assert_eq!(queue.delivery_snapshot().queued_generation, None);
+    }
+
+    #[test]
+    fn semantic_entry_retains_precommit_path_after_parent_rename() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, vfs, ctx, queue) = make_test_context("semantic-parent-rename");
+        let dir = vfs.mkdir(ROOT_INO, b"old", 0, 0, 0o755).expect("directory");
+        vfs.create(dir.ino, b"child", 0, 0, 0o644).expect("child");
+        vfs.rename(ROOT_INO, b"old", ROOT_INO, b"new")
+            .expect("rename");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 8,
+                    intents: vec![InvalidationIntent::Entry {
+                        parent: dir.ino,
+                        name: b"child".to_vec(),
+                        ino: None,
+                        ancestors: Some(vec![b"old".to_vec()])
+                    },]
+                },
+                true
+            ),
+            InvalidationAcceptance::Queued
+        );
+        let prepared = ctx.should_notify().expect("historical and current names");
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].path, r"\old\child");
+        assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
+        assert_eq!(prepared[1].path, r"\new\child");
+        assert_eq!(prepared[1].info.action, FILE_ACTION_MODIFIED);
+    }
+
+    #[test]
+    fn semantic_entry_retains_precommit_path_after_parent_delete() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, _vfs, ctx, queue) = make_test_context("semantic-parent-delete");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 8,
+                    intents: vec![InvalidationIntent::Entry {
+                        parent: u64::MAX,
+                        name: b"child".to_vec(),
+                        ino: None,
+                        ancestors: Some(vec![b"deleted".to_vec()])
+                    },]
+                },
+                true
+            ),
+            InvalidationAcceptance::Queued
+        );
+        let prepared = ctx.should_notify().expect("historical name");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].path, r"\deleted\child");
+        assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
+    }
+
+    #[test]
+    fn semantic_partial_generation_does_not_advance_queued_generation() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("semantic-partial-generation");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 42,
+                    intents: vec![InvalidationIntent::Entry {
+                        parent: ROOT_INO,
+                        name: b"gone".to_vec(),
+                        ino: None,
+                        ancestors: None,
+                    },]
+                },
+                false
+            ),
+            InvalidationAcceptance::Queued
+        );
+        assert_eq!(queue.delivery_snapshot().queued_generation, None);
+        assert_eq!(queue.drain(), vec![0]);
+    }
+
+    #[test]
+    fn semantic_entry_defers_native_purge_for_local_writer() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, vfs, _ctx, queue) = make_test_context("semantic-writer");
+        let file = vfs
+            .create(ROOT_INO, b"writing", 0, 0, 0o644)
+            .expect("create");
+        let _fh = vfs
+            .open_file(file.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 4,
+                    intents: vec![
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"writing".to_vec(),
+                            ino: None,
+                            ancestors: None,
+                        },
+                        InvalidationIntent::Attributes { ino: file.ino },
+                    ]
+                },
+                true
+            ),
+            InvalidationAcceptance::Failed
+        );
+        assert_eq!(queue.drain(), vec![file.ino, file.ino]);
+        assert_eq!(queue.delivery_snapshot().deferred_notifications, 2);
+    }
+
+    #[test]
+    fn semantic_notification_rechecks_writer_after_enqueue() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, vfs, ctx, queue) = make_test_context("semantic-late-writer");
+        let file = vfs
+            .create(ROOT_INO, b"writing", 0, 0, 0o644)
+            .expect("create");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 4,
+                    intents: vec![InvalidationIntent::Entry {
+                        parent: ROOT_INO,
+                        name: b"writing".to_vec(),
+                        ino: None,
+                        ancestors: None,
+                    },]
+                },
+                true
+            ),
+            InvalidationAcceptance::Queued
+        );
+        let _fh = vfs
+            .open_file(file.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        assert!(ctx.should_notify().is_none());
+        assert_eq!(queue.delivery_snapshot().deferred_notifications, 1);
+        assert_eq!(queue.delivery_snapshot().delivered_generation, None);
+    }
+
+    #[test]
+    fn semantic_content_covers_hardlink_aliases_with_distinct_filters() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, vfs, ctx, queue) = make_test_context("semantic-hardlinks");
+        let file = vfs.create(ROOT_INO, b"first", 0, 0, 0o644).expect("create");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"nested", 0, 0, 0o755)
+            .expect("directory");
+        vfs.link(file.ino, dir.ino, b"second").expect("alias");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 1,
+                    intents: vec![
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"first".to_vec(),
+                            ancestors: Some(vec![]),
+                            ino: Some(file.ino),
+                        },
+                        InvalidationIntent::Entry {
+                            parent: dir.ino,
+                            name: b"second".to_vec(),
+                            ancestors: Some(vec![b"nested".to_vec()]),
+                            ino: Some(file.ino),
+                        },
+                        InvalidationIntent::Attributes { ino: file.ino },
+                        InvalidationIntent::Content { ino: file.ino },
+                    ]
+                },
+                true
+            ),
+            InvalidationAcceptance::Queued
+        );
+        let prepared = ctx.should_notify().expect("aliases prepared");
+        assert_eq!(prepared.len(), 6);
+        for path in [r"\first", r"\nested\second"] {
+            assert!(
+                prepared.iter().any(|event| event.path == path
+                    && event.info.filter == FILE_NOTIFY_CHANGE_ATTRIBUTES)
+            );
+            assert!(prepared.iter().any(|event| event.path == path
+                && event.info.filter == FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE));
+        }
+    }
+
+    #[test]
+    fn semantic_deleted_inode_still_notifies_old_name_with_partial_coverage() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, _vfs, ctx, queue) = make_test_context("semantic-deleted-inode");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 3,
+                    intents: vec![
+                        InvalidationIntent::Attributes { ino: u64::MAX },
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"old".to_vec(),
+                            ino: None,
+                            ancestors: None,
+                        },
+                    ]
+                },
+                true
+            ),
+            InvalidationAcceptance::Failed
+        );
+        let prepared = ctx
+            .should_notify()
+            .expect("old name must survive absent attributes");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].path, r"\old");
+        assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
+        assert_eq!(queue.delivery_snapshot().queued_generation, None);
+    }
+
+    #[test]
+    fn semantic_unresolved_parent_reports_partial_coverage() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("semantic-unresolved");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 1,
+                    intents: vec![
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"valid".to_vec(),
+                            ino: None,
+                            ancestors: None,
+                        },
+                        InvalidationIntent::Entry {
+                            parent: u64::MAX,
+                            name: b"unresolved".to_vec(),
+                            ino: None,
+                            ancestors: None,
+                        },
+                    ]
+                },
+                true
+            ),
+            InvalidationAcceptance::Failed
+        );
+        assert_eq!(queue.drain(), vec![0]);
+        assert_eq!(queue.delivery_snapshot().failed_batches, 1);
+        assert_eq!(queue.delivery_snapshot().queued_generation, None);
+    }
+
+    #[test]
+    fn semantic_entries_preserve_removed_and_new_names() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, vfs, ctx, queue) = make_test_context("semantic-entry-names");
+        vfs.create(ROOT_INO, b"new.txt", 0, 0, 0o644)
+            .expect("new file");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 7,
+                    intents: vec![
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"old.txt".to_vec(),
+                            ino: None,
+                            ancestors: None,
+                        },
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"new.txt".to_vec(),
+                            ino: None,
+                            ancestors: None,
+                        },
+                    ],
+                },
+                true
+            ),
+            InvalidationAcceptance::Queued
+        );
+        let prepared = ctx.should_notify().expect("entries queued");
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].path, r"\old.txt");
+        assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
+        assert_eq!(prepared[1].path, r"\new.txt");
+        let status = queue.delivery_snapshot();
+        assert_eq!(status.queued_generation, Some(7));
+        assert_eq!(status.delivered_generation, None);
+    }
+
+    #[test]
+    fn semantic_batch_rejects_full_closed_and_reset_without_waiting() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("semantic-full");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        let entry = InvalidationBatch {
+            generation: 1,
+            intents: vec![InvalidationIntent::Entry {
+                parent: ROOT_INO,
+                name: b"gone".to_vec(),
+                ino: None,
+                ancestors: None,
+            }],
+        };
+        queue.extend(0..super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        assert_eq!(
+            invalidator.invalidate_batch(&entry, true),
+            InvalidationAcceptance::Failed
+        );
+        queue.drain();
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 2,
+                    intents: vec![InvalidationIntent::Reset]
+                },
+                true
+            ),
+            InvalidationAcceptance::Unsupported
+        );
+        queue.close();
+        assert_eq!(
+            invalidator.invalidate_batch(&entry, true),
+            InvalidationAcceptance::Failed
+        );
+        assert_eq!(queue.delivery_snapshot().delivered_generation, None);
+    }
+
+    #[test]
+    fn deleted_paths_for_same_inode_survive_coalescing_and_retry() {
+        let (_tmp, _vfs, ctx, queue) = make_test_context("notify-distinct-paths");
+        queue.push_deleted_path(42, r"\old.txt".to_string(), FileType::RegularFile);
+        queue.push_deleted_path(42, r"\new.txt".to_string(), FileType::RegularFile);
+        let prepared = ctx.should_notify().expect("both paths queued");
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].path, r"\old.txt");
+        assert_eq!(prepared[1].path, r"\new.txt");
+        drop(prepared);
+        let retry = ctx.should_notify().expect("both paths retried");
+        assert_eq!(retry.len(), 2);
+        assert_eq!(retry[0].path, r"\old.txt");
+        assert_eq!(retry[1].path, r"\new.txt");
+    }
+
+    #[test]
+    fn unpublished_retry_reports_capacity_failure_without_blocking_consumer() {
+        let (_tmp, _vfs, ctx, queue) = make_test_context("notify-retry-capacity");
+        queue.push_deleted_path(42, r"\old".to_string(), FileType::RegularFile);
+        let prepared = ctx.should_notify().expect("prepare");
+        queue.extend(0..super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        drop(prepared);
+        let status = queue.delivery_snapshot();
+        assert_eq!(status.retried_batches, 1);
+        assert_eq!(status.failed_notifications, 1);
+        assert_eq!(status.delivered_generation, None);
     }
 
     #[test]

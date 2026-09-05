@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 impl MetaReplication for PgMetaEngine {
+    fn take_invalidation_batches(&self) -> Vec<crate::coherence::InvalidationBatch> {
+        self.local.take_invalidation_batches()
+    }
+
     fn flush_metadata(&self) -> MetaResult<()> {
         let _guard = self
             .replication_lock

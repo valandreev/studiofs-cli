@@ -8,6 +8,330 @@ thread_local! {
 }
 
 impl RedbMetaEngine {
+    fn invalidation_binding(
+        txn: &RedbWriteTransaction<'_>,
+        key: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>> {
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        if tombstones
+            .get(key)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        for table in [DENTRIES_TABLE, BASE_DENTRIES_TABLE] {
+            let table = txn
+                .open_table(table)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            if let Some(value) = table
+                .get(key)
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+            {
+                return decode(value.value()).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn invalidation_ancestors(
+        txn: &RedbWriteTransaction<'_>,
+        mut ino: Ino,
+    ) -> MetaResult<Option<Vec<Vec<u8>>>> {
+        let mut names = Vec::new();
+        let mut visited = HashSet::new();
+        let mut bytes = 0usize;
+        while ino != ROOT_INO {
+            if names.len() >= 128 || !visited.insert(ino) {
+                return Ok(None);
+            }
+            match Self::get_attr_merged_in_write_txn(txn, ino) {
+                Ok(attr) if attr.kind == FileType::Directory => {}
+                Ok(_) | Err(MetaError::InodeNotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let prefix = dentry_by_inode_prefix(ino);
+            let mut binding = None;
+            // Prefer the serving mirror: base may already contain the next rename.
+            for index in [DENTRIES_BY_INODE_TABLE, BASE_DENTRIES_BY_INODE_TABLE] {
+                let index = txn
+                    .open_table(index)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+                let mut scanned = 0;
+                for row in index
+                    .range(prefix.as_slice()..)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?
+                {
+                    let (key, _) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                    if !key.value().starts_with(&prefix) {
+                        break;
+                    }
+                    scanned += 1;
+                    if scanned > 8 {
+                        return Ok(None);
+                    }
+                    let (_, parent, name) = decode_dentry_by_inode_key(key.value())?;
+                    let key = encode_dentry_key(parent, name);
+                    if !Self::invalidation_binding(txn, &key)?
+                        .is_some_and(|entry| entry.ino == ino && entry.kind == FileType::Directory)
+                    {
+                        continue;
+                    }
+                    if binding.is_some() {
+                        return Ok(None);
+                    }
+                    binding = Some((parent, name.to_vec()));
+                }
+                if binding.is_some() {
+                    break;
+                }
+            }
+            let Some((parent, name)) = binding else {
+                return Ok(None);
+            };
+            bytes += name.len();
+            if bytes > 64 * 1024 {
+                return Ok(None);
+            }
+            names.push(name);
+            ino = parent;
+        }
+        names.reverse();
+        Ok(Some(names))
+    }
+
+    fn invalidate_directory_descendants(
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let mut pending = vec![(ino, Self::invalidation_ancestors(txn, ino)?, 0usize)];
+        let mut visited = HashSet::new();
+        let mut remaining = crate::coherence::MAX_INVALIDATION_INTENTS;
+        let mut remaining_bytes = 1024 * 1024usize;
+        while let Some((parent, ancestors, depth)) = pending.pop() {
+            if !visited.insert(parent)
+                || depth >= 128
+                || ancestors.as_ref().is_some_and(|parts| parts.len() >= 128)
+            {
+                txn.invalidate(InvalidationIntent::Reset);
+                return Ok(());
+            }
+            let prefix = dentry_prefix(parent);
+            let mut entries = BTreeMap::new();
+            // Copy a bounded key set before opening the same tables for merged lookup.
+            for table in [DENTRIES_TABLE, BASE_DENTRIES_TABLE] {
+                let table = txn
+                    .open_table(table)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+                for row in table
+                    .range(prefix.as_slice()..)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?
+                {
+                    let (key, _) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                    if !key.value().starts_with(&prefix) {
+                        break;
+                    }
+                    if remaining == 0 {
+                        txn.invalidate(InvalidationIntent::Reset);
+                        return Ok(());
+                    }
+                    remaining -= 1;
+                    let (_, name) = decode_dentry_key(key.value())?;
+                    let bytes = key.value().len().saturating_add(name.len());
+                    if bytes > remaining_bytes {
+                        txn.invalidate(InvalidationIntent::Reset);
+                        return Ok(());
+                    }
+                    remaining_bytes -= bytes;
+                    entries.insert(key.value().to_vec(), name.to_vec());
+                }
+            }
+            for (key, name) in entries {
+                let Some(entry) = Self::invalidation_binding(txn, &key)? else {
+                    continue;
+                };
+                let bytes = ancestors.as_ref().map_or(0, |parts| {
+                    parts
+                        .iter()
+                        .map(|part| part.len() + std::mem::size_of::<Vec<u8>>())
+                        .sum::<usize>()
+                }) + name.len();
+                if bytes.saturating_mul(2) > remaining_bytes {
+                    txn.invalidate(InvalidationIntent::Reset);
+                    return Ok(());
+                }
+                remaining_bytes -= bytes * 2;
+                txn.invalidate(InvalidationIntent::Entry {
+                    parent,
+                    name: name.clone(),
+                    ancestors: ancestors.clone(),
+                    ino: Some(entry.ino),
+                });
+                txn.invalidate(InvalidationIntent::Directory { ino: parent });
+                txn.invalidate(InvalidationIntent::Attributes { ino: entry.ino });
+                if entry.kind == FileType::Directory {
+                    let next = ancestors.as_ref().map(|parts| {
+                        let mut parts = parts.clone();
+                        parts.push(name);
+                        parts
+                    });
+                    pending.push((entry.ino, next, depth + 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn invalidate_replica_entry(
+        txn: &RedbWriteTransaction<'_>,
+        parent: Ino,
+        name: &[u8],
+        new_ino: Option<Ino>,
+    ) -> MetaResult<()> {
+        txn.invalidate(InvalidationIntent::Entry {
+            parent,
+            name: name.to_vec(),
+            ancestors: Self::invalidation_ancestors(txn, parent)?,
+            ino: Self::invalidation_binding(txn, &encode_dentry_key(parent, name))?
+                .map(|entry| entry.ino)
+                .or(new_ino),
+        });
+        txn.invalidate(InvalidationIntent::Directory { ino: parent });
+        txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+        // Preserve the displaced binding before either serving or base removes it.
+        for table in [DENTRIES_TABLE, BASE_DENTRIES_TABLE] {
+            let table = txn
+                .open_table(table)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            if let Some(entry) = Self::lookup_in_opened_dentry_table(&table, parent, name)? {
+                txn.invalidate(InvalidationIntent::Attributes { ino: entry.ino });
+            }
+        }
+        Ok(())
+    }
+
+    fn invalidate_replica_inode(
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+        content: bool,
+    ) -> MetaResult<()> {
+        txn.invalidate(InvalidationIntent::Attributes { ino });
+        if content {
+            txn.invalidate(InvalidationIntent::Content { ino });
+        }
+        for index in [DENTRIES_BY_INODE_TABLE, BASE_DENTRIES_BY_INODE_TABLE] {
+            for key in Self::dentry_keys_for_inode_in_write_index(txn, index, ino)? {
+                let (parent, name) = decode_dentry_key(&key)?;
+                Self::invalidate_replica_entry(txn, parent, name, Some(ino))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn replica_content_identity_changed(
+        txn: &RedbWriteTransaction<'_>,
+        attr: &InodeAttr,
+    ) -> MetaResult<bool> {
+        if attr.kind != FileType::RegularFile {
+            return Ok(false);
+        }
+        let current = match Self::get_attr_merged_in_write_txn(txn, attr.ino) {
+            Ok(current) => current,
+            Err(MetaError::InodeNotFound(_)) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        Ok(current.kind != attr.kind
+            || current.size != attr.size
+            || current.content_epoch != attr.content_epoch
+            || current.committed_size != attr.committed_size
+            || current.committed_content_epoch != attr.committed_content_epoch)
+    }
+
+    fn invalidate_replica_event(
+        txn: &RedbWriteTransaction<'_>,
+        event: &crate::events::MetaEvent,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+        match event {
+            MetaEvent::SetAttr { attr } => {
+                Self::invalidate_replica_inode(
+                    txn,
+                    attr.ino,
+                    Self::replica_content_identity_changed(txn, attr)?,
+                )?;
+                if attr.kind == FileType::Directory {
+                    txn.invalidate(InvalidationIntent::Directory { ino: attr.ino });
+                }
+            }
+            MetaEvent::RemoveAttr { ino }
+            | MetaEvent::SetXattr { ino, .. }
+            | MetaEvent::RemoveXattr { ino, .. }
+            | MetaEvent::SetAclRule { ino, .. }
+            | MetaEvent::RemoveAclRule { ino, .. } => {
+                if matches!(event, MetaEvent::RemoveAttr { .. })
+                    && Self::get_attr_merged_in_write_txn(txn, *ino)
+                        .is_ok_and(|attr| attr.kind == FileType::Directory)
+                {
+                    Self::invalidate_directory_descendants(txn, *ino)?;
+                }
+                Self::invalidate_replica_inode(txn, *ino, false)?
+            }
+            MetaEvent::SetSymlinkTarget { ino, .. }
+            | MetaEvent::RemoveRegularFileGraph { ino }
+            | MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+            | MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                Self::invalidate_replica_inode(txn, *ino, true)?
+            }
+            MetaEvent::AddEntry {
+                parent,
+                name,
+                entry,
+            } => {
+                Self::invalidate_replica_entry(txn, *parent, name, Some(entry.ino))?;
+                Self::invalidate_replica_inode(txn, entry.ino, false)?;
+            }
+            MetaEvent::RemoveEntry { parent, name } => {
+                Self::invalidate_replica_entry(txn, *parent, name, None)?
+            }
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                displaced_set_attr,
+                displaced_remove_attr_ino,
+                moved_dir_attr,
+                old_parent_attr,
+                new_parent_attr,
+            } => {
+                if entry.kind == FileType::Directory {
+                    Self::invalidate_directory_descendants(txn, entry.ino)?;
+                }
+                Self::invalidate_replica_entry(txn, *parent, name, Some(entry.ino))?;
+                Self::invalidate_replica_entry(txn, *new_parent, new_name, Some(entry.ino))?;
+                Self::invalidate_replica_inode(txn, entry.ino, false)?;
+                if let Some(ino) = displaced_remove_attr_ino {
+                    Self::invalidate_replica_inode(txn, *ino, false)?;
+                }
+                for attr in [
+                    displaced_set_attr,
+                    moved_dir_attr,
+                    old_parent_attr,
+                    new_parent_attr,
+                ] {
+                    if let Some(attr) = attr.as_ref() {
+                        Self::invalidate_replica_inode(txn, attr.ino, false)?;
+                    }
+                }
+            }
+            MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_regular_file_serving_reconcile_call_count_for_test() {
         REGULAR_FILE_SERVING_RECONCILE_CALLS.set(0);
@@ -386,6 +710,7 @@ impl RedbMetaEngine {
         let txn = self.begin_write_txn()?;
 
         for event in events {
+            Self::invalidate_replica_event(&txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { .. } => {}
                 crate::events::MetaEvent::RemoveAttr { ino } => {
@@ -544,6 +869,7 @@ impl RedbMetaEngine {
         let txn = self.begin_write_txn()?;
 
         for event in events {
+            Self::invalidate_replica_event(&txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
                     let data = encode(attr)?;
@@ -801,6 +1127,7 @@ impl RedbMetaEngine {
         let txn = self.begin_write_txn()?;
 
         for event in events {
+            Self::invalidate_replica_event(&txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
                     let current = match Self::get_attr_merged_in_write_txn(&txn, attr.ino) {
@@ -1080,6 +1407,7 @@ impl RedbMetaEngine {
         let mut changed = false;
 
         for ino in inodes {
+            Self::invalidate_replica_inode(&txn, *ino, false)?;
             let base_attr = {
                 let base = txn
                     .open_table(BASE_INODES_TABLE)
@@ -1092,6 +1420,7 @@ impl RedbMetaEngine {
 
             match base_attr {
                 Some(attr) if attr.kind == FileType::RegularFile => {
+                    let content_changed = Self::replica_content_identity_changed(&txn, &attr)?;
                     Self::set_inode_mirror_in_txn(&txn, &attr)?;
                     Self::remove_stale_dentries_for_base_entry(
                         &txn,
@@ -1109,6 +1438,7 @@ impl RedbMetaEngine {
                         },
                         protected_dentry_keys,
                     )?;
+                    Self::invalidate_replica_inode(&txn, *ino, content_changed)?;
                     if attr.upload_state == UploadState::Ready
                         && attr.content_epoch == attr.committed_content_epoch
                         && attr.size == attr.committed_size
@@ -1151,6 +1481,7 @@ impl RedbMetaEngine {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
+            Self::invalidate_replica_entry(&txn, parent, name, None)?;
             let base_entry = {
                 let base = txn
                     .open_table(BASE_DENTRIES_TABLE)
@@ -1159,6 +1490,7 @@ impl RedbMetaEngine {
             };
             if let Some(entry) = base_entry {
                 Self::set_dentry_mirror_in_txn(&txn, parent, name, &entry)?;
+                Self::invalidate_replica_inode(&txn, entry.ino, false)?;
             } else {
                 Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
             }
@@ -1312,6 +1644,12 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
+        if entry.kind == FileType::Directory {
+            Self::invalidate_directory_descendants(&txn, entry.ino)?;
+        }
+        Self::invalidate_replica_entry(&txn, parent, name, Some(entry.ino))?;
+        Self::invalidate_replica_entry(&txn, new_parent, new_name, Some(entry.ino))?;
+        Self::invalidate_replica_inode(&txn, entry.ino, false)?;
 
         Self::reconcile_serving_rename_from_base_in_txn(
             &txn, parent, name, new_parent, new_name, entry,
@@ -1609,6 +1947,17 @@ impl RedbMetaEngine {
 }
 
 impl MetaReplication for RedbMetaEngine {
+    fn take_invalidation_batches(&self) -> Vec<crate::coherence::InvalidationBatch> {
+        self.invalidation_journal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
+    fn metadata_invalidation_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(Arc::clone(&self.invalidation_notify))
+    }
+
     fn prepare_for_close(&self) -> MetaResult<()> {
         self.seal_relaxed_durability_for_close();
         Ok(())

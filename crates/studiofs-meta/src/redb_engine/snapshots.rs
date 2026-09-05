@@ -400,6 +400,7 @@ impl RedbMetaEngine {
             (Vec::new(), Vec::new())
         };
         let txn = self.begin_write_txn()?;
+        txn.invalidate(InvalidationIntent::Reset);
 
         if !preserve_local_state {
             Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;

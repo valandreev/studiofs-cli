@@ -481,6 +481,94 @@ impl StudioVfs {
         self.kernel_invalidator.read().clone()
     }
 
+    /// Retire the local cached view before handing committed scopes to the bridge.
+    /// Content remains subject to the same active-writer protection as legacy
+    /// invalidation; the commit generation is not a new open-handle version.
+    pub(super) fn apply_semantic_invalidation_batch(
+        &self,
+        mut batch: studiofs_meta::coherence::InvalidationBatch,
+    ) {
+        use crate::coherence::InvalidationAcceptance;
+        use studiofs_meta::coherence::InvalidationIntent;
+
+        let mut deferred = false;
+        let mut attr_inodes = HashSet::new();
+        let mut full_content_inodes = HashSet::new();
+        let mut namespace_parents = HashSet::new();
+        let mut reset = false;
+        batch.intents.retain(|intent| {
+            match intent {
+                InvalidationIntent::Attributes { ino } | InvalidationIntent::Content { ino } => {
+                    attr_inodes.insert(*ino);
+                    let full = matches!(intent, InvalidationIntent::Content { .. });
+                    if full {
+                        full_content_inodes.insert(*ino);
+                    }
+                    if self.should_skip_kernel_invalidation_for_active_open(*ino, full) {
+                        deferred = true;
+                        return false;
+                    }
+                }
+                InvalidationIntent::Entry { parent, name, .. } => {
+                    self.dentry_cache_invalidate(*parent, name);
+                    namespace_parents.insert(*parent);
+                }
+                InvalidationIntent::Directory { ino } => {
+                    self.dentry_cache_invalidate_parent(*ino);
+                    attr_inodes.insert(*ino);
+                    namespace_parents.insert(*ino);
+                }
+                InvalidationIntent::Reset => {
+                    reset = true;
+                }
+            }
+            true
+        });
+        if reset {
+            self.bump_namespace_epoch();
+            self.retire_all_attr_read_observations();
+            attr_inodes.extend(self.runtime_namespace_invalidation_inodes());
+        }
+        if !attr_inodes.is_empty() {
+            self.invalidate_attr_read_cache(attr_inodes);
+        }
+        for ino in full_content_inodes {
+            self.retire_os_cache_inode(ino);
+        }
+        if !namespace_parents.is_empty() {
+            self.bump_namespace_for_parents(namespace_parents);
+        }
+        self.bump_acl_namespace_epoch();
+        if deferred {
+            debug!(
+                generation = batch.generation,
+                "semantic invalidation deferred for active writer; generation coverage incomplete"
+            );
+        }
+        let Some(invalidator) = self.kernel_invalidator() else {
+            return;
+        };
+        if batch.intents.is_empty() {
+            return;
+        }
+        match invalidator.invalidate_batch(&batch, !deferred) {
+            InvalidationAcceptance::Queued => {}
+            acceptance => {
+                debug!(
+                    generation = batch.generation,
+                    ?acceptance,
+                    "semantic invalidation not fully admitted; existing cache policy unchanged"
+                );
+            }
+        }
+    }
+
+    pub(super) fn drain_semantic_invalidations(&self) {
+        for batch in self.sync_meta().take_invalidation_batches() {
+            self.apply_semantic_invalidation_batch(batch);
+        }
+    }
+
     fn collect_metadata_snapshot<M: ?Sized + JanitorMeta>(
         engine: &M,
     ) -> MetaResult<MetadataTraversalSnapshot> {
@@ -690,6 +778,20 @@ impl StudioVfs {
         }
     }
 
+    /// Protect accepted local state when a native bridge can only invalidate
+    /// attributes together with content. A true result requires the bridge to
+    /// defer delivery and leaves the ordinary handle-release retry armed.
+    pub fn defer_kernel_invalidation_for_active_writer(&self, ino: Ino) -> bool {
+        if self.should_skip_kernel_invalidation_for_active_open(ino, true) {
+            return true;
+        }
+        if self.inode_has_local_dirty_state(ino) {
+            self.deferred_kernel_invalidations.insert(ino);
+            return true;
+        }
+        false
+    }
+
     pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino) {
         if self.kernel_invalidator().is_none() {
             return;
@@ -718,6 +820,29 @@ impl StudioVfs {
             }
         }
         removed
+    }
+
+    pub(super) fn invalidate_attr_read_cache_if_observed(
+        &self,
+        ino: Ino,
+        expected: super::AttrReadObservation,
+    ) -> Option<super::AttrReadObservation> {
+        let mut cache = self.state.namespace.attr_read_cache.lock();
+        if cache.observation(ino) != expected {
+            return None;
+        }
+        self.handle_table.clear_read_windows_for_inode(ino);
+        self.state.read.published_read_plan_cache.lock().pop(&ino);
+        cache.remove(ino);
+        Some(cache.observation(ino))
+    }
+
+    pub(super) fn retire_all_attr_read_observations(&self) {
+        self.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .retire_observations();
     }
 
     pub(super) fn read_cache_invalidation_set(
@@ -782,6 +907,9 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
+            // Local commits must not wait for a remote poll to finish before
+            // their already-visible state can invalidate the mounted cache.
+            self.drain_semantic_invalidations();
             let meta = self.meta.clone();
             let previous_namespace_token = last_namespace_token.clone();
             let previous_metadata_token = last_metadata_token.clone();
@@ -807,6 +935,9 @@ impl StudioVfs {
                 ))
             })
             .await;
+            // Earlier transactions may have committed even if the remaining
+            // remote sync failed or did not advance its public version token.
+            self.drain_semantic_invalidations();
             let Ok((
                 _before_namespace,
                 after_namespace_token,

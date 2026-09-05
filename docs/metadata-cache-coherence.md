@@ -1,8 +1,9 @@
 # Shared metadata-cache coherence contract
 
 SFS-675 defines semantics for subsequent SFS-676 (invalidation delivery),
-SFS-677 (health), and SFS-678 (Windows policy). This is a design contract, not
-a claim that these mechanisms already exist. Windows is the first validation
+SFS-677 (health), and SFS-678 (Windows policy). The implementation status below
+distinguishes delivered code from subsequent health and policy work. Windows is
+the first validation
 target. macOS and Linux must be able to consume these semantics without changing
 them; this issue changes neither platform's cache policy.
 
@@ -103,11 +104,12 @@ buffers/threads and report effective coverage and failures. Dependency direction
 is domain <- ports <- application <- adapters/runtime/API. Unsupported precise
 invalidation may use a stronger safe invalidation, with the extra scope reported.
 
-The current `KernelInvalidator` in
-`crates/studiofs-vfs/src/vfs/namespace.rs` is an existing seam, not the complete
-new contract: entry invalidation defaults to no-op and attribute invalidation
-defaults to full inode invalidation. SFS-676 must make missing semantic coverage
-explicit before callers rely on these intents for aggressive caching.
+The legacy methods of `KernelInvalidator` in
+`crates/studiofs-vfs/src/vfs/namespace.rs` retain their compatibility behavior:
+entry invalidation defaults to no-op and attributes default to full inode
+invalidation. Its semantic batch method explicitly reports Unsupported for legacy
+adapters, even when it invokes those methods as best-effort compatibility work.
+Callers cannot use that result as evidence for aggressive caching.
 
 ## Windows promotion gate
 
@@ -145,3 +147,47 @@ positive and negative lookups, and enumeration caches on the observer:
 Each test must distinguish remote publication, local apply, invalidation coverage,
 and observed OS behavior using bounded condition waits rather than fixed sleeps.
 Windows evidence does not establish macOS/Linux acceptance.
+
+## SFS-676 implementation status
+
+`studiofs-meta::coherence` defines mount-local, ordered invalidation batches.
+Redb write transactions publish retained intents only after successful commit,
+before releasing write serialization. The PostgreSQL adapter exposes that local
+journal through `MetaReplication`; VFS consumes it before and after remote sync,
+including partial-sync failure and unchanged remote-token cases. The existing
+snapshot comparison remains as conservative reconciliation, without claiming
+precise delivery coverage from a snapshot diff.
+
+Entry intents retain raw historical ancestor components and the previous inode
+binding. These contain no Windows separator or native notification flag. Directory
+rename/removal captures old descendant names before mutation. The journal is
+bounded to 4096 intents and 1 MiB; bounded ancestry/subtree traversal exposes
+unknown provenance or Reset instead of silently claiming complete coverage.
+Attributes and content are distinct semantic scopes, including same-size epoch
+changes and metadata-only mutations. VFS cache admissions retain observation
+tokens so old lookup, attribute and path-resolution results cannot repopulate a
+retired cache generation.
+
+The WinFSP adapter preserves path/action/filter identities when coalescing and
+keeps old paths during retry. Semantic enqueue and retry cannot block at capacity.
+`WinfspDeliverySnapshot` reports queue acceptance, native submissions, failed and
+unsupported work, and writer deferral. A partially deferred generation cannot
+advance the fully accepted generation. Local writable handles and dirty state
+defer native purges, retaining exact historical targets for a later timer pass.
+
+Native WinFSP invalidates more than its notification filter names suggest:
+[`FspFileNodeInvalidateCachesAndNotifyChangeByName`](https://github.com/winfsp/winfsp/blob/master/src/sys/file.c)
+flushes/purges content as well as metadata, while
+[`FspVolumeNotify`](https://github.com/winfsp/winfsp/blob/master/src/sys/volume.c)
+queues asynchronous kernel work. Consequently attributes/entries may receive a
+stronger native invalidation; the adapter checks writer protection at admission,
+preparation and submission. The current Rust notifier does not expose completion,
+so `delivered_generation` deliberately remains unknown. These checks do not prove
+that no writer can start after asynchronous native submission.
+
+Reset has no proven native whole-mount implementation and reports Unsupported.
+Unresolvable/oversized paths, incomplete bounded alias traversal and queue loss
+remain explicit failures. No aggressive admission or timeout change is enabled by
+this implementation; health/fail-safe policy and promotion remain SFS-677/SFS-678
+work. Focused unit tests do not replace the full integration and mounted gates
+above.

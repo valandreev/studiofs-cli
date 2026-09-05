@@ -10,6 +10,338 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 #[test]
+fn coherence_journal_directory_rename_and_removal_retain_descendant_paths() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let top = engine
+        .create_dir(ROOT_INO, b"old", 1000, 1000, 0o755)
+        .unwrap();
+    let nested = engine
+        .create_dir(top.ino, b"nested", 1000, 1000, 0o755)
+        .unwrap();
+    let file = engine
+        .create_file(nested.ino, b"child", 1000, 1000, 0o644)
+        .unwrap();
+    let mut initial = Vec::new();
+    for (attr, parent, name) in [
+        (&top, ROOT_INO, b"old".as_slice()),
+        (&nested, top.ino, b"nested".as_slice()),
+        (&file, nested.ino, b"child".as_slice()),
+    ] {
+        initial.push(MetaEvent::SetAttr { attr: attr.clone() });
+        initial.push(MetaEvent::AddEntry {
+            parent,
+            name: name.to_vec(),
+            entry: DirEntryValue {
+                ino: attr.ino,
+                kind: attr.kind,
+            },
+        });
+    }
+    engine.apply_replica_events_to_base(&initial).unwrap();
+    engine.take_invalidation_batches();
+    let rename = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"old".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"new".to_vec(),
+        entry: DirEntryValue {
+            ino: top.ino,
+            kind: FileType::Directory,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&rename))
+        .unwrap();
+    engine.apply_replica_serving_state(&[rename]).unwrap();
+    let renamed: Vec<_> = engine
+        .take_invalidation_batches()
+        .into_iter()
+        .flat_map(|batch| batch.intents)
+        .collect();
+    assert!(renamed.contains(&InvalidationIntent::Entry {
+        parent: nested.ino,
+        name: b"child".to_vec(),
+        ancestors: Some(vec![b"old".to_vec(), b"nested".to_vec()]),
+        ino: Some(file.ino)
+    }));
+    engine
+        .apply_replica_serving_state(&[MetaEvent::RemoveAttr { ino: top.ino }])
+        .unwrap();
+    let removed: Vec<_> = engine
+        .take_invalidation_batches()
+        .into_iter()
+        .flat_map(|batch| batch.intents)
+        .collect();
+    assert!(removed.contains(&InvalidationIntent::Entry {
+        parent: nested.ino,
+        name: b"child".to_vec(),
+        ancestors: Some(vec![b"new".to_vec(), b"nested".to_vec()]),
+        ino: Some(file.ino)
+    }));
+}
+
+#[test]
+fn coherence_journal_metadata_only_changes_preserve_content_scope() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"attrs", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.mode = 0o600;
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr },
+            MetaEvent::SetXattr {
+                ino,
+                name: b"user.test".to_vec(),
+                value: b"value".to_vec(),
+                flags: 0,
+            },
+            MetaEvent::SetAclRule {
+                ino,
+                principal: "other".to_string(),
+                access_level: AccessLevel::ReadOnly,
+            },
+        ])
+        .unwrap();
+    let intents: HashSet<_> = engine
+        .take_invalidation_batches()
+        .into_iter()
+        .flat_map(|batch| batch.intents)
+        .collect();
+    assert!(intents.contains(&InvalidationIntent::Attributes { ino }));
+    assert!(!intents.contains(&InvalidationIntent::Content { ino }));
+}
+
+#[test]
+fn coherence_journal_preserves_rename_chain_and_overwritten_inode() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 42,
+        kind: FileType::RegularFile,
+    };
+    let initial = [
+        MetaEvent::AddEntry {
+            parent: 1,
+            name: b"a".to_vec(),
+            entry: entry.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: 2,
+            name: b"b".to_vec(),
+            entry: DirEntryValue {
+                ino: 43,
+                kind: FileType::RegularFile,
+            },
+        },
+    ];
+    engine.apply_replica_events_to_base(&initial).unwrap();
+    engine.apply_replica_serving_state(&initial).unwrap();
+    engine.take_invalidation_batches();
+    for (parent, name, new_parent, new_name) in [
+        (1, b"a".as_slice(), 2, b"b".as_slice()),
+        (2, b"b".as_slice(), 2, b"c".as_slice()),
+    ] {
+        let rename = MetaEvent::RenameEntry {
+            parent,
+            name: name.to_vec(),
+            new_parent,
+            new_name: new_name.to_vec(),
+            entry: entry.clone(),
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        };
+        engine
+            .apply_replica_events_to_base(std::slice::from_ref(&rename))
+            .unwrap();
+        engine.apply_replica_serving_state(&[rename]).unwrap();
+    }
+    let batches = engine.take_invalidation_batches();
+    assert!(
+        batches
+            .windows(2)
+            .all(|pair| pair[0].generation < pair[1].generation)
+    );
+    let intents: HashSet<_> = batches
+        .into_iter()
+        .flat_map(|batch| batch.intents)
+        .collect();
+    for (parent, name) in [
+        (1, b"a".as_slice()),
+        (2, b"b".as_slice()),
+        (2, b"c".as_slice()),
+    ] {
+        assert!(intents.iter().any(|intent| matches!(intent, InvalidationIntent::Entry { parent: actual_parent, name: actual_name, .. } if *actual_parent == parent && actual_name == name)));
+        assert!(intents.contains(&InvalidationIntent::Directory { ino: parent }));
+    }
+    assert!(intents.contains(&InvalidationIntent::Attributes { ino: 43 }));
+    assert!(intents.iter().any(|intent| matches!(
+        intent,
+        InvalidationIntent::Entry {
+            parent: 2,
+            ancestors: None,
+            ..
+        }
+    )));
+    assert!(!intents.contains(&InvalidationIntent::Reset));
+}
+
+#[test]
+fn coherence_journal_content_epoch_change_does_not_rewrite_local_content() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"content", 1000, 1000, 0o644)
+        .unwrap();
+    let before = attr.clone();
+    attr.content_epoch += 1;
+    attr.committed_content_epoch = attr.content_epoch;
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr { attr }])
+        .unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert!(
+        batches
+            .iter()
+            .flat_map(|batch| &batch.intents)
+            .any(|intent| *intent == InvalidationIntent::Content { ino: before.ino })
+    );
+    // Base publication is advisory: the journal must not replace a local serving overlay.
+    assert_eq!(
+        engine.get_attr(before.ino).unwrap().content_epoch,
+        before.content_epoch
+    );
+}
+
+#[test]
+fn coherence_journal_concurrent_writer_generations_follow_commit_order() {
+    use crate::coherence::InvalidationIntent;
+    let engine = Arc::new(temp_engine());
+    let first = engine.begin_write_txn().unwrap();
+    first.invalidate(InvalidationIntent::Attributes { ino: 42 });
+    let other = Arc::clone(&engine);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let writer = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let second = other.begin_write_txn().unwrap();
+        second.invalidate(InvalidationIntent::Attributes { ino: 43 });
+        second.commit().unwrap();
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    first.commit().unwrap();
+    writer.join().unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(batches.len(), 2);
+    assert!(batches[0].generation < batches[1].generation);
+    assert_eq!(
+        batches[0].intents,
+        vec![InvalidationIntent::Attributes { ino: 42 }]
+    );
+    assert_eq!(
+        batches[1].intents,
+        vec![InvalidationIntent::Attributes { ino: 43 }]
+    );
+}
+
+#[test]
+fn coherence_journal_preserves_removed_aliases_before_drain() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 42,
+        kind: FileType::RegularFile,
+    };
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::AddEntry {
+                parent: 1,
+                name: b"old".to_vec(),
+                entry: entry.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: 1,
+                name: b"alias".to_vec(),
+                entry,
+            },
+        ])
+        .unwrap();
+    engine.take_invalidation_batches();
+    engine
+        .apply_replica_serving_state(&[MetaEvent::RemoveAttr { ino: 42 }])
+        .unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert!(!batches.is_empty());
+    for name in [b"old".as_slice(), b"alias".as_slice()] {
+        assert!(
+            batches
+                .iter()
+                .flat_map(|batch| &batch.intents)
+                .any(|intent| *intent
+                    == InvalidationIntent::Entry {
+                        parent: 1,
+                        name: name.to_vec(),
+                        ancestors: Some(Vec::new()),
+                        ino: Some(42),
+                    })
+        );
+    }
+}
+
+#[test]
+fn coherence_journal_publishes_only_committed_transactions() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 42 });
+    assert!(engine.take_invalidation_batches().is_empty());
+    txn.abort().unwrap();
+    assert!(engine.take_invalidation_batches().is_empty());
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 42 });
+    txn.commit().unwrap();
+    let first = engine.take_invalidation_batches();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].intents,
+        vec![InvalidationIntent::Attributes { ino: 42 }]
+    );
+    engine
+        .apply_replica_serving_state(&[MetaEvent::RemoveEntry {
+            parent: 1,
+            name: b"old".to_vec(),
+        }])
+        .unwrap();
+    assert!(engine.take_invalidation_batches()[0].generation > first[0].generation);
+}
+
+#[test]
+fn coherence_journal_overflow_signals_reset() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    for ino in 1..=8192 {
+        txn.invalidate(InvalidationIntent::Attributes { ino });
+    }
+    txn.commit().unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].intents, vec![InvalidationIntent::Reset]);
+}
+
+#[test]
 fn legacy_meta_event_fixture_replays_from_local_event_log() {
     let engine = temp_engine();
     let legacy_bytes = [1_u8, 42_u8];

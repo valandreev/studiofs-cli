@@ -1151,14 +1151,20 @@ pub(super) struct PreparedForegroundRead {
 struct ReadMetadataResolver<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
+    attr_observation: super::AttrReadObservation,
 }
 
 impl<'a> ReadMetadataResolver<'a> {
     fn new(vfs: &'a StudioVfs, ino: Ino) -> Self {
-        Self { vfs, ino }
+        let attr_observation = vfs.state.namespace.attr_read_cache.lock().observation(ino);
+        Self {
+            vfs,
+            ino,
+            attr_observation,
+        }
     }
 
-    fn resolve_attr_sync(&self) -> VfsResult<InodeAttr> {
+    fn resolve_attr_sync(&mut self) -> VfsResult<InodeAttr> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
         }
@@ -1171,7 +1177,7 @@ impl<'a> ReadMetadataResolver<'a> {
         self.load_attr_from_meta_sync()
     }
 
-    async fn resolve_attr(&self) -> VfsResult<InodeAttr> {
+    async fn resolve_attr(&mut self) -> VfsResult<InodeAttr> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
         }
@@ -1184,7 +1190,7 @@ impl<'a> ReadMetadataResolver<'a> {
         self.load_attr_from_meta().await
     }
 
-    async fn resolve_for_read(&self, offset: u64, buffer_len: u64) -> VfsResult<ReadMetadata> {
+    async fn resolve_for_read(&mut self, offset: u64, buffer_len: u64) -> VfsResult<ReadMetadata> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(ReadMetadata {
                 attr,
@@ -1256,10 +1262,11 @@ impl<'a> ReadMetadataResolver<'a> {
             .vfs
             .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
         {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let _ = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
+                None,
             );
             return Some(remote_attr);
         }
@@ -1312,10 +1319,11 @@ impl<'a> ReadMetadataResolver<'a> {
             .vfs
             .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
         {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let _ = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
+                None,
             );
             return Ok(Some(remote_attr));
         }
@@ -1323,7 +1331,7 @@ impl<'a> ReadMetadataResolver<'a> {
         Ok(Some(dirty_attr))
     }
 
-    fn cached_attr(&self) -> VfsResult<Option<InodeAttr>> {
+    fn cached_attr(&mut self) -> VfsResult<Option<InodeAttr>> {
         let cached_attr = self
             .vfs
             .state
@@ -1362,17 +1370,21 @@ impl<'a> ReadMetadataResolver<'a> {
             }
         };
         if StudioVfs::is_fully_published_regular_file(&remote_attr) {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let Some(observation) = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
-            );
+                Some(self.attr_observation),
+            ) else {
+                return Ok(Some(remote_attr));
+            };
+            self.attr_observation = observation;
         }
         self.cache_attr(&remote_attr);
         Ok(Some(remote_attr))
     }
 
-    async fn cached_attr_async(&self) -> VfsResult<Option<InodeAttr>> {
+    async fn cached_attr_async(&mut self) -> VfsResult<Option<InodeAttr>> {
         let Some(cached_attr) = self
             .vfs
             .state
@@ -1416,11 +1428,15 @@ impl<'a> ReadMetadataResolver<'a> {
                 }
             };
         if StudioVfs::is_fully_published_regular_file(&remote_attr) {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let Some(observation) = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
-            );
+                Some(self.attr_observation),
+            ) else {
+                return Ok(Some(remote_attr));
+            };
+            self.attr_observation = observation;
         }
         self.cache_attr(&remote_attr);
         Ok(Some(remote_attr))
@@ -1443,12 +1459,18 @@ impl<'a> ReadMetadataResolver<'a> {
                 .remove(self.ino);
             return;
         }
-        self.vfs.state.namespace.attr_read_cache.lock().put(
-            self.ino,
-            attr.clone(),
-            ATTR_CACHE_TTL,
-            Instant::now(),
-        );
+        self.vfs
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .put_observed(
+                self.ino,
+                attr.clone(),
+                ATTR_CACHE_TTL,
+                Instant::now(),
+                self.attr_observation,
+            );
     }
 
     fn clear_stale_state(&self) {
@@ -2066,6 +2088,124 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_invalidation_rejects_inflight_attribute_observation() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-observation");
+        let _guard = rt.enter();
+        for intent in [
+            InvalidationIntent::Attributes { ino: ROOT_INO },
+            InvalidationIntent::Reset,
+        ] {
+            vfs.state.namespace.attr_read_cache.lock().remove(ROOT_INO);
+            let resolver = ReadMetadataResolver::new(&vfs, ROOT_INO);
+            let attr = meta
+                .get_attr(ROOT_INO)
+                .expect("read attributes before retirement");
+            vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+                generation: 1,
+                intents: vec![intent],
+            });
+            resolver.cache_attr(&attr);
+            assert!(
+                !vfs.state
+                    .namespace
+                    .attr_read_cache
+                    .lock()
+                    .contains(ROOT_INO)
+            );
+            let current = ReadMetadataResolver::new(&vfs, ROOT_INO);
+            current.cache_attr(&attr);
+            assert!(
+                vfs.state
+                    .namespace
+                    .attr_read_cache
+                    .lock()
+                    .contains(ROOT_INO)
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_attribute_invalidation_keeps_unrelated_observation_admissible() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-observation-per-inode");
+        let _guard = rt.enter();
+        let first = vfs
+            .create(ROOT_INO, b"first", 0, 0, 0o644)
+            .expect("create first");
+        let second = vfs
+            .create(ROOT_INO, b"second", 0, 0, 0o644)
+            .expect("create second");
+        vfs.state.namespace.attr_read_cache.lock().remove(first.ino);
+        vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .remove(second.ino);
+        let first_resolver = ReadMetadataResolver::new(&vfs, first.ino);
+        let second_resolver = ReadMetadataResolver::new(&vfs, second.ino);
+        let first_attr = meta.get_attr(first.ino).expect("read first attr");
+        let second_attr = meta.get_attr(second.ino).expect("read second attr");
+
+        vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+            generation: 1,
+            intents: vec![InvalidationIntent::Attributes { ino: first.ino }],
+        });
+        first_resolver.cache_attr(&first_attr);
+        second_resolver.cache_attr(&second_attr);
+
+        let cache = vfs.state.namespace.attr_read_cache.lock();
+        assert!(!cache.contains(first.ino));
+        assert!(cache.contains(second.ino));
+    }
+
+    #[test]
+    fn attr_observation_tokens_remain_bounded_by_cache_capacity() {
+        let mut cache = AttrReadCache::new(2, 1024);
+        cache.remove(1);
+        cache.remove(2);
+        cache.remove(3);
+
+        assert!(cache.inode_observation_generations.len() <= 2);
+        assert_eq!(cache.observation_generation, 1);
+    }
+
+    #[test]
+    fn superseded_refresh_does_not_cross_concurrent_attr_invalidation() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-observation-race");
+        let _guard = rt.enter();
+        let file = vfs
+            .create(ROOT_INO, b"attr-race", 0, 0, 0o644)
+            .expect("create file");
+        let resolver = ReadMetadataResolver::new(&vfs, file.ino);
+        let attr = meta.get_attr(file.ino).expect("read attr");
+
+        vfs.invalidate_attr_read_cache([file.ino]);
+        assert!(
+            vfs.clear_superseded_local_regular_file_state(
+                file.ino,
+                attr.committed_content_epoch,
+                false,
+                Some(resolver.attr_observation),
+            )
+            .is_none(),
+            "a concurrent invalidation must reject the old resolver observation"
+        );
+        resolver.cache_attr(&attr);
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(file.ino),
+            "the stale resolver must not repopulate the invalidated attr cache"
+        );
+    }
+
     use super::super::local_dirty::PendingPayload;
     use super::super::*;
     use super::{

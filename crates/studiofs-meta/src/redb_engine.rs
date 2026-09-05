@@ -2,6 +2,7 @@
 //!
 //! Uses redb as an embedded ACID KV store for all filesystem metadata.
 
+use crate::coherence::{InvalidationIntent, InvalidationJournal, PendingInvalidations};
 use crate::engine::*;
 use crate::snapshot_ports::{UploadedFragmentLedger, UploadedFragmentLedgerEntry};
 use crate::types::*;
@@ -10,6 +11,7 @@ use redb::{
     TableDefinition, WriteTransaction,
 };
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::ops::Deref;
@@ -38,6 +40,8 @@ pub struct RedbMetaEngine {
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
     write_txn_lock: Mutex<()>,
+    invalidation_journal: Mutex<InvalidationJournal>,
+    pub(crate) invalidation_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     allocator_state_write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -235,6 +239,9 @@ pub(crate) struct RedbWriteTransaction<'a> {
     write_metrics: &'a MetadataWriteMetrics,
     mutation_started: Instant,
     relaxed_durability: Option<&'a RelaxedDurabilityRuntime>,
+    invalidation_journal: &'a Mutex<InvalidationJournal>,
+    invalidation_notify: &'a tokio::sync::Notify,
+    invalidations: RefCell<PendingInvalidations>,
 }
 
 fn begin_redb_write_txn(
@@ -455,6 +462,10 @@ impl Deref for RedbWriteTransaction<'_> {
 }
 
 impl RedbWriteTransaction<'_> {
+    pub(crate) fn invalidate(&self, intent: InvalidationIntent) {
+        self.invalidations.borrow_mut().push(intent);
+    }
+
     pub(crate) fn commit(self) -> Result<(), redb::CommitError> {
         let Self {
             txn,
@@ -462,7 +473,10 @@ impl RedbWriteTransaction<'_> {
             write_metrics,
             mutation_started,
             relaxed_durability,
-            ..
+            _write_txn_guard,
+            invalidation_journal,
+            invalidation_notify,
+            invalidations,
         } = self;
         let commit_started = Instant::now();
         MetadataWriteMetrics::observe(&write_metrics.mutation, commit_started - mutation_started);
@@ -474,6 +488,17 @@ impl RedbWriteTransaction<'_> {
             runtime.state.pending.store(true, Ordering::Release);
         }
         MetadataWriteMetrics::observe(&write_metrics.commit, commit_started.elapsed());
+        // Retain the writer guard through publication so generations have the
+        // same order as successful commits, including concurrent replay callers.
+        if result.is_ok()
+            && invalidation_journal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .publish(invalidations.into_inner())
+        {
+            invalidation_notify.notify_one();
+        }
+        drop(_write_txn_guard);
         result
     }
 
@@ -539,6 +564,9 @@ impl RedbMetaEngine {
             write_metrics: &self.write_metrics,
             mutation_started: Instant::now(),
             relaxed_durability: self.relaxed_durability.as_deref(),
+            invalidation_journal: &self.invalidation_journal,
+            invalidation_notify: &self.invalidation_notify,
+            invalidations: RefCell::default(),
         })
     }
 
@@ -567,6 +595,9 @@ impl RedbMetaEngine {
             write_metrics: &self.write_metrics,
             mutation_started: Instant::now(),
             relaxed_durability: None,
+            invalidation_journal: &self.invalidation_journal,
+            invalidation_notify: &self.invalidation_notify,
+            invalidations: RefCell::default(),
         })
     }
 
@@ -645,6 +676,8 @@ impl RedbMetaEngine {
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
             write_txn_lock: Mutex::new(()),
+            invalidation_journal: Mutex::default(),
+            invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             allocator_state_write_hook: Mutex::new(None),
         };
@@ -689,6 +722,8 @@ impl RedbMetaEngine {
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability: None,
             write_txn_lock: Mutex::new(()),
+            invalidation_journal: Mutex::default(),
+            invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             allocator_state_write_hook: Mutex::new(None),
         })

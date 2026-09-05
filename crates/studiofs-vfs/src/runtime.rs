@@ -574,6 +574,7 @@ impl<M: ?Sized + MetaAcl> MetaAcl for RuntimeMetaHandle<M> {
 }
 
 impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
+    forward_method!(fn take_invalidation_batches(&self) -> Vec<studiofs_meta::coherence::InvalidationBatch>);
     forward_method!(fn check_consistency(&self) -> MetaResult<()>);
     forward_method!(fn flush_metadata(&self) -> MetaResult<()>);
     forward_method!(fn flush_local_metadata(&self) -> MetaResult<()>);

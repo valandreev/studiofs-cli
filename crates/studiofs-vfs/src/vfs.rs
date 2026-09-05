@@ -1236,15 +1236,27 @@ impl AttrReadCacheMetrics {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttrReadObservation {
+    global_generation: u64,
+    inode_generation: u64,
+}
+
 #[derive(Debug)]
 struct AttrReadCache {
     inner: TwoTierCache<Ino, InodeAttr, AttrReadCachePolicy>,
+    /// Mount-wide epoch used only by conservative Reset invalidation.
+    observation_generation: u64,
+    /// Targeted retirement stamps keep unrelated in-flight reads admissible.
+    inode_observation_generations: HashMap<Ino, u64>,
 }
 
 impl AttrReadCache {
     fn new(entry_budget: usize, byte_budget: usize) -> Self {
         Self {
             inner: TwoTierCache::new(entry_budget, byte_budget, AttrReadCachePolicy),
+            observation_generation: 0,
+            inode_observation_generations: HashMap::new(),
         }
     }
 
@@ -1283,7 +1295,50 @@ impl AttrReadCache {
     }
 
     fn remove(&mut self, ino: Ino) -> bool {
+        self.retire_inode_observation(ino);
         self.inner.remove(&ino)
+    }
+
+    fn observation(&self, ino: Ino) -> AttrReadObservation {
+        AttrReadObservation {
+            global_generation: self.observation_generation,
+            inode_generation: self
+                .inode_observation_generations
+                .get(&ino)
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    fn retire_inode_observation(&mut self, ino: Ino) {
+        if !self.inode_observation_generations.contains_key(&ino)
+            && self.inode_observation_generations.len() >= self.inner.entry_budget.max(1)
+        {
+            // Evicting a token without knowing whether a reader still holds it
+            // would allow an old result to repopulate the cache. A conservative
+            // global epoch keeps the map bounded while preserving that barrier.
+            self.retire_observations();
+        }
+        let generation = self.inode_observation_generations.entry(ino).or_default();
+        *generation = generation.saturating_add(1);
+    }
+
+    fn retire_observations(&mut self) {
+        self.observation_generation = self.observation_generation.saturating_add(1);
+        self.inode_observation_generations.clear();
+    }
+
+    fn put_observed(
+        &mut self,
+        ino: Ino,
+        attr: InodeAttr,
+        ttl: Duration,
+        now: Instant,
+        observed: AttrReadObservation,
+    ) {
+        if observed == self.observation(ino) && observed.global_generation != u64::MAX {
+            self.put(ino, attr, ttl, now);
+        }
     }
 
     fn keys(&self) -> Vec<Ino> {
@@ -5213,10 +5268,11 @@ impl StudioVfs {
         invalidate_kernel_on_supersede: bool,
     ) -> InodeIncarnationState {
         if self.ready_attr_supersedes_local_regular_file_state(ino, attr) {
-            self.clear_superseded_local_regular_file_state(
+            let _ = self.clear_superseded_local_regular_file_state(
                 ino,
                 attr.committed_content_epoch,
                 invalidate_kernel_on_supersede,
+                None,
             );
         }
 
@@ -5450,7 +5506,8 @@ impl StudioVfs {
         ino: Ino,
         committed_epoch: u64,
         invalidate_kernel: bool,
-    ) {
+        expected_observation: Option<AttrReadObservation>,
+    ) -> Option<AttrReadObservation> {
         debug!(
             ino,
             committed_epoch, "authoritative ready metadata superseded local regular-file state"
@@ -5461,10 +5518,17 @@ impl StudioVfs {
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.remove_live_extents_for_inode(ino);
         self.remove_pending_epoch_finalizations_for_inode(ino);
-        self.invalidate_attr_read_cache([ino]);
+        let observation = match expected_observation {
+            Some(expected) => self.invalidate_attr_read_cache_if_observed(ino, expected),
+            None => {
+                self.invalidate_attr_read_cache([ino]);
+                None
+            }
+        };
         if invalidate_kernel {
             self.invalidate_kernel_inodes([ino]);
         }
+        observation
     }
 
     fn clear_inode_incarnation(&self, ino: Ino) {

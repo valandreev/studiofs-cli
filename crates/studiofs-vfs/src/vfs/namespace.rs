@@ -151,8 +151,8 @@ struct DentryCacheMeta {
     parent_generation: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct NamespaceCacheToken {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NamespaceCacheToken {
     namespace_epoch: u64,
     parent_generation: u64,
 }
@@ -748,6 +748,12 @@ impl<'a> NamespaceResolver<'a> {
 
         let cache_key = PathShortcutCacheKey::from_components(self.style, components);
         let do_resolve = || -> VfsResult<InodeAttr> {
+            let observed_epoch = self
+                .vfs
+                .state
+                .namespace
+                .namespace_epoch
+                .load(Ordering::Acquire);
             let mut current = ROOT_INO;
             let mut attr = self.vfs.getattr(ROOT_INO)?;
             let mut parent_tokens = Vec::with_capacity(components.len());
@@ -768,6 +774,7 @@ impl<'a> NamespaceResolver<'a> {
                                 current,
                                 component.as_bytes(),
                                 parent_tokens,
+                                observed_epoch,
                             );
                         }
                         return Err(err);
@@ -776,8 +783,12 @@ impl<'a> NamespaceResolver<'a> {
                 }
             }
             if let Some(key) = cache_key.clone() {
-                self.vfs
-                    .path_shortcut_cache_insert_positive_by_key(key, attr.ino, parent_tokens);
+                self.vfs.path_shortcut_cache_insert_positive_by_key(
+                    key,
+                    attr.ino,
+                    parent_tokens,
+                    observed_epoch,
+                );
             }
             Ok(attr)
         };
@@ -968,6 +979,28 @@ impl<'a> NamespaceMutationOps<'a> {
 
 /// Abstraction for backends that can invalidate inode-specific kernel cache entries.
 pub trait KernelInvalidator: Send + Sync {
+    /// Admit semantic scopes. `generation_complete` is false when the caller
+    /// deferred other scopes from the same generation. Acceptance is not delivery.
+    /// Legacy adapters explicitly lack semantic coverage until implemented.
+    fn invalidate_batch(
+        &self,
+        batch: &studiofs_meta::coherence::InvalidationBatch,
+        _generation_complete: bool,
+    ) -> crate::coherence::InvalidationAcceptance {
+        use studiofs_meta::coherence::InvalidationIntent;
+        for intent in &batch.intents {
+            match intent {
+                InvalidationIntent::Content { ino } => self.inval_inode(*ino),
+                InvalidationIntent::Attributes { ino } | InvalidationIntent::Directory { ino } => {
+                    self.inval_inode_attrs(*ino)
+                }
+                InvalidationIntent::Entry { parent, name, .. } => self.inval_entry(*parent, name),
+                InvalidationIntent::Reset => {}
+            }
+        }
+        crate::coherence::InvalidationAcceptance::Unsupported
+    }
+
     /// Invalidate the full kernel cache state for the inode, including attributes and data.
     fn inval_inode(&self, ino: u64);
 
@@ -1036,7 +1069,7 @@ impl NamespaceState {
 }
 
 impl StudioVfs {
-    fn namespace_cache_token_for_parent(&self, parent: Ino) -> NamespaceCacheToken {
+    pub(super) fn namespace_cache_token_for_parent(&self, parent: Ino) -> NamespaceCacheToken {
         let parent_generation = self
             .state
             .namespace
@@ -1129,6 +1162,27 @@ impl StudioVfs {
         );
     }
 
+    /// Admit a metadata observation only under the generation in which it began.
+    /// Retaining the observed token also makes a concurrent later retirement safe.
+    pub(super) fn dentry_cache_insert_observed(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        value: DentryCacheValue,
+        observed: NamespaceCacheToken,
+    ) {
+        if self.namespace_cache_token_for_parent(parent) != observed {
+            return;
+        }
+        self.state.namespace.dentry_cache.lock().put(
+            parent,
+            name,
+            value,
+            observed.namespace_epoch,
+            observed.parent_generation,
+        );
+    }
+
     /// Removes one dentry entry from cache.
     pub(super) fn dentry_cache_invalidate(&self, parent: Ino, name: &[u8]) {
         self.state
@@ -1192,12 +1246,12 @@ impl StudioVfs {
         key: PathShortcutCacheKey,
         child_ino: Ino,
         parent_tokens: Vec<PathShortcutParentToken>,
+        observed_epoch: u64,
     ) {
-        let namespace_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
         self.state.namespace.path_shortcut_cache.lock().put(
             key,
             PathShortcutCacheValue::Positive(child_ino),
-            namespace_epoch,
+            observed_epoch,
             parent_tokens,
         );
     }
@@ -1209,15 +1263,15 @@ impl StudioVfs {
         parent: Ino,
         name: &[u8],
         parent_tokens: Vec<PathShortcutParentToken>,
+        observed_epoch: u64,
     ) {
-        let namespace_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
         self.state.namespace.path_shortcut_cache.lock().put(
             key,
             PathShortcutCacheValue::Negative {
                 parent,
                 name: Arc::from(name),
             },
-            namespace_epoch,
+            observed_epoch,
             parent_tokens,
         );
     }
@@ -1550,6 +1604,43 @@ mod tests {
     }
 
     #[test]
+    fn semantic_reset_rejects_inflight_path_shortcut_observation() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "path-reset-observation");
+        let _guard = rt.enter();
+        let key = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Posix,
+            &[String::from("missing")],
+        )
+        .expect("key");
+        let observed = vfs.state.namespace.namespace_epoch.load(Ordering::Acquire);
+        let parent_tokens = vec![PathShortcutParentToken {
+            parent: ROOT_INO,
+            generation: vfs.directory_generation(ROOT_INO),
+        }];
+        vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+            generation: 1,
+            intents: vec![InvalidationIntent::Reset],
+        });
+        vfs.path_shortcut_cache_insert_negative_by_key(
+            key.clone(),
+            ROOT_INO,
+            b"missing",
+            parent_tokens.clone(),
+            observed,
+        );
+        assert!(vfs.path_shortcut_cache_lookup_by_key(&key).is_none());
+        vfs.path_shortcut_cache_insert_positive_by_key(
+            key.clone(),
+            ROOT_INO,
+            parent_tokens,
+            observed,
+        );
+        assert!(vfs.path_shortcut_cache_lookup_by_key(&key).is_none());
+    }
+
+    #[test]
     fn path_shortcut_cache_rejects_stale_parent_generations() {
         let key = PathShortcutCacheKey::from_components(
             NamespacePathStyle::Posix,
@@ -1781,6 +1872,40 @@ mod tests {
         assert!(
             meta.lookup(ROOT_INO, b"dangling-cached.txt").is_ok(),
             "readdir should leave the dangling dentry for foreground repair"
+        );
+    }
+
+    #[test]
+    fn readdir_dangling_entry_does_not_reject_later_observed_attrs() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-observation-after-dangling");
+        let dangling = vfs
+            .create(ROOT_INO, b"a-dangling.txt", 1000, 1000, 0o644)
+            .expect("create dangling file");
+        let surviving = vfs
+            .create(ROOT_INO, b"z-surviving.txt", 1000, 1000, 0o644)
+            .expect("create surviving file");
+        vfs.getattr(dangling.ino)
+            .expect("prime dangling attr cache");
+        vfs.getattr(surviving.ino)
+            .expect("prime surviving attr cache");
+        meta.remove_attr(dangling.ino)
+            .expect("remove attr while leaving dentry behind");
+        vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .remove(surviving.ino);
+
+        vfs.readdir(ROOT_INO).expect("readdir root");
+
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(surviving.ino),
+            "a dangling entry must not invalidate later observations in the same readdir"
         );
     }
 

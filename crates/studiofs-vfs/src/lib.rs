@@ -8,6 +8,7 @@ pub mod access;
 pub mod aimd;
 /// Bridge integration utilities for error normalization and VFS boundary conversions.
 pub mod bridge;
+pub mod coherence;
 pub mod contract_harness;
 pub mod fetch;
 /// File incarnation and upload state tracking for durable VFS metadata.
