@@ -92,9 +92,9 @@ were present in the run shell or fixture `.env`; the defaults above apply.
 Antivirus/indexing were not controlled, so these are host observations rather
 than an isolated CPU or filesystem latency guarantee.
 
-Measured executable: `target/release/deps/mount_sanity-74aabd16b63a04ac.exe`,
-19,914,752 bytes; SHA-256
-`BB0E23BA7D18FAB3D97D92CC23D85E4CC3B11CDAB7A46AFB4FDCD86B247F938D`.
+Measured executable for the original recorded run:
+`target/release/deps/mount_sanity-74aabd16b63a04ac.exe`, 19,914,752 bytes;
+SHA-256 `BB0E23BA7D18FAB3D97D92CC23D85E4CC3B11CDAB7A46AFB4FDCD86B247F938D`.
 This is the test fixture executable, not a production CLI mount. The source
 identity is the starting commit plus this issue's callback instrumentation and
 test. Cache and metadata use the fixture's fresh workspace-target temporary
@@ -119,25 +119,25 @@ and `STUDIOFS_WINFSP_TEST_MOUNT_POINT` values are honored without mutating the
 process environment. An explicitly set process environment value still takes
 precedence. If neither source enables the test, it reports a skip instead of
 failing the surrounding ignored-test run or enabling other tests in the process.
-Raw output is retained at
-`target/perf/sfs-675-metadata-1788613723550-38764.csv`; the complete values below
-preserve the result when ignored build artifacts are removed.
+The latest supplied raw output is retained at
+`target/perf/sfs-675-metadata-1788617449200-47924.csv`; the complete values below
+preserve that result when ignored build artifacts are removed.
 
 | Workload (1000 operations per pass) | Pass 1 ms | Pass 2 ms | Pass 3 ms | Median ms |
 | --- | ---: | ---: | ---: | ---: |
-| stat existing empty file | 70.4025 | 66.3235 | 73.3582 | 70.4025 |
-| open/close existing empty file | 66.8185 | 67.7462 | 72.5551 | 67.7462 |
-| negative lookup, fixed absent name | 43.7436 | 33.1068 | 36.7647 | 36.7647 |
-| enumerate all 64 names | 398.5320 | 414.4627 | 402.5469 | 402.5469 |
+| stat existing empty file | 102.7995 | 88.5705 | 97.3633 | 97.3633 |
+| open/close existing empty file | 102.5098 | 92.8760 | 129.4063 | 102.5098 |
+| negative lookup, fixed absent name | 35.9254 | 36.8291 | 46.5934 | 36.8291 |
+| enumerate all 64 names | 1788.1619 | 2096.1232 | 2067.2501 | 2067.2501 |
 
 Timings include correctness assertions and enumeration sorting; they are not
 pure callback latency. Counts per pass were identical except asynchronous close:
 
 | Workload | Security by name | Open | File info | Read directory | Cleanup | Close, passes 1/2/3 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| stat | 1000 | 1000 | 0 | 0 | 0 | 999 / 1000 / 1000 |
-| open/close | 1000 | 1000 | 0 | 0 | 0 | 1000 / 1000 / 1000 |
-| negative lookup | 1000 | 0 | 0 | 0 | 0 | 1 / 1 / 1 |
+| stat | 1000 | 1000 | 0 | 0 | 0 | 999 / 1000 / 999 |
+| open/close | 1000 | 1000 | 0 | 0 | 0 | 999 / 999 / 1000 |
+| negative lookup | 1000 | 0 | 0 | 0 | 0 | 0 / 0 / 0 |
 | enumeration | 1000 | 1000 | 0 | 1000 | 0 | 999 / 999 / 999 |
 
 Repeated operations did not eliminate successful open or directory callbacks in
@@ -147,12 +147,12 @@ The closes observed in negative-lookup windows belong to asynchronous activity,
 not successful opens of the missing name. These results neither establish
 negative-name cache TTL nor cover held-open enumeration across a remote mutation.
 
-An initial run before stronger file-length and exact-name assertions also
+An earlier run before stronger file-length and exact-name assertions also
 passed; it is retained separately at
 `target/perf/sfs-675-metadata-1788613641245-50004.csv` and is not combined with
-the final timing sample because the timed validation work differs.
+the latest supplied timing sample because the timed validation work differs.
 
-After the `.env` lookup guard fix, the same command completed with 1 passed and
+An intermediate run after the `.env` lookup guard fix completed with 1 passed and
 24 filtered tests. Its raw CSV is retained at
 `target/perf/sfs-675-metadata-1788615768816-54128.csv`. The callback counts kept
 the same per-workload shape, with one enumeration window observing four extra
@@ -160,7 +160,7 @@ open/security/close callbacks from asynchronous activity. Host timing varied
 (enumeration 1878.2270–3042.3467 ms), so this rerun is evidence that the guard
 and mount path work, not a replacement for the recorded baseline medians above.
 
-The final fixture-isolation fix was verified with the full ignored WinFSP
+The fixture-isolation fix was verified with the full ignored WinFSP
 mount-sanity selection (the same 14-test shape as the reported failure), without
 exporting either setting in the shell:
 
@@ -173,7 +173,15 @@ The baseline again produced the expected callback shape and retained
 `.env` only for its own configuration and constructs its fixture without the
 shared helper that mutates process environment; sibling tests therefore remain
 skipped unless the operator explicitly exports the platform gate. This run's
-host timings are also observational and are not merged into the medians above.
+host timings are also observational and are not merged into the latest supplied
+medians above.
+
+The latest table and callback counts are the operator-supplied run received on
+2026-09-05. Its CSV path and rows were verified in the workspace. The message
+did not include a new executable hash or host transcript, so the original
+environment identity above remains explicitly tied to the earlier recorded
+binary; reattach matching identity metadata before using this sample for an
+unrelated candidate comparison.
 
 ## Full acceptance commands (operator-run)
 
