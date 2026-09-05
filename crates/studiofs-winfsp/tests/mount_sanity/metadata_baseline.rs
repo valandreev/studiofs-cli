@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+
 const CALLBACKS: [&str; 6] = [
     "get_security_by_name",
     "open",
@@ -78,10 +80,7 @@ fn winfsp_metadata_baseline() {
         "mount point must be a drive letter"
     );
     // GetLogicalDrives includes assigned but currently inaccessible drives.
-    unsafe extern "system" {
-        fn GetLogicalDrives() -> u32;
-    }
-    // SAFETY: GetLogicalDrives has no parameters and returns the process drive mask.
+    // SAFETY: The typed Win32 binding has no parameters and returns the process drive mask.
     let drives = unsafe { GetLogicalDrives() };
     assert_ne!(drives, 0, "GetLogicalDrives failed");
     assert_eq!(
@@ -91,7 +90,10 @@ fn winfsp_metadata_baseline() {
     );
 
     let counter = CallbackCounter::default();
-    // A global subscriber is required because native callbacks run on dispatcher threads.
+    // This integration binary invokes the baseline once per process. Keep the
+    // installation fail-fast so an existing subscriber cannot hide zero counts.
+    // Native callbacks run on dispatcher threads, so a thread-local subscriber
+    // cannot observe the workload.
     tracing::subscriber::set_global_default(counter.clone()).expect("install callback counter");
     let tmp = studiofs_test_support::workspace_target_tempdir("metadata-baseline-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
