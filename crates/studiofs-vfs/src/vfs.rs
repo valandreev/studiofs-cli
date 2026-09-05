@@ -5268,10 +5268,11 @@ impl StudioVfs {
         invalidate_kernel_on_supersede: bool,
     ) -> InodeIncarnationState {
         if self.ready_attr_supersedes_local_regular_file_state(ino, attr) {
-            self.clear_superseded_local_regular_file_state(
+            let _ = self.clear_superseded_local_regular_file_state(
                 ino,
                 attr.committed_content_epoch,
                 invalidate_kernel_on_supersede,
+                None,
             );
         }
 
@@ -5505,7 +5506,8 @@ impl StudioVfs {
         ino: Ino,
         committed_epoch: u64,
         invalidate_kernel: bool,
-    ) {
+        expected_observation: Option<AttrReadObservation>,
+    ) -> Option<AttrReadObservation> {
         debug!(
             ino,
             committed_epoch, "authoritative ready metadata superseded local regular-file state"
@@ -5516,10 +5518,17 @@ impl StudioVfs {
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.remove_live_extents_for_inode(ino);
         self.remove_pending_epoch_finalizations_for_inode(ino);
-        self.invalidate_attr_read_cache([ino]);
+        let observation = match expected_observation {
+            Some(expected) => self.invalidate_attr_read_cache_if_observed(ino, expected),
+            None => {
+                self.invalidate_attr_read_cache([ino]);
+                None
+            }
+        };
         if invalidate_kernel {
             self.invalidate_kernel_inodes([ino]);
         }
+        observation
     }
 
     fn clear_inode_incarnation(&self, ino: Ino) {

@@ -822,6 +822,21 @@ impl StudioVfs {
         removed
     }
 
+    pub(super) fn invalidate_attr_read_cache_if_observed(
+        &self,
+        ino: Ino,
+        expected: super::AttrReadObservation,
+    ) -> Option<super::AttrReadObservation> {
+        let mut cache = self.state.namespace.attr_read_cache.lock();
+        if cache.observation(ino) != expected {
+            return None;
+        }
+        self.handle_table.clear_read_windows_for_inode(ino);
+        self.state.read.published_read_plan_cache.lock().pop(&ino);
+        cache.remove(ino);
+        Some(cache.observation(ino))
+    }
+
     pub(super) fn retire_all_attr_read_observations(&self) {
         self.state
             .namespace

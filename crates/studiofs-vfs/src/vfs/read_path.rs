@@ -1262,10 +1262,11 @@ impl<'a> ReadMetadataResolver<'a> {
             .vfs
             .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
         {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let _ = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
+                None,
             );
             return Some(remote_attr);
         }
@@ -1318,10 +1319,11 @@ impl<'a> ReadMetadataResolver<'a> {
             .vfs
             .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
         {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let _ = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
+                None,
             );
             return Ok(Some(remote_attr));
         }
@@ -1368,12 +1370,15 @@ impl<'a> ReadMetadataResolver<'a> {
             }
         };
         if StudioVfs::is_fully_published_regular_file(&remote_attr) {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let Some(observation) = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
-            );
-            self.refresh_attr_observation();
+                Some(self.attr_observation),
+            ) else {
+                return Ok(Some(remote_attr));
+            };
+            self.attr_observation = observation;
         }
         self.cache_attr(&remote_attr);
         Ok(Some(remote_attr))
@@ -1423,25 +1428,18 @@ impl<'a> ReadMetadataResolver<'a> {
                 }
             };
         if StudioVfs::is_fully_published_regular_file(&remote_attr) {
-            self.vfs.clear_superseded_local_regular_file_state(
+            let Some(observation) = self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
                 false,
-            );
-            self.refresh_attr_observation();
+                Some(self.attr_observation),
+            ) else {
+                return Ok(Some(remote_attr));
+            };
+            self.attr_observation = observation;
         }
         self.cache_attr(&remote_attr);
         Ok(Some(remote_attr))
-    }
-
-    fn refresh_attr_observation(&mut self) {
-        self.attr_observation = self
-            .vfs
-            .state
-            .namespace
-            .attr_read_cache
-            .lock()
-            .observation(self.ino);
     }
 
     fn cache_attr(&self, attr: &InodeAttr) {
@@ -2173,6 +2171,39 @@ mod tests {
 
         assert!(cache.inode_observation_generations.len() <= 2);
         assert_eq!(cache.observation_generation, 1);
+    }
+
+    #[test]
+    fn superseded_refresh_does_not_cross_concurrent_attr_invalidation() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-observation-race");
+        let _guard = rt.enter();
+        let file = vfs
+            .create(ROOT_INO, b"attr-race", 0, 0, 0o644)
+            .expect("create file");
+        let resolver = ReadMetadataResolver::new(&vfs, file.ino);
+        let attr = meta.get_attr(file.ino).expect("read attr");
+
+        vfs.invalidate_attr_read_cache([file.ino]);
+        assert!(
+            vfs.clear_superseded_local_regular_file_state(
+                file.ino,
+                attr.committed_content_epoch,
+                false,
+                Some(resolver.attr_observation),
+            )
+            .is_none(),
+            "a concurrent invalidation must reject the old resolver observation"
+        );
+        resolver.cache_attr(&attr);
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(file.ino),
+            "the stale resolver must not repopulate the invalidated attr cache"
+        );
     }
 
     use super::super::local_dirty::PendingPayload;
