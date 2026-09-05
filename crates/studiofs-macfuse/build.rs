@@ -20,7 +20,9 @@ const MFMOUNT_FRAMEWORK_ENV: &str = "STUDIOFS_MFMOUNT_FRAMEWORK_DIR";
 const DEFAULT_MFMOUNT_FRAMEWORK_DIR: &str = "/Library/Filesystems/macfuse.fs/Contents/Frameworks";
 
 #[cfg(not(target_os = "macos"))]
-fn main() {}
+fn main() {
+    println!("cargo:rustc-check-cfg=cfg(studiofs_fskit)");
+}
 
 #[cfg(target_os = "macos")]
 fn main() {

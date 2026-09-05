@@ -1564,7 +1564,7 @@ fn configured_mount_root(value: Option<&str>) -> Result<Option<PathBuf>, ClientC
     #[cfg(not(target_os = "macos"))]
     {
         let _ = path;
-        return Ok(None);
+        Ok(None)
     }
     #[cfg(target_os = "macos")]
     {
