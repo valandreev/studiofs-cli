@@ -5,21 +5,21 @@
 
 #![cfg(windows)]
 
+mod cache_policy;
 mod context;
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::{mem, ptr};
 
+use cache_policy::WinfspMetadataCachePolicy;
 pub use context::{
     StudioFsContext, WinfspDeliverySnapshot, WinfspInvalidationQueue, WinfspKernelInvalidator,
 };
 use thiserror::Error;
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
-const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = u32::MAX;
-const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
-const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
 const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
 const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
@@ -47,9 +47,13 @@ const _: () = {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WinfspMountOptions {
     volume_label: String,
+    metadata_cache_policy: WinfspMetadataCachePolicy,
     file_info_timeout_ms: u32,
     dir_info_timeout_ms: u32,
     volume_info_timeout_ms: u32,
+    security_timeout_ms: u32,
+    stream_info_timeout_ms: u32,
+    extended_attribute_timeout_ms: u32,
     sector_size: u16,
     sectors_per_allocation_unit: u16,
     dispatcher_threads: u32,
@@ -212,17 +216,33 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         return Err(MountOptionError::VolumeLabelContainsNul);
     }
 
+    let metadata_cache_policy = WinfspMetadataCachePolicy::parse(
+        mount_option_env_var("STUDIOFS_WINFSP_METADATA_CACHE_POLICY").as_deref(),
+    );
+    let cache_timeouts = metadata_cache_policy.timeouts();
     let file_info_timeout_ms = parse_timeout_env(
         "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS",
-        DEFAULT_FILE_INFO_TIMEOUT_MS,
+        cache_timeouts.file_info_ms,
     );
     let dir_info_timeout_ms = parse_timeout_env(
         "STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS",
-        DEFAULT_DIR_INFO_TIMEOUT_MS,
+        cache_timeouts.dir_info_ms,
     );
     let volume_info_timeout_ms = parse_timeout_env(
         "STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS",
-        DEFAULT_VOLUME_INFO_TIMEOUT_MS,
+        cache_timeouts.volume_info_ms,
+    );
+    let security_timeout_ms = parse_timeout_env(
+        "STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS",
+        cache_timeouts.security_ms,
+    );
+    let stream_info_timeout_ms = parse_timeout_env(
+        "STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS",
+        cache_timeouts.stream_info_ms,
+    );
+    let extended_attribute_timeout_ms = parse_timeout_env(
+        "STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS",
+        cache_timeouts.extended_attribute_ms,
     );
     let (sector_size, sectors_per_allocation_unit) = parse_geometry_env();
     let dispatcher_threads = default_dispatcher_threads();
@@ -239,9 +259,13 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
+        metadata_cache_policy,
         file_info_timeout_ms,
         dir_info_timeout_ms,
         volume_info_timeout_ms,
+        security_timeout_ms,
+        stream_info_timeout_ms,
+        extended_attribute_timeout_ms,
         sector_size,
         sectors_per_allocation_unit,
         dispatcher_threads,
@@ -463,11 +487,49 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
+    volume_params.security_timeout(options.security_timeout_ms);
+    volume_params.stream_info_timeout(options.stream_info_timeout_ms);
+    volume_params.extended_attribute_timeout(options.extended_attribute_timeout_ms);
+    mark_v1_timeout_fields_valid(volume_params);
     // Keep WinFSP's read cache alive across cleanup by default; this is required
     // for the hot file-manager read path to stay near OS-cache speeds. Workloads
     // that need stricter cleanup purge can enable it explicitly via env.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
+}
+
+fn mark_v1_timeout_fields_valid(volume_params: &mut winfsp::host::VolumeParams) {
+    // winfsp 0.12.4 exposes setters for the V1 timeout values but not for the
+    // corresponding validity bits. Its VolumeParams is repr(transparent) over
+    // this exact FSP binding, so use the generated winfsp-sys setters here.
+    debug_assert_eq!(
+        mem::size_of::<winfsp::host::VolumeParams>(),
+        mem::size_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>()
+    );
+    debug_assert_eq!(
+        mem::align_of::<winfsp::host::VolumeParams>(),
+        mem::align_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>()
+    );
+
+    // SAFETY: winfsp::host::VolumeParams is #[repr(transparent)] over
+    // winfsp_sys::FSP_FSCTL_VOLUME_PARAMS in the locked winfsp 0.12.4 API.
+    let raw =
+        unsafe { &mut *ptr::from_mut(volume_params).cast::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>() };
+    raw.Version = mem::size_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>() as u16;
+    raw.set_VolumeInfoTimeoutValid(1);
+    raw.set_DirInfoTimeoutValid(1);
+    raw.set_SecurityTimeoutValid(1);
+    raw.set_StreamInfoTimeoutValid(1);
+    raw.set_EaTimeoutValid(1);
+}
+
+#[cfg(test)]
+fn raw_volume_params(
+    volume_params: &winfsp::host::VolumeParams,
+) -> &winfsp_sys::FSP_FSCTL_VOLUME_PARAMS {
+    // SAFETY: see mark_v1_timeout_fields_valid; the transparent wrapper and
+    // raw binding have the same layout and lifetime.
+    unsafe { &*ptr::from_ref(volume_params).cast() }
 }
 
 fn is_drive_root_mount_point(mount_point: &str) -> bool {
@@ -749,6 +811,16 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     } = request;
 
     let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;
+    tracing::info!(
+        metadata_cache_policy = options.metadata_cache_policy.as_str(),
+        file_info_timeout_ms = options.file_info_timeout_ms,
+        dir_info_timeout_ms = options.dir_info_timeout_ms,
+        volume_info_timeout_ms = options.volume_info_timeout_ms,
+        security_timeout_ms = options.security_timeout_ms,
+        stream_info_timeout_ms = options.stream_info_timeout_ms,
+        extended_attribute_timeout_ms = options.extended_attribute_timeout_ms,
+        "selected WinFSP metadata cache policy"
+    );
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
@@ -774,16 +846,18 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     let invalidation_queue = WinfspInvalidationQueue::new(&vfs);
 
     let context = if read_only {
-        StudioFsContext::new_read_only(
+        StudioFsContext::new_read_only_with_cache_policy(
             vfs.clone(),
             runtime_handle.clone(),
             invalidation_queue.clone(),
+            options.metadata_cache_policy,
         )
     } else {
-        StudioFsContext::new(
+        StudioFsContext::new_with_cache_policy(
             vfs.clone(),
             runtime_handle.clone(),
             invalidation_queue.clone(),
+            options.metadata_cache_policy,
         )
     }
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP context: {err}")))?;
@@ -1061,14 +1135,14 @@ unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::cache_policy::WinfspMetadataCachePolicy;
     use super::{
         DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE,
-        DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_PERSISTENT_ACLS, DEFAULT_SECTOR_SIZE,
-        DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
-        WinfspShutdownHost, canonical_drive_mount_point, clear_shutdown_registry_for_test,
-        default_dispatcher_threads, is_drive_root_mount_point, mount_manager_mount_point,
-        parse_mount_options, register_shutdown_sender, remove_test_mount_option_env,
+        DEFAULT_SECTORS_PER_ALLOCATION_UNIT, MountOptionError, WinfspShutdownHost,
+        canonical_drive_mount_point, clear_shutdown_registry_for_test, default_dispatcher_threads,
+        is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
+        raw_volume_params, register_shutdown_sender, remove_test_mount_option_env,
         request_shutdown, set_test_mount_option_env, stop_host_before_vfs_shutdown,
         stop_host_before_vfs_shutdown_and_process_exit, winfsp_dll_stem_for_arch,
     };
@@ -1086,6 +1160,7 @@ mod tests {
 
     #[test]
     fn parse_mount_options_normalizes_and_sets_defaults() {
+        remove_test_mount_option_env("STUDIOFS_WINFSP_METADATA_CACHE_POLICY");
         remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
         remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
         remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
@@ -1095,10 +1170,14 @@ mod tests {
         remove_test_mount_option_env("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
 
         let opts = parse_mount_options("  StudioFS  ").expect("options");
+        let adaptive_timeouts = WinfspMetadataCachePolicy::Adaptive.timeouts();
         assert_eq!(opts.volume_label, "StudioFS");
-        assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
-        assert_eq!(opts.dir_info_timeout_ms, DEFAULT_DIR_INFO_TIMEOUT_MS);
-        assert_eq!(opts.volume_info_timeout_ms, DEFAULT_VOLUME_INFO_TIMEOUT_MS);
+        assert_eq!(opts.file_info_timeout_ms, adaptive_timeouts.file_info_ms);
+        assert_eq!(opts.dir_info_timeout_ms, adaptive_timeouts.dir_info_ms);
+        assert_eq!(
+            opts.volume_info_timeout_ms,
+            adaptive_timeouts.volume_info_ms
+        );
         assert_eq!(opts.sector_size, DEFAULT_SECTOR_SIZE);
         assert_eq!(
             opts.sectors_per_allocation_unit,
@@ -1150,7 +1229,89 @@ mod tests {
         remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
 
         let opts = parse_mount_options("StudioFS").expect("options");
-        assert_eq!(opts.file_info_timeout_ms, u32::MAX);
+        assert_eq!(
+            opts.file_info_timeout_ms,
+            WinfspMetadataCachePolicy::Adaptive.timeouts().file_info_ms
+        );
+    }
+
+    #[test]
+    fn apply_volume_params_activates_v1_metadata_timeout_overrides() {
+        remove_test_mount_option_env("STUDIOFS_WINFSP_METADATA_CACHE_POLICY");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS");
+
+        let options = parse_mount_options("StudioFS").expect("options");
+        let mut volume_params = winfsp::host::VolumeParams::new();
+        super::apply_volume_params(&mut volume_params, &options, "Z:").expect("volume params");
+        let raw = raw_volume_params(&volume_params);
+
+        assert_eq!(
+            raw.Version as usize,
+            std::mem::size_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>()
+        );
+        assert_eq!(raw.VolumeInfoTimeoutValid(), 1);
+        assert_eq!(raw.DirInfoTimeoutValid(), 1);
+        assert_eq!(raw.SecurityTimeoutValid(), 1);
+        assert_eq!(raw.StreamInfoTimeoutValid(), 1);
+        assert_eq!(raw.EaTimeoutValid(), 1);
+        assert_eq!(raw.DirInfoTimeout, options.dir_info_timeout_ms);
+        assert_eq!(raw.VolumeInfoTimeout, options.volume_info_timeout_ms);
+        assert_eq!(raw.SecurityTimeout, options.security_timeout_ms);
+        assert_eq!(raw.StreamInfoTimeout, options.stream_info_timeout_ms);
+        assert_eq!(raw.EaTimeout, options.extended_attribute_timeout_ms);
+    }
+
+    #[test]
+    fn parse_mount_options_adaptive_policy_uses_longer_directory_metadata_timeout() {
+        remove_test_mount_option_env("STUDIOFS_WINFSP_METADATA_CACHE_POLICY");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS");
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+
+        assert_eq!(
+            opts.metadata_cache_policy,
+            WinfspMetadataCachePolicy::Adaptive
+        );
+        assert_eq!(opts.dir_info_timeout_ms, 60_000);
+        assert_eq!(opts.volume_info_timeout_ms, 60_000);
+        assert_eq!(opts.security_timeout_ms, 60_000);
+        assert_eq!(opts.stream_info_timeout_ms, 60_000);
+        assert_eq!(opts.extended_attribute_timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn parse_mount_options_conservative_policy_disables_metadata_timeouts() {
+        set_test_mount_option_env("STUDIOFS_WINFSP_METADATA_CACHE_POLICY", "conservative");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS");
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+
+        assert_eq!(
+            opts.metadata_cache_policy,
+            WinfspMetadataCachePolicy::Conservative
+        );
+        assert_eq!(opts.file_info_timeout_ms, 0);
+        assert_eq!(opts.dir_info_timeout_ms, 0);
+        assert_eq!(opts.volume_info_timeout_ms, 0);
+        assert_eq!(opts.security_timeout_ms, 0);
+        assert_eq!(opts.stream_info_timeout_ms, 0);
+        assert_eq!(opts.extended_attribute_timeout_ms, 0);
+
+        remove_test_mount_option_env("STUDIOFS_WINFSP_METADATA_CACHE_POLICY");
     }
 
     #[test]
@@ -1158,15 +1319,24 @@ mod tests {
         set_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "240000");
         set_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS", "-1");
         set_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS", "480000");
+        set_test_mount_option_env("STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS", "120000");
+        set_test_mount_option_env("STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS", "60000");
+        set_test_mount_option_env("STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS", "30000");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.file_info_timeout_ms, 240_000);
         assert_eq!(opts.dir_info_timeout_ms, u32::MAX);
         assert_eq!(opts.volume_info_timeout_ms, 480_000);
+        assert_eq!(opts.security_timeout_ms, 120_000);
+        assert_eq!(opts.stream_info_timeout_ms, 60_000);
+        assert_eq!(opts.extended_attribute_timeout_ms, 30_000);
 
         remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
         remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
         remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS");
     }
 
     #[test]
@@ -1174,7 +1344,10 @@ mod tests {
         set_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "abc");
 
         let opts = parse_mount_options("StudioFS").expect("options");
-        assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
+        assert_eq!(
+            opts.file_info_timeout_ms,
+            WinfspMetadataCachePolicy::Adaptive.timeouts().file_info_ms
+        );
 
         remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
     }

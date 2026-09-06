@@ -8,7 +8,11 @@ added; cache policy remains unchanged. The accompanying
 [shared contract](../metadata-cache-coherence.md) defines future semantics.
 These measurements do not validate multi-client replication or promotion.
 
-## Current settings and behavior
+## Historical pre-SFS-678 settings and behavior
+
+This section records the settings before SFS-678 changed the Windows adaptive
+policy. Keep these values unchanged as the comparison baseline; current
+candidate defaults are documented in `docs/metadata-cache-coherence.md`.
 
 Source: `crates/studiofs-winfsp/src/lib.rs`, `parse_mount_options` and
 `apply_volume_params`; `crates/studiofs-winfsp/src/context.rs`, callback methods;

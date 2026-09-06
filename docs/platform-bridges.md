@@ -135,9 +135,13 @@ fixed or upgraded.
 | Sector size | `4096` bytes by default. Override: `STUDIOFS_WINFSP_SECTOR_SIZE` |
 | Allocation unit size | `1048576` bytes by default. Override: `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` |
 | Max component length | 255 |
+| Metadata cache policy | `adaptive` by default. Override: `STUDIOFS_WINFSP_METADATA_CACHE_POLICY=conservative`; unknown values fail safe to `conservative` |
 | File info timeout | WinFSP cache-manager mode (`-1`/`max`) by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` |
-| Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
-| Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Dir info timeout | `60000 ms` by default in adaptive mode, `0 ms` in conservative mode. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Volume info timeout | `60000 ms` by default in adaptive mode, `0 ms` in conservative mode. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Security/name timeout | `60000 ms` by default in adaptive mode, `0 ms` in conservative mode. Override: `STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS` |
+| Stream info timeout | `60000 ms` by default in adaptive mode, `0 ms` in conservative mode. Override: `STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS` |
+| Extended attribute timeout | `60000 ms` by default in adaptive mode, `0 ms` in conservative mode. Override: `STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS` |
 | Allow open in kernel mode | Disabled by default to preserve same-inode overwrite coherence. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE=1` |
 | Flush/purge on cleanup | Disabled by default to preserve read-cache pages across close/reopen cycles. Override: `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=1` |
 | Case sensitive | Yes |
@@ -148,6 +152,12 @@ fixed or upgraded.
 | Filesystem name | "StudioFS" |
 
 `STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local payload I/O.
+The metadata timeout fields are mount-time WinFSP parameters. SFS-677 health
+gates new read-only file-cache admission through `Create.Opened.DisableCache`;
+it does not mutate those kernel metadata TTLs live. On an unsafe transition,
+StudioFS retires its known cache generations and enqueues the root and known
+inodes for WinFSP invalidation; native delivery remains bounded and observable.
+Write-capable handles always bypass cache-manager writeback.
 StudioFS keeps WinFSP kernel-mode opens disabled by default: a kernel-mode open
 can reuse a stale cache-manager file object after a same-inode published
 overwrite and bypass the user-mode `Open` callback that resolves the current
