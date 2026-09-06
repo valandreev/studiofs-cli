@@ -72,18 +72,13 @@ impl PgMetaEngine {
                 .replication_lock
                 .lock()
                 .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-            self.pull_foreign_events_locked(None)
-        })();
-        self.record_metadata_sync_result(source, &result);
-        if result.is_ok()
-            && let Ok(remote_head) = self.remote_metadata_head_version()
-        {
+            let changed = self.pull_foreign_events_locked(None)?;
+            let remote_head = self.remote_metadata_head_version()?;
             self.metadata_remote_head_version
                 .store(remote_head, Ordering::Release);
-        } else if result.is_ok() {
-            self.metadata_source_connected
-                .store(false, Ordering::Release);
-        }
+            Ok(changed)
+        })();
+        self.record_metadata_sync_result(source, &result);
         result
     }
 

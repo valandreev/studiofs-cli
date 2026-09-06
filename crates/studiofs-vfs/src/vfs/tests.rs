@@ -1439,6 +1439,20 @@ struct RecordingKernelInvalidator {
     reset_requested: AtomicBool,
 }
 
+struct AlwaysFailKernelInvalidator;
+
+impl KernelInvalidator for AlwaysFailKernelInvalidator {
+    fn invalidate_batch(
+        &self,
+        _batch: &studiofs_meta::coherence::InvalidationBatch,
+        _generation_complete: bool,
+    ) -> crate::coherence::InvalidationAcceptance {
+        crate::coherence::InvalidationAcceptance::Failed
+    }
+
+    fn inval_inode(&self, _ino: Ino) {}
+}
+
 #[test]
 fn semantic_invalidation_legacy_adapter_explicitly_reports_unsupported() {
     use crate::coherence::InvalidationAcceptance;
@@ -1501,6 +1515,36 @@ fn semantic_invalidation_drains_committed_names_through_runtime_port() {
             .contains(&(ROOT_INO, b"old-name".to_vec()))
     );
     assert!(meta.take_invalidation_batches().is_empty());
+}
+
+#[test]
+fn failed_semantic_generation_falls_back_to_reset_after_bounded_retries() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-retry-limit");
+    let _guard = rt.enter();
+    vfs.set_kernel_invalidator(Arc::new(AlwaysFailKernelInvalidator));
+    vfs.coherence_pending_invalidations
+        .lock()
+        .push_back(PendingCoherenceInvalidation {
+            batch: InvalidationBatch {
+                generation: 7,
+                intents: vec![InvalidationIntent::Attributes { ino: ROOT_INO }],
+            },
+            attempts: 0,
+        });
+
+    vfs.drain_semantic_invalidations();
+    vfs.drain_semantic_invalidations();
+    vfs.drain_semantic_invalidations();
+
+    let pending = vfs.coherence_pending_invalidations.lock();
+    let retained = pending.front().expect("retry should retain a fallback");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(retained.batch.generation, 7);
+    assert_eq!(retained.batch.intents, vec![InvalidationIntent::Reset]);
+    assert_eq!(retained.attempts, 0);
 }
 
 #[test]

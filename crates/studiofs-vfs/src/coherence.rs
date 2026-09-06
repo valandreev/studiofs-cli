@@ -1,6 +1,7 @@
 //! Platform delivery contract for committed local-view invalidation scopes.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Immediate admission result, never proof of native cache invalidation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +161,7 @@ pub(crate) struct CoherenceHealthTracker {
     reconnecting: bool,
     has_sync_boundary: bool,
     coverage_gap: bool,
+    unresolved_semantic_generations: BTreeSet<u64>,
 }
 
 impl CoherenceHealthTracker {
@@ -174,6 +176,7 @@ impl CoherenceHealthTracker {
             reconnecting: false,
             has_sync_boundary: false,
             coverage_gap: false,
+            unresolved_semantic_generations: BTreeSet::new(),
         }
     }
 
@@ -209,6 +212,8 @@ impl CoherenceHealthTracker {
         }
         if self.snapshot.state == CoherenceHealthState::Degraded {
             self.reconnecting = true;
+            self.has_sync_boundary = false;
+            return;
         }
         if self.snapshot.state != CoherenceHealthState::Healthy {
             self.has_sync_boundary = false;
@@ -233,21 +238,11 @@ impl CoherenceHealthTracker {
 
         let was_degraded =
             self.snapshot.state == CoherenceHealthState::Degraded || self.reconnecting;
-        let invalidation_failure = matches!(
-            self.snapshot.reason,
-            CoherenceHealthReason::InvalidationFailed
-                | CoherenceHealthReason::InvalidationUnsupported
-                | CoherenceHealthReason::InvalidationIncomplete
-        );
         self.snapshot.applied_boundary = applied_boundary;
         self.snapshot.apply_lag = remote_boundary
             .zip(applied_boundary)
             .map(|(remote, applied)| remote.saturating_sub(applied));
         self.snapshot.last_progress_unix_ms = Some(now_unix_ms);
-        if was_degraded && invalidation_failure && !coverage_complete {
-            self.awaiting_coverage = true;
-            return;
-        }
         // A reconnect always requires an explicit post-sync coverage
         // confirmation, even when the sync produced no new batches. This
         // keeps `Degraded -> CatchingUp` observable and prevents a successful
@@ -306,14 +301,17 @@ impl CoherenceHealthTracker {
                 self.snapshot.last_progress_unix_ms = Some(now_unix_ms);
                 self.awaiting_coverage = false;
                 self.coverage_gap = false;
+                self.unresolved_semantic_generations.remove(&generation);
                 self.try_promote();
             }
             InvalidationAcceptance::Unsupported => {
                 self.coverage_gap = true;
+                self.unresolved_semantic_generations.insert(generation);
                 self.degrade(CoherenceHealthReason::InvalidationUnsupported)
             }
             InvalidationAcceptance::Failed => {
                 self.coverage_gap = true;
+                self.unresolved_semantic_generations.insert(generation);
                 self.degrade(if generation_complete {
                     CoherenceHealthReason::InvalidationFailed
                 } else {
@@ -322,6 +320,7 @@ impl CoherenceHealthTracker {
             }
             InvalidationAcceptance::Queued => {
                 self.coverage_gap = true;
+                self.unresolved_semantic_generations.insert(generation);
                 self.degrade(CoherenceHealthReason::InvalidationIncomplete)
             }
         }
@@ -336,7 +335,7 @@ impl CoherenceHealthTracker {
         if self.snapshot.state == CoherenceHealthState::Stopped {
             return;
         }
-        if self.coverage_gap {
+        if !self.unresolved_semantic_generations.is_empty() {
             return;
         }
         if let Some(boundary) = covered_boundary {
@@ -344,6 +343,7 @@ impl CoherenceHealthTracker {
                 Some(self.snapshot.covered_boundary.unwrap_or(0).max(boundary));
         }
         self.snapshot.last_progress_unix_ms = Some(now_unix_ms);
+        self.coverage_gap = false;
         self.awaiting_coverage = false;
         self.try_promote();
     }
@@ -516,11 +516,27 @@ mod tests {
         assert_eq!(tracker.snapshot().delivery_failure_count, 1);
 
         tracker.note_sync_started();
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::Degraded);
         tracker.note_sync_success(Some(2), Some(2), true, 5);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
         tracker.note_coverage_confirmed(Some(2), 6);
-        assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
-        tracker.note_invalidation(2, InvalidationAcceptance::Queued, true, 7);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Healthy);
+        assert!(tracker.allows_cache());
+    }
+
+    #[test]
+    fn unsupported_semantic_coverage_cannot_heal_from_an_empty_sync() {
+        let mut tracker = CoherenceHealthTracker::new(CoherenceHealthBudget::default());
+        tracker.note_sync_started();
+        tracker.note_sync_success(Some(1), Some(1), true, 2);
+        assert!(tracker.allows_cache());
+
+        tracker.note_invalidation(2, InvalidationAcceptance::Unsupported, true, 3);
+        tracker.note_sync_started();
+        tracker.note_sync_success(Some(2), Some(2), true, 4);
+        tracker.note_coverage_confirmed(Some(2), 5);
+
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
+        assert!(!tracker.allows_cache());
     }
 }

@@ -94,7 +94,10 @@ pub(crate) struct DiagnosticsRuntimeSnapshot {
     pub zeroio: VfsZeroIoRuntimeSnapshot,
     pub cache: DiagnosticsCacheSnapshot,
     pub synchronization: DiagnosticsSynchronizationSnapshot,
-    /// Mount-local replication and invalidation coherence health.
+    /// Canonical mount-local replication and invalidation coherence health.
+    ///
+    /// `synchronization.state.coherence` is retained as a compatibility mirror
+    /// for consumers that already read synchronization state.
     #[serde(default)]
     pub coherence: CoherenceHealthSnapshot,
 }

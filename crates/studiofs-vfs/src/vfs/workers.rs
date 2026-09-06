@@ -12,6 +12,7 @@ use crate::{JanitorMeta, VfsMeta};
 
 const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
 const COHERENCE_PENDING_INVALIDATION_CAPACITY: usize = 128;
+const COHERENCE_INVALIDATION_RETRY_LIMIT: u8 = 3;
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
@@ -177,6 +178,10 @@ fn metadata_token_changes(
         last_namespace_token != after_namespace_token,
         last_metadata_token != after_metadata_token,
     )
+}
+
+fn semantic_coverage_complete(before: Option<bool>, after: Option<bool>) -> bool {
+    after.unwrap_or_else(|| before.unwrap_or(true))
 }
 
 fn metadata_namespace_changed(
@@ -580,9 +585,15 @@ impl StudioVfs {
             .coherence_pending_invalidations
             .lock()
             .drain(..)
+            .map(|pending| (pending.batch, pending.attempts))
             .collect::<Vec<_>>();
-        batches.extend(self.sync_meta().take_invalidation_batches());
-        for batch in batches {
+        batches.extend(
+            self.sync_meta()
+                .take_invalidation_batches()
+                .into_iter()
+                .map(|batch| (batch, 0)),
+        );
+        for (batch, attempts) in batches {
             let retry = batch.clone();
             let (acceptance, generation_complete) = self.apply_semantic_invalidation_batch(batch);
             outcome = Some(
@@ -591,7 +602,7 @@ impl StudioVfs {
                     && generation_complete,
             );
             if acceptance == InvalidationAcceptance::Failed || !generation_complete {
-                self.retain_failed_coherence_invalidation(retry);
+                self.retain_failed_coherence_invalidation(retry, attempts);
             }
         }
         outcome
@@ -600,19 +611,44 @@ impl StudioVfs {
     fn retain_failed_coherence_invalidation(
         &self,
         batch: studiofs_meta::coherence::InvalidationBatch,
+        attempts: u8,
     ) {
+        let next_attempt = attempts.saturating_add(1);
+        let (batch, attempts) = if next_attempt >= COHERENCE_INVALIDATION_RETRY_LIMIT
+            && !matches!(
+                batch.intents.as_slice(),
+                [studiofs_meta::coherence::InvalidationIntent::Reset]
+            ) {
+            warn!(
+                generation = batch.generation,
+                attempts = next_attempt,
+                "semantic invalidation batch exceeded retry limit; falling back to reset"
+            );
+            (
+                studiofs_meta::coherence::InvalidationBatch {
+                    generation: batch.generation,
+                    intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+                },
+                0,
+            )
+        } else {
+            (batch, next_attempt)
+        };
         let mut pending = self.coherence_pending_invalidations.lock();
         if pending.len() >= COHERENCE_PENDING_INVALIDATION_CAPACITY {
             // Losing precision is itself a coverage gap. Preserve an explicit
             // reset marker so adapters that support it can re-establish a
             // boundary; unsupported adapters remain conservatively degraded.
             pending.clear();
-            pending.push_back(studiofs_meta::coherence::InvalidationBatch {
-                generation: batch.generation,
-                intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+            pending.push_back(PendingCoherenceInvalidation {
+                batch: studiofs_meta::coherence::InvalidationBatch {
+                    generation: batch.generation,
+                    intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+                },
+                attempts: 0,
             });
         } else {
-            pending.push_back(batch);
+            pending.push_back(PendingCoherenceInvalidation { batch, attempts });
         }
     }
 
@@ -1106,7 +1142,7 @@ impl StudioVfs {
 
             self.note_coherence_sync_success(
                 progress,
-                before_sync_coverage.unwrap_or(true) && after_sync_coverage.unwrap_or(true),
+                semantic_coverage_complete(before_sync_coverage, after_sync_coverage),
                 now_unix_millis(),
             );
             self.note_coherence_delivery_state(now_unix_millis());
@@ -2287,6 +2323,13 @@ mod tests {
             &token("2"),
             &token("1"),
         ));
+    }
+
+    #[test]
+    fn post_sync_coverage_supersedes_a_pre_sync_deferral() {
+        assert!(semantic_coverage_complete(Some(false), Some(true)));
+        assert!(!semantic_coverage_complete(Some(false), None));
+        assert!(semantic_coverage_complete(None, None));
     }
 
     #[test]

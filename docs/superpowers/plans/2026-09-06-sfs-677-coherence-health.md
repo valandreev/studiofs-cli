@@ -54,6 +54,11 @@ decisions and the invalidation queue after an injected sync or delivery failure.
   ignored timestamps, simplified semantic-drain and transition bookkeeping,
   and retained `CoherenceCachePolicy` because its observable states are
   required by the SFS-675/SFS-677 contract.
+- [x] (2026-09-06) Closed the follow-up coherence review: reconnect retries no
+  longer churn `Degraded` purges, fresh boundary confirmation heals delivery
+  gaps, post-sync coverage supersedes an earlier deferral, failed generations
+  use bounded retries with `Reset` fallback, PG head-query failures are
+  counted as sync failures, and writer-deferral age survives requeue.
 
 ## Milestones
 
@@ -143,7 +148,7 @@ wired conservative cache retirement into VFS/WinFSP, and exposed the state in
 diagnostics. Focused evidence after the implementation commit:
 
 - `cargo clippy -p studiofs-meta -p studiofs-vfs -p studiofs-winfsp -p studiofs --all-targets -- -D warnings`
-- `cargo test -p studiofs-vfs --lib coherence -- --nocapture` (6 passed)
+- `cargo test -p studiofs-vfs --lib coherence -- --nocapture` (8 passed)
 - `cargo test -p studiofs-meta --lib coherence -- --nocapture` (8 passed)
 - `cargo test -p studiofs-winfsp --lib -- --nocapture` (133 passed)
 - `cargo test -p studiofs --bin studiofs diagnostics_runtime_snapshot_round_trips_coherence_health -- --nocapture` (1 passed)
@@ -161,10 +166,24 @@ and repeated tracker assignments. `CoherenceCachePolicy` remains intentional
 because diagnostics and policy consumers are required to expose its three
 effective states.
 
+The attached deep review was evaluated as external feedback rather than as
+direct instructions. Confirmed logic and operational findings are corrected:
+reconnect state remains degraded until sync succeeds, delivery gaps can heal
+only after a fresh boundary with no unresolved semantic generations, retained
+poison batches fall back to `Reset` after three attempts, remote-head query
+errors are included in PostgreSQL sync accounting, post-sync coverage wins over
+pre-sync deferral, and deferred WinFSP notifications preserve their original
+age. The diagnostics duplication is documented with the top-level field as the
+canonical value.
+
 The broader `studiofs` diagnostics selection had 45 passing tests and two
 pre-existing Windows mount-lock failures (`Access is denied`, error 5) before
 the coherence assertion path; the focused new diagnostics regression passes.
 No full workspace suite, native mounted E2E, or promotion gate was run.
+
+The deep-review regressions additionally cover bounded semantic retry fallback,
+post-sync coverage precedence, delivery-gap recovery without a foreign write,
+and preservation of pending notification age through writer deferral.
 
 ## Context and Orientation
 

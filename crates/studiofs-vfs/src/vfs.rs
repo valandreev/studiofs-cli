@@ -3608,6 +3608,12 @@ fn catch_startup_panic(startup: impl FnOnce() -> VfsResult<()>) -> VfsResult<()>
 // StudioVfs Implementation
 // =============================================================================
 
+#[derive(Debug)]
+struct PendingCoherenceInvalidation {
+    batch: studiofs_meta::coherence::InvalidationBatch,
+    attempts: u8,
+}
+
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
 pub struct StudioVfs {
     /// Preferred metadata execution boundary for hot-path call sites.
@@ -3706,7 +3712,7 @@ pub struct StudioVfs {
     /// Mount-local replication and invalidation coherence health.
     coherence_health: Arc<Mutex<CoherenceHealthTracker>>,
     /// Failed or partially admitted semantic generations awaiting retry.
-    coherence_pending_invalidations: Mutex<VecDeque<studiofs_meta::coherence::InvalidationBatch>>,
+    coherence_pending_invalidations: Mutex<VecDeque<PendingCoherenceInvalidation>>,
     janitor_interval: Duration,
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,

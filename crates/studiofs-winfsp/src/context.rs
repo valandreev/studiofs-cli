@@ -5483,10 +5483,14 @@ mod tests {
             ),
             InvalidationAcceptance::Queued
         );
+        let pending_since = queue
+            .pending_since_for_test()
+            .expect("queued notification should have an age");
         let _fh = vfs
             .open_file(file.ino, OpenFlags::RDWR, false)
             .expect("writer");
         assert!(ctx.should_notify().is_none());
+        assert_eq!(queue.pending_since_for_test(), Some(pending_since));
         assert_eq!(queue.delivery_snapshot().deferred_notifications, 1);
         assert_eq!(queue.delivery_snapshot().delivered_generation, None);
     }
