@@ -1,5 +1,8 @@
+use std::fmt;
+
 use studiofs_vfs::StudioVfs;
 
+const ADAPTIVE_FILE_INFO_TIMEOUT_MS: u32 = u32::MAX;
 const ADAPTIVE_METADATA_TIMEOUT_MS: u32 = 60_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -11,18 +14,29 @@ pub(crate) enum WinfspMetadataCachePolicy {
 
 impl WinfspMetadataCachePolicy {
     pub(crate) fn parse(value: Option<&str>) -> Self {
-        match value.map(str::trim).filter(|value| !value.is_empty()) {
-            None | Some("adaptive") | Some("auto") => Self::Adaptive,
-            Some("conservative") | Some("direct") => Self::Conservative,
-            Some(value) => {
-                tracing::warn!(
-                    env_key = "STUDIOFS_WINFSP_METADATA_CACHE_POLICY",
-                    env_value = value,
-                    fallback_policy = "conservative",
-                    "invalid WinFSP metadata cache policy; using conservative fallback"
-                );
-                Self::Conservative
-            }
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Self::Adaptive;
+        };
+        if value.eq_ignore_ascii_case("adaptive") || value.eq_ignore_ascii_case("auto") {
+            Self::Adaptive
+        } else if value.eq_ignore_ascii_case("conservative") || value.eq_ignore_ascii_case("direct")
+        {
+            Self::Conservative
+        } else {
+            tracing::warn!(
+                env_key = "STUDIOFS_WINFSP_METADATA_CACHE_POLICY",
+                env_value = value,
+                fallback_policy = "conservative",
+                "invalid WinFSP metadata cache policy; using conservative fallback"
+            );
+            Self::Conservative
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::Adaptive => "adaptive",
         }
     }
 
@@ -35,6 +49,12 @@ impl WinfspMetadataCachePolicy {
             Self::Conservative => WinfspCacheTimeouts::conservative(),
             Self::Adaptive => WinfspCacheTimeouts::adaptive(),
         }
+    }
+}
+
+impl fmt::Display for WinfspMetadataCachePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -51,9 +71,9 @@ pub(crate) struct WinfspCacheTimeouts {
 impl WinfspCacheTimeouts {
     const fn adaptive() -> Self {
         Self {
-            file_info_ms: super::DEFAULT_FILE_INFO_TIMEOUT_MS,
-            dir_info_ms: super::DEFAULT_DIR_INFO_TIMEOUT_MS,
-            volume_info_ms: super::DEFAULT_VOLUME_INFO_TIMEOUT_MS,
+            file_info_ms: ADAPTIVE_FILE_INFO_TIMEOUT_MS,
+            dir_info_ms: ADAPTIVE_METADATA_TIMEOUT_MS,
+            volume_info_ms: ADAPTIVE_METADATA_TIMEOUT_MS,
             security_ms: ADAPTIVE_METADATA_TIMEOUT_MS,
             stream_info_ms: ADAPTIVE_METADATA_TIMEOUT_MS,
             extended_attribute_ms: ADAPTIVE_METADATA_TIMEOUT_MS,
@@ -97,6 +117,23 @@ mod tests {
         assert_eq!(
             WinfspMetadataCachePolicy::Conservative.timeouts(),
             WinfspCacheTimeouts::conservative()
+        );
+    }
+
+    #[test]
+    fn policy_values_are_case_insensitive() {
+        assert_eq!(
+            WinfspMetadataCachePolicy::parse(Some(" Adaptive ")),
+            WinfspMetadataCachePolicy::Adaptive
+        );
+        assert_eq!(
+            WinfspMetadataCachePolicy::parse(Some("CONSERVATIVE")),
+            WinfspMetadataCachePolicy::Conservative
+        );
+        assert_eq!(WinfspMetadataCachePolicy::Adaptive.as_str(), "adaptive");
+        assert_eq!(
+            WinfspMetadataCachePolicy::Conservative.to_string(),
+            "conservative"
         );
     }
 }

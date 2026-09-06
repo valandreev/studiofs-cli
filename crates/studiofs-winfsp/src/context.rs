@@ -1173,9 +1173,10 @@ impl StudioFsContext {
         create_options: u32,
         file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
     ) -> bool {
-        if !self
-            .metadata_cache_policy
-            .allows_read_only_admission(&self.vfs)
+        if self.vfs.is_runtime_stats_file_ino(handle.ino)
+            || !self
+                .metadata_cache_policy
+                .allows_read_only_admission(&self.vfs)
         {
             return true;
         }
@@ -1748,17 +1749,6 @@ impl FileSystemContext for StudioFsContext {
         let attr = resolve_path(&self.vfs, file_name)?;
         let write_local_sync_policy =
             write_local_sync_policy_from_create_options(raw_create_options);
-        let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
-            || !self
-                .metadata_cache_policy
-                .allows_read_only_admission(&self.vfs)
-            || should_disable_winfsp_file_cache(
-                attr.kind == FileType::Directory,
-                open_flags,
-                trunc,
-                raw_create_options,
-                0,
-            );
         Self::write_open_file_info(file_info, &attr);
         let mut handle = PendingStudioFileHandle::new(
             self,
@@ -1775,6 +1765,8 @@ impl FileSystemContext for StudioFsContext {
         {
             return Err(error);
         }
+        let disable_os_cache =
+            self.should_disable_os_cache_for_handle(handle.handle(), trunc, raw_create_options, 0);
         handle.handle_mut().set_disable_os_cache(disable_os_cache);
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
@@ -2639,12 +2631,7 @@ mod tests {
         StudioFsContext,
         Arc<WinfspInvalidationQueue>,
     ) {
-        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-        let rt = Arc::new(Runtime::new().expect("runtime"));
-        let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
-        let queue = WinfspInvalidationQueue::new(&vfs);
-        let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone(), false);
-        (tmp, vfs, ctx, queue)
+        make_test_context_with_cache_policy(volume_suffix, WinfspMetadataCachePolicy::default())
     }
 
     pub(super) fn make_test_context_with_cache_policy(
@@ -2852,6 +2839,32 @@ mod tests {
         let handle = StudioFileHandle::new(42, false, 1, OpenFlags::RDONLY);
 
         assert!(ctx.should_disable_os_cache_for_handle(&handle, false, 0, 0));
+    }
+
+    #[test]
+    fn conservative_metadata_policy_disables_open_callback_cache_admission() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context_with_cache_policy(
+            "conservative-metadata-open",
+            WinfspMetadataCachePolicy::Conservative,
+        );
+        assert!(wait_until(Duration::from_secs(1), || vfs.coherence_allows_os_cache()));
+        vfs.create(ROOT_INO, b"conservative-open.txt", 0, 0, 0o644)
+            .expect("create file");
+
+        let file_name = U16CString::from_str(r"\conservative-open.txt").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut file_info,
+        )
+        .expect("open existing file with conservative metadata policy");
+
+        assert!(handle.disable_os_cache);
+        assert_eq!(winfsp_callbacks(&vfs).os_cache_disabled_open, 1);
+        <StudioFsContext as FileSystemContext>::close(&ctx, handle);
     }
 
     #[test]

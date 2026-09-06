@@ -1790,6 +1790,8 @@ fn coherence_degradation_retires_os_cache_generation() {
     let tmp = studiofs_test_support::workspace_target_tempdir("coherence-health-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "coherence-degrade-cache");
     let _guard = rt.enter();
+    let invalidator = Arc::new(RecordingKernelInvalidator::default());
+    vfs.set_kernel_invalidator(invalidator.clone());
     let attr = vfs
         .create(ROOT_INO, b"coherence-cache.txt", 0, 0, 0o644)
         .expect("create file");
@@ -1819,6 +1821,10 @@ fn coherence_degradation_retires_os_cache_generation() {
 
     assert!(!vfs.coherence_allows_os_cache());
     assert!(!vfs.os_cache.lock().has_generation(attr.ino));
+    assert!(
+        invalidator.snapshot().contains(&ROOT_INO),
+        "unsafe coherence transition must enqueue root invalidation for kernel directory caches"
+    );
     assert!(
         !vfs.state
             .namespace

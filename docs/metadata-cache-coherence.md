@@ -238,12 +238,16 @@ directory invalidation intents retain the old/new names and parent scopes so a
 cached miss is not trusted after a peer create, rename, or unlink.
 
 In conservative mode, all six metadata timeouts default to zero and every new
-handle bypasses OS cache admission. In adaptive mode, read-only handles may
-retain OS metadata only after SFS-677 reports `Healthy`; startup, reconnect,
-lag, delivery failure, unsupported coverage, and shutdown remain conservative.
-Write-capable handles always bypass cache-manager writeback. WinFSP timeout
-fields are mount-time settings and are not changed live; when health becomes
-unsafe, the VFS retires known cached state and the adapter disables admission
-for later opens. The `coherence` snapshot plus WinFSP cache-enabled/disabled
-open counters and invalidation delivery diagnostics are the observable policy
-and fallback evidence.
+handle bypasses OS cache admission. In adaptive mode, SFS-677 health gates
+read-only file-cache admission: only healthy mounts return
+`Create.Opened.DisableCache=0`; startup, reconnect, lag, delivery failure,
+unsupported coverage, and shutdown disable admission for later opens. This
+per-handle bit controls WinFSP/Windows file-data caching; it does not mutate
+the mount-time directory, security/name, stream, or extended-attribute TTLs.
+Write-capable handles always bypass cache-manager writeback. When health becomes
+unsafe, VFS retires known cached state and enqueues the root plus known inodes
+for native invalidation; queue acceptance, bounded delivery, and failures
+remain observable, so native cache retirement is not claimed to be instantaneous.
+The `coherence` snapshot plus WinFSP cache-enabled/disabled open counters and
+invalidation delivery diagnostics are the observable policy and fallback
+evidence.
