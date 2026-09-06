@@ -1,6 +1,24 @@
 # StudioFS Agent Implementation Guide
 
 This file stores detailed project instructions that do not belong in the root `AGENTS.md`.
+The root file is the execution contract; this guide is the implementation reference.
+
+## Codex task entrypoint
+
+Use the root `AGENTS.md` for instruction precedence, task boundaries, graph-first
+discovery, focused validation, and delivery rules. Codex's Codebase Memory project
+key for this repository is `E-dev-studiofs-cli`. Use `search_graph` and
+`trace_path` for structural discovery, then read the exact source with
+`get_code_snippet`; check coverage before relying on negative or exhaustive graph
+claims. Use `rg` or PowerShell for Markdown, scripts, literals, and parse-partial or
+excluded files.
+
+The authoritative order is: user request, applicable scoped `AGENTS.md`, root
+`AGENTS.md`, the canonical local-first contract, relevant ADRs, and then supporting
+documentation. When a review comment or issue description conflicts with current
+code or the contract, verify it against the real path and record the disposition.
+Keep final reports evidence-based: distinguish focused tests, ignored service-backed
+tests, and native mounted acceptance; `running 0 tests` is not evidence.
 
 ## Repository structure
 
