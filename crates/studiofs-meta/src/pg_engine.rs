@@ -224,6 +224,10 @@ pub struct PgMetaEngine {
     metadata_fallback_poll_discoveries: AtomicU64,
     metadata_sync_errors: AtomicU64,
     metadata_last_successful_sync_unix_ms: AtomicI64,
+    /// Last remote metadata head observed by a bounded command query.
+    metadata_remote_head_version: AtomicI64,
+    /// Whether the most recent metadata synchronization command succeeded.
+    metadata_source_connected: AtomicBool,
 }
 
 /// PostgreSQL-only snapshot capabilities for callers that must not open the
@@ -703,6 +707,8 @@ impl PgMetaEngine {
             metadata_fallback_poll_discoveries: AtomicU64::new(0),
             metadata_sync_errors: AtomicU64::new(0),
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
+            metadata_remote_head_version: AtomicI64::new(-1),
+            metadata_source_connected: AtomicBool::new(false),
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 

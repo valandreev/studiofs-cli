@@ -1121,6 +1121,9 @@ impl StudioFsContext {
         create_options: u32,
         file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
     ) -> bool {
+        if !self.vfs.coherence_allows_os_cache() {
+            return true;
+        }
         should_disable_winfsp_file_cache(
             handle.is_dir,
             handle.open_flags,
@@ -1691,6 +1694,7 @@ impl FileSystemContext for StudioFsContext {
         let write_local_sync_policy =
             write_local_sync_policy_from_create_options(raw_create_options);
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
+            || !self.vfs.coherence_allows_os_cache()
             || should_disable_winfsp_file_cache(
                 attr.kind == FileType::Directory,
                 open_flags,
@@ -2732,6 +2736,7 @@ mod tests {
     #[test]
     fn winfsp_os_cache_observability_tracks_cacheable_open_and_read_miss() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("winfsp-os-cache-observability");
+        assert!(wait_until(Duration::from_secs(1), || vfs.coherence_allows_os_cache()));
         let attr = vfs
             .create(ROOT_INO, b"cacheable-read.txt", 0, 0, 0o644)
             .expect("create file");
@@ -2907,6 +2912,7 @@ mod tests {
     #[test]
     fn remote_file_invalidation_keeps_read_only_file_handles_cached() {
         let (_tmp, vfs, ctx, queue) = make_test_context("remote_file_notify_cached");
+        assert!(wait_until(Duration::from_secs(1), || vfs.coherence_allows_os_cache()));
         let attr = vfs
             .create(ROOT_INO, b"remote-invalidated.txt", 0, 0, 0o644)
             .expect("create file");
@@ -2944,6 +2950,36 @@ mod tests {
 
         invalidator.inval_inode(attr.ino);
         assert_eq!(queue.drain(), vec![attr.ino]);
+    }
+
+    #[test]
+    fn stopped_coherence_forces_conservative_cache_admission() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("coherence-stopped-cache");
+        let runtime = ctx
+            ._test_runtime
+            .as_ref()
+            .expect("test runtime retained")
+            .clone();
+        runtime
+            .block_on(vfs.shutdown(Duration::ZERO))
+            .expect("shutdown VFS");
+
+        let handle = StudioFileHandle::new(42, false, 1, OpenFlags::RDONLY);
+        assert!(ctx.should_disable_os_cache_for_handle(&handle, false, 0, 0));
+        assert_eq!(
+            vfs.coherence_health_snapshot().state,
+            studiofs_vfs::CoherenceHealthState::Stopped
+        );
+    }
+
+    #[test]
+    fn invalidation_queue_reports_pending_delivery_age() {
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("coherence-delivery-age");
+        assert_eq!(queue.pending_delivery_age_ms(), None);
+        queue.push(42);
+        assert!(queue.pending_delivery_age_ms().is_some());
+        queue.drain();
+        assert_eq!(queue.pending_delivery_age_ms(), None);
     }
 
     #[test]
@@ -5447,10 +5483,14 @@ mod tests {
             ),
             InvalidationAcceptance::Queued
         );
+        let pending_since = queue
+            .pending_since_for_test()
+            .expect("queued notification should have an age");
         let _fh = vfs
             .open_file(file.ino, OpenFlags::RDWR, false)
             .expect("writer");
         assert!(ctx.should_notify().is_none());
+        assert_eq!(queue.pending_since_for_test(), Some(pending_since));
         assert_eq!(queue.delivery_snapshot().deferred_notifications, 1);
         assert_eq!(queue.delivery_snapshot().delivered_generation, None);
     }

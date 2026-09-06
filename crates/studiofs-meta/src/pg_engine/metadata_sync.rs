@@ -49,6 +49,8 @@ impl PgMetaEngine {
     fn record_metadata_sync_result(&self, source: MetadataSyncSource, result: &MetaResult<bool>) {
         match result {
             Ok(changed) => {
+                self.metadata_source_connected
+                    .store(true, Ordering::Release);
                 self.metadata_last_successful_sync_unix_ms
                     .store(Self::now_millis(), Ordering::Relaxed);
                 if source == MetadataSyncSource::FallbackPoll && *changed {
@@ -57,6 +59,8 @@ impl PgMetaEngine {
                 }
             }
             Err(_) => {
+                self.metadata_source_connected
+                    .store(false, Ordering::Release);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -68,7 +72,11 @@ impl PgMetaEngine {
                 .replication_lock
                 .lock()
                 .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-            self.pull_foreign_events_locked(None)
+            let changed = self.pull_foreign_events_locked(None)?;
+            let remote_head = self.remote_metadata_head_version()?;
+            self.metadata_remote_head_version
+                .store(remote_head, Ordering::Release);
+            Ok(changed)
         })();
         self.record_metadata_sync_result(source, &result);
         result

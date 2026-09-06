@@ -2,7 +2,7 @@
 
 SFS-675 defines semantics for subsequent SFS-676 (invalidation delivery),
 SFS-677 (health), and SFS-678 (Windows policy). The implementation status below
-distinguishes delivered code from subsequent health and policy work. Windows is
+distinguishes delivered health code from subsequent adaptive policy work. Windows is
 the first validation
 target. macOS and Linux must be able to consume these semantics without changing
 them; this issue changes neither platform's cache policy.
@@ -187,7 +187,38 @@ that no writer can start after asynchronous native submission.
 
 Reset has no proven native whole-mount implementation and reports Unsupported.
 Unresolvable/oversized paths, incomplete bounded alias traversal and queue loss
-remain explicit failures. No aggressive admission or timeout change is enabled by
-this implementation; health/fail-safe policy and promotion remain SFS-677/SFS-678
-work. Focused unit tests do not replace the full integration and mounted gates
-above.
+remain explicit failures. No adaptive/aggressive admission or timeout policy is
+enabled by SFS-677; that promotion remains SFS-678 work. Focused unit tests do
+not replace the full integration and mounted gates above.
+
+## SFS-677 implementation status
+
+`studiofs-vfs::coherence` now owns a mount-local health tracker with the
+`Unknown`, `CatchingUp`, `Healthy`, `Degraded`, and `Stopped` states. It records
+the applied metadata boundary, retained invalidation boundary, optional remote
+apply lag, pending delivery age, and the effective finite budgets. Every mount
+starts `Unknown`; synchronization errors, missing authoritative progress,
+excessive lag, incomplete/failed invalidation admission, delivery timeout, and
+shutdown revoke cache eligibility immediately. A reconnect enters
+`CatchingUp` and needs an explicit coverage confirmation before it can become
+`Healthy`.
+
+The metadata replication port reports applied version, observed PostgreSQL
+remote head, command success evidence, and the last successful sync timestamp.
+The PostgreSQL implementation updates those values only around bounded
+metadata commands; an open pool connection alone is not used as health proof.
+Standalone redb metadata reports local-only progress.
+
+VFS degradation retires attribute observations, advances the namespace epoch,
+clears known OS-cache generations, and asks the installed kernel invalidator to
+purge known cached inodes (including the root directory). Active writable
+handles remain protected by the existing deferred-invalidation contract. The
+WinFSP bridge forces `DisableCache` for new opens whenever health is not
+`Healthy`; write-capable opens retain their existing unconditional bypass.
+Diagnostics and runtime snapshots expose the additive `coherence` object.
+
+This issue does not enable adaptive/aggressive promotion or change macOS/Linux
+policy; those remain SFS-678 and later platform work. Native WinFSP completion
+is still unobservable, so retained queue admission and bounded delivery age are
+the strongest health evidence available. Full integration and the ten-run
+mounted promotion gate remain operator validation.

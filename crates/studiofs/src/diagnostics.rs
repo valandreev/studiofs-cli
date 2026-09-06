@@ -38,9 +38,10 @@ use std::time::{Duration, Instant};
 use studiofs_meta::FormatInfo;
 use studiofs_vfs::vfs::VfsFileSessionStats;
 use studiofs_vfs::{
-    StudioVfs, VFS_RUNTIME_EVENT_CAPACITY, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats,
-    VfsIngressStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsUploadStats,
-    VfsWritePathObservabilitySnapshot, VfsZeroIoRuntimeSnapshot,
+    CoherenceHealthSnapshot, StudioVfs, VFS_RUNTIME_EVENT_CAPACITY, VfsCacheStateSnapshot,
+    VfsForegroundReadProtectionStats, VfsIngressStats, VfsRuntimeEvent,
+    VfsSynchronizationStateSnapshot, VfsUploadStats, VfsWritePathObservabilitySnapshot,
+    VfsZeroIoRuntimeSnapshot,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]

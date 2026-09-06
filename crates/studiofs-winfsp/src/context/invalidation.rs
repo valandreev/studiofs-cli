@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Weak};
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
@@ -111,7 +112,7 @@ impl Drop for PreparedWinfspNotifications {
                         state.delivery.retried_batches.saturating_add(1);
                 }
                 for notification in &self.notifications {
-                    queue.push_path(
+                    queue.push_path_preserving_deferred_age(
                         notification.ino,
                         notification.path.clone(),
                         notification.kind,
@@ -176,6 +177,10 @@ struct WinfspInvalidationQueueState {
     coalesced: u64,
     snapshot_generation: u64,
     notification_batches_in_flight: usize,
+    pending_since: Option<Instant>,
+    /// Oldest timestamp of drained targets that may be requeued after writer
+    /// deferral or an unsubmitted notification batch.
+    deferred_since: Option<Instant>,
 }
 
 /// Bounded, coalescing queue shared by WinFSP invalidation producers and the
@@ -206,7 +211,7 @@ impl WinfspInvalidationQueue {
     pub(crate) fn push(&self, ino: Ino) {
         let snapshot = {
             let mut state = self.state.lock();
-            if self.push_locked(&mut state, NotificationKey::Inode(ino)) {
+            if self.push_locked(&mut state, NotificationKey::Inode(ino), None) {
                 Some(Self::next_metrics_snapshot(&mut state))
             } else {
                 None
@@ -218,6 +223,29 @@ impl WinfspInvalidationQueue {
     }
 
     fn push_path(&self, ino: Ino, path: String, kind: FileType, action: u32, filter: u32) {
+        self.push_path_with_age(ino, path, kind, action, filter, false);
+    }
+
+    fn push_path_preserving_deferred_age(
+        &self,
+        ino: Ino,
+        path: String,
+        kind: FileType,
+        action: u32,
+        filter: u32,
+    ) {
+        self.push_path_with_age(ino, path, kind, action, filter, true);
+    }
+
+    fn push_path_with_age(
+        &self,
+        ino: Ino,
+        path: String,
+        kind: FileType,
+        action: u32,
+        filter: u32,
+        preserve_deferred_age: bool,
+    ) {
         let key = NotificationKey::Path {
             ino,
             path: path.clone(),
@@ -246,7 +274,10 @@ impl WinfspInvalidationQueue {
                 filter,
             },
         );
-        self.push_locked(&mut state, key);
+        let preserved_since = preserve_deferred_age
+            .then_some(state.deferred_since)
+            .flatten();
+        self.push_locked(&mut state, key, preserved_since);
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
         self.record_metrics(snapshot);
@@ -255,6 +286,19 @@ impl WinfspInvalidationQueue {
     /// Returns local acceptance and native submission diagnostics.
     pub fn delivery_snapshot(&self) -> WinfspDeliverySnapshot {
         self.state.lock().delivery
+    }
+
+    /// Return the age of the oldest pending invalidation target.
+    pub fn pending_delivery_age_ms(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .pending_since
+            .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_since_for_test(&self) -> Option<Instant> {
+        self.state.lock().pending_since
     }
 
     fn record_failed_notification(&self) {
@@ -323,7 +367,7 @@ impl WinfspInvalidationQueue {
         }
         for (key, target) in targets {
             state.path_overrides.insert(key.clone(), target);
-            self.push_locked(&mut state, key);
+            self.push_locked(&mut state, key, None);
         }
         if generation_complete && acceptance == InvalidationAcceptance::Queued {
             state.delivery.queued_generation = Some(
@@ -489,6 +533,7 @@ impl WinfspInvalidationQueue {
         &self,
         state: &mut parking_lot::MutexGuard<'_, WinfspInvalidationQueueState>,
         key: NotificationKey,
+        preserved_since: Option<Instant>,
     ) -> bool {
         if state.closed {
             state.delivery.failed_notifications =
@@ -500,6 +545,9 @@ impl WinfspInvalidationQueue {
             return true;
         }
         if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
+            if state.pending.is_empty() {
+                state.pending_since = Some(preserved_since.unwrap_or_else(Instant::now));
+            }
             state.pending.insert(key.clone());
             state.order.push_back(key);
             state.queue_peak = state.queue_peak.max(state.pending.len());
@@ -531,6 +579,7 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         let order = std::mem::take(&mut state.order);
         state.pending.clear();
+        let drained_since = state.pending_since.take();
         let targets = order
             .into_iter()
             .map(|key| {
@@ -541,8 +590,14 @@ impl WinfspInvalidationQueue {
             })
             .collect::<Vec<_>>();
         if mark_notification_in_flight && !targets.is_empty() {
+            state.deferred_since = match (state.deferred_since, drained_since) {
+                (Some(existing), Some(drained)) => Some(existing.min(drained)),
+                (existing, drained) => existing.or(drained),
+            };
             state.notification_batches_in_flight =
                 state.notification_batches_in_flight.saturating_add(1);
+        } else if !mark_notification_in_flight {
+            state.deferred_since = None;
         }
         self.quiescent.notify_all();
         let snapshot = (!targets.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
@@ -559,7 +614,7 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         let mut changed = false;
         for ino in inodes {
-            changed |= self.push_locked(&mut state, NotificationKey::Inode(ino));
+            changed |= self.push_locked(&mut state, NotificationKey::Inode(ino), None);
         }
         let snapshot = changed.then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
@@ -606,6 +661,12 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         state.notification_batches_in_flight =
             state.notification_batches_in_flight.saturating_sub(1);
+        if state.notification_batches_in_flight == 0 {
+            state.deferred_since = None;
+            if state.pending.is_empty() {
+                state.pending_since = None;
+            }
+        }
         self.quiescent.notify_all();
     }
 
@@ -735,6 +796,17 @@ impl KernelInvalidator for WinfspKernelInvalidator {
     ) -> InvalidationAcceptance {
         self.queue.enqueue_batch(batch, generation_complete)
     }
+
+    fn invalidation_delivery_age_ms(&self) -> Option<u64> {
+        self.queue.pending_delivery_age_ms()
+    }
+
+    fn invalidation_delivery_failure_count(&self) -> u64 {
+        let delivery = self.queue.delivery_snapshot();
+        delivery
+            .failed_batches
+            .saturating_add(delivery.failed_notifications)
+    }
     fn inval_inode(&self, ino: u64) {
         self.queue.push(ino);
     }
@@ -783,7 +855,7 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 || self.invalidation_queue.defer_for_writer(&self.vfs, &path)
             {
                 self.invalidation_queue
-                    .push_path(ino, path, kind, action, filter);
+                    .push_path_preserving_deferred_age(ino, path, kind, action, filter);
                 continue;
             }
             let Some(mut info) = build_notify_info_with_action(&path, kind, action) else {
@@ -821,7 +893,7 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                     .invalidation_queue
                     .defer_for_writer(&self.vfs, &notification.path)
             {
-                self.invalidation_queue.push_path(
+                self.invalidation_queue.push_path_preserving_deferred_age(
                     notification.ino,
                     notification.path.clone(),
                     notification.kind,

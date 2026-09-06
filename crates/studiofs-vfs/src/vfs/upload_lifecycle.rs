@@ -468,6 +468,7 @@ impl StudioVfs {
             }
         };
         let t0 = Instant::now();
+        self.stop_coherence();
         let background_join_timeout = Duration::from_secs(2);
 
         // Phase 0: quiesce non-uploader background work so shutdown can finish

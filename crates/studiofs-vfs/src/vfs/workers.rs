@@ -2,13 +2,17 @@ use futures::StreamExt;
 use opendal::ErrorKind;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use studiofs_meta::engine::MetadataCoherenceProgress;
 use tokio::time::MissedTickBehavior;
 
 use super::*;
+use crate::coherence::InvalidationAcceptance;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
 
 const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
+const COHERENCE_PENDING_INVALIDATION_CAPACITY: usize = 128;
+const COHERENCE_INVALIDATION_RETRY_LIMIT: u8 = 3;
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
@@ -174,6 +178,10 @@ fn metadata_token_changes(
         last_namespace_token != after_namespace_token,
         last_metadata_token != after_metadata_token,
     )
+}
+
+fn semantic_coverage_complete(before: Option<bool>, after: Option<bool>) -> bool {
+    after.unwrap_or_else(|| before.unwrap_or(true))
 }
 
 fn metadata_namespace_changed(
@@ -487,8 +495,7 @@ impl StudioVfs {
     pub(super) fn apply_semantic_invalidation_batch(
         &self,
         mut batch: studiofs_meta::coherence::InvalidationBatch,
-    ) {
-        use crate::coherence::InvalidationAcceptance;
+    ) -> (InvalidationAcceptance, bool) {
         use studiofs_meta::coherence::InvalidationIntent;
 
         let mut deferred = false;
@@ -525,6 +532,7 @@ impl StudioVfs {
             true
         });
         if reset {
+            self.note_coherence_reset_started(batch.generation);
             self.bump_namespace_epoch();
             self.retire_all_attr_read_observations();
             attr_inodes.extend(self.runtime_namespace_invalidation_inodes());
@@ -545,28 +553,222 @@ impl StudioVfs {
                 "semantic invalidation deferred for active writer; generation coverage incomplete"
             );
         }
-        let Some(invalidator) = self.kernel_invalidator() else {
-            return;
+        // A global reset covers every semantic scope, including scopes whose
+        // ordinary writer protection would otherwise defer native purges.
+        let generation_complete = !deferred || reset;
+        let invalidator = self.kernel_invalidator();
+        let has_invalidator = invalidator.is_some();
+        let acceptance = match invalidator {
+            None => InvalidationAcceptance::Unsupported,
+            Some(_invalidator) if batch.intents.is_empty() => InvalidationAcceptance::Failed,
+            Some(invalidator) => invalidator.invalidate_batch(&batch, generation_complete),
         };
-        if batch.intents.is_empty() {
+        if acceptance != InvalidationAcceptance::Queued || !generation_complete {
+            debug!(
+                generation = batch.generation,
+                ?acceptance,
+                generation_complete,
+                "semantic invalidation not fully admitted"
+            );
+        }
+        if has_invalidator {
+            self.note_coherence_invalidation(
+                batch.generation,
+                acceptance,
+                generation_complete,
+                now_unix_millis(),
+            );
+        }
+        (acceptance, generation_complete)
+    }
+
+    pub(super) fn drain_semantic_invalidations(&self) -> Option<bool> {
+        let mut outcome = None;
+        let mut batches = self
+            .coherence_pending_invalidations
+            .lock()
+            .drain(..)
+            .map(|pending| (pending.batch, pending.attempts))
+            .collect::<Vec<_>>();
+        batches.extend(
+            self.sync_meta()
+                .take_invalidation_batches()
+                .into_iter()
+                .map(|batch| (batch, 0)),
+        );
+        for (batch, attempts) in batches {
+            let retry = batch.clone();
+            let (acceptance, generation_complete) = self.apply_semantic_invalidation_batch(batch);
+            outcome = Some(
+                outcome.unwrap_or(true)
+                    && acceptance == InvalidationAcceptance::Queued
+                    && generation_complete,
+            );
+            if !generation_complete {
+                self.retain_failed_coherence_invalidation(retry, attempts);
+            } else if acceptance == InvalidationAcceptance::Failed {
+                self.retain_failed_coherence_invalidation(retry, attempts.saturating_add(1));
+            }
+        }
+        outcome
+    }
+
+    fn retain_failed_coherence_invalidation(
+        &self,
+        batch: studiofs_meta::coherence::InvalidationBatch,
+        attempts: u8,
+    ) {
+        let is_reset = matches!(
+            batch.intents.as_slice(),
+            [studiofs_meta::coherence::InvalidationIntent::Reset]
+        );
+        if is_reset && attempts >= COHERENCE_INVALIDATION_RETRY_LIMIT {
+            warn!(
+                generation = batch.generation,
+                attempts, "semantic reset invalidation exceeded retry limit; dropping retry marker"
+            );
             return;
         }
-        match invalidator.invalidate_batch(&batch, !deferred) {
-            InvalidationAcceptance::Queued => {}
-            acceptance => {
-                debug!(
-                    generation = batch.generation,
-                    ?acceptance,
-                    "semantic invalidation not fully admitted; existing cache policy unchanged"
-                );
-            }
+        let (batch, attempts) = if attempts >= COHERENCE_INVALIDATION_RETRY_LIMIT && !is_reset {
+            warn!(
+                generation = batch.generation,
+                attempts, "semantic invalidation batch exceeded retry limit; falling back to reset"
+            );
+            (
+                studiofs_meta::coherence::InvalidationBatch {
+                    generation: batch.generation,
+                    intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+                },
+                0,
+            )
+        } else {
+            (batch, attempts)
+        };
+        let mut pending = self.coherence_pending_invalidations.lock();
+        if pending.len() >= COHERENCE_PENDING_INVALIDATION_CAPACITY {
+            // Losing precision is itself a coverage gap. Preserve an explicit
+            // reset marker so adapters that support it can re-establish a
+            // boundary; unsupported adapters remain conservatively degraded.
+            pending.clear();
+            pending.push_back(PendingCoherenceInvalidation {
+                batch: studiofs_meta::coherence::InvalidationBatch {
+                    generation: batch.generation,
+                    intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+                },
+                attempts: 0,
+            });
+        } else {
+            pending.push_back(PendingCoherenceInvalidation { batch, attempts });
         }
     }
 
-    pub(super) fn drain_semantic_invalidations(&self) {
-        for batch in self.sync_meta().take_invalidation_batches() {
-            self.apply_semantic_invalidation_batch(batch);
+    fn retire_untrusted_coherence_cache(&self) {
+        let mut known_inodes = self.runtime_namespace_invalidation_inodes();
+        // The root directory is the conservative anchor for OS directory/name
+        // cache state, which is not represented in `OsCacheState` generations.
+        known_inodes.insert(ROOT_INO);
+        self.bump_namespace_epoch();
+        self.bump_acl_namespace_epoch();
+        self.retire_all_attr_read_observations();
+        self.invalidate_attr_read_cache(known_inodes.clone());
+        self.invalidate_kernel_inodes(known_inodes);
+    }
+
+    fn note_coherence_invalidation(
+        &self,
+        generation: u64,
+        acceptance: InvalidationAcceptance,
+        generation_complete: bool,
+        now_unix_ms: u64,
+    ) {
+        self.apply_coherence_transition(|health| {
+            health.note_invalidation(generation, acceptance, generation_complete, now_unix_ms);
+        });
+    }
+
+    fn note_coherence_reset_started(&self, generation: u64) {
+        self.apply_coherence_transition(|health| health.begin_global_reset(generation));
+    }
+
+    fn apply_coherence_transition(&self, transition: impl FnOnce(&mut CoherenceHealthTracker)) {
+        let (became_unsafe, entered_degraded, entered_stopped) = {
+            let mut health = self.coherence_health.lock();
+            let was_safe = health.allows_cache();
+            let previous_state = health.snapshot().state;
+            transition(&mut health);
+            let current_state = health.snapshot().state;
+            (
+                was_safe && !health.allows_cache(),
+                previous_state != crate::coherence::CoherenceHealthState::Degraded
+                    && current_state == crate::coherence::CoherenceHealthState::Degraded,
+                previous_state != crate::coherence::CoherenceHealthState::Stopped
+                    && current_state == crate::coherence::CoherenceHealthState::Stopped,
+            )
+        };
+        if became_unsafe || entered_degraded || entered_stopped {
+            self.retire_untrusted_coherence_cache();
         }
+    }
+
+    pub(super) fn note_coherence_sync_started(&self) {
+        self.apply_coherence_transition(|health| health.note_sync_started());
+    }
+
+    pub(super) fn note_coherence_sync_success(
+        &self,
+        progress: MetadataCoherenceProgress,
+        coverage_complete: bool,
+        now_unix_ms: u64,
+    ) {
+        self.apply_coherence_transition(|health| {
+            if !progress.source_connected {
+                health.note_sync_failure(crate::coherence::CoherenceHealthReason::Disconnected);
+            } else if progress.remote_authoritative && progress.remote_head_version.is_none() {
+                health.note_sync_failure(crate::coherence::CoherenceHealthReason::MissingProgress);
+            } else {
+                health.note_sync_success(
+                    progress.applied_version,
+                    progress.remote_head_version,
+                    coverage_complete,
+                    now_unix_ms,
+                );
+            }
+            if coverage_complete {
+                health.note_coverage_confirmed(progress.applied_version, now_unix_ms);
+            }
+        });
+    }
+
+    pub(super) fn note_coherence_sync_failure(&self) {
+        self.apply_coherence_transition(|health| {
+            health.note_sync_failure(crate::coherence::CoherenceHealthReason::Disconnected);
+        });
+    }
+
+    pub(super) fn note_coherence_apply_failure(&self) {
+        self.apply_coherence_transition(|health| {
+            health.note_sync_failure(crate::coherence::CoherenceHealthReason::ApplyFailed);
+        });
+    }
+
+    pub(super) fn note_coherence_delivery_state(&self, now_unix_ms: u64) {
+        let (age, failures) = self
+            .kernel_invalidator()
+            .map(|invalidator| {
+                (
+                    invalidator.invalidation_delivery_age_ms(),
+                    invalidator.invalidation_delivery_failure_count(),
+                )
+            })
+            .unwrap_or((None, 0));
+        self.apply_coherence_transition(|health| {
+            health.note_delivery_failure_count(failures);
+            health.note_delivery_age(age, now_unix_ms);
+        });
+    }
+
+    pub(super) fn stop_coherence(&self) {
+        self.apply_coherence_transition(|health| health.stop());
     }
 
     fn collect_metadata_snapshot<M: ?Sized + JanitorMeta>(
@@ -907,9 +1109,10 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
+            self.note_coherence_sync_started();
             // Local commits must not wait for a remote poll to finish before
             // their already-visible state can invalidate the mounted cache.
-            self.drain_semantic_invalidations();
+            let before_sync_coverage = self.drain_semantic_invalidations();
             let meta = self.meta.clone();
             let previous_namespace_token = last_namespace_token.clone();
             let previous_metadata_token = last_metadata_token.clone();
@@ -932,21 +1135,31 @@ impl StudioVfs {
                     after_namespace,
                     before_metadata,
                     after_metadata,
+                    engine.metadata_coherence_progress(),
                 ))
             })
             .await;
             // Earlier transactions may have committed even if the remaining
             // remote sync failed or did not advance its public version token.
-            self.drain_semantic_invalidations();
+            let after_sync_coverage = self.drain_semantic_invalidations();
             let Ok((
                 _before_namespace,
                 after_namespace_token,
                 _before_metadata,
                 after_metadata_token,
+                progress,
             )) = sync
             else {
+                self.note_coherence_sync_failure();
                 continue;
             };
+
+            self.note_coherence_sync_success(
+                progress,
+                semantic_coverage_complete(before_sync_coverage, after_sync_coverage),
+                now_unix_millis(),
+            );
+            self.note_coherence_delivery_state(now_unix_millis());
 
             let (token_namespace_changed, metadata_changed) = metadata_token_changes(
                 &last_namespace_token,
@@ -972,6 +1185,7 @@ impl StudioVfs {
                         error = %error,
                         "metadata invalidation snapshot failed; retrying on the next wake"
                     );
+                    self.note_coherence_apply_failure();
                     continue;
                 }
             };
@@ -2123,6 +2337,13 @@ mod tests {
             &token("2"),
             &token("1"),
         ));
+    }
+
+    #[test]
+    fn post_sync_coverage_supersedes_a_pre_sync_deferral() {
+        assert!(semantic_coverage_complete(Some(false), Some(true)));
+        assert!(!semantic_coverage_complete(Some(false), None));
+        assert!(semantic_coverage_complete(None, None));
     }
 
     #[test]

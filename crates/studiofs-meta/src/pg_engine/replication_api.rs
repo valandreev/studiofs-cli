@@ -1,7 +1,7 @@
 use super::{MetadataSyncSource, PgMetaEngine, sql};
 use crate::engine::{
     MetaError, MetaFormat, MetaReplication, MetaResult, MetadataAuthorityStatus,
-    MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
+    MetadataCoherenceProgress, MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
 };
 use crate::types::Ino;
 use std::sync::Arc;
@@ -89,6 +89,18 @@ impl MetaReplication for PgMetaEngine {
             sync_errors: self.metadata_sync_errors.load(Ordering::Relaxed),
             last_successful_sync_unix_ms: (last_successful_sync_unix_ms > 0)
                 .then_some(last_successful_sync_unix_ms),
+        }
+    }
+
+    fn metadata_coherence_progress(&self) -> MetadataCoherenceProgress {
+        let applied_version = u64::try_from(self.local_version.load(Ordering::Acquire)).ok();
+        let remote_head_version =
+            u64::try_from(self.metadata_remote_head_version.load(Ordering::Acquire)).ok();
+        MetadataCoherenceProgress {
+            applied_version,
+            remote_head_version,
+            source_connected: self.metadata_source_connected.load(Ordering::Acquire),
+            remote_authoritative: true,
         }
     }
 

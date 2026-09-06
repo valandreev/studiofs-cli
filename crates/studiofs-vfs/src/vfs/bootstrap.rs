@@ -554,6 +554,12 @@ impl VfsBootstrap {
             landing_zone_recovery_gate: tokio::sync::Mutex::new(()),
             handle_table: HandleTable::new(),
             os_cache: Arc::new(Mutex::new(OsCacheState::default())),
+            coherence_health: Arc::new(Mutex::new(CoherenceHealthTracker::new(
+                CoherenceHealthBudget::from_invalidation_interval_ms(
+                    plan.metadata_invalidation_sync_interval.as_millis() as u64,
+                ),
+            ))),
+            coherence_pending_invalidations: Mutex::new(VecDeque::new()),
             janitor_interval: plan.janitor_interval,
             janitor_skip_newer_than: plan.janitor_skip_newer_than,
             janitor_max_deletes_per_run: plan.janitor_max_deletes_per_run,

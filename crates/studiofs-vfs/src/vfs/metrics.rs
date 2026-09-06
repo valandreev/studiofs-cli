@@ -2246,6 +2246,9 @@ pub struct VfsSynchronizationStateSnapshot {
     pub pending_metadata_ops: u32,
     /// In-flight metadata operation count.
     pub inflight_metadata_ops: u32,
+    /// Mount-local replication and invalidation coherence health.
+    #[serde(default)]
+    pub coherence: crate::coherence::CoherenceHealthSnapshot,
 }
 
 /// Runtime event emitted by metrics stream.

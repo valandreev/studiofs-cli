@@ -510,6 +510,10 @@ where
         Ok(())
     }
 
+    fn metadata_coherence_progress(&self) -> crate::engine::MetadataCoherenceProgress {
+        self.inner.metadata_coherence_progress()
+    }
+
     fn invalidation_sender_id(&self) -> Option<String> {
         None
     }
