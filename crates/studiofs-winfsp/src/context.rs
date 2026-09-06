@@ -2983,6 +2983,28 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_queue_reports_inflight_delivery_age() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("coherence-inflight-delivery-age");
+        let file = vfs
+            .create(ROOT_INO, b"inflight-age.txt", 0, 0, 0o644)
+            .expect("create file");
+        queue.push_deleted_path(
+            file.ino,
+            r"\inflight-age.txt".to_string(),
+            FileType::RegularFile,
+        );
+
+        let prepared = ctx.should_notify().expect("prepared notification");
+        assert!(
+            queue.pending_delivery_age_ms().is_some(),
+            "an in-flight NotifyBegin batch must remain visible to the health budget"
+        );
+        drop(prepared);
+        queue.drain();
+        assert_eq!(queue.pending_delivery_age_ms(), None);
+    }
+
+    #[test]
     fn sparse_eof_growth_zero_fills_tail_reads_on_writer_handle() {
         let (_tmp, _vfs, ctx, _queue) = make_test_context("sparse_eof_zero_fill");
         let handle = StudioFileHandle::new(42, false, 7, OpenFlags::WRONLY);
@@ -5733,6 +5755,8 @@ mod tests {
         );
         let prepared = ctx.should_notify().expect("pending notification batch");
         drop(prepared);
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 1);
 
         let retry = ctx
             .should_notify()

@@ -288,12 +288,14 @@ impl WinfspInvalidationQueue {
         self.state.lock().delivery
     }
 
-    /// Return the age of the oldest pending invalidation target.
+    /// Return the age of the oldest pending or in-flight invalidation target.
     pub fn pending_delivery_age_ms(&self) -> Option<u64> {
-        self.state
-            .lock()
-            .pending_since
-            .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+        let state = self.state.lock();
+        match (state.pending_since, state.deferred_since) {
+            (Some(pending), Some(deferred)) => Some(pending.min(deferred)),
+            (pending, deferred) => pending.or(deferred),
+        }
+        .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
     }
 
     #[cfg(test)]
@@ -806,6 +808,7 @@ impl KernelInvalidator for WinfspKernelInvalidator {
         delivery
             .failed_batches
             .saturating_add(delivery.failed_notifications)
+            .saturating_add(delivery.retried_batches)
     }
     fn inval_inode(&self, ino: u64) {
         self.queue.push(ino);

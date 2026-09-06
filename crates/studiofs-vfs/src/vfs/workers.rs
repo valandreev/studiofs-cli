@@ -184,6 +184,15 @@ fn semantic_coverage_complete(before: Option<bool>, after: Option<bool>) -> bool
     after.unwrap_or_else(|| before.unwrap_or(true))
 }
 
+fn invalidation_coverage_complete(
+    before: Option<bool>,
+    after: Option<bool>,
+    namespace_changed: bool,
+    metadata_changed: bool,
+) -> bool {
+    semantic_coverage_complete(before, after) && !namespace_changed && !metadata_changed
+}
+
 fn metadata_namespace_changed(
     token_namespace_changed: bool,
     previous_snapshot: Option<&HashSet<Ino>>,
@@ -690,6 +699,12 @@ impl StudioVfs {
         self.apply_coherence_transition(|health| health.begin_global_reset(generation));
     }
 
+    fn note_coherence_coverage_confirmed(&self, covered_boundary: Option<u64>, now_unix_ms: u64) {
+        self.apply_coherence_transition(|health| {
+            health.note_coverage_confirmed(covered_boundary, now_unix_ms);
+        });
+    }
+
     fn apply_coherence_transition(&self, transition: impl FnOnce(&mut CoherenceHealthTracker)) {
         let (became_unsafe, entered_degraded, entered_stopped) = {
             let mut health = self.coherence_health.lock();
@@ -1154,21 +1169,27 @@ impl StudioVfs {
                 continue;
             };
 
-            self.note_coherence_sync_success(
-                progress,
-                semantic_coverage_complete(before_sync_coverage, after_sync_coverage),
-                now_unix_millis(),
-            );
-            self.note_coherence_delivery_state(now_unix_millis());
-
             let (token_namespace_changed, metadata_changed) = metadata_token_changes(
                 &last_namespace_token,
                 &last_metadata_token,
                 &after_namespace_token,
                 &after_metadata_token,
             );
+            let semantic_coverage_ready =
+                semantic_coverage_complete(before_sync_coverage, after_sync_coverage);
+            let reconciliation_complete = !token_namespace_changed && !metadata_changed;
+            let health_coverage_complete = invalidation_coverage_complete(
+                before_sync_coverage,
+                after_sync_coverage,
+                token_namespace_changed,
+                metadata_changed,
+            );
+            let applied_boundary = progress.applied_version;
 
-            if !token_namespace_changed && !metadata_changed {
+            self.note_coherence_sync_success(progress, health_coverage_complete, now_unix_millis());
+            self.note_coherence_delivery_state(now_unix_millis());
+
+            if reconciliation_complete {
                 continue;
             }
 
@@ -1267,6 +1288,9 @@ impl StudioVfs {
             last_payload_snapshot = Some(current_snapshot.payloads);
             last_namespace_token = after_namespace_token;
             last_metadata_token = after_metadata_token;
+            if semantic_coverage_ready {
+                self.note_coherence_coverage_confirmed(applied_boundary, now_unix_millis());
+            }
         }
     }
 
@@ -2344,6 +2368,28 @@ mod tests {
         assert!(semantic_coverage_complete(Some(false), Some(true)));
         assert!(!semantic_coverage_complete(Some(false), None));
         assert!(semantic_coverage_complete(None, None));
+    }
+
+    #[test]
+    fn changed_metadata_tokens_hold_health_until_reconciliation() {
+        assert!(!invalidation_coverage_complete(
+            Some(true),
+            Some(true),
+            true,
+            false
+        ));
+        assert!(!invalidation_coverage_complete(
+            Some(true),
+            Some(true),
+            false,
+            true
+        ));
+        assert!(invalidation_coverage_complete(
+            Some(true),
+            Some(true),
+            false,
+            false
+        ));
     }
 
     #[test]
