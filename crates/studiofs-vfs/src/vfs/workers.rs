@@ -19,12 +19,6 @@ struct MetadataTraversalSnapshot {
     entries: HashSet<(Ino, Vec<u8>, Ino)>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub(super) struct SemanticInvalidationDrain {
-    pub(super) had_batches: bool,
-    pub(super) all_accepted: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataInvalidationWakeReason {
     BackendNotify,
@@ -580,11 +574,8 @@ impl StudioVfs {
         (acceptance, generation_complete)
     }
 
-    pub(super) fn drain_semantic_invalidations(&self) -> SemanticInvalidationDrain {
-        let mut outcome = SemanticInvalidationDrain {
-            all_accepted: true,
-            ..SemanticInvalidationDrain::default()
-        };
+    pub(super) fn drain_semantic_invalidations(&self) -> Option<bool> {
+        let mut outcome = None;
         let mut batches = self
             .coherence_pending_invalidations
             .lock()
@@ -592,11 +583,13 @@ impl StudioVfs {
             .collect::<Vec<_>>();
         batches.extend(self.sync_meta().take_invalidation_batches());
         for batch in batches {
-            outcome.had_batches = true;
             let retry = batch.clone();
             let (acceptance, generation_complete) = self.apply_semantic_invalidation_batch(batch);
-            outcome.all_accepted &=
-                acceptance == InvalidationAcceptance::Queued && generation_complete;
+            outcome = Some(
+                outcome.unwrap_or(true)
+                    && acceptance == InvalidationAcceptance::Queued
+                    && generation_complete,
+            );
             if acceptance == InvalidationAcceptance::Failed || !generation_complete {
                 self.retain_failed_coherence_invalidation(retry);
             }
@@ -667,8 +660,8 @@ impl StudioVfs {
         }
     }
 
-    pub(super) fn note_coherence_sync_started(&self, now_unix_ms: u64) {
-        self.apply_coherence_transition(|health| health.note_sync_started(now_unix_ms));
+    pub(super) fn note_coherence_sync_started(&self) {
+        self.apply_coherence_transition(|health| health.note_sync_started());
     }
 
     pub(super) fn note_coherence_sync_success(
@@ -679,15 +672,9 @@ impl StudioVfs {
     ) {
         self.apply_coherence_transition(|health| {
             if !progress.source_connected {
-                health.note_sync_failure(
-                    crate::coherence::CoherenceHealthReason::Disconnected,
-                    now_unix_ms,
-                );
+                health.note_sync_failure(crate::coherence::CoherenceHealthReason::Disconnected);
             } else if progress.remote_authoritative && progress.remote_head_version.is_none() {
-                health.note_sync_failure(
-                    crate::coherence::CoherenceHealthReason::MissingProgress,
-                    now_unix_ms,
-                );
+                health.note_sync_failure(crate::coherence::CoherenceHealthReason::MissingProgress);
             } else {
                 health.note_sync_success(
                     progress.applied_version,
@@ -696,29 +683,21 @@ impl StudioVfs {
                     now_unix_ms,
                 );
             }
-        });
-        if coverage_complete {
-            self.apply_coherence_transition(|health| {
+            if coverage_complete {
                 health.note_coverage_confirmed(progress.applied_version, now_unix_ms);
-            });
-        }
-    }
-
-    pub(super) fn note_coherence_sync_failure(&self, now_unix_ms: u64) {
-        self.apply_coherence_transition(|health| {
-            health.note_sync_failure(
-                crate::coherence::CoherenceHealthReason::Disconnected,
-                now_unix_ms,
-            );
+            }
         });
     }
 
-    pub(super) fn note_coherence_apply_failure(&self, now_unix_ms: u64) {
+    pub(super) fn note_coherence_sync_failure(&self) {
         self.apply_coherence_transition(|health| {
-            health.note_sync_failure(
-                crate::coherence::CoherenceHealthReason::ApplyFailed,
-                now_unix_ms,
-            );
+            health.note_sync_failure(crate::coherence::CoherenceHealthReason::Disconnected);
+        });
+    }
+
+    pub(super) fn note_coherence_apply_failure(&self) {
+        self.apply_coherence_transition(|health| {
+            health.note_sync_failure(crate::coherence::CoherenceHealthReason::ApplyFailed);
         });
     }
 
@@ -733,13 +712,13 @@ impl StudioVfs {
             })
             .unwrap_or((None, 0));
         self.apply_coherence_transition(|health| {
-            health.note_delivery_failure_count(failures, now_unix_ms);
+            health.note_delivery_failure_count(failures);
             health.note_delivery_age(age, now_unix_ms);
         });
     }
 
-    pub(super) fn stop_coherence(&self, now_unix_ms: u64) {
-        self.apply_coherence_transition(|health| health.stop(now_unix_ms));
+    pub(super) fn stop_coherence(&self) {
+        self.apply_coherence_transition(|health| health.stop());
     }
 
     fn collect_metadata_snapshot<M: ?Sized + JanitorMeta>(
@@ -1080,8 +1059,7 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
-            let now_unix_ms = now_unix_millis();
-            self.note_coherence_sync_started(now_unix_ms);
+            self.note_coherence_sync_started();
             // Local commits must not wait for a remote poll to finish before
             // their already-visible state can invalidate the mounted cache.
             let before_sync_coverage = self.drain_semantic_invalidations();
@@ -1122,14 +1100,13 @@ impl StudioVfs {
                 progress,
             )) = sync
             else {
-                self.note_coherence_sync_failure(now_unix_millis());
+                self.note_coherence_sync_failure();
                 continue;
             };
 
             self.note_coherence_sync_success(
                 progress,
-                (!before_sync_coverage.had_batches && !after_sync_coverage.had_batches)
-                    || (before_sync_coverage.all_accepted && after_sync_coverage.all_accepted),
+                before_sync_coverage.unwrap_or(true) && after_sync_coverage.unwrap_or(true),
                 now_unix_millis(),
             );
             self.note_coherence_delivery_state(now_unix_millis());
@@ -1158,7 +1135,7 @@ impl StudioVfs {
                         error = %error,
                         "metadata invalidation snapshot failed; retrying on the next wake"
                     );
-                    self.note_coherence_apply_failure(now_unix_millis());
+                    self.note_coherence_apply_failure();
                     continue;
                 }
             };

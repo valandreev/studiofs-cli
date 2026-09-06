@@ -244,8 +244,6 @@ pub struct MetadataCoherenceProgress {
     pub applied_version: Option<u64>,
     /// Last observed authoritative remote metadata head, when available.
     pub remote_head_version: Option<u64>,
-    /// Unix timestamp for the last successful synchronization boundary.
-    pub last_successful_sync_unix_ms: Option<u64>,
     /// Whether the metadata source has a currently successful command path.
     pub source_connected: bool,
     /// Whether `remote_head_version` is authoritative for this engine.
@@ -1020,9 +1018,6 @@ pub trait MetaReplication: Send + Sync {
         MetadataCoherenceProgress {
             applied_version,
             remote_head_version: None,
-            last_successful_sync_unix_ms: diagnostics
-                .last_successful_sync_unix_ms
-                .and_then(|value| u64::try_from(value).ok()),
             source_connected: diagnostics.sync_errors == 0,
             remote_authoritative: false,
         }

@@ -96,15 +96,9 @@ impl MetaReplication for PgMetaEngine {
         let applied_version = u64::try_from(self.local_version.load(Ordering::Acquire)).ok();
         let remote_head_version =
             u64::try_from(self.metadata_remote_head_version.load(Ordering::Acquire)).ok();
-        let last_successful_sync_unix_ms = u64::try_from(
-            self.metadata_last_successful_sync_unix_ms
-                .load(Ordering::Relaxed),
-        )
-        .ok();
         MetadataCoherenceProgress {
             applied_version,
             remote_head_version,
-            last_successful_sync_unix_ms,
             source_connected: self.metadata_source_connected.load(Ordering::Acquire),
             remote_authoritative: true,
         }

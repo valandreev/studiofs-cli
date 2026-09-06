@@ -1599,7 +1599,7 @@ fn coherence_degradation_retires_os_cache_generation() {
 
     {
         let mut health = vfs.coherence_health.lock();
-        health.note_sync_started(1);
+        health.note_sync_started();
         health.note_sync_success(Some(4), Some(4), true, 2);
     }
     assert!(vfs.coherence_allows_os_cache());
@@ -1615,7 +1615,7 @@ fn coherence_degradation_retires_os_cache_generation() {
     );
     assert_eq!(decision.disposition(), OsCacheDisposition::Replace);
 
-    vfs.note_coherence_sync_failure(3);
+    vfs.note_coherence_sync_failure();
 
     assert!(!vfs.coherence_allows_os_cache());
     assert!(!vfs.os_cache.lock().has_generation(attr.ino));

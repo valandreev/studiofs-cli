@@ -50,6 +50,10 @@ decisions and the invalidation queue after an injected sync or delivery failure.
   changes in `ab3209f7` (`feat: add coherence health fail-safe cache fallback`)
   and review corrections in `72521b6e` (`fix: preserve coherence gaps across
   delivery failures`).
+- [x] (2026-09-06) Applied the ponytail review: removed unused progress data and
+  ignored timestamps, simplified semantic-drain and transition bookkeeping,
+  and retained `CoherenceCachePolicy` because its observable states are
+  required by the SFS-675/SFS-677 contract.
 
 ## Milestones
 
@@ -149,6 +153,13 @@ The review correction adds explicit sync-boundary and coverage-gap guards,
 bounded retry retention for failed semantic generations, and bridge failure
 counter sampling. The post-correction focused VFS coherence and semantic
 invalidation tests pass, as does the complete WinFSP unit target.
+
+The follow-up simplification review removed five pieces of scaffolding without
+changing the health gate: unused metadata progress timestamp state, ignored
+clock parameters, the two-boolean drain wrapper, a duplicate transition pass,
+and repeated tracker assignments. `CoherenceCachePolicy` remains intentional
+because diagnostics and policy consumers are required to expose its three
+effective states.
 
 The broader `studiofs` diagnostics selection had 45 passing tests and two
 pre-existing Windows mount-lock failures (`Access is denied`, error 5) before

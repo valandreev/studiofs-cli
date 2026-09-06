@@ -203,7 +203,7 @@ impl CoherenceHealthTracker {
     }
 
     /// Mark the beginning of a startup or reconnect catch-up pass.
-    pub(crate) fn note_sync_started(&mut self, _now_unix_ms: u64) {
+    pub(crate) fn note_sync_started(&mut self) {
         if self.snapshot.state == CoherenceHealthState::Stopped {
             return;
         }
@@ -239,20 +239,15 @@ impl CoherenceHealthTracker {
                 | CoherenceHealthReason::InvalidationUnsupported
                 | CoherenceHealthReason::InvalidationIncomplete
         );
-        if was_degraded && invalidation_failure && !coverage_complete {
-            self.snapshot.applied_boundary = applied_boundary;
-            self.snapshot.apply_lag = remote_boundary
-                .zip(applied_boundary)
-                .map(|(remote, applied)| remote.saturating_sub(applied));
-            self.snapshot.last_progress_unix_ms = Some(now_unix_ms);
-            self.awaiting_coverage = true;
-            return;
-        }
         self.snapshot.applied_boundary = applied_boundary;
         self.snapshot.apply_lag = remote_boundary
             .zip(applied_boundary)
             .map(|(remote, applied)| remote.saturating_sub(applied));
         self.snapshot.last_progress_unix_ms = Some(now_unix_ms);
+        if was_degraded && invalidation_failure && !coverage_complete {
+            self.awaiting_coverage = true;
+            return;
+        }
         // A reconnect always requires an explicit post-sync coverage
         // confirmation, even when the sync produced no new batches. This
         // keeps `Degraded -> CatchingUp` observable and prevents a successful
@@ -367,7 +362,7 @@ impl CoherenceHealthTracker {
     }
 
     /// Record monotonic post-admission delivery failures from the platform bridge.
-    pub(crate) fn note_delivery_failure_count(&mut self, count: u64, _now_unix_ms: u64) {
+    pub(crate) fn note_delivery_failure_count(&mut self, count: u64) {
         if self.snapshot.state == CoherenceHealthState::Stopped {
             return;
         }
@@ -380,14 +375,14 @@ impl CoherenceHealthTracker {
     }
 
     /// Record a synchronization failure and revoke cache eligibility immediately.
-    pub(crate) fn note_sync_failure(&mut self, reason: CoherenceHealthReason, _now_unix_ms: u64) {
+    pub(crate) fn note_sync_failure(&mut self, reason: CoherenceHealthReason) {
         if self.snapshot.state != CoherenceHealthState::Stopped {
             self.degrade(reason);
         }
     }
 
     /// Permanently stop health transitions for this mount.
-    pub(crate) fn stop(&mut self, _now_unix_ms: u64) {
+    pub(crate) fn stop(&mut self) {
         self.snapshot.state = CoherenceHealthState::Stopped;
         self.snapshot.reason = CoherenceHealthReason::Shutdown;
         self.awaiting_coverage = true;
@@ -434,7 +429,7 @@ mod tests {
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Unknown);
         assert!(!tracker.allows_cache());
 
-        tracker.note_sync_started(10);
+        tracker.note_sync_started();
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
         tracker.note_sync_success(Some(5), Some(5), false, 20);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
@@ -452,7 +447,7 @@ mod tests {
             max_apply_lag: 2,
             max_delivery_age_ms: 100,
         });
-        tracker.note_sync_started(1);
+        tracker.note_sync_started();
         tracker.note_sync_success(Some(2), Some(2), true, 2);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Healthy);
 
@@ -460,7 +455,7 @@ mod tests {
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Degraded);
         assert!(!tracker.allows_cache());
 
-        tracker.note_sync_started(4);
+        tracker.note_sync_started();
         tracker.note_sync_success(Some(4), Some(4), false, 5);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
         tracker.note_invalidation(4, InvalidationAcceptance::Queued, true, 6);
@@ -473,32 +468,32 @@ mod tests {
             max_apply_lag: 2,
             max_delivery_age_ms: 10,
         });
-        tracker.note_sync_started(1);
+        tracker.note_sync_started();
         tracker.note_sync_success(Some(2), Some(5), true, 2);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Degraded);
 
-        tracker.note_sync_started(3);
+        tracker.note_sync_started();
         tracker.note_sync_success(Some(5), Some(5), false, 4);
         tracker.note_invalidation(5, InvalidationAcceptance::Queued, true, 5);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Healthy);
         tracker.note_delivery_age(Some(11), 16);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Degraded);
 
-        tracker.stop(17);
+        tracker.stop();
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Stopped);
-        tracker.note_sync_started(18);
+        tracker.note_sync_started();
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Stopped);
     }
 
     #[test]
     fn reconnect_success_waits_for_explicit_coverage_confirmation() {
         let mut tracker = CoherenceHealthTracker::new(CoherenceHealthBudget::default());
-        tracker.note_sync_started(1);
+        tracker.note_sync_started();
         tracker.note_sync_success(Some(1), Some(1), true, 2);
         assert!(tracker.allows_cache());
 
-        tracker.note_sync_failure(CoherenceHealthReason::Disconnected, 3);
-        tracker.note_sync_started(4);
+        tracker.note_sync_failure(CoherenceHealthReason::Disconnected);
+        tracker.note_sync_started();
         tracker.note_sync_success(Some(2), Some(2), true, 5);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
         assert!(!tracker.allows_cache());
@@ -510,17 +505,17 @@ mod tests {
     #[test]
     fn invalidation_coverage_cannot_promote_without_sync_boundary() {
         let mut tracker = CoherenceHealthTracker::new(CoherenceHealthBudget::default());
-        tracker.note_sync_started(1);
+        tracker.note_sync_started();
         tracker.note_invalidation(1, InvalidationAcceptance::Queued, true, 2);
 
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
         assert!(!tracker.allows_cache());
 
-        tracker.note_delivery_failure_count(1, 3);
+        tracker.note_delivery_failure_count(1);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Degraded);
         assert_eq!(tracker.snapshot().delivery_failure_count, 1);
 
-        tracker.note_sync_started(4);
+        tracker.note_sync_started();
         tracker.note_sync_success(Some(2), Some(2), true, 5);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
         tracker.note_coverage_confirmed(Some(2), 6);
