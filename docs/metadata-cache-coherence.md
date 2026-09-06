@@ -2,10 +2,10 @@
 
 SFS-675 defines semantics for subsequent SFS-676 (invalidation delivery),
 SFS-677 (health), and SFS-678 (Windows policy). The implementation status below
-distinguishes delivered health code from subsequent adaptive policy work. Windows is
-the first validation
-target. macOS and Linux must be able to consume these semantics without changing
-them; this issue changes neither platform's cache policy.
+distinguishes the shared contract, delivered health code, and the Windows-only
+adaptive policy. Windows is the first validation target. macOS and Linux must be
+able to consume these semantics without changing them; this policy does not
+change either platform's cache behavior.
 
 The [local-first IO contract](juicefs-local-first-rust-contract.md) takes
 precedence. Coherence means consistency with the mount's current local view,
@@ -217,8 +217,33 @@ WinFSP bridge forces `DisableCache` for new opens whenever health is not
 `Healthy`; write-capable opens retain their existing unconditional bypass.
 Diagnostics and runtime snapshots expose the additive `coherence` object.
 
-This issue does not enable adaptive/aggressive promotion or change macOS/Linux
-policy; those remain SFS-678 and later platform work. Native WinFSP completion
-is still unobservable, so retained queue admission and bounded delivery age are
-the strongest health evidence available. Full integration and the ten-run
-mounted promotion gate remain operator validation.
+Native WinFSP completion is still unobservable, so retained queue admission and
+bounded delivery age are the strongest health evidence available. Full
+integration and the ten-run mounted promotion gate remain operator validation.
+
+## SFS-678 Windows policy implementation status
+
+The Windows adapter selects `adaptive` by default and accepts
+`STUDIOFS_WINFSP_METADATA_CACHE_POLICY=conservative` as a benchmark and
+operational rollback. Unknown policy values fail safe to `conservative` and
+emit a warning. This switch is Windows-only; no macOS or Linux policy reads it.
+
+In adaptive mode, WinFSP is mounted with `FileInfoTimeout=u32::MAX` to enable
+the cache-manager fast path and with 60-second `DirInfoTimeout`,
+`VolumeInfoTimeout`, `SecurityTimeout`, `StreamInfoTimeout`, and `EaTimeout`
+defaults. Each timeout retains its existing environment override. The
+security timeout is explicit because `get_security_by_name` is the WinFSP name
+resolution seam used for both positive and negative lookups. Entry and
+directory invalidation intents retain the old/new names and parent scopes so a
+cached miss is not trusted after a peer create, rename, or unlink.
+
+In conservative mode, all six metadata timeouts default to zero and every new
+handle bypasses OS cache admission. In adaptive mode, read-only handles may
+retain OS metadata only after SFS-677 reports `Healthy`; startup, reconnect,
+lag, delivery failure, unsupported coverage, and shutdown remain conservative.
+Write-capable handles always bypass cache-manager writeback. WinFSP timeout
+fields are mount-time settings and are not changed live; when health becomes
+unsafe, the VFS retires known cached state and the adapter disables admission
+for later opens. The `coherence` snapshot plus WinFSP cache-enabled/disabled
+open counters and invalidation delivery diagnostics are the observable policy
+and fallback evidence.

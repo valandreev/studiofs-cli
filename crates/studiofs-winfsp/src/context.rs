@@ -46,6 +46,7 @@ use winfsp_sys::{
     FspFsctlTransactCreateKind,
 };
 
+use crate::cache_policy::WinfspMetadataCachePolicy;
 use crate::{ensure_winfsp_runtime_loaded, ensure_winfsp_runtime_loaded_or_panic};
 
 // Windows reparse point constants
@@ -1011,6 +1012,7 @@ fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool 
 pub struct StudioFsContext {
     vfs: Arc<StudioVfs>,
     rt: Handle,
+    metadata_cache_policy: WinfspMetadataCachePolicy,
     /// Rejects every WinFSP mutation admission for a snapshot-backed context.
     read_only: bool,
     /// Cached binary security descriptor (Everyone = Full Access).
@@ -1042,7 +1044,22 @@ impl StudioFsContext {
         rt: Handle,
         invalidation_queue: Arc<WinfspInvalidationQueue>,
     ) -> std::io::Result<Self> {
-        Self::new_with_read_only(vfs, rt, invalidation_queue, false)
+        Self::new_with_read_only(
+            vfs,
+            rt,
+            invalidation_queue,
+            false,
+            WinfspMetadataCachePolicy::default(),
+        )
+    }
+
+    pub(crate) fn new_with_cache_policy(
+        vfs: Arc<StudioVfs>,
+        rt: Handle,
+        invalidation_queue: Arc<WinfspInvalidationQueue>,
+        metadata_cache_policy: WinfspMetadataCachePolicy,
+    ) -> std::io::Result<Self> {
+        Self::new_with_read_only(vfs, rt, invalidation_queue, false, metadata_cache_policy)
     }
 
     /// Creates a WinFSP filesystem context that admits reads only.
@@ -1051,7 +1068,22 @@ impl StudioFsContext {
         rt: Handle,
         invalidation_queue: Arc<WinfspInvalidationQueue>,
     ) -> std::io::Result<Self> {
-        Self::new_with_read_only(vfs, rt, invalidation_queue, true)
+        Self::new_with_read_only(
+            vfs,
+            rt,
+            invalidation_queue,
+            true,
+            WinfspMetadataCachePolicy::default(),
+        )
+    }
+
+    pub(crate) fn new_read_only_with_cache_policy(
+        vfs: Arc<StudioVfs>,
+        rt: Handle,
+        invalidation_queue: Arc<WinfspInvalidationQueue>,
+        metadata_cache_policy: WinfspMetadataCachePolicy,
+    ) -> std::io::Result<Self> {
+        Self::new_with_read_only(vfs, rt, invalidation_queue, true, metadata_cache_policy)
     }
 
     fn new_with_read_only(
@@ -1059,12 +1091,14 @@ impl StudioFsContext {
         rt: Handle,
         invalidation_queue: Arc<WinfspInvalidationQueue>,
         read_only: bool,
+        metadata_cache_policy: WinfspMetadataCachePolicy,
     ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
         Ok(Self {
             vfs,
             rt,
+            metadata_cache_policy,
             read_only,
             default_sd,
             invalidation_queue,
@@ -1087,12 +1121,30 @@ impl StudioFsContext {
         invalidation_queue: Arc<WinfspInvalidationQueue>,
         read_only: bool,
     ) -> Self {
+        Self::new_for_tests_with_cache_policy(
+            vfs,
+            rt,
+            invalidation_queue,
+            read_only,
+            WinfspMetadataCachePolicy::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests_with_cache_policy(
+        vfs: Arc<StudioVfs>,
+        rt: Arc<tokio::runtime::Runtime>,
+        invalidation_queue: Arc<WinfspInvalidationQueue>,
+        read_only: bool,
+        metadata_cache_policy: WinfspMetadataCachePolicy,
+    ) -> Self {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
             create_default_security_descriptor().expect("default WinFSP security descriptor");
         Self {
             vfs,
             rt: rt.handle().clone(),
+            metadata_cache_policy,
             read_only,
             default_sd,
             invalidation_queue,
@@ -1121,7 +1173,10 @@ impl StudioFsContext {
         create_options: u32,
         file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
     ) -> bool {
-        if !self.vfs.coherence_allows_os_cache() {
+        if !self
+            .metadata_cache_policy
+            .allows_read_only_admission(&self.vfs)
+        {
             return true;
         }
         should_disable_winfsp_file_cache(
@@ -1694,7 +1749,9 @@ impl FileSystemContext for StudioFsContext {
         let write_local_sync_policy =
             write_local_sync_policy_from_create_options(raw_create_options);
         let disable_os_cache = self.vfs.is_runtime_stats_file_ino(attr.ino)
-            || !self.vfs.coherence_allows_os_cache()
+            || !self
+                .metadata_cache_policy
+                .allows_read_only_admission(&self.vfs)
             || should_disable_winfsp_file_cache(
                 attr.kind == FileType::Directory,
                 open_flags,
@@ -2457,11 +2514,11 @@ mod tests {
         STATUS_DISK_CORRUPT_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
         SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
-        WinfspInvalidationQueue, WinfspKernelInvalidator, attr_to_file_info,
-        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
-        hidden_platform_root_path_component, ino_to_windows_path, is_runtime_stats_windows_path,
-        maybe_hide_platform_root_entry, notify_filter_for_kind, open_flags_from_access,
-        resolve_create_callback_kind, resolve_file_size_callback_action,
+        WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
+        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
+        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
+        is_runtime_stats_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
+        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
         unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
         write_local_sync_policy_from_create_options,
@@ -2587,6 +2644,29 @@ mod tests {
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
         let queue = WinfspInvalidationQueue::new(&vfs);
         let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone(), false);
+        (tmp, vfs, ctx, queue)
+    }
+
+    pub(super) fn make_test_context_with_cache_policy(
+        volume_suffix: &str,
+        metadata_cache_policy: WinfspMetadataCachePolicy,
+    ) -> (
+        TempDir,
+        Arc<StudioVfs>,
+        StudioFsContext,
+        Arc<WinfspInvalidationQueue>,
+    ) {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
+        let queue = WinfspInvalidationQueue::new(&vfs);
+        let ctx = StudioFsContext::new_for_tests_with_cache_policy(
+            vfs.clone(),
+            rt,
+            queue.clone(),
+            false,
+            metadata_cache_policy,
+        );
         (tmp, vfs, ctx, queue)
     }
 
@@ -2759,6 +2839,19 @@ mod tests {
         assert_eq!(callbacks.os_cache_disabled_open, 0);
         assert_eq!(callbacks.os_cache_miss_read_callbacks, 1);
         assert_eq!(callbacks.os_cache_miss_read_bytes, 4096);
+    }
+
+    #[test]
+    fn conservative_metadata_policy_disables_healthy_read_only_cache_admission() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context_with_cache_policy(
+            "conservative-metadata-cache",
+            WinfspMetadataCachePolicy::Conservative,
+        );
+        assert!(wait_until(Duration::from_secs(1), || vfs.coherence_allows_os_cache()));
+
+        let handle = StudioFileHandle::new(42, false, 1, OpenFlags::RDONLY);
+
+        assert!(ctx.should_disable_os_cache_for_handle(&handle, false, 0, 0));
     }
 
     #[test]
