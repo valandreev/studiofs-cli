@@ -532,6 +532,7 @@ impl StudioVfs {
             true
         });
         if reset {
+            self.note_coherence_reset_started(batch.generation);
             self.bump_namespace_epoch();
             self.retire_all_attr_read_observations();
             attr_inodes.extend(self.runtime_namespace_invalidation_inodes());
@@ -552,7 +553,9 @@ impl StudioVfs {
                 "semantic invalidation deferred for active writer; generation coverage incomplete"
             );
         }
-        let generation_complete = !deferred;
+        // A global reset covers every semantic scope, including scopes whose
+        // ordinary writer protection would otherwise defer native purges.
+        let generation_complete = !deferred || reset;
         let invalidator = self.kernel_invalidator();
         let has_invalidator = invalidator.is_some();
         let acceptance = match invalidator {
@@ -601,8 +604,10 @@ impl StudioVfs {
                     && acceptance == InvalidationAcceptance::Queued
                     && generation_complete,
             );
-            if acceptance == InvalidationAcceptance::Failed || !generation_complete {
+            if !generation_complete {
                 self.retain_failed_coherence_invalidation(retry, attempts);
+            } else if acceptance == InvalidationAcceptance::Failed {
+                self.retain_failed_coherence_invalidation(retry, attempts.saturating_add(1));
             }
         }
         outcome
@@ -613,16 +618,21 @@ impl StudioVfs {
         batch: studiofs_meta::coherence::InvalidationBatch,
         attempts: u8,
     ) {
-        let next_attempt = attempts.saturating_add(1);
-        let (batch, attempts) = if next_attempt >= COHERENCE_INVALIDATION_RETRY_LIMIT
-            && !matches!(
-                batch.intents.as_slice(),
-                [studiofs_meta::coherence::InvalidationIntent::Reset]
-            ) {
+        let is_reset = matches!(
+            batch.intents.as_slice(),
+            [studiofs_meta::coherence::InvalidationIntent::Reset]
+        );
+        if is_reset && attempts >= COHERENCE_INVALIDATION_RETRY_LIMIT {
             warn!(
                 generation = batch.generation,
-                attempts = next_attempt,
-                "semantic invalidation batch exceeded retry limit; falling back to reset"
+                attempts, "semantic reset invalidation exceeded retry limit; dropping retry marker"
+            );
+            return;
+        }
+        let (batch, attempts) = if attempts >= COHERENCE_INVALIDATION_RETRY_LIMIT && !is_reset {
+            warn!(
+                generation = batch.generation,
+                attempts, "semantic invalidation batch exceeded retry limit; falling back to reset"
             );
             (
                 studiofs_meta::coherence::InvalidationBatch {
@@ -632,7 +642,7 @@ impl StudioVfs {
                 0,
             )
         } else {
-            (batch, next_attempt)
+            (batch, attempts)
         };
         let mut pending = self.coherence_pending_invalidations.lock();
         if pending.len() >= COHERENCE_PENDING_INVALIDATION_CAPACITY {
@@ -674,6 +684,10 @@ impl StudioVfs {
         self.apply_coherence_transition(|health| {
             health.note_invalidation(generation, acceptance, generation_complete, now_unix_ms);
         });
+    }
+
+    fn note_coherence_reset_started(&self, generation: u64) {
+        self.apply_coherence_transition(|health| health.begin_global_reset(generation));
     }
 
     fn apply_coherence_transition(&self, transition: impl FnOnce(&mut CoherenceHealthTracker)) {

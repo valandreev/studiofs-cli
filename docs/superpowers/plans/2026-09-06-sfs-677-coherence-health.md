@@ -59,6 +59,11 @@ decisions and the invalidation queue after an injected sync or delivery failure.
   gaps, post-sync coverage supersedes an earlier deferral, failed generations
   use bounded retries with `Reset` fallback, PG head-query failures are
   counted as sync failures, and writer-deferral age survives requeue.
+- [x] (2026-09-06) Evaluated the second coherence review against the current
+  worker contract: incomplete generations no longer consume retry attempts,
+  Reset covers writer-deferred scopes, failed Reset batches stop after the
+  same finite limit, and an executing global Reset replaces older unresolved
+  generations with a Reset sentinel so unsupported adapters remain fail-safe.
 
 ## Milestones
 
@@ -140,6 +145,14 @@ behavior with focused VFS/WinFSP tests, clippy, formatting, and diff checks.
   Rationale: Lowering future TTLs cannot revoke entries already admitted under a
   longer lifetime, and local-first write visibility must remain intact.
   Date/Author: 2026-09-06 / Codex.
+- Decision: Count retries only for complete generations whose adapter acceptance
+  is `Failed`; retain incomplete writer-deferred generations without advancing
+  the poison counter. A global Reset is itself bounded and replaces older
+  unresolved generations only when the Reset batch starts executing.
+  Rationale: Writer deferral is expected local coordination, while a Reset
+  fallback must not leave stale generation blockers or spin forever when the
+  platform reports `Unsupported`/`Failed`.
+  Date/Author: 2026-09-06 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -184,6 +197,21 @@ No full workspace suite, native mounted E2E, or promotion gate was run.
 The deep-review regressions additionally cover bounded semantic retry fallback,
 post-sync coverage precedence, delivery-gap recovery without a foreign write,
 and preservation of pending notification age through writer deferral.
+
+The second review added focused regressions for writer retry accounting,
+bounded failed-Reset handling, mixed Reset/writer batches, and queue-overflow
+Reset recovery. Current validation for this follow-up is:
+
+- `cargo test -p studiofs-vfs --lib semantic_ -- --nocapture` (12 passed)
+- `cargo test -p studiofs-vfs --lib coherence -- --nocapture` (9 passed)
+- `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`
+- `git diff --check`
+
+The review's generic suggestion to clear unresolved generations from every
+cache-retirement path was narrowed: retirement also occurs for ordinary
+degradation, so clearing there would erase evidence of an unresolved failed
+batch. The implementation instead clears older entries at Reset execution and
+keeps the Reset generation as a sentinel until that adapter result is known.
 
 ## Context and Orientation
 

@@ -1441,6 +1441,8 @@ struct RecordingKernelInvalidator {
 
 struct AlwaysFailKernelInvalidator;
 
+struct AlwaysQueueKernelInvalidator;
+
 impl KernelInvalidator for AlwaysFailKernelInvalidator {
     fn invalidate_batch(
         &self,
@@ -1448,6 +1450,18 @@ impl KernelInvalidator for AlwaysFailKernelInvalidator {
         _generation_complete: bool,
     ) -> crate::coherence::InvalidationAcceptance {
         crate::coherence::InvalidationAcceptance::Failed
+    }
+
+    fn inval_inode(&self, _ino: Ino) {}
+}
+
+impl KernelInvalidator for AlwaysQueueKernelInvalidator {
+    fn invalidate_batch(
+        &self,
+        _batch: &studiofs_meta::coherence::InvalidationBatch,
+        _generation_complete: bool,
+    ) -> crate::coherence::InvalidationAcceptance {
+        crate::coherence::InvalidationAcceptance::Queued
     }
 
     fn inval_inode(&self, _ino: Ino) {}
@@ -1545,6 +1559,148 @@ fn failed_semantic_generation_falls_back_to_reset_after_bounded_retries() {
     assert_eq!(retained.batch.generation, 7);
     assert_eq!(retained.batch.intents, vec![InvalidationIntent::Reset]);
     assert_eq!(retained.attempts, 0);
+    drop(pending);
+
+    vfs.drain_semantic_invalidations();
+    vfs.drain_semantic_invalidations();
+    vfs.drain_semantic_invalidations();
+
+    assert!(
+        vfs.coherence_pending_invalidations.lock().is_empty(),
+        "a persistently failed reset must stop retrying after the bounded limit"
+    );
+    assert!(!vfs.coherence_allows_os_cache());
+}
+
+#[test]
+fn semantic_writer_deferral_does_not_consume_retry_attempts() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-writer-retry");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"writer-retry", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+        vfs.coherence_pending_invalidations
+            .lock()
+            .push_back(PendingCoherenceInvalidation {
+                batch: InvalidationBatch {
+                    generation: 7,
+                    intents: vec![
+                        InvalidationIntent::Content { ino: attr.ino },
+                        InvalidationIntent::Entry {
+                            parent: ROOT_INO,
+                            name: b"writer-retry".to_vec(),
+                            ancestors: None,
+                            ino: Some(attr.ino),
+                        },
+                    ],
+                },
+                attempts: 0,
+            });
+
+        assert_eq!(vfs.drain_semantic_invalidations(), Some(false));
+        {
+            let pending = vfs.coherence_pending_invalidations.lock();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending.front().expect("deferred batch").attempts, 0);
+        }
+
+        vfs.release_fh(fh).await.expect("release");
+    });
+}
+
+#[test]
+fn semantic_reset_covers_writer_deferred_scopes() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-reset-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"reset-writer", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+        vfs.coherence_pending_invalidations
+            .lock()
+            .push_back(PendingCoherenceInvalidation {
+                batch: InvalidationBatch {
+                    generation: 8,
+                    intents: vec![
+                        InvalidationIntent::Reset,
+                        InvalidationIntent::Content { ino: attr.ino },
+                    ],
+                },
+                attempts: 0,
+            });
+
+        assert_eq!(vfs.drain_semantic_invalidations(), Some(true));
+        assert!(vfs.coherence_pending_invalidations.lock().is_empty());
+
+        vfs.release_fh(fh).await.expect("release");
+    });
+}
+
+#[test]
+fn semantic_queue_overflow_reset_replaces_old_unresolved_generations() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-queue-overflow");
+    let _guard = rt.enter();
+    vfs.set_kernel_invalidator(Arc::new(AlwaysFailKernelInvalidator));
+    for generation in 1..=129 {
+        vfs.coherence_pending_invalidations
+            .lock()
+            .push_back(PendingCoherenceInvalidation {
+                batch: InvalidationBatch {
+                    generation,
+                    intents: vec![InvalidationIntent::Attributes { ino: ROOT_INO }],
+                },
+                attempts: 0,
+            });
+    }
+
+    vfs.drain_semantic_invalidations();
+    let pending = vfs.coherence_pending_invalidations.lock();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending.front().expect("overflow reset").batch.generation,
+        129
+    );
+    assert_eq!(
+        pending.front().expect("overflow reset").batch.intents,
+        vec![InvalidationIntent::Reset]
+    );
+    drop(pending);
+
+    vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+    vfs.drain_semantic_invalidations();
+    vfs.note_coherence_sync_started();
+    vfs.note_coherence_sync_success(
+        studiofs_meta::engine::MetadataCoherenceProgress {
+            applied_version: Some(129),
+            remote_head_version: Some(129),
+            source_connected: true,
+            remote_authoritative: true,
+        },
+        true,
+        1,
+    );
+    assert!(
+        vfs.coherence_allows_os_cache(),
+        "a successful reset must replace dropped generations instead of retaining stale blockers"
+    );
 }
 
 #[test]

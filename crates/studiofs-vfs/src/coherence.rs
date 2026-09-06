@@ -326,6 +326,19 @@ impl CoherenceHealthTracker {
         }
     }
 
+    /// Start a conservative whole-mount reset and retain its generation as a
+    /// sentinel until the adapter reports the reset outcome. Any older
+    /// unresolved generations are covered by the reset itself.
+    pub(crate) fn begin_global_reset(&mut self, generation: u64) {
+        if self.snapshot.state == CoherenceHealthState::Stopped {
+            return;
+        }
+        self.unresolved_semantic_generations.clear();
+        self.unresolved_semantic_generations.insert(generation);
+        self.coverage_gap = true;
+        self.degrade(CoherenceHealthReason::InvalidationIncomplete);
+    }
+
     /// Confirm that the adapter has retained the fresh catch-up boundary.
     pub(crate) fn note_coverage_confirmed(
         &mut self,
@@ -538,5 +551,31 @@ mod tests {
 
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
         assert!(!tracker.allows_cache());
+    }
+
+    #[test]
+    fn global_reset_replaces_old_unresolved_generations_with_reset_sentinel() {
+        let mut tracker = CoherenceHealthTracker::new(CoherenceHealthBudget::default());
+        tracker.note_sync_started();
+        tracker.note_sync_success(Some(1), Some(1), true, 2);
+        assert!(tracker.allows_cache());
+
+        tracker.note_invalidation(2, InvalidationAcceptance::Failed, true, 3);
+        assert!(tracker.unresolved_semantic_generations.contains(&2));
+
+        tracker.begin_global_reset(3);
+        assert_eq!(tracker.unresolved_semantic_generations, BTreeSet::from([3]));
+        assert!(!tracker.allows_cache());
+
+        tracker.note_invalidation(3, InvalidationAcceptance::Unsupported, true, 4);
+        tracker.note_sync_started();
+        tracker.note_sync_success(Some(3), Some(3), true, 5);
+        tracker.note_coverage_confirmed(Some(3), 6);
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
+        assert!(!tracker.allows_cache());
+
+        tracker.note_invalidation(3, InvalidationAcceptance::Queued, true, 7);
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::Healthy);
+        assert!(tracker.allows_cache());
     }
 }
