@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{AclMeta, LockTier, OrderedMutex};
 use std::collections::HashMap;
+use tracing::trace;
 
 /// Shared state used by ACL computations, including caches and cache invalidation epochs.
 pub(super) struct AclState {
@@ -178,6 +179,10 @@ impl StudioVfs {
 
     /// Enforces minimum required access level, or returns `AccessDenied` / not-found errors.
     pub(super) fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
+        trace!(
+            target: "studiofs_vfs::metadata_baseline::acl_check",
+            "VFS ACL check"
+        );
         self.enforce_snapshot_mount_fence(ino)?;
         let actual = self.effective_access_level(ino)?;
         if Self::access_satisfies(actual, required) {
@@ -203,6 +208,10 @@ impl StudioVfs {
         ino: Ino,
         required: AccessLevel,
     ) -> VfsResult<()> {
+        trace!(
+            target: "studiofs_vfs::metadata_baseline::acl_check",
+            "VFS ACL check"
+        );
         self.enforce_snapshot_mount_fence(ino)?;
         if let Some(actual) = self.effective_access_level_cached(ino) {
             if Self::access_satisfies(actual, required) {

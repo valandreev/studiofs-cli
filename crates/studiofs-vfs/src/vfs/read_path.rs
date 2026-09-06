@@ -22,7 +22,7 @@ use studiofs_meta::schema::{
     UploadState as MetaUploadState, chunk_start_offset,
 };
 use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 type ReadRange = IntervalRange;
 
@@ -1780,6 +1780,10 @@ impl StudioVfs {
     }
 
     pub(super) fn getattr_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        trace!(
+            target: "studiofs_vfs::metadata_baseline::metadata_getattr",
+            "VFS metadata getattr"
+        );
         if self.is_runtime_stats_file_ino(ino) {
             return Ok(self.runtime_stats_file_attr());
         }
@@ -1790,6 +1794,10 @@ impl StudioVfs {
     }
 
     pub(super) async fn getattr_async_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        trace!(
+            target: "studiofs_vfs::metadata_baseline::metadata_getattr",
+            "VFS metadata getattr"
+        );
         if self.is_runtime_stats_file_ino(ino) {
             return Ok(self.runtime_stats_file_attr());
         }

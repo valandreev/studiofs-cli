@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use studiofs_meta::engine::NamespaceMutation;
 use studiofs_meta::schema::PayloadRefState;
+use tracing::trace;
 
 struct TruncateMutation {
     removed_objects: Vec<(u32, u64)>,
@@ -1725,6 +1726,10 @@ impl StudioVfs {
         }
 
         let observed = self.namespace_cache_token_for_parent(parent);
+        trace!(
+            target: "studiofs_vfs::metadata_baseline::metadata_lookup",
+            "VFS namespace metadata lookup"
+        );
         let entry = match self.sync_meta().lookup(parent, name) {
             Ok(entry) => entry,
             Err(MetaError::EntryNotFound { .. }) => {
@@ -1788,6 +1793,10 @@ impl StudioVfs {
 
         let meta = self.sync_meta();
         let observed = self.namespace_cache_token_for_parent(ino);
+        trace!(
+            target: "studiofs_vfs::metadata_baseline::readdir",
+            "VFS readdir"
+        );
         let mut entries = meta.readdir(ino)?;
         if ino == super::ROOT_INO {
             entries.retain(|entry| {
@@ -1838,6 +1847,10 @@ impl StudioVfs {
                 .min(self.readdir_attr_batch_max_inodes)
                 .max(1);
             for chunk in child_inos.chunks(attr_batch_len) {
+                trace!(
+                    target: "studiofs_vfs::metadata_baseline::get_attrs_batch",
+                    "VFS batched attribute lookup"
+                );
                 attrs.extend(meta.get_attrs_batch(chunk)?);
             }
             attrs_by_ino = attrs

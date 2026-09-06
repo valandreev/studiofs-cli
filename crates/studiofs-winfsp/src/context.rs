@@ -677,6 +677,10 @@ fn unix_nanos_to_filetime(unix_nanos: u64) -> u64 {
 /// Handles `.` (current dir), `..` (parent dir), and strips trailing
 /// dots/spaces from path components (standard Windows path semantics).
 fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
+    trace!(
+        target: "studiofs_winfsp::metadata_baseline::path_resolution",
+        "WinFSP path resolution"
+    );
     if is_runtime_stats_windows_path(path) {
         return Ok(vfs.runtime_stats_file_attr());
     }
@@ -1604,6 +1608,10 @@ impl StudioFsContext {
         context: &StudioFileHandle,
         lock: &DirBufferLock<'_>,
     ) -> winfsp::Result<()> {
+        trace!(
+            target: "studiofs_winfsp::metadata_baseline::directory_buffer",
+            "WinFSP directory buffer construction"
+        );
         const DOT: &[u16] = &[b'.' as u16];
         const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
 
