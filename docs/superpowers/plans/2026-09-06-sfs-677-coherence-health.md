@@ -39,11 +39,17 @@ decisions and the invalidation queue after an injected sync or delivery failure.
   age reporting.
 - [x] (2026-09-06) Extended diagnostics/runtime serialization and added focused
   regressions.
+- [x] (2026-09-06) Closed independent review findings: failed generations are
+  retained for retry, coverage cannot promote without a successful sync
+  boundary, every transition into `Degraded` retires observations, and
+  post-admission WinFSP failures feed the health tracker.
 - [x] (2026-09-06) Re-ran focused validation after formatting and diff review;
   repository-wide suites and the mounted promotion gate were intentionally not
   run.
 - [x] (2026-09-06) Committed all implementation, test, plan, and documentation
-  changes in `ab3209f7` (`feat: add coherence health fail-safe cache fallback`).
+  changes in `ab3209f7` (`feat: add coherence health fail-safe cache fallback`)
+  and review corrections in `72521b6e` (`fix: preserve coherence gaps across
+  delivery failures`).
 
 ## Milestones
 
@@ -138,6 +144,11 @@ diagnostics. Focused evidence after the implementation commit:
 - `cargo test -p studiofs-winfsp --lib -- --nocapture` (133 passed)
 - `cargo test -p studiofs --bin studiofs diagnostics_runtime_snapshot_round_trips_coherence_health -- --nocapture` (1 passed)
 - `git diff HEAD^ HEAD --check`
+
+The review correction adds explicit sync-boundary and coverage-gap guards,
+bounded retry retention for failed semantic generations, and bridge failure
+counter sampling. The post-correction focused VFS coherence and semantic
+invalidation tests pass, as does the complete WinFSP unit target.
 
 The broader `studiofs` diagnostics selection had 45 passing tests and two
 pre-existing Windows mount-lock failures (`Access is denied`, error 5) before
