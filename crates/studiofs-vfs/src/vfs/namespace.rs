@@ -1017,6 +1017,11 @@ pub trait KernelInvalidator: Send + Sync {
         None
     }
 
+    /// Return a monotonic count of post-admission delivery failures, when known.
+    fn invalidation_delivery_failure_count(&self) -> u64 {
+        0
+    }
+
     /// Reset bridge-local diagnostics counters for a fresh observability interval.
     fn reset_diagnostics(&self) {}
 }

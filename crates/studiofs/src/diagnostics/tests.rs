@@ -520,6 +520,7 @@ fn diagnostics_runtime_snapshot_round_trips_coherence_health() {
             covered_boundary: Some(3),
             apply_lag: Some(7),
             pending_delivery_age_ms: Some(12),
+            delivery_failure_count: 2,
             last_progress_unix_ms: Some(10_000),
             budget: studiofs_vfs::CoherenceHealthBudget {
                 max_apply_lag: 6,

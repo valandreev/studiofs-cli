@@ -1476,7 +1476,7 @@ fn semantic_invalidation_falls_back_without_losing_content_or_attributes() {
             InvalidationIntent::Attributes { ino: 43 },
         ],
     });
-    assert_eq!(invalidator.snapshot(), vec![42]);
+    assert_eq!(invalidator.snapshot(), vec![42, ROOT_INO]);
     assert_eq!(invalidator.attr_snapshot(), vec![43]);
 }
 
@@ -1577,11 +1577,11 @@ fn semantic_invalidation_preserves_active_writer_until_release() {
             intents: vec![InvalidationIntent::Content { ino: attr.ino }],
         });
         assert!(
-            invalidator.snapshot().is_empty(),
+            !invalidator.snapshot().contains(&attr.ino),
             "active writer must retain its OS content"
         );
         vfs.release_fh(fh).await.expect("release");
-        assert_eq!(invalidator.snapshot(), vec![attr.ino]);
+        assert!(invalidator.snapshot().contains(&attr.ino));
     });
 }
 

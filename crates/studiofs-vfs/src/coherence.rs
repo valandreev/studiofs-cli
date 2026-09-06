@@ -127,6 +127,8 @@ pub struct CoherenceHealthSnapshot {
     pub apply_lag: Option<u64>,
     /// Age of currently retained delivery work.
     pub pending_delivery_age_ms: Option<u64>,
+    /// Monotonic count of invalidation delivery failures observed by the bridge.
+    pub delivery_failure_count: u64,
     /// Last time progress or coverage was observed.
     pub last_progress_unix_ms: Option<u64>,
     /// Effective finite safety budgets.
@@ -143,6 +145,7 @@ impl Default for CoherenceHealthSnapshot {
             covered_boundary: None,
             apply_lag: None,
             pending_delivery_age_ms: None,
+            delivery_failure_count: 0,
             last_progress_unix_ms: None,
             budget: CoherenceHealthBudget::default(),
         }
@@ -155,6 +158,8 @@ pub(crate) struct CoherenceHealthTracker {
     snapshot: CoherenceHealthSnapshot,
     awaiting_coverage: bool,
     reconnecting: bool,
+    has_sync_boundary: bool,
+    coverage_gap: bool,
 }
 
 impl CoherenceHealthTracker {
@@ -167,6 +172,8 @@ impl CoherenceHealthTracker {
             },
             awaiting_coverage: true,
             reconnecting: false,
+            has_sync_boundary: false,
+            coverage_gap: false,
         }
     }
 
@@ -204,6 +211,7 @@ impl CoherenceHealthTracker {
             self.reconnecting = true;
         }
         if self.snapshot.state != CoherenceHealthState::Healthy {
+            self.has_sync_boundary = false;
             self.snapshot.state = CoherenceHealthState::CatchingUp;
             self.snapshot.reason = CoherenceHealthReason::CatchingUp;
         }
@@ -220,6 +228,8 @@ impl CoherenceHealthTracker {
         if self.snapshot.state == CoherenceHealthState::Stopped {
             return;
         }
+
+        self.has_sync_boundary = false;
 
         let was_degraded =
             self.snapshot.state == CoherenceHealthState::Degraded || self.reconnecting;
@@ -247,7 +257,7 @@ impl CoherenceHealthTracker {
         // confirmation, even when the sync produced no new batches. This
         // keeps `Degraded -> CatchingUp` observable and prevents a successful
         // command alone from promoting the cache.
-        self.awaiting_coverage = !coverage_complete || was_degraded;
+        self.awaiting_coverage = !coverage_complete || was_degraded || self.coverage_gap;
         self.reconnecting = false;
 
         if remote_boundary.is_some() && applied_boundary.is_none() {
@@ -272,6 +282,7 @@ impl CoherenceHealthTracker {
             return;
         }
 
+        self.has_sync_boundary = true;
         self.snapshot.state = CoherenceHealthState::CatchingUp;
         self.snapshot.reason = if was_degraded {
             CoherenceHealthReason::Reconnected
@@ -299,17 +310,23 @@ impl CoherenceHealthTracker {
                 self.snapshot.pending_delivery_age_ms = Some(0);
                 self.snapshot.last_progress_unix_ms = Some(now_unix_ms);
                 self.awaiting_coverage = false;
+                self.coverage_gap = false;
                 self.try_promote();
             }
             InvalidationAcceptance::Unsupported => {
+                self.coverage_gap = true;
                 self.degrade(CoherenceHealthReason::InvalidationUnsupported)
             }
-            InvalidationAcceptance::Failed => self.degrade(if generation_complete {
-                CoherenceHealthReason::InvalidationFailed
-            } else {
-                CoherenceHealthReason::InvalidationIncomplete
-            }),
+            InvalidationAcceptance::Failed => {
+                self.coverage_gap = true;
+                self.degrade(if generation_complete {
+                    CoherenceHealthReason::InvalidationFailed
+                } else {
+                    CoherenceHealthReason::InvalidationIncomplete
+                })
+            }
             InvalidationAcceptance::Queued => {
+                self.coverage_gap = true;
                 self.degrade(CoherenceHealthReason::InvalidationIncomplete)
             }
         }
@@ -322,6 +339,9 @@ impl CoherenceHealthTracker {
         now_unix_ms: u64,
     ) {
         if self.snapshot.state == CoherenceHealthState::Stopped {
+            return;
+        }
+        if self.coverage_gap {
             return;
         }
         if let Some(boundary) = covered_boundary {
@@ -346,6 +366,19 @@ impl CoherenceHealthTracker {
         }
     }
 
+    /// Record monotonic post-admission delivery failures from the platform bridge.
+    pub(crate) fn note_delivery_failure_count(&mut self, count: u64, _now_unix_ms: u64) {
+        if self.snapshot.state == CoherenceHealthState::Stopped {
+            return;
+        }
+        let increased = count > self.snapshot.delivery_failure_count;
+        self.snapshot.delivery_failure_count = count;
+        if increased {
+            self.coverage_gap = true;
+            self.degrade(CoherenceHealthReason::InvalidationFailed);
+        }
+    }
+
     /// Record a synchronization failure and revoke cache eligibility immediately.
     pub(crate) fn note_sync_failure(&mut self, reason: CoherenceHealthReason, _now_unix_ms: u64) {
         if self.snapshot.state != CoherenceHealthState::Stopped {
@@ -359,6 +392,7 @@ impl CoherenceHealthTracker {
         self.snapshot.reason = CoherenceHealthReason::Shutdown;
         self.awaiting_coverage = true;
         self.reconnecting = false;
+        self.has_sync_boundary = false;
     }
 
     fn degrade(&mut self, reason: CoherenceHealthReason) {
@@ -368,11 +402,13 @@ impl CoherenceHealthTracker {
         self.snapshot.state = CoherenceHealthState::Degraded;
         self.snapshot.reason = reason;
         self.awaiting_coverage = true;
+        self.has_sync_boundary = false;
     }
 
     fn try_promote(&mut self) {
         if self.snapshot.state == CoherenceHealthState::CatchingUp
             && !self.awaiting_coverage
+            && self.has_sync_boundary
             && self
                 .snapshot
                 .apply_lag
@@ -468,6 +504,28 @@ mod tests {
         assert!(!tracker.allows_cache());
 
         tracker.note_coverage_confirmed(Some(2), 6);
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::Healthy);
+    }
+
+    #[test]
+    fn invalidation_coverage_cannot_promote_without_sync_boundary() {
+        let mut tracker = CoherenceHealthTracker::new(CoherenceHealthBudget::default());
+        tracker.note_sync_started(1);
+        tracker.note_invalidation(1, InvalidationAcceptance::Queued, true, 2);
+
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
+        assert!(!tracker.allows_cache());
+
+        tracker.note_delivery_failure_count(1, 3);
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::Degraded);
+        assert_eq!(tracker.snapshot().delivery_failure_count, 1);
+
+        tracker.note_sync_started(4);
+        tracker.note_sync_success(Some(2), Some(2), true, 5);
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
+        tracker.note_coverage_confirmed(Some(2), 6);
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::CatchingUp);
+        tracker.note_invalidation(2, InvalidationAcceptance::Queued, true, 7);
         assert_eq!(tracker.snapshot().state, CoherenceHealthState::Healthy);
     }
 }

@@ -559,6 +559,7 @@ impl VfsBootstrap {
                     plan.metadata_invalidation_sync_interval.as_millis() as u64,
                 ),
             ))),
+            coherence_pending_invalidations: Mutex::new(VecDeque::new()),
             janitor_interval: plan.janitor_interval,
             janitor_skip_newer_than: plan.janitor_skip_newer_than,
             janitor_max_deletes_per_run: plan.janitor_max_deletes_per_run,

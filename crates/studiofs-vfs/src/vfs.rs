@@ -3705,6 +3705,8 @@ pub struct StudioVfs {
     os_cache: Arc<Mutex<OsCacheState>>,
     /// Mount-local replication and invalidation coherence health.
     coherence_health: Arc<Mutex<CoherenceHealthTracker>>,
+    /// Failed or partially admitted semantic generations awaiting retry.
+    coherence_pending_invalidations: Mutex<VecDeque<studiofs_meta::coherence::InvalidationBatch>>,
     janitor_interval: Duration,
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,

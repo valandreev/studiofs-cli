@@ -753,6 +753,13 @@ impl KernelInvalidator for WinfspKernelInvalidator {
     fn invalidation_delivery_age_ms(&self) -> Option<u64> {
         self.queue.pending_delivery_age_ms()
     }
+
+    fn invalidation_delivery_failure_count(&self) -> u64 {
+        let delivery = self.queue.delivery_snapshot();
+        delivery
+            .failed_batches
+            .saturating_add(delivery.failed_notifications)
+    }
     fn inval_inode(&self, ino: u64) {
         self.queue.push(ino);
     }

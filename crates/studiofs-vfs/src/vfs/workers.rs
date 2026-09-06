@@ -11,6 +11,7 @@ use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
 
 const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
+const COHERENCE_PENDING_INVALIDATION_CAPACITY: usize = 128;
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
@@ -584,13 +585,42 @@ impl StudioVfs {
             all_accepted: true,
             ..SemanticInvalidationDrain::default()
         };
-        for batch in self.sync_meta().take_invalidation_batches() {
+        let mut batches = self
+            .coherence_pending_invalidations
+            .lock()
+            .drain(..)
+            .collect::<Vec<_>>();
+        batches.extend(self.sync_meta().take_invalidation_batches());
+        for batch in batches {
             outcome.had_batches = true;
+            let retry = batch.clone();
             let (acceptance, generation_complete) = self.apply_semantic_invalidation_batch(batch);
             outcome.all_accepted &=
                 acceptance == InvalidationAcceptance::Queued && generation_complete;
+            if acceptance == InvalidationAcceptance::Failed || !generation_complete {
+                self.retain_failed_coherence_invalidation(retry);
+            }
         }
         outcome
+    }
+
+    fn retain_failed_coherence_invalidation(
+        &self,
+        batch: studiofs_meta::coherence::InvalidationBatch,
+    ) {
+        let mut pending = self.coherence_pending_invalidations.lock();
+        if pending.len() >= COHERENCE_PENDING_INVALIDATION_CAPACITY {
+            // Losing precision is itself a coverage gap. Preserve an explicit
+            // reset marker so adapters that support it can re-establish a
+            // boundary; unsupported adapters remain conservatively degraded.
+            pending.clear();
+            pending.push_back(studiofs_meta::coherence::InvalidationBatch {
+                generation: batch.generation,
+                intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+            });
+        } else {
+            pending.push_back(batch);
+        }
     }
 
     fn retire_untrusted_coherence_cache(&self) {
@@ -618,13 +648,21 @@ impl StudioVfs {
     }
 
     fn apply_coherence_transition(&self, transition: impl FnOnce(&mut CoherenceHealthTracker)) {
-        let became_unsafe = {
+        let (became_unsafe, entered_degraded, entered_stopped) = {
             let mut health = self.coherence_health.lock();
             let was_safe = health.allows_cache();
+            let previous_state = health.snapshot().state;
             transition(&mut health);
-            was_safe && !health.allows_cache()
+            let current_state = health.snapshot().state;
+            (
+                was_safe && !health.allows_cache(),
+                previous_state != crate::coherence::CoherenceHealthState::Degraded
+                    && current_state == crate::coherence::CoherenceHealthState::Degraded,
+                previous_state != crate::coherence::CoherenceHealthState::Stopped
+                    && current_state == crate::coherence::CoherenceHealthState::Stopped,
+            )
         };
-        if became_unsafe {
+        if became_unsafe || entered_degraded || entered_stopped {
             self.retire_untrusted_coherence_cache();
         }
     }
@@ -684,11 +722,20 @@ impl StudioVfs {
         });
     }
 
-    pub(super) fn note_coherence_delivery_age(&self, now_unix_ms: u64) {
-        let age = self
+    pub(super) fn note_coherence_delivery_state(&self, now_unix_ms: u64) {
+        let (age, failures) = self
             .kernel_invalidator()
-            .and_then(|invalidator| invalidator.invalidation_delivery_age_ms());
-        self.apply_coherence_transition(|health| health.note_delivery_age(age, now_unix_ms));
+            .map(|invalidator| {
+                (
+                    invalidator.invalidation_delivery_age_ms(),
+                    invalidator.invalidation_delivery_failure_count(),
+                )
+            })
+            .unwrap_or((None, 0));
+        self.apply_coherence_transition(|health| {
+            health.note_delivery_failure_count(failures, now_unix_ms);
+            health.note_delivery_age(age, now_unix_ms);
+        });
     }
 
     pub(super) fn stop_coherence(&self, now_unix_ms: u64) {
@@ -1085,7 +1132,7 @@ impl StudioVfs {
                     || (before_sync_coverage.all_accepted && after_sync_coverage.all_accepted),
                 now_unix_millis(),
             );
-            self.note_coherence_delivery_age(now_unix_millis());
+            self.note_coherence_delivery_state(now_unix_millis());
 
             let (token_namespace_changed, metadata_changed) = metadata_token_changes(
                 &last_namespace_token,
