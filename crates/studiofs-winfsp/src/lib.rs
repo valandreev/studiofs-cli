@@ -11,6 +11,7 @@ mod context;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::{mem, ptr};
 
 use cache_policy::WinfspMetadataCachePolicy;
 pub use context::{
@@ -489,11 +490,46 @@ fn apply_volume_params(
     volume_params.security_timeout(options.security_timeout_ms);
     volume_params.stream_info_timeout(options.stream_info_timeout_ms);
     volume_params.extended_attribute_timeout(options.extended_attribute_timeout_ms);
+    mark_v1_timeout_fields_valid(volume_params);
     // Keep WinFSP's read cache alive across cleanup by default; this is required
     // for the hot file-manager read path to stay near OS-cache speeds. Workloads
     // that need stricter cleanup purge can enable it explicitly via env.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
+}
+
+fn mark_v1_timeout_fields_valid(volume_params: &mut winfsp::host::VolumeParams) {
+    // winfsp 0.12.4 exposes setters for the V1 timeout values but not for the
+    // corresponding validity bits. Its VolumeParams is repr(transparent) over
+    // this exact FSP binding, so use the generated winfsp-sys setters here.
+    debug_assert_eq!(
+        mem::size_of::<winfsp::host::VolumeParams>(),
+        mem::size_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>()
+    );
+    debug_assert_eq!(
+        mem::align_of::<winfsp::host::VolumeParams>(),
+        mem::align_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>()
+    );
+
+    // SAFETY: winfsp::host::VolumeParams is #[repr(transparent)] over
+    // winfsp_sys::FSP_FSCTL_VOLUME_PARAMS in the locked winfsp 0.12.4 API.
+    let raw =
+        unsafe { &mut *ptr::from_mut(volume_params).cast::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>() };
+    raw.Version = mem::size_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>() as u16;
+    raw.set_VolumeInfoTimeoutValid(1);
+    raw.set_DirInfoTimeoutValid(1);
+    raw.set_SecurityTimeoutValid(1);
+    raw.set_StreamInfoTimeoutValid(1);
+    raw.set_EaTimeoutValid(1);
+}
+
+#[cfg(test)]
+fn raw_volume_params(
+    volume_params: &winfsp::host::VolumeParams,
+) -> &winfsp_sys::FSP_FSCTL_VOLUME_PARAMS {
+    // SAFETY: see mark_v1_timeout_fields_valid; the transparent wrapper and
+    // raw binding have the same layout and lifetime.
+    unsafe { &*ptr::from_ref(volume_params).cast() }
 }
 
 fn is_drive_root_mount_point(mount_point: &str) -> bool {
@@ -1106,8 +1142,8 @@ mod tests {
         DEFAULT_SECTORS_PER_ALLOCATION_UNIT, MountOptionError, WinfspShutdownHost,
         canonical_drive_mount_point, clear_shutdown_registry_for_test, default_dispatcher_threads,
         is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
-        register_shutdown_sender, remove_test_mount_option_env, request_shutdown,
-        set_test_mount_option_env, stop_host_before_vfs_shutdown,
+        raw_volume_params, register_shutdown_sender, remove_test_mount_option_env,
+        request_shutdown, set_test_mount_option_env, stop_host_before_vfs_shutdown,
         stop_host_before_vfs_shutdown_and_process_exit, winfsp_dll_stem_for_arch,
     };
     #[test]
@@ -1197,6 +1233,37 @@ mod tests {
             opts.file_info_timeout_ms,
             WinfspMetadataCachePolicy::Adaptive.timeouts().file_info_ms
         );
+    }
+
+    #[test]
+    fn apply_volume_params_activates_v1_metadata_timeout_overrides() {
+        remove_test_mount_option_env("STUDIOFS_WINFSP_METADATA_CACHE_POLICY");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS");
+
+        let options = parse_mount_options("StudioFS").expect("options");
+        let mut volume_params = winfsp::host::VolumeParams::new();
+        super::apply_volume_params(&mut volume_params, &options, "Z:").expect("volume params");
+        let raw = raw_volume_params(&volume_params);
+
+        assert_eq!(
+            raw.Version as usize,
+            std::mem::size_of::<winfsp_sys::FSP_FSCTL_VOLUME_PARAMS>()
+        );
+        assert_eq!(raw.VolumeInfoTimeoutValid(), 1);
+        assert_eq!(raw.DirInfoTimeoutValid(), 1);
+        assert_eq!(raw.SecurityTimeoutValid(), 1);
+        assert_eq!(raw.StreamInfoTimeoutValid(), 1);
+        assert_eq!(raw.EaTimeoutValid(), 1);
+        assert_eq!(raw.DirInfoTimeout, options.dir_info_timeout_ms);
+        assert_eq!(raw.VolumeInfoTimeout, options.volume_info_timeout_ms);
+        assert_eq!(raw.SecurityTimeout, options.security_timeout_ms);
+        assert_eq!(raw.StreamInfoTimeout, options.stream_info_timeout_ms);
+        assert_eq!(raw.EaTimeout, options.extended_attribute_timeout_ms);
     }
 
     #[test]
