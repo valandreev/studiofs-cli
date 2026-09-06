@@ -64,6 +64,10 @@ decisions and the invalidation queue after an injected sync or delivery failure.
   Reset covers writer-deferred scopes, failed Reset batches stop after the
   same finite limit, and an executing global Reset replaces older unresolved
   generations with a Reset sentinel so unsupported adapters remain fail-safe.
+- [x] (2026-09-06) Closed the follow-up inline findings: in-flight WinFSP
+  notification age now participates in the delivery budget, changed metadata
+  tokens keep health conservative until snapshot reconciliation finishes, and
+  NotifyBegin requeues count as monotonic delivery failures.
 
 ## Milestones
 
@@ -212,6 +216,22 @@ cache-retirement path was narrowed: retirement also occurs for ordinary
 degradation, so clearing there would erase evidence of an unresolved failed
 batch. The implementation instead clears older entries at Reset execution and
 keeps the Reset generation as a sentinel until that adapter result is known.
+
+The inline review also identified three ordering/accounting gaps. The queue age
+accessor now takes the oldest of pending and deferred/in-flight timestamps;
+`background_metadata_invalidation` passes `Healthy` promotion only after any
+changed-token snapshot reconciliation and its cache invalidations complete;
+and `retried_batches` contributes to the WinFSP failure counter consumed by the
+health tracker. Semantic coverage and reconciliation readiness remain separate
+so a successful snapshot can explicitly clear the temporary conservative gate.
+
+Focused validation for this follow-up:
+
+- `cargo test -p studiofs-winfsp --lib invalidation_queue_reports_inflight_delivery_age -- --nocapture`
+- `cargo test -p studiofs-winfsp --lib unsubmitted_notification_batch_is_requeued_for_retry -- --nocapture`
+- `cargo test -p studiofs-winfsp --lib invalidation -- --nocapture` (9 passed)
+- `cargo test -p studiofs-vfs --lib changed_metadata_tokens_hold_health_until_reconciliation -- --nocapture`
+- `cargo clippy -p studiofs-vfs -p studiofs-winfsp --all-targets -- -D warnings`
 
 ## Context and Orientation
 
