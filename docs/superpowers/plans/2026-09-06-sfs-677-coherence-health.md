@@ -39,9 +39,11 @@ decisions and the invalidation queue after an injected sync or delivery failure.
   age reporting.
 - [x] (2026-09-06) Extended diagnostics/runtime serialization and added focused
   regressions.
-- [ ] Re-run the remaining validation commands after final formatting/diff
-  review; do not run repository-wide suites or the mounted promotion gate.
-- [ ] Commit all changes, including this plan and related documentation.
+- [x] (2026-09-06) Re-ran focused validation after formatting and diff review;
+  repository-wide suites and the mounted promotion gate were intentionally not
+  run.
+- [x] (2026-09-06) Committed all implementation, test, plan, and documentation
+  changes in `ab3209f7` (`feat: add coherence health fail-safe cache fallback`).
 
 ## Milestones
 
@@ -126,8 +128,21 @@ behavior with focused VFS/WinFSP tests, clippy, formatting, and diff checks.
 
 ## Outcomes & Retrospective
 
-To be filled after each completed milestone with test evidence, remaining
-limitations, and the exact validation boundary.
+Implemented the mount-local health state machine and metadata progress port,
+wired conservative cache retirement into VFS/WinFSP, and exposed the state in
+diagnostics. Focused evidence after the implementation commit:
+
+- `cargo clippy -p studiofs-meta -p studiofs-vfs -p studiofs-winfsp -p studiofs --all-targets -- -D warnings`
+- `cargo test -p studiofs-vfs --lib coherence -- --nocapture` (6 passed)
+- `cargo test -p studiofs-meta --lib coherence -- --nocapture` (8 passed)
+- `cargo test -p studiofs-winfsp --lib -- --nocapture` (133 passed)
+- `cargo test -p studiofs --bin studiofs diagnostics_runtime_snapshot_round_trips_coherence_health -- --nocapture` (1 passed)
+- `git diff HEAD^ HEAD --check`
+
+The broader `studiofs` diagnostics selection had 45 passing tests and two
+pre-existing Windows mount-lock failures (`Access is denied`, error 5) before
+the coherence assertion path; the focused new diagnostics regression passes.
+No full workspace suite, native mounted E2E, or promotion gate was run.
 
 ## Context and Orientation
 
