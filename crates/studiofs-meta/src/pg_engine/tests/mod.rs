@@ -467,6 +467,8 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         metadata_fallback_poll_discoveries: AtomicU64::new(0),
         metadata_sync_errors: AtomicU64::new(0),
         metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
+        metadata_remote_head_version: AtomicI64::new(-1),
+        metadata_source_connected: AtomicBool::new(false),
     };
 
     PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");

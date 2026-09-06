@@ -1991,6 +1991,13 @@ impl MetaReplication for RedbMetaEngine {
         Ok(())
     }
 
+    fn metadata_coherence_progress(&self) -> crate::engine::MetadataCoherenceProgress {
+        crate::engine::MetadataCoherenceProgress {
+            source_connected: true,
+            ..crate::engine::MetadataCoherenceProgress::default()
+        }
+    }
+
     fn invalidation_sender_id(&self) -> Option<String> {
         None
     }

@@ -93,6 +93,7 @@ pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
 };
 
+use crate::coherence::{CoherenceHealthBudget, CoherenceHealthSnapshot, CoherenceHealthTracker};
 use acl::AclState;
 use buffer_pool::BufferPool;
 use config::{
@@ -3702,6 +3703,8 @@ pub struct StudioVfs {
     handle_table: HandleTable,
     /// Bounded generation snapshots and active writer participation.
     os_cache: Arc<Mutex<OsCacheState>>,
+    /// Mount-local replication and invalidation coherence health.
+    coherence_health: Arc<Mutex<CoherenceHealthTracker>>,
     janitor_interval: Duration,
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,
@@ -3865,6 +3868,16 @@ impl StudioVfs {
         }
     }
 
+    /// Snapshot mount-local replication and invalidation coherence health.
+    pub fn coherence_health_snapshot(&self) -> CoherenceHealthSnapshot {
+        self.coherence_health.lock().snapshot()
+    }
+
+    /// Return whether a read-only platform open may retain OS metadata cache state.
+    pub fn coherence_allows_os_cache(&self) -> bool {
+        self.coherence_health.lock().allows_cache()
+    }
+
     /// Snapshot metadata replication and session synchronization state.
     pub fn synchronization_state_snapshot(&self) -> VfsSynchronizationStateSnapshot {
         let metadata_backlog = self.sync_meta().replication_backlog();
@@ -3873,6 +3886,7 @@ impl StudioVfs {
             foreground_reads: self.foreground_read_protection_stats(),
             pending_metadata_ops: metadata_backlog.pending_ops,
             inflight_metadata_ops: metadata_backlog.inflight_ops,
+            coherence: self.coherence_health_snapshot(),
         }
     }
 

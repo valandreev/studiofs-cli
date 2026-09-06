@@ -104,6 +104,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             foreground_reads: self.vfs.foreground_read_protection_stats(),
             write_path: self.vfs.write_path_observability_snapshot(),
             zeroio: self.vfs.zeroio_runtime_snapshot(),
+            coherence: self.vfs.coherence_health_snapshot(),
         }
     }
 
@@ -123,6 +124,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             synchronization: DiagnosticsSynchronizationSnapshot {
                 state: self.vfs.synchronization_state_snapshot(),
             },
+            coherence: health.coherence,
         }
     }
 

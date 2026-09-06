@@ -60,6 +60,9 @@ pub(crate) struct DiagnosticsHealthSnapshot {
     pub write_path: VfsWritePathObservabilitySnapshot,
     #[serde(default)]
     pub zeroio: VfsZeroIoRuntimeSnapshot,
+    /// Mount-local replication and invalidation coherence health.
+    #[serde(default)]
+    pub coherence: CoherenceHealthSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -91,6 +94,9 @@ pub(crate) struct DiagnosticsRuntimeSnapshot {
     pub zeroio: VfsZeroIoRuntimeSnapshot,
     pub cache: DiagnosticsCacheSnapshot,
     pub synchronization: DiagnosticsSynchronizationSnapshot,
+    /// Mount-local replication and invalidation coherence health.
+    #[serde(default)]
+    pub coherence: CoherenceHealthSnapshot,
 }
 
 impl DiagnosticsRuntimeSnapshot {
@@ -109,8 +115,10 @@ impl DiagnosticsRuntimeSnapshot {
                     foreground_reads: health.foreground_reads,
                     pending_metadata_ops: 0,
                     inflight_metadata_ops: 0,
+                    coherence: health.coherence,
                 },
             },
+            coherence: health.coherence,
             upload: health.upload,
             zeroio: health.zeroio,
         }

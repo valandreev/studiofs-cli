@@ -1585,6 +1585,69 @@ fn semantic_invalidation_preserves_active_writer_until_release() {
     });
 }
 
+#[test]
+fn coherence_degradation_retires_os_cache_generation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("coherence-health-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "coherence-degrade-cache");
+    let _guard = rt.enter();
+    let attr = vfs
+        .create(ROOT_INO, b"coherence-cache.txt", 0, 0, 0o644)
+        .expect("create file");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open read-only handle");
+
+    {
+        let mut health = vfs.coherence_health.lock();
+        health.note_sync_started(1);
+        health.note_sync_success(Some(4), Some(4), true, 2);
+    }
+    assert!(vfs.coherence_allows_os_cache());
+    let decision = vfs.prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+    assert!(vfs.os_cache.lock().has_generation(attr.ino));
+    let _ = vfs.getattr(attr.ino).expect("cache file attributes");
+    assert!(
+        vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .contains(attr.ino)
+    );
+    assert_eq!(decision.disposition(), OsCacheDisposition::Replace);
+
+    vfs.note_coherence_sync_failure(3);
+
+    assert!(!vfs.coherence_allows_os_cache());
+    assert!(!vfs.os_cache.lock().has_generation(attr.ino));
+    assert!(
+        !vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .contains(attr.ino)
+    );
+    rt.block_on(vfs.release_fh(fh)).expect("release handle");
+}
+
+#[test]
+fn coherence_health_reaches_healthy_after_local_startup_sync() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("coherence-health-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "coherence-startup");
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(1) && !vfs.coherence_allows_os_cache()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert!(
+        vfs.coherence_allows_os_cache(),
+        "startup sync should establish local-only coherence: {:?}",
+        vfs.coherence_health_snapshot()
+    );
+    rt.block_on(vfs.shutdown(std::time::Duration::ZERO))
+        .expect("shutdown VFS");
+}
+
 impl RecordingKernelInvalidator {
     fn snapshot(&self) -> Vec<Ino> {
         self.data_seen.lock().clone()

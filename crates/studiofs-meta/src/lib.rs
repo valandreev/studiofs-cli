@@ -45,8 +45,8 @@ pub use engine::{
     LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat,
     MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
     MetaReplication, MetaResult, MetaSymlink, MetaXattr, MetadataBatchWriteObservability,
-    MetadataWriteObservability, MetadataWriteStageTiming, NamespaceMutation,
-    RegularFileOverlayMutation,
+    MetadataCoherenceProgress, MetadataWriteObservability, MetadataWriteStageTiming,
+    NamespaceMutation, RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{

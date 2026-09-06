@@ -28,6 +28,10 @@ pub mod vfs;
 
 pub use aimd::{AimdConfig, AimdController};
 pub use bridge::{BridgeAttrTimes, BridgeVfsErrorKind, classify_vfs_error, normalize_attr_times};
+pub use coherence::{
+    CoherenceCachePolicy, CoherenceHealthBudget, CoherenceHealthReason, CoherenceHealthSnapshot,
+    CoherenceHealthState, InvalidationAcceptance,
+};
 pub use fetch::FetchScheduler;
 pub use incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,

@@ -1012,6 +1012,11 @@ pub trait KernelInvalidator: Send + Sync {
         self.inval_inode(ino);
     }
 
+    /// Return the age of the oldest retained native invalidation, when known.
+    fn invalidation_delivery_age_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// Reset bridge-local diagnostics counters for a fresh observability interval.
     fn reset_diagnostics(&self) {}
 }

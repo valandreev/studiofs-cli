@@ -237,6 +237,21 @@ pub struct MetadataInvalidationDiagnostics {
     pub last_successful_sync_unix_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Progress evidence used by the mount-local coherence health tracker.
+pub struct MetadataCoherenceProgress {
+    /// Highest metadata version applied to the local serving view.
+    pub applied_version: Option<u64>,
+    /// Last observed authoritative remote metadata head, when available.
+    pub remote_head_version: Option<u64>,
+    /// Unix timestamp for the last successful synchronization boundary.
+    pub last_successful_sync_unix_ms: Option<u64>,
+    /// Whether the metadata source has a currently successful command path.
+    pub source_connected: bool,
+    /// Whether `remote_head_version` is authoritative for this engine.
+    pub remote_authoritative: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Outcome of a best-effort local metadata storage compaction attempt.
 pub enum LocalStorageCompactionResult {
@@ -994,6 +1009,23 @@ pub trait MetaReplication: Send + Sync {
     /// Best-effort diagnostics for push-plus-poll metadata invalidation.
     fn metadata_invalidation_diagnostics(&self) -> MetadataInvalidationDiagnostics {
         MetadataInvalidationDiagnostics::default()
+    }
+
+    /// Return progress evidence for mount-local coherence health decisions.
+    fn metadata_coherence_progress(&self) -> MetadataCoherenceProgress {
+        let applied_version = self
+            .metadata_version_token()
+            .and_then(|token| token.parse::<u64>().ok());
+        let diagnostics = self.metadata_invalidation_diagnostics();
+        MetadataCoherenceProgress {
+            applied_version,
+            remote_head_version: None,
+            last_successful_sync_unix_ms: diagnostics
+                .last_successful_sync_unix_ms
+                .and_then(|value| u64::try_from(value).ok()),
+            source_connected: diagnostics.sync_errors == 0,
+            remote_authoritative: false,
+        }
     }
 
     /// Request a near-immediate flush of pending metadata mutations.

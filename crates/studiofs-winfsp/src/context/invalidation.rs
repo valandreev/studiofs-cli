@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Weak};
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
@@ -176,6 +177,7 @@ struct WinfspInvalidationQueueState {
     coalesced: u64,
     snapshot_generation: u64,
     notification_batches_in_flight: usize,
+    pending_since: Option<Instant>,
 }
 
 /// Bounded, coalescing queue shared by WinFSP invalidation producers and the
@@ -255,6 +257,14 @@ impl WinfspInvalidationQueue {
     /// Returns local acceptance and native submission diagnostics.
     pub fn delivery_snapshot(&self) -> WinfspDeliverySnapshot {
         self.state.lock().delivery
+    }
+
+    /// Return the age of the oldest pending invalidation target.
+    pub fn pending_delivery_age_ms(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .pending_since
+            .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
     }
 
     fn record_failed_notification(&self) {
@@ -500,6 +510,9 @@ impl WinfspInvalidationQueue {
             return true;
         }
         if state.pending.len() < WINFSP_INVALIDATION_QUEUE_CAPACITY {
+            if state.pending.is_empty() {
+                state.pending_since = Some(Instant::now());
+            }
             state.pending.insert(key.clone());
             state.order.push_back(key);
             state.queue_peak = state.queue_peak.max(state.pending.len());
@@ -531,6 +544,7 @@ impl WinfspInvalidationQueue {
         let mut state = self.state.lock();
         let order = std::mem::take(&mut state.order);
         state.pending.clear();
+        state.pending_since = None;
         let targets = order
             .into_iter()
             .map(|key| {
@@ -734,6 +748,10 @@ impl KernelInvalidator for WinfspKernelInvalidator {
         generation_complete: bool,
     ) -> InvalidationAcceptance {
         self.queue.enqueue_batch(batch, generation_complete)
+    }
+
+    fn invalidation_delivery_age_ms(&self) -> Option<u64> {
+        self.queue.pending_delivery_age_ms()
     }
     fn inval_inode(&self, ino: u64) {
         self.queue.push(ino);

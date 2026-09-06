@@ -510,6 +510,32 @@ fn runtime_snapshot_request_returns_structured_sections() {
 }
 
 #[test]
+fn diagnostics_runtime_snapshot_round_trips_coherence_health() {
+    let snapshot = DiagnosticsRuntimeSnapshot {
+        coherence: CoherenceHealthSnapshot {
+            state: studiofs_vfs::CoherenceHealthState::Degraded,
+            reason: studiofs_vfs::CoherenceHealthReason::ExcessiveLag,
+            policy: studiofs_vfs::CoherenceCachePolicy::Conservative,
+            applied_boundary: Some(4),
+            covered_boundary: Some(3),
+            apply_lag: Some(7),
+            pending_delivery_age_ms: Some(12),
+            last_progress_unix_ms: Some(10_000),
+            budget: studiofs_vfs::CoherenceHealthBudget {
+                max_apply_lag: 6,
+                max_delivery_age_ms: 100,
+            },
+        },
+        ..DiagnosticsRuntimeSnapshot::default()
+    };
+
+    let encoded = serde_json::to_vec(&snapshot).expect("serialize diagnostics snapshot");
+    let decoded: DiagnosticsRuntimeSnapshot =
+        serde_json::from_slice(&encoded).expect("deserialize diagnostics snapshot");
+    assert_eq!(decoded.coherence, snapshot.coherence);
+}
+
+#[test]
 fn snapshot_sections_for_scope_includes_zeroio_section() {
     let snapshot = DiagnosticsRuntimeSnapshot {
         zeroio: VfsZeroIoRuntimeSnapshot {
