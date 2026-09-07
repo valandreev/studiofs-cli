@@ -21,7 +21,7 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 - [x] (2026-09-06) Ran the release native interleaved A/B benchmark successfully in the configured WinFSP environment; the retained final artifact is `target/perf/sfs-680-windows-metadata-ab-20260906-192059`.
 - [x] (2026-09-06) Re-ran final focused checks after commit `40a5a64` and recorded the final validation boundary.
 - [x] (2026-09-07) Verified the external review findings against current code; fixed the confirmed classifier, harness polling/resource-accounting, statistics, ordering, host-load fallback, assertion, and artifact-retention issues.
-- [ ] (2026-09-07) Run final post-review verification, native evidence, and commit the review fixes.
+- [x] (2026-09-07) Ran final post-review verification, native evidence, and committed the review fixes in `a0ef4630`.
 
 ## Surprises & Discoveries
 
@@ -56,7 +56,7 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 
 ## Outcomes & Retrospective
 
-The implementation adds seven opt-in hot-path entry counters, existing cache/native-cache snapshot deltas, explicit warm-up and instrumentation coverage markers, binary identity checks, process/system observation fields, and interleaved execution. The final native run at `target/perf/sfs-680-windows-metadata-ab-20260906-192059` produced six successful runs and eight workload summaries. The candidate emitted SFS-690 attribution; the historical baseline emitted the explicitly marked legacy schema, so baseline attribution medians remain null rather than being misrepresented as zero. System CIM load fields were unavailable on this host and are recorded as explicit nulls. Commit `40a5a64` contains all intended task files, and the focused verification boundary passed.
+The implementation adds seven opt-in hot-path entry counters, existing cache/native-cache snapshot deltas, explicit warm-up and instrumentation coverage markers, binary identity checks, process/system observation fields, and interleaved execution. The final post-review native run at `target/perf/sfs-680-windows-metadata-ab-20260907-130659` produced six successful runs and eight workload summaries for candidate commit `a0ef4630`. The candidate emitted SFS-690 attribution; the historical baseline emitted the explicitly marked legacy schema, so baseline attribution medians remain null rather than being misrepresented as zero. The repeated timing result was not a production optimization decision: candidate medians were +1.1%, +8.1%, +5.2%, and +0.6% for stat, open/close, negative lookup, and enumeration respectively. System CIM load fields were unavailable on this host and are recorded as explicit nulls. Process CPU is exact; working-set values use the explicit sampled fallback on this host, and `baseline-source.zip` is retained in the artifact. Commits `40a5a64` and `a0ef4630` contain the implementation, review fixes, and documentation, and the focused verification boundary passed.
 
 ## Context and Orientation
 
@@ -124,4 +124,4 @@ Plan revision: 2026-09-06 after the native gate. The harness records direct exec
 
 Plan revision: 2026-09-06 after final verification. The focused classifier and VFS regression tests passed, both changed crates passed `check`/`clippy -D warnings`, formatting, PowerShell parsing, and diff checks passed, and commit `40a5a64` is the recorded implementation boundary.
 
-Plan revision: 2026-09-07 after external review verification. A1, A2, A3, B1, B2, B3, C1, C2, and C3 were checked against current source; all recommendations were either implemented or made explicit with a host/runtime-compatible fallback. Final post-review verification and commit remain.
+Plan revision: 2026-09-07 after external review verification. A1, A2, A3, B1, B2, B3, C1, C2, and C3 were checked against current source; all recommendations were either implemented or made explicit with a host/runtime-compatible fallback. Final native evidence and focused verification passed on candidate `a0ef4630`.
