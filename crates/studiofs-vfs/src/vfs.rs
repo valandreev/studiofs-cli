@@ -536,10 +536,6 @@ pub enum VfsError {
     #[error("remote content is still uploading (EAGAIN)")]
     RemoteContentPending,
 
-    /// A cached mount-path lookup confirmed that the requested path is absent.
-    #[error("path not found")]
-    CachedPathNotFound,
-
     /// Metadata persistence is permanently degraded and new mutations are blocked.
     #[error("metadata persistence is degraded")]
     MetadataPersistenceDegraded,

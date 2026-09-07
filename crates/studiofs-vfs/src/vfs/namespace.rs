@@ -994,7 +994,9 @@ impl<'a> NamespaceResolver<'a> {
                 && negative_name.is_some()
                 && matches!(cached, PathShortcutCacheValue::Negative { .. })
             {
-                return Err(VfsError::CachedPathNotFound);
+                return Err(VfsError::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                )));
             }
             return match self.resolve_cached_path_shortcut(cached, negative_name)? {
                 Some(attr) => Ok(attr),
@@ -1927,7 +1929,7 @@ mod tests {
             resolver
                 .resolve_path_for_mount(r"\missing.txt")
                 .expect_err("cached miss should remain an error"),
-            VfsError::CachedPathNotFound
+            VfsError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
         ));
     }
 
