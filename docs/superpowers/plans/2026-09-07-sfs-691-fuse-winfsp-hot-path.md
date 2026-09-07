@@ -32,7 +32,7 @@ deferred, and invalidation behavior remains covered by focused tests.
 - [x] (2026-09-07) Added focused safety tests for stale observations and local-first states; the 9 path-shortcut, 5 namespace-resolver, 3 `getattr_unchecked`, 6 semantic-invalidation, and 3 WinFSP unit tests passed.
 - [x] (2026-09-07) Formatting, diff checks, targeted `cargo check`, and targeted `cargo clippy --all-targets -- -D warnings` passed without invoking workspace-wide suites.
 - [x] (2026-09-07) Ran the release native interleaved SFS-690 A/B benchmark with baseline `a99fb44d` and candidate `44ff791f`; retained fresh artifacts and measured the required workloads.
-- [ ] Update SFS-691 in Linear with the implementation, validation, and benchmark evidence; do not close it without the final native evidence or an explicit environment-gated report.
+- [x] (2026-09-07) Updated SFS-691 in Linear with the implementation, validation, and benchmark evidence; left it `In Progress` for review rather than closing it on median evidence alone.
 - [x] (2026-09-07) Committed all intended task files as `44ff791f` with `perf: reuse observed attrs on WinFSP hot paths`.
 
 ## Surprises & Discoveries
