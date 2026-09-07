@@ -24,6 +24,7 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 - [x] (2026-09-07) Ran final post-review verification, native evidence, and committed the review fixes in `a0ef4630`.
 - [x] (2026-09-07) Accepted the P1 instrumentation finding: timed candidate runs now disable new hot-path event counting, and a separate untimed candidate run preserves attribution data.
 - [x] (2026-09-07) Accepted the P2 build-isolation finding: baseline and candidate release builds now use separate temporary Cargo target directories.
+- [x] (2026-09-07) Re-ran the native gate from candidate `d88ad74d`; six timed runs and one untimed attribution run passed, with the final artifact retained at `target/perf/sfs-680-windows-metadata-ab-20260907-134735`.
 
 ## Surprises & Discoveries
 
@@ -65,6 +66,8 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
   Date/Author: 2026-09-07 / Codex.
 
 ## Outcomes & Retrospective
+
+Review-fix outcome: the native run at `target/perf/sfs-680-windows-metadata-ab-20260907-134735` from candidate `d88ad74d` produced six successful timed runs and one separate candidate attribution run. Timed coverage is baseline `legacy` versus candidate `disabled`; all seven new candidate hot-path columns were zero in timed CSVs, while the enabled attribution CSV recorded nonzero events. Baseline and candidate builds used distinct target directories, both executable identities were verified, and the temporary build root was removed during cleanup. Candidate medians were +1.5%, +0.2%, -8.3%, and -0.3% for stat, open/close, negative lookup, and enumeration respectively. With three samples per workload and changing host load, this is mixed evidence rather than a proven optimization benefit or a production cache-policy decision.
 
 The implementation adds seven opt-in hot-path entry counters, existing cache/native-cache snapshot deltas, explicit warm-up and instrumentation coverage markers, binary identity checks, process/system observation fields, and interleaved execution. The final post-review native run at `target/perf/sfs-680-windows-metadata-ab-20260907-130659` produced six successful runs and eight workload summaries for candidate commit `a0ef4630`. The candidate emitted SFS-690 attribution; the historical baseline emitted the explicitly marked legacy schema, so baseline attribution medians remain null rather than being misrepresented as zero. The repeated timing result was not a production optimization decision: candidate medians were +1.1%, +8.1%, +5.2%, and +0.6% for stat, open/close, negative lookup, and enumeration respectively. System CIM load fields were unavailable on this host and are recorded as explicit nulls. Process CPU is exact; working-set values use the explicit sampled fallback on this host, and `baseline-source.zip` is retained in the artifact. Commits `40a5a64` and `a0ef4630` contain the implementation, review fixes, and documentation, and the focused verification boundary passed.
 
@@ -134,4 +137,4 @@ Plan revision: 2026-09-06 after the native gate. The harness records direct exec
 
 Plan revision: 2026-09-06 after final verification. The focused classifier and VFS regression tests passed, both changed crates passed `check`/`clippy -D warnings`, formatting, PowerShell parsing, and diff checks passed, and commit `40a5a64` is the recorded implementation boundary.
 
-Plan revision: 2026-09-07 after external review verification. A1, A2, A3, B1, B2, B3, C1, C2, and C3 were checked against current source; all recommendations were either implemented or made explicit with a host/runtime-compatible fallback. The newly accepted P1/P2 fixes are implemented; final focused verification and native evidence for this revision remain pending.
+Plan revision: 2026-09-07 after final P1/P2 verification. The timed comparison disables new candidate hot-path counters, candidate attribution is collected separately, and each side builds into a distinct target directory. Focused Rust checks, PowerShell parsing, diff checks, and the native gate passed; the final artifact is `target/perf/sfs-680-windows-metadata-ab-20260907-134735`.
