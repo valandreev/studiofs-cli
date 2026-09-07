@@ -686,7 +686,7 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
     }
     let s = path.to_string_lossy();
     vfs.namespace_resolver(NamespacePathStyle::Windows)
-        .resolve_path(&s)
+        .resolve_path_for_mount(&s)
         .map_err(vfs_to_winfsp_err)
 }
 

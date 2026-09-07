@@ -74,6 +74,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
             classify_io_error(io_error.kind())
         }
         VfsError::WouldBlock | VfsError::RemoteContentPending => BridgeVfsErrorKind::Retryable,
+        VfsError::CachedPathNotFound => BridgeVfsErrorKind::NotFound,
         VfsError::InvalidName(_) => BridgeVfsErrorKind::InvalidInput,
         VfsError::Fetch(fetch_error) => classify_fetch_error(fetch_error),
         _ => BridgeVfsErrorKind::GenericFailure,
@@ -193,6 +194,10 @@ mod tests {
             name: "missing".into(),
         });
         assert_eq!(classify_vfs_error(&not_found), BridgeVfsErrorKind::NotFound);
+        assert_eq!(
+            classify_vfs_error(&crate::VfsError::CachedPathNotFound),
+            BridgeVfsErrorKind::NotFound
+        );
 
         let exists = crate::VfsError::Meta(MetaError::EntryExists {
             parent: 1,

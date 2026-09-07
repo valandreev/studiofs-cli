@@ -963,6 +963,19 @@ impl<'a> NamespaceResolver<'a> {
 
     /// Resolves a full path, applying `.`/`..` trimming and platform-specific separators.
     pub fn resolve_path(&self, path: &str) -> VfsResult<InodeAttr> {
+        self.resolve_path_with_cached_negative(path, false)
+    }
+
+    /// Resolves a mount path while keeping a confirmed cached miss allocation-free.
+    pub fn resolve_path_for_mount(&self, path: &str) -> VfsResult<InodeAttr> {
+        self.resolve_path_with_cached_negative(path, true)
+    }
+
+    fn resolve_path_with_cached_negative(
+        &self,
+        path: &str,
+        use_lightweight_negative_error: bool,
+    ) -> VfsResult<InodeAttr> {
         let normalized = NormalizedPath::from_path(self.style, path);
         let Some(encoded_path) = normalized.encoded() else {
             return self.vfs.getattr(ROOT_INO);
@@ -977,6 +990,12 @@ impl<'a> NamespaceResolver<'a> {
                 } => normalized.component_bytes(*component_index),
                 PathShortcutCacheValue::Positive { .. } => None,
             };
+            if use_lightweight_negative_error
+                && negative_name.is_some()
+                && matches!(cached, PathShortcutCacheValue::Negative { .. })
+            {
+                return Err(VfsError::CachedPathNotFound);
+            }
             return match self.resolve_cached_path_shortcut(cached, negative_name)? {
                 Some(attr) => Ok(attr),
                 None => {
@@ -1893,6 +1912,23 @@ mod tests {
                     if name == "missing-dir"
             ));
         }
+    }
+
+    #[test]
+    fn mount_path_negative_shortcut_uses_lightweight_not_found_error() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "mount-negative-shortcut");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Windows);
+
+        resolver
+            .resolve_path(r"\missing.txt")
+            .expect_err("first miss should populate the negative shortcut");
+        assert!(matches!(
+            resolver
+                .resolve_path_for_mount(r"\missing.txt")
+                .expect_err("cached miss should remain an error"),
+            VfsError::CachedPathNotFound
+        ));
     }
 
     #[test]
