@@ -1,6 +1,10 @@
 use super::*;
 use crate::{LockTier, OrderedMutex};
-use std::sync::{OnceLock, Weak};
+use smallvec::SmallVec;
+use std::{
+    borrow::Borrow,
+    sync::{OnceLock, Weak},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Controls how namespace paths are parsed and rendered (POSIX vs Windows separator rules).
@@ -404,11 +408,19 @@ impl DentryCache {
 /// Encoded normalized full-path token used by the path-shortcut cache.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct PathShortcutCacheKey {
-    style: NamespacePathStyle,
     path: Arc<[u8]>,
 }
 
 impl PathShortcutCacheKey {
+    const INLINE_PATH_CAPACITY: usize = 256;
+
+    fn style_tag(style: NamespacePathStyle) -> u8 {
+        match style {
+            NamespacePathStyle::Posix => 0,
+            NamespacePathStyle::Windows => 1,
+        }
+    }
+
     fn from_components(style: NamespacePathStyle, components: &[String]) -> Option<Self> {
         if components.is_empty() {
             return None;
@@ -417,8 +429,10 @@ impl PathShortcutCacheKey {
             .iter()
             .map(|component| component.len())
             .sum::<usize>()
-            .saturating_add(components.len().saturating_sub(1));
+            .saturating_add(components.len().saturating_sub(1))
+            .saturating_add(1);
         let mut encoded = Vec::with_capacity(estimated);
+        encoded.push(Self::style_tag(style));
         for (idx, component) in components.iter().enumerate() {
             if idx > 0 {
                 encoded.push(0);
@@ -426,17 +440,116 @@ impl PathShortcutCacheKey {
             encoded.extend_from_slice(component.as_bytes());
         }
         Some(Self {
-            style,
             path: Arc::from(encoded.into_boxed_slice()),
         })
+    }
+
+    #[cfg(test)]
+    fn from_path(
+        style: NamespacePathStyle,
+        path: &str,
+    ) -> Option<SmallVec<[u8; Self::INLINE_PATH_CAPACITY]>> {
+        NormalizedPath::from_path(style, path).into_encoded()
+    }
+
+    fn from_encoded(encoded: &[u8]) -> Self {
+        Self {
+            path: Arc::from(encoded),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NormalizedPath<'a> {
+    components: SmallVec<[&'a str; 16]>,
+    encoded: SmallVec<[u8; PathShortcutCacheKey::INLINE_PATH_CAPACITY]>,
+}
+
+impl<'a> NormalizedPath<'a> {
+    fn from_path(style: NamespacePathStyle, path: &'a str) -> Self {
+        let (stripped, separator) = match style {
+            NamespacePathStyle::Posix => (path.trim_start_matches('/'), '/'),
+            NamespacePathStyle::Windows => (path.trim_start_matches('\\'), '\\'),
+        };
+        let mut components = SmallVec::new();
+        let mut encoded = SmallVec::with_capacity(path.len().saturating_add(1));
+        encoded.push(PathShortcutCacheKey::style_tag(style));
+        let mut component_starts = SmallVec::<[usize; 16]>::new();
+
+        for raw in stripped.split(separator) {
+            if raw.is_empty() || raw == "." {
+                continue;
+            }
+            if raw == ".." {
+                if let Some(start) = component_starts.pop() {
+                    // The first component follows the style tag; later
+                    // components also have a zero-byte separator to remove.
+                    let truncate_to = if component_starts.is_empty() {
+                        start
+                    } else {
+                        start.saturating_sub(1)
+                    };
+                    encoded.truncate(truncate_to);
+                    components.pop();
+                }
+                continue;
+            }
+            let normalized = match style {
+                NamespacePathStyle::Posix => raw,
+                NamespacePathStyle::Windows => raw.trim_end_matches(['.', ' ']),
+            };
+            if !normalized.is_empty() {
+                if !component_starts.is_empty() {
+                    encoded.push(0);
+                }
+                component_starts.push(encoded.len());
+                encoded.extend_from_slice(normalized.as_bytes());
+                components.push(normalized);
+            }
+        }
+
+        Self {
+            components,
+            encoded,
+        }
+    }
+
+    #[cfg(test)]
+    fn components(&self) -> &[&'a str] {
+        &self.components
+    }
+
+    fn encoded(&self) -> Option<&[u8]> {
+        if self.components.is_empty() {
+            return None;
+        }
+        Some(&self.encoded)
+    }
+
+    #[cfg(test)]
+    fn into_encoded(self) -> Option<SmallVec<[u8; PathShortcutCacheKey::INLINE_PATH_CAPACITY]>> {
+        (!self.components.is_empty()).then_some(self.encoded)
+    }
+
+    fn into_components(self) -> Vec<String> {
+        self.components.into_iter().map(ToOwned::to_owned).collect()
+    }
+}
+
+impl Borrow<[u8]> for PathShortcutCacheKey {
+    fn borrow(&self) -> &[u8] {
+        &self.path
     }
 }
 
 /// Cached value for memoized full-path resolution.
 #[derive(Debug, Clone)]
 pub(super) enum PathShortcutCacheValue {
-    /// Positive path resolution: full path maps to inode.
-    Positive(Ino),
+    /// Positive path resolution: full path maps to inode and a valid attr observation.
+    Positive {
+        ino: Ino,
+        attr_observation: AttrReadObservation,
+    },
     /// Negative path resolution: parent+name pair is known missing.
     Negative { parent: Ino, name: Arc<[u8]> },
 }
@@ -539,7 +652,7 @@ impl PathShortcutCachePolicy {
         parent_tokens: &[PathShortcutParentToken],
     ) -> usize {
         let negative_name_len = match value {
-            PathShortcutCacheValue::Positive(_) => 0,
+            PathShortcutCacheValue::Positive { .. } => 0,
             PathShortcutCacheValue::Negative { name, .. } => name.len(),
         };
         std::mem::size_of::<PathShortcutCacheKey>()
@@ -662,6 +775,21 @@ impl PathShortcutCache {
         )
     }
 
+    fn get_borrowed(
+        &mut self,
+        key: &[u8],
+        namespace_epoch: u64,
+        mut generation_of: impl FnMut(Ino) -> u64,
+    ) -> Option<PathShortcutCacheValue> {
+        self.inner.get_borrowed(
+            key,
+            PathShortcutLookupCtx {
+                namespace_epoch,
+                generation_of: &mut generation_of,
+            },
+        )
+    }
+
     fn put(
         &mut self,
         key: PathShortcutCacheKey,
@@ -698,29 +826,7 @@ impl<'a> NamespaceResolver<'a> {
     }
 
     fn path_components(&self, path: &str) -> Vec<String> {
-        let (stripped, separator) = match self.style {
-            NamespacePathStyle::Posix => (path.trim_start_matches('/'), '/'),
-            NamespacePathStyle::Windows => (path.trim_start_matches('\\'), '\\'),
-        };
-
-        let mut components: Vec<String> = Vec::new();
-        for raw in stripped.split(separator) {
-            if raw.is_empty() || raw == "." {
-                continue;
-            }
-            if raw == ".." {
-                components.pop();
-                continue;
-            }
-            let normalized = match self.style {
-                NamespacePathStyle::Posix => raw,
-                NamespacePathStyle::Windows => raw.trim_end_matches(['.', ' ']),
-            };
-            if !normalized.is_empty() {
-                components.push(normalized.to_string());
-            }
-        }
-        components
+        NormalizedPath::from_path(self.style, path).into_components()
     }
 
     fn path_not_found(path: &str) -> VfsError {
@@ -742,11 +848,42 @@ impl<'a> NamespaceResolver<'a> {
     }
 
     fn resolve_components_cached(&self, components: &[String]) -> VfsResult<InodeAttr> {
+        let cache_key = PathShortcutCacheKey::from_components(self.style, components);
+        self.resolve_components_cached_with_key(components, cache_key, true)
+    }
+
+    fn resolve_cached_path_shortcut(
+        &self,
+        cached: PathShortcutCacheValue,
+    ) -> VfsResult<Option<InodeAttr>> {
+        match cached {
+            PathShortcutCacheValue::Positive {
+                ino,
+                attr_observation,
+            } => match self
+                .vfs
+                .cached_attr_for_path_shortcut(ino, attr_observation)
+            {
+                Ok(attr) => Ok(attr),
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => Ok(None),
+                Err(err) => Err(err),
+            },
+            PathShortcutCacheValue::Negative { parent, name } => {
+                Err(Self::component_not_found(parent, name.as_ref()))
+            }
+        }
+    }
+
+    fn resolve_components_cached_with_key(
+        &self,
+        components: &[String],
+        cache_key: Option<PathShortcutCacheKey>,
+        lookup_cache: bool,
+    ) -> VfsResult<InodeAttr> {
         if components.is_empty() {
             return self.vfs.getattr(ROOT_INO);
         }
 
-        let cache_key = PathShortcutCacheKey::from_components(self.style, components);
         let do_resolve = || -> VfsResult<InodeAttr> {
             let observed_epoch = self
                 .vfs
@@ -783,9 +920,11 @@ impl<'a> NamespaceResolver<'a> {
                 }
             }
             if let Some(key) = cache_key.clone() {
+                let attr_observation = self.vfs.attr_read_observation(attr.ino);
                 self.vfs.path_shortcut_cache_insert_positive_by_key(
                     key,
                     attr.ino,
+                    attr_observation,
                     parent_tokens,
                     observed_epoch,
                 );
@@ -793,18 +932,13 @@ impl<'a> NamespaceResolver<'a> {
             Ok(attr)
         };
 
-        if let Some(key) = &cache_key
+        if lookup_cache
+            && let Some(key) = &cache_key
             && let Some(cached) = self.vfs.path_shortcut_cache_lookup_by_key(key)
         {
-            return match cached {
-                PathShortcutCacheValue::Positive(ino) => match self.vfs.getattr(ino) {
-                    Ok(attr) => Ok(attr),
-                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => do_resolve(),
-                    Err(err) => Err(err),
-                },
-                PathShortcutCacheValue::Negative { parent, name } => {
-                    Err(Self::component_not_found(parent, name.as_ref()))
-                }
+            return match self.resolve_cached_path_shortcut(cached)? {
+                Some(attr) => Ok(attr),
+                None => do_resolve(),
             };
         }
 
@@ -818,8 +952,26 @@ impl<'a> NamespaceResolver<'a> {
 
     /// Resolves a full path, applying `.`/`..` trimming and platform-specific separators.
     pub fn resolve_path(&self, path: &str) -> VfsResult<InodeAttr> {
-        let components = self.path_components(path);
-        self.resolve_components_cached(&components)
+        let normalized = NormalizedPath::from_path(self.style, path);
+        let Some(encoded_path) = normalized.encoded() else {
+            return self.vfs.getattr(ROOT_INO);
+        };
+        if let Some(cached) = self
+            .vfs
+            .path_shortcut_cache_lookup_by_encoded_path(encoded_path)
+        {
+            return match self.resolve_cached_path_shortcut(cached)? {
+                Some(attr) => Ok(attr),
+                None => {
+                    let cache_key = PathShortcutCacheKey::from_encoded(encoded_path);
+                    let components = normalized.into_components();
+                    self.resolve_components_cached_with_key(&components, Some(cache_key), false)
+                }
+            };
+        }
+        let cache_key = PathShortcutCacheKey::from_encoded(encoded_path);
+        let components = normalized.into_components();
+        self.resolve_components_cached_with_key(&components, Some(cache_key), false)
     }
 
     /// Resolves a path to `(parent_inode, final_component_name)`.
@@ -1250,17 +1402,37 @@ impl StudioVfs {
             })
     }
 
+    /// Looks up a path-shortcut cache entry without allocating an owned key.
+    pub(super) fn path_shortcut_cache_lookup_by_encoded_path(
+        &self,
+        encoded_path: &[u8],
+    ) -> Option<PathShortcutCacheValue> {
+        let namespace_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
+        let generations = self.state.namespace.directory_generations.lock();
+        self.state
+            .namespace
+            .path_shortcut_cache
+            .lock()
+            .get_borrowed(encoded_path, namespace_epoch, |parent| {
+                generations.get(&parent).copied().unwrap_or(0)
+            })
+    }
+
     /// Caches positive full-path resolution by key with captured parent generation tokens.
     pub(super) fn path_shortcut_cache_insert_positive_by_key(
         &self,
         key: PathShortcutCacheKey,
         child_ino: Ino,
+        attr_observation: AttrReadObservation,
         parent_tokens: Vec<PathShortcutParentToken>,
         observed_epoch: u64,
     ) {
         self.state.namespace.path_shortcut_cache.lock().put(
             key,
-            PathShortcutCacheValue::Positive(child_ino),
+            PathShortcutCacheValue::Positive {
+                ino: child_ino,
+                attr_observation,
+            },
             observed_epoch,
             parent_tokens,
         );
@@ -1568,14 +1740,20 @@ mod tests {
         }];
         let single_charge = PathShortcutCache::estimate_entry_charge(
             &key_a,
-            &PathShortcutCacheValue::Positive(11),
+            &PathShortcutCacheValue::Positive {
+                ino: 11,
+                attr_observation: AttrReadObservation::default(),
+            },
             &tokens,
         );
         let mut cache = PathShortcutCache::new(2, single_charge * 4);
 
         cache.put(
             key_a.clone(),
-            PathShortcutCacheValue::Positive(11),
+            PathShortcutCacheValue::Positive {
+                ino: 11,
+                attr_observation: AttrReadObservation::default(),
+            },
             0,
             tokens.clone(),
         );
@@ -1591,11 +1769,21 @@ mod tests {
         assert_eq!(cache.entry_len(), 2);
         assert!(matches!(
             cache.get(&key_a, 0, |_| 0),
-            Some(PathShortcutCacheValue::Positive(11))
+            Some(PathShortcutCacheValue::Positive {
+                ino,
+                attr_observation,
+            }) if ino == 11 && attr_observation == AttrReadObservation::default()
         ));
         assert!(matches!(
             cache.get(&key_b, 0, |_| 0),
             Some(PathShortcutCacheValue::Negative { .. })
+        ));
+        assert!(matches!(
+            cache.get_borrowed(key_a.path.as_ref(), 0, |_| 0),
+            Some(PathShortcutCacheValue::Positive {
+                ino: 11,
+                attr_observation,
+            }) if attr_observation == AttrReadObservation::default()
         ));
 
         let key_c = PathShortcutCacheKey::from_components(
@@ -1605,12 +1793,255 @@ mod tests {
         .expect("path key c");
         cache.put(
             key_c.clone(),
-            PathShortcutCacheValue::Positive(33),
+            PathShortcutCacheValue::Positive {
+                ino: 33,
+                attr_observation: AttrReadObservation::default(),
+            },
             0,
             tokens,
         );
         assert_eq!(cache.entry_len(), 2);
         assert!(cache.get(&key_c, 0, |_| 0).is_some());
+    }
+
+    #[test]
+    fn path_shortcut_key_from_path_matches_component_encoding() {
+        let direct =
+            PathShortcutCacheKey::from_path(NamespacePathStyle::Windows, r"\dir\..\dir\file.  ")
+                .expect("normalized path key");
+        let components = vec![String::from("dir"), String::from("file")];
+        let from_components =
+            PathShortcutCacheKey::from_components(NamespacePathStyle::Windows, &components)
+                .expect("component path key");
+
+        assert_eq!(direct.as_slice(), from_components.path.as_ref());
+    }
+
+    #[test]
+    fn normalized_path_shares_components_and_encoded_key() {
+        let normalized =
+            NormalizedPath::from_path(NamespacePathStyle::Windows, r"\dir\..\dir\file.  ");
+        assert_eq!(normalized.components(), ["dir", "file"].as_slice());
+
+        let expected = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Windows,
+            &[String::from("dir"), String::from("file")],
+        )
+        .expect("component path key");
+        assert_eq!(
+            normalized.encoded().expect("normalized path key"),
+            expected.path.as_ref()
+        );
+
+        let root = NormalizedPath::from_path(NamespacePathStyle::Posix, "/../");
+        assert!(root.components().is_empty());
+        assert!(root.encoded().is_none());
+    }
+
+    #[test]
+    fn namespace_resolver_negative_path_shortcut_hits() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "negative-path-shortcut-hit");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+
+        assert!(resolver.resolve_path("/missing.txt").is_err());
+        let before = vfs.path_shortcut_cache_metrics();
+        assert!(resolver.resolve_path("/missing.txt").is_err());
+        let after = vfs.path_shortcut_cache_metrics();
+
+        assert!(after.hits > before.hits);
+        assert!(after.negative_hits > before.negative_hits);
+    }
+
+    #[test]
+    fn namespace_resolver_root_paths_resolve_root_inode() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "root-path-shortcut");
+
+        for path in ["", "/", "/.", "/../"] {
+            assert_eq!(
+                vfs.namespace_resolver(NamespacePathStyle::Posix)
+                    .resolve_path(path)
+                    .expect("resolve POSIX root path")
+                    .ino,
+                ROOT_INO
+            );
+        }
+        for path in ["", r"\", r"\.\", r"\..\"] {
+            assert_eq!(
+                vfs.namespace_resolver(NamespacePathStyle::Windows)
+                    .resolve_path(path)
+                    .expect("resolve Windows root path")
+                    .ino,
+                ROOT_INO
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_resolver_handles_deep_paths_beyond_inline_component_capacity() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deep-path-shortcut");
+        let mut parent = ROOT_INO;
+        let mut names = Vec::new();
+        let mut leaf = None;
+        for index in 0..20 {
+            let name = format!("d{index:02}");
+            let attr = vfs
+                .mkdir(parent, name.as_bytes(), 1000, 1000, 0o755)
+                .expect("create deep path component");
+            parent = attr.ino;
+            leaf = Some(attr);
+            names.push(name);
+        }
+        let path = format!("/{}", names.join("/"));
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+
+        let resolved = resolver.resolve_path(&path).expect("resolve deep path");
+        assert_eq!(resolved.ino, leaf.expect("deep path leaf").ino);
+        let before = vfs.path_shortcut_cache_metrics();
+        assert_eq!(
+            resolver
+                .resolve_path(&path)
+                .expect("resolve warm deep path")
+                .ino,
+            resolved.ino
+        );
+        assert!(vfs.path_shortcut_cache_metrics().hits > before.hits);
+    }
+
+    #[test]
+    fn namespace_resolver_handles_paths_beyond_inline_key_capacity() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "long-path-shortcut");
+        let mut parent = ROOT_INO;
+        let mut names = Vec::new();
+        let mut leaf = None;
+        for index in 0..12 {
+            let name = format!("segment{index:02}_{}", "x".repeat(20));
+            let attr = vfs
+                .mkdir(parent, name.as_bytes(), 1000, 1000, 0o755)
+                .expect("create long path component");
+            parent = attr.ino;
+            leaf = Some(attr);
+            names.push(name);
+        }
+        let path = format!("/{}", names.join("/"));
+        assert!(path.len() > PathShortcutCacheKey::INLINE_PATH_CAPACITY);
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+
+        let resolved = resolver.resolve_path(&path).expect("resolve long path");
+        assert_eq!(resolved.ino, leaf.expect("long path leaf").ino);
+        let before = vfs.path_shortcut_cache_metrics();
+        assert_eq!(
+            resolver
+                .resolve_path(&path)
+                .expect("resolve warm long path")
+                .ino,
+            resolved.ino
+        );
+        assert!(vfs.path_shortcut_cache_metrics().hits > before.hits);
+    }
+
+    #[test]
+    fn positive_path_shortcut_reuses_current_attribute_observation() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-attr-observation");
+        let file = vfs
+            .create(ROOT_INO, b"observed.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        let first = resolver
+            .resolve_path("/observed.txt")
+            .expect("resolve file");
+        let observed = vfs.attr_read_observation(file.ino);
+        let key = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Posix,
+            &[String::from("observed.txt")],
+        )
+        .expect("path key");
+        let cached = vfs
+            .path_shortcut_cache_lookup_by_key(&key)
+            .expect("positive path shortcut");
+
+        assert!(matches!(
+            cached,
+            PathShortcutCacheValue::Positive {
+                ino,
+                attr_observation
+            } if ino == file.ino && attr_observation == observed
+        ));
+        assert_eq!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("reuse cached attr")
+                .expect("cached attr should be reusable"),
+            first
+        );
+    }
+
+    #[test]
+    fn positive_path_shortcut_falls_back_for_dirty_deferred_or_stale_attrs() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-attr-fallback");
+        let file = vfs
+            .create(ROOT_INO, b"fallback.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        resolver
+            .resolve_path("/fallback.txt")
+            .expect("prime positive path shortcut");
+        let observed = vfs.attr_read_observation(file.ino);
+
+        let mut dirty_attr = vfs.getattr_unchecked(file.ino).expect("read file attr");
+        dirty_attr.size = dirty_attr.size.saturating_add(1);
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(file.ino, dirty_attr.clone());
+        assert!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("check dirty attr fallback")
+                .is_none(),
+            "positive shortcut must not bypass dirty local attributes"
+        );
+        assert_eq!(
+            resolver
+                .resolve_path("/fallback.txt")
+                .expect("resolve through dirty fallback")
+                .size,
+            dirty_attr.size
+        );
+
+        vfs.state.namespace.dirty_attrs.lock().remove(&file.ino);
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .attrs
+            .insert(file.ino, dirty_attr);
+        assert!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("check deferred attr fallback")
+                .is_none(),
+            "positive shortcut must not bypass deferred namespace attributes"
+        );
+
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .attrs
+            .remove(&file.ino);
+        vfs.invalidate_attr_read_cache([file.ino]);
+        assert!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("check retired observation fallback")
+                .is_none(),
+            "positive shortcut must reject a retired attribute observation"
+        );
     }
 
     #[test]
@@ -1644,6 +2075,7 @@ mod tests {
         vfs.path_shortcut_cache_insert_positive_by_key(
             key.clone(),
             ROOT_INO,
+            AttrReadObservation::default(),
             parent_tokens,
             observed,
         );
@@ -1673,11 +2105,22 @@ mod tests {
         ];
         let charge = PathShortcutCache::estimate_entry_charge(
             &key,
-            &PathShortcutCacheValue::Positive(9),
+            &PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
             &tokens,
         );
         let mut cache = PathShortcutCache::new(8, charge * 8);
-        cache.put(key.clone(), PathShortcutCacheValue::Positive(9), 3, tokens);
+        cache.put(
+            key.clone(),
+            PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
+            3,
+            tokens,
+        );
 
         assert!(
             cache
@@ -1710,13 +2153,19 @@ mod tests {
         }];
         let charge = PathShortcutCache::estimate_entry_charge(
             &key,
-            &PathShortcutCacheValue::Positive(9),
+            &PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
             &tokens,
         );
         let mut cache = PathShortcutCache::new(8, charge * 32);
         cache.put(
             key.clone(),
-            PathShortcutCacheValue::Positive(9),
+            PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
             1,
             tokens.clone(),
         );

@@ -963,6 +963,48 @@ where
         Some(value)
     }
 
+    fn get_borrowed<Q>(&mut self, key: &Q, ctx: P::LookupContext<'_>) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: ?Sized + Eq + std::hash::Hash,
+    {
+        if !self.is_enabled() {
+            self.metrics.misses = self.metrics.misses.saturating_add(1);
+            return None;
+        }
+        let (stored_key, value, segment, stale) = match self.entries.get_key_value(key) {
+            Some((stored_key, entry)) => (
+                stored_key.clone(),
+                entry.value.clone(),
+                entry.segment,
+                self.policy
+                    .is_stale(stored_key, &entry.value, &entry.meta, ctx),
+            ),
+            None => {
+                self.metrics.misses = self.metrics.misses.saturating_add(1);
+                return None;
+            }
+        };
+        if stale {
+            // Stale invalidation is a cache-miss cleanup, not an eviction.
+            self.remove(&stored_key);
+            self.metrics.misses = self.metrics.misses.saturating_add(1);
+            return None;
+        }
+        self.metrics.hits = self.metrics.hits.saturating_add(1);
+        if self.policy.is_negative(&value) {
+            self.metrics.negative_hits = self.metrics.negative_hits.saturating_add(1);
+        }
+        match segment {
+            TwoTierSegment::Probationary => self.promote_to_protected_owned(stored_key),
+            TwoTierSegment::Protected => {
+                self.metrics.protected_hits = self.metrics.protected_hits.saturating_add(1);
+                self.touch_protected_owned(stored_key);
+            }
+        }
+        Some(value)
+    }
+
     fn put(&mut self, key: K, value: V, ctx: P::InsertContext) {
         if !self.is_enabled() {
             return;
@@ -1039,6 +1081,15 @@ where
         self.maybe_compact_orders();
     }
 
+    fn touch_protected_owned(&mut self, key: K) {
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.stamp = stamp;
+            self.protected_order.push_back((key, stamp));
+        }
+        self.maybe_compact_orders();
+    }
+
     fn promote_to_protected(&mut self, key: &K) {
         let stamp = self.next_stamp();
         if let Some(entry) = self.entries.get_mut(key) {
@@ -1049,6 +1100,21 @@ where
             }
             entry.stamp = stamp;
             self.protected_order.push_back((key.clone(), stamp));
+        }
+        self.maybe_compact_orders();
+        self.enforce_protected_budget();
+    }
+
+    fn promote_to_protected_owned(&mut self, key: K) {
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.segment == TwoTierSegment::Probationary {
+                entry.segment = TwoTierSegment::Protected;
+                self.protected_entries = self.protected_entries.saturating_add(1);
+                self.protected_bytes = self.protected_bytes.saturating_add(entry.charge);
+            }
+            entry.stamp = stamp;
+            self.protected_order.push_back((key, stamp));
         }
         self.maybe_compact_orders();
         self.enforce_protected_budget();
@@ -1237,7 +1303,7 @@ impl AttrReadCacheMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AttrReadObservation {
     global_generation: u64,
     inode_generation: u64,
@@ -1288,6 +1354,18 @@ impl AttrReadCache {
 
     fn get(&mut self, ino: Ino, now: Instant) -> Option<InodeAttr> {
         self.inner.get(&ino, now)
+    }
+
+    fn get_if_observed(
+        &mut self,
+        ino: Ino,
+        expected: AttrReadObservation,
+        now: Instant,
+    ) -> Option<InodeAttr> {
+        if self.observation(ino) != expected {
+            return None;
+        }
+        self.get(ino, now)
     }
 
     fn put(&mut self, ino: Ino, attr: InodeAttr, ttl: Duration, now: Instant) {
