@@ -1667,10 +1667,8 @@ impl StudioFsContext {
 
         let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
         dotdot.set_name_raw(DOTDOT)?;
-        let dotdot = self.vfs.getattr(context.ino).ok().map(|attr| {
-            *dotdot.file_info_mut() = attr_to_file_info(&attr);
-            dotdot
-        });
+        *dotdot.file_info_mut() = attr_to_file_info(&attr);
+        let dotdot = Some(dotdot);
 
         let entries = self
             .vfs
@@ -1739,15 +1737,14 @@ impl StudioFsContext {
     fn populate_directory_buffer(
         &self,
         context: &StudioFileHandle,
-        pattern: Option<&U16CStr>,
         lock: &DirBufferLock<'_>,
     ) -> winfsp::Result<()> {
         let observation = self
             .vfs
             .directory_enumeration_observation(context.ino)
             .map_err(vfs_to_winfsp_err)?;
-        let key = DirectorySnapshotCacheKey::new(context.ino, observation, pattern);
-        let snapshot = match self.directory_snapshot_cache.lookup(&key) {
+        let key = DirectorySnapshotCacheKey::new(context.ino);
+        let snapshot = match self.directory_snapshot_cache.lookup(&key, observation) {
             Some(snapshot) => snapshot,
             None => {
                 let snapshot = Arc::new(self.build_directory_snapshot(context)?);
@@ -1756,7 +1753,9 @@ impl StudioFsContext {
                     .directory_enumeration_observation(context.ino)
                     .map_err(vfs_to_winfsp_err)?;
                 if current_observation == observation {
-                    let _ = self.directory_snapshot_cache.insert(key, snapshot.clone());
+                    let _ =
+                        self.directory_snapshot_cache
+                            .insert(key, observation, snapshot.clone());
                 } else {
                     self.directory_snapshot_cache.note_stale_build();
                 }
@@ -2162,7 +2161,7 @@ impl FileSystemContext for StudioFsContext {
     fn read_directory(
         &self,
         context: &Self::FileContext,
-        pattern: Option<&U16CStr>,
+        _pattern: Option<&U16CStr>,
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
@@ -2170,7 +2169,7 @@ impl FileSystemContext for StudioFsContext {
         trace!(target: "studiofs_winfsp::metadata_baseline::read_directory", "callback entry");
         if marker.is_none() {
             let lock = context.dir_buffer.acquire(true, None)?;
-            self.populate_directory_buffer(context, pattern, &lock)?;
+            self.populate_directory_buffer(context, &lock)?;
         }
 
         Ok(context.dir_buffer.read(marker, buffer))
@@ -2615,7 +2614,8 @@ mod tests {
     };
     use studiofs_meta::{FileLockLease, HardLockKind, MetaError};
     use studiofs_vfs::{
-        KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StudioVfs, VfsConfig,
+        DirectoryEnumerationObservation, KernelInvalidator, LocalSyncPolicy, OpenFlags,
+        ReadAheadOwner, StudioVfs, VfsConfig,
     };
     use studiofs_vfs::{RUNTIME_STATS_FILE_INO, VfsError};
     use tempfile::TempDir;
@@ -2623,6 +2623,20 @@ mod tests {
     use winfsp::U16CString;
     use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
+
+    fn cache_observation(
+        namespace_epoch: u64,
+        directory_generation: u64,
+    ) -> DirectoryEnumerationObservation {
+        DirectoryEnumerationObservation {
+            namespace_epoch,
+            directory_generation,
+            attribute_generation: 0,
+            acl_epoch: 0,
+            acl_namespace_epoch: 0,
+            access_level: 2,
+        }
+    }
 
     #[test]
     fn async_callback_tracker_drains_admitted_work_before_rejecting_new_work() {
@@ -2852,11 +2866,12 @@ mod tests {
     #[test]
     fn directory_snapshot_cache_reuses_entries_and_enforces_budgets() {
         let cache = super::directory_cache::DirectorySnapshotCache::new(1, 128);
-        let key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11, 1, 0);
+        let key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11);
+        let observation = cache_observation(1, 0);
         let snapshot = super::directory_cache::DirectorySnapshot::empty_for_test(64);
 
-        assert!(cache.insert(key.clone(), snapshot));
-        assert!(cache.lookup(&key).is_some());
+        assert!(cache.insert(key.clone(), observation, snapshot));
+        assert!(cache.lookup(&key, observation).is_some());
 
         let stats = cache.snapshot();
         assert_eq!(stats.hits, 1);
@@ -2868,9 +2883,10 @@ mod tests {
         assert_eq!(stats.entry_budget, 1);
         assert_eq!(stats.byte_budget, 128);
 
-        let replacement_key = super::directory_cache::DirectorySnapshotCacheKey::for_test(12, 1, 0);
+        let replacement_key = super::directory_cache::DirectorySnapshotCacheKey::for_test(12);
         assert!(cache.insert(
             replacement_key,
+            observation,
             super::directory_cache::DirectorySnapshot::empty_for_test(64),
         ));
         let stats = cache.snapshot();
@@ -2882,24 +2898,44 @@ mod tests {
     #[test]
     fn directory_snapshot_cache_rejects_stale_observations_and_resets_by_namespace_epoch() {
         let cache = super::directory_cache::DirectorySnapshotCache::new(4, 256);
-        let first_key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11, 1, 0);
-        let changed_key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11, 1, 1);
-        let reset_key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11, 2, 1);
+        let key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11);
+        let first_observation = cache_observation(1, 0);
+        let changed_observation = cache_observation(1, 1);
+        let reset_observation = cache_observation(2, 1);
 
         assert!(cache.insert(
-            first_key,
+            key.clone(),
+            first_observation,
             super::directory_cache::DirectorySnapshot::empty_for_test(64),
         ));
-        assert!(cache.lookup(&changed_key).is_none());
+        assert!(cache.lookup(&key, changed_observation).is_none());
         assert!(cache.insert(
-            changed_key,
+            key.clone(),
+            changed_observation,
             super::directory_cache::DirectorySnapshot::empty_for_test(64),
         ));
-        assert!(cache.lookup(&reset_key).is_none());
+        assert!(cache.lookup(&key, reset_observation).is_none());
 
         let stats = cache.snapshot();
         assert_eq!(stats.misses, 2);
         assert!(stats.invalidations >= 2);
+        assert_eq!(stats.occupancy_entries, 0);
+        assert_eq!(stats.occupancy_bytes, 0);
+    }
+
+    #[test]
+    fn directory_snapshot_cache_rejects_oversized_entries() {
+        let cache = super::directory_cache::DirectorySnapshotCache::new(4, 64);
+        let key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11);
+        let observation = cache_observation(1, 0);
+
+        assert!(!cache.insert(
+            key,
+            observation,
+            super::directory_cache::DirectorySnapshot::empty_for_test(65),
+        ));
+
+        let stats = cache.snapshot();
         assert_eq!(stats.occupancy_entries, 0);
         assert_eq!(stats.occupancy_bytes, 0);
     }
@@ -2916,7 +2952,7 @@ mod tests {
             .dir_buffer
             .acquire(true, None)
             .expect("acquire first directory buffer");
-        ctx.populate_directory_buffer(&handle, None, &lock)
+        ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate first directory buffer");
         drop(lock);
         let first = ctx.directory_snapshot_cache.snapshot();
@@ -2927,7 +2963,7 @@ mod tests {
             .dir_buffer
             .acquire(true, None)
             .expect("acquire second directory buffer");
-        ctx.populate_directory_buffer(&handle, None, &lock)
+        ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate second directory buffer");
         drop(lock);
         let second = ctx.directory_snapshot_cache.snapshot();
@@ -2947,7 +2983,7 @@ mod tests {
             .dir_buffer
             .acquire(true, None)
             .expect("acquire post-invalidation directory buffer");
-        ctx.populate_directory_buffer(&handle, None, &lock)
+        ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate post-invalidation directory buffer");
         let third = ctx.directory_snapshot_cache.snapshot();
         assert_eq!(third.misses, 2);
@@ -2970,7 +3006,7 @@ mod tests {
             .acquire(true, None)
             .expect("acquire directory buffer");
 
-        ctx.populate_directory_buffer(&handle, None, &lock)
+        ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate directory buffer");
 
         let raw_entries = vfs.meta().readdir(ROOT_INO).expect("raw root readdir");

@@ -1026,14 +1026,15 @@ impl StudioVfs {
         &self,
         inodes: impl IntoIterator<Item = Ino>,
     ) -> Vec<Ino> {
-        let inodes = inodes.into_iter().collect::<Vec<_>>();
-        if !inodes.is_empty() {
-            self.bump_attribute_generation();
-        }
+        let mut inodes = inodes.into_iter();
+        let Some(first_ino) = inodes.next() else {
+            return Vec::new();
+        };
+        self.bump_attribute_generation();
         let mut cache = self.state.namespace.attr_read_cache.lock();
         let mut read_plan_cache = self.state.read.published_read_plan_cache.lock();
         let mut removed = Vec::new();
-        for ino in inodes {
+        for ino in std::iter::once(first_ino).chain(inodes) {
             self.handle_table.clear_read_windows_for_inode(ino);
             read_plan_cache.pop(&ino);
             if cache.remove(ino) {

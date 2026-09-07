@@ -482,8 +482,11 @@ function Invoke-CargoBenchmark {
             throw "$runLabel emitted an unexpected instrumentation mode"
         }
     }
-    $instrumentationStatus = if ($hasSfs690Schema -or $hasPreviousSfs690Schema) {
+    $instrumentationStatus = if ($hasSfs690Schema) {
         if ($instrumentationMode -eq "enabled") { "sfs-693" } else { "disabled" }
+    }
+    elseif ($hasPreviousSfs690Schema) {
+        if ($instrumentationMode -eq "enabled") { "sfs-690" } else { "disabled" }
     }
     else { "legacy" }
     $expectedWorkloads = @("stat", "open_close", "negative_lookup", "enumeration")

@@ -168,6 +168,14 @@ changes and metadata-only mutations. VFS cache admissions retain observation
 tokens so old lookup, attribute and path-resolution results cannot repopulate a
 retired cache generation.
 
+The WinFSP directory snapshot observation currently includes one mount-wide
+aggregate attribute generation. Any committed attribute invalidation therefore
+conservatively invalidates directory snapshots across the mount, including
+directories unrelated to the changed inode. This is an intentional bounded
+correctness choice; per-directory or subtree-scoped attribute generations
+remain a separate optimization and must preserve the same post-commit
+observation check before cache admission.
+
 The WinFSP adapter preserves path/action/filter identities when coalescing and
 keeps old paths during retry. Semantic enqueue and retry cannot block at capacity.
 `WinfspDeliverySnapshot` reports queue acceptance, native submissions, failed and

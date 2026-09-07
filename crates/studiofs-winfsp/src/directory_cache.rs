@@ -5,7 +5,6 @@ use parking_lot::Mutex;
 use studiofs_meta::Ino;
 use studiofs_vfs::DirectoryEnumerationObservation;
 use tracing::trace;
-use winfsp::U16CStr;
 use winfsp::filesystem::{DirBufferLock, DirInfo};
 
 use crate::context::MAX_WINDOWS_COMPONENT_UTF16_UNITS;
@@ -31,43 +30,16 @@ pub(super) struct DirectorySnapshotCacheSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct DirectorySnapshotCacheKey {
     ino: Ino,
-    observation: DirectoryEnumerationObservation,
-    pattern: Option<Arc<[u16]>>,
 }
 
 impl DirectorySnapshotCacheKey {
-    pub(super) fn new(
-        ino: Ino,
-        observation: DirectoryEnumerationObservation,
-        pattern: Option<&U16CStr>,
-    ) -> Self {
-        Self {
-            ino,
-            observation,
-            pattern: pattern.map(|pattern| Arc::from(pattern.as_slice())),
-        }
-    }
-
-    fn dynamic_byte_size(&self) -> usize {
-        self.pattern.as_ref().map_or(0, |pattern| {
-            pattern.len().saturating_mul(std::mem::size_of::<u16>())
-        })
+    pub(super) fn new(ino: Ino) -> Self {
+        Self { ino }
     }
 
     #[cfg(test)]
-    pub(super) fn for_test(ino: Ino, namespace_epoch: u64, directory_generation: u64) -> Self {
-        Self {
-            ino,
-            observation: DirectoryEnumerationObservation {
-                namespace_epoch,
-                directory_generation,
-                attribute_generation: 0,
-                acl_epoch: 0,
-                acl_namespace_epoch: 0,
-                access_level: 2,
-            },
-            pattern: None,
-        }
+    pub(super) fn for_test(ino: Ino) -> Self {
+        Self { ino }
     }
 }
 
@@ -79,6 +51,7 @@ struct DirectorySnapshotEntries {
 
 pub(super) struct DirectorySnapshot {
     entries: Mutex<DirectorySnapshotEntries>,
+    children_len: usize,
     byte_size: usize,
 }
 
@@ -89,6 +62,7 @@ impl DirectorySnapshot {
         children: Vec<CachedDirInfo>,
     ) -> Self {
         let info_size = std::mem::size_of::<CachedDirInfo>();
+        let children_len = children.len();
         let byte_size =
             info_size.saturating_mul(1 + usize::from(dotdot.is_some()) + children.len());
         Self {
@@ -97,6 +71,7 @@ impl DirectorySnapshot {
                 dotdot,
                 children,
             }),
+            children_len,
             byte_size,
         }
     }
@@ -106,7 +81,7 @@ impl DirectorySnapshot {
     }
 
     pub(super) fn children_len(&self) -> usize {
-        self.entries.lock().children.len()
+        self.children_len
     }
 
     pub(super) fn write_to(&self, lock: &DirBufferLock<'_>) -> winfsp::Result<()> {
@@ -129,13 +104,19 @@ impl DirectorySnapshot {
                 dotdot: None,
                 children: Vec::new(),
             }),
+            children_len: 0,
             byte_size,
         })
     }
 }
 
+struct DirectorySnapshotCacheEntry {
+    observation: DirectoryEnumerationObservation,
+    snapshot: Arc<DirectorySnapshot>,
+}
+
 struct DirectorySnapshotCacheState {
-    entries: HashMap<DirectorySnapshotCacheKey, Arc<DirectorySnapshot>>,
+    entries: HashMap<DirectorySnapshotCacheKey, DirectorySnapshotCacheEntry>,
     lru: VecDeque<DirectorySnapshotCacheKey>,
     last_namespace_epoch: Option<u64>,
     hits: u64,
@@ -181,10 +162,17 @@ impl DirectorySnapshotCache {
         }
     }
 
-    pub(super) fn lookup(&self, key: &DirectorySnapshotCacheKey) -> Option<Arc<DirectorySnapshot>> {
+    pub(super) fn lookup(
+        &self,
+        key: &DirectorySnapshotCacheKey,
+        observation: DirectoryEnumerationObservation,
+    ) -> Option<Arc<DirectorySnapshot>> {
         let mut state = self.state.lock();
-        self.prepare_namespace_epoch(&mut state, key.observation.namespace_epoch);
-        if let Some(snapshot) = state.entries.get(key).cloned() {
+        self.prepare_namespace_epoch(&mut state, observation.namespace_epoch);
+        let hit = state.entries.get(key).and_then(|entry| {
+            (entry.observation == observation).then(|| Arc::clone(&entry.snapshot))
+        });
+        if let Some(snapshot) = hit {
             state.hits = state.hits.saturating_add(1);
             Self::touch_lru(&mut state.lru, key);
             trace!(
@@ -195,24 +183,37 @@ impl DirectorySnapshotCache {
             return Some(snapshot);
         }
 
+        if let Some(stale) = state.entries.remove(key) {
+            state.occupancy_bytes = state
+                .occupancy_bytes
+                .saturating_sub(stale.snapshot.byte_size());
+            Self::remove_lru(&mut state.lru, key);
+            state.invalidations = state.invalidations.saturating_add(1);
+            trace!(
+                target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_invalidation",
+                ino = key.ino,
+                "directory snapshot cache invalidation"
+            );
+        }
+
         state.misses = state.misses.saturating_add(1);
         trace!(
             target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_miss",
             ino = key.ino,
             "directory snapshot cache miss"
         );
-        self.invalidate_stale_directory_entries(&mut state, key);
         None
     }
 
     pub(super) fn insert(
         &self,
         key: DirectorySnapshotCacheKey,
+        observation: DirectoryEnumerationObservation,
         snapshot: Arc<DirectorySnapshot>,
     ) -> bool {
         let mut state = self.state.lock();
-        self.prepare_namespace_epoch(&mut state, key.observation.namespace_epoch);
-        let byte_size = snapshot.byte_size().saturating_add(key.dynamic_byte_size());
+        self.prepare_namespace_epoch(&mut state, observation.namespace_epoch);
+        let byte_size = snapshot.byte_size();
         if self.entry_budget == 0 || byte_size > self.byte_budget {
             return false;
         }
@@ -220,7 +221,7 @@ impl DirectorySnapshotCache {
         if let Some(previous) = state.entries.remove(&key) {
             state.occupancy_bytes = state
                 .occupancy_bytes
-                .saturating_sub(previous.byte_size().saturating_add(key.dynamic_byte_size()));
+                .saturating_sub(previous.snapshot.byte_size());
             Self::remove_lru(&mut state.lru, &key);
         }
 
@@ -231,11 +232,9 @@ impl DirectorySnapshotCache {
                 break;
             };
             if let Some(previous) = state.entries.remove(&oldest) {
-                state.occupancy_bytes = state.occupancy_bytes.saturating_sub(
-                    previous
-                        .byte_size()
-                        .saturating_add(oldest.dynamic_byte_size()),
-                );
+                state.occupancy_bytes = state
+                    .occupancy_bytes
+                    .saturating_sub(previous.snapshot.byte_size());
                 state.evictions = state.evictions.saturating_add(1);
                 trace!(
                     target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_eviction",
@@ -247,7 +246,13 @@ impl DirectorySnapshotCache {
 
         state.occupancy_bytes = state.occupancy_bytes.saturating_add(byte_size);
         state.lru.push_back(key.clone());
-        state.entries.insert(key, snapshot);
+        state.entries.insert(
+            key,
+            DirectorySnapshotCacheEntry {
+                observation,
+                snapshot,
+            },
+        );
         true
     }
 
@@ -294,37 +299,6 @@ impl DirectorySnapshotCache {
             }
         }
         state.last_namespace_epoch = Some(epoch);
-    }
-
-    fn invalidate_stale_directory_entries(
-        &self,
-        state: &mut DirectorySnapshotCacheState,
-        key: &DirectorySnapshotCacheKey,
-    ) {
-        let stale_keys = state
-            .entries
-            .keys()
-            .filter(|candidate| {
-                candidate.ino == key.ino && candidate.observation != key.observation
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for stale_key in stale_keys {
-            if let Some(snapshot) = state.entries.remove(&stale_key) {
-                state.occupancy_bytes = state.occupancy_bytes.saturating_sub(
-                    snapshot
-                        .byte_size()
-                        .saturating_add(stale_key.dynamic_byte_size()),
-                );
-                Self::remove_lru(&mut state.lru, &stale_key);
-                state.invalidations = state.invalidations.saturating_add(1);
-                trace!(
-                    target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_invalidation",
-                    ino = stale_key.ino,
-                    "directory snapshot cache invalidation"
-                );
-            }
-        }
     }
 
     fn touch_lru(lru: &mut VecDeque<DirectorySnapshotCacheKey>, key: &DirectorySnapshotCacheKey) {
