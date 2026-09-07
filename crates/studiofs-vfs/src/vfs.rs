@@ -599,6 +599,27 @@ pub struct DirEntryWithAttr {
     pub attr: Option<InodeAttr>,
 }
 
+/// Coherence token used by bridge-side directory enumeration snapshots.
+///
+/// The token deliberately combines namespace, metadata, and ACL generations so
+/// a snapshot can only be reused while both its names and rendered attributes
+/// remain valid for the same access view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DirectoryEnumerationObservation {
+    /// Global namespace generation.
+    pub namespace_epoch: u64,
+    /// Generation of the enumerated directory.
+    pub directory_generation: u64,
+    /// Aggregate generation for cached inode attributes.
+    pub attribute_generation: u64,
+    /// ACL rule generation.
+    pub acl_epoch: u64,
+    /// Namespace ACL derivation generation.
+    pub acl_namespace_epoch: u64,
+    /// Effective access level for the directory, encoded as its stable repr.
+    pub access_level: u8,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WinfspBarrierType {
     /// Barrier for WinFSP cleanup callbacks.

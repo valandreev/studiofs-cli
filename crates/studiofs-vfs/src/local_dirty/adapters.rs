@@ -215,7 +215,7 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
 impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
     fn on_metadata_committed(&self, ino: Ino, committed_attr: Option<&InodeAttr>) {
         if let Some(attr) = committed_attr {
-            self.vfs.state.namespace.attr_read_cache.lock().remove(ino);
+            self.vfs.invalidate_attr_read_cache([ino]);
             self.vfs
                 .refresh_inode_incarnation_state_from_attr(ino, attr);
         }

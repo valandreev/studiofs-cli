@@ -9,6 +9,7 @@ use super::{
     chunk_start_offset, debug, error, info, offset_within_block, validate_name, warn,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use studiofs_meta::engine::NamespaceMutation;
 use studiofs_meta::schema::PayloadRefState;
@@ -863,7 +864,7 @@ impl StudioVfs {
                 args,
             },
         )?;
-        self.state.namespace.attr_read_cache.lock().remove(ino);
+        self.invalidate_attr_read_cache([ino]);
         self.schedule_deferred_namespace_metadata_drain(runtime);
         Ok(attr)
     }
@@ -944,8 +945,8 @@ impl StudioVfs {
                 .dirty_attrs
                 .lock()
                 .insert(ino, attr.clone());
-            self.state.namespace.attr_read_cache.lock().remove(ino);
             self.sync_meta().set_attr(&attr)?;
+            self.invalidate_attr_read_cache([ino]);
             self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
@@ -1072,7 +1073,7 @@ impl StudioVfs {
                 .dirty_attrs
                 .lock()
                 .insert(ino, attr.clone());
-            self.state.namespace.attr_read_cache.lock().remove(ino);
+            self.invalidate_attr_read_cache([ino]);
 
             if !defer_strict_flush_for_growth {
                 let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
@@ -1147,7 +1148,7 @@ impl StudioVfs {
     ) -> VfsResult<()> {
         self.clear_pending_payloads_for_inode(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.state.namespace.attr_read_cache.lock().remove(ino);
+        self.invalidate_attr_read_cache([ino]);
 
         self.rollback_truncate_mutation(ino, old_attr.content_epoch, truncate_mutation)?;
 
@@ -1643,7 +1644,7 @@ impl StudioVfs {
             self.clear_pending_payloads_for_inode(ino);
             self.clear_inode_incarnation(ino);
             self.state.namespace.dirty_attrs.lock().remove(&ino);
-            self.state.namespace.attr_read_cache.lock().remove(ino);
+            self.invalidate_attr_read_cache([ino]);
         }
 
         self.bump_namespace_for_parents([parent]);
@@ -1935,6 +1936,27 @@ impl StudioVfs {
         Ok((entries, attrs_by_ino))
     }
 
+    /// Return the coherence observation for a bridge-side directory snapshot.
+    pub fn directory_enumeration_observation(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<super::DirectoryEnumerationObservation> {
+        let access_level = self.effective_access_level(ino)?;
+        let namespace = self.namespace_cache_token_for_parent(ino);
+        Ok(super::DirectoryEnumerationObservation {
+            namespace_epoch: namespace.namespace_epoch,
+            directory_generation: namespace.parent_generation,
+            attribute_generation: self
+                .state
+                .namespace
+                .attribute_generation
+                .load(Ordering::Acquire),
+            acl_epoch: self.state.acl.acl_epoch.load(Ordering::Acquire),
+            acl_namespace_epoch: self.state.acl.acl_namespace_epoch.load(Ordering::Acquire),
+            access_level: access_level as u8,
+        })
+    }
+
     /// Read directory entries from `ino` with namespace filtering and access checks.
     ///
     /// The method applies ACL filtering, skips inaccessible entries, drops platform/root
@@ -2136,6 +2158,7 @@ impl StudioVfs {
                 dirty_attr.nlink = attr.nlink;
                 dirty_attr.ctime = attr.ctime;
             }
+            self.invalidate_attr_read_cache([ino]);
             self.state.namespace.attr_read_cache.lock().put(
                 ino,
                 visible_attr.clone(),
@@ -2512,6 +2535,7 @@ impl StudioVfs {
             };
 
             namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
+            self.invalidate_attr_read_cache([unlinked_attr.ino]);
             if unlinked_attr.nlink > 0 {
                 self.state.namespace.attr_read_cache.lock().put(
                     unlinked_attr.ino,

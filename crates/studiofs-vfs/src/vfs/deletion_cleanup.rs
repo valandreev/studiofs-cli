@@ -170,7 +170,7 @@ impl StudioVfs {
 
         self.clear_inode_incarnation(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.state.namespace.attr_read_cache.lock().remove(ino);
+        self.invalidate_attr_read_cache([ino]);
         self.maybe_clear_deleted_inode_marker(ino);
         deferred_local_payloads_len
     }
@@ -200,7 +200,7 @@ impl StudioVfs {
 
         self.clear_inode_incarnation(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.state.namespace.attr_read_cache.lock().remove(ino);
+        self.invalidate_attr_read_cache([ino]);
         self.maybe_clear_deleted_inode_marker(ino);
         deferred_local_payloads_len
     }

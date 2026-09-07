@@ -1026,6 +1026,10 @@ impl StudioVfs {
         &self,
         inodes: impl IntoIterator<Item = Ino>,
     ) -> Vec<Ino> {
+        let inodes = inodes.into_iter().collect::<Vec<_>>();
+        if !inodes.is_empty() {
+            self.bump_attribute_generation();
+        }
         let mut cache = self.state.namespace.attr_read_cache.lock();
         let mut read_plan_cache = self.state.read.published_read_plan_cache.lock();
         let mut removed = Vec::new();
@@ -1048,6 +1052,7 @@ impl StudioVfs {
         if cache.observation(ino) != expected {
             return None;
         }
+        self.bump_attribute_generation();
         self.handle_table.clear_read_windows_for_inode(ino);
         self.state.read.published_read_plan_cache.lock().pop(&ino);
         cache.remove(ino);
@@ -1055,11 +1060,22 @@ impl StudioVfs {
     }
 
     pub(super) fn retire_all_attr_read_observations(&self) {
+        self.bump_attribute_generation();
         self.state
             .namespace
             .attr_read_cache
             .lock()
             .retire_observations();
+    }
+
+    pub(super) fn bump_attribute_generation(&self) {
+        self.state
+            .namespace
+            .attribute_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(1))
+            })
+            .ok();
     }
 
     pub(super) fn read_cache_invalidation_set(
