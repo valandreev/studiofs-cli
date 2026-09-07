@@ -22,6 +22,8 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 - [x] (2026-09-06) Re-ran final focused checks after commit `40a5a64` and recorded the final validation boundary.
 - [x] (2026-09-07) Verified the external review findings against current code; fixed the confirmed classifier, harness polling/resource-accounting, statistics, ordering, host-load fallback, assertion, and artifact-retention issues.
 - [x] (2026-09-07) Ran final post-review verification, native evidence, and committed the review fixes in `a0ef4630`.
+- [x] (2026-09-07) Accepted the P1 instrumentation finding: timed candidate runs now disable new hot-path event counting, and a separate untimed candidate run preserves attribution data.
+- [x] (2026-09-07) Accepted the P2 build-isolation finding: baseline and candidate release builds now use separate temporary Cargo target directories.
 
 ## Surprises & Discoveries
 
@@ -38,6 +40,8 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 - The review caught that the classifier test still accepted a cross-crate `directory_buffer` target. A red regression reproduced it; the classifier now restricts WinFSP-native and VFS event names to their actual prefixes, and count assertions use target names instead of raw indices.
 - The direct `mount_sanity` executable does not spawn benchmark children, so enumerating the entire Windows process table through WMI inside the 100 ms loop only perturbed the host. Polling now uses the already-owned benchmark process handle.
 - On this host and .NET runtime, `TotalProcessorTime` remains available after exit but `WorkingSet64` and `PeakWorkingSet64` become null. The harness therefore keeps exact final CPU, uses kernel peak only when exposed, and records a sampled working-set fallback source instead of writing zero.
+- The candidate-only hot-path subscriber changed the timed comparison's cost model: the historical baseline could not pay the new atomic-counter cost because it emits the legacy schema. Timed candidate runs now disable those event targets, while a separate enabled run supplies attribution evidence.
+- Cargo's default target directory is unsafe for this two-source build loop because both test binaries have the same artifact name. The harness now gives each side a distinct temporary target directory and removes the parent only after the artifact is complete.
 
 ## Decision Log
 
@@ -53,6 +57,12 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 - Decision: Fail conservatively when the expected test executable cannot be located, changes identity between build and run, or the fresh metadata report is absent or malformed.
   Rationale: SFS-690 explicitly forbids silently accepting stale artifacts, wrong binaries, or skipped tests; a false rejection is preferable to an unattributable performance result.
   Date/Author: 2026-09-06 / Codex.
+- Decision: Disable new hot-path event targets during timed A/B runs and collect candidate attribution in one separate untimed invocation.
+  Rationale: The historical baseline source predates SFS-690 and cannot emit equivalent hot-path events without ceasing to be the requested baseline. Keeping the callback-compatible subscriber but rejecting the new targets removes the new atomic-counter overhead from the timed candidate; the enabled attribution run remains available for causal evidence.
+  Date/Author: 2026-09-07 / Codex.
+- Decision: Assign separate temporary `CARGO_TARGET_DIR` values to baseline and candidate builds.
+  Rationale: Both source trees produce `mount_sanity`, so a shared target directory can make the later candidate build replace the binary selected for the baseline. Side-specific targets make the identity check meaningful without changing the build order.
+  Date/Author: 2026-09-07 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -124,4 +134,4 @@ Plan revision: 2026-09-06 after the native gate. The harness records direct exec
 
 Plan revision: 2026-09-06 after final verification. The focused classifier and VFS regression tests passed, both changed crates passed `check`/`clippy -D warnings`, formatting, PowerShell parsing, and diff checks passed, and commit `40a5a64` is the recorded implementation boundary.
 
-Plan revision: 2026-09-07 after external review verification. A1, A2, A3, B1, B2, B3, C1, C2, and C3 were checked against current source; all recommendations were either implemented or made explicit with a host/runtime-compatible fallback. Final native evidence and focused verification passed on candidate `a0ef4630`.
+Plan revision: 2026-09-07 after external review verification. A1, A2, A3, B1, B2, B3, C1, C2, and C3 were checked against current source; all recommendations were either implemented or made explicit with a host/runtime-compatible fallback. The newly accepted P1/P2 fixes are implemented; final focused verification and native evidence for this revision remain pending.

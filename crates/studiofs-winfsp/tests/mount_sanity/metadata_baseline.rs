@@ -34,10 +34,26 @@ const VFS_HOT_PATH_EVENTS: [&str; 5] = [
 ];
 const EVENT_COUNT: usize = CALLBACKS.len() + HOT_PATH_EVENTS.len();
 
-#[derive(Clone, Default)]
-struct CallbackCounter(Arc<[AtomicU64; EVENT_COUNT]>);
+#[derive(Clone)]
+struct CallbackCounter {
+    counts: Arc<[AtomicU64; EVENT_COUNT]>,
+    include_hot_path: bool,
+}
+
+impl Default for CallbackCounter {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 impl CallbackCounter {
+    fn new(include_hot_path: bool) -> Self {
+        Self {
+            counts: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            include_hot_path,
+        }
+    }
+
     fn event_index(target: &str) -> Option<usize> {
         if let Some(name) = target.strip_prefix("studiofs_winfsp::metadata_baseline::") {
             if let Some(index) = CALLBACKS.iter().position(|callback| *callback == name) {
@@ -66,8 +82,16 @@ impl CallbackCounter {
         Self::event_index(target).map_or(0, |index| snapshot[index])
     }
 
+    fn event_index_for(&self, target: &str) -> Option<usize> {
+        let index = Self::event_index(target)?;
+        if !self.include_hot_path && index >= CALLBACKS.len() {
+            return None;
+        }
+        Some(index)
+    }
+
     fn snapshot(&self) -> [u64; EVENT_COUNT] {
-        std::array::from_fn(|index| self.0[index].load(Ordering::Relaxed))
+        std::array::from_fn(|index| self.counts[index].load(Ordering::Relaxed))
     }
 }
 
@@ -108,6 +132,24 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn callback_counter_can_disable_hot_path_events_for_timed_runs() {
+        let counter = CallbackCounter::new(false);
+
+        assert_eq!(
+            counter.event_index_for("studiofs_winfsp::metadata_baseline::open"),
+            Some(1)
+        );
+        assert_eq!(
+            counter.event_index_for("studiofs_vfs::metadata_baseline::metadata_lookup"),
+            None
+        );
+        assert_eq!(
+            counter.event_index_for("studiofs_winfsp::metadata_baseline::directory_buffer"),
+            None
+        );
+    }
 }
 
 impl tracing::Subscriber for CallbackCounter {
@@ -115,7 +157,7 @@ impl tracing::Subscriber for CallbackCounter {
         &self,
         metadata: &'static tracing::Metadata<'static>,
     ) -> tracing::subscriber::Interest {
-        if Self::event_index(metadata.target()).is_some() {
+        if self.event_index_for(metadata.target()).is_some() {
             tracing::subscriber::Interest::always()
         } else {
             tracing::subscriber::Interest::never()
@@ -123,7 +165,7 @@ impl tracing::Subscriber for CallbackCounter {
     }
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        Self::event_index(metadata.target()).is_some()
+        self.event_index_for(metadata.target()).is_some()
     }
 
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -134,8 +176,8 @@ impl tracing::Subscriber for CallbackCounter {
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        if let Some(index) = Self::event_index(event.metadata().target()) {
-            self.0[index].fetch_add(1, Ordering::Relaxed);
+        if let Some(index) = self.event_index_for(event.metadata().target()) {
+            self.counts[index].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -178,7 +220,9 @@ fn winfsp_metadata_baseline() {
         "requested drive is already assigned"
     );
 
-    let counter = CallbackCounter::default();
+    let instrumentation_enabled =
+        configured_value("STUDIOFS_METADATA_INSTRUMENTATION").as_deref() != Some("disabled");
+    let counter = CallbackCounter::new(instrumentation_enabled);
     // This integration binary invokes the baseline once per process. Keep the
     // installation fail-fast so an existing subscriber cannot hide zero counts.
     // Native callbacks run on dispatcher threads, so a thread-local subscriber
@@ -205,7 +249,7 @@ fn winfsp_metadata_baseline() {
             .map(|index| format!("file-{index:02}").into())
             .collect();
         let mut report = String::from(
-            "pass,workload,operations,elapsed_ns,warmup,get_security_by_name,open,get_file_info,read_directory,cleanup,close,path_resolution,metadata_lookup,metadata_getattr,acl_check,readdir,get_attrs_batch,directory_buffer,dentry_cache_hits,dentry_cache_misses,path_shortcut_cache_hits,path_shortcut_cache_misses,attr_read_cache_hits,attr_read_cache_misses,native_cache_enabled_open,native_cache_disabled_open\n",
+            "pass,workload,operations,elapsed_ns,warmup,instrumentation_mode,get_security_by_name,open,get_file_info,read_directory,cleanup,close,path_resolution,metadata_lookup,metadata_getattr,acl_check,readdir,get_attrs_batch,directory_buffer,dentry_cache_hits,dentry_cache_misses,path_shortcut_cache_hits,path_shortcut_cache_misses,attr_read_cache_hits,attr_read_cache_misses,native_cache_enabled_open,native_cache_disabled_open\n",
         );
         for pass in 1..=3 {
             for workload in ["stat", "open_close", "negative_lookup", "enumeration"] {
@@ -253,6 +297,11 @@ fn winfsp_metadata_baseline() {
                     "1000".to_string(),
                     elapsed.to_string(),
                     "false".to_string(),
+                    if instrumentation_enabled {
+                        "enabled".to_string()
+                    } else {
+                        "disabled".to_string()
+                    },
                 ];
                 row.extend(delta.iter().map(|value| value.to_string()));
                 row.extend(
@@ -310,34 +359,36 @@ fn winfsp_metadata_baseline() {
             count("studiofs_winfsp::metadata_baseline::read_directory") > 0,
             "directory instrumentation must be active"
         );
-        assert!(
-            count("studiofs_winfsp::metadata_baseline::path_resolution") > 0,
-            "path-resolution instrumentation must be active"
-        );
-        assert!(
-            count("studiofs_vfs::metadata_baseline::metadata_lookup") > 0,
-            "metadata-lookup instrumentation must be active"
-        );
-        assert!(
-            count("studiofs_vfs::metadata_baseline::metadata_getattr") > 0,
-            "metadata-getattr instrumentation must be active"
-        );
-        assert!(
-            count("studiofs_vfs::metadata_baseline::acl_check") > 0,
-            "ACL instrumentation must be active"
-        );
-        assert!(
-            count("studiofs_vfs::metadata_baseline::readdir") > 0,
-            "readdir instrumentation must be active"
-        );
-        assert!(
-            count("studiofs_vfs::metadata_baseline::get_attrs_batch") > 0,
-            "batched-attribute instrumentation must be active"
-        );
-        assert!(
-            count("studiofs_winfsp::metadata_baseline::directory_buffer") > 0,
-            "directory-buffer instrumentation must be active"
-        );
+        if instrumentation_enabled {
+            assert!(
+                count("studiofs_winfsp::metadata_baseline::path_resolution") > 0,
+                "path-resolution instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::metadata_lookup") > 0,
+                "metadata-lookup instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::metadata_getattr") > 0,
+                "metadata-getattr instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::acl_check") > 0,
+                "ACL instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::readdir") > 0,
+                "readdir instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::get_attrs_batch") > 0,
+                "batched-attribute instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_winfsp::metadata_baseline::directory_buffer") > 0,
+                "directory-buffer instrumentation must be active"
+            );
+        }
         report
     });
     let directory = super::workspace_root().join("target/perf");

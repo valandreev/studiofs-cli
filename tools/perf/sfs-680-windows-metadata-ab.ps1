@@ -39,6 +39,15 @@ $measurementColumns = @(
     "native_cache_disabled_open"
 )
 $numericMeasurementColumns = @("elapsed_ns") + $measurementColumns
+$hotPathMeasurementColumns = @(
+    "path_resolution",
+    "metadata_lookup",
+    "metadata_getattr",
+    "acl_check",
+    "readdir",
+    "get_attrs_batch",
+    "directory_buffer"
+)
 $callbackColumns = @(
     "get_security_by_name",
     "open",
@@ -170,7 +179,8 @@ function Start-ProcessHandle {
     param(
         [string]$FilePath,
         [string]$Worktree,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [hashtable]$Environment = $null
     )
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $FilePath
@@ -180,6 +190,11 @@ function Start-ProcessHandle {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    if ($null -ne $Environment) {
+        foreach ($entry in $Environment.GetEnumerator()) {
+            $startInfo.EnvironmentVariables[[string]$entry.Key] = [string]$entry.Value
+        }
+    }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     if (-not $process.Start()) {
@@ -195,9 +210,14 @@ function Start-ProcessHandle {
 function Start-CargoProcess {
     param(
         [string]$Worktree,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [hashtable]$Environment = $null
     )
-    Start-ProcessHandle -FilePath "cargo.exe" -Worktree $Worktree -Arguments $Arguments
+    Start-ProcessHandle `
+        -FilePath "cargo.exe" `
+        -Worktree $Worktree `
+        -Arguments $Arguments `
+        -Environment $Environment
 }
 
 function Complete-CargoProcess {
@@ -222,7 +242,8 @@ function Invoke-CargoBuild {
     param(
         [string]$Worktree,
         [string]$Side,
-        [string]$ArtifactDirectory
+        [string]$ArtifactDirectory,
+        [string]$TargetDirectory
     )
     $stdoutPath = Join-Path $ArtifactDirectory ("{0}-build.stdout.log" -f $Side)
     $stderrPath = Join-Path $ArtifactDirectory ("{0}-build.stderr.log" -f $Side)
@@ -237,7 +258,10 @@ function Invoke-CargoBuild {
         "--message-format=json"
     )
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    $handle = Start-CargoProcess -Worktree $Worktree -Arguments $arguments
+    $handle = Start-CargoProcess `
+        -Worktree $Worktree `
+        -Arguments $arguments `
+        -Environment @{ CARGO_TARGET_DIR = $TargetDirectory }
     $cargo = $handle.process
     while (-not $cargo.HasExited) {
         Start-Sleep -Milliseconds 100
@@ -283,11 +307,19 @@ function Invoke-CargoBuild {
         [System.IO.Path]::GetFullPath($reportedExecutable)
     }
     else {
-        [System.IO.Path]::GetFullPath((Join-Path $Worktree $reportedExecutable))
+        $worktreePath = Join-Path $Worktree $reportedExecutable
+        $targetPath = Join-Path $TargetDirectory $reportedExecutable
+        if (Test-Path -LiteralPath $worktreePath -PathType Leaf) {
+            [System.IO.Path]::GetFullPath($worktreePath)
+        }
+        else {
+            [System.IO.Path]::GetFullPath($targetPath)
+        }
     }
     $executableIdentity = Get-FileIdentity -Path $executablePath
     [pscustomobject][ordered]@{
         side                 = $Side
+        target_directory     = $TargetDirectory
         exit_code            = $completed.exit_code
         wall_ms              = [math]::Round($timer.Elapsed.TotalMilliseconds, 3)
         executable_identity  = $executableIdentity
@@ -303,10 +335,19 @@ function Invoke-CargoBenchmark {
         [int]$Run,
         [int]$Sequence,
         [pscustomobject]$ExpectedExecutable,
-        [string]$ArtifactDirectory
+        [string]$ArtifactDirectory,
+        [ValidateSet("timed", "attribution")]
+        [string]$Purpose = "timed"
     )
-    $stdoutPath = Join-Path $ArtifactDirectory ("{0}-run-{1:D2}.stdout.log" -f $Side, $Run)
-    $stderrPath = Join-Path $ArtifactDirectory ("{0}-run-{1:D2}.stderr.log" -f $Side, $Run)
+    $instrumentationMode = if ($Purpose -eq "attribution") { "enabled" } else { "disabled" }
+    $runLabel = if ($Purpose -eq "attribution") {
+        "$Side-attribution"
+    }
+    else {
+        "{0}-run-{1:D2}" -f $Side, $Run
+    }
+    $stdoutPath = Join-Path $ArtifactDirectory ("{0}.stdout.log" -f $runLabel)
+    $stderrPath = Join-Path $ArtifactDirectory ("{0}.stderr.log" -f $runLabel)
     $arguments = @(
         "metadata_baseline::winfsp_metadata_baseline",
         "--ignored",
@@ -322,7 +363,11 @@ function Invoke-CargoBenchmark {
     $systemLoadBefore = Get-SystemLoadObservation
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $startedAt = Get-Date
-    $handle = Start-ProcessHandle -FilePath $ExpectedExecutable.path -Worktree $Worktree -Arguments $arguments
+    $handle = Start-ProcessHandle `
+        -FilePath $ExpectedExecutable.path `
+        -Worktree $Worktree `
+        -Arguments $arguments `
+        -Environment @{ STUDIOFS_METADATA_INSTRUMENTATION = $instrumentationMode }
     $benchmarkProcess = $handle.process
     $maxWorkingSet = [int64]0
     $maxWorkingSetSource = "sampled"
@@ -378,13 +423,13 @@ function Invoke-CargoBenchmark {
         $afterIdentity.length_bytes -ne $ExpectedExecutable.length_bytes) {
         throw "$Side run $Run executable identity changed during benchmark: $($ExpectedExecutable.path)"
     }
-    $csvPath = Join-Path $ArtifactDirectory ("{0}-run-{1:D2}.csv" -f $Side, $Run)
+    $csvPath = Join-Path $ArtifactDirectory ("{0}.csv" -f $runLabel)
     Copy-Item -LiteralPath $sourceCsv -Destination $csvPath -Force
     $rows = @(Import-Csv -LiteralPath $csvPath)
     if ($rows.Count -ne 12) {
         throw "$Side run $Run produced $($rows.Count) CSV rows; expected 12"
     }
-    $expectedColumns = @("pass", "workload", "operations", "elapsed_ns", "warmup") + $measurementColumns
+    $expectedColumns = @("pass", "workload", "operations", "elapsed_ns", "warmup", "instrumentation_mode") + $measurementColumns
     $legacyColumns = @("pass", "workload", "operations", "elapsed_ns") + $callbackColumns
     $actualColumns = @($rows[0].PSObject.Properties.Name)
     $hasSfs690Schema = $actualColumns.Count -eq $expectedColumns.Count -and
@@ -397,7 +442,16 @@ function Invoke-CargoBenchmark {
     if ($hasLegacySchema -and $Side -ne "baseline") {
         throw "$Side run $Run emitted the legacy metadata schema; candidate instrumentation is required"
     }
-    $instrumentationStatus = if ($hasSfs690Schema) { "sfs-690" } else { "legacy" }
+    if ($hasSfs690Schema) {
+        $actualModes = @($rows | Select-Object -ExpandProperty instrumentation_mode -Unique)
+        if ($actualModes.Count -ne 1 -or $actualModes[0] -ne $instrumentationMode) {
+            throw "$runLabel emitted an unexpected instrumentation mode"
+        }
+    }
+    $instrumentationStatus = if ($hasSfs690Schema) {
+        if ($instrumentationMode -eq "enabled") { "sfs-690" } else { "disabled" }
+    }
+    else { "legacy" }
     $expectedWorkloads = @("stat", "open_close", "negative_lookup", "enumeration")
     if (@($rows | Where-Object { [int]$_.operations -ne 1000 }).Count -ne 0) {
         throw "$Side run $Run contains a workload with operations other than 1000"
@@ -430,11 +484,21 @@ function Invoke-CargoBenchmark {
             throw "$Side run $Run contains a non-integer measurement in column $column"
         }
     }
+    if ($Purpose -eq "timed" -and $Side -eq "candidate" -and $hasSfs690Schema) {
+        foreach ($column in $hotPathMeasurementColumns) {
+            if (@($rows | Where-Object { [int64]$_.$column -ne 0 }).Count -ne 0) {
+                throw "$Side run $Run contains enabled hot-path instrumentation in timed column $column"
+            }
+        }
+    }
     [pscustomobject][ordered]@{
         side                    = $Side
         run                     = $Run
         sequence                = $Sequence
-        run_label               = "{0}-run-{1:D2}" -f $Side, $Run
+        run_label               = $runLabel
+        measurement_purpose     = $Purpose
+        instrumentation_mode   = $instrumentationMode
+        include_in_timing       = ($Purpose -eq "timed")
         instrumentation_status  = $instrumentationStatus
         exit_code               = $completed.exit_code
         wall_ms                 = [math]::Round($timer.Elapsed.TotalMilliseconds, 3)
@@ -604,6 +668,11 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 }
 $artifactDirectory = New-UniqueDirectory -Root $OutputRoot -Name ("sfs-680-windows-metadata-ab-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 $targetRoot = (Resolve-Path -LiteralPath (Join-Path $repoRoot "target")).Path
+$buildTargetRoot = Join-Path $targetRoot ("sfs-690-build-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
+$buildTargetDirectories = [ordered]@{
+    baseline  = Join-Path $buildTargetRoot "baseline"
+    candidate = Join-Path $buildTargetRoot "candidate"
+}
 $snapshot = Join-Path $targetRoot ("sfs-680-baseline-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
 $snapshotArchive = Join-Path $artifactDirectory "baseline-source.zip"
 if (Test-Path -LiteralPath $snapshot) {
@@ -627,7 +696,10 @@ foreach ($name in $environmentNames) {
 }
 
 $snapshotCreated = $false
+$buildTargetRootCreated = $false
 try {
+    New-Item -ItemType Directory -Path $buildTargetRoot -ErrorAction Stop | Out-Null
+    $buildTargetRootCreated = $true
     # The managed workspace keeps .git read-only. A tracked-source archive gives
     # the baseline its own Cargo root without mutating Git's worktree metadata.
     & git -C $repoRoot archive --format=zip --output=$snapshotArchive $baselineResolved
@@ -671,7 +743,8 @@ try {
     }
     $runOrderLabels = @($runOrder | ForEach-Object { $_.label })
     $buildCommand = "cargo test -p studiofs-winfsp --release --test mount_sanity --no-run --message-format=json"
-    $runnerCommand = "<built mount_sanity executable> metadata_baseline::winfsp_metadata_baseline --ignored --exact --nocapture --test-threads=1"
+    $runnerCommand = "<built mount_sanity executable> metadata_baseline::winfsp_metadata_baseline --ignored --exact --nocapture --test-threads=1 (timed; STUDIOFS_METADATA_INSTRUMENTATION=disabled)"
+    $attributionRunnerCommand = "<built candidate mount_sanity executable> metadata_baseline::winfsp_metadata_baseline --ignored --exact --nocapture --test-threads=1 (untimed attribution; STUDIOFS_METADATA_INSTRUMENTATION=enabled)"
     $harnessCommand = "powershell -ExecutionPolicy Bypass -File .\tools\perf\sfs-680-windows-metadata-ab.ps1 -MountPoint $($MountPoint.Trim().ToUpperInvariant()) -BaselineCommit $baselineResolved -CandidateCommit $candidateResolved -Runs $Runs"
     $environment = [ordered]@{
         issue                  = "SFS-690"
@@ -683,11 +756,13 @@ try {
         workload_definition    = "stat,open_close,negative_lookup,enumeration; 1000 operations; 3 passes per invocation"
         build_command          = $buildCommand
         command                = $runnerCommand
+        attribution_command    = $attributionRunnerCommand
         harness_command        = $harnessCommand
         run_order              = $runOrderLabels
         warmup_passes          = 0
         warmup_status          = "none; all three passes are measured observations"
         measurement_columns    = @("elapsed_ns") + $measurementColumns
+        csv_metadata_columns   = @("warmup", "instrumentation_mode")
         baseline_commit        = $baselineResolved
         candidate_commit       = $candidateResolved
         baseline_policy        = "pre-SFS-678 defaults; policy and timeout overrides unset"
@@ -699,18 +774,24 @@ try {
         rustc_version          = (& rustc --version).Trim()
         cargo_version          = (& cargo --version).Trim()
         source_dotenv_keys     = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS,STUDIOFS_WINFSP_TEST_MOUNT_POINT"
+        build_target_directories = $buildTargetDirectories
+        build_target_directories_retained = $false
         resource_observation   = "benchmark process exact total CPU time and kernel-recorded peak working set when exposed; sampled working-set fallback otherwise; supporting evidence, not a profiler"
         system_load_observation = "processor load and free physical memory sampled before and after each native run; unavailable fields are explicit nulls"
         baseline_source_archive = "baseline-source.zip"
     }
     Write-Utf8NoBom -Path (Join-Path $artifactDirectory "environment.json") -Value ($environment | ConvertTo-Json -Depth 8)
-    Write-Utf8NoBom -Path (Join-Path $artifactDirectory "command.txt") -Value ($harnessCommand + [Environment]::NewLine + "build: " + $buildCommand + [Environment]::NewLine + "run: " + $runnerCommand + [Environment]::NewLine + "run_order=" + ($runOrderLabels -join ","))
+    Write-Utf8NoBom -Path (Join-Path $artifactDirectory "command.txt") -Value ($harnessCommand + [Environment]::NewLine + "build: " + $buildCommand + [Environment]::NewLine + "run: " + $runnerCommand + [Environment]::NewLine + "attribution: " + $attributionRunnerCommand + [Environment]::NewLine + "run_order=" + ($runOrderLabels -join ","))
 
     $builds = @{}
     foreach ($side in @("baseline", "candidate")) {
         $sideWorktree = if ($side -eq "baseline") { $snapshot } else { $repoRoot }
         Write-Host ("[{0}] release build (excluded from workload timing)" -f $side)
-        $builds[$side] = Invoke-CargoBuild -Worktree $sideWorktree -Side $side -ArtifactDirectory $artifactDirectory
+        $builds[$side] = Invoke-CargoBuild `
+            -Worktree $sideWorktree `
+            -Side $side `
+            -ArtifactDirectory $artifactDirectory `
+            -TargetDirectory $buildTargetDirectories[$side]
     }
     $environment["binary_identity"] = [ordered]@{
         baseline  = $builds["baseline"].executable_identity
@@ -731,6 +812,16 @@ try {
             -ExpectedExecutable $builds[$side].executable_identity `
             -ArtifactDirectory $artifactDirectory
     }
+    $attributionRecords = @()
+    Write-Host "[candidate] untimed metadata attribution run"
+    $attributionRecords += Invoke-CargoBenchmark `
+        -Worktree $repoRoot `
+        -Side "candidate" `
+        -Run 1 `
+        -Sequence ($runOrder.Count + 1) `
+        -ExpectedExecutable $builds["candidate"].executable_identity `
+        -ArtifactDirectory $artifactDirectory `
+        -Purpose "attribution"
     Write-Host "aggregation: workload summaries"
     $summaryRows = @()
     foreach ($side in @("baseline", "candidate")) {
@@ -738,9 +829,14 @@ try {
             $summaryRows += Get-WorkloadSummary -RunRecords $records -Side $side -Workload $workload
         }
     }
+    $attributionSummaryRows = @()
+    foreach ($workload in @("stat", "open_close", "negative_lookup", "enumeration")) {
+        $attributionSummaryRows += Get-WorkloadSummary -RunRecords $attributionRecords -Side "candidate" -Workload $workload
+    }
     $instrumentationCoverage = [ordered]@{
-        baseline  = (@($records | Where-Object { $_.side -eq "baseline" } | Select-Object -ExpandProperty instrumentation_status -Unique) -join ",")
-        candidate = (@($records | Where-Object { $_.side -eq "candidate" } | Select-Object -ExpandProperty instrumentation_status -Unique) -join ",")
+        baseline_timed       = (@($records | Where-Object { $_.side -eq "baseline" } | Select-Object -ExpandProperty instrumentation_status -Unique) -join ",")
+        candidate_timed      = (@($records | Where-Object { $_.side -eq "candidate" } | Select-Object -ExpandProperty instrumentation_status -Unique) -join ",")
+        candidate_attribution = (@($attributionRecords | Select-Object -ExpandProperty instrumentation_status -Unique) -join ",")
     }
     $environment["instrumentation_coverage"] = $instrumentationCoverage
     Write-Utf8NoBom -Path (Join-Path $artifactDirectory "environment.json") -Value ($environment | ConvertTo-Json -Depth 8)
@@ -752,6 +848,8 @@ try {
         builds                  = @($builds["baseline"], $builds["candidate"])
         runs                    = @($records)
         workloads               = @($summaryRows)
+        attribution_runs        = @($attributionRecords)
+        attribution_workloads   = @($attributionSummaryRows)
     }
     Write-Utf8NoBom -Path (Join-Path $artifactDirectory "results.json") -Value ($json | ConvertTo-Json -Depth 8)
 
@@ -762,7 +860,8 @@ try {
     $markdown.Add(("Baseline `{0}`; candidate `{1}`." -f $baselineResolved, $candidateResolved))
     $markdown.Add("")
     $markdown.Add(("Run order: `{0}`." -f ($runOrderLabels -join " -> ")))
-    $markdown.Add(("Instrumentation coverage: baseline `{0}`; candidate `{1}`." -f $instrumentationCoverage.baseline, $instrumentationCoverage.candidate))
+    $markdown.Add(("Timed instrumentation: baseline `{0}`; candidate `{1}`. Candidate attribution: `{2}` in a separate untimed run." -f $instrumentationCoverage.baseline_timed, $instrumentationCoverage.candidate_timed, $instrumentationCoverage.candidate_attribution))
+    $markdown.Add("The timed A/B comparison disables SFS-690 hot-path event counting on the candidate; attribution measurements are retained separately in `results.json` and are excluded from the timing table.")
     $markdown.Add("")
     $markdown.Add("| Workload | Baseline median (ms) | Candidate median (ms) | Baseline p95 (ms) | Candidate p95 (ms) | Change | Outliers B/C |")
     $markdown.Add("|---|---:|---:|---:|---:|---:|---:|")
@@ -781,6 +880,7 @@ try {
     }
     $markdown.Add("")
     $markdown.Add('Callback, VFS hot-path, cache, and native-cache medians are retained in `results.json`; raw CSVs preserve every pass and delta.')
+    $markdown.Add('Candidate SFS-690 attribution medians are retained under `attribution_workloads`; they are not part of the baseline/candidate timing comparison.')
     $markdown.Add('P95, sample standard deviation, coefficient of variation, and IQR outlier samples are retained per workload in `results.json`.')
     $markdown.Add(("Warm-up status: {0}. System-load observations are stored per run; unavailable CIM fields remain null." -f $environment.warmup_status))
     $markdown.Add("Enumeration timing includes correctness assertions, allocation and sorting. Close callbacks can cross workload boundaries.")
@@ -811,6 +911,15 @@ finally {
             throw "Refusing to remove baseline snapshot outside target: $resolvedSnapshot"
         }
         Remove-Item -LiteralPath $resolvedSnapshot -Recurse -Force
+    }
+    if ($buildTargetRootCreated) {
+        Write-Host "cleanup: per-side cargo target directories"
+        $resolvedBuildTargetRoot = [System.IO.Path]::GetFullPath($buildTargetRoot).TrimEnd('\')
+        $resolvedTargetRoot = [System.IO.Path]::GetFullPath($targetRoot).TrimEnd('\')
+        if (-not $resolvedBuildTargetRoot.StartsWith($resolvedTargetRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to remove build target outside target: $resolvedBuildTargetRoot"
+        }
+        Remove-Item -LiteralPath $resolvedBuildTargetRoot -Recurse -Force
     }
     Write-Host "cleanup: complete"
 }
