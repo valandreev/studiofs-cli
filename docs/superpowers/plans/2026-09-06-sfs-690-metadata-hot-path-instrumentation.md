@@ -20,6 +20,8 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 - [x] (2026-09-06) Ran focused compile/tests, formatting, PowerShell parsing, and clippy checks; final diff checks remain after the documentation/reporting polish.
 - [x] (2026-09-06) Ran the release native interleaved A/B benchmark successfully in the configured WinFSP environment; the retained final artifact is `target/perf/sfs-680-windows-metadata-ab-20260906-192059`.
 - [x] (2026-09-06) Re-ran final focused checks after commit `40a5a64` and recorded the final validation boundary.
+- [x] (2026-09-07) Verified the external review findings against current code; fixed the confirmed classifier, harness polling/resource-accounting, statistics, ordering, host-load fallback, assertion, and artifact-retention issues.
+- [ ] (2026-09-07) Run final post-review verification, native evidence, and commit the review fixes.
 
 ## Surprises & Discoveries
 
@@ -33,6 +35,9 @@ The observable proof is the registered ignored test `metadata_baseline::winfsp_m
 - Cargo's JSON build output includes messages without a `reason` property. Strict property access initially rejected those lines; the parser now checks message properties before selecting the `mount_sanity` test executable.
 - The historical baseline commit emitted the pre-SFS-690 callback-only CSV and the direct test binary initially remained ignored because Cargo's `--` separator was passed to libtest. The harness now invokes the built executable with the direct libtest argument form, marks the known baseline as `legacy`, and requires SFS-690 schema from the candidate instead of fabricating missing attribution as zero.
 - The first event-classifier implementation dropped new WinFSP-prefixed hot-path names after failing callback lookup. The focused test was expanded to cover `path_resolution` under that prefix, and the classifier now falls through correctly.
+- The review caught that the classifier test still accepted a cross-crate `directory_buffer` target. A red regression reproduced it; the classifier now restricts WinFSP-native and VFS event names to their actual prefixes, and count assertions use target names instead of raw indices.
+- The direct `mount_sanity` executable does not spawn benchmark children, so enumerating the entire Windows process table through WMI inside the 100 ms loop only perturbed the host. Polling now uses the already-owned benchmark process handle.
+- On this host and .NET runtime, `TotalProcessorTime` remains available after exit but `WorkingSet64` and `PeakWorkingSet64` become null. The harness therefore keeps exact final CPU, uses kernel peak only when exposed, and records a sampled working-set fallback source instead of writing zero.
 
 ## Decision Log
 
@@ -118,3 +123,5 @@ Plan revision: 2026-09-06 after instrumentation and harness implementation. The 
 Plan revision: 2026-09-06 after the native gate. The harness records direct executable identity and explicit legacy baseline coverage; the final native artifact passed six interleaved runs with candidate commit `40a5a64`.
 
 Plan revision: 2026-09-06 after final verification. The focused classifier and VFS regression tests passed, both changed crates passed `check`/`clippy -D warnings`, formatting, PowerShell parsing, and diff checks passed, and commit `40a5a64` is the recorded implementation boundary.
+
+Plan revision: 2026-09-07 after external review verification. A1, A2, A3, B1, B2, B3, C1, C2, and C3 were checked against current source; all recommendations were either implemented or made explicit with a host/runtime-compatible fallback. Final post-review verification and commit remain.

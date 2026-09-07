@@ -24,6 +24,14 @@ const HOT_PATH_EVENTS: [&str; 7] = [
     "get_attrs_batch",
     "directory_buffer",
 ];
+const WINFSP_HOT_PATH_EVENTS: [&str; 2] = ["path_resolution", "directory_buffer"];
+const VFS_HOT_PATH_EVENTS: [&str; 5] = [
+    "metadata_lookup",
+    "metadata_getattr",
+    "acl_check",
+    "readdir",
+    "get_attrs_batch",
+];
 const EVENT_COUNT: usize = CALLBACKS.len() + HOT_PATH_EVENTS.len();
 
 #[derive(Clone, Default)]
@@ -35,18 +43,27 @@ impl CallbackCounter {
             if let Some(index) = CALLBACKS.iter().position(|callback| *callback == name) {
                 return Some(index);
             }
-            return HOT_PATH_EVENTS
-                .iter()
-                .position(|event| *event == name)
-                .map(|index| CALLBACKS.len() + index);
+            if WINFSP_HOT_PATH_EVENTS.contains(&name) {
+                return HOT_PATH_EVENTS
+                    .iter()
+                    .position(|event| *event == name)
+                    .map(|index| CALLBACKS.len() + index);
+            }
+            return None;
         }
-        if let Some(name) = target.strip_prefix("studiofs_vfs::metadata_baseline::") {
+        if let Some(name) = target.strip_prefix("studiofs_vfs::metadata_baseline::")
+            && VFS_HOT_PATH_EVENTS.contains(&name)
+        {
             return HOT_PATH_EVENTS
                 .iter()
                 .position(|event| *event == name)
                 .map(|index| CALLBACKS.len() + index);
         }
         None
+    }
+
+    fn count_for(snapshot: &[u64; EVENT_COUNT], target: &str) -> u64 {
+        Self::event_index(target).map_or(0, |index| snapshot[index])
     }
 
     fn snapshot(&self) -> [u64; EVENT_COUNT] {
@@ -75,8 +92,16 @@ mod tests {
             Some(7)
         );
         assert_eq!(
-            CallbackCounter::event_index("studiofs_vfs::metadata_baseline::directory_buffer"),
+            CallbackCounter::event_index("studiofs_winfsp::metadata_baseline::directory_buffer"),
             Some(12)
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_vfs::metadata_baseline::directory_buffer"),
+            None
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_winfsp::metadata_baseline::metadata_lookup"),
+            None
         );
         assert_eq!(
             CallbackCounter::event_index("studiofs_vfs::metadata_baseline::unrelated"),
@@ -86,6 +111,17 @@ mod tests {
 }
 
 impl tracing::Subscriber for CallbackCounter {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if Self::event_index(metadata.target()).is_some() {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         Self::event_index(metadata.target()).is_some()
     }
@@ -261,35 +297,45 @@ fn winfsp_metadata_baseline() {
             }
         }
         let counts = counter.snapshot();
+        let count = |target| CallbackCounter::count_for(&counts, target);
         assert!(
-            counts[0] > 0,
+            count("studiofs_winfsp::metadata_baseline::get_security_by_name") > 0,
             "security-by-name instrumentation must be active"
         );
         assert!(
-            counts[1] >= 3000,
+            count("studiofs_winfsp::metadata_baseline::open") >= 3000,
             "open instrumentation must observe repeated opens"
         );
-        assert!(counts[3] > 0, "directory instrumentation must be active");
         assert!(
-            counts[6] > 0,
+            count("studiofs_winfsp::metadata_baseline::read_directory") > 0,
+            "directory instrumentation must be active"
+        );
+        assert!(
+            count("studiofs_winfsp::metadata_baseline::path_resolution") > 0,
             "path-resolution instrumentation must be active"
         );
         assert!(
-            counts[7] > 0,
+            count("studiofs_vfs::metadata_baseline::metadata_lookup") > 0,
             "metadata-lookup instrumentation must be active"
         );
         assert!(
-            counts[8] > 0,
+            count("studiofs_vfs::metadata_baseline::metadata_getattr") > 0,
             "metadata-getattr instrumentation must be active"
         );
-        assert!(counts[9] > 0, "ACL instrumentation must be active");
-        assert!(counts[10] > 0, "readdir instrumentation must be active");
         assert!(
-            counts[11] > 0,
+            count("studiofs_vfs::metadata_baseline::acl_check") > 0,
+            "ACL instrumentation must be active"
+        );
+        assert!(
+            count("studiofs_vfs::metadata_baseline::readdir") > 0,
+            "readdir instrumentation must be active"
+        );
+        assert!(
+            count("studiofs_vfs::metadata_baseline::get_attrs_batch") > 0,
             "batched-attribute instrumentation must be active"
         );
         assert!(
-            counts[12] > 0,
+            count("studiofs_winfsp::metadata_baseline::directory_buffer") > 0,
             "directory-buffer instrumentation must be active"
         );
         report

@@ -133,12 +133,24 @@ function Get-FileIdentity {
 
 function Get-SystemLoadObservation {
     $sampledAt = (Get-Date).ToUniversalTime()
-    $processors = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)
-    $loadValues = @(
-        $processors |
-            Where-Object { $null -ne $_.LoadPercentage } |
-            ForEach-Object { [double]$_.LoadPercentage }
+    $perfProcessors = @(
+        Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor `
+            -Filter "Name='_Total'" `
+            -ErrorAction SilentlyContinue
     )
+    $loadValues = @(
+        $perfProcessors |
+            Where-Object { $null -ne $_.PercentProcessorTime } |
+            ForEach-Object { [double]$_.PercentProcessorTime }
+    )
+    if ($loadValues.Count -eq 0) {
+        $processors = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)
+        $loadValues = @(
+            $processors |
+                Where-Object { $null -ne $_.LoadPercentage } |
+                ForEach-Object { [double]$_.LoadPercentage }
+        )
+    }
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     [pscustomobject][ordered]@{
         available                    = ($loadValues.Count -gt 0 -or $null -ne $os)
@@ -204,55 +216,6 @@ function Complete-CargoProcess {
         stdout    = $stdout
         stderr    = $stderr
     }
-}
-
-function Get-DescendantProcessIds {
-    param([int]$RootProcessId)
-    $parents = @{}
-    foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
-        $parents[[int]$process.ProcessId] = [int]$process.ParentProcessId
-    }
-    $ids = [System.Collections.Generic.HashSet[int]]::new()
-    $queue = [System.Collections.Generic.Queue[int]]::new()
-    $ids.Add($RootProcessId) | Out-Null
-    $queue.Enqueue($RootProcessId)
-    while ($queue.Count -gt 0) {
-        $parentId = $queue.Dequeue()
-        foreach ($entry in $parents.GetEnumerator()) {
-            if ($entry.Value -eq $parentId -and $ids.Add([int]$entry.Key)) {
-                $queue.Enqueue([int]$entry.Key)
-            }
-        }
-    }
-    [int[]]$ids
-}
-
-function Get-BenchmarkProcessIds {
-    param(
-        [int]$RootProcessId,
-        [datetime]$StartedAt
-    )
-    $ids = [System.Collections.Generic.HashSet[int]]::new()
-    $ids.Add($RootProcessId) | Out-Null
-    foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
-        if ($process.ProcessName -ne "cargo" -and
-            $process.ProcessName -notlike "mount_sanity*" -and
-            $process.ProcessName -notlike "studiofs*") {
-            continue
-        }
-        try {
-            if ($process.StartTime -ge $StartedAt) {
-                $ids.Add([int]$process.Id) | Out-Null
-            }
-        }
-        catch {
-            # A short-lived process can disappear while its start time is read.
-        }
-    }
-    foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
-        $ids.Add([int]$processId) | Out-Null
-    }
-    [int[]]$ids
 }
 
 function Invoke-CargoBuild {
@@ -360,24 +323,36 @@ function Invoke-CargoBenchmark {
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $startedAt = Get-Date
     $handle = Start-ProcessHandle -FilePath $ExpectedExecutable.path -Worktree $Worktree -Arguments $arguments
-    $cargo = $handle.process
+    $benchmarkProcess = $handle.process
     $maxWorkingSet = [int64]0
-    $cpuByProcessId = @{}
-    while (-not $cargo.HasExited) {
-        foreach ($processId in @(Get-BenchmarkProcessIds -RootProcessId $cargo.Id -StartedAt $startedAt)) {
-            try {
-                $process = Get-Process -Id $processId -ErrorAction Stop
-                $maxWorkingSet = [math]::Max($maxWorkingSet, [int64]$process.WorkingSet64)
-                $cpuByProcessId[$process.Id] = $process.TotalProcessorTime.TotalMilliseconds
-            }
-            catch {
-                # A short-lived cargo/test child can exit between discovery and sampling.
-            }
+    $maxWorkingSetSource = "sampled"
+    while (-not $benchmarkProcess.HasExited) {
+        try {
+            $benchmarkProcess.Refresh()
+            $maxWorkingSet = [math]::Max(
+                $maxWorkingSet,
+                [int64]$benchmarkProcess.WorkingSet64
+            )
+        }
+        catch {
+            # The process can exit between the status check and the sample.
         }
         Start-Sleep -Milliseconds 100
-        $cargo.Refresh()
+        $benchmarkProcess.Refresh()
     }
     $completed = Complete-CargoProcess -Handle $handle -StdoutPath $stdoutPath -StderrPath $stderrPath
+    $benchmarkProcess.Refresh()
+    $finalCpuMs = $benchmarkProcess.TotalProcessorTime.TotalMilliseconds
+    try {
+        $kernelPeakWorkingSet = [int64]$benchmarkProcess.PeakWorkingSet64
+    }
+    catch {
+        $kernelPeakWorkingSet = [int64]0
+    }
+    if ($kernelPeakWorkingSet -gt 0) {
+        $maxWorkingSet = $kernelPeakWorkingSet
+        $maxWorkingSetSource = "kernel_peak"
+    }
     $timer.Stop()
     $systemLoadAfter = Get-SystemLoadObservation
     $stdout = $completed.stdout
@@ -463,8 +438,9 @@ function Invoke-CargoBenchmark {
         instrumentation_status  = $instrumentationStatus
         exit_code               = $completed.exit_code
         wall_ms                 = [math]::Round($timer.Elapsed.TotalMilliseconds, 3)
-        process_cpu_ms          = [math]::Round((@($cpuByProcessId.Values | Measure-Object -Sum).Sum), 3)
+        process_cpu_ms          = [math]::Round($finalCpuMs, 3)
         max_working_set_bytes   = $maxWorkingSet
+        max_working_set_source  = $maxWorkingSetSource
         executable_identity     = $afterIdentity
         system_load_before      = $systemLoadBefore
         system_load_after       = $systemLoadAfter
@@ -572,6 +548,7 @@ function Get-WorkloadSummary {
             }
     )
     $elapsedMedian = Get-Median -Values $elapsedValues
+    $elapsedMean = ($elapsedValues | Measure-Object -Average).Average
     $elapsedStdDev = Get-StandardDeviation -Values $elapsedValues
     $result = [ordered]@{
         side                  = $Side
@@ -579,17 +556,18 @@ function Get-WorkloadSummary {
         instrumentation_status = (@($RunRecords | Where-Object { $_.side -eq $Side } | Select-Object -ExpandProperty instrumentation_status -Unique) -join ",")
         sample_count          = $elapsedValues.Count
         elapsed_ns_min        = [math]::Round((($elapsedValues | Measure-Object -Minimum).Minimum), 3)
+        elapsed_ns_mean       = [math]::Round($elapsedMean, 3)
         elapsed_ns_median     = [math]::Round($elapsedMedian, 3)
         elapsed_ns_p95        = [math]::Round((Get-Quantile -Values $elapsedValues -Probability 0.95), 3)
         elapsed_ns_max        = [math]::Round((($elapsedValues | Measure-Object -Maximum).Maximum), 3)
         elapsed_ns_stddev     = [math]::Round($elapsedStdDev, 3)
-        elapsed_ns_cv_percent = if ($elapsedMedian -eq 0) { 0 } else { [math]::Round(($elapsedStdDev / $elapsedMedian) * 100, 3) }
+        elapsed_ns_cv_percent = if ($elapsedMean -eq 0) { 0 } else { [math]::Round(($elapsedStdDev / $elapsedMean) * 100, 3) }
         iqr_lower_fence       = [math]::Round($lowerFence, 3)
         iqr_upper_fence       = [math]::Round($upperFence, 3)
         outlier_count         = $outlierSamples.Count
         outliers              = $outlierSamples
     }
-    foreach ($name in $passMeasurements.Keys) {
+    foreach ($name in $measurementColumns) {
         $values = $passMeasurements[$name].ToArray()
         $result["${name}_median"] = if ($values.Count -eq 0) {
             $null
@@ -721,8 +699,9 @@ try {
         rustc_version          = (& rustc --version).Trim()
         cargo_version          = (& cargo --version).Trim()
         source_dotenv_keys     = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS,STUDIOFS_WINFSP_TEST_MOUNT_POINT"
-        resource_observation   = "cargo process tree CPU time and maximum sampled working set; supporting evidence, not a profiler"
+        resource_observation   = "benchmark process exact total CPU time and kernel-recorded peak working set when exposed; sampled working-set fallback otherwise; supporting evidence, not a profiler"
         system_load_observation = "processor load and free physical memory sampled before and after each native run; unavailable fields are explicit nulls"
+        baseline_source_archive = "baseline-source.zip"
     }
     Write-Utf8NoBom -Path (Join-Path $artifactDirectory "environment.json") -Value ($environment | ConvertTo-Json -Depth 8)
     Write-Utf8NoBom -Path (Join-Path $artifactDirectory "command.txt") -Value ($harnessCommand + [Environment]::NewLine + "build: " + $buildCommand + [Environment]::NewLine + "run: " + $runnerCommand + [Environment]::NewLine + "run_order=" + ($runOrderLabels -join ","))
@@ -832,9 +811,6 @@ finally {
             throw "Refusing to remove baseline snapshot outside target: $resolvedSnapshot"
         }
         Remove-Item -LiteralPath $resolvedSnapshot -Recurse -Force
-        if (Test-Path -LiteralPath $snapshotArchive) {
-            Remove-Item -LiteralPath $snapshotArchive -Force
-        }
     }
     Write-Host "cleanup: complete"
 }
