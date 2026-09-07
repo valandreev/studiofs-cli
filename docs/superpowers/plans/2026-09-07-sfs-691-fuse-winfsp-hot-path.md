@@ -34,9 +34,11 @@ deferred, and invalidation behavior remains covered by focused tests.
 - [x] (2026-09-07) Ran the release native interleaved SFS-690 A/B benchmark with baseline `a99fb44d` and candidate `44ff791f`; retained fresh artifacts and measured the required workloads.
 - [x] (2026-09-07) Added a red test for direct normalized path-key encoding, then implemented borrowed path-cache lookup with an inline `SmallVec` key; full component strings remain fallback-only.
 - [x] (2026-09-07) Re-ran the focused path, namespace, invalidation, metadata, WinFSP, check, and clippy validation after the key-preparation change.
-- [ ] Run a fresh release native interleaved A/B benchmark for the key-preparation candidate and record whether the additional optimization improves the hot path without regressions.
+- [x] (2026-09-07) Ran the fresh release native interleaved SFS-690 A/B benchmark with baseline `44ff791f` and candidate `885e7eda`; recorded latency gains, resource-cost signals, and the remaining `metadata_getattr` work.
 - [x] (2026-09-07) Updated SFS-691 in Linear with the implementation, validation, and benchmark evidence; left it `In Progress` for review rather than closing it on median evidence alone.
-- [x] (2026-09-07) Committed all intended task files as `44ff791f` with `perf: reuse observed attrs on WinFSP hot paths`.
+- [x] (2026-09-07) Updated SFS-691 in Linear with the follow-up key-preparation implementation and five-run native benchmark evidence; left it `In Progress` because CPU/working-set and residual-getattr signals still need review.
+- [x] (2026-09-07) Committed the initial SFS-691 implementation as `44ff791f` with `perf: reuse observed attrs on WinFSP hot paths`.
+- [x] (2026-09-07) Committed the follow-up key-preparation optimization as `885e7eda` with `perf: avoid hot path key allocations`.
 
 ## Surprises & Discoveries
 
@@ -64,6 +66,12 @@ deferred, and invalidation behavior remains covered by focused tests.
   owned encoded cache key before every shortcut lookup. The second optimization
   moves normalization and encoding to an inline borrowed lookup key; a miss
   pays the existing component parse only after the cache has been checked.
+- The five-run follow-up reduced timed medians by `-6.5%` for `stat`, `-2.9%`
+  for `open_close`, `0.0%` for `negative_lookup`, and `-1.4%` for
+  `enumeration`; all four p95 values also decreased. The candidate process CPU
+  median was `1.0%` higher and max working set was about `14%` higher, while
+  candidate attribution still showed `1000` `metadata_getattr` events for
+  `stat` and `open_close`.
 
 ## Decision Log
 
@@ -122,8 +130,14 @@ artifact has successful fresh reports, exact binary identities, and the
   required candidate attribution run. The Linear issue remains open for its
   owner's review; it is not closed here.
 
-The follow-up key-preparation optimization is implemented but requires its own
-fresh native A/B comparison before it can be considered an improvement.
+The follow-up key-preparation optimization is implemented and has been measured
+against the previous SFS-691 candidate.
+
+That comparison is now recorded in
+`target/perf/sfs-680-windows-metadata-ab-20260907-155249`: it improved the
+latency distributions, including `stat` p95, but retained a small aggregate
+resource-cost signal and did not remove the residual attribute work. The Linear
+issue remains `In Progress` for review.
 
 ## Context and Orientation
 
