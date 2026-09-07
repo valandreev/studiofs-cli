@@ -526,6 +526,12 @@ impl<'a> NormalizedPath<'a> {
         Some(&self.encoded)
     }
 
+    fn component_bytes(&self, index: usize) -> Option<&[u8]> {
+        self.components
+            .get(index)
+            .map(|component| component.as_bytes())
+    }
+
     #[cfg(test)]
     fn into_encoded(self) -> Option<SmallVec<[u8; PathShortcutCacheKey::INLINE_PATH_CAPACITY]>> {
         (!self.components.is_empty()).then_some(self.encoded)
@@ -543,15 +549,15 @@ impl Borrow<[u8]> for PathShortcutCacheKey {
 }
 
 /// Cached value for memoized full-path resolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(super) enum PathShortcutCacheValue {
     /// Positive path resolution: full path maps to inode and a valid attr observation.
     Positive {
         ino: Ino,
         attr_observation: AttrReadObservation,
     },
-    /// Negative path resolution: parent+name pair is known missing.
-    Negative { parent: Ino, name: Arc<[u8]> },
+    /// Negative path resolution: the indexed component is missing under `parent`.
+    Negative { parent: Ino, component_index: usize },
 }
 
 /// Captured parent and generation snapshot used to validate shortcut freshness.
@@ -648,19 +654,14 @@ struct PathShortcutCachePolicy;
 impl PathShortcutCachePolicy {
     fn estimate_entry_charge_for(
         key: &PathShortcutCacheKey,
-        value: &PathShortcutCacheValue,
+        _value: &PathShortcutCacheValue,
         parent_tokens: &[PathShortcutParentToken],
     ) -> usize {
-        let negative_name_len = match value {
-            PathShortcutCacheValue::Positive { .. } => 0,
-            PathShortcutCacheValue::Negative { name, .. } => name.len(),
-        };
         std::mem::size_of::<PathShortcutCacheKey>()
             .saturating_add(std::mem::size_of::<
                 TwoTierEntry<PathShortcutCacheValue, PathShortcutCacheMeta>,
             >())
             .saturating_add(key.path.len())
-            .saturating_add(negative_name_len)
             .saturating_add(
                 parent_tokens
                     .len()
@@ -855,6 +856,7 @@ impl<'a> NamespaceResolver<'a> {
     fn resolve_cached_path_shortcut(
         &self,
         cached: PathShortcutCacheValue,
+        negative_name: Option<&[u8]>,
     ) -> VfsResult<Option<InodeAttr>> {
         match cached {
             PathShortcutCacheValue::Positive {
@@ -868,8 +870,11 @@ impl<'a> NamespaceResolver<'a> {
                 Err(VfsError::Meta(MetaError::InodeNotFound(_))) => Ok(None),
                 Err(err) => Err(err),
             },
-            PathShortcutCacheValue::Negative { parent, name } => {
-                Err(Self::component_not_found(parent, name.as_ref()))
+            PathShortcutCacheValue::Negative { parent, .. } => {
+                let Some(name) = negative_name else {
+                    return Ok(None);
+                };
+                Err(Self::component_not_found(parent, name))
             }
         }
     }
@@ -894,7 +899,7 @@ impl<'a> NamespaceResolver<'a> {
             let mut current = ROOT_INO;
             let mut attr = self.vfs.getattr(ROOT_INO)?;
             let mut parent_tokens = Vec::with_capacity(components.len());
-            for component in components {
+            for (component_index, component) in components.iter().enumerate() {
                 parent_tokens.push(PathShortcutParentToken {
                     parent: current,
                     generation: self.vfs.directory_generation(current),
@@ -909,7 +914,7 @@ impl<'a> NamespaceResolver<'a> {
                             self.vfs.path_shortcut_cache_insert_negative_by_key(
                                 key,
                                 current,
-                                component.as_bytes(),
+                                component_index,
                                 parent_tokens,
                                 observed_epoch,
                             );
@@ -936,7 +941,13 @@ impl<'a> NamespaceResolver<'a> {
             && let Some(key) = &cache_key
             && let Some(cached) = self.vfs.path_shortcut_cache_lookup_by_key(key)
         {
-            return match self.resolve_cached_path_shortcut(cached)? {
+            let negative_name = match &cached {
+                PathShortcutCacheValue::Negative {
+                    component_index, ..
+                } => components.get(*component_index).map(String::as_bytes),
+                PathShortcutCacheValue::Positive { .. } => None,
+            };
+            return match self.resolve_cached_path_shortcut(cached, negative_name)? {
                 Some(attr) => Ok(attr),
                 None => do_resolve(),
             };
@@ -960,7 +971,13 @@ impl<'a> NamespaceResolver<'a> {
             .vfs
             .path_shortcut_cache_lookup_by_encoded_path(encoded_path)
         {
-            return match self.resolve_cached_path_shortcut(cached)? {
+            let negative_name = match &cached {
+                PathShortcutCacheValue::Negative {
+                    component_index, ..
+                } => normalized.component_bytes(*component_index),
+                PathShortcutCacheValue::Positive { .. } => None,
+            };
+            return match self.resolve_cached_path_shortcut(cached, negative_name)? {
                 Some(attr) => Ok(attr),
                 None => {
                     let cache_key = PathShortcutCacheKey::from_encoded(encoded_path);
@@ -1438,12 +1455,12 @@ impl StudioVfs {
         );
     }
 
-    /// Caches negative full-path resolution by key with missing `(parent,name)` pair.
+    /// Caches negative full-path resolution by key with the missing component index.
     pub(super) fn path_shortcut_cache_insert_negative_by_key(
         &self,
         key: PathShortcutCacheKey,
         parent: Ino,
-        name: &[u8],
+        component_index: usize,
         parent_tokens: Vec<PathShortcutParentToken>,
         observed_epoch: u64,
     ) {
@@ -1451,7 +1468,7 @@ impl StudioVfs {
             key,
             PathShortcutCacheValue::Negative {
                 parent,
-                name: Arc::from(name),
+                component_index,
             },
             observed_epoch,
             parent_tokens,
@@ -1761,7 +1778,7 @@ mod tests {
             key_b.clone(),
             PathShortcutCacheValue::Negative {
                 parent: ROOT_INO,
-                name: Arc::from(&b"missing"[..]),
+                component_index: 1,
             },
             0,
             tokens.clone(),
@@ -1851,6 +1868,31 @@ mod tests {
 
         assert!(after.hits > before.hits);
         assert!(after.negative_hits > before.negative_hits);
+    }
+
+    #[test]
+    fn negative_path_shortcut_value_is_copyable_for_allocation_free_hits() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<PathShortcutCacheValue>();
+    }
+
+    #[test]
+    fn namespace_resolver_negative_path_shortcut_preserves_intermediate_component() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "negative-intermediate-component");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Windows);
+
+        for _ in 0..2 {
+            let error = resolver
+                .resolve_path(r"\missing-dir\child.txt")
+                .expect_err("missing intermediate component");
+            assert!(matches!(
+                error,
+                VfsError::Meta(MetaError::EntryNotFound { parent: ROOT_INO, name })
+                    if name == "missing-dir"
+            ));
+        }
     }
 
     #[test]
@@ -2067,7 +2109,7 @@ mod tests {
         vfs.path_shortcut_cache_insert_negative_by_key(
             key.clone(),
             ROOT_INO,
-            b"missing",
+            0,
             parent_tokens.clone(),
             observed,
         );
