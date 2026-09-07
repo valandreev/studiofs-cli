@@ -193,6 +193,11 @@ mod tests {
             name: "missing".into(),
         });
         assert_eq!(classify_vfs_error(&not_found), BridgeVfsErrorKind::NotFound);
+        let io_not_found = crate::VfsError::Io(std::io::Error::from(ErrorKind::NotFound));
+        assert_eq!(
+            classify_vfs_error(&io_not_found),
+            BridgeVfsErrorKind::NotFound
+        );
 
         let exists = crate::VfsError::Meta(MetaError::EntryExists {
             parent: 1,

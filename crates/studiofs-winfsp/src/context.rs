@@ -74,6 +74,7 @@ const READ_CONTROL_ACCESS: FILE_ACCESS_RIGHTS = 0x0002_0000;
 const SYNCHRONIZE_ACCESS: FILE_ACCESS_RIGHTS = 0x0010_0000;
 const DEFAULT_DIR_MODE: u16 = 0o755;
 const DEFAULT_FILE_MODE: u16 = 0o644;
+const PATH_STACK_BUFFER_BYTES: usize = 1024;
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -684,10 +685,38 @@ fn resolve_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<InodeAttr> {
     if is_runtime_stats_windows_path(path) {
         return Ok(vfs.runtime_stats_file_attr());
     }
-    let s = path.to_string_lossy();
-    vfs.namespace_resolver(NamespacePathStyle::Windows)
-        .resolve_path(&s)
-        .map_err(vfs_to_winfsp_err)
+    with_lossy_utf16_path(path, |path| {
+        vfs.namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_path_for_mount(path)
+            .map_err(vfs_to_winfsp_err)
+    })
+}
+
+/// Decodes the usual short WinFSP path without allocating; long paths fall back
+/// to the canonical widestring conversion.
+fn with_lossy_utf16_path<T>(path: &U16CStr, f: impl FnOnce(&str) -> T) -> T {
+    let mut buffer = [0_u8; PATH_STACK_BUFFER_BYTES];
+    let mut length = 0;
+    for code_point in std::char::decode_utf16(path.as_slice().iter().copied())
+        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+    {
+        let mut encoded = [0_u8; 4];
+        let encoded = code_point.encode_utf8(&mut encoded).as_bytes();
+        if encoded.len() > buffer.len().saturating_sub(length) {
+            let owned = path.to_string_lossy();
+            return f(&owned);
+        }
+        buffer[length..length + encoded.len()].copy_from_slice(encoded);
+        length += encoded.len();
+    }
+
+    match std::str::from_utf8(&buffer[..length]) {
+        Ok(decoded) => f(decoded),
+        Err(_) => {
+            let owned = path.to_string_lossy();
+            f(&owned)
+        }
+    }
 }
 
 fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
@@ -718,12 +747,13 @@ fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
 ///
 /// Handles `.`, `..`, and trailing-dot/space stripping like `resolve_path`.
 fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u8>)> {
-    let s = path.to_string_lossy();
-    let parent = vfs
-        .namespace_resolver(NamespacePathStyle::Windows)
-        .resolve_parent(&s)
-        .map_err(vfs_to_winfsp_err)?;
-    Ok((parent.parent, parent.name))
+    with_lossy_utf16_path(path, |path| {
+        let parent = vfs
+            .namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_parent(path)
+            .map_err(vfs_to_winfsp_err)?;
+        Ok((parent.parent, parent.name))
+    })
 }
 
 fn hidden_platform_root_path_component(path: &str) -> Option<&'static [u8]> {
@@ -740,13 +770,23 @@ fn hidden_platform_root_path_component(path: &str) -> Option<&'static [u8]> {
 }
 
 fn maybe_hide_platform_root_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<bool> {
-    let display_path = path.to_string_lossy();
-    let Some(name) = hidden_platform_root_path_component(&display_path) else {
+    let first_component = path
+        .as_slice()
+        .iter()
+        .copied()
+        .find(|&unit| unit != b'\\' as u16 && unit != b'/' as u16);
+    if first_component != Some(b'.' as u16) {
         return Ok(false);
-    };
-    vfs.heal_dangling_entry_if_inode_missing(ROOT_INO, name)
-        .map_err(vfs_to_winfsp_err)?;
-    Ok(true)
+    }
+
+    with_lossy_utf16_path(path, |display_path| {
+        let Some(name) = hidden_platform_root_path_component(display_path) else {
+            return Ok(false);
+        };
+        vfs.heal_dangling_entry_if_inode_missing(ROOT_INO, name)
+            .map_err(vfs_to_winfsp_err)?;
+        Ok(true)
+    })
 }
 
 fn maybe_hide_platform_root_entry(
@@ -2509,19 +2549,20 @@ mod tests {
         FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
         FILE_NOTIFY_CHANGE_SIZE, FILE_OVERWRITE_IF_DISPOSITION, FILE_READ_ATTRIBUTES_ACCESS,
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
-        FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PreparedWinfspNotifications,
-        READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR,
-        STATUS_DISK_CORRUPT_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
-        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
-        WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
-        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
-        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
-        is_runtime_stats_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
-        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
+        FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PATH_STACK_BUFFER_BYTES,
+        PreparedWinfspNotifications, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
+        STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR, STATUS_DISK_CORRUPT_ERROR, STATUS_EA_TOO_LARGE,
+        STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
+        STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
+        WinfspAsyncCallbackTracker, WinfspInvalidationQueue, WinfspKernelInvalidator,
+        WinfspMetadataCachePolicy, attr_to_file_info, build_basic_info_setattr_args,
+        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
+        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        maybe_hide_platform_root_path, notify_filter_for_kind, open_flags_from_access,
+        resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
         unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
-        write_local_sync_policy_from_create_options,
+        with_lossy_utf16_path, write_local_sync_policy_from_create_options,
         write_local_sync_policy_from_create_parameters,
     };
     use std::collections::BTreeSet;
@@ -3536,6 +3577,23 @@ mod tests {
     }
 
     #[test]
+    fn lossy_utf16_path_decoder_matches_widestring_for_short_and_long_paths() {
+        let short_path =
+            U16CString::from_vec(vec![b'\\' as u16, 0xd83d, 0xdc96, 0xd800]).expect("utf16 path");
+        assert_eq!(
+            with_lossy_utf16_path(short_path.as_ucstr(), str::to_owned),
+            String::from_utf16_lossy(short_path.as_ucstr().as_slice())
+        );
+
+        let long_path = format!(r"\{}", "a".repeat(PATH_STACK_BUFFER_BYTES));
+        let long_path = U16CString::from_str(&long_path).expect("long utf16 path");
+        assert_eq!(
+            with_lossy_utf16_path(long_path.as_ucstr(), str::to_owned),
+            long_path.to_string_lossy()
+        );
+    }
+
+    #[test]
     fn winfsp_runtime_stats_open_disables_os_cache() {
         let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-cache-policy");
         let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
@@ -4067,6 +4125,18 @@ mod tests {
         );
         assert_eq!(hidden_platform_root_path_component(r"\visible"), None);
         assert_eq!(hidden_platform_root_path_component(r"\docs\.Trashes"), None);
+    }
+
+    #[test]
+    fn maybe_hide_platform_root_path_filters_by_first_utf16_component() {
+        let (_tmp, vfs, _ctx, _queue) = make_test_context("hidden-root-path-filter");
+        for path in [r"\visible", r"/visible", r"\", r""] {
+            let path = U16CString::from_str(path).expect("u16 path");
+            assert!(!maybe_hide_platform_root_path(&vfs, path.as_ucstr()).expect("check path"));
+        }
+
+        let hidden = U16CString::from_str(r"\.Trashes\501").expect("u16 hidden path");
+        assert!(maybe_hide_platform_root_path(&vfs, hidden.as_ucstr()).expect("hide path"));
     }
 
     #[test]
