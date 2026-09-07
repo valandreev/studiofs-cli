@@ -1793,6 +1793,46 @@ impl StudioVfs {
         ReadMetadataResolver::new(self, ino).resolve_attr_sync()
     }
 
+    pub(super) fn attr_read_observation(&self, ino: Ino) -> super::AttrReadObservation {
+        self.state.namespace.attr_read_cache.lock().observation(ino)
+    }
+
+    pub(super) fn cached_attr_for_path_shortcut(
+        &self,
+        ino: Ino,
+        expected: super::AttrReadObservation,
+    ) -> VfsResult<Option<InodeAttr>> {
+        if self.ignored_entry_attr(ino).is_some()
+            || self.deferred_namespace_attr(ino).is_some()
+            || self.peek_dirty_attr(ino).is_some()
+        {
+            return Ok(None);
+        }
+
+        let Some(attr) = self.state.namespace.attr_read_cache.lock().get_if_observed(
+            ino,
+            expected,
+            Instant::now(),
+        ) else {
+            return Ok(None);
+        };
+
+        if MetadataRefreshDecision::for_local_attr(
+            &attr,
+            self.has_pending_local_dirty_payloads_for_inode(ino),
+            self.inode_has_dirty_writer_stack(ino),
+            self.inode_has_pending_uploads(ino),
+            self.has_pending_incarnation_newer_than(ino, attr.committed_content_epoch),
+            self.has_deferred_namespace_metadata(ino),
+        ) == MetadataRefreshDecision::RefreshAuthoritative
+        {
+            return Ok(None);
+        }
+
+        self.enforce_access(ino, AccessLevel::ReadOnly)?;
+        Ok(Some(attr))
+    }
+
     pub(super) async fn getattr_async_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
         trace!(
             target: "studiofs_vfs::metadata_baseline::metadata_getattr",

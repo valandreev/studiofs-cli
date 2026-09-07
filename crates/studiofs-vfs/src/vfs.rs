@@ -1237,7 +1237,7 @@ impl AttrReadCacheMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AttrReadObservation {
     global_generation: u64,
     inode_generation: u64,
@@ -1288,6 +1288,19 @@ impl AttrReadCache {
 
     fn get(&mut self, ino: Ino, now: Instant) -> Option<InodeAttr> {
         self.inner.get(&ino, now)
+    }
+
+    fn get_if_observed(
+        &mut self,
+        ino: Ino,
+        expected: AttrReadObservation,
+        now: Instant,
+    ) -> Option<InodeAttr> {
+        if self.observation(ino) != expected {
+            return None;
+        }
+        let attr = self.get(ino, now)?;
+        (self.observation(ino) == expected).then_some(attr)
     }
 
     fn put(&mut self, ino: Ino, attr: InodeAttr, ttl: Duration, now: Instant) {

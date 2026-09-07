@@ -435,8 +435,11 @@ impl PathShortcutCacheKey {
 /// Cached value for memoized full-path resolution.
 #[derive(Debug, Clone)]
 pub(super) enum PathShortcutCacheValue {
-    /// Positive path resolution: full path maps to inode.
-    Positive(Ino),
+    /// Positive path resolution: full path maps to inode and a valid attr observation.
+    Positive {
+        ino: Ino,
+        attr_observation: AttrReadObservation,
+    },
     /// Negative path resolution: parent+name pair is known missing.
     Negative { parent: Ino, name: Arc<[u8]> },
 }
@@ -539,7 +542,7 @@ impl PathShortcutCachePolicy {
         parent_tokens: &[PathShortcutParentToken],
     ) -> usize {
         let negative_name_len = match value {
-            PathShortcutCacheValue::Positive(_) => 0,
+            PathShortcutCacheValue::Positive { .. } => 0,
             PathShortcutCacheValue::Negative { name, .. } => name.len(),
         };
         std::mem::size_of::<PathShortcutCacheKey>()
@@ -783,9 +786,11 @@ impl<'a> NamespaceResolver<'a> {
                 }
             }
             if let Some(key) = cache_key.clone() {
+                let attr_observation = self.vfs.attr_read_observation(attr.ino);
                 self.vfs.path_shortcut_cache_insert_positive_by_key(
                     key,
                     attr.ino,
+                    attr_observation,
                     parent_tokens,
                     observed_epoch,
                 );
@@ -797,8 +802,15 @@ impl<'a> NamespaceResolver<'a> {
             && let Some(cached) = self.vfs.path_shortcut_cache_lookup_by_key(key)
         {
             return match cached {
-                PathShortcutCacheValue::Positive(ino) => match self.vfs.getattr(ino) {
-                    Ok(attr) => Ok(attr),
+                PathShortcutCacheValue::Positive {
+                    ino,
+                    attr_observation,
+                } => match self
+                    .vfs
+                    .cached_attr_for_path_shortcut(ino, attr_observation)
+                {
+                    Ok(Some(attr)) => Ok(attr),
+                    Ok(None) => do_resolve(),
                     Err(VfsError::Meta(MetaError::InodeNotFound(_))) => do_resolve(),
                     Err(err) => Err(err),
                 },
@@ -1255,12 +1267,16 @@ impl StudioVfs {
         &self,
         key: PathShortcutCacheKey,
         child_ino: Ino,
+        attr_observation: AttrReadObservation,
         parent_tokens: Vec<PathShortcutParentToken>,
         observed_epoch: u64,
     ) {
         self.state.namespace.path_shortcut_cache.lock().put(
             key,
-            PathShortcutCacheValue::Positive(child_ino),
+            PathShortcutCacheValue::Positive {
+                ino: child_ino,
+                attr_observation,
+            },
             observed_epoch,
             parent_tokens,
         );
@@ -1568,14 +1584,20 @@ mod tests {
         }];
         let single_charge = PathShortcutCache::estimate_entry_charge(
             &key_a,
-            &PathShortcutCacheValue::Positive(11),
+            &PathShortcutCacheValue::Positive {
+                ino: 11,
+                attr_observation: AttrReadObservation::default(),
+            },
             &tokens,
         );
         let mut cache = PathShortcutCache::new(2, single_charge * 4);
 
         cache.put(
             key_a.clone(),
-            PathShortcutCacheValue::Positive(11),
+            PathShortcutCacheValue::Positive {
+                ino: 11,
+                attr_observation: AttrReadObservation::default(),
+            },
             0,
             tokens.clone(),
         );
@@ -1591,7 +1613,10 @@ mod tests {
         assert_eq!(cache.entry_len(), 2);
         assert!(matches!(
             cache.get(&key_a, 0, |_| 0),
-            Some(PathShortcutCacheValue::Positive(11))
+            Some(PathShortcutCacheValue::Positive {
+                ino,
+                attr_observation,
+            }) if ino == 11 && attr_observation == AttrReadObservation::default()
         ));
         assert!(matches!(
             cache.get(&key_b, 0, |_| 0),
@@ -1605,12 +1630,116 @@ mod tests {
         .expect("path key c");
         cache.put(
             key_c.clone(),
-            PathShortcutCacheValue::Positive(33),
+            PathShortcutCacheValue::Positive {
+                ino: 33,
+                attr_observation: AttrReadObservation::default(),
+            },
             0,
             tokens,
         );
         assert_eq!(cache.entry_len(), 2);
         assert!(cache.get(&key_c, 0, |_| 0).is_some());
+    }
+
+    #[test]
+    fn positive_path_shortcut_reuses_current_attribute_observation() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-attr-observation");
+        let file = vfs
+            .create(ROOT_INO, b"observed.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        let first = resolver
+            .resolve_path("/observed.txt")
+            .expect("resolve file");
+        let observed = vfs.attr_read_observation(file.ino);
+        let key = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Posix,
+            &[String::from("observed.txt")],
+        )
+        .expect("path key");
+        let cached = vfs
+            .path_shortcut_cache_lookup_by_key(&key)
+            .expect("positive path shortcut");
+
+        assert!(matches!(
+            cached,
+            PathShortcutCacheValue::Positive {
+                ino,
+                attr_observation
+            } if ino == file.ino && attr_observation == observed
+        ));
+        assert_eq!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("reuse cached attr")
+                .expect("cached attr should be reusable"),
+            first
+        );
+    }
+
+    #[test]
+    fn positive_path_shortcut_falls_back_for_dirty_deferred_or_stale_attrs() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-shortcut-attr-fallback");
+        let file = vfs
+            .create(ROOT_INO, b"fallback.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        resolver
+            .resolve_path("/fallback.txt")
+            .expect("prime positive path shortcut");
+        let observed = vfs.attr_read_observation(file.ino);
+
+        let mut dirty_attr = vfs.getattr_unchecked(file.ino).expect("read file attr");
+        dirty_attr.size = dirty_attr.size.saturating_add(1);
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(file.ino, dirty_attr.clone());
+        assert!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("check dirty attr fallback")
+                .is_none(),
+            "positive shortcut must not bypass dirty local attributes"
+        );
+        assert_eq!(
+            resolver
+                .resolve_path("/fallback.txt")
+                .expect("resolve through dirty fallback")
+                .size,
+            dirty_attr.size
+        );
+
+        vfs.state.namespace.dirty_attrs.lock().remove(&file.ino);
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .attrs
+            .insert(file.ino, dirty_attr);
+        assert!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("check deferred attr fallback")
+                .is_none(),
+            "positive shortcut must not bypass deferred namespace attributes"
+        );
+
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .attrs
+            .remove(&file.ino);
+        vfs.invalidate_attr_read_cache([file.ino]);
+        assert!(
+            vfs.cached_attr_for_path_shortcut(file.ino, observed)
+                .expect("check retired observation fallback")
+                .is_none(),
+            "positive shortcut must reject a retired attribute observation"
+        );
     }
 
     #[test]
@@ -1644,6 +1773,7 @@ mod tests {
         vfs.path_shortcut_cache_insert_positive_by_key(
             key.clone(),
             ROOT_INO,
+            AttrReadObservation::default(),
             parent_tokens,
             observed,
         );
@@ -1673,11 +1803,22 @@ mod tests {
         ];
         let charge = PathShortcutCache::estimate_entry_charge(
             &key,
-            &PathShortcutCacheValue::Positive(9),
+            &PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
             &tokens,
         );
         let mut cache = PathShortcutCache::new(8, charge * 8);
-        cache.put(key.clone(), PathShortcutCacheValue::Positive(9), 3, tokens);
+        cache.put(
+            key.clone(),
+            PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
+            3,
+            tokens,
+        );
 
         assert!(
             cache
@@ -1710,13 +1851,19 @@ mod tests {
         }];
         let charge = PathShortcutCache::estimate_entry_charge(
             &key,
-            &PathShortcutCacheValue::Positive(9),
+            &PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
             &tokens,
         );
         let mut cache = PathShortcutCache::new(8, charge * 32);
         cache.put(
             key.clone(),
-            PathShortcutCacheValue::Positive(9),
+            PathShortcutCacheValue::Positive {
+                ino: 9,
+                attr_observation: AttrReadObservation::default(),
+            },
             1,
             tokens.clone(),
         );
