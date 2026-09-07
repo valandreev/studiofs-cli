@@ -32,6 +32,9 @@ deferred, and invalidation behavior remains covered by focused tests.
 - [x] (2026-09-07) Added focused safety tests for stale observations and local-first states; the 9 path-shortcut, 5 namespace-resolver, 3 `getattr_unchecked`, 6 semantic-invalidation, and 3 WinFSP unit tests passed.
 - [x] (2026-09-07) Formatting, diff checks, targeted `cargo check`, and targeted `cargo clippy --all-targets -- -D warnings` passed without invoking workspace-wide suites.
 - [x] (2026-09-07) Ran the release native interleaved SFS-690 A/B benchmark with baseline `a99fb44d` and candidate `44ff791f`; retained fresh artifacts and measured the required workloads.
+- [x] (2026-09-07) Added a red test for direct normalized path-key encoding, then implemented borrowed path-cache lookup with an inline `SmallVec` key; full component strings remain fallback-only.
+- [x] (2026-09-07) Re-ran the focused path, namespace, invalidation, metadata, WinFSP, check, and clippy validation after the key-preparation change.
+- [ ] Run a fresh release native interleaved A/B benchmark for the key-preparation candidate and record whether the additional optimization improves the hot path without regressions.
 - [x] (2026-09-07) Updated SFS-691 in Linear with the implementation, validation, and benchmark evidence; left it `In Progress` for review rather than closing it on median evidence alone.
 - [x] (2026-09-07) Committed all intended task files as `44ff791f` with `perf: reuse observed attrs on WinFSP hot paths`.
 
@@ -57,6 +60,10 @@ deferred, and invalidation behavior remains covered by focused tests.
   for `open_close`, `-6.4%` for `negative_lookup`, and `-1.7%` for
   `enumeration`; candidate enumeration reported two IQR outliers, and no
   workload process failed.
+- The first SFS-691 optimization still rebuilt `Vec<String>` components and an
+  owned encoded cache key before every shortcut lookup. The second optimization
+  moves normalization and encoding to an inline borrowed lookup key; a miss
+  pays the existing component parse only after the cache has been checked.
 
 ## Decision Log
 
@@ -112,8 +119,11 @@ interleaved results comparing baseline
 p95 improved slightly (`72.453 -> 72.057 ms`), while `stat` p95 was higher
 (`73.337 -> 78.048 ms`) and candidate enumeration had two IQR outliers. The
 artifact has successful fresh reports, exact binary identities, and the
-required candidate attribution run. The Linear issue remains open for its
-owner's review; it is not closed here.
+  required candidate attribution run. The Linear issue remains open for its
+  owner's review; it is not closed here.
+
+The follow-up key-preparation optimization is implemented but requires its own
+fresh native A/B comparison before it can be considered an improvement.
 
 ## Context and Orientation
 
