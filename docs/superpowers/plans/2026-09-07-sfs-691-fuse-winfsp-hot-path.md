@@ -29,11 +29,11 @@ deferred, and invalidation behavior remains covered by focused tests.
 - [x] (2026-09-07) Confirmed the relevant graph index coverage has no recorded parse gaps; the source is metadata-changed and must remain the source of truth.
 - [x] (2026-09-07) Added the first red focused test for observation-bound positive path reuse; before implementation it failed to compile because the observation-aware value and helpers did not exist.
 - [x] (2026-09-07) Implemented the observation-aware cache fusion and preserved access, dirty, deferred, orphan, symlink, and invalidation fallbacks in the shared VFS resolver.
-- [ ] Add focused safety tests for stale observations and local-first states, then run focused VFS/WinFSP validation.
-- [ ] Run formatting, diff checks, and targeted clippy/checks without invoking workspace-wide suites.
-- [ ] Run the release native interleaved SFS-690 A/B benchmark if the configured WinFSP mount and `.env` prerequisites are available; retain its artifact path and report whether the required workloads improved.
+- [x] (2026-09-07) Added focused safety tests for stale observations and local-first states; the 9 path-shortcut, 5 namespace-resolver, 3 `getattr_unchecked`, 6 semantic-invalidation, and 3 WinFSP unit tests passed.
+- [x] (2026-09-07) Formatting, diff checks, targeted `cargo check`, and targeted `cargo clippy --all-targets -- -D warnings` passed without invoking workspace-wide suites.
+- [x] (2026-09-07) Ran the release native interleaved SFS-690 A/B benchmark with baseline `a99fb44d` and candidate `44ff791f`; retained fresh artifacts and measured the required workloads.
 - [ ] Update SFS-691 in Linear with the implementation, validation, and benchmark evidence; do not close it without the final native evidence or an explicit environment-gated report.
-- [ ] Commit all intended task files with an English `<type>: <subject>` commit message.
+- [x] (2026-09-07) Committed all intended task files as `44ff791f` with `perf: reuse observed attrs on WinFSP hot paths`.
 
 ## Surprises & Discoveries
 
@@ -46,12 +46,17 @@ deferred, and invalidation behavior remains covered by focused tests.
   cache currently discards that attribute and stores only its inode.
 - SFS-690 already measures `path_shortcut_cache_*`, `attr_read_cache_*`, and
   `metadata_getattr` at the real boundaries. The implementation will reuse
-  these existing attribution counters and add a trace message for fused-hit
-  versus fallback reasoning only if the focused validation shows the existing
-  counters cannot explain the path.
+  these existing attribution counters; no new hot-path trace target was added
+  because the harness already attributes the relevant cache and getattr work,
+  while an extra trace event would add work to the optimized path.
 - The previous SFS-680 sequential comparison was not decisive under changing
   host load, so performance acceptance must use the existing interleaved
   baseline/candidate harness rather than sequential timing claims.
+- The SFS-690 harness completed all six timed processes and one untimed
+  attribution process. Timed medians changed by `-12.0%` for `stat`, `-6.5%`
+  for `open_close`, `-6.4%` for `negative_lookup`, and `-1.7%` for
+  `enumeration`; candidate enumeration reported two IQR outliers, and no
+  workload process failed.
 
 ## Decision Log
 
@@ -81,13 +86,34 @@ deferred, and invalidation behavior remains covered by focused tests.
   authority.
   Rationale: These are explicit issue and StudioFS contract boundaries.
   Date/Author: 2026-09-07 / Codex.
+- Decision: Use the existing SFS-690 cache and `metadata_getattr` counters for
+  attribution and keep the benchmark harness/schema unchanged.
+  Rationale: The native attribution run reported the candidate's path-shortcut
+  hits, attr-cache hits, and remaining `metadata_getattr` work without adding
+  a new per-hit counter or production trace overhead. The timing comparison is
+  already interleaved and binary-identified.
+  Date/Author: 2026-09-07 / Codex.
 
 ## Outcomes & Retrospective
 
-This section is updated at each completed milestone. At completion it will
-state whether the focused tests passed, which native workloads changed versus
-the SFS-690 baseline, whether negative lookup and enumeration remained safe,
-and which environment prerequisites, if any, prevented native confirmation.
+The implementation is complete and committed in `44ff791f`. The shared VFS
+resolver now records the attr observation with positive path shortcuts and
+reuses the attr-cache entry only after observation, TTL, local-first, and read
+access checks. The focused tests and targeted checks passed.
+
+The native artifact
+`target/perf/sfs-680-windows-metadata-ab-20260907-152048` contains fresh
+interleaved results comparing baseline
+`a99fb44d5d1f0000aee7b7a20508983060c2b360` with candidate
+`44ff791fc2c27e807bff369de00deafec7938ebf`. Timed medians were
+`46.550 -> 40.965 ms` for `stat` (-12.0%), `45.002 -> 42.085 ms` for
+`open_close` (-6.5%), `24.569 -> 22.996 ms` for `negative_lookup` (-6.4%), and
+`311.285 -> 305.912 ms` for 64-entry `enumeration` (-1.7%). The `open_close`
+p95 improved slightly (`72.453 -> 72.057 ms`), while `stat` p95 was higher
+(`73.337 -> 78.048 ms`) and candidate enumeration had two IQR outliers. The
+artifact has successful fresh reports, exact binary identities, and the
+required candidate attribution run. The Linear issue remains open for its
+owner's review; it is not closed here.
 
 ## Context and Orientation
 
@@ -267,3 +293,9 @@ Plan revision note (2026-09-07): created after tracing the shared WinFSP path
 and reviewing the SFS-690 measurement contract; the plan intentionally keeps
 native benchmark work as a final acceptance milestone because the current
 worktree has no code changes yet.
+
+Plan revision note (2026-09-07): recorded the red-green focused test cycle,
+the committed implementation, targeted validation, and the successful native
+interleaved artifact. The timing result is reported with its p95 and outlier
+qualification rather than treating median improvement as universal tail
+improvement.
