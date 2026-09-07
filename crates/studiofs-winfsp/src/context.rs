@@ -710,8 +710,13 @@ fn with_lossy_utf16_path<T>(path: &U16CStr, f: impl FnOnce(&str) -> T) -> T {
         length += encoded.len();
     }
 
-    let decoded = String::from_utf8_lossy(&buffer[..length]);
-    f(&decoded)
+    match std::str::from_utf8(&buffer[..length]) {
+        Ok(decoded) => f(decoded),
+        Err(_) => {
+            let owned = path.to_string_lossy();
+            f(&owned)
+        }
+    }
 }
 
 fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
@@ -742,12 +747,13 @@ fn is_runtime_stats_windows_path(path: &U16CStr) -> bool {
 ///
 /// Handles `.`, `..`, and trailing-dot/space stripping like `resolve_path`.
 fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u8>)> {
-    let s = path.to_string_lossy();
-    let parent = vfs
-        .namespace_resolver(NamespacePathStyle::Windows)
-        .resolve_parent(&s)
-        .map_err(vfs_to_winfsp_err)?;
-    Ok((parent.parent, parent.name))
+    with_lossy_utf16_path(path, |path| {
+        let parent = vfs
+            .namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_parent(path)
+            .map_err(vfs_to_winfsp_err)?;
+        Ok((parent.parent, parent.name))
+    })
 }
 
 fn hidden_platform_root_path_component(path: &str) -> Option<&'static [u8]> {
@@ -764,13 +770,23 @@ fn hidden_platform_root_path_component(path: &str) -> Option<&'static [u8]> {
 }
 
 fn maybe_hide_platform_root_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<bool> {
-    let display_path = path.to_string_lossy();
-    let Some(name) = hidden_platform_root_path_component(&display_path) else {
+    let first_component = path
+        .as_slice()
+        .iter()
+        .copied()
+        .find(|&unit| unit != b'\\' as u16 && unit != b'/' as u16);
+    if first_component != Some(b'.' as u16) {
         return Ok(false);
-    };
-    vfs.heal_dangling_entry_if_inode_missing(ROOT_INO, name)
-        .map_err(vfs_to_winfsp_err)?;
-    Ok(true)
+    }
+
+    with_lossy_utf16_path(path, |display_path| {
+        let Some(name) = hidden_platform_root_path_component(display_path) else {
+            return Ok(false);
+        };
+        vfs.heal_dangling_entry_if_inode_missing(ROOT_INO, name)
+            .map_err(vfs_to_winfsp_err)?;
+        Ok(true)
+    })
 }
 
 fn maybe_hide_platform_root_entry(
@@ -2542,11 +2558,11 @@ mod tests {
         WinfspMetadataCachePolicy, attr_to_file_info, build_basic_info_setattr_args,
         build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
         ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
-        notify_filter_for_kind, open_flags_from_access, resolve_create_callback_kind,
-        resolve_file_size_callback_action, should_disable_winfsp_file_cache,
-        should_truncate_existing_file_on_open, unix_nanos_to_filetime, vfs_to_winfsp_err,
-        winfsp_regular_file_allocation_size, with_lossy_utf16_path,
-        write_local_sync_policy_from_create_options,
+        maybe_hide_platform_root_path, notify_filter_for_kind, open_flags_from_access,
+        resolve_create_callback_kind, resolve_file_size_callback_action,
+        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
+        with_lossy_utf16_path, write_local_sync_policy_from_create_options,
         write_local_sync_policy_from_create_parameters,
     };
     use std::collections::BTreeSet;
@@ -4109,6 +4125,18 @@ mod tests {
         );
         assert_eq!(hidden_platform_root_path_component(r"\visible"), None);
         assert_eq!(hidden_platform_root_path_component(r"\docs\.Trashes"), None);
+    }
+
+    #[test]
+    fn maybe_hide_platform_root_path_filters_by_first_utf16_component() {
+        let (_tmp, vfs, _ctx, _queue) = make_test_context("hidden-root-path-filter");
+        for path in [r"\visible", r"/visible", r"\", r""] {
+            let path = U16CString::from_str(path).expect("u16 path");
+            assert!(!maybe_hide_platform_root_path(&vfs, path.as_ucstr()).expect("check path"));
+        }
+
+        let hidden = U16CString::from_str(r"\.Trashes\501").expect("u16 hidden path");
+        assert!(maybe_hide_platform_root_path(&vfs, hidden.as_ucstr()).expect("hide path"));
     }
 
     #[test]
