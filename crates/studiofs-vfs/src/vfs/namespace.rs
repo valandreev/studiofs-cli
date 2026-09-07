@@ -844,13 +844,17 @@ impl<'a> NamespaceResolver<'a> {
         })
     }
 
+    fn lightweight_not_found() -> VfsError {
+        VfsError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+
     fn is_entry_not_found(err: &VfsError) -> bool {
         matches!(err, VfsError::Meta(MetaError::EntryNotFound { .. }))
     }
 
     fn resolve_components_cached(&self, components: &[String]) -> VfsResult<InodeAttr> {
         let cache_key = PathShortcutCacheKey::from_components(self.style, components);
-        self.resolve_components_cached_with_key(components, cache_key, true)
+        self.resolve_components_cached_with_key(components, cache_key, true, false)
     }
 
     fn resolve_cached_path_shortcut(
@@ -884,6 +888,7 @@ impl<'a> NamespaceResolver<'a> {
         components: &[String],
         cache_key: Option<PathShortcutCacheKey>,
         lookup_cache: bool,
+        use_lightweight_negative_error: bool,
     ) -> VfsResult<InodeAttr> {
         if components.is_empty() {
             return self.vfs.getattr(ROOT_INO);
@@ -918,6 +923,9 @@ impl<'a> NamespaceResolver<'a> {
                                 parent_tokens,
                                 observed_epoch,
                             );
+                        }
+                        if use_lightweight_negative_error {
+                            return Err(Self::lightweight_not_found());
                         }
                         return Err(err);
                     }
@@ -990,26 +998,31 @@ impl<'a> NamespaceResolver<'a> {
                 } => normalized.component_bytes(*component_index),
                 PathShortcutCacheValue::Positive { .. } => None,
             };
-            if use_lightweight_negative_error
-                && negative_name.is_some()
-                && matches!(cached, PathShortcutCacheValue::Negative { .. })
-            {
-                return Err(VfsError::Io(std::io::Error::from(
-                    std::io::ErrorKind::NotFound,
-                )));
+            if use_lightweight_negative_error && negative_name.is_some() {
+                return Err(Self::lightweight_not_found());
             }
             return match self.resolve_cached_path_shortcut(cached, negative_name)? {
                 Some(attr) => Ok(attr),
                 None => {
                     let cache_key = PathShortcutCacheKey::from_encoded(encoded_path);
                     let components = normalized.into_components();
-                    self.resolve_components_cached_with_key(&components, Some(cache_key), false)
+                    self.resolve_components_cached_with_key(
+                        &components,
+                        Some(cache_key),
+                        false,
+                        use_lightweight_negative_error,
+                    )
                 }
             };
         }
         let cache_key = PathShortcutCacheKey::from_encoded(encoded_path);
         let components = normalized.into_components();
-        self.resolve_components_cached_with_key(&components, Some(cache_key), false)
+        self.resolve_components_cached_with_key(
+            &components,
+            Some(cache_key),
+            false,
+            use_lightweight_negative_error,
+        )
     }
 
     /// Resolves a path to `(parent_inode, final_component_name)`.
@@ -1922,13 +1935,80 @@ mod tests {
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "mount-negative-shortcut");
         let resolver = vfs.namespace_resolver(NamespacePathStyle::Windows);
 
-        resolver
-            .resolve_path(r"\missing.txt")
-            .expect_err("first miss should populate the negative shortcut");
+        assert!(matches!(
+            resolver
+                .resolve_path_for_mount(r"\missing.txt")
+                .expect_err("cold miss should remain an error"),
+            VfsError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
         assert!(matches!(
             resolver
                 .resolve_path_for_mount(r"\missing.txt")
                 .expect_err("cached miss should remain an error"),
+            VfsError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn mount_path_negative_shortcut_with_invalid_component_index_falls_back() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "mount-negative-shortcut-invalid-index");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Windows);
+        let key = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Windows,
+            &[String::from("missing.txt")],
+        )
+        .expect("path key");
+        let observed_epoch = vfs.state.namespace.namespace_epoch.load(Ordering::Acquire);
+        let parent_tokens = vec![PathShortcutParentToken {
+            parent: ROOT_INO,
+            generation: vfs.directory_generation(ROOT_INO),
+        }];
+        vfs.path_shortcut_cache_insert_negative_by_key(
+            key,
+            ROOT_INO,
+            usize::MAX,
+            parent_tokens,
+            observed_epoch,
+        );
+
+        assert!(matches!(
+            resolver
+                .resolve_path_for_mount(r"\missing.txt")
+                .expect_err("invalid cached index should fall back to the component walk"),
+            VfsError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn mount_path_negative_shortcut_invalidates_for_resurrection_and_delete() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "mount-negative-shortcut-resurrection");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Windows);
+
+        assert!(matches!(
+            resolver
+                .resolve_path_for_mount(r"\resurrect.txt")
+                .expect_err("initial lookup should miss"),
+            VfsError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        let file = vfs
+            .create(ROOT_INO, b"resurrect.txt", 1000, 1000, 0o644)
+            .expect("create file after negative lookup");
+        assert_eq!(
+            resolver
+                .resolve_path_for_mount(r"\resurrect.txt")
+                .expect("resurrected path should resolve")
+                .ino,
+            file.ino
+        );
+
+        vfs.unlink(ROOT_INO, b"resurrect.txt")
+            .expect("unlink resurrected file");
+        assert!(matches!(
+            resolver
+                .resolve_path_for_mount(r"\resurrect.txt")
+                .expect_err("deleted path should miss again"),
             VfsError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
         ));
     }
