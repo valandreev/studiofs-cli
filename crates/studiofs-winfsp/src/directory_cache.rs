@@ -27,7 +27,7 @@ pub(super) struct DirectorySnapshotCacheSnapshot {
     pub(super) byte_budget: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct DirectorySnapshotCacheKey {
     ino: Ino,
 }
@@ -168,7 +168,17 @@ impl DirectorySnapshotCache {
         observation: DirectoryEnumerationObservation,
     ) -> Option<Arc<DirectorySnapshot>> {
         let mut state = self.state.lock();
-        self.prepare_namespace_epoch(&mut state, observation.namespace_epoch);
+        if !Self::prepare_namespace_epoch(&mut state, observation.namespace_epoch) {
+            state.misses = state.misses.saturating_add(1);
+            trace!(
+                target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_miss",
+                ino = key.ino,
+                requested_namespace_epoch = observation.namespace_epoch,
+                current_namespace_epoch = state.last_namespace_epoch,
+                "directory snapshot cache miss for stale namespace epoch"
+            );
+            return None;
+        }
         let hit = state.entries.get(key).and_then(|entry| {
             (entry.observation == observation).then(|| Arc::clone(&entry.snapshot))
         });
@@ -212,9 +222,34 @@ impl DirectorySnapshotCache {
         snapshot: Arc<DirectorySnapshot>,
     ) -> bool {
         let mut state = self.state.lock();
-        self.prepare_namespace_epoch(&mut state, observation.namespace_epoch);
+        if !Self::prepare_namespace_epoch(&mut state, observation.namespace_epoch) {
+            state.invalidations = state.invalidations.saturating_add(1);
+            trace!(
+                target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_invalidation",
+                ino = key.ino,
+                requested_namespace_epoch = observation.namespace_epoch,
+                current_namespace_epoch = state.last_namespace_epoch,
+                "directory snapshot cache admission rejected for stale namespace epoch"
+            );
+            return false;
+        }
         let byte_size = snapshot.byte_size();
-        if self.entry_budget == 0 || byte_size > self.byte_budget {
+        if self.entry_budget == 0 {
+            trace!(
+                target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_admission_rejected",
+                ino = key.ino,
+                "directory snapshot cache admission rejected because entry budget is zero"
+            );
+            return false;
+        }
+        if byte_size > self.byte_budget {
+            trace!(
+                target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_admission_rejected",
+                ino = key.ino,
+                byte_size,
+                byte_budget = self.byte_budget,
+                "directory snapshot cache admission rejected because snapshot exceeds byte budget"
+            );
             return false;
         }
 
@@ -245,7 +280,7 @@ impl DirectorySnapshotCache {
         }
 
         state.occupancy_bytes = state.occupancy_bytes.saturating_add(byte_size);
-        state.lru.push_back(key.clone());
+        state.lru.push_back(key);
         state.entries.insert(
             key,
             DirectorySnapshotCacheEntry {
@@ -280,30 +315,36 @@ impl DirectorySnapshotCache {
         }
     }
 
-    fn prepare_namespace_epoch(&self, state: &mut DirectorySnapshotCacheState, epoch: u64) {
-        if state.last_namespace_epoch == Some(epoch) {
-            return;
-        }
-        if state.last_namespace_epoch.is_some() {
-            let invalidated = state.entries.len();
-            state.invalidations = state.invalidations.saturating_add(invalidated as u64);
-            state.entries.clear();
-            state.lru.clear();
-            state.occupancy_bytes = 0;
-            if invalidated != 0 {
-                trace!(
-                    target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_invalidation",
-                    count = invalidated,
-                    "directory snapshot cache invalidation"
-                );
+    fn prepare_namespace_epoch(state: &mut DirectorySnapshotCacheState, epoch: u64) -> bool {
+        match state.last_namespace_epoch {
+            None => {
+                state.last_namespace_epoch = Some(epoch);
+                true
+            }
+            Some(last) if epoch == last => true,
+            Some(last) if epoch < last => false,
+            Some(_) => {
+                let invalidated = state.entries.len();
+                state.invalidations = state.invalidations.saturating_add(invalidated as u64);
+                state.entries.clear();
+                state.lru.clear();
+                state.occupancy_bytes = 0;
+                if invalidated != 0 {
+                    trace!(
+                        target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_invalidation",
+                        count = invalidated,
+                        "directory snapshot cache invalidation"
+                    );
+                }
+                state.last_namespace_epoch = Some(epoch);
+                true
             }
         }
-        state.last_namespace_epoch = Some(epoch);
     }
 
     fn touch_lru(lru: &mut VecDeque<DirectorySnapshotCacheKey>, key: &DirectorySnapshotCacheKey) {
         Self::remove_lru(lru, key);
-        lru.push_back(key.clone());
+        lru.push_back(*key);
     }
 
     fn remove_lru(lru: &mut VecDeque<DirectorySnapshotCacheKey>, key: &DirectorySnapshotCacheKey) {

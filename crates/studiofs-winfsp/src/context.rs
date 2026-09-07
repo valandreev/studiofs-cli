@@ -2870,7 +2870,7 @@ mod tests {
         let observation = cache_observation(1, 0);
         let snapshot = super::directory_cache::DirectorySnapshot::empty_for_test(64);
 
-        assert!(cache.insert(key.clone(), observation, snapshot));
+        assert!(cache.insert(key, observation, snapshot));
         assert!(cache.lookup(&key, observation).is_some());
 
         let stats = cache.snapshot();
@@ -2904,13 +2904,13 @@ mod tests {
         let reset_observation = cache_observation(2, 1);
 
         assert!(cache.insert(
-            key.clone(),
+            key,
             first_observation,
             super::directory_cache::DirectorySnapshot::empty_for_test(64),
         ));
         assert!(cache.lookup(&key, changed_observation).is_none());
         assert!(cache.insert(
-            key.clone(),
+            key,
             changed_observation,
             super::directory_cache::DirectorySnapshot::empty_for_test(64),
         ));
@@ -2938,6 +2938,33 @@ mod tests {
         let stats = cache.snapshot();
         assert_eq!(stats.occupancy_entries, 0);
         assert_eq!(stats.occupancy_bytes, 0);
+    }
+
+    #[test]
+    fn directory_snapshot_cache_rejects_regressed_namespace_epochs() {
+        let cache = super::directory_cache::DirectorySnapshotCache::new(4, 256);
+        let key = super::directory_cache::DirectorySnapshotCacheKey::for_test(11);
+        let current = cache_observation(3, 0);
+        let stale = cache_observation(2, 0);
+
+        assert!(cache.insert(
+            key,
+            current,
+            super::directory_cache::DirectorySnapshot::empty_for_test(64),
+        ));
+        assert!(cache.lookup(&key, stale).is_none());
+        assert!(!cache.insert(
+            key,
+            stale,
+            super::directory_cache::DirectorySnapshot::empty_for_test(64),
+        ));
+        assert!(cache.lookup(&key, current).is_some());
+
+        let stats = cache.snapshot();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.occupancy_entries, 1);
+        assert_eq!(stats.invalidations, 1);
     }
 
     #[test]
