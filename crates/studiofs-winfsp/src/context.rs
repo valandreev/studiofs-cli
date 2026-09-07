@@ -1652,7 +1652,8 @@ impl StudioFsContext {
     fn build_directory_snapshot(
         &self,
         context: &StudioFileHandle,
-    ) -> winfsp::Result<DirectorySnapshot> {
+        lock: &DirBufferLock<'_>,
+    ) -> winfsp::Result<Option<DirectorySnapshot>> {
         trace!(
             target: "studiofs_winfsp::metadata_baseline::directory_buffer",
             "WinFSP directory buffer construction"
@@ -1668,14 +1669,30 @@ impl StudioFsContext {
         let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
         dotdot.set_name_raw(DOTDOT)?;
         *dotdot.file_info_mut() = attr_to_file_info(&attr);
-        let dotdot = Some(dotdot);
+        let mut dotdot = Some(dotdot);
 
         let entries = self
             .vfs
             .readdir_with_attrs(context.ino)
             .map_err(vfs_to_winfsp_err)?;
         let mut name_u16 = Vec::<u16>::new();
-        let mut children = Vec::with_capacity(entries.len());
+        let info_size = std::mem::size_of::<DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>>();
+        let fixed_entry_count = 1 + usize::from(dotdot.is_some());
+        let fixed_byte_size = info_size.saturating_mul(fixed_entry_count);
+        let byte_budget = self.directory_snapshot_cache.byte_budget_if_enabled();
+        let max_cached_children = byte_budget
+            .map(|budget| budget.saturating_sub(fixed_byte_size) / info_size)
+            .unwrap_or(0)
+            .min(entries.len());
+        let mut children = Vec::with_capacity(max_cached_children);
+        let mut direct = byte_budget.is_none_or(|budget| fixed_byte_size > budget);
+
+        if direct {
+            let _ = lock.write(&mut dot);
+            if let Some(dotdot) = dotdot.as_mut() {
+                let _ = lock.write(dotdot);
+            }
+        }
 
         for entry_with_attr in &entries {
             let entry = &entry_with_attr.entry;
@@ -1727,11 +1744,46 @@ impl StudioFsContext {
                 },
             };
             *dir_info.file_info_mut() = attr_to_file_info(child_attr);
-            children.push(dir_info);
+
+            if !direct && children.len() >= max_cached_children {
+                let _ = lock.write(&mut dot);
+                if let Some(dotdot) = dotdot.as_mut() {
+                    let _ = lock.write(dotdot);
+                }
+                for mut child in children.drain(..) {
+                    if let Err(error) = lock.write(&mut child) {
+                        warn!(
+                            ino = context.ino,
+                            error = ?error,
+                            "DirBuffer write failed while falling back from directory snapshot"
+                        );
+                        return Ok(None);
+                    }
+                }
+                children.shrink_to_fit();
+                direct = true;
+            }
+
+            if direct {
+                if let Err(error) = lock.write(&mut dir_info) {
+                    warn!(
+                        ino = context.ino,
+                        error = ?error,
+                        "DirBuffer write failed while populating directory directly"
+                    );
+                    return Ok(None);
+                }
+            } else {
+                children.push(dir_info);
+            }
+        }
+
+        if direct {
+            return Ok(None);
         }
 
         children.shrink_to_fit();
-        Ok(DirectorySnapshot::new(dot, dotdot, children))
+        Ok(Some(DirectorySnapshot::new(dot, dotdot, children)))
     }
 
     fn populate_directory_buffer(
@@ -1747,7 +1799,10 @@ impl StudioFsContext {
         let snapshot = match self.directory_snapshot_cache.lookup(&key, observation) {
             Some(snapshot) => snapshot,
             None => {
-                let snapshot = Arc::new(self.build_directory_snapshot(context)?);
+                let Some(snapshot) = self.build_directory_snapshot(context, lock)? else {
+                    return Ok(());
+                };
+                let snapshot = Arc::new(snapshot);
                 let current_observation = self
                     .vfs
                     .directory_enumeration_observation(context.ino)
@@ -2621,7 +2676,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
-    use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
+    use winfsp::filesystem::{AsyncFileSystemContext, DirInfo, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
 
     fn cache_observation(
@@ -2936,6 +2991,32 @@ mod tests {
         ));
 
         let stats = cache.snapshot();
+        assert_eq!(stats.occupancy_entries, 0);
+        assert_eq!(stats.occupancy_bytes, 0);
+    }
+
+    #[test]
+    fn oversized_directory_snapshot_falls_back_to_direct_buffer_population() {
+        let (_tmp, vfs, mut ctx, _queue) = make_test_context("oversized-directory-snapshot");
+        let entry_size =
+            std::mem::size_of::<DirInfo<{ super::MAX_WINDOWS_COMPONENT_UTF16_UNITS }>>();
+        ctx.directory_snapshot_cache =
+            super::directory_cache::DirectorySnapshotCache::new(1, entry_size * 3);
+        vfs.create(ROOT_INO, b"oversized-a.txt", 1000, 1000, 0o644)
+            .expect("create first file");
+        vfs.create(ROOT_INO, b"oversized-b.txt", 1000, 1000, 0o644)
+            .expect("create second file");
+        let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDONLY);
+
+        let lock = handle
+            .dir_buffer
+            .acquire(true, None)
+            .expect("acquire directory buffer");
+        ctx.populate_directory_buffer(&handle, &lock)
+            .expect("populate oversized directory buffer");
+
+        let stats = ctx.directory_snapshot_cache.snapshot();
+        assert_eq!(stats.misses, 1);
         assert_eq!(stats.occupancy_entries, 0);
         assert_eq!(stats.occupancy_bytes, 0);
     }

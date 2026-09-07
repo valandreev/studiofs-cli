@@ -162,6 +162,10 @@ impl DirectorySnapshotCache {
         }
     }
 
+    pub(super) fn byte_budget_if_enabled(&self) -> Option<usize> {
+        (self.entry_budget != 0).then_some(self.byte_budget)
+    }
+
     pub(super) fn lookup(
         &self,
         key: &DirectorySnapshotCacheKey,
@@ -234,7 +238,7 @@ impl DirectorySnapshotCache {
             return false;
         }
         let byte_size = snapshot.byte_size();
-        if self.entry_budget == 0 {
+        if self.byte_budget_if_enabled().is_none() {
             trace!(
                 target: "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_admission_rejected",
                 ino = key.ino,
