@@ -861,7 +861,7 @@ try {
     $markdown.Add("")
     $markdown.Add(("Run order: `{0}`." -f ($runOrderLabels -join " -> ")))
     $markdown.Add(("Timed instrumentation: baseline `{0}`; candidate `{1}`. Candidate attribution: `{2}` in a separate untimed run." -f $instrumentationCoverage.baseline_timed, $instrumentationCoverage.candidate_timed, $instrumentationCoverage.candidate_attribution))
-    $markdown.Add("The timed A/B comparison disables SFS-690 hot-path event counting on the candidate; attribution measurements are retained separately in `results.json` and are excluded from the timing table.")
+    $markdown.Add('The timed A/B comparison disables SFS-690 hot-path event counting on the candidate; attribution measurements are retained separately in `results.json` and are excluded from the timing table.')
     $markdown.Add("")
     $markdown.Add("| Workload | Baseline median (ms) | Candidate median (ms) | Baseline p95 (ms) | Candidate p95 (ms) | Change | Outliers B/C |")
     $markdown.Add("|---|---:|---:|---:|---:|---:|---:|")
