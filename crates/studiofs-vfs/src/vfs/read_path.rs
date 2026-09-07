@@ -1793,10 +1793,20 @@ impl StudioVfs {
         ReadMetadataResolver::new(self, ino).resolve_attr_sync()
     }
 
+    /// Returns the observation token currently guarding cached attributes for `ino`.
+    ///
+    /// Callers capture this token before binding an attribute-cache result to a
+    /// path shortcut. Invalidation retires the token, so a later lookup can
+    /// safely reject the shortcut and use the authoritative local path.
     pub(super) fn attr_read_observation(&self, ino: Ino) -> super::AttrReadObservation {
         self.state.namespace.attr_read_cache.lock().observation(ino)
     }
 
+    /// Returns a reusable cached attribute when the expected observation and
+    /// local-first read-safety checks still permit the path shortcut.
+    ///
+    /// `Ok(None)` means the caller must use normal component resolution because
+    /// the observation expired, was retired, or is shadowed by local state.
     pub(super) fn cached_attr_for_path_shortcut(
         &self,
         ino: Ino,

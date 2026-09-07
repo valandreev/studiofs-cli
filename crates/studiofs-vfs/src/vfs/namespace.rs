@@ -444,16 +444,36 @@ impl PathShortcutCacheKey {
         })
     }
 
+    #[cfg(test)]
     fn from_path(
         style: NamespacePathStyle,
         path: &str,
     ) -> Option<SmallVec<[u8; Self::INLINE_PATH_CAPACITY]>> {
+        NormalizedPath::from_path(style, path).into_encoded()
+    }
+
+    fn from_encoded(encoded: &[u8]) -> Self {
+        Self {
+            path: Arc::from(encoded),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NormalizedPath<'a> {
+    components: SmallVec<[&'a str; 16]>,
+    encoded: SmallVec<[u8; PathShortcutCacheKey::INLINE_PATH_CAPACITY]>,
+}
+
+impl<'a> NormalizedPath<'a> {
+    fn from_path(style: NamespacePathStyle, path: &'a str) -> Self {
         let (stripped, separator) = match style {
             NamespacePathStyle::Posix => (path.trim_start_matches('/'), '/'),
             NamespacePathStyle::Windows => (path.trim_start_matches('\\'), '\\'),
         };
+        let mut components = SmallVec::new();
         let mut encoded = SmallVec::with_capacity(path.len().saturating_add(1));
-        encoded.push(Self::style_tag(style));
+        encoded.push(PathShortcutCacheKey::style_tag(style));
         let mut component_starts = SmallVec::<[usize; 16]>::new();
 
         for raw in stripped.split(separator) {
@@ -462,12 +482,15 @@ impl PathShortcutCacheKey {
             }
             if raw == ".." {
                 if let Some(start) = component_starts.pop() {
+                    // The first component follows the style tag; later
+                    // components also have a zero-byte separator to remove.
                     let truncate_to = if component_starts.is_empty() {
                         start
                     } else {
                         start.saturating_sub(1)
                     };
                     encoded.truncate(truncate_to);
+                    components.pop();
                 }
                 continue;
             }
@@ -475,23 +498,41 @@ impl PathShortcutCacheKey {
                 NamespacePathStyle::Posix => raw,
                 NamespacePathStyle::Windows => raw.trim_end_matches(['.', ' ']),
             };
-            if normalized.is_empty() {
-                continue;
+            if !normalized.is_empty() {
+                if !component_starts.is_empty() {
+                    encoded.push(0);
+                }
+                component_starts.push(encoded.len());
+                encoded.extend_from_slice(normalized.as_bytes());
+                components.push(normalized);
             }
-            if !component_starts.is_empty() {
-                encoded.push(0);
-            }
-            component_starts.push(encoded.len());
-            encoded.extend_from_slice(normalized.as_bytes());
         }
 
-        (!component_starts.is_empty()).then_some(encoded)
+        Self {
+            components,
+            encoded,
+        }
     }
 
-    fn from_encoded(encoded: &[u8]) -> Self {
-        Self {
-            path: Arc::from(encoded),
+    #[cfg(test)]
+    fn components(&self) -> &[&'a str] {
+        &self.components
+    }
+
+    fn encoded(&self) -> Option<&[u8]> {
+        if self.components.is_empty() {
+            return None;
         }
+        Some(&self.encoded)
+    }
+
+    #[cfg(test)]
+    fn into_encoded(self) -> Option<SmallVec<[u8; PathShortcutCacheKey::INLINE_PATH_CAPACITY]>> {
+        (!self.components.is_empty()).then_some(self.encoded)
+    }
+
+    fn into_components(self) -> Vec<String> {
+        self.components.into_iter().map(ToOwned::to_owned).collect()
     }
 }
 
@@ -785,29 +826,7 @@ impl<'a> NamespaceResolver<'a> {
     }
 
     fn path_components(&self, path: &str) -> Vec<String> {
-        let (stripped, separator) = match self.style {
-            NamespacePathStyle::Posix => (path.trim_start_matches('/'), '/'),
-            NamespacePathStyle::Windows => (path.trim_start_matches('\\'), '\\'),
-        };
-
-        let mut components: Vec<String> = Vec::new();
-        for raw in stripped.split(separator) {
-            if raw.is_empty() || raw == "." {
-                continue;
-            }
-            if raw == ".." {
-                components.pop();
-                continue;
-            }
-            let normalized = match self.style {
-                NamespacePathStyle::Posix => raw,
-                NamespacePathStyle::Windows => raw.trim_end_matches(['.', ' ']),
-            };
-            if !normalized.is_empty() {
-                components.push(normalized.to_string());
-            }
-        }
-        components
+        NormalizedPath::from_path(self.style, path).into_components()
     }
 
     fn path_not_found(path: &str) -> VfsError {
@@ -933,32 +952,26 @@ impl<'a> NamespaceResolver<'a> {
 
     /// Resolves a full path, applying `.`/`..` trimming and platform-specific separators.
     pub fn resolve_path(&self, path: &str) -> VfsResult<InodeAttr> {
-        if let Some(encoded_path) = PathShortcutCacheKey::from_path(self.style, path) {
-            if let Some(cached) = self
-                .vfs
-                .path_shortcut_cache_lookup_by_encoded_path(&encoded_path)
-            {
-                return match self.resolve_cached_path_shortcut(cached)? {
-                    Some(attr) => Ok(attr),
-                    None => {
-                        let components = self.path_components(path);
-                        self.resolve_components_cached_with_key(
-                            &components,
-                            Some(PathShortcutCacheKey::from_encoded(&encoded_path)),
-                            false,
-                        )
-                    }
-                };
-            }
-            let components = self.path_components(path);
-            return self.resolve_components_cached_with_key(
-                &components,
-                Some(PathShortcutCacheKey::from_encoded(&encoded_path)),
-                false,
-            );
+        let normalized = NormalizedPath::from_path(self.style, path);
+        let Some(encoded_path) = normalized.encoded() else {
+            return self.vfs.getattr(ROOT_INO);
+        };
+        if let Some(cached) = self
+            .vfs
+            .path_shortcut_cache_lookup_by_encoded_path(encoded_path)
+        {
+            return match self.resolve_cached_path_shortcut(cached)? {
+                Some(attr) => Ok(attr),
+                None => {
+                    let cache_key = PathShortcutCacheKey::from_encoded(encoded_path);
+                    let components = normalized.into_components();
+                    self.resolve_components_cached_with_key(&components, Some(cache_key), false)
+                }
+            };
         }
-        let components = self.path_components(path);
-        self.resolve_components_cached(&components)
+        let cache_key = PathShortcutCacheKey::from_encoded(encoded_path);
+        let components = normalized.into_components();
+        self.resolve_components_cached_with_key(&components, Some(cache_key), false)
     }
 
     /// Resolves a path to `(parent_inode, final_component_name)`.
@@ -1802,6 +1815,132 @@ mod tests {
                 .expect("component path key");
 
         assert_eq!(direct.as_slice(), from_components.path.as_ref());
+    }
+
+    #[test]
+    fn normalized_path_shares_components_and_encoded_key() {
+        let normalized =
+            NormalizedPath::from_path(NamespacePathStyle::Windows, r"\dir\..\dir\file.  ");
+        assert_eq!(normalized.components(), ["dir", "file"].as_slice());
+
+        let expected = PathShortcutCacheKey::from_components(
+            NamespacePathStyle::Windows,
+            &[String::from("dir"), String::from("file")],
+        )
+        .expect("component path key");
+        assert_eq!(
+            normalized.encoded().expect("normalized path key"),
+            expected.path.as_ref()
+        );
+
+        let root = NormalizedPath::from_path(NamespacePathStyle::Posix, "/../");
+        assert!(root.components().is_empty());
+        assert!(root.encoded().is_none());
+    }
+
+    #[test]
+    fn namespace_resolver_negative_path_shortcut_hits() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "negative-path-shortcut-hit");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+
+        assert!(resolver.resolve_path("/missing.txt").is_err());
+        let before = vfs.path_shortcut_cache_metrics();
+        assert!(resolver.resolve_path("/missing.txt").is_err());
+        let after = vfs.path_shortcut_cache_metrics();
+
+        assert!(after.hits > before.hits);
+        assert!(after.negative_hits > before.negative_hits);
+    }
+
+    #[test]
+    fn namespace_resolver_root_paths_resolve_root_inode() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "root-path-shortcut");
+
+        for path in ["", "/", "/.", "/../"] {
+            assert_eq!(
+                vfs.namespace_resolver(NamespacePathStyle::Posix)
+                    .resolve_path(path)
+                    .expect("resolve POSIX root path")
+                    .ino,
+                ROOT_INO
+            );
+        }
+        for path in ["", r"\", r"\.\", r"\..\"] {
+            assert_eq!(
+                vfs.namespace_resolver(NamespacePathStyle::Windows)
+                    .resolve_path(path)
+                    .expect("resolve Windows root path")
+                    .ino,
+                ROOT_INO
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_resolver_handles_deep_paths_beyond_inline_component_capacity() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deep-path-shortcut");
+        let mut parent = ROOT_INO;
+        let mut names = Vec::new();
+        let mut leaf = None;
+        for index in 0..20 {
+            let name = format!("d{index:02}");
+            let attr = vfs
+                .mkdir(parent, name.as_bytes(), 1000, 1000, 0o755)
+                .expect("create deep path component");
+            parent = attr.ino;
+            leaf = Some(attr);
+            names.push(name);
+        }
+        let path = format!("/{}", names.join("/"));
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+
+        let resolved = resolver.resolve_path(&path).expect("resolve deep path");
+        assert_eq!(resolved.ino, leaf.expect("deep path leaf").ino);
+        let before = vfs.path_shortcut_cache_metrics();
+        assert_eq!(
+            resolver
+                .resolve_path(&path)
+                .expect("resolve warm deep path")
+                .ino,
+            resolved.ino
+        );
+        assert!(vfs.path_shortcut_cache_metrics().hits > before.hits);
+    }
+
+    #[test]
+    fn namespace_resolver_handles_paths_beyond_inline_key_capacity() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "long-path-shortcut");
+        let mut parent = ROOT_INO;
+        let mut names = Vec::new();
+        let mut leaf = None;
+        for index in 0..12 {
+            let name = format!("segment{index:02}_{}", "x".repeat(20));
+            let attr = vfs
+                .mkdir(parent, name.as_bytes(), 1000, 1000, 0o755)
+                .expect("create long path component");
+            parent = attr.ino;
+            leaf = Some(attr);
+            names.push(name);
+        }
+        let path = format!("/{}", names.join("/"));
+        assert!(path.len() > PathShortcutCacheKey::INLINE_PATH_CAPACITY);
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+
+        let resolved = resolver.resolve_path(&path).expect("resolve long path");
+        assert_eq!(resolved.ino, leaf.expect("long path leaf").ino);
+        let before = vfs.path_shortcut_cache_metrics();
+        assert_eq!(
+            resolver
+                .resolve_path(&path)
+                .expect("resolve warm long path")
+                .ino,
+            resolved.ino
+        );
+        assert!(vfs.path_shortcut_cache_metrics().hits > before.hits);
     }
 
     #[test]

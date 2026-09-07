@@ -39,6 +39,10 @@ deferred, and invalidation behavior remains covered by focused tests.
 - [x] (2026-09-07) Updated SFS-691 in Linear with the follow-up key-preparation implementation and five-run native benchmark evidence; left it `In Progress` because CPU/working-set and residual-getattr signals still need review.
 - [x] (2026-09-07) Committed the initial SFS-691 implementation as `44ff791f` with `perf: reuse observed attrs on WinFSP hot paths`.
 - [x] (2026-09-07) Committed the follow-up key-preparation optimization as `885e7eda` with `perf: avoid hot path key allocations`.
+- [x] (2026-09-07) Verified the attached code review against the current source: the borrowed-key clone, duplicated normalization, root-path, observation-check, documentation, and boundary-test recommendations are applicable; the residual handle-based `metadata_getattr` is a separate WinFSP concern.
+- [x] (2026-09-07) Applied the confirmed review fixes, added clone-count and path-boundary coverage, and rejected an initial two-pass normalization implementation after its native regression.
+- [x] (2026-09-07) Reworked normalization to one pass and completed fresh three-run interleaved native benchmarks against `885e7eda`; the focused final check and Clippy pass.
+- [x] (2026-09-07) Completed a five-run interleaved native benchmark for the final working tree; medians were directionally lower, but `stat` was effectively flat and enumeration p95 increased, so no universal tail-performance claim is made.
 
 ## Surprises & Discoveries
 
@@ -72,6 +76,30 @@ deferred, and invalidation behavior remains covered by focused tests.
   median was `1.0%` higher and max working set was about `14%` higher, while
   candidate attribution still showed `1000` `metadata_getattr` events for
   `stat` and `open_close`.
+- The review's root-path allocation description is slightly overstated: an
+  empty `Vec` has no element allocation, but bypassing normalization still
+  removes the temporary parsing and bookkeeping path. The review's remaining
+  `metadata_getattr` attribution is consistent with the handle-based
+  `StudioFsContext::get_file_info` fallback and is not caused by a path-cache
+  miss.
+- The first shared-normalizer implementation stored component slices and then
+  walked them again to encode the key. Its native A/B regressed `stat` by
+  `+5.7%`, `open_close` by `+7.2%`, and enumeration by `+4.5%`, with higher
+  candidate CPU; it was not retained. Building the encoded key and component
+  slices in the same normalization pass removed that hot-path regression.
+- The retained one-pass implementation's fresh interleaved A/B artifact
+  `target/perf/sfs-680-windows-metadata-ab-20260907-164101` improved medians by
+  `-11.2%` for `stat`, `-14.9%` for `open_close`, `-4.2%` for
+  `negative_lookup`, and `-4.3%` for enumeration. Candidate p95 also improved
+  for every workload; candidate CPU was lower in this run, while max working
+  set remained higher (`24.012` vs `22.094` MiB).
+- The final five-run interleaved artifact
+  `target/perf/sfs-680-windows-metadata-ab-20260907-165415` was more stable for
+  medians: `stat -0.8%`, `open_close -3.1%`, `negative_lookup -10.6%`, and
+  enumeration `-3.7%`. `open_close` p95 improved, while `stat` was effectively
+  flat and enumeration p95 increased; candidate CPU was lower and max working
+  set was about `5%` higher. These results support keeping the correctness and
+  maintainability fixes, but not claiming a universal latency-tail win.
 
 ## Decision Log
 
@@ -108,6 +136,26 @@ deferred, and invalidation behavior remains covered by focused tests.
   a new per-hit counter or production trace overhead. The timing comparison is
   already interleaved and binary-identified.
   Date/Author: 2026-09-07 / Codex.
+- Decision: Represent one parsed path as borrowed normalized component slices
+  plus its encoded shortcut key, and reuse that representation on a fallback.
+  Rationale: The hot hit path keeps the existing inline `SmallVec` behavior,
+  while a miss or stale observation converts the already parsed slices into
+  owned component strings instead of parsing separators and Windows suffixes a
+  second time. The same parser becomes the single normalization authority for
+  `resolve_path` and `resolve_parent`.
+  Date/Author: 2026-09-07 / Codex.
+- Decision: Add owned promotion/touch helpers to `TwoTierCache` and use them
+  only from `get_borrowed`; retain the existing borrowed helpers for `get`.
+  Rationale: The borrowed lookup already owns the stored key for stale cleanup
+  and can transfer it directly into the ordering deque, removing one redundant
+  `K::clone` without changing cache policy or ordering semantics.
+  Date/Author: 2026-09-07 / Codex.
+- Decision: Keep the residual handle-based `metadata_getattr` outside this
+  follow-up.
+  Rationale: `StudioFsContext::get_file_info` resolves by inode and has no path
+  key to reuse. Changing it would be a separate WinFSP handle-attribute design,
+  not a review cleanup of SFS-691's path shortcut.
+  Date/Author: 2026-09-07 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -138,6 +186,20 @@ That comparison is now recorded in
 latency distributions, including `stat` p95, but retained a small aggregate
 resource-cost signal and did not remove the residual attribute work. The Linear
 issue remains `In Progress` for review.
+
+The review follow-up is now measured in
+`target/perf/sfs-680-windows-metadata-ab-20260907-164101`. The one-pass shared
+normalizer preserves the previous shortcut attribution while avoiding the
+two-pass hot-path cost. The remaining `metadata_getattr` events are still the
+expected inode-based `get_file_info` reads and are not changed by this path
+work.
+
+The final five-run repeat is retained in
+`target/perf/sfs-680-windows-metadata-ab-20260907-165415`; its binary identity
+and interleaved run order are recorded in `environment.json` and `command.txt`.
+The plan is complete for the review follow-up, while SFS-691 remains open in
+Linear for owner review and the separate handle-based `metadata_getattr`
+optimization.
 
 ## Context and Orientation
 
@@ -210,6 +272,24 @@ record the raw artifact identity and workload medians. If native prerequisites
 are unavailable, report that exact gate as unavailable rather than claiming a
 performance result.
 
+For the review follow-up, first add a clone-count regression for
+`TwoTierCache::get_borrowed` in `crates/studiofs-vfs/src/vfs/tests.rs`. The
+regression must prove that a probationary hit and a protected hit each clone
+the stored key once after the initial insertion. Then add a borrowed
+`NormalizedPath` representation in
+`crates/studiofs-vfs/src/vfs/namespace.rs`. It owns only inline component
+references and the encoded key during normal paths, shares separator,
+`.`/`..`, and Windows trailing-dot/space handling for all callers, and converts
+to `Vec<String>` only when the existing component resolver needs owned names.
+Use it in `resolve_path` so cache misses and unsafe positive hits reuse the
+already parsed components, in `resolve_parent`, and in the existing direct-key
+unit test. Add tests for negative resolver hits, root normalization, more than
+16 components, and encoded paths longer than 256 bytes. The refactor removes
+the old delimiter-truncation calculation entirely, so no explanatory comment
+is needed for that code. Finally add rustdoc for the two internal attribute
+helpers and simplify `AttrReadCache::get_if_observed` without changing its
+lock or observation contract.
+
 ## Concrete Steps
 
 All commands below run from `E:\dev\studiofs-cli` in PowerShell. Do not run a
@@ -234,6 +314,13 @@ with exactly the four workloads (`stat`, `open_close`, `negative_lookup`, and
 `enumeration`), three measured passes, interleaved run order, and attribution
 columns. A focused test or compile check does not substitute for this native
 gate.
+
+The review follow-up used the same harness from `E:\dev\studiofs-cli` with
+`-BaselineCommit 885e7eda -CandidateCommit HEAD -Runs 3`. It produced six
+successful timed CSVs, one candidate attribution CSV, and the retained
+artifact `target/perf/sfs-680-windows-metadata-ab-20260907-164101`. The
+candidate binary was built from the current working tree; its commit identity
+in the artifact is `578958618d6dc02be8b4980d51eddb23babe3469`.
 
 ## Validation and Acceptance
 
@@ -323,3 +410,8 @@ the committed implementation, targeted validation, and the successful native
 interleaved artifact. The timing result is reported with its p95 and outlier
 qualification rather than treating median improvement as universal tail
 improvement.
+
+Plan revision note (2026-09-07): added the attached-review follow-up, rejected
+the measured two-pass normalization regression, retained the one-pass shared
+representation, and recorded the final five-run result with its mixed tail and
+memory signals.

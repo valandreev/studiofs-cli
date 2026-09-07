@@ -2,6 +2,7 @@ use super::namespace_ops::NAMESPACE_INODE_BATCH;
 use super::*;
 use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
@@ -15634,6 +15635,99 @@ fn attr_read_cache_is_bounded_and_tracks_hotset_hits() {
     assert!(metrics.protected_occupancy_entries >= 1);
     assert!(metrics.protected_hits >= 1);
     assert!(metrics.hot_hit_ratio() > 0.0);
+}
+
+#[derive(Debug)]
+struct CloneCountingKey {
+    value: u64,
+    clone_count: Arc<AtomicUsize>,
+}
+
+impl Clone for CloneCountingKey {
+    fn clone(&self) -> Self {
+        self.clone_count.fetch_add(1, AtomicOrdering::SeqCst);
+        Self {
+            value: self.value,
+            clone_count: Arc::clone(&self.clone_count),
+        }
+    }
+}
+
+impl PartialEq for CloneCountingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for CloneCountingKey {}
+
+impl Hash for CloneCountingKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+#[derive(Debug, Default)]
+struct CloneCountingPolicy;
+
+impl CachePolicy<CloneCountingKey, u8> for CloneCountingPolicy {
+    type Meta = ();
+    type InsertContext = ();
+    type LookupContext<'a> = ();
+
+    fn make_meta(
+        &mut self,
+        _key: &CloneCountingKey,
+        _value: &u8,
+        _ctx: Self::InsertContext,
+    ) -> Self::Meta {
+    }
+
+    fn is_stale(
+        &self,
+        _key: &CloneCountingKey,
+        _value: &u8,
+        _meta: &Self::Meta,
+        _ctx: Self::LookupContext<'_>,
+    ) -> bool {
+        false
+    }
+
+    fn estimate_entry_charge(
+        &self,
+        _key: &CloneCountingKey,
+        _value: &u8,
+        _meta: &Self::Meta,
+    ) -> usize {
+        1
+    }
+}
+
+#[test]
+fn borrowed_cache_hit_transfers_stored_key_without_recloning() {
+    let clone_count = Arc::new(AtomicUsize::new(0));
+    let key = CloneCountingKey {
+        value: 1,
+        clone_count: Arc::clone(&clone_count),
+    };
+    let mut cache = TwoTierCache::new(4, 1024, CloneCountingPolicy);
+    cache.put(key.clone(), 7, ());
+    clone_count.store(0, AtomicOrdering::SeqCst);
+
+    assert_eq!(cache.get_borrowed(&key, ()), Some(7));
+    assert_eq!(
+        clone_count.load(AtomicOrdering::SeqCst),
+        1,
+        "probationary borrowed hit should clone the stored key once"
+    );
+
+    clone_count.store(0, AtomicOrdering::SeqCst);
+    assert_eq!(cache.get_borrowed(&key, ()), Some(7));
+    assert_eq!(
+        clone_count.load(AtomicOrdering::SeqCst),
+        1,
+        "protected borrowed hit should clone the stored key once"
+    );
 }
 
 #[test]
