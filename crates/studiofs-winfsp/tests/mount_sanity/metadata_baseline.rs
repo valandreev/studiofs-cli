@@ -15,21 +15,157 @@ const CALLBACKS: [&str; 6] = [
     "cleanup",
     "close",
 ];
+const HOT_PATH_EVENTS: [&str; 7] = [
+    "path_resolution",
+    "metadata_lookup",
+    "metadata_getattr",
+    "acl_check",
+    "readdir",
+    "get_attrs_batch",
+    "directory_buffer",
+];
+const WINFSP_HOT_PATH_EVENTS: [&str; 2] = ["path_resolution", "directory_buffer"];
+const VFS_HOT_PATH_EVENTS: [&str; 5] = [
+    "metadata_lookup",
+    "metadata_getattr",
+    "acl_check",
+    "readdir",
+    "get_attrs_batch",
+];
+const EVENT_COUNT: usize = CALLBACKS.len() + HOT_PATH_EVENTS.len();
 
-#[derive(Clone, Default)]
-struct CallbackCounter(Arc<[AtomicU64; 6]>);
+#[derive(Clone)]
+struct CallbackCounter {
+    counts: Arc<[AtomicU64; EVENT_COUNT]>,
+    include_hot_path: bool,
+}
+
+impl Default for CallbackCounter {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 impl CallbackCounter {
-    fn snapshot(&self) -> [u64; 6] {
-        std::array::from_fn(|index| self.0[index].load(Ordering::Relaxed))
+    fn new(include_hot_path: bool) -> Self {
+        Self {
+            counts: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            include_hot_path,
+        }
+    }
+
+    fn event_index(target: &str) -> Option<usize> {
+        if let Some(name) = target.strip_prefix("studiofs_winfsp::metadata_baseline::") {
+            if let Some(index) = CALLBACKS.iter().position(|callback| *callback == name) {
+                return Some(index);
+            }
+            if WINFSP_HOT_PATH_EVENTS.contains(&name) {
+                return HOT_PATH_EVENTS
+                    .iter()
+                    .position(|event| *event == name)
+                    .map(|index| CALLBACKS.len() + index);
+            }
+            return None;
+        }
+        if let Some(name) = target.strip_prefix("studiofs_vfs::metadata_baseline::")
+            && VFS_HOT_PATH_EVENTS.contains(&name)
+        {
+            return HOT_PATH_EVENTS
+                .iter()
+                .position(|event| *event == name)
+                .map(|index| CALLBACKS.len() + index);
+        }
+        None
+    }
+
+    fn count_for(snapshot: &[u64; EVENT_COUNT], target: &str) -> u64 {
+        Self::event_index(target).map_or(0, |index| snapshot[index])
+    }
+
+    fn event_index_for(&self, target: &str) -> Option<usize> {
+        let index = Self::event_index(target)?;
+        if !self.include_hot_path && index >= CALLBACKS.len() {
+            return None;
+        }
+        Some(index)
+    }
+
+    fn snapshot(&self) -> [u64; EVENT_COUNT] {
+        std::array::from_fn(|index| self.counts[index].load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CallbackCounter;
+
+    #[test]
+    fn callback_counter_classifies_vfs_hot_path_events() {
+        assert_eq!(
+            CallbackCounter::event_index(
+                "studiofs_winfsp::metadata_baseline::get_security_by_name"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_winfsp::metadata_baseline::path_resolution"),
+            Some(6)
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_vfs::metadata_baseline::metadata_lookup"),
+            Some(7)
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_winfsp::metadata_baseline::directory_buffer"),
+            Some(12)
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_vfs::metadata_baseline::directory_buffer"),
+            None
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_winfsp::metadata_baseline::metadata_lookup"),
+            None
+        );
+        assert_eq!(
+            CallbackCounter::event_index("studiofs_vfs::metadata_baseline::unrelated"),
+            None
+        );
+    }
+
+    #[test]
+    fn callback_counter_can_disable_hot_path_events_for_timed_runs() {
+        let counter = CallbackCounter::new(false);
+
+        assert_eq!(
+            counter.event_index_for("studiofs_winfsp::metadata_baseline::open"),
+            Some(1)
+        );
+        assert_eq!(
+            counter.event_index_for("studiofs_vfs::metadata_baseline::metadata_lookup"),
+            None
+        );
+        assert_eq!(
+            counter.event_index_for("studiofs_winfsp::metadata_baseline::directory_buffer"),
+            None
+        );
     }
 }
 
 impl tracing::Subscriber for CallbackCounter {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if self.event_index_for(metadata.target()).is_some() {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata
-            .target()
-            .starts_with("studiofs_winfsp::metadata_baseline::")
+        self.event_index_for(metadata.target()).is_some()
     }
 
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -40,13 +176,8 @@ impl tracing::Subscriber for CallbackCounter {
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        if let Some(name) = event
-            .metadata()
-            .target()
-            .strip_prefix("studiofs_winfsp::metadata_baseline::")
-            && let Some(index) = CALLBACKS.iter().position(|callback| *callback == name)
-        {
-            self.0[index].fetch_add(1, Ordering::Relaxed);
+        if let Some(index) = self.event_index_for(event.metadata().target()) {
+            self.counts[index].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -89,7 +220,9 @@ fn winfsp_metadata_baseline() {
         "requested drive is already assigned"
     );
 
-    let counter = CallbackCounter::default();
+    let instrumentation_enabled =
+        configured_value("STUDIOFS_METADATA_INSTRUMENTATION").as_deref() != Some("disabled");
+    let counter = CallbackCounter::new(instrumentation_enabled);
     // This integration binary invokes the baseline once per process. Keep the
     // installation fail-fast so an existing subscriber cannot hide zero counts.
     // Native callbacks run on dispatcher threads, so a thread-local subscriber
@@ -99,6 +232,7 @@ fn winfsp_metadata_baseline() {
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let format_info = super::test_format_info_without_loading_env("metadata_baseline");
     let vfs = super::make_test_vfs_with_format_info(&tmp, format_info, &rt);
+    let vfs_observer = vfs.clone();
     let event_name = format!("Local\\StudioFsMetadataBaseline-{}", std::process::id());
     let report = super::with_winfsp_mount(vfs, rt, mount_point, event_name, |drive| {
         let directory = std::path::Path::new(drive).join("baseline");
@@ -115,11 +249,13 @@ fn winfsp_metadata_baseline() {
             .map(|index| format!("file-{index:02}").into())
             .collect();
         let mut report = String::from(
-            "pass,workload,operations,elapsed_ns,get_security_by_name,open,get_file_info,read_directory,cleanup,close\n",
+            "pass,workload,operations,elapsed_ns,warmup,instrumentation_mode,get_security_by_name,open,get_file_info,read_directory,cleanup,close,path_resolution,metadata_lookup,metadata_getattr,acl_check,readdir,get_attrs_batch,directory_buffer,dentry_cache_hits,dentry_cache_misses,path_shortcut_cache_hits,path_shortcut_cache_misses,attr_read_cache_hits,attr_read_cache_misses,native_cache_enabled_open,native_cache_disabled_open\n",
         );
         for pass in 1..=3 {
             for workload in ["stat", "open_close", "negative_lookup", "enumeration"] {
                 let before = counter.snapshot();
+                let before_cache = vfs_observer.cache_state_snapshot();
+                let before_write = vfs_observer.write_path_observability_snapshot();
                 let started = Instant::now();
                 for _ in 0..1000 {
                     match workload {
@@ -150,26 +286,109 @@ fn winfsp_metadata_baseline() {
                 }
                 let elapsed = started.elapsed().as_nanos();
                 let after = counter.snapshot();
-                let delta: [u64; 6] = std::array::from_fn(|index| after[index] - before[index]);
+                let delta: [u64; EVENT_COUNT] =
+                    std::array::from_fn(|index| after[index].saturating_sub(before[index]));
+                let after_cache = vfs_observer.cache_state_snapshot();
+                let after_write = vfs_observer.write_path_observability_snapshot();
                 use std::fmt::Write;
-                writeln!(
-                    report,
-                    "{pass},{workload},1000,{elapsed},{},{},{},{},{},{}",
-                    delta[0], delta[1], delta[2], delta[3], delta[4], delta[5]
-                )
-                .expect("format row");
+                let mut row = vec![
+                    pass.to_string(),
+                    workload.to_string(),
+                    "1000".to_string(),
+                    elapsed.to_string(),
+                    "false".to_string(),
+                    if instrumentation_enabled {
+                        "enabled".to_string()
+                    } else {
+                        "disabled".to_string()
+                    },
+                ];
+                row.extend(delta.iter().map(|value| value.to_string()));
+                row.extend(
+                    [
+                        after_cache
+                            .dentry_cache
+                            .hits
+                            .saturating_sub(before_cache.dentry_cache.hits),
+                        after_cache
+                            .dentry_cache
+                            .misses
+                            .saturating_sub(before_cache.dentry_cache.misses),
+                        after_cache
+                            .path_shortcut_cache
+                            .hits
+                            .saturating_sub(before_cache.path_shortcut_cache.hits),
+                        after_cache
+                            .path_shortcut_cache
+                            .misses
+                            .saturating_sub(before_cache.path_shortcut_cache.misses),
+                        after_cache
+                            .attr_read_cache
+                            .hits
+                            .saturating_sub(before_cache.attr_read_cache.hits),
+                        after_cache
+                            .attr_read_cache
+                            .misses
+                            .saturating_sub(before_cache.attr_read_cache.misses),
+                        after_write
+                            .winfsp_callbacks
+                            .os_cache_enabled_open
+                            .saturating_sub(before_write.winfsp_callbacks.os_cache_enabled_open),
+                        after_write
+                            .winfsp_callbacks
+                            .os_cache_disabled_open
+                            .saturating_sub(before_write.winfsp_callbacks.os_cache_disabled_open),
+                    ]
+                    .iter()
+                    .map(|value| value.to_string()),
+                );
+                writeln!(report, "{}", row.join(",")).expect("format row");
             }
         }
         let counts = counter.snapshot();
+        let count = |target| CallbackCounter::count_for(&counts, target);
         assert!(
-            counts[0] > 0,
+            count("studiofs_winfsp::metadata_baseline::get_security_by_name") > 0,
             "security-by-name instrumentation must be active"
         );
         assert!(
-            counts[1] >= 3000,
+            count("studiofs_winfsp::metadata_baseline::open") >= 3000,
             "open instrumentation must observe repeated opens"
         );
-        assert!(counts[3] > 0, "directory instrumentation must be active");
+        assert!(
+            count("studiofs_winfsp::metadata_baseline::read_directory") > 0,
+            "directory instrumentation must be active"
+        );
+        if instrumentation_enabled {
+            assert!(
+                count("studiofs_winfsp::metadata_baseline::path_resolution") > 0,
+                "path-resolution instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::metadata_lookup") > 0,
+                "metadata-lookup instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::metadata_getattr") > 0,
+                "metadata-getattr instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::acl_check") > 0,
+                "ACL instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::readdir") > 0,
+                "readdir instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_vfs::metadata_baseline::get_attrs_batch") > 0,
+                "batched-attribute instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_winfsp::metadata_baseline::directory_buffer") > 0,
+                "directory-buffer instrumentation must be active"
+            );
+        }
         report
     });
     let directory = super::workspace_root().join("target/perf");
@@ -179,7 +398,7 @@ fn winfsp_metadata_baseline() {
         .expect("clock")
         .as_millis();
     let path = directory.join(format!(
-        "sfs-675-metadata-{timestamp}-{}.csv",
+        "sfs-690-metadata-{timestamp}-{}.csv",
         std::process::id()
     ));
     std::fs::write(&path, &report).expect("retain raw baseline report");
