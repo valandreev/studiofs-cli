@@ -1764,15 +1764,6 @@ impl StudioFsContext {
             }
         };
 
-        self.replay_directory_snapshot(context, snapshot, lock)
-    }
-
-    fn replay_directory_snapshot(
-        &self,
-        context: &StudioFileHandle,
-        snapshot: Arc<DirectorySnapshot>,
-        lock: &DirBufferLock<'_>,
-    ) -> winfsp::Result<()> {
         debug!(
             ino = context.ino,
             count = snapshot.children_len(),
