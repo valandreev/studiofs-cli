@@ -1026,10 +1026,15 @@ impl StudioVfs {
         &self,
         inodes: impl IntoIterator<Item = Ino>,
     ) -> Vec<Ino> {
+        let mut inodes = inodes.into_iter();
+        let Some(first_ino) = inodes.next() else {
+            return Vec::new();
+        };
+        self.bump_attribute_generation();
         let mut cache = self.state.namespace.attr_read_cache.lock();
         let mut read_plan_cache = self.state.read.published_read_plan_cache.lock();
         let mut removed = Vec::new();
-        for ino in inodes {
+        for ino in std::iter::once(first_ino).chain(inodes) {
             self.handle_table.clear_read_windows_for_inode(ino);
             read_plan_cache.pop(&ino);
             if cache.remove(ino) {
@@ -1048,6 +1053,7 @@ impl StudioVfs {
         if cache.observation(ino) != expected {
             return None;
         }
+        self.bump_attribute_generation();
         self.handle_table.clear_read_windows_for_inode(ino);
         self.state.read.published_read_plan_cache.lock().pop(&ino);
         cache.remove(ino);
@@ -1055,11 +1061,22 @@ impl StudioVfs {
     }
 
     pub(super) fn retire_all_attr_read_observations(&self) {
+        self.bump_attribute_generation();
         self.state
             .namespace
             .attr_read_cache
             .lock()
             .retire_observations();
+    }
+
+    pub(super) fn bump_attribute_generation(&self) {
+        self.state
+            .namespace
+            .attribute_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(1))
+            })
+            .ok();
     }
 
     pub(super) fn read_cache_invalidation_set(

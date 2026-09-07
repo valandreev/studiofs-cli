@@ -157,8 +157,8 @@ struct DentryCacheMeta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NamespaceCacheToken {
-    namespace_epoch: u64,
-    parent_generation: u64,
+    pub(super) namespace_epoch: u64,
+    pub(super) parent_generation: u64,
 }
 
 /// Metrics for dentry cache hits, misses, and hot-set occupancy.
@@ -1241,6 +1241,8 @@ pub(super) struct NamespaceState {
     pub(super) dirty_attrs: OrderedMutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Global namespace epoch to invalidate stale dentry/path cache entries.
     pub(super) namespace_epoch: AtomicU64,
+    /// Aggregate attribute generation used by bridge-side enumeration caches.
+    pub(super) attribute_generation: AtomicU64,
     /// Per-directory generation map used to detect stale parent chains.
     pub(super) directory_generations: OrderedMutex<std::collections::HashMap<Ino, u64>>,
     /// Linux opt-in namespace metadata admission queue and in-memory visibility overlay.
@@ -1272,6 +1274,7 @@ impl NamespaceState {
             ),
             dirty_attrs: OrderedMutex::new(std::collections::HashMap::new(), LockTier::Namespace),
             namespace_epoch: AtomicU64::new(0),
+            attribute_generation: AtomicU64::new(0),
             directory_generations: OrderedMutex::new(
                 std::collections::HashMap::new(),
                 LockTier::Namespace,
@@ -2750,6 +2753,64 @@ mod tests {
             cache.entry_value(&key),
             Some(DentryCacheValue::Positive(created.ino))
         );
+    }
+
+    #[test]
+    fn directory_enumeration_observation_changes_after_attribute_invalidation() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "directory-enumeration-observation");
+        let created = vfs
+            .create(ROOT_INO, b"observed.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let before = vfs
+            .directory_enumeration_observation(ROOT_INO)
+            .expect("read initial directory observation");
+        vfs.invalidate_attr_read_cache([created.ino]);
+        let after = vfs
+            .directory_enumeration_observation(ROOT_INO)
+            .expect("read updated directory observation");
+
+        assert_eq!(before.namespace_epoch, after.namespace_epoch);
+        assert_eq!(before.directory_generation, after.directory_generation);
+        assert!(after.attribute_generation > before.attribute_generation);
+    }
+
+    #[test]
+    fn directory_enumeration_observation_changes_for_namespace_and_acl_mutations() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "directory-enumeration-mutations");
+
+        let before_create = vfs
+            .directory_enumeration_observation(ROOT_INO)
+            .expect("read initial observation");
+        let _created = vfs
+            .create(ROOT_INO, b"mutation.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let after_create = vfs
+            .directory_enumeration_observation(ROOT_INO)
+            .expect("read post-create observation");
+        assert_ne!(before_create, after_create);
+
+        vfs.rename(ROOT_INO, b"mutation.txt", ROOT_INO, b"renamed.txt")
+            .expect("rename file");
+        let after_rename = vfs
+            .directory_enumeration_observation(ROOT_INO)
+            .expect("read post-rename observation");
+        assert_ne!(after_create, after_rename);
+
+        vfs.unlink(ROOT_INO, b"renamed.txt").expect("unlink file");
+        let after_unlink = vfs
+            .directory_enumeration_observation(ROOT_INO)
+            .expect("read post-unlink observation");
+        assert_ne!(after_rename, after_unlink);
+
+        vfs.set_acl_rule(ROOT_INO, "*", studiofs_meta::schema::AccessLevel::ReadOnly)
+            .expect("set ACL rule");
+        let after_acl = vfs
+            .directory_enumeration_observation(ROOT_INO)
+            .expect("read post-ACL observation");
+        assert!(after_acl.acl_epoch > after_unlink.acl_epoch);
     }
 
     #[test]

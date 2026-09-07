@@ -24,6 +24,12 @@ const HOT_PATH_EVENTS: [&str; 7] = [
     "get_attrs_batch",
     "directory_buffer",
 ];
+const DIRECTORY_SNAPSHOT_CACHE_EVENTS: [&str; 4] = [
+    "directory_snapshot_cache_hit",
+    "directory_snapshot_cache_miss",
+    "directory_snapshot_cache_eviction",
+    "directory_snapshot_cache_invalidation",
+];
 const WINFSP_HOT_PATH_EVENTS: [&str; 2] = ["path_resolution", "directory_buffer"];
 const VFS_HOT_PATH_EVENTS: [&str; 5] = [
     "metadata_lookup",
@@ -32,7 +38,8 @@ const VFS_HOT_PATH_EVENTS: [&str; 5] = [
     "readdir",
     "get_attrs_batch",
 ];
-const EVENT_COUNT: usize = CALLBACKS.len() + HOT_PATH_EVENTS.len();
+const EVENT_COUNT: usize =
+    CALLBACKS.len() + HOT_PATH_EVENTS.len() + DIRECTORY_SNAPSHOT_CACHE_EVENTS.len();
 
 #[derive(Clone)]
 struct CallbackCounter {
@@ -64,6 +71,12 @@ impl CallbackCounter {
                     .iter()
                     .position(|event| *event == name)
                     .map(|index| CALLBACKS.len() + index);
+            }
+            if let Some(index) = DIRECTORY_SNAPSHOT_CACHE_EVENTS
+                .iter()
+                .position(|event| *event == name)
+            {
+                return Some(CALLBACKS.len() + HOT_PATH_EVENTS.len() + index);
             }
             return None;
         }
@@ -118,6 +131,12 @@ mod tests {
         assert_eq!(
             CallbackCounter::event_index("studiofs_winfsp::metadata_baseline::directory_buffer"),
             Some(12)
+        );
+        assert_eq!(
+            CallbackCounter::event_index(
+                "studiofs_winfsp::metadata_baseline::directory_snapshot_cache_hit"
+            ),
+            Some(13)
         );
         assert_eq!(
             CallbackCounter::event_index("studiofs_vfs::metadata_baseline::directory_buffer"),
@@ -249,7 +268,7 @@ fn winfsp_metadata_baseline() {
             .map(|index| format!("file-{index:02}").into())
             .collect();
         let mut report = String::from(
-            "pass,workload,operations,elapsed_ns,warmup,instrumentation_mode,get_security_by_name,open,get_file_info,read_directory,cleanup,close,path_resolution,metadata_lookup,metadata_getattr,acl_check,readdir,get_attrs_batch,directory_buffer,dentry_cache_hits,dentry_cache_misses,path_shortcut_cache_hits,path_shortcut_cache_misses,attr_read_cache_hits,attr_read_cache_misses,native_cache_enabled_open,native_cache_disabled_open\n",
+            "pass,workload,operations,elapsed_ns,warmup,instrumentation_mode,get_security_by_name,open,get_file_info,read_directory,cleanup,close,path_resolution,metadata_lookup,metadata_getattr,acl_check,readdir,get_attrs_batch,directory_buffer,directory_snapshot_cache_hit,directory_snapshot_cache_miss,directory_snapshot_cache_eviction,directory_snapshot_cache_invalidation,dentry_cache_hits,dentry_cache_misses,path_shortcut_cache_hits,path_shortcut_cache_misses,attr_read_cache_hits,attr_read_cache_misses,native_cache_enabled_open,native_cache_disabled_open\n",
         );
         for pass in 1..=3 {
             for workload in ["stat", "open_close", "negative_lookup", "enumeration"] {
@@ -388,6 +407,14 @@ fn winfsp_metadata_baseline() {
                 count("studiofs_winfsp::metadata_baseline::directory_buffer") > 0,
                 "directory-buffer instrumentation must be active"
             );
+            assert!(
+                count("studiofs_winfsp::metadata_baseline::directory_snapshot_cache_hit") > 0,
+                "directory snapshot cache hit instrumentation must be active"
+            );
+            assert!(
+                count("studiofs_winfsp::metadata_baseline::directory_snapshot_cache_miss") > 0,
+                "directory snapshot cache miss instrumentation must be active"
+            );
         }
         report
     });
@@ -398,7 +425,7 @@ fn winfsp_metadata_baseline() {
         .expect("clock")
         .as_millis();
     let path = directory.join(format!(
-        "sfs-690-metadata-{timestamp}-{}.csv",
+        "sfs-693-metadata-{timestamp}-{}.csv",
         std::process::id()
     ));
     std::fs::write(&path, &report).expect("retain raw baseline report");

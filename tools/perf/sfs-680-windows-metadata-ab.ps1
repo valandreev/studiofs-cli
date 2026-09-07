@@ -29,6 +29,10 @@ $measurementColumns = @(
     "readdir",
     "get_attrs_batch",
     "directory_buffer",
+    "directory_snapshot_cache_hit",
+    "directory_snapshot_cache_miss",
+    "directory_snapshot_cache_eviction",
+    "directory_snapshot_cache_invalidation",
     "dentry_cache_hits",
     "dentry_cache_misses",
     "path_shortcut_cache_hits",
@@ -46,7 +50,11 @@ $hotPathMeasurementColumns = @(
     "acl_check",
     "readdir",
     "get_attrs_batch",
-    "directory_buffer"
+    "directory_buffer",
+    "directory_snapshot_cache_hit",
+    "directory_snapshot_cache_miss",
+    "directory_snapshot_cache_eviction",
+    "directory_snapshot_cache_invalidation"
 )
 $callbackColumns = @(
     "get_security_by_name",
@@ -430,16 +438,42 @@ function Invoke-CargoBenchmark {
         throw "$Side run $Run produced $($rows.Count) CSV rows; expected 12"
     }
     $expectedColumns = @("pass", "workload", "operations", "elapsed_ns", "warmup", "instrumentation_mode") + $measurementColumns
+    $previousSfs690MeasurementColumns = @(
+        "get_security_by_name",
+        "open",
+        "get_file_info",
+        "read_directory",
+        "cleanup",
+        "close",
+        "path_resolution",
+        "metadata_lookup",
+        "metadata_getattr",
+        "acl_check",
+        "readdir",
+        "get_attrs_batch",
+        "directory_buffer",
+        "dentry_cache_hits",
+        "dentry_cache_misses",
+        "path_shortcut_cache_hits",
+        "path_shortcut_cache_misses",
+        "attr_read_cache_hits",
+        "attr_read_cache_misses",
+        "native_cache_enabled_open",
+        "native_cache_disabled_open"
+    )
+    $previousSfs690Columns = @("pass", "workload", "operations", "elapsed_ns", "warmup", "instrumentation_mode") + $previousSfs690MeasurementColumns
     $legacyColumns = @("pass", "workload", "operations", "elapsed_ns") + $callbackColumns
     $actualColumns = @($rows[0].PSObject.Properties.Name)
     $hasSfs690Schema = $actualColumns.Count -eq $expectedColumns.Count -and
         ($actualColumns -join ',') -eq ($expectedColumns -join ',')
+    $hasPreviousSfs690Schema = $actualColumns.Count -eq $previousSfs690Columns.Count -and
+        ($actualColumns -join ',') -eq ($previousSfs690Columns -join ',')
     $hasLegacySchema = $actualColumns.Count -eq $legacyColumns.Count -and
         ($actualColumns -join ',') -eq ($legacyColumns -join ',')
-    if (-not $hasSfs690Schema -and -not $hasLegacySchema) {
+    if (-not $hasSfs690Schema -and -not $hasPreviousSfs690Schema -and -not $hasLegacySchema) {
         throw "$Side run $Run CSV has an unknown schema"
     }
-    if ($hasLegacySchema -and $Side -ne "baseline") {
+    if (($hasLegacySchema -or $hasPreviousSfs690Schema) -and $Side -ne "baseline") {
         throw "$Side run $Run emitted the legacy metadata schema; candidate instrumentation is required"
     }
     if ($hasSfs690Schema) {
@@ -449,6 +483,9 @@ function Invoke-CargoBenchmark {
         }
     }
     $instrumentationStatus = if ($hasSfs690Schema) {
+        if ($instrumentationMode -eq "enabled") { "sfs-693" } else { "disabled" }
+    }
+    elseif ($hasPreviousSfs690Schema) {
         if ($instrumentationMode -eq "enabled") { "sfs-690" } else { "disabled" }
     }
     else { "legacy" }
@@ -470,11 +507,14 @@ function Invoke-CargoBenchmark {
             throw "$Side run $Run contains an invalid pass set for workload $workload"
         }
     }
-    if ($hasSfs690Schema -and @($rows | Where-Object { $_.warmup -ne "false" }).Count -ne 0) {
+    if (($hasSfs690Schema -or $hasPreviousSfs690Schema) -and @($rows | Where-Object { $_.warmup -ne "false" }).Count -ne 0) {
         throw "$Side run $Run contains an unexpected warm-up marker"
     }
     $columnsToValidate = if ($hasSfs690Schema) {
         $numericMeasurementColumns
+    }
+    elseif ($hasPreviousSfs690Schema) {
+        @("elapsed_ns") + $previousSfs690MeasurementColumns
     }
     else {
         @("elapsed_ns") + $callbackColumns
@@ -668,7 +708,7 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 }
 $artifactDirectory = New-UniqueDirectory -Root $OutputRoot -Name ("sfs-680-windows-metadata-ab-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 $targetRoot = (Resolve-Path -LiteralPath (Join-Path $repoRoot "target")).Path
-$buildTargetRoot = Join-Path $targetRoot ("sfs-690-build-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
+$buildTargetRoot = Join-Path $targetRoot ("sfs-693-build-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
 $buildTargetDirectories = [ordered]@{
     baseline  = Join-Path $buildTargetRoot "baseline"
     candidate = Join-Path $buildTargetRoot "candidate"
@@ -747,9 +787,9 @@ try {
     $attributionRunnerCommand = "<built candidate mount_sanity executable> metadata_baseline::winfsp_metadata_baseline --ignored --exact --nocapture --test-threads=1 (untimed attribution; STUDIOFS_METADATA_INSTRUMENTATION=enabled)"
     $harnessCommand = "powershell -ExecutionPolicy Bypass -File .\tools\perf\sfs-680-windows-metadata-ab.ps1 -MountPoint $($MountPoint.Trim().ToUpperInvariant()) -BaselineCommit $baselineResolved -CandidateCommit $candidateResolved -Runs $Runs"
     $environment = [ordered]@{
-        issue                  = "SFS-690"
+        issue                  = "SFS-693"
         related_harness        = "SFS-680"
-        instrumentation        = "SFS-690 opt-in metadata hot-path attribution"
+        instrumentation        = "SFS-693 bounded directory snapshot cache attribution"
         platform               = "Windows"
         mount_point            = $MountPoint.Trim().ToUpperInvariant()
         runs_per_side          = $Runs
@@ -842,7 +882,7 @@ try {
     Write-Utf8NoBom -Path (Join-Path $artifactDirectory "environment.json") -Value ($environment | ConvertTo-Json -Depth 8)
     Write-Host "aggregation: JSON"
     $json = [ordered]@{
-        issue                   = "SFS-690"
+        issue                   = "SFS-693"
         run_order               = @($runOrder)
         instrumentation_coverage = $instrumentationCoverage
         builds                  = @($builds["baseline"], $builds["candidate"])
@@ -855,13 +895,13 @@ try {
 
     Write-Host "aggregation: Markdown"
     $markdown = New-Object System.Collections.Generic.List[string]
-    $markdown.Add("# SFS-690 Windows metadata A/B benchmark")
+    $markdown.Add("# SFS-693 Windows metadata A/B benchmark")
     $markdown.Add("")
     $markdown.Add(("Baseline `{0}`; candidate `{1}`." -f $baselineResolved, $candidateResolved))
     $markdown.Add("")
     $markdown.Add(("Run order: `{0}`." -f ($runOrderLabels -join " -> ")))
     $markdown.Add(("Timed instrumentation: baseline `{0}`; candidate `{1}`. Candidate attribution: `{2}` in a separate untimed run." -f $instrumentationCoverage.baseline_timed, $instrumentationCoverage.candidate_timed, $instrumentationCoverage.candidate_attribution))
-    $markdown.Add('The timed A/B comparison disables SFS-690 hot-path event counting on the candidate; attribution measurements are retained separately in `results.json` and are excluded from the timing table.')
+    $markdown.Add('The timed A/B comparison disables SFS-693 hot-path event counting on the candidate; attribution measurements are retained separately in `results.json` and are excluded from the timing table.')
     $markdown.Add("")
     $markdown.Add("| Workload | Baseline median (ms) | Candidate median (ms) | Baseline p95 (ms) | Candidate p95 (ms) | Change | Outliers B/C |")
     $markdown.Add("|---|---:|---:|---:|---:|---:|---:|")
@@ -880,7 +920,7 @@ try {
     }
     $markdown.Add("")
     $markdown.Add('Callback, VFS hot-path, cache, and native-cache medians are retained in `results.json`; raw CSVs preserve every pass and delta.')
-    $markdown.Add('Candidate SFS-690 attribution medians are retained under `attribution_workloads`; they are not part of the baseline/candidate timing comparison.')
+    $markdown.Add('Candidate SFS-693 attribution medians are retained under `attribution_workloads`; they are not part of the baseline/candidate timing comparison.')
     $markdown.Add('P95, sample standard deviation, coefficient of variation, and IQR outlier samples are retained per workload in `results.json`.')
     $markdown.Add(("Warm-up status: {0}. System-load observations are stored per run; unavailable CIM fields remain null." -f $environment.warmup_status))
     $markdown.Add("Enumeration timing includes correctness assertions, allocation and sorting. Close callbacks can cross workload boundaries.")
