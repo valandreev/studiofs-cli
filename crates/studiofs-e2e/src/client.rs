@@ -1786,8 +1786,14 @@ fn client_env(client: &ClientSpec) -> Vec<(String, String)> {
             "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS".to_string(),
             "250".to_string(),
         ),
+        // Keep native WinFSP cache invalidation observable within the bounded
+        // convergence window used by mounted E2E scenarios.
         (
             "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS".to_string(),
+            "1000".to_string(),
+        ),
+        (
+            "STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS".to_string(),
             "1000".to_string(),
         ),
     ]
@@ -2886,7 +2892,7 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
     }
 
     #[test]
-    fn client_env_bounds_winfsp_file_info_timeout_for_invalidation_runs() {
+    fn client_env_bounds_winfsp_metadata_timeouts_for_invalidation_runs() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let client = client_spec_for(
             temp.path(),
@@ -2898,6 +2904,9 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
 
         assert!(env.iter().any(|(key, value)| {
             key == "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS" && value == "1000"
+        }));
+        assert!(env.iter().any(|(key, value)| {
+            key == "STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS" && value == "1000"
         }));
     }
 
