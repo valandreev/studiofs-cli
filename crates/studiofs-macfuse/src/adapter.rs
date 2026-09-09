@@ -103,6 +103,11 @@ impl MacFuseMetadataCachePolicy {
     }
 }
 
+enum MetadataReplyTarget<'a> {
+    Entry { parent: u64, name: &'a [u8] },
+    InodeAttrs { ino: u64 },
+}
+
 /// Operation adapter shared by macFUSE callbacks and fast tests.
 pub(crate) struct StudioVfsAdapter {
     vfs: Arc<StudioVfs>,
@@ -114,6 +119,7 @@ pub(crate) struct StudioVfsAdapter {
     directory_handles: ParkingMutex<HashMap<u64, Arc<DirectoryHandle>>>,
     next_directory_handle: AtomicU64,
     shared: Arc<AdapterSharedState>,
+    metadata_cache_invalidator: ParkingMutex<Option<Arc<dyn KernelInvalidator>>>,
     open_reply_serializer: FuseOpenReplySerializer,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_queue_byte_limit: u32,
@@ -137,6 +143,7 @@ struct AdapterSharedState {
     read_buffers: Arc<ReadBufferPool>,
     read_diagnostics: AsyncReadDiagnostics,
     kernel_invalidations: Arc<KernelInvalidationGate>,
+    metadata_invalidation_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -406,6 +413,7 @@ struct OpenCacheKernelInvalidator {
 
 struct LiveKernelInvalidator {
     kernel_inode_liveness: Arc<KernelInodeLiveness>,
+    metadata_invalidation_epoch: Arc<AtomicU64>,
     inner: Arc<dyn KernelInvalidator>,
 }
 
@@ -415,6 +423,8 @@ impl KernelInvalidator for LiveKernelInvalidator {
         batch: &studiofs_meta::coherence::InvalidationBatch,
         generation_complete: bool,
     ) -> studiofs_vfs::coherence::InvalidationAcceptance {
+        self.metadata_invalidation_epoch
+            .fetch_add(1, Ordering::AcqRel);
         let intents = batch
             .intents
             .iter()
@@ -444,16 +454,22 @@ impl KernelInvalidator for LiveKernelInvalidator {
     }
 
     fn inval_inode(&self, ino: u64) {
+        self.metadata_invalidation_epoch
+            .fetch_add(1, Ordering::AcqRel);
         self.kernel_inode_liveness
             .notify_if_observed(ino, || self.inner.inval_inode(ino));
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
+        self.metadata_invalidation_epoch
+            .fetch_add(1, Ordering::AcqRel);
         self.kernel_inode_liveness
             .notify_if_observed(ino, || self.inner.inval_inode_attrs(ino));
     }
 
     fn inval_entry(&self, parent: u64, name: &[u8]) {
+        self.metadata_invalidation_epoch
+            .fetch_add(1, Ordering::AcqRel);
         // A cached or negative dentry can outlive our lookup-reference count.
         // macFUSE safely returns ENOENT when the kernel no longer knows it.
         self.inner.inval_entry(parent, name);
@@ -1091,7 +1107,9 @@ impl StudioVfsAdapter {
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
                 kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
+                metadata_invalidation_epoch: Arc::new(AtomicU64::new(0)),
             }),
+            metadata_cache_invalidator: ParkingMutex::new(None),
             open_reply_serializer: FuseOpenReplySerializer::new(),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_queue_byte_limit,
@@ -1171,6 +1189,7 @@ impl StudioVfsAdapter {
     ) -> Arc<dyn KernelInvalidator> {
         let deferred_inner: Arc<dyn KernelInvalidator> = Arc::new(LiveKernelInvalidator {
             kernel_inode_liveness: Arc::clone(&self.shared.kernel_inode_liveness),
+            metadata_invalidation_epoch: Arc::clone(&self.shared.metadata_invalidation_epoch),
             inner: Arc::clone(&inner),
         });
         let open_cache: Arc<dyn KernelInvalidator> = Arc::new(OpenCacheKernelInvalidator {
@@ -1181,8 +1200,10 @@ impl StudioVfsAdapter {
         });
         let live: Arc<dyn KernelInvalidator> = Arc::new(LiveKernelInvalidator {
             kernel_inode_liveness: Arc::clone(&self.shared.kernel_inode_liveness),
+            metadata_invalidation_epoch: Arc::clone(&self.shared.metadata_invalidation_epoch),
             inner: open_cache,
         });
+        *self.metadata_cache_invalidator.lock() = Some(Arc::clone(&live));
         self.shared
             .kernel_invalidations
             // Deferred full invalidations already expand to data plus attrs;
@@ -1224,6 +1245,12 @@ impl StudioVfsAdapter {
         timeout
     }
 
+    fn metadata_cache_epoch(&self) -> u64 {
+        self.shared
+            .metadata_invalidation_epoch
+            .load(Ordering::Acquire)
+    }
+
     fn metadata_attr_timeout(&self, ino: u64) -> f64 {
         if self.vfs.is_runtime_stats_file_ino(ino) {
             0.0
@@ -1232,9 +1259,34 @@ impl StudioVfsAdapter {
         }
     }
 
+    fn metadata_attr_timeout_at_epoch(&self, ino: u64, observed_epoch: u64) -> f64 {
+        if self.metadata_cache_epoch() != observed_epoch {
+            0.0
+        } else {
+            self.metadata_attr_timeout(ino)
+        }
+    }
+
     fn entry_for_reply(&self, attr: &InodeAttr) -> Entry {
-        let timeout = self.metadata_attr_timeout(attr.ino);
+        self.entry_for_reply_at_epoch(attr, self.metadata_cache_epoch())
+    }
+
+    fn entry_for_reply_at_epoch(&self, attr: &InodeAttr, observed_epoch: u64) -> Entry {
+        let timeout = self.metadata_attr_timeout_at_epoch(attr.ino, observed_epoch);
         Entry::new(attr.ino, 0, self.attr_to_stat(attr), timeout, timeout)
+    }
+
+    fn revalidate_metadata_reply<'a>(&self, observed_epoch: u64, target: MetadataReplyTarget<'a>) {
+        if self.metadata_cache_epoch() == observed_epoch {
+            return;
+        }
+        let Some(invalidator) = self.metadata_cache_invalidator.lock().clone() else {
+            return;
+        };
+        match target {
+            MetadataReplyTarget::Entry { parent, name } => invalidator.inval_entry(parent, name),
+            MetadataReplyTarget::InodeAttrs { ino } => invalidator.inval_inode_attrs(ino),
+        }
     }
 
     /// Get inode attributes.
@@ -3446,11 +3498,18 @@ pub extern "C" fn studiofs_macfuse_lookup(
     }
     // SAFETY: macFUSE passes a NUL-terminated entry name for lookup callbacks.
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    let observed_epoch = state.adapter.metadata_cache_epoch();
     match state.adapter.lookup(parent, name) {
         Ok(attr) => {
             if let Some(request) = owned_request(req) {
-                let entry = state.adapter.entry_for_reply(&attr);
+                let entry = state
+                    .adapter
+                    .entry_for_reply_at_epoch(&attr, observed_epoch);
                 let _ = Reply::new(request).entry(&entry);
+                state.adapter.revalidate_metadata_reply(
+                    observed_epoch,
+                    MetadataReplyTarget::Entry { parent, name },
+                );
             }
         }
         Err(libc::ENOENT) => {
@@ -3494,11 +3553,18 @@ pub extern "C" fn studiofs_macfuse_getattr(
         reply_error(req, libc::EIO);
         return;
     };
+    let observed_epoch = state.adapter.metadata_cache_epoch();
     match state.adapter.getattr(ino) {
         Ok(attr) => {
             if let Some(request) = owned_request(req) {
-                let timeout = state.adapter.metadata_attr_timeout(ino);
+                let timeout = state
+                    .adapter
+                    .metadata_attr_timeout_at_epoch(ino, observed_epoch);
                 let _ = Reply::new(request).attr(&attr, timeout);
+                state.adapter.revalidate_metadata_reply(
+                    observed_epoch,
+                    MetadataReplyTarget::InodeAttrs { ino },
+                );
             }
         }
         Err(errno) => {
@@ -4887,6 +4953,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_entry_reply_is_reinvalidated_when_epoch_changes() {
+        let fixture = ContractVfsFixture::new("macfuse-metadata-reply-invalidation-race")
+            .expect("create VFS fixture");
+        crate::start_vfs_and_wait_for_healthy_cache(&fixture);
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let inner = Arc::new(EntryRecordingKernelInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(Arc::clone(&inner) as Arc<_>);
+        let observed_epoch = adapter.metadata_cache_epoch();
+
+        assert_eq!(
+            adapter.metadata_attr_timeout_at_epoch(501, observed_epoch),
+            ADAPTIVE_METADATA_TIMEOUT_SECONDS
+        );
+
+        invalidator.inval_entry(42, b"entry");
+        assert_eq!(
+            adapter.metadata_attr_timeout_at_epoch(501, observed_epoch),
+            0.0
+        );
+
+        adapter.revalidate_metadata_reply(
+            observed_epoch,
+            MetadataReplyTarget::Entry {
+                parent: 42,
+                name: b"entry",
+            },
+        );
+
+        assert_eq!(
+            *inner.entries.lock(),
+            vec![(42, b"entry".to_vec()), (42, b"entry".to_vec())]
+        );
+
+        let attr_epoch = adapter.metadata_cache_epoch();
+        adapter.shared.kernel_inode_liveness.observe(501);
+        invalidator.inval_inode_attrs(501);
+        adapter.revalidate_metadata_reply(attr_epoch, MetadataReplyTarget::InodeAttrs { ino: 501 });
+        assert_eq!(*inner.attrs.lock(), vec![501, 501]);
+    }
+
+    #[test]
     fn queued_read_execution_size_stays_within_reusable_pool_capacity() {
         let oversized_queue_limit = u32::MAX;
         assert_eq!(
@@ -4935,6 +5042,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct EntryRecordingKernelInvalidator {
         entries: ParkingMutex<Vec<(u64, Vec<u8>)>>,
+        attrs: ParkingMutex<Vec<u64>>,
     }
 
     #[derive(Default)]
@@ -4968,7 +5076,9 @@ mod tests {
     impl KernelInvalidator for EntryRecordingKernelInvalidator {
         fn inval_inode(&self, _ino: u64) {}
 
-        fn inval_inode_attrs(&self, _ino: u64) {}
+        fn inval_inode_attrs(&self, ino: u64) {
+            self.attrs.lock().push(ino);
+        }
 
         fn inval_entry(&self, parent: u64, name: &[u8]) {
             self.entries.lock().push((parent, name.to_vec()));
@@ -4980,6 +5090,7 @@ mod tests {
         let inner = Arc::new(EntryRecordingKernelInvalidator::default());
         let invalidator = LiveKernelInvalidator {
             kernel_inode_liveness: Arc::new(KernelInodeLiveness::default()),
+            metadata_invalidation_epoch: Arc::new(AtomicU64::new(0)),
             inner: Arc::clone(&inner) as Arc<dyn KernelInvalidator>,
         };
 
