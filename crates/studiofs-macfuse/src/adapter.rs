@@ -170,6 +170,10 @@ impl KernelInodeLiveness {
 
     #[cfg(test)]
     fn contains(&self, ino: u64) -> bool {
+        self.is_observed(ino)
+    }
+
+    fn is_observed(&self, ino: u64) -> bool {
         self.current(ino).is_some_and(|state| *state.lock() > 0)
     }
 
@@ -376,6 +380,39 @@ struct LiveKernelInvalidator {
 }
 
 impl KernelInvalidator for LiveKernelInvalidator {
+    fn invalidate_batch(
+        &self,
+        batch: &studiofs_meta::coherence::InvalidationBatch,
+        generation_complete: bool,
+    ) -> studiofs_vfs::coherence::InvalidationAcceptance {
+        let intents = batch
+            .intents
+            .iter()
+            .filter(|intent| match intent {
+                studiofs_meta::coherence::InvalidationIntent::Content { ino }
+                | studiofs_meta::coherence::InvalidationIntent::Attributes { ino }
+                | studiofs_meta::coherence::InvalidationIntent::Directory { ino } => {
+                    self.kernel_inode_liveness.is_observed(*ino)
+                }
+                studiofs_meta::coherence::InvalidationIntent::Entry { .. }
+                | studiofs_meta::coherence::InvalidationIntent::Reset => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if intents.is_empty() {
+            return if generation_complete {
+                studiofs_vfs::coherence::InvalidationAcceptance::Queued
+            } else {
+                studiofs_vfs::coherence::InvalidationAcceptance::Failed
+            };
+        }
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: batch.generation,
+            intents,
+        };
+        self.inner.invalidate_batch(&batch, generation_complete)
+    }
+
     fn inval_inode(&self, ino: u64) {
         self.kernel_inode_liveness
             .notify_if_observed(ino, || self.inner.inval_inode(ino));
@@ -395,9 +432,45 @@ impl KernelInvalidator for LiveKernelInvalidator {
     fn reset_diagnostics(&self) {
         self.inner.reset_diagnostics();
     }
+
+    fn invalidation_delivery_age_ms(&self) -> Option<u64> {
+        self.inner.invalidation_delivery_age_ms()
+    }
+
+    fn invalidation_delivery_failure_count(&self) -> u64 {
+        self.inner.invalidation_delivery_failure_count()
+    }
 }
 
 impl KernelInvalidator for OpenCacheKernelInvalidator {
+    fn invalidate_batch(
+        &self,
+        batch: &studiofs_meta::coherence::InvalidationBatch,
+        generation_complete: bool,
+    ) -> studiofs_vfs::coherence::InvalidationAcceptance {
+        let mut deferred = false;
+        for intent in &batch.intents {
+            match intent {
+                studiofs_meta::coherence::InvalidationIntent::Content { ino } => {
+                    if self.kernel_invalidations.defer_data_if_reads_active(*ino) {
+                        self.kernel_invalidations.defer_attrs_if_reads_active(*ino);
+                        deferred = true;
+                    }
+                }
+                studiofs_meta::coherence::InvalidationIntent::Attributes { ino }
+                | studiofs_meta::coherence::InvalidationIntent::Directory { ino } => {
+                    deferred |= self.kernel_invalidations.defer_attrs_if_reads_active(*ino);
+                }
+                studiofs_meta::coherence::InvalidationIntent::Entry { .. }
+                | studiofs_meta::coherence::InvalidationIntent::Reset => {}
+            }
+        }
+        if deferred {
+            return studiofs_vfs::coherence::InvalidationAcceptance::Failed;
+        }
+        self.inner.invalidate_batch(batch, generation_complete)
+    }
+
     fn inval_inode(&self, ino: u64) {
         #[cfg(test)]
         self.open_cache_snapshots.lock().pop(&ino);
@@ -430,6 +503,14 @@ impl KernelInvalidator for OpenCacheKernelInvalidator {
 
     fn reset_diagnostics(&self) {
         self.inner.reset_diagnostics();
+    }
+
+    fn invalidation_delivery_age_ms(&self) -> Option<u64> {
+        self.inner.invalidation_delivery_age_ms()
+    }
+
+    fn invalidation_delivery_failure_count(&self) -> u64 {
+        self.inner.invalidation_delivery_failure_count()
     }
 }
 
@@ -4741,6 +4822,34 @@ mod tests {
         entries: ParkingMutex<Vec<(u64, Vec<u8>)>>,
     }
 
+    #[derive(Default)]
+    struct BatchRecordingKernelInvalidator {
+        batches: ParkingMutex<Vec<(studiofs_meta::coherence::InvalidationBatch, bool)>>,
+    }
+
+    impl KernelInvalidator for BatchRecordingKernelInvalidator {
+        fn invalidate_batch(
+            &self,
+            batch: &studiofs_meta::coherence::InvalidationBatch,
+            generation_complete: bool,
+        ) -> studiofs_vfs::coherence::InvalidationAcceptance {
+            self.batches
+                .lock()
+                .push((batch.clone(), generation_complete));
+            studiofs_vfs::coherence::InvalidationAcceptance::Queued
+        }
+
+        fn inval_inode(&self, _ino: u64) {}
+
+        fn invalidation_delivery_age_ms(&self) -> Option<u64> {
+            Some(23)
+        }
+
+        fn invalidation_delivery_failure_count(&self) -> u64 {
+            7
+        }
+    }
+
     impl KernelInvalidator for EntryRecordingKernelInvalidator {
         fn inval_inode(&self, _ino: u64) {}
 
@@ -4762,6 +4871,71 @@ mod tests {
         invalidator.inval_entry(42, b"recover.bin");
 
         assert_eq!(*inner.entries.lock(), vec![(42, b"recover.bin".to_vec())]);
+    }
+
+    #[test]
+    fn semantic_batch_and_diagnostics_cross_both_invalidator_decorators() {
+        let fixture = ContractVfsFixture::new("macfuse-semantic-invalidator-chain")
+            .expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let inner = Arc::new(BatchRecordingKernelInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(Arc::clone(&inner) as Arc<_>);
+        adapter.shared.kernel_inode_liveness.observe(42);
+
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 9,
+            intents: vec![
+                studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 42 },
+                studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 43 },
+                studiofs_meta::coherence::InvalidationIntent::Entry {
+                    parent: 1,
+                    name: b"entry".to_vec(),
+                    ancestors: None,
+                    ino: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Queued
+        );
+        assert_eq!(invalidator.invalidation_delivery_age_ms(), Some(23));
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 7);
+
+        let batches = inner.batches.lock();
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].1);
+        assert_eq!(batches[0].0.intents.len(), 2);
+        assert!(matches!(
+            batches[0].0.intents[0],
+            studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 42 }
+        ));
+        assert!(matches!(
+            batches[0].0.intents[1],
+            studiofs_meta::coherence::InvalidationIntent::Entry { .. }
+        ));
+    }
+
+    #[test]
+    fn semantic_batch_respects_open_read_gate_before_forwarding() {
+        let fixture = ContractVfsFixture::new("macfuse-semantic-invalidator-read-gate")
+            .expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let inner = Arc::new(BatchRecordingKernelInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(Arc::clone(&inner) as Arc<_>);
+        adapter.shared.kernel_invalidations.begin_read();
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 10,
+            intents: vec![studiofs_meta::coherence::InvalidationIntent::Content { ino: 42 }],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        assert!(inner.batches.lock().is_empty());
+        drop(adapter.shared.kernel_invalidations.finish_read());
     }
 
     #[test]
