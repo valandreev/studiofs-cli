@@ -325,6 +325,21 @@ fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperation
 }
 
 #[cfg(test)]
+fn start_vfs_and_wait_for_healthy_cache(
+    fixture: &studiofs_vfs::contract_harness::ContractVfsFixture,
+) {
+    fixture.start().expect("start VFS workers");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !fixture.vfs().coherence_allows_os_cache() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        fixture.vfs().coherence_allows_os_cache(),
+        "started VFS should reach healthy coherence before cache assertions"
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -2020,6 +2035,7 @@ mod tests {
             "macfuse-adapter-cache-generation",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
@@ -2072,11 +2088,48 @@ mod tests {
     }
 
     #[test]
+    fn adapter_does_not_reuse_kernel_cache_before_coherence_health_is_healthy() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-health-gate",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        assert!(!vfs.coherence_allows_os_cache());
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"cache-health.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let first_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open first read-only handle");
+        adapter
+            .release(attr.ino, first_open.file_handle())
+            .expect("release first handle");
+        let repeated_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open repeated read-only handle");
+
+        assert!(
+            !repeated_open.keep_cache(),
+            "unsafe coherence health must not retain kernel pages: {repeated_open:?}"
+        );
+    }
+
+    #[test]
     fn adapter_clean_write_capable_release_makes_next_read_drop_kernel_cache() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-write-open",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
@@ -2179,6 +2232,7 @@ mod tests {
             "macfuse-adapter-cache-read-open-during-write-release",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
@@ -2278,6 +2332,7 @@ mod tests {
             "macfuse-adapter-cache-dirty-write-release",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
@@ -2344,6 +2399,7 @@ mod tests {
             "macfuse-adapter-cache-clean-active-writer",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
@@ -2386,6 +2442,7 @@ mod tests {
             "macfuse-adapter-cache-local-stable-write-release",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
@@ -2462,6 +2519,7 @@ mod tests {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-cache-unlink")
                 .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
         let attr = vfs
@@ -2677,6 +2735,7 @@ mod tests {
             "macfuse-adapter-cache-hardlink",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
         let attr = vfs
@@ -2887,6 +2946,7 @@ mod tests {
             "macfuse-adapter-cache-bounded",
         )
         .expect("create VFS fixture");
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
         let adapter =

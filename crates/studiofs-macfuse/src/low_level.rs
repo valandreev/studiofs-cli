@@ -4,7 +4,7 @@
 //! low-level macFUSE FFI. Public types copy callback-owned values before they
 //! can cross async boundaries and keep request/reply ownership explicit.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::mem::MaybeUninit;
@@ -29,8 +29,8 @@ const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 4 * 1024 * 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-// Bound unique invalidation targets per session; producers apply backpressure
-// instead of dropping invalidations when this finite metadata budget is exhausted.
+// Bound unique semantic targets per session; legacy invalidations retain their
+// historical backpressure so publication work cannot be silently discarded.
 const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
@@ -843,11 +843,13 @@ struct SessionInvalidationQueueState {
     closed: bool,
     pending: VecDeque<InvalidationKey>,
     kinds: HashMap<InvalidationKey, bool>,
+    pending_since: Option<Instant>,
+    in_flight_since: Option<Instant>,
+    failed_enqueues: u64,
+    delivery_failures: u64,
     queue_peak: usize,
     coalesced: u64,
     snapshot_generation: u64,
-    #[cfg(test)]
-    waiting_producers: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -866,11 +868,13 @@ impl SessionInvalidationQueue {
                 closed: false,
                 pending: VecDeque::new(),
                 kinds: HashMap::new(),
+                pending_since: None,
+                in_flight_since: None,
+                failed_enqueues: 0,
+                delivery_failures: 0,
                 queue_peak: 0,
                 coalesced: 0,
                 snapshot_generation: 0,
-                #[cfg(test)]
-                waiting_producers: 0,
             }),
             wake: Condvar::new(),
             worker: ParkingMutex::new(None),
@@ -901,20 +905,24 @@ impl SessionInvalidationQueue {
                     match invalidation {
                         SessionInvalidation::Inode(invalidation) => {
                             let (offset, len) = invalidation_range(invalidation.data);
-                            notify_inode_range(
+                            let failed = notify_inode_range(
                                 channel,
                                 &invalidation_state,
                                 invalidation.ino,
                                 offset,
                                 len,
                             );
+                            worker_queue.complete_delivery(failed);
                         }
-                        SessionInvalidation::Entry(invalidation) => notify_entry(
-                            channel,
-                            &invalidation_state,
-                            invalidation.parent,
-                            &invalidation.name,
-                        ),
+                        SessionInvalidation::Entry(invalidation) => {
+                            let failed = notify_entry(
+                                channel,
+                                &invalidation_state,
+                                invalidation.parent,
+                                &invalidation.name,
+                            );
+                            worker_queue.complete_delivery(failed);
+                        }
                     }
                 }
             })?;
@@ -922,54 +930,99 @@ impl SessionInvalidationQueue {
         Ok(queue)
     }
 
-    fn enqueue(&self, ino: u64, data: bool) {
-        self.enqueue_key(InvalidationKey::Inode(ino), data);
+    fn enqueue(&self, ino: u64, data: bool) -> bool {
+        self.enqueue_key(InvalidationKey::Inode(ino), data)
     }
 
-    fn enqueue_entry(&self, parent: u64, name: &[u8]) {
+    fn enqueue_entry(&self, parent: u64, name: &[u8]) -> bool {
+        if name.contains(&0) {
+            self.record_failed_enqueues(1);
+            return false;
+        }
         self.enqueue_key(
             InvalidationKey::Entry {
                 parent,
                 name: name.to_vec(),
             },
             false,
-        );
+        )
     }
 
-    fn enqueue_key(&self, key: InvalidationKey, data: bool) {
+    fn enqueue_key(&self, key: InvalidationKey, data: bool) -> bool {
         let mut state = self.state.lock();
         loop {
             if state.closed {
-                return;
+                state.failed_enqueues = state.failed_enqueues.saturating_add(1);
+                return false;
             }
             if let Some(kind) = state.kinds.get_mut(&key) {
                 *kind |= data;
                 state.coalesced = state.coalesced.saturating_add(1);
-                break;
+                let snapshot = Self::next_metrics_snapshot(&mut state);
+                drop(state);
+                self.record_metrics(snapshot);
+                return true;
             }
             if state.pending.len() < MACFUSE_INVALIDATION_QUEUE_CAPACITY {
+                if state.pending.is_empty() {
+                    state.pending_since = Some(Instant::now());
+                }
                 state.kinds.insert(key.clone(), data);
-                state.pending.push_back(key.clone());
+                state.pending.push_back(key);
                 state.queue_peak = state.queue_peak.max(state.pending.len());
                 self.wake.notify_one();
-                break;
-            }
-            // Preserve every invalidation while bounding memory: producers
-            // wait for the dedicated worker to make queue capacity available.
-            #[cfg(test)]
-            {
-                state.waiting_producers = state.waiting_producers.saturating_add(1);
-                self.wake.notify_all();
+                let snapshot = Self::next_metrics_snapshot(&mut state);
+                drop(state);
+                self.record_metrics(snapshot);
+                return true;
             }
             self.wake.wait(&mut state);
-            #[cfg(test)]
-            {
-                state.waiting_producers = state.waiting_producers.saturating_sub(1);
+        }
+    }
+
+    fn enqueue_batch(&self, targets: Vec<(InvalidationKey, bool)>) -> bool {
+        let mut state = self.state.lock();
+        if state.closed {
+            state.failed_enqueues = state.failed_enqueues.saturating_add(targets.len() as u64);
+            return false;
+        }
+        let additional = targets
+            .iter()
+            .filter(|(key, _)| !state.kinds.contains_key(key))
+            .map(|(key, _)| key)
+            .collect::<HashSet<_>>()
+            .len();
+        if state.pending.len().saturating_add(additional) > MACFUSE_INVALIDATION_QUEUE_CAPACITY {
+            state.failed_enqueues = state.failed_enqueues.saturating_add(targets.len() as u64);
+            return false;
+        }
+        let mut queued_new_target = false;
+        for (key, data) in targets {
+            if let Some(kind) = state.kinds.get_mut(&key) {
+                *kind |= data;
+                state.coalesced = state.coalesced.saturating_add(1);
+            } else {
+                if state.pending.is_empty() {
+                    state.pending_since = Some(Instant::now());
+                }
+                state.kinds.insert(key.clone(), data);
+                state.pending.push_back(key);
+                state.queue_peak = state.queue_peak.max(state.pending.len());
+                queued_new_target = true;
             }
+        }
+        if queued_new_target {
+            self.wake.notify_one();
         }
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
         self.record_metrics(snapshot);
+        true
+    }
+
+    fn record_failed_enqueues(&self, count: usize) {
+        let mut state = self.state.lock();
+        state.failed_enqueues = state.failed_enqueues.saturating_add(count as u64);
     }
 
     fn next(&self) -> Option<SessionInvalidation> {
@@ -977,6 +1030,10 @@ impl SessionInvalidationQueue {
         loop {
             if let Some(key) = state.pending.pop_front() {
                 let data = state.kinds.remove(&key).unwrap_or(false);
+                state.in_flight_since = Some(state.pending_since.unwrap_or_else(Instant::now));
+                if state.pending.is_empty() {
+                    state.pending_since = None;
+                }
                 self.wake.notify_one();
                 let snapshot = Self::next_metrics_snapshot(&mut state);
                 drop(state);
@@ -1013,23 +1070,12 @@ impl SessionInvalidationQueue {
         true
     }
 
-    #[cfg(test)]
-    fn wait_until_producer_blocked(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock();
-        while state.waiting_producers == 0 {
-            if self.wake.wait_until(&mut state, deadline).timed_out() {
-                return state.waiting_producers > 0;
-            }
-        }
-        true
-    }
-
     fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
         state.pending.clear();
         state.kinds.clear();
+        state.pending_since = None;
         self.wake.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
@@ -1048,6 +1094,36 @@ impl SessionInvalidationQueue {
         Self::metrics_snapshot_from_state(&state)
     }
 
+    fn delivery_failure_count(&self) -> u64 {
+        self.state.lock().delivery_failures
+    }
+
+    fn complete_delivery(&self, failed: bool) {
+        let mut state = self.state.lock();
+        if failed {
+            state.delivery_failures = state.delivery_failures.saturating_add(1);
+        }
+        state.in_flight_since = None;
+        let snapshot = Self::next_metrics_snapshot(&mut state);
+        drop(state);
+        self.record_metrics(snapshot);
+    }
+
+    fn delivery_age_ms(&self) -> Option<u64> {
+        let state = self.state.lock();
+        let oldest = state
+            .in_flight_since
+            .into_iter()
+            .chain(state.pending_since)
+            .min();
+        oldest.map(|started| {
+            Instant::now()
+                .saturating_duration_since(started)
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        })
+    }
+
     fn metrics_snapshot_from_state(
         state: &SessionInvalidationQueueState,
     ) -> VfsFuseInvalidationSnapshot {
@@ -1056,6 +1132,8 @@ impl SessionInvalidationQueue {
             queue_depth: state.pending.len(),
             queue_peak: state.queue_peak,
             coalesced: state.coalesced,
+            notify_failures: state.delivery_failures,
+            notification_in_flight: state.in_flight_since.is_some(),
             ..VfsFuseInvalidationSnapshot::default()
         }
     }
@@ -1161,6 +1239,57 @@ impl Drop for SessionInvalidationGuard<'_> {
 }
 
 impl KernelInvalidator for MacFuseKernelInvalidator {
+    fn invalidate_batch(
+        &self,
+        batch: &studiofs_meta::coherence::InvalidationBatch,
+        generation_complete: bool,
+    ) -> studiofs_vfs::coherence::InvalidationAcceptance {
+        use studiofs_meta::coherence::InvalidationIntent;
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+
+        if !generation_complete || batch.intents.is_empty() {
+            return InvalidationAcceptance::Failed;
+        }
+        if batch
+            .intents
+            .iter()
+            .any(|intent| matches!(intent, InvalidationIntent::Reset))
+        {
+            return InvalidationAcceptance::Unsupported;
+        }
+
+        let mut targets = Vec::with_capacity(batch.intents.len());
+        for intent in &batch.intents {
+            match intent {
+                InvalidationIntent::Attributes { ino } | InvalidationIntent::Directory { ino } => {
+                    targets.push((InvalidationKey::Inode(*ino), false));
+                }
+                InvalidationIntent::Content { ino } => {
+                    targets.push((InvalidationKey::Inode(*ino), true));
+                }
+                InvalidationIntent::Entry { parent, name, .. } => {
+                    if name.contains(&0) {
+                        self.queue.record_failed_enqueues(batch.intents.len());
+                        return InvalidationAcceptance::Failed;
+                    }
+                    targets.push((
+                        InvalidationKey::Entry {
+                            parent: *parent,
+                            name: name.clone(),
+                        },
+                        false,
+                    ));
+                }
+                InvalidationIntent::Reset => unreachable!("reset was rejected above"),
+            }
+        }
+        if self.queue.enqueue_batch(targets) {
+            InvalidationAcceptance::Queued
+        } else {
+            InvalidationAcceptance::Failed
+        }
+    }
+
     fn inval_inode(&self, ino: u64) {
         self.queue.enqueue(ino, true);
     }
@@ -1171,6 +1300,14 @@ impl KernelInvalidator for MacFuseKernelInvalidator {
 
     fn inval_entry(&self, parent: u64, name: &[u8]) {
         self.queue.enqueue_entry(parent, name);
+    }
+
+    fn invalidation_delivery_age_ms(&self) -> Option<u64> {
+        self.queue.delivery_age_ms()
+    }
+
+    fn invalidation_delivery_failure_count(&self) -> u64 {
+        self.queue.delivery_failure_count()
     }
 
     fn reset_diagnostics(&self) {
@@ -1188,13 +1325,13 @@ fn notify_inode_range(
     ino: u64,
     offset: off_t,
     len: off_t,
-) {
+) -> bool {
     let Some(_active) = state.begin_invalidation() else {
         debug!(
             ino,
             offset, len, "macFUSE inode invalidation skipped after session shutdown"
         );
-        return;
+        return false;
     };
     // SAFETY: `channel` comes from a mounted macFUSE session. The counted
     // invalidation guard prevents `Session::drop` from destroying the raw
@@ -1207,6 +1344,7 @@ fn notify_inode_range(
             offset, len, result, "macFUSE inode invalidation failed"
         );
     }
+    result != 0 && result != -libc::ENOENT
 }
 
 fn notify_entry(
@@ -1214,14 +1352,14 @@ fn notify_entry(
     state: &SessionInvalidationState,
     parent: u64,
     name: &[u8],
-) {
+) -> bool {
     let Ok(name) = CString::new(name) else {
         debug!(
             parent,
             name_len = name.len(),
             "macFUSE entry invalidation skipped for invalid name"
         );
-        return;
+        return false;
     };
     let Some(_active) = state.begin_invalidation() else {
         debug!(
@@ -1229,7 +1367,7 @@ fn notify_entry(
             name_len = name.as_bytes().len(),
             "macFUSE entry invalidation skipped after session shutdown"
         );
-        return;
+        return false;
     };
     // SAFETY: `channel` comes from a mounted macFUSE session. The counted
     // invalidation guard prevents `Session::drop` from destroying the raw
@@ -1250,6 +1388,7 @@ fn notify_entry(
             "macFUSE entry invalidation failed"
         );
     }
+    result != 0 && result != -libc::ENOENT
 }
 
 impl Drop for Session {
@@ -2113,10 +2252,10 @@ mod tests {
     }
 
     #[test]
-    fn session_invalidation_queue_backpressures_distinct_inodes_at_capacity() {
+    fn legacy_invalidation_backpressures_distinct_inodes_at_capacity() {
         let queue = SessionInvalidationQueue::new();
         for ino in 0..MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64 {
-            queue.enqueue(ino, false);
+            assert!(queue.enqueue_batch(vec![(InvalidationKey::Inode(ino), false)]));
         }
         {
             let state = queue.state.lock();
@@ -2133,12 +2272,8 @@ mod tests {
                 .expect("signal blocked producer finish");
         });
         assert!(
-            queue.wait_until_producer_blocked(Duration::from_secs(1)),
-            "producer should enter the full-queue wait"
-        );
-        assert!(
             finished_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "a full queue must apply producer backpressure"
+            "legacy invalidation must wait for queue capacity"
         );
 
         assert_eq!(
@@ -2150,7 +2285,7 @@ mod tests {
         );
         finished_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("producer should continue after queue capacity is freed");
+            .expect("legacy invalidation should continue after capacity is freed");
         producer.join().expect("blocked producer should exit");
     }
 
@@ -2161,6 +2296,236 @@ mod tests {
 
         queue.close();
 
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn semantic_batch_accepts_precise_macfuse_scopes() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 7,
+            intents: vec![
+                studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 11 },
+                studiofs_meta::coherence::InvalidationIntent::Content { ino: 12 },
+                studiofs_meta::coherence::InvalidationIntent::Entry {
+                    parent: 1,
+                    name: b"entry".to_vec(),
+                    ancestors: None,
+                    ino: None,
+                },
+                studiofs_meta::coherence::InvalidationIntent::Directory { ino: 14 },
+            ],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Queued
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Inode(InodeInvalidation {
+                ino: 11,
+                data: false,
+            }))
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Inode(InodeInvalidation {
+                ino: 12,
+                data: true,
+            }))
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Entry(EntryInvalidation {
+                parent: 1,
+                name: b"entry".to_vec(),
+            }))
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Inode(InodeInvalidation {
+                ino: 14,
+                data: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn incomplete_semantic_generation_is_not_admitted() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 8,
+            intents: vec![studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 11 }],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, false),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        queue.close();
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn closed_queue_rejects_entire_batch() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 8,
+            intents: vec![
+                studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 11 },
+                studiofs_meta::coherence::InvalidationIntent::Content { ino: 12 },
+            ],
+        };
+
+        queue.close();
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn admission_failures_do_not_count_as_delivery_failures() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 8,
+            intents: vec![studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 11 }],
+        };
+
+        queue.close();
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        invalidator.reset_diagnostics();
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn semantic_batch_rejects_atomically_when_capacity_is_exhausted() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        for ino in 0..(MACFUSE_INVALIDATION_QUEUE_CAPACITY - 1) as u64 {
+            assert!(queue.enqueue_batch(vec![(InvalidationKey::Inode(ino), false)]));
+        }
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 10,
+            intents: vec![
+                studiofs_meta::coherence::InvalidationIntent::Content {
+                    ino: (MACFUSE_INVALIDATION_QUEUE_CAPACITY - 1) as u64,
+                },
+                studiofs_meta::coherence::InvalidationIntent::Content {
+                    ino: MACFUSE_INVALIDATION_QUEUE_CAPACITY as u64,
+                },
+            ],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        let state = queue.state.lock();
+        assert_eq!(state.pending.len(), MACFUSE_INVALIDATION_QUEUE_CAPACITY - 1);
+        assert_eq!(state.failed_enqueues, 2);
+    }
+
+    #[test]
+    fn entry_with_interior_nul_is_not_admitted() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 11,
+            intents: vec![studiofs_meta::coherence::InvalidationIntent::Entry {
+                parent: 1,
+                name: b"invalid\0entry".to_vec(),
+                ancestors: None,
+                ino: None,
+            }],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
+        queue.close();
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn delivery_failure_count_only_tracks_native_failures() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+
+        assert!(queue.enqueue(7, false));
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
+        assert!(queue.next().is_some());
+        queue.complete_delivery(true);
+
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 1);
+        invalidator.reset_diagnostics();
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 1);
+    }
+
+    #[test]
+    fn invalidation_delivery_age_covers_queued_and_in_flight_work() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+
+        assert_eq!(invalidator.invalidation_delivery_age_ms(), None);
+        assert!(queue.enqueue(7, false));
+        assert!(invalidator.invalidation_delivery_age_ms().is_some());
+        assert!(queue.next().is_some());
+        assert!(invalidator.invalidation_delivery_age_ms().is_some());
+        queue.complete_delivery(false);
+        assert_eq!(invalidator.invalidation_delivery_age_ms(), None);
+    }
+
+    #[test]
+    fn reset_semantic_generation_remains_unsupported() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 9,
+            intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Unsupported
+        );
+        queue.close();
         assert_eq!(queue.next(), None);
     }
 }
