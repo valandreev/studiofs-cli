@@ -1371,24 +1371,14 @@ impl StudioVfsAdapter {
                 write_capable: false,
             };
         };
-        if !self.vfs.coherence_allows_os_cache() {
-            let _ = self
-                .vfs
-                .prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
-            self.vfs.record_macfuse_open_cache_decision(
-                VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
-            );
-            #[cfg(test)]
-            self.shared.open_cache_snapshots.lock().pop(&ino);
-            return MacFuseOpenCachePolicy {
-                direct_io: available_memory.is_some_and(|available| attr.size > available),
-                keep_cache: false,
-                write_capable: false,
-            };
-        }
-        let decision =
-            self.vfs
-                .prepare_os_cache_open_with_attr(fh, OsCacheParticipation::Enabled, &attr);
+        let participation = if self.vfs.coherence_allows_os_cache() {
+            OsCacheParticipation::Enabled
+        } else {
+            OsCacheParticipation::Disabled
+        };
+        let decision = self
+            .vfs
+            .prepare_os_cache_open_with_attr(fh, participation, &attr);
         let keep_cache = decision.disposition() == OsCacheDisposition::Reuse;
         let policy = MacFuseOpenCachePolicy {
             direct_io: available_memory.is_some_and(|available| attr.size > available),
