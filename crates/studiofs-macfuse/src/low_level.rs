@@ -843,6 +843,7 @@ struct SessionInvalidationQueueState {
     closed: bool,
     pending: VecDeque<InvalidationKey>,
     kinds: HashMap<InvalidationKey, bool>,
+    failed_enqueues: u64,
     queue_peak: usize,
     coalesced: u64,
     snapshot_generation: u64,
@@ -866,6 +867,7 @@ impl SessionInvalidationQueue {
                 closed: false,
                 pending: VecDeque::new(),
                 kinds: HashMap::new(),
+                failed_enqueues: 0,
                 queue_peak: 0,
                 coalesced: 0,
                 snapshot_generation: 0,
@@ -922,25 +924,26 @@ impl SessionInvalidationQueue {
         Ok(queue)
     }
 
-    fn enqueue(&self, ino: u64, data: bool) {
-        self.enqueue_key(InvalidationKey::Inode(ino), data);
+    fn enqueue(&self, ino: u64, data: bool) -> bool {
+        self.enqueue_key(InvalidationKey::Inode(ino), data)
     }
 
-    fn enqueue_entry(&self, parent: u64, name: &[u8]) {
+    fn enqueue_entry(&self, parent: u64, name: &[u8]) -> bool {
         self.enqueue_key(
             InvalidationKey::Entry {
                 parent,
                 name: name.to_vec(),
             },
             false,
-        );
+        )
     }
 
-    fn enqueue_key(&self, key: InvalidationKey, data: bool) {
+    fn enqueue_key(&self, key: InvalidationKey, data: bool) -> bool {
         let mut state = self.state.lock();
         loop {
             if state.closed {
-                return;
+                state.failed_enqueues = state.failed_enqueues.saturating_add(1);
+                return false;
             }
             if let Some(kind) = state.kinds.get_mut(&key) {
                 *kind |= data;
@@ -970,6 +973,7 @@ impl SessionInvalidationQueue {
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
         self.record_metrics(snapshot);
+        true
     }
 
     fn next(&self) -> Option<SessionInvalidation> {
@@ -1040,12 +1044,17 @@ impl SessionInvalidationQueue {
         let mut state = self.state.lock();
         state.queue_peak = 0;
         state.coalesced = 0;
+        state.failed_enqueues = 0;
     }
 
     #[cfg(test)]
     fn metrics_snapshot(&self) -> VfsFuseInvalidationSnapshot {
         let state = self.state.lock();
         Self::metrics_snapshot_from_state(&state)
+    }
+
+    fn failed_enqueue_count(&self) -> u64 {
+        self.state.lock().failed_enqueues
     }
 
     fn metrics_snapshot_from_state(
@@ -1161,6 +1170,42 @@ impl Drop for SessionInvalidationGuard<'_> {
 }
 
 impl KernelInvalidator for MacFuseKernelInvalidator {
+    fn invalidate_batch(
+        &self,
+        batch: &studiofs_meta::coherence::InvalidationBatch,
+        generation_complete: bool,
+    ) -> studiofs_vfs::coherence::InvalidationAcceptance {
+        use studiofs_meta::coherence::InvalidationIntent;
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+
+        if !generation_complete || batch.intents.is_empty() {
+            return InvalidationAcceptance::Failed;
+        }
+        if batch
+            .intents
+            .iter()
+            .any(|intent| matches!(intent, InvalidationIntent::Reset))
+        {
+            return InvalidationAcceptance::Unsupported;
+        }
+
+        let accepted = batch.intents.iter().all(|intent| match intent {
+            InvalidationIntent::Attributes { ino } | InvalidationIntent::Directory { ino } => {
+                self.queue.enqueue(*ino, false)
+            }
+            InvalidationIntent::Content { ino } => self.queue.enqueue(*ino, true),
+            InvalidationIntent::Entry { parent, name, .. } => {
+                self.queue.enqueue_entry(*parent, name)
+            }
+            InvalidationIntent::Reset => false,
+        });
+        if accepted {
+            InvalidationAcceptance::Queued
+        } else {
+            InvalidationAcceptance::Failed
+        }
+    }
+
     fn inval_inode(&self, ino: u64) {
         self.queue.enqueue(ino, true);
     }
@@ -1171,6 +1216,10 @@ impl KernelInvalidator for MacFuseKernelInvalidator {
 
     fn inval_entry(&self, parent: u64, name: &[u8]) {
         self.queue.enqueue_entry(parent, name);
+    }
+
+    fn invalidation_delivery_failure_count(&self) -> u64 {
+        self.queue.failed_enqueue_count()
     }
 
     fn reset_diagnostics(&self) {
@@ -2161,6 +2210,104 @@ mod tests {
 
         queue.close();
 
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn semantic_batch_accepts_precise_macfuse_scopes() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 7,
+            intents: vec![
+                studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 11 },
+                studiofs_meta::coherence::InvalidationIntent::Content { ino: 12 },
+                studiofs_meta::coherence::InvalidationIntent::Entry {
+                    parent: 1,
+                    name: b"entry".to_vec(),
+                    ancestors: Some(vec![]),
+                    ino: Some(13),
+                },
+                studiofs_meta::coherence::InvalidationIntent::Directory { ino: 14 },
+            ],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Queued
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Inode(InodeInvalidation {
+                ino: 11,
+                data: false,
+            }))
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Inode(InodeInvalidation {
+                ino: 12,
+                data: true,
+            }))
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Entry(EntryInvalidation {
+                parent: 1,
+                name: b"entry".to_vec(),
+            }))
+        );
+        assert_eq!(
+            queue.next(),
+            Some(SessionInvalidation::Inode(InodeInvalidation {
+                ino: 14,
+                data: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn incomplete_semantic_generation_is_not_admitted() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 8,
+            intents: vec![studiofs_meta::coherence::InvalidationIntent::Attributes { ino: 11 }],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, false),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        queue.close();
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Failed
+        );
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 1);
+        assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn reset_semantic_generation_remains_unsupported() {
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
+        };
+        let batch = studiofs_meta::coherence::InvalidationBatch {
+            generation: 9,
+            intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
+        };
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            studiofs_vfs::coherence::InvalidationAcceptance::Unsupported
+        );
+        queue.close();
         assert_eq!(queue.next(), None);
     }
 }

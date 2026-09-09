@@ -1356,18 +1356,10 @@ impl StudioVfsAdapter {
         available_memory: Option<u64>,
     ) -> MacFuseOpenCachePolicy {
         let attr = self.vfs.getattr(ino).ok();
-        let participation = if attr.is_some() {
-            OsCacheParticipation::Enabled
-        } else {
-            OsCacheParticipation::Disabled
-        };
-        let decision = if let Some(attr) = attr.as_ref() {
-            self.vfs
-                .prepare_os_cache_open_with_attr(fh, participation, attr)
-        } else {
-            self.vfs.prepare_os_cache_open(fh, participation)
-        };
         let Some(attr) = attr else {
+            let _ = self
+                .vfs
+                .prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
             );
@@ -1379,6 +1371,24 @@ impl StudioVfsAdapter {
                 write_capable: false,
             };
         };
+        if !self.vfs.coherence_allows_os_cache() {
+            let _ = self
+                .vfs
+                .prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
+            self.vfs.record_macfuse_open_cache_decision(
+                VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
+            );
+            #[cfg(test)]
+            self.shared.open_cache_snapshots.lock().pop(&ino);
+            return MacFuseOpenCachePolicy {
+                direct_io: available_memory.is_some_and(|available| attr.size > available),
+                keep_cache: false,
+                write_capable: false,
+            };
+        }
+        let decision =
+            self.vfs
+                .prepare_os_cache_open_with_attr(fh, OsCacheParticipation::Enabled, &attr);
         let keep_cache = decision.disposition() == OsCacheDisposition::Reuse;
         let policy = MacFuseOpenCachePolicy {
             direct_io: available_memory.is_some_and(|available| attr.size > available),
@@ -2978,6 +2988,7 @@ mod open_cache_snapshot_tests {
     fn last_write_release_clears_snapshot_even_when_read_handle_remains_open() {
         let fixture = ContractVfsFixture::new("macfuse-open-cache-write-before-read-release")
             .expect("create VFS fixture");
+        crate::start_vfs_and_wait_for_healthy_cache(&fixture);
         let vfs = fixture.vfs();
         let attr = vfs
             .create(
