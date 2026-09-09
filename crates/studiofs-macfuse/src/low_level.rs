@@ -986,25 +986,12 @@ impl SessionInvalidationQueue {
             state.failed_enqueues = state.failed_enqueues.saturating_add(targets.len() as u64);
             return false;
         }
-        let additional = if targets.len() <= 16 {
-            targets
-                .iter()
-                .enumerate()
-                .filter(|(index, (key, _))| {
-                    !state.kinds.contains_key(key)
-                        && !targets[..*index]
-                            .iter()
-                            .any(|(previous, _)| previous == key)
-                })
-                .count()
-        } else {
-            targets
-                .iter()
-                .filter(|(key, _)| !state.kinds.contains_key(key))
-                .map(|(key, _)| key)
-                .collect::<HashSet<_>>()
-                .len()
-        };
+        let additional = targets
+            .iter()
+            .filter(|(key, _)| !state.kinds.contains_key(key))
+            .map(|(key, _)| key)
+            .collect::<HashSet<_>>()
+            .len();
         if state.pending.len().saturating_add(additional) > MACFUSE_INVALIDATION_QUEUE_CAPACITY {
             state.failed_enqueues = state.failed_enqueues.saturating_add(targets.len() as u64);
             return false;
