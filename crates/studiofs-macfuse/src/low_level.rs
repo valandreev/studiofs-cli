@@ -843,7 +843,7 @@ struct SessionInvalidationQueueState {
     closed: bool,
     pending: VecDeque<InvalidationKey>,
     kinds: HashMap<InvalidationKey, bool>,
-    pending_since: HashMap<InvalidationKey, Instant>,
+    pending_since: Option<Instant>,
     in_flight_since: Option<Instant>,
     failed_enqueues: u64,
     delivery_failures: u64,
@@ -868,7 +868,7 @@ impl SessionInvalidationQueue {
                 closed: false,
                 pending: VecDeque::new(),
                 kinds: HashMap::new(),
-                pending_since: HashMap::new(),
+                pending_since: None,
                 in_flight_since: None,
                 failed_enqueues: 0,
                 delivery_failures: 0,
@@ -964,8 +964,10 @@ impl SessionInvalidationQueue {
                 return true;
             }
             if state.pending.len() < MACFUSE_INVALIDATION_QUEUE_CAPACITY {
+                if state.pending.is_empty() {
+                    state.pending_since = Some(Instant::now());
+                }
                 state.kinds.insert(key.clone(), data);
-                state.pending_since.insert(key.clone(), Instant::now());
                 state.pending.push_back(key);
                 state.queue_peak = state.queue_peak.max(state.pending.len());
                 self.wake.notify_one();
@@ -984,12 +986,25 @@ impl SessionInvalidationQueue {
             state.failed_enqueues = state.failed_enqueues.saturating_add(targets.len() as u64);
             return false;
         }
-        let additional = targets
-            .iter()
-            .filter(|(key, _)| !state.kinds.contains_key(key))
-            .map(|(key, _)| key)
-            .collect::<HashSet<_>>()
-            .len();
+        let additional = if targets.len() <= 16 {
+            targets
+                .iter()
+                .enumerate()
+                .filter(|(index, (key, _))| {
+                    !state.kinds.contains_key(key)
+                        && !targets[..*index]
+                            .iter()
+                            .any(|(previous, _)| previous == key)
+                })
+                .count()
+        } else {
+            targets
+                .iter()
+                .filter(|(key, _)| !state.kinds.contains_key(key))
+                .map(|(key, _)| key)
+                .collect::<HashSet<_>>()
+                .len()
+        };
         if state.pending.len().saturating_add(additional) > MACFUSE_INVALIDATION_QUEUE_CAPACITY {
             state.failed_enqueues = state.failed_enqueues.saturating_add(targets.len() as u64);
             return false;
@@ -1000,8 +1015,10 @@ impl SessionInvalidationQueue {
                 *kind |= data;
                 state.coalesced = state.coalesced.saturating_add(1);
             } else {
+                if state.pending.is_empty() {
+                    state.pending_since = Some(Instant::now());
+                }
                 state.kinds.insert(key.clone(), data);
-                state.pending_since.insert(key.clone(), Instant::now());
                 state.pending.push_back(key);
                 state.queue_peak = state.queue_peak.max(state.pending.len());
                 queued_new_target = true;
@@ -1026,12 +1043,10 @@ impl SessionInvalidationQueue {
         loop {
             if let Some(key) = state.pending.pop_front() {
                 let data = state.kinds.remove(&key).unwrap_or(false);
-                state.in_flight_since = Some(
-                    state
-                        .pending_since
-                        .remove(&key)
-                        .unwrap_or_else(Instant::now),
-                );
+                state.in_flight_since = Some(state.pending_since.unwrap_or_else(Instant::now));
+                if state.pending.is_empty() {
+                    state.pending_since = None;
+                }
                 self.wake.notify_one();
                 let snapshot = Self::next_metrics_snapshot(&mut state);
                 drop(state);
@@ -1073,7 +1088,7 @@ impl SessionInvalidationQueue {
         state.closed = true;
         state.pending.clear();
         state.kinds.clear();
-        state.pending_since.clear();
+        state.pending_since = None;
         self.wake.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
@@ -1112,7 +1127,7 @@ impl SessionInvalidationQueue {
         let oldest = state
             .in_flight_since
             .into_iter()
-            .chain(state.pending_since.values().copied())
+            .chain(state.pending_since)
             .min();
         oldest.map(|started| {
             Instant::now()

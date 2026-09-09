@@ -331,7 +331,7 @@ fn start_vfs_and_wait_for_healthy_cache(
     fixture.start().expect("start VFS workers");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !fixture.vfs().coherence_allows_os_cache() && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(
         fixture.vfs().coherence_allows_os_cache(),
