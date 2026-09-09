@@ -41,6 +41,13 @@ const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
 const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
 const E2E_MOUNT_ROOT_ENV: &str = "STUDIOFS_E2E_MOUNT_ROOT";
+const WINFSP_FILE_INFO_TIMEOUT_ENV: &str = "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS";
+const WINFSP_DIR_INFO_TIMEOUT_ENV: &str = "STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS";
+const WINFSP_VOLUME_INFO_TIMEOUT_ENV: &str = "STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS";
+const WINFSP_SECURITY_TIMEOUT_ENV: &str = "STUDIOFS_WINFSP_SECURITY_TIMEOUT_MS";
+const WINFSP_STREAM_INFO_TIMEOUT_ENV: &str = "STUDIOFS_WINFSP_STREAM_INFO_TIMEOUT_MS";
+const WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_ENV: &str = "STUDIOFS_WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_MS";
+const E2E_WINFSP_METADATA_TIMEOUT_MS: &str = "1000";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Shared configuration used to create and run a multi-client controller.
@@ -1786,15 +1793,32 @@ fn client_env(client: &ClientSpec) -> Vec<(String, String)> {
             "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS".to_string(),
             "250".to_string(),
         ),
-        // Keep native WinFSP cache invalidation observable within the bounded
-        // convergence window used by mounted E2E scenarios.
+        // Keep native WinFSP kernel metadata cache expiration (TTL) within the
+        // bounded 5-second convergence window used by mounted E2E scenarios,
+        // matching the Linux and macOS bridge defaults.
         (
-            "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS".to_string(),
-            "1000".to_string(),
+            WINFSP_FILE_INFO_TIMEOUT_ENV.to_string(),
+            E2E_WINFSP_METADATA_TIMEOUT_MS.to_string(),
         ),
         (
-            "STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS".to_string(),
-            "1000".to_string(),
+            WINFSP_DIR_INFO_TIMEOUT_ENV.to_string(),
+            E2E_WINFSP_METADATA_TIMEOUT_MS.to_string(),
+        ),
+        (
+            WINFSP_VOLUME_INFO_TIMEOUT_ENV.to_string(),
+            E2E_WINFSP_METADATA_TIMEOUT_MS.to_string(),
+        ),
+        (
+            WINFSP_SECURITY_TIMEOUT_ENV.to_string(),
+            E2E_WINFSP_METADATA_TIMEOUT_MS.to_string(),
+        ),
+        (
+            WINFSP_STREAM_INFO_TIMEOUT_ENV.to_string(),
+            E2E_WINFSP_METADATA_TIMEOUT_MS.to_string(),
+        ),
+        (
+            WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_ENV.to_string(),
+            E2E_WINFSP_METADATA_TIMEOUT_MS.to_string(),
         ),
     ]
 }
@@ -2893,21 +2917,52 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
 
     #[test]
     fn client_env_bounds_winfsp_metadata_timeouts_for_invalidation_runs() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let client = client_spec_for(
-            temp.path(),
+            Path::new("target/e2e-env-test"),
             "projectfs",
             "client-a",
-            temp.path().join("mount"),
+            PathBuf::from("target/e2e-env-test/mount"),
         );
         let env = client_env(&client);
+        let lookup = |key: &str| {
+            env.iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+        };
 
-        assert!(env.iter().any(|(key, value)| {
-            key == "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS" && value == "1000"
-        }));
-        assert!(env.iter().any(|(key, value)| {
-            key == "STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS" && value == "1000"
-        }));
+        for key in [
+            WINFSP_FILE_INFO_TIMEOUT_ENV,
+            WINFSP_DIR_INFO_TIMEOUT_ENV,
+            WINFSP_VOLUME_INFO_TIMEOUT_ENV,
+            WINFSP_SECURITY_TIMEOUT_ENV,
+            WINFSP_STREAM_INFO_TIMEOUT_ENV,
+            WINFSP_EXTENDED_ATTRIBUTE_TIMEOUT_ENV,
+        ] {
+            assert_eq!(
+                lookup(key),
+                Some(E2E_WINFSP_METADATA_TIMEOUT_MS),
+                "{key} must be bounded to 1000ms for mounted E2E scenarios"
+            );
+        }
+    }
+
+    #[test]
+    fn client_env_overrides_replace_winfsp_directory_timeout() {
+        let client = client_spec_for(
+            Path::new("target/e2e-env-test"),
+            "projectfs",
+            "client-a",
+            PathBuf::from("target/e2e-env-test/mount"),
+        );
+        let overrides = [(WINFSP_DIR_INFO_TIMEOUT_ENV.to_string(), "0".to_string())];
+        let env = client_env_with_overrides(&client, Some(&overrides));
+
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == WINFSP_DIR_INFO_TIMEOUT_ENV)
+                .map(|(_, value)| value.as_str()),
+            Some("0")
+        );
     }
 
     #[test]
