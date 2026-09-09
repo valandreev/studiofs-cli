@@ -2030,6 +2030,39 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_metadata_policy_uses_bounded_long_lifetimes() {
+        let timeout = super::adapter::MacFuseMetadataCachePolicy::Adaptive.timeout();
+
+        assert_eq!(timeout, 60.0);
+    }
+
+    #[test]
+    fn conservative_metadata_policy_disables_all_kernel_metadata_caching() {
+        let timeout = super::adapter::MacFuseMetadataCachePolicy::Conservative.timeout();
+
+        assert_eq!(timeout, 0.0);
+    }
+
+    #[test]
+    fn macfuse_metadata_policy_follows_coherence_health() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adaptive-metadata-policy",
+        )
+        .expect("create VFS fixture");
+        assert_eq!(
+            super::adapter::MacFuseMetadataCachePolicy::for_vfs(&fixture.vfs()),
+            super::adapter::MacFuseMetadataCachePolicy::Conservative
+        );
+
+        super::start_vfs_and_wait_for_healthy_cache(&fixture);
+
+        assert_eq!(
+            super::adapter::MacFuseMetadataCachePolicy::for_vfs(&fixture.vfs()),
+            super::adapter::MacFuseMetadataCachePolicy::Adaptive
+        );
+    }
+
+    #[test]
     fn adapter_keeps_kernel_cache_only_for_unchanged_read_only_generation() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-generation",

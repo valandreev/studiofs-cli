@@ -42,7 +42,7 @@ use tracing::{debug, warn};
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
 
-const TTL_SECONDS: f64 = 1.0;
+const ADAPTIVE_METADATA_TIMEOUT_SECONDS: f64 = 60.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
@@ -71,6 +71,36 @@ pub(crate) struct MacFuseOpenCachePolicy {
     pub(crate) keep_cache: bool,
     /// Whether this handle can mutate the inode and must participate in writer accounting.
     pub(crate) write_capable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacFuseMetadataCachePolicy {
+    Conservative,
+    Adaptive,
+}
+
+impl MacFuseMetadataCachePolicy {
+    pub(crate) fn for_vfs(vfs: &StudioVfs) -> Self {
+        if vfs.coherence_allows_os_cache() {
+            Self::Adaptive
+        } else {
+            Self::Conservative
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::Adaptive => "adaptive",
+        }
+    }
+
+    pub(crate) const fn timeout(self) -> f64 {
+        match self {
+            Self::Conservative => 0.0,
+            Self::Adaptive => ADAPTIVE_METADATA_TIMEOUT_SECONDS,
+        }
+    }
 }
 
 /// Operation adapter shared by macFUSE callbacks and fast tests.
@@ -1183,6 +1213,30 @@ impl StudioVfsAdapter {
         }
     }
 
+    fn metadata_cache_timeout(&self) -> f64 {
+        let policy = MacFuseMetadataCachePolicy::for_vfs(&self.vfs);
+        let timeout = policy.timeout();
+        debug!(
+            policy = policy.as_str(),
+            timeout_s = timeout,
+            "selected macFUSE metadata cache policy"
+        );
+        timeout
+    }
+
+    fn metadata_attr_timeout(&self, ino: u64) -> f64 {
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            0.0
+        } else {
+            self.metadata_cache_timeout()
+        }
+    }
+
+    fn entry_for_reply(&self, attr: &InodeAttr) -> Entry {
+        let timeout = self.metadata_cache_timeout();
+        Entry::new(attr.ino, 0, self.attr_to_stat(attr), timeout, timeout)
+    }
+
     /// Get inode attributes.
     pub(crate) fn getattr(&self, ino: u64) -> Result<stat, i32> {
         if self.vfs.is_runtime_stats_file_ino(ino) {
@@ -1637,8 +1691,7 @@ impl StudioVfsAdapter {
                         ino = attr.ino,
                         "macFUSE symlink callback created entry"
                     );
-                    let stat = adapter.attr_to_stat(&attr);
-                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let entry = adapter.entry_for_reply(&attr);
                     let _ = Reply::new(request).entry(&entry);
                 }
                 Err(errno) => {
@@ -3395,9 +3448,15 @@ pub extern "C" fn studiofs_macfuse_lookup(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.lookup(parent, name) {
         Ok(attr) => {
-            let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let entry = state.adapter.entry_for_reply(&attr);
+                let _ = Reply::new(request).entry(&entry);
+            }
+        }
+        Err(libc::ENOENT) => {
+            if let Some(request) = owned_request(req) {
+                let timeout = state.adapter.metadata_cache_timeout();
+                let entry = Entry::new(0, 0, minimal_stat(0), 0.0, timeout);
                 let _ = Reply::new(request).entry(&entry);
             }
         }
@@ -3442,7 +3501,8 @@ pub extern "C" fn studiofs_macfuse_getattr(
     match state.adapter.getattr(ino) {
         Ok(attr) => {
             if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).attr(&attr, TTL_SECONDS);
+                let timeout = state.adapter.metadata_attr_timeout(ino);
+                let _ = Reply::new(request).attr(&attr, timeout);
             }
         }
         Err(errno) => {
@@ -3481,9 +3541,8 @@ pub extern "C" fn studiofs_macfuse_mkdir(
                 mode,
                 "macFUSE mkdir callback created entry"
             );
-            let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let entry = state.adapter.entry_for_reply(&attr);
                 let _ = Reply::new(request).entry(&entry);
             }
         }
@@ -3555,9 +3614,8 @@ pub extern "C" fn studiofs_macfuse_mknod(
                 mode,
                 "macFUSE mknod callback created entry"
             );
-            let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let entry = state.adapter.entry_for_reply(&attr);
                 let _ = Reply::new(request).entry(&entry);
             }
         }
@@ -3606,9 +3664,8 @@ pub extern "C" fn studiofs_macfuse_create(
                 file_handle = open.file_handle(),
                 "macFUSE create callback created entry"
             );
-            let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let entry = state.adapter.entry_for_reply(&attr);
                 if let Err(error) = Reply::new(request).create(&entry, open) {
                     warn!(
                         ino = attr.ino,
@@ -3753,9 +3810,8 @@ pub extern "C" fn studiofs_macfuse_link(
     let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
     match state.adapter.link(ino, newparent, newname) {
         Ok(attr) => {
-            let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let entry = state.adapter.entry_for_reply(&attr);
                 let _ = Reply::new(request).entry(&entry);
             }
         }
@@ -4030,7 +4086,8 @@ pub extern "C" fn studiofs_macfuse_setattr(
             match state.adapter.getattr(ino) {
                 Ok(stat) => {
                     if let Some(request) = owned_request(req) {
-                        let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                        let timeout = state.adapter.metadata_attr_timeout(ino);
+                        let _ = Reply::new(request).attr(&stat, timeout);
                     }
                 }
                 Err(errno) => {
@@ -4063,7 +4120,8 @@ pub extern "C" fn studiofs_macfuse_setattr(
         Ok(attr) => {
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                let timeout = state.adapter.metadata_attr_timeout(ino);
+                let _ = Reply::new(request).attr(&stat, timeout);
             }
         }
         Err(errno) => {
@@ -4120,7 +4178,8 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
             Ok(attr) => {
                 let stat = state.adapter.attr_to_stat(&attr);
                 if let Some(request) = owned_request(req) {
-                    let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                    let timeout = state.adapter.metadata_attr_timeout(ino);
+                    let _ = Reply::new(request).attr(&stat, timeout);
                 }
             }
             Err(errno) => {
@@ -4136,7 +4195,8 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
     match state.adapter.getattr(ino) {
         Ok(stat) => {
             if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                let timeout = state.adapter.metadata_attr_timeout(ino);
+                let _ = Reply::new(request).attr(&stat, timeout);
             }
         }
         Err(errno) => {
