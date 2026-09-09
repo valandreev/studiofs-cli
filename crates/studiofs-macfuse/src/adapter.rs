@@ -38,7 +38,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
 
@@ -1216,7 +1216,7 @@ impl StudioVfsAdapter {
     fn metadata_cache_timeout(&self) -> f64 {
         let policy = MacFuseMetadataCachePolicy::for_vfs(&self.vfs);
         let timeout = policy.timeout();
-        debug!(
+        trace!(
             policy = policy.as_str(),
             timeout_s = timeout,
             "selected macFUSE metadata cache policy"
@@ -1233,7 +1233,7 @@ impl StudioVfsAdapter {
     }
 
     fn entry_for_reply(&self, attr: &InodeAttr) -> Entry {
-        let timeout = self.metadata_cache_timeout();
+        let timeout = self.metadata_attr_timeout(attr.ino);
         Entry::new(attr.ino, 0, self.attr_to_stat(attr), timeout, timeout)
     }
 
@@ -3454,11 +3454,7 @@ pub extern "C" fn studiofs_macfuse_lookup(
             }
         }
         Err(libc::ENOENT) => {
-            if let Some(request) = owned_request(req) {
-                let timeout = state.adapter.metadata_cache_timeout();
-                let entry = Entry::new(0, 0, minimal_stat(0), 0.0, timeout);
-                let _ = Reply::new(request).entry(&entry);
-            }
+            reply_error(req, libc::ENOENT);
         }
         Err(errno) => {
             if callback_error_log_level("lookup", errno).is_some() {
@@ -4864,6 +4860,30 @@ mod tests {
                 .expect("recycled buffer should retain capacity")
                 >= 16
         );
+    }
+
+    #[test]
+    fn entry_reply_keeps_runtime_stats_uncached() {
+        let fixture = ContractVfsFixture::new("macfuse-runtime-stats-timeout-exemption")
+            .expect("create VFS fixture");
+        crate::start_vfs_and_wait_for_healthy_cache(&fixture);
+        let vfs = fixture.vfs();
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let stats_entry = adapter.entry_for_reply(&vfs.runtime_stats_file_attr());
+        assert_eq!(stats_entry.timeouts_for_test(), (0.0, 0.0));
+
+        let regular_attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"regular-metadata.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create regular file");
+        let regular_entry = adapter.entry_for_reply(&regular_attr);
+        assert_eq!(regular_entry.timeouts_for_test(), (60.0, 60.0));
     }
 
     #[test]

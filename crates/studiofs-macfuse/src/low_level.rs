@@ -1723,6 +1723,12 @@ impl Entry {
             },
         }
     }
+
+    /// Return attribute and entry lifetimes for adapter-level tests.
+    #[cfg(test)]
+    pub(crate) fn timeouts_for_test(&self) -> (f64, f64) {
+        (self.raw.attr_timeout, self.raw.entry_timeout)
+    }
 }
 
 /// Owned readdir reply buffer.
