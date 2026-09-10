@@ -6,8 +6,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use studiofs_cache::runtime::{LocalPayloadRuntimeDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
+use studiofs_meta::connect_studiofs_postgres;
 use studiofs_meta::engine::MetaError;
-use studiofs_meta::{MetaFormat, connect_studiofs_postgres};
 use thiserror::Error;
 use tracing::warn;
 
@@ -120,19 +120,10 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         DestroyMode::LocalOnly => {
             match studiofs_meta::RedbMetaEngine::read_format_info_readonly(&db_path) {
                 Ok(info) => Some(info),
-                Err(err) if err.is_redb_repair_needed() => {
-                    warn!(
-                        error = %err,
-                        "local redb needs repair; attempting writable open for recovery"
-                    );
-                    studiofs_meta::RedbMetaEngine::open(&db_path)
-                        .and_then(|meta| meta.get_format_info())
-                        .ok()
-                }
                 Err(err) => {
                     warn!(
                         error = %err,
-                        "local metadata format is unavailable; proceeding with local cleanup"
+                        "local metadata format is unavailable; repair or cleanup will wait for confirmation"
                     );
                     None
                 }
@@ -263,6 +254,15 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         return Ok(());
     }
 
+    // Acquire writable local metadata ownership only after confirmation. This
+    // refuses deletion while a mount owns the database and defers redb repair
+    // until the user has committed to destroying the local state.
+    let local_meta_owner = if mode == DestroyMode::LocalOnly {
+        Some(studiofs_meta::RedbMetaEngine::open(&db_path)?)
+    } else {
+        None
+    };
+
     if mode.should_remove_remote() {
         let format_info = format_info.as_ref().ok_or(MetaError::NotFormatted)?;
         println!("Deleting data from S3 and metadata backends...");
@@ -271,6 +271,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     }
 
     // 5. Delete metadata directory
+    drop(local_meta_owner);
     println!("Deleting local metadata files...");
     if meta_dir.exists() {
         std::fs::remove_dir_all(meta_dir)?;

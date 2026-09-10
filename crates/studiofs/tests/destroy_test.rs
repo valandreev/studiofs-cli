@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use studiofs_data::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
+use studiofs_meta::engine::MetaError;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
     FormatInfo, MetaFormat, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
@@ -114,6 +115,11 @@ fn set_home_env(cmd: &mut Command, home: &Path) {
 }
 
 fn run_destroy_cmd(home: &Path, name: &str, local_only: bool, confirm_name: &str) -> Output {
+    let input = format!("y\n{confirm_name}\n");
+    run_destroy_cmd_with_input(home, name, local_only, &input)
+}
+
+fn run_destroy_cmd_with_input(home: &Path, name: &str, local_only: bool, input: &str) -> Output {
     let exe = env!("CARGO_BIN_EXE_studiofs");
     let mut cmd = Command::new(exe);
     cmd.arg("destroy").arg(name);
@@ -129,7 +135,9 @@ fn run_destroy_cmd(home: &Path, name: &str, local_only: bool, confirm_name: &str
 
     let mut child = cmd.spawn().expect("spawn studiofs destroy");
     let mut stdin = child.stdin.take().expect("take stdin");
-    write!(stdin, "y\n{confirm_name}\n").expect("write confirmations");
+    stdin
+        .write_all(input.as_bytes())
+        .expect("write destroy input");
     drop(stdin);
     child.wait_with_output().expect("wait for destroy process")
 }
@@ -435,6 +443,42 @@ fn destroy_local_only_succeeds_without_remote_services() {
 }
 
 #[test]
+fn destroy_local_only_refuses_active_local_metadata() {
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
+    let name = random_name("destroy-local-active");
+    let meta_dir = home_meta_dir(home.path(), &name);
+    let remote_env = TestEnv {
+        s3_endpoint: "http://127.0.0.1:0".to_string(),
+        s3_bucket: "unreachable".to_string(),
+        s3_access_key: "unused".to_string(),
+        s3_secret_key: "unused".to_string(),
+        s3_region: "us-east-1".to_string(),
+    };
+    create_local_metadata(
+        &meta_dir,
+        &name,
+        "host=127.0.0.1 port=0 user=unused dbname=unused connect_timeout=1",
+        1,
+        &remote_env,
+        &Uuid::new_v4().to_string(),
+    );
+    let _active_meta = RedbMetaEngine::open(meta_dir.join(format!("{name}.db")))
+        .expect("open active local metadata");
+
+    let output = run_destroy_cmd(home.path(), &name, true, &name);
+
+    assert!(
+        !output.status.success(),
+        "--local destroy should refuse active local metadata, got: {}",
+        output_text(&output)
+    );
+    assert!(
+        meta_dir.exists(),
+        "--local destroy should keep metadata while another engine owns it"
+    );
+}
+
+#[test]
 fn destroy_local_only_recovers_unclean_local_state_without_remote_services() {
     let home = studiofs_test_support::workspace_target_tempdir("home-");
     let name = random_name("destroy-local-repair");
@@ -475,7 +519,54 @@ fn destroy_local_only_recovers_unclean_local_state_without_remote_services() {
 }
 
 #[test]
-fn destroy_local_only_removes_corrupt_local_state_without_remote_services() {
+fn destroy_local_only_does_not_repair_before_confirmation() {
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
+    let name = random_name("destroy-local-decline-repair");
+    let meta_dir = home_meta_dir(home.path(), &name);
+    let remote_env = TestEnv {
+        s3_endpoint: "http://127.0.0.1:0".to_string(),
+        s3_bucket: "unreachable".to_string(),
+        s3_access_key: "unused".to_string(),
+        s3_secret_key: "unused".to_string(),
+        s3_region: "us-east-1".to_string(),
+    };
+    create_local_metadata(
+        &meta_dir,
+        &name,
+        "host=127.0.0.1 port=0 user=unused dbname=unused connect_timeout=1",
+        1,
+        &remote_env,
+        &Uuid::new_v4().to_string(),
+    );
+    let db_path = meta_dir.join(format!("{name}.db"));
+    mark_redb_repair_required(&db_path);
+
+    let output = run_destroy_cmd_with_input(home.path(), &name, true, "n\n");
+
+    assert!(
+        output.status.success(),
+        "declining local destroy should succeed, got: {}",
+        output_text(&output)
+    );
+    assert!(
+        output_text(&output).contains("Aborting."),
+        "declining local destroy should abort before repair"
+    );
+    assert!(
+        meta_dir.exists(),
+        "declining local destroy should keep local metadata"
+    );
+    assert!(
+        matches!(
+            RedbMetaEngine::read_format_info_readonly(&db_path),
+            Err(MetaError::RepairRequired(_))
+        ),
+        "declining local destroy must not repair the redb database"
+    );
+}
+
+#[test]
+fn destroy_local_only_rejects_corrupt_local_state_without_remote_services() {
     let home = studiofs_test_support::workspace_target_tempdir("home-");
     let name = random_name("destroy-local-corrupt");
     let meta_dir = home_meta_dir(home.path(), &name);
@@ -487,16 +578,16 @@ fn destroy_local_only_removes_corrupt_local_state_without_remote_services() {
     let text = output_text(&output);
 
     assert!(
-        output.status.success(),
-        "--local destroy should clean up corrupt local state, got: {text}"
+        !output.status.success(),
+        "--local destroy should refuse corrupt local state without ownership, got: {text}"
     );
     assert!(
-        text.contains(&format!("Volume '{name}' detached locally.")),
-        "output should confirm local detachment, got: {text}"
+        text.contains("metadata operation failed"),
+        "output should explain the local metadata failure, got: {text}"
     );
     assert!(
-        !meta_dir.exists(),
-        "--local destroy should remove corrupt local metadata"
+        meta_dir.exists(),
+        "--local destroy should keep corrupt local metadata when ownership cannot be acquired"
     );
 }
 
