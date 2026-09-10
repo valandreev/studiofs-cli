@@ -114,10 +114,19 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         });
     }
 
-    // 2. Open metadata to get S3 credentials
-    // We only need read access to format info
-    let live_meta = studiofs_meta::open_meta_engine(&db_path)?;
-    let format_info = live_meta.get_format_info()?;
+    // 2. Read the format locally.  Local-only cleanup must not open a
+    // PostgreSQL-backed metadata engine or touch remote services.
+    let (format_info, live_meta) = match mode {
+        DestroyMode::LocalOnly => (
+            studiofs_meta::RedbMetaEngine::read_format_info_readonly(&db_path)?,
+            None,
+        ),
+        DestroyMode::Full => {
+            let live_meta = studiofs_meta::open_meta_engine(&db_path)?;
+            let format_info = live_meta.get_format_info()?;
+            (format_info, Some(live_meta))
+        }
+    };
     let default_cache_root = meta_dir.join("cache").join(&format_info.uuid);
     let cache_backend_detection = match detect_cache_backends(&default_cache_root) {
         Ok(detection) => Some(detection),
@@ -132,6 +141,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
 
     // 2.1 Validate UUID against remote store if applicable (SFS-95)
     if mode.should_remove_remote()
+        && let Some(live_meta) = live_meta.as_ref()
         && let Err(e) = live_meta.check_consistency()
     {
         let cleanup = super::utils::format_cleanup_command(name);

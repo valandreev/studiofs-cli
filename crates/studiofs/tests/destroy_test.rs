@@ -118,6 +118,7 @@ fn run_destroy_cmd(home: &Path, name: &str, local_only: bool, confirm_name: &str
     cmd.arg("destroy").arg(name);
     if local_only {
         cmd.arg("--local");
+        cmd.env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
     }
     set_home_env(&mut cmd, home);
     cmd.stdin(Stdio::piped())
@@ -365,6 +366,42 @@ fn destroy_fails_for_missing_volume_name() {
     assert!(
         text.contains("not found"),
         "output should mention missing volume, got: {text}"
+    );
+}
+
+#[test]
+fn destroy_local_only_succeeds_without_remote_services() {
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
+    let name = random_name("destroy-local-offline");
+    let meta_dir = home_meta_dir(home.path(), &name);
+    let port = 65534;
+    let remote_env = TestEnv {
+        s3_endpoint: format!("http://127.0.0.1:{port}"),
+        s3_bucket: "unreachable".to_string(),
+        s3_access_key: "unused".to_string(),
+        s3_secret_key: "unused".to_string(),
+        s3_region: "us-east-1".to_string(),
+    };
+    let pg_dsn = format!("host=127.0.0.1 port={port} user=unused dbname=unused connect_timeout=1");
+    create_local_metadata(
+        &meta_dir,
+        &name,
+        &pg_dsn,
+        1,
+        &remote_env,
+        &Uuid::new_v4().to_string(),
+    );
+
+    let output = run_destroy_cmd(home.path(), &name, true, &name);
+
+    assert!(
+        output.status.success(),
+        "--local destroy should not need remote services, got: {}",
+        output_text(&output)
+    );
+    assert!(
+        !meta_dir.exists(),
+        "--local destroy should remove local metadata while remote services are unavailable"
     );
 }
 
