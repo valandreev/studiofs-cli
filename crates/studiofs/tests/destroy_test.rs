@@ -8,7 +8,8 @@
 
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -271,6 +272,28 @@ fn create_local_metadata(
     meta.set_format_info(&format_info).expect("set format info");
 }
 
+fn mark_redb_repair_required(path: &Path) {
+    const REDB_GOD_BYTE_OFFSET: u64 = 9;
+    const REDB_RECOVERY_REQUIRED: u8 = 2;
+    const REDB_TWO_PHASE_COMMIT: u8 = 4;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open redb header");
+    file.seek(SeekFrom::Start(REDB_GOD_BYTE_OFFSET))
+        .expect("seek to redb god byte");
+    let mut flags = [0u8; 1];
+    file.read_exact(&mut flags).expect("read redb god byte");
+    flags[0] |= REDB_RECOVERY_REQUIRED;
+    flags[0] &= !REDB_TWO_PHASE_COMMIT;
+    file.seek(SeekFrom::Start(REDB_GOD_BYTE_OFFSET))
+        .expect("seek to redb god byte");
+    file.write_all(&flags).expect("write redb god byte");
+    file.sync_all().expect("sync redb header");
+}
+
 fn create_local_metadata_with_bad_s3_secret(
     meta_dir: &Path,
     name: &str,
@@ -375,7 +398,7 @@ fn destroy_local_only_succeeds_without_remote_services() {
     let home = studiofs_test_support::workspace_target_tempdir("home-");
     let name = random_name("destroy-local-offline");
     let meta_dir = home_meta_dir(home.path(), &name);
-    let port = 65534;
+    let port = 0;
     let remote_env = TestEnv {
         s3_endpoint: format!("http://127.0.0.1:{port}"),
         s3_bucket: "unreachable".to_string(),
@@ -408,6 +431,72 @@ fn destroy_local_only_succeeds_without_remote_services() {
     assert!(
         !meta_dir.exists(),
         "--local destroy should remove local metadata while remote services are unavailable"
+    );
+}
+
+#[test]
+fn destroy_local_only_recovers_unclean_local_state_without_remote_services() {
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
+    let name = random_name("destroy-local-repair");
+    let meta_dir = home_meta_dir(home.path(), &name);
+    let remote_env = TestEnv {
+        s3_endpoint: "http://127.0.0.1:0".to_string(),
+        s3_bucket: "unreachable".to_string(),
+        s3_access_key: "unused".to_string(),
+        s3_secret_key: "unused".to_string(),
+        s3_region: "us-east-1".to_string(),
+    };
+    let pg_dsn = "host=127.0.0.1 port=0 user=unused dbname=unused connect_timeout=1";
+    create_local_metadata(
+        &meta_dir,
+        &name,
+        pg_dsn,
+        1,
+        &remote_env,
+        &Uuid::new_v4().to_string(),
+    );
+    mark_redb_repair_required(&meta_dir.join(format!("{name}.db")));
+
+    let output = run_destroy_cmd(home.path(), &name, true, &name);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "--local destroy should recover unclean local state, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("Volume '{name}' detached locally.")),
+        "output should confirm local detachment, got: {text}"
+    );
+    assert!(
+        !meta_dir.exists(),
+        "--local destroy should remove recovered local metadata"
+    );
+}
+
+#[test]
+fn destroy_local_only_removes_corrupt_local_state_without_remote_services() {
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
+    let name = random_name("destroy-local-corrupt");
+    let meta_dir = home_meta_dir(home.path(), &name);
+    std::fs::create_dir_all(&meta_dir).expect("create metadata directory");
+    std::fs::write(meta_dir.join(format!("{name}.db")), b"not a redb database")
+        .expect("write corrupt metadata file");
+
+    let output = run_destroy_cmd(home.path(), &name, true, &name);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "--local destroy should clean up corrupt local state, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("Volume '{name}' detached locally.")),
+        "output should confirm local detachment, got: {text}"
+    );
+    assert!(
+        !meta_dir.exists(),
+        "--local destroy should remove corrupt local metadata"
     );
 }
 

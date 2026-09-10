@@ -6,8 +6,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use studiofs_cache::runtime::{LocalPayloadRuntimeDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
-use studiofs_meta::connect_studiofs_postgres;
 use studiofs_meta::engine::MetaError;
+use studiofs_meta::{MetaFormat, connect_studiofs_postgres};
 use thiserror::Error;
 use tracing::warn;
 
@@ -116,64 +116,78 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
 
     // 2. Read the format locally.  Local-only cleanup must not open a
     // PostgreSQL-backed metadata engine or touch remote services.
-    let (format_info, live_meta) = match mode {
-        DestroyMode::LocalOnly => (
-            studiofs_meta::RedbMetaEngine::read_format_info_readonly(&db_path)?,
-            None,
-        ),
+    let format_info = match mode {
+        DestroyMode::LocalOnly => {
+            match studiofs_meta::RedbMetaEngine::read_format_info_readonly(&db_path) {
+                Ok(info) => Some(info),
+                Err(err) if err.is_redb_repair_needed() => {
+                    warn!(
+                        error = %err,
+                        "local redb needs repair; attempting writable open for recovery"
+                    );
+                    studiofs_meta::RedbMetaEngine::open(&db_path)
+                        .and_then(|meta| meta.get_format_info())
+                        .ok()
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "local metadata format is unavailable; proceeding with local cleanup"
+                    );
+                    None
+                }
+            }
+        }
         DestroyMode::Full => {
             let options = studiofs_meta::MetaOpenOptions {
                 background_poll: false,
                 ..Default::default()
             };
             let live_meta = studiofs_meta::open_meta_engine_with_options(&db_path, options)?;
-            let format_info = live_meta.get_format_info()?;
-            (format_info, Some(live_meta))
+            if let Err(e) = live_meta.check_consistency() {
+                let cleanup = super::utils::format_cleanup_command(name);
+                match e {
+                    studiofs_meta::engine::MetaError::UuidMismatch { local, remote } => {
+                        println!(
+                            "Warning: Local disk UUID does not match the remote database. You might be trying to destroy a recreated disk that you haven't discovered yet."
+                        );
+                        println!("Remote UUID: {remote}");
+                        println!("Local UUID:  {local}");
+                        println!("\nDo you want to only remove the local stale configuration?");
+                        println!("Suggested command: {cleanup}");
+                        return Ok(());
+                    }
+                    _ => {
+                        println!(
+                            "Warning: Could not verify disk identity (remote database is unreachable)."
+                        );
+                        println!(
+                            "If you want to remove the local configuration and metadata only, use the --local flag."
+                        );
+                        println!("Suggested command: {cleanup}");
+                        return Ok(());
+                    }
+                }
+            }
+            Some(live_meta.get_format_info()?)
         }
     };
-    let default_cache_root = meta_dir.join("cache").join(&format_info.uuid);
-    let cache_backend_detection = match detect_cache_backends(&default_cache_root) {
-        Ok(detection) => Some(detection),
-        Err(error) => {
-            println!(
-                "Warning: Failed to inspect local cache layout state at '{}': {error}",
-                default_cache_root.display()
-            );
-            None
-        }
+    let default_cache_root = format_info
+        .as_ref()
+        .map(|info| meta_dir.join("cache").join(&info.uuid));
+    let cache_backend_detection = match default_cache_root.as_deref() {
+        Some(default_cache_root) => match detect_cache_backends(default_cache_root) {
+            Ok(detection) => Some(detection),
+            Err(error) => {
+                println!(
+                    "Warning: Failed to inspect local cache layout state at '{}': {error}",
+                    default_cache_root.display()
+                );
+                None
+            }
+        },
+        None => None,
     };
-
-    // 2.1 Validate UUID against remote store if applicable (SFS-95)
-    if let Some(live_meta) = live_meta.as_ref()
-        && let Err(e) = live_meta.check_consistency()
-    {
-        let cleanup = super::utils::format_cleanup_command(name);
-        match e {
-            studiofs_meta::engine::MetaError::UuidMismatch { local, remote } => {
-                println!(
-                    "Warning: Local disk UUID does not match the remote database. You might be trying to destroy a recreated disk that you haven't discovered yet."
-                );
-                println!("Remote UUID: {remote}");
-                println!("Local UUID:  {local}");
-                println!("\nDo you want to only remove the local stale configuration?");
-                println!("Suggested command: {cleanup}");
-                return Ok(());
-            }
-            _ => {
-                println!(
-                    "Warning: Could not verify disk identity (remote database is unreachable)."
-                );
-                println!(
-                    "If you want to remove the local configuration and metadata only, use the --local flag."
-                );
-                println!("Suggested command: {cleanup}");
-                return Ok(());
-            }
-        }
-    }
-
-    // Close DB so we can delete it later
-    drop(live_meta);
 
     // 3. Confirm with user
     println!("WARNING: You are about to DESTROY volume '{}'.", name);
@@ -182,6 +196,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         println!("  1. Local metadata files at {:?}", meta_dir);
         println!("Remote data and remote metadata will be kept.");
     } else {
+        let format_info = format_info.as_ref().ok_or(MetaError::NotFormatted)?;
         println!("This will permanently delete:");
         println!(
             "  1. All data in S3 bucket '{}' with prefix '{}/'",
@@ -189,7 +204,11 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         );
         println!("  2. Local metadata files at {:?}", meta_dir);
     }
-    println!("  Default cache root: {}", default_cache_root.display());
+    if let Some(default_cache_root) = default_cache_root.as_deref() {
+        println!("  Default cache root: {}", default_cache_root.display());
+    } else {
+        println!("  Default cache root: unavailable (local format metadata unreadable)");
+    }
     println!(
         "  Cache layout state: {}",
         describe_cache_layout_state(cache_backend_detection.as_ref())
@@ -222,10 +241,12 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         "NOTE: Custom local data cache directories are not auto-detected and will NOT be removed."
     );
     println!("WARNING: If this volume used a non-default cache_dir, remove that path manually.");
-    println!(
-        "After destroy, remove local cache manually for volume UUID '{}'.",
-        format_info.uuid
-    );
+    if let Some(format_info) = format_info.as_ref() {
+        println!(
+            "After destroy, remove local cache manually for volume UUID '{}'.",
+            format_info.uuid
+        );
+    }
     println!();
 
     if !prompt_and_read_line("Do you want to proceed? [y/N]: ")?.eq_ignore_ascii_case("y") {
@@ -243,8 +264,9 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     }
 
     if mode.should_remove_remote() {
+        let format_info = format_info.as_ref().ok_or(MetaError::NotFormatted)?;
         println!("Deleting data from S3 and metadata backends...");
-        crate::runtime_bridge::block_on(delete_remote_state(&format_info))?;
+        crate::runtime_bridge::block_on(delete_remote_state(format_info))?;
         println!("✓ Remote metadata and data deleted.");
     }
 
@@ -255,10 +277,12 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     }
 
     println!("✓ Local metadata files deleted.");
-    println!(
-        "Reminder: remove custom local cache directories for volume UUID '{}'.",
-        format_info.uuid
-    );
+    if let Some(format_info) = format_info.as_ref() {
+        println!(
+            "Reminder: remove custom local cache directories for volume UUID '{}'.",
+            format_info.uuid
+        );
+    }
     if mode == DestroyMode::LocalOnly {
         println!("Volume '{}' detached locally.", name);
     } else {
