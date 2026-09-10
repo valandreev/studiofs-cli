@@ -118,6 +118,7 @@ fn run_destroy_cmd(home: &Path, name: &str, local_only: bool, confirm_name: &str
     cmd.arg("destroy").arg(name);
     if local_only {
         cmd.arg("--local");
+        // Keep a regressed PG-backed --local path bounded; any such access must fail the test.
         cmd.env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
     }
     set_home_env(&mut cmd, home);
@@ -393,11 +394,16 @@ fn destroy_local_only_succeeds_without_remote_services() {
     );
 
     let output = run_destroy_cmd(home.path(), &name, true, &name);
+    let text = output_text(&output);
 
     assert!(
         output.status.success(),
         "--local destroy should not need remote services, got: {}",
-        output_text(&output)
+        text
+    );
+    assert!(
+        text.contains(&format!("Volume '{name}' detached locally.")),
+        "output should confirm local detachment, got: {text}"
     );
     assert!(
         !meta_dir.exists(),

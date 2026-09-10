@@ -122,7 +122,11 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
             None,
         ),
         DestroyMode::Full => {
-            let live_meta = studiofs_meta::open_meta_engine(&db_path)?;
+            let options = studiofs_meta::MetaOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            };
+            let live_meta = studiofs_meta::open_meta_engine_with_options(&db_path, options)?;
             let format_info = live_meta.get_format_info()?;
             (format_info, Some(live_meta))
         }
@@ -140,8 +144,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     };
 
     // 2.1 Validate UUID against remote store if applicable (SFS-95)
-    if mode.should_remove_remote()
-        && let Some(live_meta) = live_meta.as_ref()
+    if let Some(live_meta) = live_meta.as_ref()
         && let Err(e) = live_meta.check_consistency()
     {
         let cleanup = super::utils::format_cleanup_command(name);
