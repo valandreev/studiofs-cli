@@ -83,7 +83,12 @@ access is rejected in that state. `discover` persists a local
 the fresh-client startup gate is unresolved; a successful startup catch-up
 clears that marker. The marker is local state and is preserved by serving
 checkpoint import, so a failed fresh bootstrap remains recoverable and
-read-only on a later mount.
+read-only on a later mount. If that mount remains active while PostgreSQL is
+unavailable, a later successful background sync may complete the pending
+bootstrap once the local replay cursor reaches the observed remote head. The
+runtime then advances through `catching-up` and `target-reached`, clears the
+marker, and reevaluates allocator authority; it remains `allocator-pending`
+when the paired allocator gate is still unavailable.
 
 ## Serving-First Mount Lifecycle
 

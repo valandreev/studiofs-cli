@@ -123,6 +123,10 @@ pub enum MetaError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The local metadata serving view is unsafe to use.
+    #[error("metadata serving lifecycle is fatal")]
+    LifecycleFatal,
+
     /// The serving-checkpoint descriptor violates its publication contract.
     #[error("checkpoint descriptor is invalid: {reason}")]
     InvalidCheckpointDescriptor {

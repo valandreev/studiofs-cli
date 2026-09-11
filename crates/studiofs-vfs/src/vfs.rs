@@ -6740,6 +6740,14 @@ impl StudioVfs {
         self.sync_meta()
     }
 
+    /// Return the effective PostgreSQL synchronization status for this mount.
+    ///
+    /// Unlike [`Self::meta`], this includes mount-local authority overrides
+    /// such as an explicitly read-only mount.
+    pub fn sync_status(&self) -> PgSyncStatus {
+        self.metadata_sync_status()
+    }
+
     /// Get volume name.
     pub fn volume_name(&self) -> VfsResult<String> {
         self.meta
@@ -7475,12 +7483,10 @@ impl StudioVfs {
     }
 
     pub(super) fn enforce_metadata_serving_lifecycle(&self) -> VfsResult<()> {
-        if self.metadata_sync_status().lifecycle.allows_reads() {
+        if self.sync_status().lifecycle.allows_reads() {
             return Ok(());
         }
-        Err(VfsError::Meta(MetaError::Storage(
-            "metadata serving lifecycle is fatal".to_string(),
-        )))
+        Err(VfsError::Meta(MetaError::LifecycleFatal))
     }
 
     /// Ensure current metadata authority allows mutating operations for an inode.
@@ -7495,7 +7501,7 @@ impl StudioVfs {
         {
             return Err(VfsError::MetadataPersistenceDegraded);
         }
-        if self.metadata_sync_status().allows_new_mutations() {
+        if self.sync_status().allows_new_mutations() {
             return Ok(());
         }
         Err(VfsError::Meta(MetaError::AccessDenied {

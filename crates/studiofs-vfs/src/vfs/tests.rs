@@ -19899,6 +19899,19 @@ fn sfs623_read_only_allocator_blocks_new_mutations_but_keeps_reads_open() {
 }
 
 #[test]
+fn sync_status_reports_effective_read_only_mount_authority() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) =
+        make_unstarted_read_only_test_vfs(&tmp, "effective-read-only-sync-status");
+
+    assert_eq!(
+        vfs.sync_status().authority,
+        MetadataAuthorityStatus::read_only(),
+        "public VFS sync status must include the read-only mount override"
+    );
+}
+
+#[test]
 fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "pg-sync-catching-up");
@@ -19906,36 +19919,51 @@ fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
         .create(ROOT_INO, b"pg-sync-catching-up.txt", 0, 0, 0o644)
         .expect("create file before catch-up starts");
 
-    vfs.set_pg_sync_lifecycle_for_test(Some(PgSyncLifecycle::CatchingUp));
+    for lifecycle in [
+        PgSyncLifecycle::CatchingUp,
+        PgSyncLifecycle::Degraded,
+        PgSyncLifecycle::TargetReached,
+        PgSyncLifecycle::AllocatorPending,
+    ] {
+        vfs.set_pg_sync_lifecycle_for_test(Some(lifecycle));
 
-    assert!(
-        vfs.getattr(attr.ino).is_ok(),
-        "known local metadata must remain readable while catch-up is active"
-    );
-    let create_error = vfs
-        .create(ROOT_INO, b"blocked-during-pg-catch-up.txt", 0, 0, 0o644)
-        .expect_err("fresh-client mutations must wait for PG catch-up");
+        assert!(
+            vfs.getattr(attr.ino).is_ok(),
+            "known local metadata must remain readable in {lifecycle:?}"
+        );
+        let create_error = vfs
+            .create(ROOT_INO, b"blocked-during-pg-sync.txt", 0, 0, 0o644)
+            .expect_err("read-safe lifecycle must not grant fresh mutations");
+        assert!(
+            matches!(
+                create_error,
+                VfsError::Meta(MetaError::AccessDenied {
+                    actual: AccessLevel::ReadOnly,
+                    ..
+                })
+            ),
+            "unexpected {lifecycle:?} mutation error: {create_error}"
+        );
+    }
+
+    vfs.set_acl_rule(ROOT_INO, "*", AccessLevel::NoAccess)
+        .expect("set root ACL before fatal lifecycle check");
+    vfs.set_pg_sync_lifecycle_for_test(Some(PgSyncLifecycle::Fatal));
+    let fatal_readdir_error = vfs
+        .readdir(ROOT_INO)
+        .expect_err("fatal metadata lifecycle must precede ACL early returns");
     assert!(
         matches!(
-            create_error,
-            VfsError::Meta(MetaError::AccessDenied {
-                actual: AccessLevel::ReadOnly,
-                ..
-            })
+            fatal_readdir_error,
+            VfsError::Meta(MetaError::LifecycleFatal)
         ),
-        "unexpected catch-up mutation error: {create_error}"
+        "unexpected fatal lifecycle readdir error: {fatal_readdir_error}"
     );
-
-    vfs.set_pg_sync_lifecycle_for_test(Some(PgSyncLifecycle::Fatal));
     let fatal_read_error = vfs
         .getattr(attr.ino)
         .expect_err("fatal metadata lifecycle must block local reads");
     assert!(
-        matches!(
-            &fatal_read_error,
-            VfsError::Meta(MetaError::Storage(message))
-                if message == "metadata serving lifecycle is fatal"
-        ),
+        matches!(&fatal_read_error, VfsError::Meta(MetaError::LifecycleFatal)),
         "unexpected fatal lifecycle read error: {fatal_read_error}"
     );
     let mut buffer = [0_u8; 1];
@@ -19945,9 +19973,18 @@ fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
     assert!(
         matches!(
             &fatal_async_read_error,
-            VfsError::Meta(MetaError::Storage(message))
-                if message == "metadata serving lifecycle is fatal"
+            VfsError::Meta(MetaError::LifecycleFatal)
         ),
         "unexpected fatal lifecycle async read error: {fatal_async_read_error}"
+    );
+    let fatal_statfs_error = vfs
+        .statfs()
+        .expect_err("fatal metadata lifecycle must block filesystem statistics");
+    assert!(
+        matches!(
+            fatal_statfs_error,
+            VfsError::Meta(MetaError::LifecycleFatal)
+        ),
+        "unexpected fatal lifecycle statfs error: {fatal_statfs_error}"
     );
 }

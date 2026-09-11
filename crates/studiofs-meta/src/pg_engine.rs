@@ -454,17 +454,13 @@ impl PgMetaEngine {
 
     fn pg_sync_lifecycle_from_raw(value: u8) -> PgSyncLifecycle {
         match value {
-            value if value == PgSyncLifecycle::LocalReady as u8 => PgSyncLifecycle::LocalReady,
-            value if value == PgSyncLifecycle::CatchingUp as u8 => PgSyncLifecycle::CatchingUp,
-            value if value == PgSyncLifecycle::TargetReached as u8 => {
-                PgSyncLifecycle::TargetReached
-            }
-            value if value == PgSyncLifecycle::AllocatorPending as u8 => {
-                PgSyncLifecycle::AllocatorPending
-            }
-            value if value == PgSyncLifecycle::Live as u8 => PgSyncLifecycle::Live,
-            value if value == PgSyncLifecycle::Degraded as u8 => PgSyncLifecycle::Degraded,
-            value if value == PgSyncLifecycle::Fatal as u8 => PgSyncLifecycle::Fatal,
+            0 => PgSyncLifecycle::LocalReady,
+            1 => PgSyncLifecycle::CatchingUp,
+            2 => PgSyncLifecycle::TargetReached,
+            3 => PgSyncLifecycle::AllocatorPending,
+            4 => PgSyncLifecycle::Live,
+            5 => PgSyncLifecycle::Degraded,
+            6 => PgSyncLifecycle::Fatal,
             value => {
                 warn!(
                     raw_lifecycle = value,
@@ -526,6 +522,51 @@ impl PgMetaEngine {
                 (lifecycle, _) => lifecycle,
             }
         });
+    }
+
+    /// Complete a failed fresh-client bootstrap after a successful sync has
+    /// reached the most recently observed remote head.
+    pub(super) fn try_complete_degraded_fresh_client_sync(&self) -> MetaResult<()> {
+        if self
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)?
+            == 0
+        {
+            return Ok(());
+        }
+
+        match self.current_pg_sync_lifecycle() {
+            PgSyncLifecycle::Degraded => {
+                let local_version = self.local_version.load(Ordering::Acquire);
+                let remote_head = self.metadata_remote_head_version.load(Ordering::Acquire);
+                if remote_head < 0 || local_version < remote_head {
+                    return Ok(());
+                }
+
+                self.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                self.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
+            }
+            PgSyncLifecycle::TargetReached
+            | PgSyncLifecycle::AllocatorPending
+            | PgSyncLifecycle::Live => {}
+            PgSyncLifecycle::LocalReady | PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Fatal => {
+                return Ok(());
+            }
+        }
+
+        if !matches!(
+            self.current_pg_sync_lifecycle(),
+            PgSyncLifecycle::TargetReached
+                | PgSyncLifecycle::AllocatorPending
+                | PgSyncLifecycle::Live
+        ) {
+            return Ok(());
+        }
+
+        self.local
+            .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
+        self.refresh_pg_sync_lifecycle_for_allocator();
+        Ok(())
     }
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {

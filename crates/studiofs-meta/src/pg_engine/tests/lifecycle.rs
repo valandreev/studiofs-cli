@@ -563,6 +563,104 @@ fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
 }
 
 #[test]
+fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("complete degraded fresh-client sync");
+
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::Live,
+        "allocator-ready recovery should restore write authority"
+    );
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        0
+    );
+}
+
+#[test]
+fn degraded_fresh_client_stays_degraded_until_remote_head_is_reached() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(8, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("inspect incomplete degraded fresh-client sync");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1
+    );
+}
+
+#[test]
+fn degraded_fresh_client_recovers_to_allocator_pending_without_write_authority() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .inode_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("complete degraded fresh-client sync");
+
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        0
+    );
+}
+
+#[test]
 fn startup_snapshot_preserves_local_overlay_when_only_acl_changed() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
