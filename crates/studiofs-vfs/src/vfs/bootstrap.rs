@@ -580,6 +580,8 @@ impl VfsBootstrap {
             #[cfg(test)]
             metadata_authority_override: Mutex::new(None),
             #[cfg(test)]
+            metadata_sync_lifecycle_override: Mutex::new(None),
+            #[cfg(test)]
             fail_next_inline_dirty_attr_persist: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool::new(false),

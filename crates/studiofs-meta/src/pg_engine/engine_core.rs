@@ -32,7 +32,7 @@ impl MetaEngineCore for PgMetaEngine {
         self.ensure_lock_workers_started()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let client_id = self.client_id.clone();
+        let client_id = self.current_client_id()?;
         let command_timeout = self.command_timeout;
         let outcome = self.run_async(async move {
             Self::with_postgres_client_timeout(
@@ -207,7 +207,7 @@ impl MetaEngineCore for PgMetaEngine {
     fn release_file_lock_lease(&self, ino: Ino) -> MetaResult<FileLockLeaseReleaseOutcome> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let client_id = self.client_id.clone();
+        let client_id = self.current_client_id()?;
         let command_timeout = self.command_timeout;
         let outcome = self.run_async(async move {
             Self::with_postgres_client_timeout(
@@ -339,7 +339,7 @@ impl MetaEngineCore for PgMetaEngine {
         self.ensure_lock_workers_started()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let client_id = self.client_id.clone();
+        let client_id = self.current_client_id()?;
         let command_timeout = self.command_timeout;
         let outcome = self.run_async(async move {
             Self::with_postgres_client_timeout(

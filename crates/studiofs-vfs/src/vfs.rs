@@ -180,7 +180,9 @@ use studiofs_data::object::{
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
-use studiofs_meta::engine::MetadataAuthorityStatus;
+#[cfg(test)]
+use studiofs_meta::engine::PgSyncLifecycle;
+use studiofs_meta::engine::{MetadataAuthorityStatus, PgSyncStatus};
 use studiofs_meta::schema::{
     ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass,
     ROOT_INO, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
@@ -3838,6 +3840,8 @@ pub struct StudioVfs {
     #[cfg(test)]
     metadata_authority_override: Mutex<Option<MetadataAuthorityStatus>>,
     #[cfg(test)]
+    metadata_sync_lifecycle_override: Mutex<Option<PgSyncLifecycle>>,
+    #[cfg(test)]
     fail_next_inline_dirty_attr_persist: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool,
@@ -6736,6 +6740,14 @@ impl StudioVfs {
         self.sync_meta()
     }
 
+    /// Return the effective PostgreSQL synchronization status for this mount.
+    ///
+    /// Unlike [`Self::meta`], this includes mount-local authority overrides
+    /// such as an explicitly read-only mount.
+    pub fn sync_status(&self) -> PgSyncStatus {
+        self.metadata_sync_status()
+    }
+
     /// Get volume name.
     pub fn volume_name(&self) -> VfsResult<String> {
         self.meta
@@ -7452,27 +7464,29 @@ impl StudioVfs {
             || flags.contains(OpenFlags::APPEND)
     }
 
-    fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
+    fn metadata_sync_status(&self) -> PgSyncStatus {
+        let mut status = self.meta.sync_view().pg_sync_status();
         if self.read_only_mount {
-            return MetadataAuthorityStatus::read_only();
+            status.authority = MetadataAuthorityStatus::read_only();
         }
-
         #[cfg(test)]
-        if let Some(status) = *self.metadata_authority_override.lock() {
-            return status;
-        }
-
-        if self
-            .state
-            .namespace
-            .deferred
-            .degraded
-            .load(Ordering::Acquire)
+        if !self.read_only_mount
+            && let Some(authority_override) = *self.metadata_authority_override.lock()
         {
-            return MetadataAuthorityStatus::read_only();
+            status.authority = authority_override;
         }
+        #[cfg(test)]
+        if let Some(lifecycle_override) = *self.metadata_sync_lifecycle_override.lock() {
+            status.lifecycle = lifecycle_override;
+        }
+        status
+    }
 
-        self.meta.sync_view().metadata_authority_status()
+    pub(super) fn enforce_metadata_serving_lifecycle(&self) -> VfsResult<()> {
+        if self.sync_status().lifecycle.allows_reads() {
+            return Ok(());
+        }
+        Err(VfsError::Meta(MetaError::LifecycleFatal))
     }
 
     /// Ensure current metadata authority allows mutating operations for an inode.
@@ -7487,7 +7501,7 @@ impl StudioVfs {
         {
             return Err(VfsError::MetadataPersistenceDegraded);
         }
-        if self.metadata_authority_status().allows_new_mutations() {
+        if self.sync_status().allows_new_mutations() {
             return Ok(());
         }
         Err(VfsError::Meta(MetaError::AccessDenied {
@@ -7593,6 +7607,13 @@ impl StudioVfs {
     #[doc(hidden)]
     pub fn set_metadata_authority_status_for_test(&self, status: Option<MetadataAuthorityStatus>) {
         *self.metadata_authority_override.lock() = status;
+    }
+
+    #[cfg(test)]
+    /// Test-only override for the PostgreSQL synchronization lifecycle.
+    #[doc(hidden)]
+    pub fn set_pg_sync_lifecycle_for_test(&self, lifecycle: Option<PgSyncLifecycle>) {
+        *self.metadata_sync_lifecycle_override.lock() = lifecycle;
     }
 
     /// Record a WinFSP write callback metric.

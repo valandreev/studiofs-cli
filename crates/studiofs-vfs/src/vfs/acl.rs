@@ -183,6 +183,7 @@ impl StudioVfs {
             target: "studiofs_vfs::metadata_baseline::acl_check",
             "VFS ACL check"
         );
+        self.enforce_metadata_serving_lifecycle()?;
         self.enforce_snapshot_mount_fence(ino)?;
         let actual = self.effective_access_level(ino)?;
         if Self::access_satisfies(actual, required) {
@@ -212,6 +213,7 @@ impl StudioVfs {
             target: "studiofs_vfs::metadata_baseline::acl_check",
             "VFS ACL check"
         );
+        self.enforce_metadata_serving_lifecycle()?;
         self.enforce_snapshot_mount_fence(ino)?;
         if let Some(actual) = self.effective_access_level_cached(ino) {
             if Self::access_satisfies(actual, required) {
@@ -262,6 +264,8 @@ impl StudioVfs {
         principal: &str,
         access_level: AccessLevel,
     ) -> VfsResult<()> {
+        self.enforce_metadata_serving_lifecycle()?;
+        self.enforce_metadata_mutation_authority(ino)?;
         let meta = self.sync_meta();
         meta.set_acl_rule(ino, principal, access_level)?;
         self.bump_acl_epoch();
@@ -271,6 +275,8 @@ impl StudioVfs {
 
     /// Removes an ACL rule for an inode and principal.
     pub fn remove_acl_rule(&self, ino: Ino, principal: &str) -> VfsResult<()> {
+        self.enforce_metadata_serving_lifecycle()?;
+        self.enforce_metadata_mutation_authority(ino)?;
         let meta = self.sync_meta();
         meta.remove_acl_rule(ino, principal)?;
         self.bump_acl_epoch();

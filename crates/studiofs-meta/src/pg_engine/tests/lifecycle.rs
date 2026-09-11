@@ -507,6 +507,291 @@ fn repair_startup_keeps_recovery_marker_when_remote_sync_fails() {
 }
 
 #[test]
+fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
+    let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
+    let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&db).expect("open local metadata");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "fresh-client-startup-failure",
+            "fresh-client-startup-failure-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set format info");
+    PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+    drop(local);
+
+    let fresh = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: true,
+            ..Default::default()
+        },
+    )
+    .expect("fresh local view should survive unavailable PostgreSQL");
+    let status = fresh.pg_sync_status();
+    assert_eq!(status.lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!status.allows_new_mutations());
+    assert_eq!(
+        fresh
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1,
+        "failed fresh startup must retain its durable write gate"
+    );
+    drop(fresh);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("reopen failed fresh client locally");
+    assert_eq!(
+        reopened.pg_sync_status().lifecycle,
+        PgSyncLifecycle::Degraded,
+        "ordinary reopen must not mistake an unfinished fresh bootstrap for an established client"
+    );
+}
+
+#[test]
+fn fresh_client_startup_without_client_slot_is_degraded_and_marker_survives_reopen() {
+    let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
+    let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&db).expect("open local metadata");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "fresh-client-startup-without-slot",
+            "fresh-client-startup-without-slot-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set format info");
+    drop(local);
+
+    let fresh = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: true,
+            ..Default::default()
+        },
+    )
+    .expect("fresh local view should survive unavailable PostgreSQL without a client slot");
+    assert_eq!(fresh.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!fresh.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        fresh
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1,
+        "failed fresh startup must retain its durable write gate"
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_client_slot(&fresh.local).expect("read client slot"),
+        None,
+        "unavailable PostgreSQL must not fabricate a client slot"
+    );
+    drop(fresh);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("reopen failed fresh client locally without a client slot");
+    assert_eq!(
+        reopened.pg_sync_status().lifecycle,
+        PgSyncLifecycle::Degraded,
+        "ordinary reopen must retain the unfinished fresh bootstrap state"
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_client_slot(&reopened.local).expect("read client slot"),
+        None,
+        "reopen must not reserve a slot while PostgreSQL remains unavailable"
+    );
+}
+
+#[test]
+fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("complete degraded fresh-client sync");
+
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::Live,
+        "allocator-ready recovery should restore write authority"
+    );
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        0
+    );
+}
+
+#[test]
+fn degraded_fresh_client_rehydrates_allocator_runtime_before_restoring_write_authority() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.clear_allocator_runtime_for_test();
+    engine
+        .inode_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .object_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("complete degraded fresh-client sync");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(engine.allocator_runtime_available_for_test());
+}
+
+#[test]
+fn degraded_fresh_client_without_client_slot_stays_degraded_at_remote_head() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_CLIENT_SLOT_COUNTER, 0)
+        .expect("clear client slot");
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    assert!(
+        engine.try_complete_degraded_fresh_client_sync().is_err(),
+        "fresh-client recovery must not promote without a reserved client slot"
+    );
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_client_slot(&engine.local).expect("read client slot"),
+        None
+    );
+}
+
+#[test]
+fn degraded_fresh_client_stays_degraded_until_remote_head_is_reached() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(8, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("inspect incomplete degraded fresh-client sync");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1
+    );
+}
+
+#[test]
+fn degraded_fresh_client_recovers_to_allocator_pending_without_write_authority() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .inode_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("complete degraded fresh-client sync");
+
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        0
+    );
+}
+
+#[test]
 fn startup_snapshot_preserves_local_overlay_when_only_acl_changed() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
@@ -615,6 +900,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
     local
         .write_counters(|counters| {
             counters.set(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 150)?;
+            counters.set(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, 1_000)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, 1_100)?;
             counters.set(LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, 1_200)?;
@@ -634,6 +920,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
     for local_counter in [
         LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
         LOCAL_PG_CLIENT_SLOT_COUNTER,
+        LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER,
         LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
         LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
         LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
@@ -1095,6 +1382,7 @@ fn command_pool_capacity_is_bounded_by_configured_pool_size() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            fresh_client: false,
             pg_pool_size: 1,
         },
     )
@@ -1192,6 +1480,7 @@ fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            fresh_client: false,
             pg_pool_size: 2,
         },
     )

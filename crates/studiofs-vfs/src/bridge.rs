@@ -110,6 +110,7 @@ fn classify_meta_error(error: &MetaError) -> BridgeVfsErrorKind {
         MetaError::IsADirectory(_) => BridgeVfsErrorKind::IsDirectory,
         MetaError::DirNotEmpty(_) => BridgeVfsErrorKind::DirectoryNotEmpty,
         MetaError::NotFormatted => BridgeVfsErrorKind::UnrecognizedVolume,
+        MetaError::LifecycleFatal => BridgeVfsErrorKind::RepairRequired,
         MetaError::RepairRequired(_) => BridgeVfsErrorKind::RepairRequired,
         MetaError::RemoteUnavailable(_) => BridgeVfsErrorKind::RemoteUnavailable,
         MetaError::Timeout(_) => BridgeVfsErrorKind::TimedOut,
@@ -384,6 +385,16 @@ mod tests {
     #[test]
     fn classify_vfs_error_preserves_repair_category() {
         let error = crate::VfsError::Meta(MetaError::RepairRequired("redb repair".into()));
+
+        assert_eq!(
+            classify_vfs_error(&error),
+            BridgeVfsErrorKind::RepairRequired
+        );
+    }
+
+    #[test]
+    fn classify_vfs_error_maps_fatal_metadata_lifecycle_to_repair_category() {
+        let error = crate::VfsError::Meta(MetaError::LifecycleFatal);
 
         assert_eq!(
             classify_vfs_error(&error),

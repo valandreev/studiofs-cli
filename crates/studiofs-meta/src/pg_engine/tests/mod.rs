@@ -424,7 +424,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         local,
         postgres_url: "postgres://127.0.0.1:1/studiofs".to_string(),
         volume_id: 1,
-        client_id: "unit-test".to_string(),
+        client_id: Mutex::new("unit-test".to_string()),
         client_slot_plus_one: AtomicU64::new(0),
         local_version: AtomicI64::new(0),
         namespace_version: AtomicI64::new(0),
@@ -454,6 +454,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         allocator_refill_lock: Mutex::new(()),
         inode_id_headroom_available: AtomicBool::new(false),
         object_id_headroom_available: AtomicBool::new(false),
+        pg_sync_lifecycle: AtomicU8::new(PgSyncLifecycle::LocalReady as u8),
         janitor_lock: Mutex::new(None),
         file_lock_cache: Mutex::new(HashMap::new()),
         held_file_locks: Mutex::new(HashMap::new()),
@@ -487,6 +488,45 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     engine.bootstrap_allocator_state();
 
     (dir, engine)
+}
+
+#[test]
+fn trusted_pg_allocator_enters_live_lifecycle_and_losing_headroom_enters_pending() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+
+    let live = engine.pg_sync_status();
+    assert_eq!(live.lifecycle, PgSyncLifecycle::Live);
+    assert!(live.allows_new_mutations());
+
+    engine
+        .inode_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine.refresh_pg_sync_lifecycle_for_allocator();
+
+    let pending = engine.pg_sync_status();
+    assert_eq!(pending.lifecycle, PgSyncLifecycle::AllocatorPending);
+    assert!(!pending.allows_new_mutations());
+}
+
+#[test]
+fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
+    let cases = [
+        (0, PgSyncLifecycle::LocalReady),
+        (1, PgSyncLifecycle::CatchingUp),
+        (2, PgSyncLifecycle::TargetReached),
+        (3, PgSyncLifecycle::AllocatorPending),
+        (4, PgSyncLifecycle::Live),
+        (5, PgSyncLifecycle::Degraded),
+        (6, PgSyncLifecycle::Fatal),
+    ];
+
+    for (raw, expected) in cases {
+        assert_eq!(PgMetaEngine::pg_sync_lifecycle_from_raw(raw), expected);
+    }
+    assert_eq!(
+        PgMetaEngine::pg_sync_lifecycle_from_raw(u8::MAX),
+        PgSyncLifecycle::Fatal
+    );
 }
 
 fn apply_projected_remote_range(

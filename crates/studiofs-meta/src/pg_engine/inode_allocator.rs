@@ -32,9 +32,15 @@ impl PgMetaEngine {
         )
     }
 
-    pub(super) fn cache_client_slot(&self, slot: u64) {
+    pub(super) fn cache_client_slot(&self, slot: u64) -> MetaResult<()> {
         self.client_slot_plus_one
             .store(slot.saturating_add(1), Ordering::Release);
+        let mut client_id = self
+            .client_id
+            .lock()
+            .map_err(|_| MetaError::Storage("pg client id lock poisoned".to_string()))?;
+        *client_id = format!("client-slot:{slot}");
+        Ok(())
     }
 
     pub(super) fn reserve_global_client_slot(
@@ -89,6 +95,15 @@ impl PgMetaEngine {
         let slot = Self::reserve_global_client_slot(postgres_url, volume_id)?;
         Self::persist_client_slot(local, slot)?;
         Ok(slot)
+    }
+
+    pub(super) fn ensure_client_slot_for_fresh_client(&self) -> MetaResult<()> {
+        let _guard = self
+            .replication_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        let slot = Self::ensure_client_slot(&self.local, &self.postgres_url, self.volume_id)?;
+        self.cache_client_slot(slot)
     }
 
     fn mint_allocator_state(&self) -> MetaResult<AllocatorStateV1> {
@@ -190,6 +205,34 @@ impl PgMetaEngine {
                 );
             }
         }
+        self.refresh_pg_sync_lifecycle_for_allocator();
+    }
+
+    pub(super) fn allocator_runtime_state_missing(&self) -> bool {
+        self.allocator_runtime
+            .lock()
+            .map(|runtime| runtime.state.is_none())
+            .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_allocator_runtime_for_test(&self) {
+        let mut runtime = self
+            .allocator_runtime
+            .lock()
+            .expect("allocator runtime lock");
+        runtime.state = None;
+        runtime.inode_batch = 0..0;
+        runtime.payload_batch = 0..0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn allocator_runtime_available_for_test(&self) -> bool {
+        self.allocator_runtime
+            .lock()
+            .expect("allocator runtime lock")
+            .state
+            .is_some()
     }
 
     fn take_from_batch<T>(
@@ -314,6 +357,7 @@ impl PgMetaEngine {
                     self.object_id_headroom_available
                         .store(false, Ordering::Release);
                 }
+                self.refresh_pg_sync_lifecycle_for_allocator();
                 warn!(
                     error = %error,
                     volume_id = self.volume_id,
@@ -347,6 +391,7 @@ impl PgMetaEngine {
                 self.object_id_headroom_available
                     .store(false, Ordering::Release);
             }
+            self.refresh_pg_sync_lifecycle_for_allocator();
         }
 
         let mut runtime = self

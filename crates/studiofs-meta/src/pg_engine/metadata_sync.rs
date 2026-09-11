@@ -7,6 +7,7 @@ use crate::engine::{MetaError, MetaInodes, MetaReplication, MetaResult};
 use crate::types::FileType;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
+use tracing::warn;
 
 impl PgMetaEngine {
     fn active_open_inode_overlay(&self) -> OverlayConflictSets {
@@ -56,6 +57,13 @@ impl PgMetaEngine {
                 if source == MetadataSyncSource::FallbackPoll && *changed {
                     self.metadata_fallback_poll_discoveries
                         .fetch_add(1, Ordering::Relaxed);
+                }
+                if let Err(error) = self.try_complete_degraded_fresh_client_sync() {
+                    warn!(
+                        error = %error,
+                        volume_id = self.volume_id,
+                        "degraded fresh-client lifecycle recovery could not be completed"
+                    );
                 }
             }
             Err(_) => {
@@ -131,7 +139,7 @@ impl PgMetaEngine {
     ) -> MetaResult<bool> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let client_id = self.client_id.clone();
+        let client_id = self.current_client_id()?;
         let last_seq = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
 

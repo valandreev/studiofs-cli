@@ -321,7 +321,7 @@ fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
     );
 
     assert_eq!(
-        a.client_id,
+        a.current_client_id().expect("a client id"),
         format!("client-slot:{a_slot}"),
         "self-batch identity must be derived from the persisted client slot"
     );
@@ -356,8 +356,9 @@ fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
         })
         .expect("read self-authored batch")
     };
+    let a_client_id = a.current_client_id().expect("a client id");
     let (_, _, _, is_self_batch) =
-        RemoteApplyCoordinator::decode_foreign_batch(&rows, 0, &a.client_id)
+        RemoteApplyCoordinator::decode_foreign_batch(&rows, 0, &a_client_id)
             .expect("decode self-authored batch");
     assert!(
         is_self_batch,
@@ -368,7 +369,7 @@ fn sfs623_pg_allocator_two_fresh_roots_receive_four_unique_namespaces() {
     drop(a);
     let reopened = PgMetaEngine::open(&db_a).expect("reopen a");
     assert_eq!(
-        reopened.client_id,
+        reopened.current_client_id().expect("reopened client id"),
         format!("client-slot:{a_slot}"),
         "reopen must reuse the persisted client slot for self-batch detection"
     );

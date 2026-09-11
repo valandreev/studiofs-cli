@@ -8,6 +8,7 @@ impl StudioVfs {
     pub fn statfs(&self) -> VfsResult<StatFs> {
         use studiofs_meta::types::counters;
 
+        self.enforce_metadata_serving_lifecycle()?;
         let meta = self.sync_meta();
         let used_inodes = meta.get_counter(counters::TOTAL_INODES)?;
         let used_bytes = meta.get_counter(counters::USED_SPACE)?;

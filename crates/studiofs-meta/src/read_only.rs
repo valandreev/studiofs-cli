@@ -536,6 +536,13 @@ where
         MetadataAuthorityStatus::read_only()
     }
 
+    fn pg_sync_status(&self) -> PgSyncStatus {
+        PgSyncStatus::new(
+            self.inner.pg_sync_status().lifecycle,
+            MetadataAuthorityStatus::read_only(),
+        )
+    }
+
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
         self.inner.remote_metadata_size()
     }
@@ -614,5 +621,26 @@ where
         _attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>> {
         Err(read_only_error(ino))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redb_engine::RedbMetaEngine;
+
+    #[test]
+    fn pg_sync_status_preserves_lifecycle_and_forces_read_only_authority() {
+        let dir = studiofs_test_support::workspace_target_tempdir("read-only-pg-sync-");
+        let path = dir.path().join("meta.redb");
+        let inner = Arc::new(RedbMetaEngine::open(&path).expect("open local metadata"));
+        let expected_lifecycle = inner.pg_sync_status().lifecycle;
+
+        let read_only = ReadOnlyMetaEngine::new(Arc::clone(&inner));
+        let status = read_only.pg_sync_status();
+
+        assert_eq!(status.lifecycle, expected_lifecycle);
+        assert_eq!(status.authority, MetadataAuthorityStatus::read_only());
+        assert!(!status.allows_new_mutations());
     }
 }

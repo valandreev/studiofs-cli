@@ -1783,6 +1783,7 @@ impl StudioVfs {
         &self,
         ino: Ino,
     ) -> VfsResult<(Vec<DirEntry>, HashMap<Ino, InodeAttr>)> {
+        self.enforce_metadata_serving_lifecycle()?;
         let parent_effective = self.effective_access_level(ino)?;
         if parent_effective == AccessLevel::NoAccess {
             return Ok((Vec::new(), HashMap::new()));
