@@ -171,7 +171,7 @@ impl PgMetaEngine {
 
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let client_id = self.client_id.clone();
+        let client_id = self.current_client_id()?;
         let now_ms = Self::now_millis();
         let events_vec = events;
         let expected_metadata_format_version =

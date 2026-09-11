@@ -32,9 +32,15 @@ impl PgMetaEngine {
         )
     }
 
-    pub(super) fn cache_client_slot(&self, slot: u64) {
+    pub(super) fn cache_client_slot(&self, slot: u64) -> MetaResult<()> {
         self.client_slot_plus_one
             .store(slot.saturating_add(1), Ordering::Release);
+        let mut client_id = self
+            .client_id
+            .lock()
+            .map_err(|_| MetaError::Storage("pg client id lock poisoned".to_string()))?;
+        *client_id = format!("client-slot:{slot}");
+        Ok(())
     }
 
     pub(super) fn reserve_global_client_slot(
@@ -89,6 +95,15 @@ impl PgMetaEngine {
         let slot = Self::reserve_global_client_slot(postgres_url, volume_id)?;
         Self::persist_client_slot(local, slot)?;
         Ok(slot)
+    }
+
+    pub(super) fn ensure_client_slot_for_fresh_client(&self) -> MetaResult<()> {
+        let _guard = self
+            .replication_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        let slot = Self::ensure_client_slot(&self.local, &self.postgres_url, self.volume_id)?;
+        self.cache_client_slot(slot)
     }
 
     fn mint_allocator_state(&self) -> MetaResult<AllocatorStateV1> {

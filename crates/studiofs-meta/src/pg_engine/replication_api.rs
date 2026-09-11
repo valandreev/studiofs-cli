@@ -71,7 +71,7 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn invalidation_sender_id(&self) -> Option<String> {
-        Some(self.client_id.clone())
+        self.current_client_id().ok()
     }
 
     fn metadata_invalidation_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {

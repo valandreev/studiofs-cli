@@ -139,7 +139,7 @@ impl PgMetaEngine {
     ) -> MetaResult<bool> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let client_id = self.client_id.clone();
+        let client_id = self.current_client_id()?;
         let last_seq = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
 

@@ -190,7 +190,7 @@ pub struct PgMetaEngine {
     local: Arc<RedbMetaEngine>,
     postgres_url: String,
     volume_id: i64,
-    client_id: String,
+    client_id: Mutex<String>,
     client_slot_plus_one: AtomicU64,
     local_version: AtomicI64,
     namespace_version: AtomicI64,
@@ -509,6 +509,13 @@ impl PgMetaEngine {
         self.update_pg_sync_lifecycle(|_| next);
     }
 
+    pub(super) fn current_client_id(&self) -> MetaResult<String> {
+        self.client_id
+            .lock()
+            .map(|client_id| client_id.clone())
+            .map_err(|_| MetaError::Storage("pg client id lock poisoned".to_string()))
+    }
+
     pub(super) fn refresh_pg_sync_lifecycle_for_allocator(&self) {
         self.update_pg_sync_lifecycle(|current| {
             let authority_available = self.metadata_authority_status().allows_new_mutations();
@@ -543,6 +550,7 @@ impl PgMetaEngine {
                     return Ok(());
                 }
 
+                self.ensure_client_slot_for_fresh_client()?;
                 self.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                 self.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
             }
@@ -901,8 +909,9 @@ impl PgMetaEngine {
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
         let client_slot = match persisted_client_slot {
-            Some(slot) => slot,
-            None => Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?,
+            Some(slot) => Some(slot),
+            None if fresh_client_pending => None,
+            None => Some(Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?),
         };
         let restored_local_version = Self::load_persisted_local_version(&local)?;
         let restored_namespace_version = Self::load_persisted_namespace_version(&local)?;
@@ -923,8 +932,16 @@ impl PgMetaEngine {
             local,
             postgres_url: pg.url.clone(),
             volume_id: pg.volume_id,
-            client_id: format!("client-slot:{client_slot}"),
-            client_slot_plus_one: AtomicU64::new(client_slot.saturating_add(1)),
+            client_id: Mutex::new(
+                client_slot
+                    .map(|slot| format!("client-slot:{slot}"))
+                    .unwrap_or_else(|| "client-slot:pending".to_string()),
+            ),
+            client_slot_plus_one: AtomicU64::new(
+                client_slot
+                    .map(|slot| slot.saturating_add(1))
+                    .unwrap_or_default(),
+            ),
             local_version: AtomicI64::new(restored_local_version),
             namespace_version: AtomicI64::new(restored_namespace_version),
             flushed_event_seq: AtomicU64::new(restored_flushed_event_seq),
@@ -1016,8 +1033,23 @@ impl PgMetaEngine {
         if repair_local_graph_recovery_pending && metadata_sync_succeeded {
             engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
         }
+        let fresh_client_slot_ready = if fresh_client_pending && metadata_sync_succeeded {
+            match engine.ensure_client_slot_for_fresh_client() {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        volume_id = engine.volume_id,
+                        "fresh-client startup reached the remote head but client-slot reservation did not complete"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if fresh_client_pending {
-            if metadata_sync_succeeded {
+            if metadata_sync_succeeded && fresh_client_slot_ready {
                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
                 engine
                     .local
@@ -1032,7 +1064,9 @@ impl PgMetaEngine {
                 "postgres snapshot reachability bootstrap did not complete; janitor will remain conservative"
             );
         }
-        engine.cache_client_slot(client_slot);
+        if let Some(client_slot) = client_slot {
+            engine.cache_client_slot(client_slot)?;
+        }
         engine.bootstrap_allocator_state();
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;

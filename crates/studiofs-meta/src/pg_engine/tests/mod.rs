@@ -424,7 +424,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         local,
         postgres_url: "postgres://127.0.0.1:1/studiofs".to_string(),
         volume_id: 1,
-        client_id: "unit-test".to_string(),
+        client_id: Mutex::new("unit-test".to_string()),
         client_slot_plus_one: AtomicU64::new(0),
         local_version: AtomicI64::new(0),
         namespace_version: AtomicI64::new(0),
