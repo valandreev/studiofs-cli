@@ -134,6 +134,35 @@ fn legacy_pg_sync_format_requires_recreate_or_discover() {
 }
 
 #[test]
+fn incompatible_redb_open_rejects_before_creating_schema_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-format.db");
+    let db = redb::Database::create(&path).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(SETTINGS_TABLE).unwrap();
+        table
+            .insert("format", br#"{"format_version":4}"#.as_slice())
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    drop(db);
+
+    let result = RedbMetaEngine::open(&path);
+    assert!(matches!(
+        result,
+        Err(MetaError::UnsupportedFormatVersion {
+            found: 4,
+            expected: 5
+        })
+    ));
+
+    let db = redb::ReadOnlyDatabase::open(&path).unwrap();
+    let txn = db.begin_read().unwrap();
+    assert_eq!(txn.list_tables().unwrap().count(), 1);
+}
+
+#[test]
 fn encryption_config_validation_rejects_disabled_or_unsupported_values() {
     let mut disabled = EncryptionConfig::new([0x11; ENCRYPTION_KEY_LENGTH]);
     disabled.enabled = false;

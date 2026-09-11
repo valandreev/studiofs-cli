@@ -21,6 +21,21 @@ pub(super) fn decode_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
 }
 
 impl RedbMetaEngine {
+    pub(super) fn read_format_info_from_read_txn(
+        txn: &redb::ReadTransaction,
+    ) -> MetaResult<FormatInfo> {
+        let table = match txn.open_table(SETTINGS_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Err(MetaError::NotFormatted),
+            Err(error) => return Err(MetaError::Storage(error.to_string())),
+        };
+        let entry = table
+            .get("format")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .ok_or(MetaError::NotFormatted)?;
+        decode_format_info(entry.value())
+    }
+
     /// Read persisted format metadata from a redb file without opening the full engine.
     pub fn read_format_info_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
         let db = match ReadOnlyDatabase::open(path.as_ref()) {
@@ -44,14 +59,7 @@ impl RedbMetaEngine {
         let txn = db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(SETTINGS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let entry = table
-            .get("format")
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .ok_or(MetaError::NotFormatted)?;
-        decode_format_info(entry.value())
+        Self::read_format_info_from_read_txn(&txn)
     }
 
     #[cfg(test)]
@@ -90,13 +98,6 @@ impl MetaFormat for RedbMetaEngine {
 
     fn get_format_info(&self) -> MetaResult<FormatInfo> {
         let txn = self.begin_read_txn()?;
-        let table = txn
-            .open_table(SETTINGS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let entry = table
-            .get("format")
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .ok_or(MetaError::NotFormatted)?;
-        decode_format_info(entry.value())
+        Self::read_format_info_from_read_txn(&txn)
     }
 }

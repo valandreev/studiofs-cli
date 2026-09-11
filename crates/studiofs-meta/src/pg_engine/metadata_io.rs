@@ -291,7 +291,7 @@ impl PgMetaEngine {
         let metadata_format_version = i16::try_from(format_info.format_version).map_err(|_| {
             MetaError::Storage("metadata format version exceeds PostgreSQL SMALLINT".to_string())
         })?;
-        let checkpoint_sha256 = Sha256::digest(&payload).to_vec();
+        let checkpoint_sha256 = Sha256::digest(&payload);
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
@@ -314,7 +314,7 @@ impl PgMetaEngine {
                                     &version,
                                     &version,
                                     &payload,
-                                    &checkpoint_sha256,
+                                    &&checkpoint_sha256[..],
                                     &format_info,
                                 ],
                             )

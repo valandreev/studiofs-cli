@@ -462,7 +462,7 @@ fn seed_pg_metadata_state(
     format_info_bytes: &[u8],
 ) -> anyhow::Result<()> {
     let metadata_format_version = i16::try_from(CURRENT_FORMAT_VERSION)?;
-    let checkpoint_sha256 = Sha256::digest(checkpoint_bytes).to_vec();
+    let checkpoint_sha256 = Sha256::digest(checkpoint_bytes);
     rt.block_on(async {
         let (client, connection) = connect_studiofs_postgres(dsn).await?;
         let conn_task = tokio::spawn(async move {
@@ -493,7 +493,7 @@ fn seed_pg_metadata_state(
                     &metadata_format_version,
                     &INITIAL_METADATA_STATE_VERSION,
                     &checkpoint_bytes,
-                    &checkpoint_sha256,
+                    &&checkpoint_sha256[..],
                     &format_info_bytes,
                 ],
             )

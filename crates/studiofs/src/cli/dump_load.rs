@@ -52,6 +52,11 @@ struct MetadataDump {
     event_log: Vec<DumpEvent>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DumpHeader {
+    dump_version: u16,
+}
+
 #[derive(Debug, Error)]
 pub enum DumpLoadError {
     #[error("input/output error: {0}")]
@@ -262,7 +267,7 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
     Ok(())
 }
 
-fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64> {
+fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64> {
     crate::runtime_bridge::block_on(async move {
         let metadata_dsn = ensure_studiofs_database(postgres_address)
             .await
@@ -398,26 +403,7 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
     })
 }
 
-pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
-    let bytes = std::fs::read(input).map_err(|e| {
-        DumpLoadError::Message(format!("failed to read dump {}: {e}", input.display()))
-    })?;
-    let dump: MetadataDump = serde_json::from_slice(&bytes).map_err(|e| {
-        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
-    })?;
-    let volume_name = dump.volume.name.clone();
-
-    if dump.dump_version != 4 {
-        return Err(DumpLoadError::Message(format!(
-            "unsupported dump version: {}",
-            dump.dump_version
-        )));
-    }
-
-    ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
-    let format_info: studiofs_meta::FormatInfo =
-        serde_json::from_slice(&dump.metadata_state_format_info)?;
-    ensure_supported_format_version(&format_info)?;
+fn validate_checkpoint_descriptor(dump: &MetadataDump) -> DumpLoadResult<()> {
     if dump.metadata_state_checkpoint_sha256.as_slice()
         != Sha256::digest(&dump.metadata_state_snapshot).as_slice()
     {
@@ -430,8 +416,36 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
             "dump checkpoint descriptor is not a completed publication".to_string(),
         ));
     }
+    Ok(())
+}
 
-    apply_dump(postgres_address, dump)?;
+pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
+    let bytes = std::fs::read(input).map_err(|e| {
+        DumpLoadError::Message(format!("failed to read dump {}: {e}", input.display()))
+    })?;
+    let header: DumpHeader = serde_json::from_slice(&bytes).map_err(|e| {
+        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
+    })?;
+
+    if header.dump_version != 4 {
+        return Err(DumpLoadError::Message(format!(
+            "unsupported dump version: {}",
+            header.dump_version
+        )));
+    }
+
+    let dump: MetadataDump = serde_json::from_slice(&bytes).map_err(|e| {
+        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
+    })?;
+    let volume_name = dump.volume.name.as_str();
+
+    ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
+    let format_info: studiofs_meta::FormatInfo =
+        serde_json::from_slice(&dump.metadata_state_format_info)?;
+    ensure_supported_format_version(&format_info)?;
+    validate_checkpoint_descriptor(&dump)?;
+
+    apply_dump(postgres_address, &dump)?;
 
     println!("✓ Dump loaded into PostgreSQL");
     println!("  Volume: {}", volume_name);
@@ -493,5 +507,66 @@ mod tests {
             }) => assert_eq!(postgresql_address, "postgres://user:pass@127.0.0.1:5432"),
             other => panic!("expected Load, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_rejects_legacy_dump_before_full_deserialization() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), br#"{"dump_version":3}"#).unwrap();
+
+        let err = load(input.path(), "postgres://unused").unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("unsupported dump version: 3")
+        ));
+    }
+
+    fn test_dump() -> MetadataDump {
+        let snapshot = vec![1, 2, 3];
+        MetadataDump {
+            dump_version: 4,
+            volume: DumpVolume {
+                vol: 1,
+                name: "test".to_string(),
+                uuid: "test".to_string(),
+                block_size: 4096,
+            },
+            metadata_state_format_version: 5,
+            metadata_state_version: 1,
+            metadata_state_checkpoint_version: 1,
+            metadata_state_snapshot: snapshot.clone(),
+            metadata_state_checkpoint_sha256: Sha256::digest(&snapshot).to_vec(),
+            metadata_state_format_info: Vec::new(),
+            metadata_state_publication_state: "published".to_string(),
+            metadata_state_generation: 1,
+            counters: Vec::new(),
+            event_log: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dump_checkpoint_validation_rejects_checksum_mismatch() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_sha256[0] ^= 1;
+
+        let err = validate_checkpoint_descriptor(&dump).unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message)
+                if message == "dump checkpoint checksum does not match checkpoint bytes"
+        ));
+    }
+
+    #[test]
+    fn dump_checkpoint_validation_rejects_incomplete_publication() {
+        let mut dump = test_dump();
+        dump.metadata_state_publication_state = "pending".to_string();
+
+        let err = validate_checkpoint_descriptor(&dump).unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message)
+                if message == "dump checkpoint descriptor is not a completed publication"
+        ));
     }
 }

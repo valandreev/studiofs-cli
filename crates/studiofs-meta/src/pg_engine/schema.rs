@@ -93,13 +93,16 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             ADD COLUMN IF NOT EXISTS checkpoint_version BIGINT NOT NULL DEFAULT 0;
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_sha256 BYTEA NOT NULL
-                DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex');
+                DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
+                CHECK (octet_length(checkpoint_sha256) = 32);
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS format_info BYTEA NOT NULL DEFAULT decode('', 'hex');
         ALTER TABLE metadata_state
-            ADD COLUMN IF NOT EXISTS checkpoint_publication_state TEXT NOT NULL DEFAULT 'published';
+            ADD COLUMN IF NOT EXISTS checkpoint_publication_state TEXT NOT NULL DEFAULT 'published'
+                CHECK (checkpoint_publication_state IN ('pending', 'published'));
         ALTER TABLE metadata_state
-            ADD COLUMN IF NOT EXISTS checkpoint_generation BIGINT NOT NULL DEFAULT 0;
+            ADD COLUMN IF NOT EXISTS checkpoint_generation BIGINT NOT NULL DEFAULT 0
+                CHECK (checkpoint_generation >= 0);
 
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -753,5 +756,16 @@ mod tests {
         assert!(sql.contains("octet_length(checkpoint_sha256) = 32"));
         assert!(sql.contains("checkpoint_publication_state IN ('pending', 'published')"));
         assert!(sql.contains("checkpoint_generation >= 0"));
+        assert!(
+            sql.matches("CHECK (octet_length(checkpoint_sha256) = 32)")
+                .count()
+                >= 2
+        );
+        assert!(
+            sql.matches("CHECK (checkpoint_publication_state IN ('pending', 'published'))")
+                .count()
+                >= 2
+        );
+        assert!(sql.matches("CHECK (checkpoint_generation >= 0)").count() >= 2);
     }
 }

@@ -622,6 +622,17 @@ impl RedbMetaEngine {
         let db = Database::create(path.as_ref())
             .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
 
+        let persisted_format = {
+            let txn = db
+                .begin_read()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            match Self::read_format_info_from_read_txn(&txn) {
+                Ok(format_info) => Some(format_info),
+                Err(MetaError::NotFormatted) => None,
+                Err(error) => return Err(error),
+            }
+        };
+
         {
             let txn = begin_redb_write_txn(&db, None)?;
             let _ = txn.open_table(SETTINGS_TABLE);
@@ -684,24 +695,17 @@ impl RedbMetaEngine {
         engine.ensure_dentry_by_inode_indexes()?;
         let _ = engine.recover_undo_logs()?;
 
-        match engine.get_format_info() {
-            Ok(format_info) if format_info.format_version == CURRENT_FORMAT_VERSION => {
+        match persisted_format {
+            Some(format_info) => {
                 engine.ensure_inode_lifecycle_table()?;
                 debug!(
                     "format version {} is up to date",
                     format_info.format_version
                 );
             }
-            Ok(info) => {
-                return Err(MetaError::UnsupportedFormatVersion {
-                    found: info.format_version,
-                    expected: CURRENT_FORMAT_VERSION,
-                });
-            }
-            Err(MetaError::NotFormatted) => {
+            None => {
                 debug!("new database (not yet formatted) — skipping migration check");
             }
-            Err(e) => return Err(e),
         }
 
         Ok(engine)
