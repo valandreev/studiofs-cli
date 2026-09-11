@@ -102,7 +102,8 @@ impl Default for MetaOpenOptions {
     }
 }
 
-fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
+/// Validate the local/remote metadata format before opening or importing it.
+pub fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
     if info.format_version != CURRENT_FORMAT_VERSION {
         return Err(MetaError::UnsupportedFormatVersion {
             found: info.format_version,
@@ -110,6 +111,24 @@ fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
         });
     }
     info.validate_format_contract()?;
+    Ok(())
+}
+
+/// Validate the PostgreSQL scalar sync-format version stored with a checkpoint.
+///
+/// PostgreSQL stores this value as `SMALLINT`, so missing, negative, or
+/// otherwise unrepresentable values are converted to the unsupported sentinel
+/// instead of being accepted as a current format.
+pub fn ensure_supported_pg_sync_format_version(found: Option<i16>) -> MetaResult<()> {
+    let found = found
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or_default();
+    if found != CURRENT_FORMAT_VERSION {
+        return Err(MetaError::UnsupportedFormatVersion {
+            found,
+            expected: CURRENT_FORMAT_VERSION,
+        });
+    }
     Ok(())
 }
 
@@ -202,6 +221,27 @@ pub fn open_meta_engine_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_sync_format_validator_rejects_missing_or_legacy_values() {
+        assert!(
+            ensure_supported_pg_sync_format_version(Some(CURRENT_FORMAT_VERSION as i16,)).is_ok()
+        );
+
+        for found in [None, Some(4), Some(-1)] {
+            let err = ensure_supported_pg_sync_format_version(found).unwrap_err();
+            assert!(matches!(
+                err,
+                MetaError::UnsupportedFormatVersion {
+                    expected: CURRENT_FORMAT_VERSION,
+                    ..
+                }
+            ));
+            let message = err.to_string();
+            assert!(message.contains("recreate"));
+            assert!(message.contains("discover"));
+        }
+    }
 
     #[test]
     fn test_open_meta_engine_missing_file_creates_redb() {

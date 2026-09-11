@@ -693,10 +693,10 @@ impl RedbMetaEngine {
                 );
             }
             Ok(info) => {
-                return Err(MetaError::Storage(format!(
-                    "unsupported format version: {}",
-                    info.format_version
-                )));
+                return Err(MetaError::UnsupportedFormatVersion {
+                    found: info.format_version,
+                    expected: CURRENT_FORMAT_VERSION,
+                });
             }
             Err(MetaError::NotFormatted) => {
                 debug!("new database (not yet formatted) — skipping migration check");

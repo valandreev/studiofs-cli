@@ -14,6 +14,7 @@
 
 use bytes::Bytes;
 use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -1092,13 +1093,31 @@ fn setup_pg_volume(
             })?;
         let volume_id: i64 = row.get(0);
 
+        let empty_checkpoint = Vec::<u8>::new();
+        let checkpoint_sha256 = Sha256::digest(&empty_checkpoint).to_vec();
+        let metadata_format_version = CURRENT_FORMAT_VERSION as i16;
+
         tx.execute(
             r#"
-            INSERT INTO metadata_state (vol, version, snapshot)
-            VALUES ($1, 0, $2)
+            INSERT INTO metadata_state (
+                vol,
+                metadata_format_version,
+                version,
+                checkpoint_version,
+                snapshot,
+                checkpoint_sha256,
+                checkpoint_publication_state,
+                checkpoint_generation
+            )
+            VALUES ($1, $2, 0, 0, $3, $4, 'published', 1)
             ON CONFLICT (vol) DO NOTHING
             "#,
-            &[&volume_id, &Vec::<u8>::new()],
+            &[
+                &volume_id,
+                &metadata_format_version,
+                &empty_checkpoint,
+                &checkpoint_sha256,
+            ],
         )
         .await
         .map_err(|e| {

@@ -28,8 +28,8 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 /// Follow-up: promote this into persisted `FormatInfo` once chunk-size
 /// migration/versioning is introduced.
 pub const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
-/// Current on-disk metadata format version.
-pub const CURRENT_FORMAT_VERSION: u16 = 4;
+/// Current on-disk metadata and PostgreSQL sync format version.
+pub const CURRENT_FORMAT_VERSION: u16 = 5;
 /// Supported encryption format version for remote payload envelopes.
 pub const CURRENT_ENCRYPTION_FORMAT_VERSION: u16 = 1;
 /// Initial active key identifier for formatted encrypted volumes.

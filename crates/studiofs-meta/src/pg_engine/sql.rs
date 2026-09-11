@@ -1,7 +1,6 @@
 pub(super) const SELECT_METADATA_VERSION: &str = "SELECT version FROM metadata_state WHERE vol=$1";
 
-pub(super) const SELECT_METADATA_SNAPSHOT: &str =
-    "SELECT version, checkpoint_version, snapshot FROM metadata_state WHERE vol=$1";
+pub(super) const SELECT_METADATA_SNAPSHOT: &str = "SELECT version, checkpoint_version, snapshot, metadata_format_version, checkpoint_sha256, checkpoint_publication_state, checkpoint_generation FROM metadata_state WHERE vol=$1";
 
 pub(super) const BUMP_METADATA_VERSION: &str = r#"
     UPDATE metadata_state
@@ -31,13 +30,27 @@ pub(super) const INSERT_EVENT_LOG_BATCH: &str = r#"
     "#;
 
 pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
-    INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO metadata_state (
+        vol,
+        metadata_format_version,
+        version,
+        checkpoint_version,
+        snapshot,
+        checkpoint_sha256,
+        format_info,
+        checkpoint_publication_state,
+        checkpoint_generation
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'published', 1)
     ON CONFLICT (vol) DO UPDATE
-    SET version = GREATEST(metadata_state.version, EXCLUDED.version),
+    SET metadata_format_version = EXCLUDED.metadata_format_version,
+        version = GREATEST(metadata_state.version, EXCLUDED.version),
         checkpoint_version = EXCLUDED.checkpoint_version,
         snapshot = EXCLUDED.snapshot,
+        checkpoint_sha256 = EXCLUDED.checkpoint_sha256,
         format_info = EXCLUDED.format_info,
+        checkpoint_publication_state = EXCLUDED.checkpoint_publication_state,
+        checkpoint_generation = metadata_state.checkpoint_generation + 1,
         updated_at = now()
     WHERE EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
     "#;

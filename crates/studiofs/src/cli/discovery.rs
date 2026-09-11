@@ -4,7 +4,8 @@ use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
     FormatInfo, MetaFormat, MetaOpenOptions, RedbMetaEngine, connect_studiofs_postgres,
-    ensure_studiofs_database, open_meta_engine_with_options,
+    ensure_studiofs_database, ensure_supported_format_version,
+    ensure_supported_pg_sync_format_version, open_meta_engine_with_options,
 };
 use thiserror::Error;
 
@@ -77,10 +78,12 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
             .await
             .map_err(|e| DiscoveryError::Message(e.to_string()))?
             .metadata_dsn;
-        let (volume_id, serving_checkpoint, format_info_bytes) =
+        let (volume_id, serving_checkpoint, format_info_bytes, pg_format_version) =
             fetch_remote_state(name, &postgres_dsn).await?;
 
+        ensure_supported_pg_sync_format_version(pg_format_version)?;
         let mut format_info = decode_format_info(&format_info_bytes)?;
+        ensure_supported_format_version(&format_info)?;
         let pg = format_info
             .metadata
             .postgres
@@ -102,7 +105,7 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
 async fn fetch_remote_state(
     name: &str,
     postgres_dsn: &str,
-) -> DiscoveryResult<(i64, Vec<u8>, Vec<u8>)> {
+) -> DiscoveryResult<(i64, Vec<u8>, Vec<u8>, Option<i16>)> {
     let (client, connection) = connect_studiofs_postgres(postgres_dsn)
         .await
         .map_err(|e| DiscoveryError::Message(e.to_string()))?;
@@ -112,7 +115,7 @@ async fn fetch_remote_state(
         let row = client
             .query_opt(
                 r#"
-            SELECT v.vol, ms.snapshot, ms.format_info
+            SELECT v.vol, ms.snapshot, ms.format_info, ms.metadata_format_version
             FROM volumes v
             JOIN metadata_state ms ON ms.vol = v.vol
             WHERE v.name = $1
@@ -130,7 +133,12 @@ async fn fetch_remote_state(
             ))
         })?;
 
-        Ok::<(i64, Vec<u8>, Vec<u8>), DiscoveryError>((row.get(0), row.get(1), row.get(2)))
+        Ok::<(i64, Vec<u8>, Vec<u8>, Option<i16>), DiscoveryError>((
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+        ))
     }
     .await;
 

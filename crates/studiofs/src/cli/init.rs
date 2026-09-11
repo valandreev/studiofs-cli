@@ -6,6 +6,7 @@
 //! before writing local metadata state.
 
 use clap::Args;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::PathBuf;
 use studiofs_data::{
@@ -460,6 +461,8 @@ fn seed_pg_metadata_state(
     checkpoint_bytes: &[u8],
     format_info_bytes: &[u8],
 ) -> anyhow::Result<()> {
+    let metadata_format_version = i16::try_from(CURRENT_FORMAT_VERSION)?;
+    let checkpoint_sha256 = Sha256::digest(checkpoint_bytes).to_vec();
     rt.block_on(async {
         let (client, connection) = connect_studiofs_postgres(dsn).await?;
         let conn_task = tokio::spawn(async move {
@@ -471,14 +474,26 @@ fn seed_pg_metadata_state(
         client
             .execute(
                 r#"
-                INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info)
-                VALUES ($1, $2, $2, $3, $4)
+                INSERT INTO metadata_state (
+                    vol,
+                    metadata_format_version,
+                    version,
+                    checkpoint_version,
+                    snapshot,
+                    checkpoint_sha256,
+                    format_info,
+                    checkpoint_publication_state,
+                    checkpoint_generation
+                )
+                VALUES ($1, $2, $3, $3, $4, $5, $6, 'published', 1)
                 ON CONFLICT (vol) DO NOTHING
                 "#,
                 &[
                     &volume_id,
+                    &metadata_format_version,
                     &INITIAL_METADATA_STATE_VERSION,
                     &checkpoint_bytes,
+                    &checkpoint_sha256,
                     &format_info_bytes,
                 ],
             )

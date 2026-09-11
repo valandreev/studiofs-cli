@@ -1,12 +1,14 @@
 //! `studiofs dump` / `studiofs load` — PostgreSQL metadata manifest backup/restore.
 
 use clap::Args;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema;
 use studiofs_meta::{
-    MetaError, connect_studiofs_postgres, ensure_studiofs_database, open_meta_engine,
+    MetaError, connect_studiofs_postgres, ensure_studiofs_database,
+    ensure_supported_format_version, ensure_supported_pg_sync_format_version, open_meta_engine,
 };
 use thiserror::Error;
 
@@ -38,10 +40,14 @@ struct DumpEvent {
 struct MetadataDump {
     dump_version: u16,
     volume: DumpVolume,
+    metadata_state_format_version: i16,
     metadata_state_version: i64,
     metadata_state_checkpoint_version: i64,
     metadata_state_snapshot: Vec<u8>,
+    metadata_state_checkpoint_sha256: Vec<u8>,
     metadata_state_format_info: Vec<u8>,
+    metadata_state_publication_state: String,
+    metadata_state_generation: i64,
     counters: Vec<DumpCounter>,
     event_log: Vec<DumpEvent>,
 }
@@ -115,7 +121,19 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             let row = client
                 .query_opt(
                     r#"
-            SELECT v.vol, v.name, v.uuid, v.block_size, ms.version, ms.checkpoint_version, ms.snapshot, ms.format_info
+            SELECT
+                v.vol,
+                v.name,
+                v.uuid,
+                v.block_size,
+                ms.metadata_format_version,
+                ms.version,
+                ms.checkpoint_version,
+                ms.snapshot,
+                ms.checkpoint_sha256,
+                ms.format_info,
+                ms.checkpoint_publication_state,
+                ms.checkpoint_generation
             FROM volumes v
             JOIN metadata_state ms ON ms.vol = v.vol
             WHERE v.vol = $1
@@ -137,10 +155,14 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 uuid: row.get(2),
                 block_size: row.get(3),
             };
-            let state_version: i64 = row.get(4);
-            let state_checkpoint_version: i64 = row.get(5);
-            let state_snapshot: Vec<u8> = row.get(6);
-            let state_format_info: Vec<u8> = row.get(7);
+            let state_format_version: i16 = row.get(4);
+            let state_version: i64 = row.get(5);
+            let state_checkpoint_version: i64 = row.get(6);
+            let state_snapshot: Vec<u8> = row.get(7);
+            let state_checkpoint_sha256: Vec<u8> = row.get(8);
+            let state_format_info: Vec<u8> = row.get(9);
+            let state_publication_state: String = row.get(10);
+            let state_generation: i64 = row.get(11);
 
             let counter_rows = client
                 .query(
@@ -181,12 +203,16 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 .collect();
 
             Ok(MetadataDump {
-                dump_version: 3,
+                dump_version: 4,
                 volume,
+                metadata_state_format_version: state_format_version,
                 metadata_state_version: state_version,
                 metadata_state_checkpoint_version: state_checkpoint_version,
                 metadata_state_snapshot: state_snapshot,
+                metadata_state_checkpoint_sha256: state_checkpoint_sha256,
                 metadata_state_format_info: state_format_info,
+                metadata_state_publication_state: state_publication_state,
+                metadata_state_generation: state_generation,
                 counters,
                 event_log,
             })
@@ -306,13 +332,17 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("clear metadata_state failed: {e}")))?;
             tx.execute(
-                "INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info) VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &target_vol,
+                    &dump.metadata_state_format_version,
                     &dump.metadata_state_version,
                     &dump.metadata_state_checkpoint_version,
                     &dump.metadata_state_snapshot,
+                    &dump.metadata_state_checkpoint_sha256,
                     &dump.metadata_state_format_info,
+                    &dump.metadata_state_publication_state,
+                    &dump.metadata_state_generation,
                 ],
             )
             .await
@@ -377,11 +407,28 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     })?;
     let volume_name = dump.volume.name.clone();
 
-    if dump.dump_version != 3 {
+    if dump.dump_version != 4 {
         return Err(DumpLoadError::Message(format!(
             "unsupported dump version: {}",
             dump.dump_version
         )));
+    }
+
+    ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
+    let format_info: studiofs_meta::FormatInfo =
+        serde_json::from_slice(&dump.metadata_state_format_info)?;
+    ensure_supported_format_version(&format_info)?;
+    if dump.metadata_state_checkpoint_sha256.as_slice()
+        != Sha256::digest(&dump.metadata_state_snapshot).as_slice()
+    {
+        return Err(DumpLoadError::Message(
+            "dump checkpoint checksum does not match checkpoint bytes".to_string(),
+        ));
+    }
+    if dump.metadata_state_publication_state != "published" || dump.metadata_state_generation <= 0 {
+        return Err(DumpLoadError::Message(
+            "dump checkpoint descriptor is not a completed publication".to_string(),
+        ));
     }
 
     apply_dump(postgres_address, dump)?;

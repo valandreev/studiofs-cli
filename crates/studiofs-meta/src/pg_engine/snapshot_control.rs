@@ -374,7 +374,7 @@ impl PgSnapshotBackend {
                     "snapshot format info is invalid",
                 ))
             })?;
-        format_info.validate_format_contract().map_err(|_| {
+        crate::ensure_supported_format_version(&format_info).map_err(|_| {
             SnapshotSourceError::permanent(snapshot_control_error(
                 "snapshot format info is invalid",
             ))

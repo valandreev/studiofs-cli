@@ -13,6 +13,15 @@ required for existing test disks. A client or test fixture must use the new
 format/protocol boundary rather than relying on an old PostgreSQL startup
 layout.
 
+SFS-696 establishes the new boundary at metadata format version `5`. Local
+`redb` metadata and the PostgreSQL `metadata_state` row must carry that same
+version. The PostgreSQL row also carries the live bootstrap checkpoint's
+SHA-256 digest, publication state, and monotonically increasing publication
+generation. Schema setup may add these columns to an existing database with
+legacy sentinel values, but it never upgrades old rows. A reachable legacy
+version is rejected with an actionable recreate/`studiofs discover` error;
+there is no migration, dual-read, or dual-write path.
+
 The mounted data-plane contract remains in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 This document owns the PostgreSQL lifecycle and synchronization rules that the

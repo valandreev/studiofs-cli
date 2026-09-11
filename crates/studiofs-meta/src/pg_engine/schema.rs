@@ -1,7 +1,7 @@
 use crate::engine::{MetaError, MetaResult};
 
 /// The PostgreSQL schema generation owned by the Snapshot v2 control plane.
-pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 6;
+pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 7;
 
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
@@ -72,17 +72,34 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
 
         CREATE TABLE IF NOT EXISTS metadata_state (
             vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            metadata_format_version SMALLINT NOT NULL,
             version BIGINT NOT NULL,
             checkpoint_version BIGINT NOT NULL DEFAULT 0,
             snapshot BYTEA NOT NULL,
+            checkpoint_sha256 BYTEA NOT NULL
+                DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
+                CHECK (octet_length(checkpoint_sha256) = 32),
             format_info BYTEA NOT NULL DEFAULT decode('', 'hex'),
+            checkpoint_publication_state TEXT NOT NULL DEFAULT 'published'
+                CHECK (checkpoint_publication_state IN ('pending', 'published')),
+            checkpoint_generation BIGINT NOT NULL DEFAULT 0
+                CHECK (checkpoint_generation >= 0),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
         ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS metadata_format_version SMALLINT NOT NULL DEFAULT 0;
+        ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_version BIGINT NOT NULL DEFAULT 0;
         ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_sha256 BYTEA NOT NULL
+                DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex');
+        ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS format_info BYTEA NOT NULL DEFAULT decode('', 'hex');
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_publication_state TEXT NOT NULL DEFAULT 'published';
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_generation BIGINT NOT NULL DEFAULT 0;
 
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -716,4 +733,27 @@ where
         .batch_execute(studiofs_pg_schema_sql())
         .await
         .map_err(|_| MetaError::RemoteUnavailable("postgres schema ensure failed".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_declares_incompatible_sync_boundary_and_checkpoint_descriptor() {
+        assert_eq!(STUDIOFS_PG_SCHEMA_VERSION, 7);
+
+        let sql = studiofs_pg_schema_sql();
+        for fragment in [
+            "metadata_format_version SMALLINT NOT NULL",
+            "checkpoint_sha256 BYTEA NOT NULL",
+            "checkpoint_publication_state TEXT NOT NULL",
+            "checkpoint_generation BIGINT NOT NULL",
+        ] {
+            assert!(sql.contains(fragment), "schema is missing {fragment}");
+        }
+        assert!(sql.contains("octet_length(checkpoint_sha256) = 32"));
+        assert!(sql.contains("checkpoint_publication_state IN ('pending', 'published')"));
+        assert!(sql.contains("checkpoint_generation >= 0"));
+    }
 }

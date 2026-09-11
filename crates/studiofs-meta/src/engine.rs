@@ -133,10 +133,12 @@ pub enum MetaError {
     #[error("format info not found — run `studiofs init` first")]
     NotFormatted,
 
-    /// The on-disk metadata format version is unsupported by this binary.
-    #[error("unsupported format version: found {found}, expected {expected}")]
+    /// A persisted local or PostgreSQL metadata format is unsupported by this binary.
+    #[error(
+        "unsupported metadata/PG sync format version: found {found}, expected {expected}; recreate the incompatible metadata or volume, then run `studiofs discover` for a fresh client"
+    )]
     UnsupportedFormatVersion {
-        /// Version stored in metadata.
+        /// Version stored in local or PostgreSQL metadata.
         found: u16,
         /// Version expected by the running binary.
         expected: u16,

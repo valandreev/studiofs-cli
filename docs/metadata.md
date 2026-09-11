@@ -104,7 +104,7 @@ Runtime behavior:
 - foreground ops (`create`, `rename`, `unlink`, `truncate`, block staging) mutate local `redb`
 - local mutations append to the local metadata event log
 - background flush projects remote-visible deltas into PostgreSQL `event_log`
-- background pull (SFS-695 target; implemented by SFS-696 through SFS-698)
+- background pull (SFS-695 target; runtime follow-ups SFS-697 and SFS-698)
   applies only newer foreign delta pages toward a bounded, frozen target
 - restart/reopen rebuilds pending replication state from the local event log when
   unpublished local overlay mutations still exist
@@ -266,9 +266,8 @@ Operational note:
 ### Pull from PostgreSQL
 
 The procedure below describes the SFS-695 target contract, not the currently
-shipped SQL path. Until SFS-696 through SFS-698 land, the transitional pull
-does not yet enforce the frozen upper bound or bounded page query described
-here.
+shipped SQL path. Until SFS-697 and SFS-698 land, the transitional pull does
+not yet enforce the frozen upper bound or bounded page query described here.
 
 1. Load only rows with `batch_version > local_version`.
 2. Freeze one target `metadata_state.version` for the current sync operation.
@@ -446,6 +445,7 @@ The shared PostgreSQL schema uses:
   - append-only remote-visible metadata deltas
 - `metadata_state`
   - per-volume serving checkpoint, checkpoint cursor, format bootstrap bytes,
+    metadata/PG sync format version, checksum, publication state/generation,
     and monotonic `version`
 - `snapshot_catalog`
   - thin Snapshot v2 lifecycle/control rows
@@ -454,6 +454,14 @@ The shared PostgreSQL schema uses:
 
 Important cursor rule:
 - runtime pull follows `batch_version`, not `seq_id`
+
+Compatibility boundary:
+- format version `5` is required in both local `redb` metadata and
+  `metadata_state.metadata_format_version`
+- schema setup never promotes legacy rows to version `5`; old rows fail startup
+  and must be recreated or used as the source for a fresh `studiofs discover`
+- the durable applied replay cursor remains local redb state; a startup target
+  is an ephemeral catch-up-session value
 
 ## Config Fields
 

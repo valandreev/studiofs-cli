@@ -6,6 +6,7 @@ use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode,
 use crate::engine::{MetaError, MetaFormat, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::snapshot::ServingCheckpoint;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
@@ -67,6 +68,20 @@ impl PgMetaEngine {
         let version: i64 = row.get(0);
         let checkpoint_version: i64 = row.get(1);
         let bytes: Vec<u8> = row.get(2);
+        let metadata_format_version = row.get::<_, Option<i16>>(3);
+        let checkpoint_sha256: Option<Vec<u8>> = row.get(4);
+        let checkpoint_publication_state: Option<String> = row.get(5);
+        let checkpoint_generation: Option<i64> = row.get(6);
+
+        crate::ensure_supported_pg_sync_format_version(metadata_format_version)?;
+        if checkpoint_publication_state.as_deref() != Some("published")
+            || checkpoint_generation.unwrap_or_default() <= 0
+            || checkpoint_sha256.as_deref() != Some(Sha256::digest(&bytes).as_slice())
+        {
+            return Err(MetaError::Storage(
+                "postgres serving checkpoint descriptor is invalid".to_string(),
+            ));
+        }
 
         if checkpoint_version < 0 || checkpoint_version > version {
             return Err(MetaError::Storage(
@@ -273,6 +288,10 @@ impl PgMetaEngine {
         let volume_id = self.volume_id;
         let payload = self.local.export_serving_checkpoint_bytes()?;
         let format_info = self.local.get_format_info()?;
+        let metadata_format_version = i16::try_from(format_info.format_version).map_err(|_| {
+            MetaError::Storage("metadata format version exceeds PostgreSQL SMALLINT".to_string())
+        })?;
+        let checkpoint_sha256 = Sha256::digest(&payload).to_vec();
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
@@ -289,7 +308,15 @@ impl PgMetaEngine {
                         client
                             .execute(
                                 sql::UPSERT_METADATA_CHECKPOINT,
-                                &[&volume_id, &version, &version, &payload, &format_info],
+                                &[
+                                    &volume_id,
+                                    &metadata_format_version,
+                                    &version,
+                                    &version,
+                                    &payload,
+                                    &checkpoint_sha256,
+                                    &format_info,
+                                ],
                             )
                             .await
                             .map_err(|e| {

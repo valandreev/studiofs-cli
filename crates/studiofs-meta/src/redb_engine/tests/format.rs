@@ -103,6 +103,37 @@ fn format_info_decode_reports_unsupported_version_before_missing_encryption() {
 }
 
 #[test]
+fn legacy_pg_sync_format_requires_recreate_or_discover() {
+    let legacy = serde_json::json!({
+        "format_version": 4,
+        "name": "legacy-pg-sync",
+        "uuid": "legacy-pg-sync-uuid",
+        "endpoint": "http://localhost:9000",
+        "bucket": "legacy-bucket",
+        "access_key": "studiofs",
+        "secret_key": "studiofs123",
+        "region": "",
+        "data_prefix": "legacy-volume/objects/",
+        "metadata": {},
+        "block_size": DEFAULT_BLOCK_SIZE
+    });
+
+    let err = super::format::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice())
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        MetaError::UnsupportedFormatVersion {
+            found: 4,
+            expected: 5
+        }
+    ));
+    let message = err.to_string();
+    assert!(message.contains("recreate"), "error must guide recreation: {message}");
+    assert!(message.contains("discover"), "error must guide discovery: {message}");
+}
+
+#[test]
 fn encryption_config_validation_rejects_disabled_or_unsupported_values() {
     let mut disabled = EncryptionConfig::new([0x11; ENCRYPTION_KEY_LENGTH]);
     disabled.enabled = false;
