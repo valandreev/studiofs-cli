@@ -1,8 +1,5 @@
 use crate::engine::{MetaError, MetaResult};
 
-/// The PostgreSQL schema generation owned by the Snapshot v2 control plane.
-pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 7;
-
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
 /// This is the single schema definition used by initialization, dump/load, and
