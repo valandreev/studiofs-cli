@@ -7,6 +7,7 @@ use crate::engine::{
 use crate::types::Ino;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tracing::warn;
 
 impl MetaReplication for PgMetaEngine {
     fn take_invalidation_batches(&self) -> Vec<crate::coherence::InvalidationBatch> {
@@ -41,6 +42,13 @@ impl MetaReplication for PgMetaEngine {
 
     fn sync_metadata(&self) -> MetaResult<()> {
         let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+        if let Err(error) = self.backfill_current_reference_ledger_if_needed() {
+            warn!(
+                error = %error,
+                volume_id = self.volume_id,
+                "postgres snapshot reachability bootstrap did not complete"
+            );
+        }
         self.local.sync_local_metadata()
     }
 

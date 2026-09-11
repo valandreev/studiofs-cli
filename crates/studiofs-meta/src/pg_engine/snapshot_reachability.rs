@@ -17,6 +17,7 @@ use crate::snapshot_ports::{
     UploadedObjectDeletionOutcome,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use tokio_postgres::GenericClient;
 
 /// Maximum number of uploaded fragment rows one reconciliation cycle may claim.
@@ -431,6 +432,33 @@ impl PgMetaEngine {
             .collect()
     }
 
+    pub(super) fn backfill_current_reference_ledger_if_needed(&self) -> MetaResult<()> {
+        if self
+            .snapshot_reachability_bootstrapped
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        let _guard = self
+            .snapshot_reachability_bootstrap_lock
+            .lock()
+            .map_err(|_| {
+                MetaError::Storage("snapshot reachability bootstrap lock poisoned".to_owned())
+            })?;
+        if self
+            .snapshot_reachability_bootstrapped
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        self.backfill_current_reference_ledger()?;
+        self.snapshot_reachability_bootstrapped
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub(super) fn backfill_current_reference_ledger(&self) -> MetaResult<()> {
         for attempt in 0..=SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES {
             if !self.backfill_current_reference_ledger_once()? {
@@ -502,25 +530,6 @@ impl PgMetaEngine {
                             return Ok(false);
                         }
 
-                        let local_version_before = checked_i64(
-                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
-                            "local metadata version",
-                        )?;
-                        let references = local.list_published_object_references()?;
-                        let local_version_after = checked_i64(
-                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
-                            "local metadata version",
-                        )?;
-                        if local_version_before != local_version_after
-                            || local_version_before != version
-                        {
-                            return Ok(true);
-                        }
-
-                        let objects = references
-                            .iter()
-                            .map(|(_, object_id)| *object_id)
-                            .collect::<BTreeSet<_>>();
                         let creating_snapshot = tx
                             .query_opt(
                                 "SELECT 1 FROM snapshot_catalog WHERE vol = $1 AND lifecycle = 'creating' LIMIT 1",
@@ -540,6 +549,25 @@ impl PgMetaEngine {
                             ));
                         }
 
+                        let local_version_before = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        let references = local.list_published_object_references()?;
+                        let local_version_after = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        if local_version_before != local_version_after
+                            || local_version_before != version
+                        {
+                            return Ok(true);
+                        }
+
+                        let objects = references
+                            .iter()
+                            .map(|(_, object_id)| *object_id)
+                            .collect::<BTreeSet<_>>();
                         let inserted = tx
                             .execute(
                                 "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, $2) ON CONFLICT DO NOTHING",

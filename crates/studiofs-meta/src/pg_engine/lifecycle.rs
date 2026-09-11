@@ -281,11 +281,21 @@ impl PgMetaEngine {
                         break;
                     };
                     let _ = engine.flush_due_pending();
-                    if matches!(
-                        engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll),
-                        Ok(true)
-                    ) {
-                        engine.metadata_invalidation_notify.notify_one();
+                    if let Ok(initial_changed) =
+                        engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
+                    {
+                        let local_version_before = engine.local_version.load(Ordering::Acquire);
+                        if let Err(error) = engine.backfill_current_reference_ledger_if_needed() {
+                            warn!(
+                                error = %error,
+                                volume_id = engine.volume_id,
+                                "postgres snapshot reachability bootstrap did not complete"
+                            );
+                        }
+                        let local_version_after = engine.local_version.load(Ordering::Acquire);
+                        if initial_changed || local_version_after > local_version_before {
+                            engine.metadata_invalidation_notify.notify_one();
+                        }
                     }
                 }
             })

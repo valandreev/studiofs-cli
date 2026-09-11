@@ -3,7 +3,7 @@
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaReplication, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle};
 use crate::types::FileType;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -58,11 +58,11 @@ impl PgMetaEngine {
                     self.metadata_fallback_poll_discoveries
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if let Err(error) = self.try_complete_degraded_fresh_client_sync() {
+                if let Err(error) = self.try_complete_catchup_sync() {
                     warn!(
                         error = %error,
                         volume_id = self.volume_id,
-                        "degraded fresh-client lifecycle recovery could not be completed"
+                        "metadata catch-up lifecycle recovery could not be completed"
                     );
                 }
             }
@@ -86,6 +86,17 @@ impl PgMetaEngine {
             let remote_head = self.remote_metadata_head_version()?;
             self.metadata_remote_head_version
                 .store(remote_head, Ordering::Release);
+            if matches!(
+                self.current_pg_sync_lifecycle(),
+                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+            ) {
+                let _ = self.metadata_startup_target_version.compare_exchange(
+                    -1,
+                    remote_head,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
             Ok(changed)
         })();
         self.record_metadata_sync_result(source, &result);
@@ -93,22 +104,21 @@ impl PgMetaEngine {
     }
 
     pub(super) fn sync_metadata_to_current_head(&self) -> MetaResult<()> {
-        // CONTEXT(SFS-698): Transitional helper retained for the pre-SFS-698
-        // startup path. The SFS-695 contract requires one frozen target per
-        // bounded operation.
+        // SFS-698: this bounded helper is reserved for explicit background
+        // reachability/bootstrap work; engine construction must not call it.
         const MAX_STARTUP_CATCHUP_ROUNDS: usize = 16;
 
         self.ensure_remote_format_validated()?;
-        let mut target_head = self.remote_metadata_head_version()?;
+        let target_head = self.remote_metadata_head_version()?;
         for _ in 0..MAX_STARTUP_CATCHUP_ROUNDS {
             if self.local_version.load(Ordering::SeqCst) >= target_head {
                 return Ok(());
             }
 
             let before = self.local_version.load(Ordering::SeqCst);
-            self.sync_metadata()?;
+            self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+            self.local.sync_local_metadata()?;
             let after = self.local_version.load(Ordering::SeqCst);
-            target_head = self.remote_metadata_head_version()?;
             if after >= target_head {
                 return Ok(());
             }
@@ -120,7 +130,7 @@ impl PgMetaEngine {
         }
 
         Err(MetaError::Storage(
-            "postgres metadata catch-up did not reach the current remote head".to_string(),
+            "postgres metadata catch-up did not reach the frozen remote head".to_string(),
         ))
     }
 

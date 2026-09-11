@@ -229,6 +229,11 @@ pub struct PgMetaEngine {
     metadata_last_successful_sync_unix_ms: AtomicI64,
     /// Last remote metadata head observed by a bounded command query.
     metadata_remote_head_version: AtomicI64,
+    /// Frozen remote metadata head for the current startup/catch-up operation.
+    metadata_startup_target_version: AtomicI64,
+    /// Whether snapshot reachability bootstrap completed for this engine.
+    snapshot_reachability_bootstrapped: AtomicBool,
+    snapshot_reachability_bootstrap_lock: Mutex<()>,
     /// Whether the most recent metadata synchronization command succeeded.
     metadata_source_connected: AtomicBool,
     /// Whether PostgreSQL's sync format was validated successfully for this
@@ -478,13 +483,13 @@ impl PgMetaEngine {
     fn update_pg_sync_lifecycle(
         &self,
         next_for_current: impl Fn(PgSyncLifecycle) -> PgSyncLifecycle,
-    ) {
+    ) -> bool {
         loop {
             let current_raw = self.pg_sync_lifecycle.load(Ordering::Acquire);
             let current = Self::pg_sync_lifecycle_from_raw(current_raw);
             let next = next_for_current(current);
             if current == next {
-                return;
+                return false;
             }
             if !current.can_transition_to(next) {
                 warn!(
@@ -493,14 +498,14 @@ impl PgMetaEngine {
                     volume_id = self.volume_id,
                     "invalid pg sync lifecycle transition"
                 );
-                return;
+                return false;
             }
             if self
                 .pg_sync_lifecycle
                 .compare_exchange(current_raw, next as u8, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return;
+                return true;
             }
         }
     }
@@ -531,53 +536,67 @@ impl PgMetaEngine {
         });
     }
 
-    /// Complete a failed fresh-client bootstrap after a successful sync has
-    /// reached the most recently observed remote head.
-    pub(super) fn try_complete_degraded_fresh_client_sync(&self) -> MetaResult<()> {
-        if self
-            .local
-            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)?
-            == 0
-        {
-            return Ok(());
-        }
-
-        match self.current_pg_sync_lifecycle() {
-            PgSyncLifecycle::Degraded => {
-                let local_version = self.local_version.load(Ordering::Acquire);
-                let remote_head = self.metadata_remote_head_version.load(Ordering::Acquire);
-                if remote_head < 0 || local_version < remote_head {
-                    return Ok(());
-                }
-
-                self.ensure_client_slot_for_fresh_client()?;
-                self.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
-                self.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
-            }
-            PgSyncLifecycle::TargetReached
-            | PgSyncLifecycle::AllocatorPending
-            | PgSyncLifecycle::Live => {}
-            PgSyncLifecycle::LocalReady | PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Fatal => {
-                return Ok(());
-            }
-        }
-
+    /// Complete local catch-up after a successful sync has reached the frozen
+    /// startup target.
+    pub(super) fn try_complete_catchup_sync(&self) -> MetaResult<()> {
+        let current = self.current_pg_sync_lifecycle();
         if !matches!(
-            self.current_pg_sync_lifecycle(),
-            PgSyncLifecycle::TargetReached
-                | PgSyncLifecycle::AllocatorPending
-                | PgSyncLifecycle::Live
+            current,
+            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
         ) {
             return Ok(());
         }
 
-        self.local
-            .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
+        let local_version = self.local_version.load(Ordering::Acquire);
+        let startup_target = self.metadata_startup_target_version.load(Ordering::Acquire);
+        if startup_target < 0 || local_version < startup_target {
+            return Ok(());
+        }
+
+        let fresh_client_pending = self
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)?
+            != 0;
+        if fresh_client_pending && let Err(error) = self.ensure_client_slot_for_fresh_client() {
+            self.update_pg_sync_lifecycle(|current| match current {
+                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded => {
+                    PgSyncLifecycle::Degraded
+                }
+                current => current,
+            });
+            return Err(error);
+        }
+
+        let mut reached_target = false;
+        loop {
+            if !self.update_pg_sync_lifecycle(|current| match current {
+                PgSyncLifecycle::Degraded => PgSyncLifecycle::CatchingUp,
+                PgSyncLifecycle::CatchingUp => PgSyncLifecycle::TargetReached,
+                current => current,
+            }) {
+                break;
+            }
+            if self.current_pg_sync_lifecycle() == PgSyncLifecycle::TargetReached {
+                reached_target = true;
+                break;
+            }
+        }
+        if !reached_target {
+            return Ok(());
+        }
+
+        if fresh_client_pending {
+            self.local
+                .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
+        }
         if self.allocator_runtime_state_missing() {
             self.bootstrap_allocator_state();
         } else {
             self.refresh_pg_sync_lifecycle_for_allocator();
         }
+        // A later recovery cycle must capture its own startup target.
+        self.metadata_startup_target_version
+            .store(-1, Ordering::Release);
         Ok(())
     }
 
@@ -848,7 +867,6 @@ impl PgMetaEngine {
                 "PgMetaEngine open requested for non-Postgres volume".to_string(),
             ));
         }
-        let metadata_sync_succeeded;
         if repair_local_graph_recovery_pending {
             // A crash can persist the durable repair marker before the caller
             // resets these cursors. Reset them here as well, before any remote
@@ -986,6 +1004,9 @@ impl PgMetaEngine {
             metadata_sync_errors: AtomicU64::new(0),
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             metadata_remote_head_version: AtomicI64::new(-1),
+            metadata_startup_target_version: AtomicI64::new(-1),
+            snapshot_reachability_bootstrapped: AtomicBool::new(false),
+            snapshot_reachability_bootstrap_lock: Mutex::new(()),
             metadata_source_connected: AtomicBool::new(false),
             remote_format_validated: AtomicBool::new(remote_format_validated),
             remote_format_validation_lock: Mutex::new(()),
@@ -996,82 +1017,80 @@ impl PgMetaEngine {
             engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
         }
 
-        // CONTEXT(SFS-698): Transitional startup path. SFS-695 defines local
-        // serving readiness before remote replay; SFS-698 will move this
-        // bootstrap/catch-up work behind that boundary.
-        if repair_local_graph_recovery_pending {
+        // SFS-698: local serving becomes available before remote event replay.
+        // Startup checkpoint import is bounded bootstrap work; event-tail
+        // catch-up belongs to the explicit replication/background path.
+        let startup_bootstrap_succeeded = if repair_local_graph_recovery_pending {
             engine.pull_snapshot_locked(
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
             )?;
-            engine.sync_metadata_to_current_head()?;
-            metadata_sync_succeeded = true;
             engine.restore_pending_state_from_local_log()?;
             engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
             engine
                 .local
                 .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
+            true
         } else {
-            // CONTEXT(SFS-698): Preserve unflushed local overlays while the
-            // transitional startup path fast-forwards from the latest remote
-            // checkpoint. The canonical lifecycle is documented in
-            // `docs/pg-sync-contract.md`.
-            if let Some(import_mode) = startup_snapshot_import_mode
-                && let Err(error) = engine.pull_snapshot_locked(import_mode)
-            {
-                warn!(
-                    error = %error,
-                    "postgres metadata startup snapshot pull failed; continuing from local state"
-                );
-            }
-            metadata_sync_succeeded = if let Err(error) = engine.sync_metadata_to_current_head() {
-                warn!(
-                    error = %error,
-                    "postgres metadata startup catch-up did not reach the current remote head"
-                );
-                false
+            // Preserve unflushed local overlays while optionally importing a
+            // bounded startup checkpoint. Do not replay the remote event tail
+            // before returning the local engine.
+            let bootstrap_succeeded = if let Some(import_mode) = startup_snapshot_import_mode {
+                match engine.pull_snapshot_locked(import_mode) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "postgres metadata startup snapshot pull failed; continuing from local state"
+                        );
+                        false
+                    }
+                }
             } else {
                 true
             };
             engine.restore_pending_state_from_local_log()?;
-        }
-        if repair_local_graph_recovery_pending && metadata_sync_succeeded {
-            engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
-        }
-        let fresh_client_slot_ready = if fresh_client_pending && metadata_sync_succeeded {
-            match engine.ensure_client_slot_for_fresh_client() {
-                Ok(()) => true,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        volume_id = engine.volume_id,
-                        "fresh-client startup reached the remote head but client-slot reservation did not complete"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
+            bootstrap_succeeded
         };
-        if fresh_client_pending {
-            if metadata_sync_succeeded && fresh_client_slot_ready {
-                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
+        let startup_target_observed = match engine.remote_metadata_head_version() {
+            Ok(remote_head) => {
                 engine
-                    .local
-                    .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
-            } else {
-                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+                    .metadata_remote_head_version
+                    .store(remote_head, Ordering::Release);
+                if fresh_client_pending
+                    || repair_local_graph_recovery_pending
+                    || !startup_bootstrap_succeeded
+                    || engine.local_version.load(Ordering::Acquire) < remote_head
+                {
+                    engine
+                        .metadata_startup_target_version
+                        .store(remote_head, Ordering::Release);
+                }
+                if engine.local_version.load(Ordering::Acquire) < remote_head {
+                    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                }
+                true
             }
-        }
-        if metadata_sync_succeeded && let Err(error) = engine.backfill_current_reference_ledger() {
-            warn!(
-                error = %error,
-                "postgres snapshot reachability bootstrap did not complete; janitor will remain conservative"
-            );
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    volume_id = engine.volume_id,
+                    "postgres startup head observation unavailable; continuing with local serving state"
+                );
+                false
+            }
+        };
+        let startup_failed = !startup_bootstrap_succeeded || !startup_target_observed;
+        if (fresh_client_pending && startup_failed)
+            || (!fresh_client_pending && !startup_bootstrap_succeeded)
+        {
+            engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
         }
         if let Some(client_slot) = client_slot {
             engine.cache_client_slot(client_slot)?;
         }
-        engine.bootstrap_allocator_state();
+        if !fresh_client_pending {
+            engine.bootstrap_allocator_state();
+        }
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;
             let handle = Self::start_background_poll(
