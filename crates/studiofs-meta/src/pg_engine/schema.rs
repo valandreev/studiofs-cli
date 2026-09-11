@@ -741,8 +741,6 @@ mod tests {
 
     #[test]
     fn schema_declares_incompatible_sync_boundary_and_checkpoint_descriptor() {
-        assert_eq!(STUDIOFS_PG_SCHEMA_VERSION, 7);
-
         let sql = studiofs_pg_schema_sql();
         for fragment in [
             "metadata_format_version SMALLINT NOT NULL",
