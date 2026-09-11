@@ -281,11 +281,13 @@ impl PgMetaEngine {
                         break;
                     };
                     let _ = engine.flush_due_pending();
-                    if matches!(
-                        engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll),
-                        Ok(true)
-                    ) {
-                        engine.metadata_invalidation_notify.notify_one();
+                    if let Ok(metadata_changed) =
+                        engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
+                    {
+                        let _ = engine.backfill_current_reference_ledger();
+                        if metadata_changed {
+                            engine.metadata_invalidation_notify.notify_one();
+                        }
                     }
                 }
             })

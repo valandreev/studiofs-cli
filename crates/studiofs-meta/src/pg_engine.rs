@@ -848,7 +848,6 @@ impl PgMetaEngine {
                 "PgMetaEngine open requested for non-Postgres volume".to_string(),
             ));
         }
-        let metadata_sync_succeeded;
         if repair_local_graph_recovery_pending {
             // A crash can persist the durable repair marker before the caller
             // resets these cursors. Reset them here as well, before any remote
@@ -996,82 +995,68 @@ impl PgMetaEngine {
             engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
         }
 
-        // CONTEXT(SFS-698): Transitional startup path. SFS-695 defines local
-        // serving readiness before remote replay; SFS-698 will move this
-        // bootstrap/catch-up work behind that boundary.
-        if repair_local_graph_recovery_pending {
+        // SFS-698: local serving becomes available before remote event replay.
+        // Startup checkpoint import is bounded bootstrap work; event-tail
+        // catch-up belongs to the explicit replication/background path.
+        let startup_bootstrap_succeeded = if repair_local_graph_recovery_pending {
             engine.pull_snapshot_locked(
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
             )?;
-            engine.sync_metadata_to_current_head()?;
-            metadata_sync_succeeded = true;
             engine.restore_pending_state_from_local_log()?;
             engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
             engine
                 .local
                 .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
+            true
         } else {
-            // CONTEXT(SFS-698): Preserve unflushed local overlays while the
-            // transitional startup path fast-forwards from the latest remote
-            // checkpoint. The canonical lifecycle is documented in
-            // `docs/pg-sync-contract.md`.
-            if let Some(import_mode) = startup_snapshot_import_mode
-                && let Err(error) = engine.pull_snapshot_locked(import_mode)
-            {
-                warn!(
-                    error = %error,
-                    "postgres metadata startup snapshot pull failed; continuing from local state"
-                );
-            }
-            metadata_sync_succeeded = if let Err(error) = engine.sync_metadata_to_current_head() {
-                warn!(
-                    error = %error,
-                    "postgres metadata startup catch-up did not reach the current remote head"
-                );
-                false
+            // Preserve unflushed local overlays while optionally importing a
+            // bounded startup checkpoint. Do not replay the remote event tail
+            // before returning the local engine.
+            let bootstrap_succeeded = if let Some(import_mode) = startup_snapshot_import_mode {
+                match engine.pull_snapshot_locked(import_mode) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "postgres metadata startup snapshot pull failed; continuing from local state"
+                        );
+                        false
+                    }
+                }
             } else {
                 true
             };
             engine.restore_pending_state_from_local_log()?;
-        }
-        if repair_local_graph_recovery_pending && metadata_sync_succeeded {
-            engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
-        }
-        let fresh_client_slot_ready = if fresh_client_pending && metadata_sync_succeeded {
-            match engine.ensure_client_slot_for_fresh_client() {
-                Ok(()) => true,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        volume_id = engine.volume_id,
-                        "fresh-client startup reached the remote head but client-slot reservation did not complete"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
+            bootstrap_succeeded
         };
-        if fresh_client_pending {
-            if metadata_sync_succeeded && fresh_client_slot_ready {
-                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
+        let startup_target_observed = match engine.remote_metadata_head_version() {
+            Ok(remote_head) => {
                 engine
-                    .local
-                    .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
-            } else {
-                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+                    .metadata_remote_head_version
+                    .store(remote_head, Ordering::Release);
+                if engine.local_version.load(Ordering::Acquire) < remote_head {
+                    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                }
+                true
             }
-        }
-        if metadata_sync_succeeded && let Err(error) = engine.backfill_current_reference_ledger() {
-            warn!(
-                error = %error,
-                "postgres snapshot reachability bootstrap did not complete; janitor will remain conservative"
-            );
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    volume_id = engine.volume_id,
+                    "postgres startup head observation unavailable; continuing with local serving state"
+                );
+                false
+            }
+        };
+        if fresh_client_pending && (!startup_bootstrap_succeeded || !startup_target_observed) {
+            engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
         }
         if let Some(client_slot) = client_slot {
             engine.cache_client_slot(client_slot)?;
         }
-        engine.bootstrap_allocator_state();
+        if !fresh_client_pending {
+            engine.bootstrap_allocator_state();
+        }
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;
             let handle = Self::start_background_poll(

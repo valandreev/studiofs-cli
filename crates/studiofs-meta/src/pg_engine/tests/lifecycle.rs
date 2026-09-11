@@ -21,6 +21,99 @@ where
 }
 
 #[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn stale_local_open_does_not_replay_remote_event_tail() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "1000");
+    let volume = PgTestVolume::new(&dsn, "pg-open-local-first");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let local = RedbMetaEngine::open(&db).expect("open seeded local metadata");
+    PgMetaEngine::persist_client_slot(&local, 0).expect("persist client slot");
+    drop(local);
+
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        let remote_head = 1_i64;
+        client
+            .execute(
+                "UPDATE metadata_state SET version = $1 WHERE vol = $2",
+                &[&remote_head, &volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(())
+    }))
+    .expect("advance remote metadata head");
+
+    let (lock_ready_tx, lock_ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_dsn = dsn.clone();
+    let lock_thread = std::thread::spawn(move || {
+        run_async(async move {
+            let (mut client, connection) =
+                tokio_postgres::connect(&lock_dsn, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let connection_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let transaction = client
+                .transaction()
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            transaction
+                .batch_execute("LOCK TABLE event_log IN ACCESS EXCLUSIVE MODE")
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            lock_ready_tx
+                .send(())
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            release_rx
+                .recv()
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            connection_task.abort();
+            let _ = connection_task.await;
+            Ok(())
+        })
+        .expect("hold event-log lock");
+    });
+    lock_ready_rx.recv().expect("wait for event-log lock");
+
+    let started = Instant::now();
+    let opened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("stale local metadata should open while event replay is blocked");
+    let elapsed = started.elapsed();
+    let lifecycle = opened.pg_sync_status().lifecycle;
+    drop(opened);
+
+    release_tx.send(()).expect("release event-log lock");
+    lock_thread.join().expect("join event-log lock thread");
+
+    assert!(
+        elapsed < Duration::from_millis(1_500),
+        "open should not perform repeated event-tail replay, elapsed {elapsed:?}"
+    );
+    assert_eq!(
+        lifecycle,
+        PgSyncLifecycle::CatchingUp,
+        "stale local metadata must remain explicitly non-live"
+    );
+}
+
+#[test]
 fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
     let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
     let (_dir, engine) = temp_pg_engine_for_unit();

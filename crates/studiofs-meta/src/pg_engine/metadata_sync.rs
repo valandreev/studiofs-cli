@@ -93,9 +93,8 @@ impl PgMetaEngine {
     }
 
     pub(super) fn sync_metadata_to_current_head(&self) -> MetaResult<()> {
-        // CONTEXT(SFS-698): Transitional helper retained for the pre-SFS-698
-        // startup path. The SFS-695 contract requires one frozen target per
-        // bounded operation.
+        // SFS-698: this bounded helper is reserved for explicit background
+        // reachability/bootstrap work; engine construction must not call it.
         const MAX_STARTUP_CATCHUP_ROUNDS: usize = 16;
 
         self.ensure_remote_format_validated()?;
