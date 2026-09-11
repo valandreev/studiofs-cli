@@ -129,13 +129,29 @@ cursor. Each operation follows this sequence:
 5. Repeat while the cursor is below the frozen target, subject to the per-run
    page, byte, operation-time, and cancellation bounds.
 
+The producer must enforce the replay envelope before assigning a
+`batch_version`. It splits each pending local event range into one or more
+transactional batches, and every published batch must fit both the configured
+replay row limit and replay byte limit after event encoding. The producer
+limits must be no greater than the corresponding replay page limits. SQL insert
+chunking inside one transaction is not a batch bound: all rows published under
+one `batch_version` count toward the same batch. If a single event cannot fit
+the configured byte limit, publication must return a typed size/unsupported
+event error or use a durable chunking representation; it must never exempt that
+event or batch from the replay bounds.
+
+The catch-up worker checks the operation deadline and cancellation boundary
+before each batch and rolls back without advancing the cursor when either is
+reached. The producer-side row/byte caps keep any one attempted batch bounded;
+the worker must not waive the operation-time bound for a large batch.
+
 The cursor is durable progress, not an optimistic remote acknowledgment. A
 page boundary must never split a `batch_version` batch. The cursor advances to
 the last fully applied batch, so a page whose nominal row/byte budget would be
-smaller than one oversized batch must admit that complete batch rather than
-split it. `seq_id` is only the ordering tie-breaker within the batch and must
-not become an independently persisted resume position. A failed or
-interrupted page must be retried from its previous cursor. A page that
+smaller than one batch is invalid because the producer contract above forbids
+such an oversized batch. `seq_id` is only the ordering tie-breaker within the
+batch and must not become an independently persisted resume position. A failed
+or interrupted page must be retried from its previous cursor. A page that
 committed locally must never be replayed in a way that loses later local
 authority. A newly published event after the frozen target belongs to a later
 sync operation; the current operation must not chase a moving remote head.

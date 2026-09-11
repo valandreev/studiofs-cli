@@ -586,6 +586,10 @@ fn pg_sync_contract_contains_required_invariants() {
         "degraded read-only",
         "page boundary must never split",
         "last fully applied batch",
+        "producer must enforce the replay envelope",
+        "replay row limit",
+        "replay byte limit",
+        "SQL insert chunking inside one transaction is not a batch bound",
         "max_checkpoint_lag_versions",
         "single-flight",
         "coordination lease",
@@ -629,6 +633,29 @@ fn related_docs_link_to_canonical_pg_sync_contract() {
         missing_links.is_empty(),
         "SFS-695 canonical PostgreSQL sync contract links are missing from:\n{}",
         missing_links.join("\n")
+    );
+}
+
+#[test]
+fn configuration_docs_label_pg_sync_target_behavior() {
+    let configuration = read_workspace_file("docs/configuration.md");
+    let normalized_configuration = normalize_doc_whitespace(&configuration);
+    let required_terms = [
+        "Target behavior (SFS-695",
+        "runtime follow-ups SFS-696 through SFS-698",
+        "Current transitional behavior",
+        "does not yet return checkpoint/head versions",
+        "fresh-client authority state",
+    ];
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&configuration, &normalized_configuration, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "configuration docs must label SFS-695 behavior as transitional until runtime follow-ups land:\n{}",
+        missing.join("\n")
     );
 }
 

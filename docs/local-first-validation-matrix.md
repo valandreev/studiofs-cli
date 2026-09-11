@@ -28,6 +28,7 @@ not described ambiguously:
 ```powershell
 cargo test -p studiofs --test architecture_vocabulary_test pg_sync_contract_contains_required_invariants -- --nocapture
 cargo test -p studiofs --test architecture_vocabulary_test related_docs_link_to_canonical_pg_sync_contract -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test configuration_docs_label_pg_sync_target_behavior -- --nocapture
 cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_superseded_pg_startup_wording -- --nocapture
 ```
 
