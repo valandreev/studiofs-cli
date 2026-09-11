@@ -4,6 +4,10 @@ The canonical mounted-IO contract lives in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 This page summarizes the same architecture at system level.
 
+The canonical PostgreSQL lifecycle and replay contract lives in
+[pg-sync-contract.md](./pg-sync-contract.md). It separates local serving
+readiness, remote catch-up, and read/write authority.
+
 ## System Design
 
 StudioFS mounts S3-compatible object storage as a local-first filesystem with a
@@ -57,8 +61,11 @@ E2E validation.
 
 `PgMetaEngine` keeps a local metadata view and a replication path:
 
-- bootstrap loads the latest replicated checkpoint from `metadata_state`
-- steady-state sync exchanges ordered delta events through `event_log`
+- a valid local `redb` view becomes serving-ready before remote catch-up
+- a fresh client bootstraps from the latest published checkpoint in
+  `metadata_state`
+- bounded steady-state sync exchanges ordered delta pages through `event_log`
+  toward a frozen target version
 - local reads resolve against local `redb` only, then converge toward newer
   foreign state through invalidation and replay
 - crash recovery rebuilds pending local state from local metadata and
@@ -80,6 +87,15 @@ readable during that window, but older readers cannot consume the new envelope;
 the minimum reader version for new writes is therefore the SFS-639 build.
 
 Core invariants:
+- opening local metadata does not require replaying remote history
+- serving readiness, catch-up progress, and read/write authority are separate
+  lifecycle observations
+- fresh clients remain read-only until their frozen startup target and required
+  write authority are both available
+- checkpoint lag is governed by an explicit bounded policy
+- finite remote history is recovered through checkpoint rebootstrap or a
+  recoverable degraded read-only state
+- local-only destruction does not require PostgreSQL or S3
 - local `size` and local slices may be ahead of peer-visible replicated state
 - the writing mount keeps newer local state ahead of foreign replicated state
 - foreign apply updates replicated/base tables and must not clobber newer local
