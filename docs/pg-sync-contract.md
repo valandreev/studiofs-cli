@@ -3,9 +3,10 @@
 ## Status
 
 This document is the canonical PostgreSQL sync contract for SFS-695 and the
-follow-up implementation issues SFS-696, SFS-697, SFS-698, and SFS-721. It
-defines the behavior that the metadata, CLI, VFS, and cleanup implementations
-must preserve.
+follow-up implementation issues SFS-696, SFS-697, and SFS-698. The local-only
+destroy boundary from SFS-721 is already implemented on `main`; this document
+retains it as a shipped invariant that the cleanup implementation must
+preserve.
 
 This is a breaking on-disk/protocol change. Migration compatibility is not
 required for existing test disks. A client or test fixture must use the new
@@ -41,14 +42,26 @@ No caller may infer one of these states from another.
 | `serving checkpoint` | A serialized snapshot of remote-visible metadata: namespace, attributes, regular-file base graph, symlinks, xattrs, and ACL rules. |
 | `checkpoint_version` | The remote event-log version represented by a serving checkpoint. |
 | `remote head` | The monotonic `metadata_state.version` observed at one point in time. It can advance after the observation. |
-| `replay cursor` | The locally persisted position through the ordered remote event stream. The cursor advances only after the corresponding page has been applied locally. |
+| `replay cursor` | The scalar `batch_version` of the last fully applied remote batch. The cursor advances only after the corresponding complete page has been applied locally; `seq_id` orders rows within a batch but is not a separate persisted cursor component. |
 | `startup target` | One remote version captured for a client startup or catch-up operation. It is frozen for that operation and is not re-read as a moving completion target. |
 | `local-ready` | Local `redb` is open and its valid local serving view can answer foreground reads and metadata requests. |
 | `catching-up` | A background or explicit sync operation is applying remote checkpoint/delta state toward a frozen startup target. |
 | `target-reached` | The local replay cursor has reached the startup target for the current operation. This does not by itself grant write authority. |
+| `read-only authority` | The authority state that permits known safe local reads while rejecting new shared mutations until the write-authority gate succeeds. |
 | `write authority` | The independent capability to accept new shared mutations. It includes the required local allocator state and any PostgreSQL-backed authority registration. |
-| `degraded read-only` | A usable local serving view whose remote catch-up or write-authority precondition is not currently complete. |
+| `degraded read-only` | A health/authority combination used when a usable local serving view is operating with a remote catch-up or authority failure. It does not describe the normal healthy fresh-client phase that is intentionally read-only while catching up. |
 | `checkpoint lag` | The difference between the observed remote head and the checkpoint version used for bootstrap. |
+
+These dimensions remain separate even when an implementation exposes them in a
+single diagnostic record:
+
+- convergence is `catching-up` or `target-reached`;
+- authority is `read-only` or `read/write`;
+- health is `healthy` or `degraded(reason)`.
+
+A normal fresh bootstrap is therefore `local-ready + catching-up + healthy +
+read-only`; withholding write authority during that bounded phase is not by
+itself a degraded condition.
 
 ## Serving-First Mount Lifecycle
 
@@ -108,17 +121,22 @@ Catch-up applies the ordered event log after a checkpoint or the last local
 cursor. Each operation follows this sequence:
 
 1. Read the remote head once and record it as the frozen startup target.
-2. Read at most the configured page limit of event rows and bytes whose
+2. Read at most the configured page limit of complete event batches whose
    versions are greater than the cursor and no greater than the target.
-3. Apply that page in event order to local `redb`, preserving local overlay
-   authority and base/overlay conflict rules.
+3. Apply that page of complete batches in event order to local `redb`,
+   preserving local overlay authority and base/overlay conflict rules.
 4. Commit the local serving-state changes and replay cursor together.
 5. Repeat while the cursor is below the frozen target, subject to the per-run
    page, byte, operation-time, and cancellation bounds.
 
 The cursor is durable progress, not an optimistic remote acknowledgment. A
-failed or interrupted page must be retried from its previous cursor. A page
-that committed locally must never be replayed in a way that loses later local
+page boundary must never split a `batch_version` batch. The cursor advances to
+the last fully applied batch, so a page whose nominal row/byte budget would be
+smaller than one oversized batch must admit that complete batch rather than
+split it. `seq_id` is only the ordering tie-breaker within the batch and must
+not become an independently persisted resume position. A failed or
+interrupted page must be retried from its previous cursor. A page that
+committed locally must never be replayed in a way that loses later local
 authority. A newly published event after the frozen target belongs to a later
 sync operation; the current operation must not chase a moving remote head.
 
@@ -148,6 +166,14 @@ If checkpoint publication cannot maintain the configured lag bound, the system
 must report the checkpoint as stale/degraded and use one of the recoverable
 paths below. It must not silently claim a fresh bootstrap or make all local
 disks permanently unavailable.
+
+Checkpoint publication is volume-scoped and single-flight. Before performing
+the expensive checkpoint serialization, a publisher must acquire a bounded
+coordination lease or equivalent claim (for example, a PostgreSQL advisory
+transaction lock keyed by volume). A publisher that cannot acquire the claim
+must defer and report the attempt rather than serialize a duplicate checkpoint
+concurrently. A process-local replication mutex is not sufficient coordination
+across clients.
 
 ## Finite Remote History and Recovery
 
@@ -209,7 +235,8 @@ The implementation must distinguish at least these outcomes:
 - remote bootstrap unavailable before a checkpoint exists: discovery is not
   complete and may be retried;
 - remote catch-up unavailable after local state is valid: local serving remains
-  available, with `catching-up` or `degraded read-only` state;
+  available, health is degraded, and authority is reported separately from
+  `catching-up` progress;
 - startup target not reached: fresh-client writes remain rejected;
 - write authority unavailable: known local reads remain available while new
   mutations use the existing typed read-only error category;
@@ -231,12 +258,14 @@ The contract is intentionally defined before the runtime changes are complete:
   read/write authority lifecycle state.
 - SFS-698 removes remote catch-up from `PgMetaEngine` open and moves bounded
   replay behind local serving readiness.
-- SFS-721 enforces the local-only destroy boundary without PostgreSQL or S3.
+- SFS-721 already implements the local-only destroy boundary on `main`; future
+  changes must preserve that boundary without PostgreSQL or S3.
 
-Until those implementation issues land, existing startup code and some
-integration tests may still exercise the superseded synchronous path. This
-document is the target contract for that migration; it is not a claim that
-those follow-up runtime changes are already implemented.
+Until SFS-696, SFS-697, and SFS-698 land, existing startup code and some
+integration tests may still exercise the superseded synchronous path. SFS-721
+is already shipped on `main`. This document is the target contract for the
+remaining migration; it is not a claim that those remaining runtime changes
+are already implemented.
 
 ## Validation Boundary
 

@@ -28,13 +28,16 @@ The PostgreSQL lifecycle contract is documented in
 for serving-first mount, checkpoint-first bootstrap, bounded/paged/resumable
 catch-up, frozen startup targets, read/write authority, checkpoint lag,
 finite-history recovery, and local-only destruction. It does not claim live
-PostgreSQL or mounted runtime behavior; those checks belong to SFS-696 through
-SFS-698 and SFS-721.
+PostgreSQL or mounted runtime behavior; the remaining startup/sync checks
+belong to SFS-696 through SFS-698. The local-only destruction boundary is
+already implemented by SFS-721 and should retain its focused coverage.
 
-Run the focused contract test:
+Run the three focused contract checks:
 
 ```powershell
-cargo test -p studiofs --test architecture_vocabulary_test pg_sync_contract_covers_sfs695_invariants -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test pg_sync_contract_contains_required_invariants -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test related_docs_link_to_canonical_pg_sync_contract -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_superseded_pg_startup_wording -- --nocapture
 ```
 
 ---
