@@ -573,7 +573,11 @@ impl PgMetaEngine {
 
         self.local
             .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
-        self.refresh_pg_sync_lifecycle_for_allocator();
+        if self.allocator_runtime_state_missing() {
+            self.bootstrap_allocator_state();
+        } else {
+            self.refresh_pg_sync_lifecycle_for_allocator();
+        }
         Ok(())
     }
 

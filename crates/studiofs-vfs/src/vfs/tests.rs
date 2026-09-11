@@ -19909,6 +19909,26 @@ fn sync_status_reports_effective_read_only_mount_authority() {
         MetadataAuthorityStatus::read_only(),
         "public VFS sync status must include the read-only mount override"
     );
+    let set_error = vfs
+        .set_acl_rule(ROOT_INO, "review-principal", AccessLevel::ReadOnly)
+        .expect_err("read-only mount must block ACL insertion");
+    assert!(matches!(
+        set_error,
+        VfsError::Meta(MetaError::AccessDenied {
+            actual: AccessLevel::ReadOnly,
+            ..
+        })
+    ));
+    let remove_error = vfs
+        .remove_acl_rule(ROOT_INO, "review-principal")
+        .expect_err("read-only mount must block ACL removal");
+    assert!(matches!(
+        remove_error,
+        VfsError::Meta(MetaError::AccessDenied {
+            actual: AccessLevel::ReadOnly,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -19944,11 +19964,47 @@ fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
             ),
             "unexpected {lifecycle:?} mutation error: {create_error}"
         );
+
+        let acl_set_error = vfs
+            .set_acl_rule(attr.ino, "review-principal", AccessLevel::ReadOnly)
+            .expect_err("read-safe lifecycle must block ACL insertion");
+        assert!(matches!(
+            acl_set_error,
+            VfsError::Meta(MetaError::AccessDenied {
+                actual: AccessLevel::ReadOnly,
+                ..
+            })
+        ));
+        let acl_remove_error = vfs
+            .remove_acl_rule(attr.ino, "review-principal")
+            .expect_err("read-safe lifecycle must block ACL removal");
+        assert!(matches!(
+            acl_remove_error,
+            VfsError::Meta(MetaError::AccessDenied {
+                actual: AccessLevel::ReadOnly,
+                ..
+            })
+        ));
     }
 
+    vfs.set_pg_sync_lifecycle_for_test(Some(PgSyncLifecycle::Live));
     vfs.set_acl_rule(ROOT_INO, "*", AccessLevel::NoAccess)
         .expect("set root ACL before fatal lifecycle check");
     vfs.set_pg_sync_lifecycle_for_test(Some(PgSyncLifecycle::Fatal));
+    let fatal_acl_set_error = vfs
+        .set_acl_rule(attr.ino, "review-principal", AccessLevel::ReadOnly)
+        .expect_err("fatal lifecycle must block ACL insertion");
+    assert!(matches!(
+        fatal_acl_set_error,
+        VfsError::Meta(MetaError::LifecycleFatal)
+    ));
+    let fatal_acl_remove_error = vfs
+        .remove_acl_rule(attr.ino, "review-principal")
+        .expect_err("fatal lifecycle must block ACL removal");
+    assert!(matches!(
+        fatal_acl_remove_error,
+        VfsError::Meta(MetaError::LifecycleFatal)
+    ));
     let fatal_readdir_error = vfs
         .readdir(ROOT_INO)
         .expect_err("fatal metadata lifecycle must precede ACL early returns");

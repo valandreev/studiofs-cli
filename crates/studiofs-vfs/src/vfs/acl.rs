@@ -264,6 +264,8 @@ impl StudioVfs {
         principal: &str,
         access_level: AccessLevel,
     ) -> VfsResult<()> {
+        self.enforce_metadata_serving_lifecycle()?;
+        self.enforce_metadata_mutation_authority(ino)?;
         let meta = self.sync_meta();
         meta.set_acl_rule(ino, principal, access_level)?;
         self.bump_acl_epoch();
@@ -273,6 +275,8 @@ impl StudioVfs {
 
     /// Removes an ACL rule for an inode and principal.
     pub fn remove_acl_rule(&self, ino: Ino, principal: &str) -> VfsResult<()> {
+        self.enforce_metadata_serving_lifecycle()?;
+        self.enforce_metadata_mutation_authority(ino)?;
         let meta = self.sync_meta();
         meta.remove_acl_rule(ino, principal)?;
         self.bump_acl_epoch();

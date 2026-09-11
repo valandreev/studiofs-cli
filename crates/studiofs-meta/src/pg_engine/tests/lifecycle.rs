@@ -660,6 +660,36 @@ fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
 }
 
 #[test]
+fn degraded_fresh_client_rehydrates_allocator_runtime_before_restoring_write_authority() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.clear_allocator_runtime_for_test();
+    engine
+        .inode_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .object_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_degraded_fresh_client_sync()
+        .expect("complete degraded fresh-client sync");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(engine.allocator_runtime_available_for_test());
+}
+
+#[test]
 fn degraded_fresh_client_without_client_slot_stays_degraded_at_remote_head() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine

@@ -208,6 +208,33 @@ impl PgMetaEngine {
         self.refresh_pg_sync_lifecycle_for_allocator();
     }
 
+    pub(super) fn allocator_runtime_state_missing(&self) -> bool {
+        self.allocator_runtime
+            .lock()
+            .map(|runtime| runtime.state.is_none())
+            .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_allocator_runtime_for_test(&self) {
+        let mut runtime = self
+            .allocator_runtime
+            .lock()
+            .expect("allocator runtime lock");
+        runtime.state = None;
+        runtime.inode_batch = 0..0;
+        runtime.payload_batch = 0..0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn allocator_runtime_available_for_test(&self) -> bool {
+        self.allocator_runtime
+            .lock()
+            .expect("allocator runtime lock")
+            .state
+            .is_some()
+    }
+
     fn take_from_batch<T>(
         runtime: &mut AllocatorRuntime,
         count: u64,
