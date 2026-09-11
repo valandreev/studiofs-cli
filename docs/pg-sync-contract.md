@@ -77,7 +77,9 @@ Its `PgSyncLifecycle` reports the local serving/synchronization phase, while
 the embedded `MetadataAuthorityStatus` reports paired inode/object allocator
 headroom. Only `Live` grants lifecycle mutation permission, and the final
 mutation decision requires both lifecycle permission and both allocator
-headroom flags. `discover` persists a local `pgFreshClientPending` marker while
+headroom flags. `Fatal` means the local serving view is unsafe; foreground VFS
+access is rejected in that state. `discover` persists a local
+`pgFreshClientPending` marker while
 the fresh-client startup gate is unresolved; a successful startup catch-up
 clears that marker. The marker is local state and is preserved by serving
 checkpoint import, so a failed fresh bootstrap remains recoverable and

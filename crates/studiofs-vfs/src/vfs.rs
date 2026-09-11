@@ -7460,34 +7460,27 @@ impl StudioVfs {
         let mut status = self.meta.sync_view().pg_sync_status();
         if self.read_only_mount {
             status.authority = MetadataAuthorityStatus::read_only();
-        } else {
-            let authority_override = {
-                #[cfg(test)]
-                {
-                    *self.metadata_authority_override.lock()
-                }
-                #[cfg(not(test))]
-                {
-                    None
-                }
-            };
-            if let Some(authority_override) = authority_override {
-                status.authority = authority_override;
-            } else if self
-                .state
-                .namespace
-                .deferred
-                .degraded
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                status.authority = MetadataAuthorityStatus::read_only();
-            }
+        }
+        #[cfg(test)]
+        if !self.read_only_mount
+            && let Some(authority_override) = *self.metadata_authority_override.lock()
+        {
+            status.authority = authority_override;
         }
         #[cfg(test)]
         if let Some(lifecycle_override) = *self.metadata_sync_lifecycle_override.lock() {
             status.lifecycle = lifecycle_override;
         }
         status
+    }
+
+    pub(super) fn enforce_metadata_serving_lifecycle(&self) -> VfsResult<()> {
+        if self.metadata_sync_status().lifecycle.allows_reads() {
+            return Ok(());
+        }
+        Err(VfsError::Meta(MetaError::Storage(
+            "metadata serving lifecycle is fatal".to_string(),
+        )))
     }
 
     /// Ensure current metadata authority allows mutating operations for an inode.

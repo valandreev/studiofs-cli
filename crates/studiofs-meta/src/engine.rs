@@ -334,23 +334,23 @@ pub enum PgSyncLifecycle {
     /// The local serving view is open and safe for reads, but startup gates
     /// have not yet granted lifecycle write permission.
     #[default]
-    LocalReady,
+    LocalReady = 0,
     /// Remote checkpoint or event-log state is being applied toward a frozen
     /// startup target.
-    CatchingUp,
+    CatchingUp = 1,
     /// The current startup target has been reached; allocator authority is
     /// still evaluated independently.
-    TargetReached,
+    TargetReached = 2,
     /// The target is complete but the paired local allocator authority is not
     /// currently available.
-    AllocatorPending,
+    AllocatorPending = 3,
     /// The local view and lifecycle gates permit normal operation.
-    Live,
+    Live = 4,
     /// The local view remains usable for reads, but a recoverable sync or
     /// authority failure requires read-only operation.
-    Degraded,
+    Degraded = 5,
     /// The local serving view cannot be used safely.
-    Fatal,
+    Fatal = 6,
 }
 
 impl PgSyncLifecycle {
@@ -393,15 +393,7 @@ impl PgSyncLifecycle {
             }
             Self::AllocatorPending => matches!(next, Self::Live | Self::Degraded | Self::Fatal),
             Self::Live => matches!(next, Self::AllocatorPending | Self::Degraded | Self::Fatal),
-            Self::Degraded => matches!(
-                next,
-                Self::LocalReady
-                    | Self::CatchingUp
-                    | Self::TargetReached
-                    | Self::AllocatorPending
-                    | Self::Live
-                    | Self::Fatal
-            ),
+            Self::Degraded => matches!(next, Self::LocalReady | Self::CatchingUp | Self::Fatal),
             Self::Fatal => false,
         }
     }
@@ -1312,6 +1304,9 @@ mod tests {
         assert!(PgSyncLifecycle::Fatal.can_transition_to(PgSyncLifecycle::Fatal));
         assert!(!PgSyncLifecycle::Fatal.can_transition_to(PgSyncLifecycle::Live));
         assert!(!PgSyncLifecycle::CatchingUp.can_transition_to(PgSyncLifecycle::Live));
+        assert!(!PgSyncLifecycle::Degraded.can_transition_to(PgSyncLifecycle::TargetReached));
+        assert!(!PgSyncLifecycle::Degraded.can_transition_to(PgSyncLifecycle::AllocatorPending));
+        assert!(!PgSyncLifecycle::Degraded.can_transition_to(PgSyncLifecycle::Live));
     }
 
     #[test]

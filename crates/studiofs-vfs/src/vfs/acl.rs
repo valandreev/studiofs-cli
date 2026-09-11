@@ -183,6 +183,7 @@ impl StudioVfs {
             target: "studiofs_vfs::metadata_baseline::acl_check",
             "VFS ACL check"
         );
+        self.enforce_metadata_serving_lifecycle()?;
         self.enforce_snapshot_mount_fence(ino)?;
         let actual = self.effective_access_level(ino)?;
         if Self::access_satisfies(actual, required) {
@@ -212,6 +213,7 @@ impl StudioVfs {
             target: "studiofs_vfs::metadata_baseline::acl_check",
             "VFS ACL check"
         );
+        self.enforce_metadata_serving_lifecycle()?;
         self.enforce_snapshot_mount_fence(ino)?;
         if let Some(actual) = self.effective_access_level_cached(ino) {
             if Self::access_satisfies(actual, required) {

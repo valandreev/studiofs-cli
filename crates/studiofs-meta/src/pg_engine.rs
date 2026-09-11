@@ -464,7 +464,14 @@ impl PgMetaEngine {
             }
             value if value == PgSyncLifecycle::Live as u8 => PgSyncLifecycle::Live,
             value if value == PgSyncLifecycle::Degraded as u8 => PgSyncLifecycle::Degraded,
-            _ => PgSyncLifecycle::Fatal,
+            value if value == PgSyncLifecycle::Fatal as u8 => PgSyncLifecycle::Fatal,
+            value => {
+                warn!(
+                    raw_lifecycle = value,
+                    "invalid pg sync lifecycle value; treating it as fatal"
+                );
+                PgSyncLifecycle::Fatal
+            }
         }
     }
 
@@ -472,10 +479,14 @@ impl PgMetaEngine {
         Self::pg_sync_lifecycle_from_raw(self.pg_sync_lifecycle.load(Ordering::Acquire))
     }
 
-    pub(super) fn transition_pg_sync_lifecycle(&self, next: PgSyncLifecycle) {
+    fn update_pg_sync_lifecycle(
+        &self,
+        next_for_current: impl Fn(PgSyncLifecycle) -> PgSyncLifecycle,
+    ) {
         loop {
             let current_raw = self.pg_sync_lifecycle.load(Ordering::Acquire);
             let current = Self::pg_sync_lifecycle_from_raw(current_raw);
+            let next = next_for_current(current);
             if current == next {
                 return;
             }
@@ -498,19 +509,23 @@ impl PgMetaEngine {
         }
     }
 
+    pub(super) fn transition_pg_sync_lifecycle(&self, next: PgSyncLifecycle) {
+        self.update_pg_sync_lifecycle(|_| next);
+    }
+
     pub(super) fn refresh_pg_sync_lifecycle_for_allocator(&self) {
-        let current = self.current_pg_sync_lifecycle();
-        let authority_available = self.metadata_authority_status().allows_new_mutations();
-        let next = match (current, authority_available) {
-            (PgSyncLifecycle::LocalReady, true)
-            | (PgSyncLifecycle::TargetReached, true)
-            | (PgSyncLifecycle::AllocatorPending, true) => PgSyncLifecycle::Live,
-            (PgSyncLifecycle::LocalReady, false)
-            | (PgSyncLifecycle::TargetReached, false)
-            | (PgSyncLifecycle::Live, false) => PgSyncLifecycle::AllocatorPending,
-            (lifecycle, _) => lifecycle,
-        };
-        self.transition_pg_sync_lifecycle(next);
+        self.update_pg_sync_lifecycle(|current| {
+            let authority_available = self.metadata_authority_status().allows_new_mutations();
+            match (current, authority_available) {
+                (PgSyncLifecycle::LocalReady, true)
+                | (PgSyncLifecycle::TargetReached, true)
+                | (PgSyncLifecycle::AllocatorPending, true) => PgSyncLifecycle::Live,
+                (PgSyncLifecycle::LocalReady, false)
+                | (PgSyncLifecycle::TargetReached, false)
+                | (PgSyncLifecycle::Live, false) => PgSyncLifecycle::AllocatorPending,
+                (lifecycle, _) => lifecycle,
+            }
+        });
     }
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {

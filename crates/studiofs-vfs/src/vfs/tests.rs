@@ -19901,7 +19901,7 @@ fn sfs623_read_only_allocator_blocks_new_mutations_but_keeps_reads_open() {
 #[test]
 fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "pg-sync-catching-up");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "pg-sync-catching-up");
     let attr = vfs
         .create(ROOT_INO, b"pg-sync-catching-up.txt", 0, 0, 0o644)
         .expect("create file before catch-up starts");
@@ -19924,5 +19924,30 @@ fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
             })
         ),
         "unexpected catch-up mutation error: {create_error}"
+    );
+
+    vfs.set_pg_sync_lifecycle_for_test(Some(PgSyncLifecycle::Fatal));
+    let fatal_read_error = vfs
+        .getattr(attr.ino)
+        .expect_err("fatal metadata lifecycle must block local reads");
+    assert!(
+        matches!(
+            &fatal_read_error,
+            VfsError::Meta(MetaError::Storage(message))
+                if message == "metadata serving lifecycle is fatal"
+        ),
+        "unexpected fatal lifecycle read error: {fatal_read_error}"
+    );
+    let mut buffer = [0_u8; 1];
+    let fatal_async_read_error = rt
+        .block_on(vfs.read_into(attr.ino, 0, &mut buffer))
+        .expect_err("fatal metadata lifecycle must block async local reads");
+    assert!(
+        matches!(
+            &fatal_async_read_error,
+            VfsError::Meta(MetaError::Storage(message))
+                if message == "metadata serving lifecycle is fatal"
+        ),
+        "unexpected fatal lifecycle async read error: {fatal_async_read_error}"
     );
 }
