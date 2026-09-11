@@ -806,6 +806,9 @@ fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
         .metadata_remote_head_version
         .store(7, std::sync::atomic::Ordering::Release);
     engine
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
         .try_complete_catchup_sync()
         .expect("complete degraded fresh-client sync");
 
@@ -836,6 +839,9 @@ fn catching_up_client_reaches_live_after_sync_reaches_remote_head() {
     engine
         .metadata_remote_head_version
         .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
 
     engine
         .try_complete_catchup_sync()
@@ -843,6 +849,30 @@ fn catching_up_client_reaches_live_after_sync_reaches_remote_head() {
 
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
     assert!(engine.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
+fn catchup_completion_uses_frozen_startup_target() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(9, std::sync::atomic::Ordering::Release);
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("complete catch-up at the frozen startup target");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
 }
 
 #[test]
@@ -857,6 +887,9 @@ fn concurrent_catchup_completion_preserves_live_lifecycle() {
         .store(7, std::sync::atomic::Ordering::Release);
     engine
         .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
         .store(7, std::sync::atomic::Ordering::Release);
     let engine = std::sync::Arc::new(engine);
 
@@ -892,6 +925,9 @@ fn catching_up_fresh_client_completes_slot_and_allocator_bootstrap() {
         .store(7, std::sync::atomic::Ordering::Release);
     engine
         .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
         .store(7, std::sync::atomic::Ordering::Release);
 
     engine
@@ -942,6 +978,9 @@ fn degraded_fresh_client_rehydrates_allocator_runtime_before_restoring_write_aut
     engine
         .metadata_remote_head_version
         .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
 
     engine
         .try_complete_catchup_sync()
@@ -968,6 +1007,9 @@ fn degraded_fresh_client_without_client_slot_stays_degraded_at_remote_head() {
         .store(7, std::sync::atomic::Ordering::Release);
     engine
         .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
         .store(7, std::sync::atomic::Ordering::Release);
 
     assert!(
@@ -1009,6 +1051,9 @@ fn catching_up_fresh_client_slot_failure_becomes_degraded() {
     engine
         .metadata_remote_head_version
         .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
 
     assert!(engine.try_complete_catchup_sync().is_err());
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
@@ -1027,6 +1072,9 @@ fn degraded_fresh_client_stays_degraded_until_remote_head_is_reached() {
         .store(7, std::sync::atomic::Ordering::Release);
     engine
         .metadata_remote_head_version
+        .store(8, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
         .store(8, std::sync::atomic::Ordering::Release);
 
     engine
@@ -1059,6 +1107,9 @@ fn degraded_fresh_client_recovers_to_allocator_pending_without_write_authority()
         .store(7, std::sync::atomic::Ordering::Release);
     engine
         .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
         .store(7, std::sync::atomic::Ordering::Release);
 
     engine

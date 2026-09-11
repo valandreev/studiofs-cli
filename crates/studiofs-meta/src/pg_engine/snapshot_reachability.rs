@@ -495,6 +495,19 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
+                        let version: i64 = tx
+                            .query_one(
+                                "SELECT version FROM metadata_state WHERE vol = $1 FOR UPDATE",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap version query failed",
+                                    error,
+                                )
+                            })?
+                            .get(0);
                         let initialized = tx
                             .query_opt(
                                 "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",
@@ -535,20 +548,6 @@ impl PgMetaEngine {
                                     .to_owned(),
                             ));
                         }
-
-                        let version: i64 = tx
-                            .query_one(
-                                "SELECT version FROM metadata_state WHERE vol = $1 FOR UPDATE",
-                                &[&volume_id],
-                            )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot reachability bootstrap version query failed",
-                                    error,
-                                )
-                            })?
-                            .get(0);
 
                         let local_version_before = checked_i64(
                             local.get_counter(LOCAL_PG_VERSION_COUNTER)?,

@@ -229,6 +229,8 @@ pub struct PgMetaEngine {
     metadata_last_successful_sync_unix_ms: AtomicI64,
     /// Last remote metadata head observed by a bounded command query.
     metadata_remote_head_version: AtomicI64,
+    /// Frozen remote metadata head for the current startup/catch-up operation.
+    metadata_startup_target_version: AtomicI64,
     /// Whether snapshot reachability bootstrap completed for this engine.
     snapshot_reachability_bootstrapped: AtomicBool,
     snapshot_reachability_bootstrap_lock: Mutex<()>,
@@ -534,8 +536,8 @@ impl PgMetaEngine {
         });
     }
 
-    /// Complete local catch-up after a successful sync has reached the most
-    /// recently observed remote head.
+    /// Complete local catch-up after a successful sync has reached the frozen
+    /// startup target.
     pub(super) fn try_complete_catchup_sync(&self) -> MetaResult<()> {
         let current = self.current_pg_sync_lifecycle();
         if !matches!(
@@ -546,8 +548,8 @@ impl PgMetaEngine {
         }
 
         let local_version = self.local_version.load(Ordering::Acquire);
-        let remote_head = self.metadata_remote_head_version.load(Ordering::Acquire);
-        if remote_head < 0 || local_version < remote_head {
+        let startup_target = self.metadata_startup_target_version.load(Ordering::Acquire);
+        if startup_target < 0 || local_version < startup_target {
             return Ok(());
         }
 
@@ -999,6 +1001,7 @@ impl PgMetaEngine {
             metadata_sync_errors: AtomicU64::new(0),
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             metadata_remote_head_version: AtomicI64::new(-1),
+            metadata_startup_target_version: AtomicI64::new(-1),
             snapshot_reachability_bootstrapped: AtomicBool::new(false),
             snapshot_reachability_bootstrap_lock: Mutex::new(()),
             metadata_source_connected: AtomicBool::new(false),
@@ -1050,6 +1053,15 @@ impl PgMetaEngine {
                 engine
                     .metadata_remote_head_version
                     .store(remote_head, Ordering::Release);
+                if fresh_client_pending
+                    || repair_local_graph_recovery_pending
+                    || !startup_bootstrap_succeeded
+                    || engine.local_version.load(Ordering::Acquire) < remote_head
+                {
+                    engine
+                        .metadata_startup_target_version
+                        .store(remote_head, Ordering::Release);
+                }
                 if engine.local_version.load(Ordering::Acquire) < remote_head {
                     engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                 }

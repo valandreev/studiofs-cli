@@ -230,6 +230,9 @@ fn bootstrap_defers_while_a_snapshot_is_creating() {
         },
     )
     .expect("open postgres engine");
+    engine
+        .sync_metadata()
+        .expect("metadata sync must remain available while reachability bootstrap is deferred");
     let error = engine
         .get_global_snapshot_pins()
         .expect_err("janitor pins must stay unavailable until bootstrap completes");

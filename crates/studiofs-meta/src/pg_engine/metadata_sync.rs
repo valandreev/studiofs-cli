@@ -3,7 +3,7 @@
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle};
 use crate::types::FileType;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -86,6 +86,17 @@ impl PgMetaEngine {
             let remote_head = self.remote_metadata_head_version()?;
             self.metadata_remote_head_version
                 .store(remote_head, Ordering::Release);
+            if matches!(
+                self.current_pg_sync_lifecycle(),
+                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+            ) {
+                let _ = self.metadata_startup_target_version.compare_exchange(
+                    -1,
+                    remote_head,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
             Ok(changed)
         })();
         self.record_metadata_sync_result(source, &result);
