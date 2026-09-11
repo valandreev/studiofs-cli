@@ -1,9 +1,10 @@
 #[cfg(test)]
 use crate::engine::{
-    MetaEngineCore, MetaFsOps, MetaGc, MetaNamespace, MetaPayloadObjects, MetaReplication,
-    MetaSymlink, MetaXattr,
+    MetaEngineCore, MetaFsOps, MetaGc, MetaNamespace, MetaPayloadObjects, MetaSymlink, MetaXattr,
 };
-use crate::engine::{MetaError, MetaFormat, MetaInodes, MetaResult};
+use crate::engine::{
+    MetaError, MetaFormat, MetaInodes, MetaReplication, MetaResult, PgSyncLifecycle,
+};
 #[cfg(test)]
 use crate::events::MetaEvent;
 use crate::pg_transport::connect_studiofs_postgres;
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -104,6 +105,7 @@ const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
 pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =
     "pgRedbRepairLocalGraphRecoveryPending";
+pub(crate) const LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER: &str = "pgFreshClientPending";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER: &str = "pgInodeActiveRangeStart";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER: &str = "pgInodeActiveRangeEnd";
 const LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER: &str = "pgInodeReservedRangeEnd";
@@ -135,6 +137,7 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
         LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER
             | LOCAL_PG_CLIENT_SLOT_COUNTER
             | LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER
+            | LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER
             | LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER
@@ -208,6 +211,7 @@ pub struct PgMetaEngine {
     allocator_refill_lock: Mutex<()>,
     inode_id_headroom_available: AtomicBool,
     object_id_headroom_available: AtomicBool,
+    pg_sync_lifecycle: AtomicU8,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
@@ -324,6 +328,9 @@ impl PgSnapshotBackend {
 pub struct PgOpenOptions {
     /// Whether to start background polling and lock-worker threads immediately.
     pub background_poll: bool,
+    /// Whether this open belongs to the checkpoint-first bootstrap of a newly
+    /// discovered client.
+    pub fresh_client: bool,
     /// Maximum number of PostgreSQL command connections for this client.
     /// Values above the runtime semaphore capacity are rejected.
     /// `STUDIOFS_PG_POOL_SIZE` overrides this value when set.
@@ -334,6 +341,7 @@ impl Default for PgOpenOptions {
     fn default() -> Self {
         Self {
             background_poll: true,
+            fresh_client: false,
             pg_pool_size: DEFAULT_PG_POOL_SIZE,
         }
     }
@@ -443,6 +451,67 @@ impl PgMetaEngine {
     const METADATA_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
     const METADATA_NOTIFY_RECONNECT_MIN_DELAY_MS: u64 = 250;
     const METADATA_NOTIFY_RECONNECT_MAX_DELAY_MS: u64 = 5_000;
+
+    fn pg_sync_lifecycle_from_raw(value: u8) -> PgSyncLifecycle {
+        match value {
+            value if value == PgSyncLifecycle::LocalReady as u8 => PgSyncLifecycle::LocalReady,
+            value if value == PgSyncLifecycle::CatchingUp as u8 => PgSyncLifecycle::CatchingUp,
+            value if value == PgSyncLifecycle::TargetReached as u8 => {
+                PgSyncLifecycle::TargetReached
+            }
+            value if value == PgSyncLifecycle::AllocatorPending as u8 => {
+                PgSyncLifecycle::AllocatorPending
+            }
+            value if value == PgSyncLifecycle::Live as u8 => PgSyncLifecycle::Live,
+            value if value == PgSyncLifecycle::Degraded as u8 => PgSyncLifecycle::Degraded,
+            _ => PgSyncLifecycle::Fatal,
+        }
+    }
+
+    fn current_pg_sync_lifecycle(&self) -> PgSyncLifecycle {
+        Self::pg_sync_lifecycle_from_raw(self.pg_sync_lifecycle.load(Ordering::Acquire))
+    }
+
+    pub(super) fn transition_pg_sync_lifecycle(&self, next: PgSyncLifecycle) {
+        loop {
+            let current_raw = self.pg_sync_lifecycle.load(Ordering::Acquire);
+            let current = Self::pg_sync_lifecycle_from_raw(current_raw);
+            if current == next {
+                return;
+            }
+            if let Err(error) = current.transition_to(next) {
+                warn!(
+                    from = ?error.from,
+                    to = ?error.to,
+                    volume_id = self.volume_id,
+                    "invalid pg sync lifecycle transition"
+                );
+                return;
+            }
+            if self
+                .pg_sync_lifecycle
+                .compare_exchange(current_raw, next as u8, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    pub(super) fn refresh_pg_sync_lifecycle_for_allocator(&self) {
+        let current = self.current_pg_sync_lifecycle();
+        let authority_available = self.metadata_authority_status().allows_new_mutations();
+        let next = match (current, authority_available) {
+            (PgSyncLifecycle::LocalReady, true)
+            | (PgSyncLifecycle::TargetReached, true)
+            | (PgSyncLifecycle::AllocatorPending, true) => PgSyncLifecycle::Live,
+            (PgSyncLifecycle::LocalReady, false)
+            | (PgSyncLifecycle::TargetReached, false)
+            | (PgSyncLifecycle::Live, false) => PgSyncLifecycle::AllocatorPending,
+            (lifecycle, _) => lifecycle,
+        };
+        self.transition_pg_sync_lifecycle(next);
+    }
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
         Duration::from_millis(
@@ -729,6 +798,10 @@ impl PgMetaEngine {
                 "metadata.postgres.url must not be empty".to_string(),
             ));
         }
+        if options.fresh_client {
+            local.set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
+        }
+        let fresh_client_pending = local.get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)? != 0;
         let pool_size = resolve_pg_pool_size(options.pg_pool_size)?;
 
         let poll_secs = pg_env_var("STUDIOFS_PG_SYNC_POLL_SECS")
@@ -784,6 +857,11 @@ impl PgMetaEngine {
             } else {
                 restored_flushed_event_seq
             };
+        let startup_snapshot_import_mode = if repair_local_graph_recovery_pending {
+            None
+        } else {
+            Self::startup_snapshot_import_mode(&local, restored_local_version)?
+        };
         let metadata_invalidation_notify = Arc::clone(&local.invalidation_notify);
         let engine = Arc::new(Self {
             local,
@@ -815,6 +893,7 @@ impl PgMetaEngine {
             allocator_refill_lock: Mutex::new(()),
             inode_id_headroom_available: AtomicBool::new(false),
             object_id_headroom_available: AtomicBool::new(false),
+            pg_sync_lifecycle: AtomicU8::new(PgSyncLifecycle::LocalReady as u8),
             janitor_lock: Mutex::new(None),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
@@ -836,6 +915,10 @@ impl PgMetaEngine {
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 
+        if repair_local_graph_recovery_pending || fresh_client_pending {
+            engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+        }
+
         // CONTEXT(SFS-698): Transitional startup path. SFS-695 defines local
         // serving readiness before remote replay; SFS-698 will move this
         // bootstrap/catch-up work behind that boundary.
@@ -855,8 +938,7 @@ impl PgMetaEngine {
             // transitional startup path fast-forwards from the latest remote
             // checkpoint. The canonical lifecycle is documented in
             // `docs/pg-sync-contract.md`.
-            if let Some(import_mode) =
-                Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?
+            if let Some(import_mode) = startup_snapshot_import_mode
                 && let Err(error) = engine.pull_snapshot_locked(import_mode)
             {
                 warn!(
@@ -874,6 +956,19 @@ impl PgMetaEngine {
                 true
             };
             engine.restore_pending_state_from_local_log()?;
+        }
+        if repair_local_graph_recovery_pending && metadata_sync_succeeded {
+            engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
+        }
+        if fresh_client_pending {
+            if metadata_sync_succeeded {
+                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
+                engine
+                    .local
+                    .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
+            } else {
+                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+            }
         }
         if metadata_sync_succeeded && let Err(error) = engine.backfill_current_reference_ledger() {
             warn!(

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::Duration;
 use studiofs_cache::CachedStoreWriterConfig;
-use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::engine::{MetaEngineCore, MetaInodes, MetaPayloadObjects};
+use studiofs_meta::engine::{MetadataAuthorityStatus, PgSyncLifecycle};
 use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, InodeLifecycleState,
     MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
@@ -19895,5 +19895,34 @@ fn sfs623_read_only_allocator_blocks_new_mutations_but_keeps_reads_open() {
             }))
         ),
         "new namespace mutations should stop once metadata authority degrades to read-only"
+    );
+}
+
+#[test]
+fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "pg-sync-catching-up");
+    let attr = vfs
+        .create(ROOT_INO, b"pg-sync-catching-up.txt", 0, 0, 0o644)
+        .expect("create file before catch-up starts");
+
+    vfs.set_pg_sync_lifecycle_for_test(Some(PgSyncLifecycle::CatchingUp));
+
+    assert!(
+        vfs.getattr(attr.ino).is_ok(),
+        "known local metadata must remain readable while catch-up is active"
+    );
+    let create_error = vfs
+        .create(ROOT_INO, b"blocked-during-pg-catch-up.txt", 0, 0, 0o644)
+        .expect_err("fresh-client mutations must wait for PG catch-up");
+    assert!(
+        matches!(
+            create_error,
+            VfsError::Meta(MetaError::AccessDenied {
+                actual: AccessLevel::ReadOnly,
+                ..
+            })
+        ),
+        "unexpected catch-up mutation error: {create_error}"
     );
 }

@@ -190,6 +190,7 @@ impl PgMetaEngine {
                 );
             }
         }
+        self.refresh_pg_sync_lifecycle_for_allocator();
     }
 
     fn take_from_batch<T>(
@@ -314,6 +315,7 @@ impl PgMetaEngine {
                     self.object_id_headroom_available
                         .store(false, Ordering::Release);
                 }
+                self.refresh_pg_sync_lifecycle_for_allocator();
                 warn!(
                     error = %error,
                     volume_id = self.volume_id,
@@ -347,6 +349,7 @@ impl PgMetaEngine {
                 self.object_id_headroom_available
                     .store(false, Ordering::Release);
             }
+            self.refresh_pg_sync_lifecycle_for_allocator();
         }
 
         let mut runtime = self

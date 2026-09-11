@@ -47,7 +47,8 @@ pub use engine::{
     MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects,
     MetaRecovery, MetaReplication, MetaResult, MetaSymlink, MetaXattr,
     MetadataBatchWriteObservability, MetadataCoherenceProgress, MetadataWriteObservability,
-    MetadataWriteStageTiming, NamespaceMutation, RegularFileOverlayMutation,
+    MetadataWriteStageTiming, NamespaceMutation, PgSyncLifecycle, PgSyncLifecycleTransitionError,
+    PgSyncStatus, RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{
@@ -142,6 +143,9 @@ pub fn open_read_only_snapshot_meta(
 pub struct MetaOpenOptions {
     /// Whether remote-backed engines may start background polling workers.
     pub background_poll: bool,
+    /// Whether this open is the checkpoint-first bootstrap of a newly
+    /// discovered client.
+    pub fresh_client: bool,
     /// Maximum number of PostgreSQL command connections for this client.
     /// Values above the runtime semaphore capacity are rejected.
     /// `STUDIOFS_PG_POOL_SIZE` overrides this value when set.
@@ -152,6 +156,7 @@ impl Default for MetaOpenOptions {
     fn default() -> Self {
         Self {
             background_poll: true,
+            fresh_client: false,
             pg_pool_size: DEFAULT_PG_POOL_SIZE,
         }
     }
@@ -205,6 +210,7 @@ pub fn open_meta_engine_with_options(
                 path,
                 PgOpenOptions {
                     background_poll: options.background_poll,
+                    fresh_client: options.fresh_client,
                     pg_pool_size: options.pg_pool_size,
                 },
             )?;
@@ -260,6 +266,7 @@ pub fn open_meta_engine_with_options(
                     path,
                     PgOpenOptions {
                         background_poll: options.background_poll,
+                        fresh_client: options.fresh_client,
                         pg_pool_size: options.pg_pool_size,
                     },
                 )?;

@@ -72,6 +72,17 @@ A normal fresh bootstrap is therefore `local-ready + catching-up + healthy +
 read-only`; withholding write authority during that bounded phase is not by
 itself a degraded condition.
 
+The runtime exposes this contract through `MetaReplication::pg_sync_status()`.
+Its `PgSyncLifecycle` reports the local serving/synchronization phase, while
+the embedded `MetadataAuthorityStatus` reports paired inode/object allocator
+headroom. Only `Live` grants lifecycle mutation permission, and the final
+mutation decision requires both lifecycle permission and both allocator
+headroom flags. `discover` persists a local `pgFreshClientPending` marker while
+the fresh-client startup gate is unresolved; a successful startup catch-up
+clears that marker. The marker is local state and is preserved by serving
+checkpoint import, so a failed fresh bootstrap remains recoverable and
+read-only on a later mount.
+
 ## Serving-First Mount Lifecycle
 
 ### Existing local client

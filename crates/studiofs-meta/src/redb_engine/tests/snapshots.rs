@@ -48,6 +48,26 @@ fn import_serving_checkpoint_rebuilds_local_counters() {
 }
 
 #[test]
+fn import_remote_snapshot_preserves_fresh_client_pending_marker() {
+    let local = temp_engine();
+    local
+        .set_counter(crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .unwrap();
+
+    let source = temp_engine();
+    let snapshot = source.export_remote_snapshot().unwrap();
+    local.import_remote_snapshot(&snapshot).unwrap();
+
+    assert_eq!(
+        local
+            .get_counter(crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .unwrap(),
+        1,
+        "remote serving checkpoint import must retain the unresolved fresh-client gate"
+    );
+}
+
+#[test]
 fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_log() {
     let local = temp_engine();
     let local_event_start = local.get_counter("nextEventSeq").unwrap();

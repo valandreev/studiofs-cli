@@ -536,6 +536,13 @@ where
         MetadataAuthorityStatus::read_only()
     }
 
+    fn pg_sync_status(&self) -> PgSyncStatus {
+        PgSyncStatus::new(
+            self.inner.pg_sync_status().lifecycle,
+            MetadataAuthorityStatus::read_only(),
+        )
+    }
+
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
         self.inner.remote_metadata_size()
     }

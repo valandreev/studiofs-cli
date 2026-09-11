@@ -431,6 +431,8 @@ impl RedbMetaEngine {
                         || (preserve_event_log
                             && (name == "nextEventSeq"
                                 || crate::pg_engine::is_local_pg_snapshot_state_counter(name)))
+                        || (enable_remote_namespace_filter
+                            && name == crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
                 })
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.counters {

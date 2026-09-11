@@ -507,6 +507,62 @@ fn repair_startup_keeps_recovery_marker_when_remote_sync_fails() {
 }
 
 #[test]
+fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
+    let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
+    let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&db).expect("open local metadata");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "fresh-client-startup-failure",
+            "fresh-client-startup-failure-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set format info");
+    PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+    drop(local);
+
+    let fresh = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: true,
+            ..Default::default()
+        },
+    )
+    .expect("fresh local view should survive unavailable PostgreSQL");
+    let status = fresh.pg_sync_status();
+    assert_eq!(status.lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!status.allows_new_mutations());
+    assert_eq!(
+        fresh
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1,
+        "failed fresh startup must retain its durable write gate"
+    );
+    drop(fresh);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("reopen failed fresh client locally");
+    assert_eq!(
+        reopened.pg_sync_status().lifecycle,
+        PgSyncLifecycle::Degraded,
+        "ordinary reopen must not mistake an unfinished fresh bootstrap for an established client"
+    );
+}
+
+#[test]
 fn startup_snapshot_preserves_local_overlay_when_only_acl_changed() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
@@ -615,6 +671,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
     local
         .write_counters(|counters| {
             counters.set(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 150)?;
+            counters.set(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, 1_000)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, 1_100)?;
             counters.set(LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, 1_200)?;
@@ -634,6 +691,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
     for local_counter in [
         LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
         LOCAL_PG_CLIENT_SLOT_COUNTER,
+        LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER,
         LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
         LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
         LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
@@ -1095,6 +1153,7 @@ fn command_pool_capacity_is_bounded_by_configured_pool_size() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            fresh_client: false,
             pg_pool_size: 1,
         },
     )
@@ -1192,6 +1251,7 @@ fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
         &db,
         PgOpenOptions {
             background_poll: false,
+            fresh_client: false,
             pg_pool_size: 2,
         },
     )

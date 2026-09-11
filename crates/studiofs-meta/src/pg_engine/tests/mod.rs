@@ -454,6 +454,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         allocator_refill_lock: Mutex::new(()),
         inode_id_headroom_available: AtomicBool::new(false),
         object_id_headroom_available: AtomicBool::new(false),
+        pg_sync_lifecycle: AtomicU8::new(PgSyncLifecycle::LocalReady as u8),
         janitor_lock: Mutex::new(None),
         file_lock_cache: Mutex::new(HashMap::new()),
         held_file_locks: Mutex::new(HashMap::new()),
@@ -487,6 +488,24 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     engine.bootstrap_allocator_state();
 
     (dir, engine)
+}
+
+#[test]
+fn trusted_pg_allocator_enters_live_lifecycle_and_losing_headroom_enters_pending() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+
+    let live = engine.pg_sync_status();
+    assert_eq!(live.lifecycle, PgSyncLifecycle::Live);
+    assert!(live.allows_new_mutations());
+
+    engine
+        .inode_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine.refresh_pg_sync_lifecycle_for_allocator();
+
+    let pending = engine.pg_sync_status();
+    assert_eq!(pending.lifecycle, PgSyncLifecycle::AllocatorPending);
+    assert!(!pending.allows_new_mutations());
 }
 
 fn apply_projected_remote_range(

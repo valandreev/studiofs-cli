@@ -2,6 +2,7 @@ use super::{MetadataSyncSource, PgMetaEngine, sql};
 use crate::engine::{
     MetaError, MetaFormat, MetaReplication, MetaResult, MetadataAuthorityStatus,
     MetadataCoherenceProgress, MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
+    PgSyncStatus,
 };
 use crate::types::Ino;
 use std::sync::Arc;
@@ -131,6 +132,13 @@ impl MetaReplication for PgMetaEngine {
             inode_id_headroom: self.inode_id_headroom_available.load(Ordering::Acquire),
             object_id_headroom: self.object_id_headroom_available.load(Ordering::Acquire),
         }
+    }
+
+    fn pg_sync_status(&self) -> PgSyncStatus {
+        PgSyncStatus::new(
+            self.current_pg_sync_lifecycle(),
+            self.metadata_authority_status(),
+        )
     }
 
     fn check_consistency(&self) -> MetaResult<()> {

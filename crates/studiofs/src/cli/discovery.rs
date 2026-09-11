@@ -208,6 +208,7 @@ fn create_local_snapshot(
         &db_path,
         MetaOpenOptions {
             background_poll: false,
+            fresh_client: true,
             ..Default::default()
         },
     )?;

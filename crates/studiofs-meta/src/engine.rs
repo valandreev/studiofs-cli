@@ -284,7 +284,7 @@ pub enum LocalStorageCompactionResult {
     NoWork,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Whether this engine instance is still allowed to accept new mutations.
 pub struct MetadataAuthorityStatus {
     /// `true` when inode id allocation still has local headroom.
@@ -319,6 +319,149 @@ impl MetadataAuthorityStatus {
 impl Default for MetadataAuthorityStatus {
     fn default() -> Self {
         Self::writable()
+    }
+}
+
+/// Lifecycle of the local serving view and PostgreSQL startup synchronization.
+///
+/// The lifecycle is intentionally separate from [`MetadataAuthorityStatus`].
+/// A local view can be readable while it is catching up, and an established
+/// client can retain write authority while PostgreSQL is temporarily
+/// unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum PgSyncLifecycle {
+    /// The local serving view is open and safe for reads, but startup gates
+    /// have not yet granted lifecycle write permission.
+    #[default]
+    LocalReady,
+    /// Remote checkpoint or event-log state is being applied toward a frozen
+    /// startup target.
+    CatchingUp,
+    /// The current startup target has been reached; allocator authority is
+    /// still evaluated independently.
+    TargetReached,
+    /// The target is complete but the paired local allocator authority is not
+    /// currently available.
+    AllocatorPending,
+    /// The local view and lifecycle gates permit normal operation.
+    Live,
+    /// The local view remains usable for reads, but a recoverable sync or
+    /// authority failure requires read-only operation.
+    Degraded,
+    /// The local serving view cannot be used safely.
+    Fatal,
+}
+
+impl PgSyncLifecycle {
+    /// Return whether foreground reads are permitted in this lifecycle.
+    pub const fn allows_reads(self) -> bool {
+        !matches!(self, Self::Fatal)
+    }
+
+    /// Return whether the lifecycle itself permits new mutations.
+    ///
+    /// Allocator authority is an independent second gate and is evaluated by
+    /// [`PgSyncStatus::allows_new_mutations`].
+    pub const fn allows_new_mutations(self) -> bool {
+        matches!(self, Self::Live)
+    }
+
+    /// Return whether a lifecycle transition is valid for the startup/recovery
+    /// state machine.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        if self as u8 == next as u8 {
+            return true;
+        }
+
+        match self {
+            Self::LocalReady => matches!(
+                next,
+                Self::CatchingUp
+                    | Self::TargetReached
+                    | Self::AllocatorPending
+                    | Self::Live
+                    | Self::Degraded
+                    | Self::Fatal
+            ),
+            Self::CatchingUp => matches!(next, Self::TargetReached | Self::Degraded | Self::Fatal),
+            Self::TargetReached => {
+                matches!(
+                    next,
+                    Self::AllocatorPending | Self::Live | Self::Degraded | Self::Fatal
+                )
+            }
+            Self::AllocatorPending => matches!(next, Self::Live | Self::Degraded | Self::Fatal),
+            Self::Live => matches!(next, Self::AllocatorPending | Self::Degraded | Self::Fatal),
+            Self::Degraded => matches!(
+                next,
+                Self::LocalReady
+                    | Self::CatchingUp
+                    | Self::TargetReached
+                    | Self::AllocatorPending
+                    | Self::Live
+                    | Self::Fatal
+            ),
+            Self::Fatal => false,
+        }
+    }
+
+    /// Apply one validated lifecycle transition.
+    pub const fn transition_to(self, next: Self) -> Result<Self, PgSyncLifecycleTransitionError> {
+        if self.can_transition_to(next) {
+            Ok(next)
+        } else {
+            Err(PgSyncLifecycleTransitionError {
+                from: self,
+                to: next,
+            })
+        }
+    }
+}
+
+/// Error returned when a PostgreSQL synchronization lifecycle transition is
+/// not part of the explicit state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid PostgreSQL sync lifecycle transition: {from:?} -> {to:?}")]
+pub struct PgSyncLifecycleTransitionError {
+    /// Lifecycle before the attempted transition.
+    pub from: PgSyncLifecycle,
+    /// Requested lifecycle after the attempted transition.
+    pub to: PgSyncLifecycle,
+}
+
+/// Snapshot of PostgreSQL synchronization lifecycle and local write authority.
+///
+/// `lifecycle` describes local serving/catch-up health. `authority` describes
+/// the paired allocator headroom. New mutations require both dimensions to
+/// allow them; reads require only a non-fatal lifecycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgSyncStatus {
+    /// Current local serving and synchronization lifecycle.
+    pub lifecycle: PgSyncLifecycle,
+    /// Current paired local allocator authority.
+    pub authority: MetadataAuthorityStatus,
+}
+
+impl PgSyncStatus {
+    /// Build a status from independent lifecycle and allocator observations.
+    pub const fn new(lifecycle: PgSyncLifecycle, authority: MetadataAuthorityStatus) -> Self {
+        Self {
+            lifecycle,
+            authority,
+        }
+    }
+
+    /// Return whether foreground reads are permitted.
+    pub const fn allows_reads(self) -> bool {
+        self.lifecycle.allows_reads()
+    }
+
+    /// Return whether both lifecycle and paired allocator authority permit a
+    /// new mutation.
+    pub const fn allows_new_mutations(self) -> bool {
+        self.lifecycle.allows_new_mutations() && self.authority.allows_new_mutations()
     }
 }
 
@@ -1062,6 +1205,15 @@ pub trait MetaReplication: Send + Sync {
     /// mutations should still be accepted.
     fn metadata_authority_status(&self) -> MetadataAuthorityStatus;
 
+    /// Return the explicit PostgreSQL synchronization lifecycle and local
+    /// write-authority snapshot.
+    ///
+    /// Backends that do not have a separate PostgreSQL lifecycle retain their
+    /// existing behavior by reporting `Live` with their current authority.
+    fn pg_sync_status(&self) -> PgSyncStatus {
+        PgSyncStatus::new(PgSyncLifecycle::Live, self.metadata_authority_status())
+    }
+
     /// Return the estimated size of remote metadata in bytes, if applicable.
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
 
@@ -1147,4 +1299,103 @@ pub trait MetaEngine:
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pg_sync_lifecycle_permissions_are_explicit() {
+        let cases = [
+            (PgSyncLifecycle::LocalReady, true, false),
+            (PgSyncLifecycle::CatchingUp, true, false),
+            (PgSyncLifecycle::TargetReached, true, false),
+            (PgSyncLifecycle::AllocatorPending, true, false),
+            (PgSyncLifecycle::Live, true, true),
+            (PgSyncLifecycle::Degraded, true, false),
+            (PgSyncLifecycle::Fatal, false, false),
+        ];
+
+        for (lifecycle, allows_reads, allows_new_mutations) in cases {
+            assert_eq!(lifecycle.allows_reads(), allows_reads, "{lifecycle:?}");
+            assert_eq!(
+                lifecycle.allows_new_mutations(),
+                allows_new_mutations,
+                "{lifecycle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pg_sync_lifecycle_transitions_follow_startup_order_and_fatal_is_terminal() {
+        assert!(
+            PgSyncLifecycle::LocalReady
+                .transition_to(PgSyncLifecycle::CatchingUp)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::CatchingUp
+                .transition_to(PgSyncLifecycle::TargetReached)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::TargetReached
+                .transition_to(PgSyncLifecycle::AllocatorPending)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::AllocatorPending
+                .transition_to(PgSyncLifecycle::Live)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::Live
+                .transition_to(PgSyncLifecycle::Degraded)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::Degraded
+                .transition_to(PgSyncLifecycle::CatchingUp)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::Live
+                .transition_to(PgSyncLifecycle::Fatal)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::Fatal
+                .transition_to(PgSyncLifecycle::Fatal)
+                .is_ok()
+        );
+        assert!(
+            PgSyncLifecycle::Fatal
+                .transition_to(PgSyncLifecycle::Live)
+                .is_err()
+        );
+        assert!(
+            PgSyncLifecycle::CatchingUp
+                .transition_to(PgSyncLifecycle::Live)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pg_sync_status_requires_live_lifecycle_and_paired_allocator_headroom() {
+        let writable = MetadataAuthorityStatus::writable();
+        assert!(!PgSyncStatus::new(PgSyncLifecycle::Fatal, writable).allows_reads());
+        assert!(PgSyncStatus::new(PgSyncLifecycle::Live, writable).allows_new_mutations());
+        assert!(!PgSyncStatus::new(PgSyncLifecycle::CatchingUp, writable).allows_new_mutations());
+        assert!(
+            !PgSyncStatus::new(
+                PgSyncLifecycle::Live,
+                MetadataAuthorityStatus {
+                    inode_id_headroom: true,
+                    object_id_headroom: false,
+                },
+            )
+            .allows_new_mutations()
+        );
+    }
 }
