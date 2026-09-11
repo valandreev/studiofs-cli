@@ -616,17 +616,23 @@ fn pg_sync_contract_contains_required_invariants() {
 #[test]
 fn related_docs_link_to_canonical_pg_sync_contract() {
     let linked_docs = [
-        "docs/architecture.md",
-        "docs/metadata.md",
-        "docs/configuration.md",
-        "docs/juicefs-local-first-rust-contract.md",
-        "docs/local-first-validation-matrix.md",
-        "docs/tests.md",
-        "README.md",
+        ("docs/architecture.md", "](./pg-sync-contract.md)"),
+        ("docs/metadata.md", "](./pg-sync-contract.md)"),
+        ("docs/configuration.md", "](./pg-sync-contract.md)"),
+        (
+            "docs/juicefs-local-first-rust-contract.md",
+            "](./pg-sync-contract.md)",
+        ),
+        (
+            "docs/local-first-validation-matrix.md",
+            "](./pg-sync-contract.md)",
+        ),
+        ("docs/tests.md", "](pg-sync-contract.md)"),
+        ("README.md", "](docs/pg-sync-contract.md)"),
     ];
     let missing_links: Vec<_> = linked_docs
         .into_iter()
-        .filter(|path| !read_workspace_file(path).contains("pg-sync-contract.md"))
+        .filter_map(|(path, link)| (!read_workspace_file(path).contains(link)).then_some(path))
         .collect();
 
     assert!(

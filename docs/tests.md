@@ -32,7 +32,7 @@ PostgreSQL or mounted runtime behavior; the remaining startup/sync checks
 belong to SFS-696 through SFS-698. The local-only destruction boundary is
 already implemented by SFS-721 and should retain its focused coverage.
 
-Run the three focused contract checks:
+Run the four focused contract checks:
 
 ```powershell
 cargo test -p studiofs --test architecture_vocabulary_test pg_sync_contract_contains_required_invariants -- --nocapture

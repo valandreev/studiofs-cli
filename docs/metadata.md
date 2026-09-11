@@ -104,8 +104,8 @@ Runtime behavior:
 - foreground ops (`create`, `rename`, `unlink`, `truncate`, block staging) mutate local `redb`
 - local mutations append to the local metadata event log
 - background flush projects remote-visible deltas into PostgreSQL `event_log`
-- background pull applies only newer foreign delta pages toward a bounded,
-  frozen target
+- background pull (SFS-695 target; implemented by SFS-696 through SFS-698)
+  applies only newer foreign delta pages toward a bounded, frozen target
 - restart/reopen rebuilds pending replication state from the local event log when
   unpublished local overlay mutations still exist
 - foreign namespace/attr/symlink/xattr apply updates the local `base_*` view
@@ -114,6 +114,11 @@ Runtime behavior:
   prerequisite for local serving
 - `metadata_state` is the checkpoint/bootstrap store, not the primary runtime
   sync channel
+
+The bounded, frozen pull behavior above is the SFS-695 target contract. Until
+SFS-696 through SFS-698 land, the current transitional pull path calls
+`query_foreign_event_rows`, which uses `SELECT_FOREIGN_EVENT_ROWS` without a
+page limit or frozen upper version bound.
 
 ### Backend Selection on Open
 
@@ -259,6 +264,11 @@ Operational note:
   metadata or running `discover`.
 
 ### Pull from PostgreSQL
+
+The procedure below describes the SFS-695 target contract, not the currently
+shipped SQL path. Until SFS-696 through SFS-698 land, the transitional pull
+does not yet enforce the frozen upper bound or bounded page query described
+here.
 
 1. Load only rows with `batch_version > local_version`.
 2. Freeze one target `metadata_state.version` for the current sync operation.
