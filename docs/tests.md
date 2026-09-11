@@ -21,6 +21,26 @@ For final encryption-at-rest acceptance, use the
 It collects the encrypted-object unit, integration, E2E, platform smoke, and
 performance checks that should be recorded before closing the feature.
 
+### SFS-695 PostgreSQL sync contract
+
+The PostgreSQL lifecycle contract is documented in
+[pg-sync-contract.md](pg-sync-contract.md). It is a documentation-level gate
+for serving-first mount, checkpoint-first bootstrap, bounded/paged/resumable
+catch-up, frozen startup targets, read/write authority, checkpoint lag,
+finite-history recovery, and local-only destruction. It does not claim live
+PostgreSQL or mounted runtime behavior; the remaining startup/sync checks
+belong to SFS-696 through SFS-698. The local-only destruction boundary is
+already implemented by SFS-721 and should retain its focused coverage.
+
+Run the four focused contract checks:
+
+```powershell
+cargo test -p studiofs --test architecture_vocabulary_test pg_sync_contract_contains_required_invariants -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test related_docs_link_to_canonical_pg_sync_contract -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test configuration_docs_label_pg_sync_target_behavior -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_superseded_pg_startup_wording -- --nocapture
+```
+
 ---
 
 ## Test Layers

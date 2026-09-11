@@ -712,8 +712,9 @@ impl PgMetaEngine {
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 
-        // Bootstrap from the last checkpoint if present, then catch up from
-        // append-only event deltas.
+        // CONTEXT(SFS-698): Transitional startup path. SFS-695 defines local
+        // serving readiness before remote replay; SFS-698 will move this
+        // bootstrap/catch-up work behind that boundary.
         if repair_local_graph_recovery_pending {
             engine.pull_snapshot_locked(
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
@@ -726,8 +727,10 @@ impl PgMetaEngine {
                 .local
                 .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
         } else {
-            // Preserve unflushed local overlays while allowing acknowledged
-            // journals to fast-forward from the latest remote checkpoint.
+            // CONTEXT(SFS-698): Preserve unflushed local overlays while the
+            // transitional startup path fast-forwards from the latest remote
+            // checkpoint. The canonical lifecycle is documented in
+            // `docs/pg-sync-contract.md`.
             if let Some(import_mode) =
                 Self::startup_snapshot_import_mode(&engine.local, restored_local_version)?
                 && let Err(error) = engine.pull_snapshot_locked(import_mode)

@@ -2,6 +2,8 @@
 
 This page describes `studiofs-meta` under the canonical mounted-IO contract in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+The canonical PostgreSQL lifecycle, replay, and authority contract is
+[pg-sync-contract.md](./pg-sync-contract.md).
 Terms such as `base` and `overlay` below are metadata-internal names.
 
 `studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
@@ -102,12 +104,21 @@ Runtime behavior:
 - foreground ops (`create`, `rename`, `unlink`, `truncate`, block staging) mutate local `redb`
 - local mutations append to the local metadata event log
 - background flush projects remote-visible deltas into PostgreSQL `event_log`
-- background pull applies only newer foreign delta batches
+- background pull (SFS-695 target; implemented by SFS-696 through SFS-698)
+  applies only newer foreign delta pages toward a bounded, frozen target
 - restart/reopen rebuilds pending replication state from the local event log when
   unpublished local overlay mutations still exist
 - foreign namespace/attr/symlink/xattr apply updates the local `base_*` view
 - local serving view is `overlay over base`
-- `metadata_state` is used as a bootstrap/checkpoint store, not the primary runtime sync channel
+- a valid local `redb` view is the serving boundary; PostgreSQL replay is not a
+  prerequisite for local serving
+- `metadata_state` is the checkpoint/bootstrap store, not the primary runtime
+  sync channel
+
+The bounded, frozen pull behavior above is the SFS-695 target contract. Until
+SFS-696 through SFS-698 land, the current transitional pull path calls
+`query_foreign_event_rows`, which uses `SELECT_FOREIGN_EVENT_ROWS` without a
+page limit or frozen upper version bound.
 
 ### Backend Selection on Open
 
@@ -130,14 +141,29 @@ Each StudioFS volume is assigned a unique `disk_uuid` during initialization (`st
 
 To prevent accidental data corruption or inconsistent states when a volume is deleted and recreated with the same name, StudioFS performs a mandatory UUID verification during `mount` and `destroy` operations:
 
-- **Mount**: Before starting the filesystem, the client connects to the remote PostgreSQL database and compares the local UUID with the remote one. If they do not match, the mount is blocked.
+- **Mount**: the client may establish local serving readiness from a valid
+  local root independently of remote replay. UUID verification remains a
+  separate safety/authority check; a mismatch blocks remote use and
+  write-capable operation without turning replay into an unbounded mount wait.
 - **Destroy**: Before performing a remote destruction of S3 data and PostgreSQL tables, the UUID is verified. If a mismatch is detected, the command will fail and suggest using `--local` to only clean up the stale local metadata.
 
 ### Offline Behavior
 
 If the remote PostgreSQL database is unreachable during a `mount` or `destroy` command:
-- **Mount**: The operation is blocked because the identity of the disk cannot be verified.
-- **Destroy**: The command will warn that the identity could not be verified and will only allow a local cleanup via the `--local` flag.
+- **Mount**: an existing valid local root can become locally serving-ready
+  without replaying remote history. Catch-up and any missing write authority
+  are reported separately, and a fresh client remains read-only until its
+  checkpoint, startup target, and authority requirements are satisfied.
+- **Discover**: a new client cannot complete checkpoint-first bootstrap without
+  a valid remote checkpoint, but an already imported local checkpoint remains a
+  recoverable local/read-only state for a later catch-up attempt.
+- **Destroy**: `destroy --local` performs only local cleanup and does not
+  contact PostgreSQL or S3. Full remote destruction retains its separate
+  identity and remote-service requirements.
+
+Remote UUID verification remains a separate safety check for operations that
+need remote identity. An identity result must not be treated as a replay result
+or used to add an unbounded wait to local serving readiness.
 
 ### Troubleshooting
 
@@ -220,7 +246,9 @@ Serving rules are:
 3. Start a PostgreSQL transaction.
 4. Bump `metadata_state.version` and use that value as the batch cursor.
 5. Append projected events into `event_log`.
-6. Periodically refresh the remote-visible checkpoint in `metadata_state`.
+6. Refresh the remote-visible checkpoint in `metadata_state` often enough to
+   satisfy the explicit `max_checkpoint_lag_versions` bound. A periodic timer
+   may trigger refresh, but periodic work alone is not the freshness contract.
 
 Events that stay local-only are not published as remote-visible deltas:
 - local regular-file overlay graph staging (`StageRegularFileOverlaySlices` and upload-state marks)
@@ -237,9 +265,15 @@ Operational note:
 
 ### Pull from PostgreSQL
 
+The procedure below describes the SFS-695 target contract, not the currently
+shipped SQL path. Until SFS-696 through SFS-698 land, the transitional pull
+does not yet enforce the frozen upper bound or bounded page query described
+here.
+
 1. Load only rows with `batch_version > local_version`.
-2. Decode batches in `(batch_version, client_id)` order.
-3. Apply foreign batches in order.
+2. Freeze one target `metadata_state.version` for the current sync operation.
+3. Read and apply bounded pages in `(batch_version, seq_id)` order, never past
+   the frozen target.
 4. Apply self batches only to remote-visible/base reconciliation (not as local overlay writes).
 5. Use self batches to acknowledge already-published local event prefixes and
    advance the local flushed watermark after restart/crash windows.
@@ -248,6 +282,11 @@ Operational note:
 7. Apply foreign namespace/attr/symlink/xattr state into local `base_*`.
 8. Skip auxiliary serving-view updates for events that conflict with local overlay state and continue applying later
    independent batches.
+
+After each page, the local serving-state changes and replay cursor are
+committed together. A failed page resumes from the previous cursor; newer
+remote events are handled by a later bounded sync operation rather than
+extending the current operation toward a moving head.
 
 This avoids replaying a client's own changes and avoids clobbering local staged
 writes with foreign state, while still advancing the remote-visible base view.
@@ -266,7 +305,8 @@ PostgreSQL-backed clients use a push-plus-poll invalidation model:
 - periodic `STUDIOFS_PG_SYNC_POLL_SECS` polling remains enabled as the fallback
   for missed notifications, network stalls, process pauses, and listener restarts
 
-The metadata listener performs the event-log pull before waking the VFS
+The metadata listener performs the event-log pull after local serving state is
+available and before waking the VFS
 invalidation worker. On a notify-driven wake, the worker first compares local
 namespace and metadata version tokens with the last tokens it processed. If the
 listener already advanced either token, the worker skips the fallback poll's
@@ -676,7 +716,8 @@ Destination side:
 - if the key exists in `base_xattrs`, write a tombstone
 
 Update behavior:
-- no offline migration is required
+- the PostgreSQL sync format/protocol change is breaking; migration
+  compatibility is not required for existing test disks
 - existing plain `com.apple.ResourceFork` rows remain readable
 - setxattr progressively stores hot keys in compressed representation when it
   wins on size

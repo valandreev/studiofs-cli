@@ -292,6 +292,7 @@ Project docs live in [docs/](docs/):
 - [docs/filesystem-testing-overview.md](docs/filesystem-testing-overview.md) - friendly overview of the real filesystem testing approach
 - [docs/e2e-runner-contract.md](docs/e2e-runner-contract.md) - real mounted E2E runner contract, artifacts, reports, preflight, and cleanup rules
 - [docs/metadata.md](docs/metadata.md) - local `redb` + PostgreSQL metadata model
+- [docs/pg-sync-contract.md](docs/pg-sync-contract.md) - canonical PostgreSQL bootstrap, catch-up, lifecycle, and authority contract
 - [docs/cache.md](docs/cache.md) - local cache backend, staged writeback, and upload flow
 - [docs/vfs.md](docs/vfs.md) - filesystem runtime behavior
 - [docs/data-layer.md](docs/data-layer.md) - S3 object I/O and format details

@@ -127,15 +127,31 @@ Attaches another client to an existing PG-backed volume.
 studiofs discover <name> --meta <postgres-server-dsn>
 ```
 
-What it does:
-- reads the latest remote-visible checkpoint from PostgreSQL,
+Target behavior (SFS-695; implemented by the runtime follow-ups SFS-696
+through SFS-698):
+
+- reads one consistent latest remote-visible checkpoint and frozen startup
+  target from PostgreSQL,
 - creates local `redb` metadata DB for this client,
 - stores discovered `FormatInfo` locally,
-- then normal runtime sync continues through PostgreSQL delta batches.
+- imports the checkpoint before bounded, paged, resumable replay of later
+  PostgreSQL delta batches,
+- keeps the fresh client read-only until the startup target and write authority
+  are both available.
+
+Current transitional behavior: until SFS-696 through SFS-698 land,
+`fetch_remote_state` reads the volume, snapshot, and format bytes but does not
+yet return checkpoint/head versions. `create_local_snapshot` then primes a
+`PgMetaEngine`, whose current open path may synchronously catch up toward the
+moving PostgreSQL head. The current command does not yet expose an independent
+fresh-client authority state or the target read-only gate described above.
 
 `discover` is the bootstrap path for a new client and a manual repair tool. A
 normal client restart/reopen should recover pending PG metadata convergence
-without requiring `discover`.
+without requiring `discover`; it serves a valid local view independently of
+remote catch-up progress. See
+[PostgreSQL Sync Contract](./pg-sync-contract.md) for the lifecycle and
+finite-history recovery rules.
 
 ### `mount`
 
@@ -156,7 +172,12 @@ Notes:
 - If `<mount-point>` is omitted, `studiofs mount` uses the configured default from `settings` on non-Windows platforms.
 - Precedence for mount path knobs is: CLI args -> persisted `studiofs settings` values -> built-in defaults.
 - Public runtime IO tuning starts from persisted `studiofs settings` values, then applies transitional `STUDIOFS_*` env overrides, and finally applies explicit mount flags before validation.
-- Cross-client metadata convergence is handled through PostgreSQL sync.
+- Cross-client metadata convergence is handled through bounded PostgreSQL sync
+  after local serving readiness; one sync operation targets a frozen remote
+  version rather than chasing a moving head.
+- `local-ready`, `catching-up`, `target-reached`, and read/write authority are
+  separate runtime observations. A fresh discovered client may serve its
+  imported local state read-only while catch-up continues.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
 - Ordinary local redb commits use `Durability::None`. Each metadata-engine instance supplies its own idle-progress worker with a one-second maximum group-commit interval; explicit sync and clean shutdown execute an immediate barrier.
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.

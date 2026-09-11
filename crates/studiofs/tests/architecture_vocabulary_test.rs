@@ -560,6 +560,147 @@ fn active_docs_drop_superseded_io_architecture_terms() {
 }
 
 #[test]
+fn pg_sync_contract_contains_required_invariants() {
+    // CONTEXT: This is a documentation contract guard for SFS-695. Runtime
+    // startup behavior is implemented by the follow-up PG sync issues.
+    let contract = read_workspace_file("docs/pg-sync-contract.md");
+    let normalized_contract = normalize_doc_whitespace(&contract);
+    let required_terms = [
+        "# PostgreSQL Sync Contract",
+        "SFS-695",
+        "breaking on-disk/protocol change",
+        "Migration compatibility is not required for existing test disks",
+        "Serving-First Mount Lifecycle",
+        "checkpoint-first bootstrap",
+        "Bounded, Paged, and Resumable Catch-Up",
+        "frozen startup target",
+        "local-ready",
+        "catching-up",
+        "target-reached",
+        "healthy",
+        "degraded(reason)",
+        "read-only authority",
+        "read/write authority",
+        "replay cursor",
+        "checkpoint lag",
+        "degraded read-only",
+        "page boundary must never split",
+        "last fully applied batch",
+        "producer must enforce the replay envelope",
+        "replay row limit",
+        "replay byte limit",
+        "SQL insert chunking inside one transaction is not a batch bound",
+        "max_checkpoint_lag_versions",
+        "single-flight",
+        "coordination lease",
+        "permanently unmountable",
+        "`destroy --local`",
+        "SFS-696",
+        "SFS-697",
+        "SFS-698",
+        "SFS-721",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&contract, &normalized_contract, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-695 PostgreSQL sync contract is missing required invariants:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn related_docs_link_to_canonical_pg_sync_contract() {
+    let linked_docs = [
+        ("docs/architecture.md", "](./pg-sync-contract.md)"),
+        ("docs/metadata.md", "](./pg-sync-contract.md)"),
+        ("docs/configuration.md", "](./pg-sync-contract.md)"),
+        (
+            "docs/juicefs-local-first-rust-contract.md",
+            "](./pg-sync-contract.md)",
+        ),
+        (
+            "docs/local-first-validation-matrix.md",
+            "](./pg-sync-contract.md)",
+        ),
+        ("docs/tests.md", "](pg-sync-contract.md)"),
+        ("README.md", "](docs/pg-sync-contract.md)"),
+    ];
+    let missing_links: Vec<_> = linked_docs
+        .into_iter()
+        .filter_map(|(path, link)| (!read_workspace_file(path).contains(link)).then_some(path))
+        .collect();
+
+    assert!(
+        missing_links.is_empty(),
+        "SFS-695 canonical PostgreSQL sync contract links are missing from:\n{}",
+        missing_links.join("\n")
+    );
+}
+
+#[test]
+fn configuration_docs_label_pg_sync_target_behavior() {
+    let configuration = read_workspace_file("docs/configuration.md");
+    let normalized_configuration = normalize_doc_whitespace(&configuration);
+    let required_terms = [
+        "Target behavior (SFS-695",
+        "runtime follow-ups SFS-696 through SFS-698",
+        "Current transitional behavior",
+        "does not yet return checkpoint/head versions",
+        "fresh-client authority state",
+    ];
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&configuration, &normalized_configuration, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "configuration docs must label SFS-695 behavior as transitional until runtime follow-ups land:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn active_docs_drop_superseded_pg_startup_wording() {
+    let active_docs = [
+        (
+            "docs/architecture.md",
+            read_workspace_file("docs/architecture.md"),
+        ),
+        ("docs/metadata.md", read_workspace_file("docs/metadata.md")),
+        (
+            "docs/configuration.md",
+            read_workspace_file("docs/configuration.md"),
+        ),
+    ];
+    let forbidden_legacy_statements = [
+        "Before starting the filesystem, the client connects to the remote PostgreSQL database and compares the local UUID with the remote one.",
+        "The operation is blocked because the identity of the disk cannot be verified.",
+        "startup catch-up did not reach the current remote head",
+    ];
+    let legacy_hits: Vec<String> = active_docs
+        .iter()
+        .flat_map(|(path, doc)| {
+            forbidden_legacy_statements
+                .iter()
+                .filter(move |term| doc.contains(*term))
+                .map(move |term| format!("{path}: found `{term}`"))
+        })
+        .collect();
+
+    assert!(
+        legacy_hits.is_empty(),
+        "active docs still contain superseded PostgreSQL startup wording:\n{}",
+        legacy_hits.join("\n")
+    );
+}
+
+#[test]
 fn cli_surface_avoids_legacy_runtime_product_wording() {
     let files = [
         "crates/studiofs/src/cli/cache_layout.rs",

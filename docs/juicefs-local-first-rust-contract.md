@@ -23,6 +23,11 @@ StudioFS implements one production mount model:
 The goal is IO parity with JuiceFS writeback mode at the filesystem data-plane
 level, while retaining StudioFS shared metadata replication and lock semantics.
 
+The PostgreSQL lifecycle contract is defined separately in
+[pg-sync-contract.md](./pg-sync-contract.md). In particular, PostgreSQL
+catch-up is not a foreground data-plane prerequisite: local `redb` serving,
+remote replay, and read/write authority have separate contracts.
+
 ## 1. Core Vocabulary
 
 | Term | Meaning |
@@ -180,6 +185,18 @@ PostgreSQL responsibilities:
 - client discovery;
 - paired inode and payload allocator-namespace registration;
 - shared hard-lock coordination.
+
+The lifecycle rules for those responsibilities are:
+
+- local `redb` is serving-ready before remote catch-up is required;
+- a fresh client uses checkpoint-first bootstrap, then bounded/paged/resumable
+  replay toward one frozen startup target;
+- a fresh client remains read-only until the target is reached and write
+  authority is available;
+- checkpoint freshness has an explicit bounded-lag policy;
+- finite remote history produces checkpoint rebootstrap or a recoverable
+  degraded read-only state, never a permanently unmountable local disk;
+- `destroy --local` never requires PostgreSQL or S3.
 
 Rules:
 

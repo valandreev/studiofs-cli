@@ -16,6 +16,25 @@ The goal is one obvious place to verify:
 This is the focused StudioFS contract matrix that should be consulted before
 data-plane, semantics, or performance work.
 
+## PostgreSQL Sync Contract
+
+The canonical PostgreSQL lifecycle contract is
+[docs/pg-sync-contract.md](./pg-sync-contract.md). Its portable documentation
+gate ensures that local serving readiness, remote catch-up, and read/write
+authority remain separate, and that checkpoint-first bootstrap, bounded
+replay, frozen targets, finite-history recovery, and local-only destruction are
+not described ambiguously:
+
+```powershell
+cargo test -p studiofs --test architecture_vocabulary_test pg_sync_contract_contains_required_invariants -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test related_docs_link_to_canonical_pg_sync_contract -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test configuration_docs_label_pg_sync_target_behavior -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_superseded_pg_startup_wording -- --nocapture
+```
+
+Runtime PostgreSQL and mounted validation is intentionally assigned to the
+follow-up implementation issues named in the contract.
+
 ## How To Use This Matrix
 
 1. Start with the fast/local rows that match the contract rule you changed.
