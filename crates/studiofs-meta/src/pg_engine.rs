@@ -479,10 +479,10 @@ impl PgMetaEngine {
             if current == next {
                 return;
             }
-            if let Err(error) = current.transition_to(next) {
+            if !current.can_transition_to(next) {
                 warn!(
-                    from = ?error.from,
-                    to = ?error.to,
+                    from = ?current,
+                    to = ?next,
                     volume_id = self.volume_id,
                     "invalid pg sync lifecycle transition"
                 );
