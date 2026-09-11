@@ -284,7 +284,13 @@ impl PgMetaEngine {
                     if let Ok(metadata_changed) =
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
                     {
-                        let _ = engine.backfill_current_reference_ledger();
+                        if let Err(error) = engine.backfill_current_reference_ledger_if_needed() {
+                            warn!(
+                                error = %error,
+                                volume_id = engine.volume_id,
+                                "postgres snapshot reachability bootstrap did not complete"
+                            );
+                        }
                         if metadata_changed {
                             engine.metadata_invalidation_notify.notify_one();
                         }

@@ -17,6 +17,7 @@ use crate::snapshot_ports::{
     UploadedObjectDeletionOutcome,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use tokio_postgres::GenericClient;
 
 /// Maximum number of uploaded fragment rows one reconciliation cycle may claim.
@@ -429,6 +430,20 @@ impl PgMetaEngine {
                 })
             })
             .collect()
+    }
+
+    pub(super) fn backfill_current_reference_ledger_if_needed(&self) -> MetaResult<()> {
+        if self
+            .snapshot_reachability_bootstrapped
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        self.backfill_current_reference_ledger()?;
+        self.snapshot_reachability_bootstrapped
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn backfill_current_reference_ledger(&self) -> MetaResult<()> {

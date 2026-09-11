@@ -229,6 +229,8 @@ pub struct PgMetaEngine {
     metadata_last_successful_sync_unix_ms: AtomicI64,
     /// Last remote metadata head observed by a bounded command query.
     metadata_remote_head_version: AtomicI64,
+    /// Whether snapshot reachability bootstrap completed for this engine.
+    snapshot_reachability_bootstrapped: AtomicBool,
     /// Whether the most recent metadata synchronization command succeeded.
     metadata_source_connected: AtomicBool,
     /// Whether PostgreSQL's sync format was validated successfully for this
@@ -531,48 +533,39 @@ impl PgMetaEngine {
         });
     }
 
-    /// Complete a failed fresh-client bootstrap after a successful sync has
-    /// reached the most recently observed remote head.
-    pub(super) fn try_complete_degraded_fresh_client_sync(&self) -> MetaResult<()> {
-        if self
-            .local
-            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)?
-            == 0
-        {
-            return Ok(());
-        }
-
-        match self.current_pg_sync_lifecycle() {
-            PgSyncLifecycle::Degraded => {
-                let local_version = self.local_version.load(Ordering::Acquire);
-                let remote_head = self.metadata_remote_head_version.load(Ordering::Acquire);
-                if remote_head < 0 || local_version < remote_head {
-                    return Ok(());
-                }
-
-                self.ensure_client_slot_for_fresh_client()?;
-                self.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
-                self.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
-            }
-            PgSyncLifecycle::TargetReached
-            | PgSyncLifecycle::AllocatorPending
-            | PgSyncLifecycle::Live => {}
-            PgSyncLifecycle::LocalReady | PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Fatal => {
-                return Ok(());
-            }
-        }
-
+    /// Complete local catch-up after a successful sync has reached the most
+    /// recently observed remote head.
+    pub(super) fn try_complete_catchup_sync(&self) -> MetaResult<()> {
+        let current = self.current_pg_sync_lifecycle();
         if !matches!(
-            self.current_pg_sync_lifecycle(),
-            PgSyncLifecycle::TargetReached
-                | PgSyncLifecycle::AllocatorPending
-                | PgSyncLifecycle::Live
+            current,
+            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
         ) {
             return Ok(());
         }
 
-        self.local
-            .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
+        let local_version = self.local_version.load(Ordering::Acquire);
+        let remote_head = self.metadata_remote_head_version.load(Ordering::Acquire);
+        if remote_head < 0 || local_version < remote_head {
+            return Ok(());
+        }
+
+        let fresh_client_pending = self
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)?
+            != 0;
+        if fresh_client_pending {
+            self.ensure_client_slot_for_fresh_client()?;
+        }
+        if current == PgSyncLifecycle::Degraded {
+            self.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+        }
+        self.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
+
+        if fresh_client_pending {
+            self.local
+                .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
+        }
         if self.allocator_runtime_state_missing() {
             self.bootstrap_allocator_state();
         } else {
@@ -985,6 +978,7 @@ impl PgMetaEngine {
             metadata_sync_errors: AtomicU64::new(0),
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             metadata_remote_head_version: AtomicI64::new(-1),
+            snapshot_reachability_bootstrapped: AtomicBool::new(false),
             metadata_source_connected: AtomicBool::new(false),
             remote_format_validated: AtomicBool::new(remote_format_validated),
             remote_format_validation_lock: Mutex::new(()),

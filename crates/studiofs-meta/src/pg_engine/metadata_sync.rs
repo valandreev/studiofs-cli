@@ -58,11 +58,11 @@ impl PgMetaEngine {
                     self.metadata_fallback_poll_discoveries
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if let Err(error) = self.try_complete_degraded_fresh_client_sync() {
+                if let Err(error) = self.try_complete_catchup_sync() {
                     warn!(
                         error = %error,
                         volume_id = self.volume_id,
-                        "degraded fresh-client lifecycle recovery could not be completed"
+                        "metadata catch-up lifecycle recovery could not be completed"
                     );
                 }
             }
