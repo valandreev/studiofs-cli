@@ -7,6 +7,7 @@
 
 use clap::Args;
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use studiofs_data::{
@@ -27,6 +28,24 @@ const ACTIVE_CRYPTO_KEY_STATE: &str = "active";
 const INIT_SCHEMA_ADVISORY_LOCK: i64 = 902_202_603;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+async fn with_postgres_client<T, F, Fut>(dsn: &str, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce(tokio_postgres::Client) -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let (client, connection) = connect_studiofs_postgres(dsn).await?;
+    let conn_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::warn!("postgres connection task ended: {error}");
+        }
+    });
+
+    let result = f(client).await;
+    conn_task.abort();
+    let _ = conn_task.await;
+    result
+}
 
 #[cfg(unix)]
 fn get_current_ids() -> (u32, u32) {
@@ -246,42 +265,23 @@ fn ensure_bucket_accessible(
 }
 
 fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Result<()> {
-    rt.block_on(async {
-        let (client, connection) = connect_studiofs_postgres(dsn).await?;
-
-        let conn_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres connection task ended: {e}");
-            }
-        });
-
+    rt.block_on(with_postgres_client(dsn, |client| async move {
         client
             .query_one("SELECT 1", &[])
             .await
             .map_err(|e| anyhow::anyhow!("postgres health query failed: {e}"))?;
-
-        conn_task.abort();
         Ok(())
-    })
+    }))
 }
 
 fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> anyhow::Result<bool> {
-    rt.block_on(async {
-        let (client, connection) = connect_studiofs_postgres(dsn).await?;
-
-        let conn_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres connection task ended: {e}");
-            }
-        });
-
+    rt.block_on(with_postgres_client(dsn, |client| async move {
         let has_volumes_table = client
             .query_one("SELECT to_regclass('public.volumes') IS NOT NULL", &[])
             .await
             .map_err(|e| anyhow::anyhow!("postgres schema probe failed: {e}"))?;
         let has_volumes_table: bool = has_volumes_table.get(0);
         if !has_volumes_table {
-            conn_task.abort();
             return Ok(false);
         }
 
@@ -290,20 +290,12 @@ fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> an
             .await
             .map_err(|e| anyhow::anyhow!("postgres volume lookup failed: {e}"))?;
 
-        conn_task.abort();
         Ok(row.is_some())
-    })
+    }))
 }
 
 fn provision_pg_schema(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Result<()> {
-    rt.block_on(async {
-        let (mut client, connection) = connect_studiofs_postgres(dsn).await?;
-        let conn_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres connection task ended: {e}");
-            }
-        });
-
+    rt.block_on(with_postgres_client(dsn, |mut client| async move {
         let tx = client.transaction().await?;
         tx.execute(
             "SELECT pg_advisory_xact_lock($1)",
@@ -312,9 +304,8 @@ fn provision_pg_schema(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Resul
         .await?;
         ensure_studiofs_pg_schema(&tx).await?;
         tx.commit().await?;
-        conn_task.abort();
         Ok(())
-    })
+    }))
 }
 
 struct ActiveCryptoKeyRow<'a> {
@@ -399,58 +390,52 @@ fn init_pg_schema_and_volume(
                 )
             })?;
         let active_key = ActiveCryptoKeyRow::from_encryption(encryption);
-        let (mut client, connection) = connect_studiofs_postgres(dsn).await?;
+        with_postgres_client(dsn, |mut client| async move {
+            let tx = client.transaction().await?;
 
-        let conn_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres connection task ended: {e}");
-            }
-        });
+            // Serialize DDL across concurrent initializers to avoid sequence-name races.
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&INIT_SCHEMA_ADVISORY_LOCK],
+            )
+            .await?;
 
-        let tx = client.transaction().await?;
+            ensure_studiofs_pg_schema(&tx).await?;
 
-        // Serialize DDL across concurrent initializers to avoid sequence-name races.
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&INIT_SCHEMA_ADVISORY_LOCK],
-        )
-        .await?;
+            let row = tx
+                .query_one(
+                    init_pg_volume_upsert_sql(),
+                    &[
+                        &name,
+                        &uuid,
+                        &block_size_i32,
+                        &encryption.enabled,
+                        &encryption_format_version_i16,
+                        &active_key_id_i32,
+                    ],
+                )
+                .await?;
+            let volume_id: i64 = row.get(0);
 
-        ensure_studiofs_pg_schema(&tx).await?;
-
-        let row = tx
-            .query_one(
-                init_pg_volume_upsert_sql(),
+            tx.execute(
+                init_pg_crypto_key_insert_sql(),
                 &[
-                    &name,
-                    &uuid,
-                    &block_size_i32,
-                    &encryption.enabled,
-                    &encryption_format_version_i16,
+                    &volume_id,
                     &active_key_id_i32,
+                    &active_key.algorithm,
+                    &active_key.key_material,
+                    &active_key.state,
                 ],
             )
             .await?;
-        let volume_id: i64 = row.get(0);
 
-        tx.execute(
-            init_pg_crypto_key_insert_sql(),
-            &[
-                &volume_id,
-                &active_key_id_i32,
-                &active_key.algorithm,
-                &active_key.key_material,
-                &active_key.state,
-            ],
-        )
-        .await?;
+            tx.execute(init_pg_counter_seed_sql(), &[&volume_id])
+                .await?;
 
-        tx.execute(init_pg_counter_seed_sql(), &[&volume_id])
-            .await?;
-
-        tx.commit().await?;
-        conn_task.abort();
-        Ok(volume_id)
+            tx.commit().await?;
+            Ok(volume_id)
+        })
+        .await
     })
 }
 
@@ -463,15 +448,8 @@ fn seed_pg_metadata_state(
 ) -> anyhow::Result<()> {
     let metadata_format_version = i16::try_from(CURRENT_FORMAT_VERSION)?;
     let checkpoint_sha256 = Sha256::digest(checkpoint_bytes);
-    rt.block_on(async {
-        let (client, connection) = connect_studiofs_postgres(dsn).await?;
-        let conn_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres connection task ended: {e}");
-            }
-        });
-
-        let result = client
+    rt.block_on(with_postgres_client(dsn, |client| async move {
+        client
             .execute(
                 r#"
                 INSERT INTO metadata_state (
@@ -493,19 +471,14 @@ fn seed_pg_metadata_state(
                     &metadata_format_version,
                     &INITIAL_METADATA_STATE_VERSION,
                     &checkpoint_bytes,
-                    &&checkpoint_sha256[..],
+                    &checkpoint_sha256.as_slice(),
                     &format_info_bytes,
                 ],
             )
             .await
-            .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"));
-
-        drop(client);
-        conn_task.abort();
-        let _ = conn_task.await;
-        result?;
+            .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
         Ok(())
-    })
+    }))
 }
 
 // ── Main run function ─────────────────────────────────────────────────────────

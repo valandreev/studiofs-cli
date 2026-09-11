@@ -100,7 +100,12 @@ pub fn validate_checkpoint_descriptor(
             reason: CheckpointDescriptorFailure::Generation,
         });
     }
-    if sha256 != Some(Sha256::digest(snapshot_bytes).as_slice()) {
+    let Some(sha256) = sha256 else {
+        return Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::Checksum,
+        });
+    };
+    if sha256.len() != 32 || sha256 != Sha256::digest(snapshot_bytes).as_slice() {
         return Err(MetaError::InvalidCheckpointDescriptor {
             reason: CheckpointDescriptorFailure::Checksum,
         });
@@ -294,6 +299,20 @@ mod tests {
     }
 
     #[test]
+    fn format_info_decode_reports_malformed_payloads() {
+        for bytes in [
+            b"".as_slice(),
+            b"{".as_slice(),
+            br#"{"name":"missing-version"}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                decode_format_info(bytes),
+                Err(MetaError::Serialization(_))
+            ));
+        }
+    }
+
+    #[test]
     fn checkpoint_descriptor_validator_reports_each_invalid_field() {
         let bytes = b"checkpoint";
         let digest = Sha256::digest(bytes);
@@ -328,6 +347,36 @@ mod tests {
                 MetaError::InvalidCheckpointDescriptor { reason: actual } if actual == reason
             ));
         }
+    }
+
+    #[test]
+    fn checkpoint_descriptor_validator_rejects_missing_or_malformed_checksum() {
+        let bytes = b"checkpoint";
+        for checksum in [None, Some(&[0; 31][..])] {
+            let error = validate_checkpoint_descriptor(bytes, checksum, Some("published"), Some(1))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                MetaError::InvalidCheckpointDescriptor {
+                    reason: CheckpointDescriptorFailure::Checksum
+                }
+            ));
+        }
+
+        let digest = Sha256::digest(bytes);
+        let error = validate_checkpoint_descriptor(
+            bytes,
+            Some(digest.as_slice()),
+            Some("published"),
+            Some(-1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetaError::InvalidCheckpointDescriptor {
+                reason: CheckpointDescriptorFailure::Generation
+            }
+        ));
     }
 
     #[test]

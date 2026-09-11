@@ -356,7 +356,7 @@ impl PgMetaEngine {
                                     &version,
                                     &version,
                                     &payload,
-                                    &&checkpoint_sha256[..],
+                                    &checkpoint_sha256.as_slice(),
                                     &format_info,
                                 ],
                             )

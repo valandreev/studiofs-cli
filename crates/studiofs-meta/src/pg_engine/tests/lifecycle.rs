@@ -2,6 +2,24 @@ use super::*;
 use crate::engine::MetaAcl;
 use crate::redb_engine::RedbSnapshot;
 
+async fn with_pg_test_client<T, F, Fut>(dsn: &str, f: F) -> Result<T, MetaError>
+where
+    F: FnOnce(tokio_postgres::Client) -> Fut,
+    Fut: std::future::Future<Output = Result<T, MetaError>>,
+{
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let result = f(client).await;
+    conn_task.abort();
+    let _ = conn_task.await;
+    result
+}
+
 #[test]
 fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
     let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
@@ -846,13 +864,7 @@ fn test_pg_flush_advances_checkpoint_version() {
     create_published_small_file(&pg, ROOT_INO, b"a.txt", 44_010);
     pg.flush_metadata().expect("flush metadata");
     let ok = wait_until(Duration::from_secs(10), || {
-        run_async(async {
-            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
+        run_async(with_pg_test_client(&dsn, |client| async move {
             let row = client
                 .query_opt(
                     "SELECT version FROM metadata_state WHERE vol=$1",
@@ -860,9 +872,8 @@ fn test_pg_flush_advances_checkpoint_version() {
                 )
                 .await
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            conn_task.abort();
             Ok::<bool, MetaError>(row.map(|r| r.get::<_, i64>(0) >= 1).unwrap_or(false))
-        })
+        }))
         .unwrap_or(false)
     });
     assert!(ok, "expected metadata_state version >= 1");
@@ -888,13 +899,7 @@ fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
     pg.write_checkpoint_locked()
         .expect("write stale checkpoint");
 
-    let version = run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    let version = run_async(with_pg_test_client(&dsn, |client| async move {
         let row = client
             .query_one(
                 "SELECT version FROM metadata_state WHERE vol=$1",
@@ -902,9 +907,8 @@ fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        conn_task.abort();
         Ok::<i64, MetaError>(row.get(0))
-    })
+    }))
     .expect("query checkpoint version");
 
     assert_eq!(
@@ -927,13 +931,7 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
 
     let pg = PgMetaEngine::open(&db).expect("open pg");
     let legacy_format = (CURRENT_FORMAT_VERSION - 1) as i16;
-    run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    run_async(with_pg_test_client(&dsn, |client| async move {
         client
             .execute(
                 "UPDATE metadata_state SET metadata_format_version = $1 WHERE vol = $2",
@@ -941,9 +939,8 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        conn_task.abort();
         Ok::<(), MetaError>(())
-    })
+    }))
     .expect("restore legacy metadata format");
 
     let error = pg
@@ -960,13 +957,7 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
         "unexpected checkpoint format error: {error}"
     );
 
-    let actual = run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    let actual = run_async(with_pg_test_client(&dsn, |client| async move {
         let row = client
             .query_one(
                 "SELECT metadata_format_version FROM metadata_state WHERE vol = $1",
@@ -974,9 +965,8 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        conn_task.abort();
         Ok::<i16, MetaError>(row.get(0))
-    })
+    }))
     .expect("read legacy metadata format");
     assert_eq!(actual, legacy_format, "legacy format must not be promoted");
 }
@@ -995,13 +985,7 @@ fn test_pg_event_publication_refuses_legacy_format() {
 
     let pg = PgMetaEngine::open(&db).expect("open pg");
     let legacy_format = (CURRENT_FORMAT_VERSION - 1) as i16;
-    run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    run_async(with_pg_test_client(&dsn, |client| async move {
         client
             .execute(
                 "UPDATE metadata_state SET metadata_format_version = $1 WHERE vol = $2",
@@ -1009,9 +993,8 @@ fn test_pg_event_publication_refuses_legacy_format() {
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        conn_task.abort();
         Ok::<(), MetaError>(())
-    })
+    }))
     .expect("restore legacy metadata format");
 
     let error = pg
@@ -1032,13 +1015,7 @@ fn test_pg_event_publication_refuses_legacy_format() {
         "unexpected event publication format error: {error}"
     );
 
-    let (version, event_count) = run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    let (version, event_count) = run_async(with_pg_test_client(&dsn, |client| async move {
         let row = client
             .query_one(
                 "SELECT version, (SELECT count(*) FROM event_log WHERE vol = $1) FROM metadata_state WHERE vol = $1",
@@ -1046,9 +1023,8 @@ fn test_pg_event_publication_refuses_legacy_format() {
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        conn_task.abort();
         Ok::<(i64, i64), MetaError>((row.get(0), row.get(1)))
-    })
+    }))
     .expect("read legacy publication state");
     assert_eq!(
         version, 0,
@@ -1070,13 +1046,7 @@ fn test_pg_checkpoint_repairs_missing_remote_format_info() {
     seed_local(&db, &volume.format_info());
 
     let pg = PgMetaEngine::open(&db).expect("open pg");
-    run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    run_async(with_pg_test_client(&dsn, |client| async move {
         client
             .execute(
                 "UPDATE metadata_state SET format_info = decode('', 'hex') WHERE vol = $1",
@@ -1084,21 +1054,14 @@ fn test_pg_checkpoint_repairs_missing_remote_format_info() {
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        conn_task.abort();
         Ok::<(), MetaError>(())
-    })
+    }))
     .expect("clear remote format info");
 
     pg.write_checkpoint_locked()
         .expect("write checkpoint with format info");
 
-    let actual = run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+    let actual = run_async(with_pg_test_client(&dsn, |client| async move {
         let row = client
             .query_one(
                 "SELECT format_info FROM metadata_state WHERE vol = $1",
@@ -1106,9 +1069,8 @@ fn test_pg_checkpoint_repairs_missing_remote_format_info() {
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        conn_task.abort();
         Ok::<Vec<u8>, MetaError>(row.get(0))
-    })
+    }))
     .expect("read repaired format info");
 
     assert_eq!(

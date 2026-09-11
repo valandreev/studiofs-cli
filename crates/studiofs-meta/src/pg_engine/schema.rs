@@ -74,12 +74,11 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             checkpoint_version BIGINT NOT NULL DEFAULT 0,
             snapshot BYTEA NOT NULL,
             checkpoint_sha256 BYTEA NOT NULL
-                DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
                 CHECK (octet_length(checkpoint_sha256) = 32),
             format_info BYTEA NOT NULL DEFAULT decode('', 'hex'),
-            checkpoint_publication_state TEXT NOT NULL DEFAULT 'published'
+            checkpoint_publication_state TEXT NOT NULL
                 CHECK (checkpoint_publication_state IN ('pending', 'published')),
-            checkpoint_generation BIGINT NOT NULL DEFAULT 0
+            checkpoint_generation BIGINT NOT NULL
                 CHECK (checkpoint_generation >= 0),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -764,5 +763,18 @@ mod tests {
                 >= 2
         );
         assert!(sql.matches("CHECK (checkpoint_generation >= 0)").count() >= 2);
+
+        let fresh_metadata_state = sql
+            .split("ALTER TABLE metadata_state")
+            .next()
+            .expect("fresh metadata_state DDL");
+        assert!(
+            !fresh_metadata_state
+                .contains("checkpoint_sha256 BYTEA NOT NULL\n                DEFAULT")
+        );
+        assert!(
+            !fresh_metadata_state.contains("checkpoint_publication_state TEXT NOT NULL DEFAULT")
+        );
+        assert!(!fresh_metadata_state.contains("checkpoint_generation BIGINT NOT NULL DEFAULT"));
     }
 }

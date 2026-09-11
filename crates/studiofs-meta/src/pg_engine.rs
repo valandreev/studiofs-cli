@@ -231,6 +231,7 @@ pub struct PgMetaEngine {
     /// runtime. A local-first startup may leave this pending while PostgreSQL
     /// is unavailable; no remote pull or publication may pass that boundary.
     remote_format_validated: AtomicBool,
+    remote_format_validation_lock: Mutex<()>,
 }
 
 /// PostgreSQL-only snapshot capabilities for callers that must not open the
@@ -557,7 +558,7 @@ impl PgMetaEngine {
                             .collect::<Vec<_>>()
                             .join(", ");
                         return Err(MetaError::Storage(format!(
-                            "postgres schema is missing required table(s): {missing}; recreate the PostgreSQL volume with `studiofs init`, then run `studiofs discover` for a fresh client"
+                            "postgres schema is missing required table(s): {missing}; recreate the PostgreSQL volume with `studiofs destroy` followed by `studiofs init`, then run `studiofs discover` for a fresh client"
                         )));
                     }
 
@@ -592,7 +593,7 @@ impl PgMetaEngine {
                             .collect::<Vec<_>>()
                             .join(", ");
                         return Err(MetaError::Storage(format!(
-                            "postgres schema is missing required column(s): {missing}; recreate the PostgreSQL volume with `studiofs init`, then run `studiofs discover` for a fresh client"
+                            "postgres schema is missing required column(s): {missing}; recreate the PostgreSQL volume with `studiofs destroy` followed by `studiofs init`, then run `studiofs discover` for a fresh client"
                         )));
                     }
 
@@ -618,8 +619,18 @@ impl PgMetaEngine {
                 )
             });
             connection_task.abort();
-            let () = result??;
-            Ok(StartupSchemaValidation::Available)
+            let _ = connection_task.await;
+            match result {
+                Ok(Ok(())) => Ok(StartupSchemaValidation::Available),
+                Ok(Err(error)) if Self::is_postgres_unavailable(&error) => {
+                    Ok(StartupSchemaValidation::Fallback(error))
+                }
+                Ok(Err(error)) if matches!(&error, MetaError::Timeout(_)) => {
+                    Ok(StartupSchemaValidation::Fallback(error))
+                }
+                Ok(Err(error)) => Err(error),
+                Err(error) => Ok(StartupSchemaValidation::Fallback(error)),
+            }
         })
     }
 
@@ -628,22 +639,46 @@ impl PgMetaEngine {
     }
 
     fn ensure_remote_format_validated(&self) -> MetaResult<()> {
+        let _guard = self
+            .remote_format_validation_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg format validation lock poisoned".to_string()))?;
         if self.remote_format_validated.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        match Self::validate_postgres_schema(
-            &self.postgres_url,
-            self.volume_id,
-            self.connect_timeout,
-            self.command_timeout,
-        )? {
-            StartupSchemaValidation::Available => {
-                self.remote_format_validated.store(true, Ordering::Release);
-                Ok(())
-            }
-            StartupSchemaValidation::Fallback(error) => Err(error),
-        }
+        self.validate_remote_format_version()?;
+        self.remote_format_validated.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn validate_remote_format_version(&self) -> MetaResult<()> {
+        let command_pool = Arc::clone(&self.command_pool);
+        let volume_id = self.volume_id;
+        let command_timeout = self.command_timeout;
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                command_pool,
+                command_timeout,
+                "validate postgres format",
+                move |client| {
+                    Box::pin(async move {
+                        let row = client
+                            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres metadata format query failed",
+                                    error,
+                                )
+                            })?;
+                        let found = row.and_then(|row| row.get::<_, Option<i16>>(0));
+                        crate::ensure_supported_pg_sync_format_version(found)
+                    })
+                },
+            )
+            .await
+        })
     }
 
     fn invalidate_remote_format_validation(&self) {
@@ -797,6 +832,7 @@ impl PgMetaEngine {
             metadata_remote_head_version: AtomicI64::new(-1),
             metadata_source_connected: AtomicBool::new(false),
             remote_format_validated: AtomicBool::new(remote_format_validated),
+            remote_format_validation_lock: Mutex::new(()),
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 

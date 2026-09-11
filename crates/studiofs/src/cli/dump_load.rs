@@ -252,6 +252,7 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
         .ok_or_else(|| DumpLoadError::Message("volume is not postgres-backed".to_string()))?;
 
     let dump = load_remote_dump(&pg.url, pg.volume_id)?;
+    validate_dump(&dump)?;
 
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -561,6 +562,21 @@ mod tests {
             err,
             DumpLoadError::Meta(MetaError::InvalidCheckpointDescriptor {
                 reason: studiofs_meta::CheckpointDescriptorFailure::Checksum
+            })
+        ));
+    }
+
+    #[test]
+    fn dump_checkpoint_validation_rejects_legacy_metadata_format() {
+        let mut dump = test_dump();
+        dump.metadata_state_format_version = 4;
+
+        let err = validate_dump(&dump).unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Meta(MetaError::UnsupportedFormatVersion {
+                found: 4,
+                expected: 5
             })
         ));
     }
