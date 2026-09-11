@@ -594,6 +594,9 @@ impl PgMetaEngine {
         } else {
             self.refresh_pg_sync_lifecycle_for_allocator();
         }
+        // A later recovery cycle must capture its own startup target.
+        self.metadata_startup_target_version
+            .store(-1, Ordering::Release);
         Ok(())
     }
 

@@ -876,6 +876,40 @@ fn catchup_completion_uses_frozen_startup_target() {
 }
 
 #[test]
+fn catchup_completion_requires_a_new_target_after_recovery() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .try_complete_catchup_sync()
+        .expect("complete the first recovery cycle");
+
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::Degraded as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    engine
+        .local_version
+        .store(8, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(10, std::sync::atomic::Ordering::Release);
+    engine
+        .try_complete_catchup_sync()
+        .expect("inspect the second recovery cycle");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+}
+
+#[test]
 fn concurrent_catchup_completion_preserves_live_lifecycle() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine.pg_sync_lifecycle.store(
