@@ -5,6 +5,7 @@ use super::RemoteApplyCoordinator;
 use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
 use crate::engine::{MetaError, MetaFormat, MetaResult};
 use crate::events::{MetaEvent, encode_event};
+use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
@@ -173,6 +174,12 @@ impl PgMetaEngine {
         let client_id = self.client_id.clone();
         let now_ms = Self::now_millis();
         let events_vec = events;
+        let expected_metadata_format_version =
+            i16::try_from(CURRENT_FORMAT_VERSION).map_err(|_| {
+                MetaError::Storage(
+                    "metadata format version exceeds PostgreSQL SMALLINT".to_string(),
+                )
+            })?;
         let command_timeout = self.command_timeout;
 
         let result = self.run_async(async move {
@@ -186,13 +193,35 @@ impl PgMetaEngine {
                         .await
                         .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
-                    let batch_version: i64 = tx
-                        .query_one(sql::BUMP_METADATA_VERSION, &[&volume_id])
+                    let batch_version_row = tx
+                        .query_opt(
+                            sql::BUMP_METADATA_VERSION,
+                            &[&volume_id, &expected_metadata_format_version],
+                        )
                         .await
                         .map_err(|e| {
                             Self::classify_pg_error("postgres metadata_state bump failed", e)
-                        })?
-                        .get(0);
+                        })?;
+                    let Some(batch_version_row) = batch_version_row else {
+                        let format_row = tx
+                            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres metadata format revalidation failed",
+                                    e,
+                                )
+                            })?;
+                        let found = format_row
+                            .as_ref()
+                            .and_then(|row| row.get::<_, Option<i16>>(0));
+                        crate::ensure_supported_pg_sync_format_version(found)?;
+                        return Err(MetaError::Storage(
+                            "postgres metadata version bump did not update the current-format row"
+                                .to_string(),
+                        ));
+                    };
+                    let batch_version: i64 = batch_version_row.get(0);
 
                     for chunk in events_vec.chunks(PG_EVENT_INSERT_CHUNK_SIZE) {
                         let event_types: Vec<&str> =

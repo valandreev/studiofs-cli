@@ -388,6 +388,20 @@ impl PgMetaEngine {
         Some(batch)
     }
 
+    fn pending_batch_is_due(&self) -> bool {
+        let Ok(state) = self.pending_state.lock() else {
+            return false;
+        };
+        state.ops > 0
+            && state.event_start.is_some()
+            && (state.force_flush
+                || Self::should_flush_due_interval(
+                    &state,
+                    self.flush_idle_grace,
+                    self.flush_interval,
+                ))
+    }
+
     pub(super) fn restore_pending_batch(&self, batch: ClaimedPendingBatch) {
         self.finish_claimed_batch(batch);
         if let Ok(mut state) = self.pending_state.lock() {
@@ -472,8 +486,11 @@ impl PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        self.ensure_remote_format_validated()?;
         self.replay_local_upload_ledger()?;
+        if !self.pending_batch_is_due() {
+            return Ok(());
+        }
+        self.ensure_remote_format_validated()?;
         let Some(batch) = self.claim_pending_batch(false) else {
             return Ok(());
         };

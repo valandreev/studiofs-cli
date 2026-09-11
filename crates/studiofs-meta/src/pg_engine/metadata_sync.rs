@@ -142,8 +142,31 @@ impl PgMetaEngine {
                 "pull foreign events",
                 move |client| {
                     Box::pin(async move {
-                        let client: &tokio_postgres::Client = client;
-                        Self::query_foreign_event_rows(client, volume_id, last_seq).await
+                        let tx = client.transaction().await.map_err(|e| {
+                            Self::classify_pg_error("postgres begin pull transaction failed", e)
+                        })?;
+                        let format_row = tx
+                            .query_opt(
+                                "SELECT metadata_format_version FROM metadata_state WHERE vol = $1 FOR SHARE",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres metadata format revalidation failed",
+                                    e,
+                                )
+                            })?;
+                        let found = format_row
+                            .as_ref()
+                            .and_then(|row| row.get::<_, Option<i16>>(0));
+                        crate::ensure_supported_pg_sync_format_version(found)?;
+
+                        let rows = Self::query_foreign_event_rows(&tx, volume_id, last_seq).await?;
+                        tx.commit().await.map_err(|e| {
+                            Self::classify_pg_error("postgres pull transaction commit failed", e)
+                        })?;
+                        Ok(rows)
                     })
                 },
             )

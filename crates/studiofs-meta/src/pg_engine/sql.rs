@@ -1,12 +1,14 @@
 pub(super) const SELECT_METADATA_VERSION: &str = "SELECT version FROM metadata_state WHERE vol=$1";
 
 pub(super) const SELECT_METADATA_SNAPSHOT: &str = "SELECT version, checkpoint_version, snapshot, metadata_format_version, checkpoint_sha256, checkpoint_publication_state, checkpoint_generation FROM metadata_state WHERE vol=$1";
+pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =
+    "SELECT metadata_format_version FROM metadata_state WHERE vol = $1";
 
 pub(super) const BUMP_METADATA_VERSION: &str = r#"
     UPDATE metadata_state
     SET version = version + 1,
         updated_at = now()
-    WHERE vol = $1
+    WHERE vol = $1 AND metadata_format_version = $2
     RETURNING version
     "#;
 
