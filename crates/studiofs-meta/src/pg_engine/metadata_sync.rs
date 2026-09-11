@@ -59,6 +59,7 @@ impl PgMetaEngine {
                 }
             }
             Err(_) => {
+                self.invalidate_remote_format_validation();
                 self.metadata_source_connected
                     .store(false, Ordering::Release);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
@@ -68,6 +69,7 @@ impl PgMetaEngine {
 
     pub(super) fn sync_metadata_with_source(&self, source: MetadataSyncSource) -> MetaResult<bool> {
         let result = (|| {
+            self.ensure_remote_format_validated()?;
             let _guard = self
                 .replication_lock
                 .lock()
@@ -88,6 +90,7 @@ impl PgMetaEngine {
         // bounded operation.
         const MAX_STARTUP_CATCHUP_ROUNDS: usize = 16;
 
+        self.ensure_remote_format_validated()?;
         let mut target_head = self.remote_metadata_head_version()?;
         for _ in 0..MAX_STARTUP_CATCHUP_ROUNDS {
             if self.local_version.load(Ordering::SeqCst) >= target_head {
@@ -114,6 +117,15 @@ impl PgMetaEngine {
     }
 
     pub(super) fn pull_foreign_events_locked(
+        &self,
+        recent_flush: Option<&RecentFlush>,
+    ) -> MetaResult<bool> {
+        self.ensure_remote_format_validated()?;
+        let result = self.pull_foreign_events_locked_inner(recent_flush);
+        self.record_remote_operation_result(result)
+    }
+
+    fn pull_foreign_events_locked_inner(
         &self,
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {

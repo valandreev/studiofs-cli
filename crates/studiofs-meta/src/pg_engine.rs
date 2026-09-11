@@ -13,7 +13,6 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
 use std::path::Path;
-#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -228,6 +227,10 @@ pub struct PgMetaEngine {
     metadata_remote_head_version: AtomicI64,
     /// Whether the most recent metadata synchronization command succeeded.
     metadata_source_connected: AtomicBool,
+    /// Whether PostgreSQL's sync format was validated successfully for this
+    /// runtime. A local-first startup may leave this pending while PostgreSQL
+    /// is unavailable; no remote pull or publication may pass that boundary.
+    remote_format_validated: AtomicBool,
 }
 
 /// PostgreSQL-only snapshot capabilities for callers that must not open the
@@ -624,6 +627,36 @@ impl PgMetaEngine {
         matches!(error, MetaError::RemoteUnavailable(_))
     }
 
+    fn ensure_remote_format_validated(&self) -> MetaResult<()> {
+        if self.remote_format_validated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        match Self::validate_postgres_schema(
+            &self.postgres_url,
+            self.volume_id,
+            self.connect_timeout,
+            self.command_timeout,
+        )? {
+            StartupSchemaValidation::Available => {
+                self.remote_format_validated.store(true, Ordering::Release);
+                Ok(())
+            }
+            StartupSchemaValidation::Fallback(error) => Err(error),
+        }
+    }
+
+    fn invalidate_remote_format_validation(&self) {
+        self.remote_format_validated.store(false, Ordering::Release);
+    }
+
+    fn record_remote_operation_result<T>(&self, result: MetaResult<T>) -> MetaResult<T> {
+        if result.is_err() {
+            self.invalidate_remote_format_validation();
+        }
+        result
+    }
+
     /// Open the PostgreSQL-backed metadata engine using default startup options.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
         Self::open_with_options(path, PgOpenOptions::default())
@@ -685,21 +718,22 @@ impl PgMetaEngine {
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
-        match Self::validate_postgres_schema(
+        let remote_format_validated = match Self::validate_postgres_schema(
             &pg.url,
             pg.volume_id,
             connect_timeout,
             command_timeout,
         ) {
-            Ok(StartupSchemaValidation::Available) => {}
+            Ok(StartupSchemaValidation::Available) => true,
             Ok(StartupSchemaValidation::Fallback(error)) => {
                 warn!(
                     error = %error,
                     "postgres schema validation unavailable; continuing with local-first startup"
                 );
+                false
             }
             Err(error) => return Err(error),
-        }
+        };
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
         let client_slot = match persisted_client_slot {
@@ -762,6 +796,7 @@ impl PgMetaEngine {
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             metadata_remote_head_version: AtomicI64::new(-1),
             metadata_source_connected: AtomicBool::new(false),
+            remote_format_validated: AtomicBool::new(remote_format_validated),
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 

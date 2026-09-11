@@ -43,8 +43,7 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, 'published', 1)
     ON CONFLICT (vol) DO UPDATE
-    SET metadata_format_version = EXCLUDED.metadata_format_version,
-        version = GREATEST(metadata_state.version, EXCLUDED.version),
+    SET version = GREATEST(metadata_state.version, EXCLUDED.version),
         checkpoint_version = EXCLUDED.checkpoint_version,
         snapshot = EXCLUDED.snapshot,
         checkpoint_sha256 = EXCLUDED.checkpoint_sha256,
@@ -52,7 +51,9 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
         checkpoint_publication_state = EXCLUDED.checkpoint_publication_state,
         checkpoint_generation = metadata_state.checkpoint_generation + 1,
         updated_at = now()
-    WHERE EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
+    WHERE metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
+      AND EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
+    RETURNING metadata_format_version
     "#;
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"

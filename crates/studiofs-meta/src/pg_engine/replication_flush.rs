@@ -472,6 +472,7 @@ impl PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        self.ensure_remote_format_validated()?;
         self.replay_local_upload_ledger()?;
         let Some(batch) = self.claim_pending_batch(false) else {
             return Ok(());

@@ -14,6 +14,15 @@ impl PgMetaEngine {
         &self,
         import_mode: StartupSnapshotImportMode,
     ) -> MetaResult<bool> {
+        self.ensure_remote_format_validated()?;
+        let result = self.pull_snapshot_locked_inner(import_mode);
+        self.record_remote_operation_result(result)
+    }
+
+    fn pull_snapshot_locked_inner(
+        &self,
+        import_mode: StartupSnapshotImportMode,
+    ) -> MetaResult<bool> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let local_version = self.local_version.load(Ordering::SeqCst);
@@ -113,11 +122,12 @@ impl PgMetaEngine {
     }
 
     pub(super) fn remote_metadata_head_version(&self) -> MetaResult<i64> {
+        self.ensure_remote_format_validated()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
 
-        self.run_async(async move {
+        let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
@@ -138,7 +148,8 @@ impl PgMetaEngine {
                 },
             )
             .await
-        })
+        });
+        self.record_remote_operation_result(result)
     }
 
     #[cfg(test)]
@@ -155,6 +166,8 @@ impl PgMetaEngine {
             return Ok(self.local_version.load(Ordering::SeqCst));
         }
 
+        self.ensure_remote_format_validated()?;
+
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
@@ -162,7 +175,7 @@ impl PgMetaEngine {
         let events_vec = events;
         let command_timeout = self.command_timeout;
 
-        self.run_async(async move {
+        let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
@@ -264,7 +277,8 @@ impl PgMetaEngine {
                 }),
             )
             .await
-        })
+        });
+        self.record_remote_operation_result(result)
     }
 
     pub(super) async fn query_foreign_event_rows<C>(
@@ -282,6 +296,7 @@ impl PgMetaEngine {
     }
 
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
+        self.ensure_remote_format_validated()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let payload = self.local.export_serving_checkpoint_bytes()?;
@@ -296,15 +311,15 @@ impl PgMetaEngine {
         let version = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
 
-        self.run_async(async move {
+        let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
                 "write checkpoint",
                 move |client| {
                     Box::pin(async move {
-                        client
-                            .execute(
+                        let upserted = client
+                            .query_opt(
                                 sql::UPSERT_METADATA_CHECKPOINT,
                                 &[
                                     &volume_id,
@@ -321,11 +336,28 @@ impl PgMetaEngine {
                                 Self::classify_pg_error("postgres checkpoint upsert failed", e)
                             })?;
 
+                        if upserted.is_none() {
+                            let row = client
+                                .query_one(
+                                    "SELECT metadata_format_version FROM metadata_state WHERE vol = $1",
+                                    &[&volume_id],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres checkpoint format revalidation failed",
+                                        e,
+                                    )
+                                })?;
+                            crate::ensure_supported_pg_sync_format_version(row.get(0))?;
+                        }
+
                         Ok(())
                     })
                 },
             )
             .await
-        })
+        });
+        self.record_remote_operation_result(result)
     }
 }
