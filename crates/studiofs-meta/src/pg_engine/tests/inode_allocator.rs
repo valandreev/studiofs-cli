@@ -54,6 +54,24 @@ fn allocator_uses_separate_inode_and_payload_namespaces() {
 }
 
 #[test]
+fn trusted_pg_allocator_enters_live_lifecycle_and_losing_headroom_enters_pending() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+
+    let live = engine.pg_sync_status();
+    assert_eq!(live.lifecycle, PgSyncLifecycle::Live);
+    assert!(live.allows_new_mutations());
+
+    engine
+        .inode_id_headroom_available
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine.refresh_pg_sync_lifecycle_for_allocator();
+
+    let pending = engine.pg_sync_status();
+    assert_eq!(pending.lifecycle, PgSyncLifecycle::AllocatorPending);
+    assert!(!pending.allows_new_mutations());
+}
+
+#[test]
 fn sfs623_recovery_trusted_state_allocates_offline_after_reopen() {
     let (dir, pg) = temp_pg_engine_for_unit();
     let first = pg.next_inode().expect("allocate first inode");

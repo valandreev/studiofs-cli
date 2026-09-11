@@ -20,6 +20,27 @@ where
     result
 }
 
+#[test]
+fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
+    let cases = [
+        (0, PgSyncLifecycle::LocalReady),
+        (1, PgSyncLifecycle::CatchingUp),
+        (2, PgSyncLifecycle::TargetReached),
+        (3, PgSyncLifecycle::AllocatorPending),
+        (4, PgSyncLifecycle::Live),
+        (5, PgSyncLifecycle::Degraded),
+        (6, PgSyncLifecycle::Fatal),
+    ];
+
+    for (raw, expected) in cases {
+        assert_eq!(PgMetaEngine::pg_sync_lifecycle_from_raw(raw), expected);
+    }
+    assert_eq!(
+        PgMetaEngine::pg_sync_lifecycle_from_raw(u8::MAX),
+        PgSyncLifecycle::Fatal
+    );
+}
+
 struct EventLogLockGuard {
     release_tx: Option<tokio::sync::oneshot::Sender<()>>,
     lock_thread: Option<std::thread::JoinHandle<()>>,

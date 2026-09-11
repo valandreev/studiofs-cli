@@ -493,45 +493,6 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     (dir, engine)
 }
 
-#[test]
-fn trusted_pg_allocator_enters_live_lifecycle_and_losing_headroom_enters_pending() {
-    let (_dir, engine) = temp_pg_engine_for_unit();
-
-    let live = engine.pg_sync_status();
-    assert_eq!(live.lifecycle, PgSyncLifecycle::Live);
-    assert!(live.allows_new_mutations());
-
-    engine
-        .inode_id_headroom_available
-        .store(false, std::sync::atomic::Ordering::Release);
-    engine.refresh_pg_sync_lifecycle_for_allocator();
-
-    let pending = engine.pg_sync_status();
-    assert_eq!(pending.lifecycle, PgSyncLifecycle::AllocatorPending);
-    assert!(!pending.allows_new_mutations());
-}
-
-#[test]
-fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
-    let cases = [
-        (0, PgSyncLifecycle::LocalReady),
-        (1, PgSyncLifecycle::CatchingUp),
-        (2, PgSyncLifecycle::TargetReached),
-        (3, PgSyncLifecycle::AllocatorPending),
-        (4, PgSyncLifecycle::Live),
-        (5, PgSyncLifecycle::Degraded),
-        (6, PgSyncLifecycle::Fatal),
-    ];
-
-    for (raw, expected) in cases {
-        assert_eq!(PgMetaEngine::pg_sync_lifecycle_from_raw(raw), expected);
-    }
-    assert_eq!(
-        PgMetaEngine::pg_sync_lifecycle_from_raw(u8::MAX),
-        PgSyncLifecycle::Fatal
-    );
-}
-
 fn apply_projected_remote_range(
     writer: &PgMetaEngine,
     remote: &PgMetaEngine,
