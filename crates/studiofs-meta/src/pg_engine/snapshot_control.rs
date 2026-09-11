@@ -60,6 +60,7 @@ enum SnapshotSourceError {
     Retryable,
     Permanent,
     MissingFormatInfo,
+    UnsupportedFormatVersion { found: u16, expected: u16 },
 }
 
 impl SnapshotSourceError {
@@ -92,6 +93,12 @@ impl SnapshotSourceError {
             Self::MissingFormatInfo => SnapshotPortError::permanent(
                 "missing_format_info",
                 "snapshot source format info is missing",
+            ),
+            Self::UnsupportedFormatVersion { found, expected } => SnapshotPortError::permanent(
+                "unsupported_format_version",
+                &format!(
+                    "format {found} expected {expected} recreate metadata or run studiofs discover"
+                ),
             ),
         }
     }
@@ -368,17 +375,15 @@ impl PgSnapshotBackend {
         if raw.format_info_bytes.is_empty() {
             return Err(SnapshotSourceError::MissingFormatInfo);
         }
-        let format_info: FormatInfo =
-            serde_json::from_slice(&raw.format_info_bytes).map_err(|_| {
-                SnapshotSourceError::permanent(snapshot_control_error(
+        let format_info =
+            crate::decode_format_info(&raw.format_info_bytes).map_err(|error| match error {
+                MetaError::UnsupportedFormatVersion { found, expected } => {
+                    SnapshotSourceError::UnsupportedFormatVersion { found, expected }
+                }
+                _ => SnapshotSourceError::permanent(snapshot_control_error(
                     "snapshot format info is invalid",
-                ))
+                )),
             })?;
-        format_info.validate_format_contract().map_err(|_| {
-            SnapshotSourceError::permanent(snapshot_control_error(
-                "snapshot format info is invalid",
-            ))
-        })?;
         let descriptor = SnapshotSourceDescriptor {
             checkpoint_id: snapshot_id_text,
             checkpoint_version: raw.checkpoint_version,
@@ -988,6 +993,19 @@ mod tests {
                 .into_port_error()
                 .to_string(),
             "snapshot operation rejected: missing_format_info: snapshot source format info is missing"
+        );
+    }
+
+    #[test]
+    fn unsupported_format_is_reported_with_recreate_guidance() {
+        assert_eq!(
+            SnapshotSourceError::UnsupportedFormatVersion {
+                found: 4,
+                expected: 5,
+            }
+            .into_port_error()
+            .to_string(),
+            "snapshot operation rejected: unsupported_format_version: format 4 expected 5 recreate metadata or run studiofs discover"
         );
     }
 }

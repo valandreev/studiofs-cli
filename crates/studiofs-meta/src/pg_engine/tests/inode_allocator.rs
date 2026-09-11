@@ -85,6 +85,10 @@ fn sfs623_recovery_trusted_state_allocates_offline_after_reopen() {
         },
     )
     .expect("reopen PgMetaEngine with PostgreSQL unavailable");
+    assert!(
+        !reopened.remote_format_validated.load(Ordering::Acquire),
+        "offline startup must leave remote format validation pending"
+    );
     let next = reopened
         .next_inode()
         .expect("allocate after offline restart");

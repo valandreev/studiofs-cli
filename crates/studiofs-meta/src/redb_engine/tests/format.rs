@@ -90,8 +90,7 @@ fn format_info_decode_reports_unsupported_version_before_missing_encryption() {
     });
 
     let err =
-        super::format::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice())
-            .unwrap_err();
+        crate::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -100,6 +99,66 @@ fn format_info_decode_reports_unsupported_version_before_missing_encryption() {
             expected
         } if found == CURRENT_FORMAT_VERSION - 1 && expected == CURRENT_FORMAT_VERSION
     ));
+}
+
+#[test]
+fn legacy_pg_sync_format_requires_recreate_or_discover() {
+    let legacy = serde_json::json!({
+        "format_version": 4,
+        "name": "legacy-pg-sync",
+        "uuid": "legacy-pg-sync-uuid",
+        "endpoint": "http://localhost:9000",
+        "bucket": "legacy-bucket",
+        "access_key": "studiofs",
+        "secret_key": "studiofs123",
+        "region": "",
+        "data_prefix": "legacy-volume/objects/",
+        "metadata": {},
+        "block_size": DEFAULT_BLOCK_SIZE
+    });
+
+    let err = crate::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice())
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        MetaError::UnsupportedFormatVersion {
+            found: 4,
+            expected: 5
+        }
+    ));
+    let message = err.to_string();
+    assert!(message.contains("recreate"), "error must guide recreation: {message}");
+    assert!(message.contains("discover"), "error must guide discovery: {message}");
+}
+
+#[test]
+fn incompatible_redb_open_rejects_before_creating_schema_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-format.db");
+    let db = redb::Database::create(&path).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(SETTINGS_TABLE).unwrap();
+        table
+            .insert("format", br#"{"format_version":4}"#.as_slice())
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    drop(db);
+
+    let result = RedbMetaEngine::open(&path);
+    assert!(matches!(
+        result,
+        Err(MetaError::UnsupportedFormatVersion {
+            found: 4,
+            expected: 5
+        })
+    ));
+
+    let db = redb::ReadOnlyDatabase::open(&path).unwrap();
+    let txn = db.begin_read().unwrap();
+    assert_eq!(txn.list_tables().unwrap().count(), 1);
 }
 
 #[test]

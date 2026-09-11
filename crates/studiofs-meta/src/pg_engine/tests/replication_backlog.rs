@@ -4,6 +4,18 @@ use std::sync::Barrier;
 use std::thread;
 
 #[test]
+fn flush_due_pending_skips_remote_validation_when_no_batch_is_due() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    pg.flush_due_pending()
+        .expect("idle flush must not contact unavailable PostgreSQL");
+    assert!(
+        !pg.remote_format_validated.load(Ordering::Acquire),
+        "idle flush must leave the pending format validation state unchanged"
+    );
+}
+
+#[test]
 fn pending_replay_lock_blocks_local_mutation_before_commit() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let pg = Arc::new(pg);

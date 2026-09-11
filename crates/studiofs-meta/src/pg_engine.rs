@@ -13,7 +13,6 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
 use std::path::Path;
-#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -228,6 +227,11 @@ pub struct PgMetaEngine {
     metadata_remote_head_version: AtomicI64,
     /// Whether the most recent metadata synchronization command succeeded.
     metadata_source_connected: AtomicBool,
+    /// Whether PostgreSQL's sync format was validated successfully for this
+    /// runtime. A local-first startup may leave this pending while PostgreSQL
+    /// is unavailable; no remote pull or publication may pass that boundary.
+    remote_format_validated: AtomicBool,
+    remote_format_validation_lock: Mutex<()>,
 }
 
 /// PostgreSQL-only snapshot capabilities for callers that must not open the
@@ -472,6 +476,7 @@ impl PgMetaEngine {
 
     fn validate_postgres_schema(
         postgres_url: &str,
+        volume_id: i64,
         connect_timeout: Duration,
         command_timeout: Duration,
     ) -> MetaResult<StartupSchemaValidation> {
@@ -553,9 +558,56 @@ impl PgMetaEngine {
                             .collect::<Vec<_>>()
                             .join(", ");
                         return Err(MetaError::Storage(format!(
-                            "postgres schema is missing required table(s): {missing}; run `studiofs init`"
+                            "postgres schema is missing required table(s): {missing}; recreate the PostgreSQL volume with `studiofs destroy` followed by `studiofs init`, then run `studiofs discover` for a fresh client"
                         )));
                     }
+
+                    let rows = client
+                        .query(
+                            r#"
+                            SELECT required.table_name || '.' || required.column_name
+                            FROM (
+                                VALUES
+                                    ('metadata_state'::TEXT, 'metadata_format_version'::TEXT),
+                                    ('metadata_state'::TEXT, 'checkpoint_sha256'::TEXT),
+                                    ('metadata_state'::TEXT, 'checkpoint_publication_state'::TEXT),
+                                    ('metadata_state'::TEXT, 'checkpoint_generation'::TEXT)
+                            ) AS required(table_name, column_name)
+                            LEFT JOIN information_schema.columns AS column_info
+                                ON column_info.table_schema = current_schema()
+                                AND column_info.table_name = required.table_name
+                                AND column_info.column_name = required.column_name
+                            WHERE column_info.column_name IS NULL
+                            ORDER BY required.table_name, required.column_name
+                            "#,
+                            &[],
+                        )
+                        .await
+                        .map_err(|error| {
+                            Self::classify_pg_error("postgres schema column validation failed", error)
+                        })?;
+                    if !rows.is_empty() {
+                        let missing = rows
+                            .into_iter()
+                            .map(|row| row.get::<_, String>(0))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(MetaError::Storage(format!(
+                            "postgres schema is missing required column(s): {missing}; recreate the PostgreSQL volume with `studiofs destroy` followed by `studiofs init`, then run `studiofs discover` for a fresh client"
+                        )));
+                    }
+
+                    let row = client
+                        .query_opt(
+                            "SELECT metadata_format_version FROM metadata_state WHERE vol = $1",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|error| {
+                            Self::classify_pg_error("postgres metadata format query failed", error)
+                        })?;
+                    let found = row.and_then(|row| row.get::<_, Option<i16>>(0));
+                    crate::ensure_supported_pg_sync_format_version(found)?;
                     Ok(())
                 },
             )
@@ -567,13 +619,77 @@ impl PgMetaEngine {
                 )
             });
             connection_task.abort();
-            let () = result??;
-            Ok(StartupSchemaValidation::Available)
+            let _ = connection_task.await;
+            match result {
+                Ok(Ok(())) => Ok(StartupSchemaValidation::Available),
+                Ok(Err(error)) if Self::is_postgres_unavailable(&error) => {
+                    Ok(StartupSchemaValidation::Fallback(error))
+                }
+                Ok(Err(error)) if matches!(&error, MetaError::Timeout(_)) => {
+                    Ok(StartupSchemaValidation::Fallback(error))
+                }
+                Ok(Err(error)) => Err(error),
+                Err(error) => Ok(StartupSchemaValidation::Fallback(error)),
+            }
         })
     }
 
     fn is_postgres_unavailable(error: &MetaError) -> bool {
         matches!(error, MetaError::RemoteUnavailable(_))
+    }
+
+    fn ensure_remote_format_validated(&self) -> MetaResult<()> {
+        let _guard = self
+            .remote_format_validation_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg format validation lock poisoned".to_string()))?;
+        if self.remote_format_validated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        self.validate_remote_format_version()?;
+        self.remote_format_validated.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn validate_remote_format_version(&self) -> MetaResult<()> {
+        let command_pool = Arc::clone(&self.command_pool);
+        let volume_id = self.volume_id;
+        let command_timeout = self.command_timeout;
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                command_pool,
+                command_timeout,
+                "validate postgres format",
+                move |client| {
+                    Box::pin(async move {
+                        let row = client
+                            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres metadata format query failed",
+                                    error,
+                                )
+                            })?;
+                        let found = row.and_then(|row| row.get::<_, Option<i16>>(0));
+                        crate::ensure_supported_pg_sync_format_version(found)
+                    })
+                },
+            )
+            .await
+        })
+    }
+
+    fn invalidate_remote_format_validation(&self) {
+        self.remote_format_validated.store(false, Ordering::Release);
+    }
+
+    fn record_remote_operation_result<T>(&self, result: MetaResult<T>) -> MetaResult<T> {
+        if result.is_err() {
+            self.invalidate_remote_format_validation();
+        }
+        result
     }
 
     /// Open the PostgreSQL-backed metadata engine using default startup options.
@@ -637,16 +753,22 @@ impl PgMetaEngine {
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
-        match Self::validate_postgres_schema(&pg.url, connect_timeout, command_timeout) {
-            Ok(StartupSchemaValidation::Available) => {}
+        let remote_format_validated = match Self::validate_postgres_schema(
+            &pg.url,
+            pg.volume_id,
+            connect_timeout,
+            command_timeout,
+        ) {
+            Ok(StartupSchemaValidation::Available) => true,
             Ok(StartupSchemaValidation::Fallback(error)) => {
                 warn!(
                     error = %error,
                     "postgres schema validation unavailable; continuing with local-first startup"
                 );
+                false
             }
             Err(error) => return Err(error),
-        }
+        };
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
         let client_slot = match persisted_client_slot {
@@ -709,6 +831,8 @@ impl PgMetaEngine {
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             metadata_remote_head_version: AtomicI64::new(-1),
             metadata_source_connected: AtomicBool::new(false),
+            remote_format_validated: AtomicBool::new(remote_format_validated),
+            remote_format_validation_lock: Mutex::new(()),
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 

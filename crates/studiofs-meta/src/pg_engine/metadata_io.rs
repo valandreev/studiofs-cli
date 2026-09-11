@@ -5,11 +5,22 @@ use super::RemoteApplyCoordinator;
 use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
 use crate::engine::{MetaError, MetaFormat, MetaResult};
 use crate::events::{MetaEvent, encode_event};
+use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
     pub(super) fn pull_snapshot_locked(
+        &self,
+        import_mode: StartupSnapshotImportMode,
+    ) -> MetaResult<bool> {
+        self.ensure_remote_format_validated()?;
+        let result = self.pull_snapshot_locked_inner(import_mode);
+        self.record_remote_operation_result(result)
+    }
+
+    fn pull_snapshot_locked_inner(
         &self,
         import_mode: StartupSnapshotImportMode,
     ) -> MetaResult<bool> {
@@ -67,6 +78,18 @@ impl PgMetaEngine {
         let version: i64 = row.get(0);
         let checkpoint_version: i64 = row.get(1);
         let bytes: Vec<u8> = row.get(2);
+        let metadata_format_version = row.get::<_, Option<i16>>(3);
+        let checkpoint_sha256: Option<Vec<u8>> = row.get(4);
+        let checkpoint_publication_state: Option<String> = row.get(5);
+        let checkpoint_generation: Option<i64> = row.get(6);
+
+        crate::ensure_supported_pg_sync_format_version(metadata_format_version)?;
+        crate::validate_checkpoint_descriptor(
+            &bytes,
+            checkpoint_sha256.as_deref(),
+            checkpoint_publication_state.as_deref(),
+            checkpoint_generation,
+        )?;
 
         if checkpoint_version < 0 || checkpoint_version > version {
             return Err(MetaError::Storage(
@@ -100,11 +123,12 @@ impl PgMetaEngine {
     }
 
     pub(super) fn remote_metadata_head_version(&self) -> MetaResult<i64> {
+        self.ensure_remote_format_validated()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
 
-        self.run_async(async move {
+        let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
@@ -125,7 +149,8 @@ impl PgMetaEngine {
                 },
             )
             .await
-        })
+        });
+        self.record_remote_operation_result(result)
     }
 
     #[cfg(test)]
@@ -142,14 +167,22 @@ impl PgMetaEngine {
             return Ok(self.local_version.load(Ordering::SeqCst));
         }
 
+        self.ensure_remote_format_validated()?;
+
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
         let now_ms = Self::now_millis();
         let events_vec = events;
+        let expected_metadata_format_version =
+            i16::try_from(CURRENT_FORMAT_VERSION).map_err(|_| {
+                MetaError::Storage(
+                    "metadata format version exceeds PostgreSQL SMALLINT".to_string(),
+                )
+            })?;
         let command_timeout = self.command_timeout;
 
-        self.run_async(async move {
+        let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
@@ -160,13 +193,35 @@ impl PgMetaEngine {
                         .await
                         .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
-                    let batch_version: i64 = tx
-                        .query_one(sql::BUMP_METADATA_VERSION, &[&volume_id])
+                    let batch_version_row = tx
+                        .query_opt(
+                            sql::BUMP_METADATA_VERSION,
+                            &[&volume_id, &expected_metadata_format_version],
+                        )
                         .await
                         .map_err(|e| {
                             Self::classify_pg_error("postgres metadata_state bump failed", e)
-                        })?
-                        .get(0);
+                        })?;
+                    let Some(batch_version_row) = batch_version_row else {
+                        let format_row = tx
+                            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres metadata format revalidation failed",
+                                    e,
+                                )
+                            })?;
+                        let found = format_row
+                            .as_ref()
+                            .and_then(|row| row.get::<_, Option<i16>>(0));
+                        crate::ensure_supported_pg_sync_format_version(found)?;
+                        return Err(MetaError::Storage(
+                            "postgres metadata version bump did not update the current-format row"
+                                .to_string(),
+                        ));
+                    };
+                    let batch_version: i64 = batch_version_row.get(0);
 
                     for chunk in events_vec.chunks(PG_EVENT_INSERT_CHUNK_SIZE) {
                         let event_types: Vec<&str> =
@@ -251,7 +306,8 @@ impl PgMetaEngine {
                 }),
             )
             .await
-        })
+        });
+        self.record_remote_operation_result(result)
     }
 
     pub(super) async fn query_foreign_event_rows<C>(
@@ -269,38 +325,68 @@ impl PgMetaEngine {
     }
 
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
+        self.ensure_remote_format_validated()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let payload = self.local.export_serving_checkpoint_bytes()?;
         let format_info = self.local.get_format_info()?;
+        let metadata_format_version = i16::try_from(format_info.format_version).map_err(|_| {
+            MetaError::Storage("metadata format version exceeds PostgreSQL SMALLINT".to_string())
+        })?;
+        let checkpoint_sha256 = Sha256::digest(&payload);
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
         let version = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
 
-        self.run_async(async move {
+        let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
                 "write checkpoint",
                 move |client| {
                     Box::pin(async move {
-                        client
-                            .execute(
+                        let upserted = client
+                            .query_opt(
                                 sql::UPSERT_METADATA_CHECKPOINT,
-                                &[&volume_id, &version, &version, &payload, &format_info],
+                                &[
+                                    &volume_id,
+                                    &metadata_format_version,
+                                    &version,
+                                    &version,
+                                    &payload,
+                                    &checkpoint_sha256.as_slice(),
+                                    &format_info,
+                                ],
                             )
                             .await
                             .map_err(|e| {
                                 Self::classify_pg_error("postgres checkpoint upsert failed", e)
                             })?;
 
+                        if upserted.is_none() {
+                            let row = client
+                                .query_one(
+                                    "SELECT metadata_format_version FROM metadata_state WHERE vol = $1",
+                                    &[&volume_id],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres checkpoint format revalidation failed",
+                                        e,
+                                    )
+                                })?;
+                            crate::ensure_supported_pg_sync_format_version(row.get(0))?;
+                        }
+
                         Ok(())
                     })
                 },
             )
             .await
-        })
+        });
+        self.record_remote_operation_result(result)
     }
 }

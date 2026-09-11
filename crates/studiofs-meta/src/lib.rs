@@ -37,16 +37,17 @@ pub mod snapshot_ports;
 /// Public metadata model types shared across engines and callers.
 pub mod types;
 
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 
 pub use async_engine::{SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
-    LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat,
-    MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
-    MetaReplication, MetaResult, MetaSymlink, MetaXattr, MetadataBatchWriteObservability,
-    MetadataCoherenceProgress, MetadataWriteObservability, MetadataWriteStageTiming,
-    NamespaceMutation, RegularFileOverlayMutation,
+    CheckpointDescriptorFailure, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaEngineCore,
+    MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects,
+    MetaRecovery, MetaReplication, MetaResult, MetaSymlink, MetaXattr,
+    MetadataBatchWriteObservability, MetadataCoherenceProgress, MetadataWriteObservability,
+    MetadataWriteStageTiming, NamespaceMutation, RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{
@@ -57,6 +58,60 @@ pub use pg_transport::connect_studiofs_postgres;
 pub use read_only::ReadOnlyMetaEngine;
 pub use redb_engine::RedbMetaEngine;
 pub use types::*;
+
+#[derive(serde::Deserialize)]
+struct FormatVersionOnly {
+    format_version: u16,
+}
+
+/// Decode and validate persisted [`FormatInfo`] while checking its version first.
+///
+/// The version-only pass preserves the actionable incompatibility error even when
+/// an older format no longer satisfies the current JSON shape.
+pub fn decode_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
+    let version: FormatVersionOnly =
+        serde_json::from_slice(bytes).map_err(|e| MetaError::Serialization(e.to_string()))?;
+    if version.format_version != CURRENT_FORMAT_VERSION {
+        return Err(MetaError::UnsupportedFormatVersion {
+            found: version.format_version,
+            expected: CURRENT_FORMAT_VERSION,
+        });
+    }
+    let info: FormatInfo =
+        serde_json::from_slice(bytes).map_err(|e| MetaError::Serialization(e.to_string()))?;
+    info.validate_format_contract()?;
+    Ok(info)
+}
+
+/// Validate the atomic PostgreSQL serving-checkpoint descriptor.
+pub fn validate_checkpoint_descriptor(
+    snapshot_bytes: &[u8],
+    sha256: Option<&[u8]>,
+    publication_state: Option<&str>,
+    generation: Option<i64>,
+) -> MetaResult<()> {
+    if publication_state != Some("published") {
+        return Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::PublicationState,
+        });
+    }
+    if generation.unwrap_or_default() <= 0 {
+        return Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::Generation,
+        });
+    }
+    let Some(sha256) = sha256 else {
+        return Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::Checksum,
+        });
+    };
+    if sha256.len() != 32 || sha256 != Sha256::digest(snapshot_bytes).as_slice() {
+        return Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::Checksum,
+        });
+    }
+    Ok(())
+}
 
 /// Opens an immutable snapshot metadata artifact behind the read-only metadata
 /// adapter used by snapshot mounts.
@@ -102,7 +157,8 @@ impl Default for MetaOpenOptions {
     }
 }
 
-fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
+/// Validate the local/remote metadata format before opening or importing it.
+pub fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
     if info.format_version != CURRENT_FORMAT_VERSION {
         return Err(MetaError::UnsupportedFormatVersion {
             found: info.format_version,
@@ -110,6 +166,24 @@ fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
         });
     }
     info.validate_format_contract()?;
+    Ok(())
+}
+
+/// Validate the PostgreSQL scalar sync-format version stored with a checkpoint.
+///
+/// PostgreSQL stores this value as `SMALLINT`, so missing, negative, or
+/// otherwise unrepresentable values are converted to the unsupported sentinel
+/// instead of being accepted as a current format.
+pub fn ensure_supported_pg_sync_format_version(found: Option<i16>) -> MetaResult<()> {
+    let found = found
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or_default();
+    if found != CURRENT_FORMAT_VERSION {
+        return Err(MetaError::UnsupportedFormatVersion {
+            found,
+            expected: CURRENT_FORMAT_VERSION,
+        });
+    }
     Ok(())
 }
 
@@ -202,6 +276,120 @@ pub fn open_meta_engine_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_sync_format_validator_rejects_missing_or_legacy_values() {
+        assert!(
+            ensure_supported_pg_sync_format_version(Some(CURRENT_FORMAT_VERSION as i16,)).is_ok()
+        );
+
+        for found in [None, Some(4), Some(-1)] {
+            let err = ensure_supported_pg_sync_format_version(found).unwrap_err();
+            assert!(matches!(
+                err,
+                MetaError::UnsupportedFormatVersion {
+                    expected: CURRENT_FORMAT_VERSION,
+                    ..
+                }
+            ));
+            let message = err.to_string();
+            assert!(message.contains("recreate"));
+            assert!(message.contains("discover"));
+        }
+    }
+
+    #[test]
+    fn format_info_decode_reports_malformed_payloads() {
+        for bytes in [
+            b"".as_slice(),
+            b"{".as_slice(),
+            br#"{"name":"missing-version"}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                decode_format_info(bytes),
+                Err(MetaError::Serialization(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_descriptor_validator_reports_each_invalid_field() {
+        let bytes = b"checkpoint";
+        let digest = Sha256::digest(bytes);
+
+        let cases = [
+            (
+                Some(1),
+                Some(digest.as_slice()),
+                Some("pending"),
+                CheckpointDescriptorFailure::PublicationState,
+            ),
+            (
+                Some(0),
+                Some(digest.as_slice()),
+                Some("published"),
+                CheckpointDescriptorFailure::Generation,
+            ),
+            (
+                Some(1),
+                Some(&[0; 32][..]),
+                Some("published"),
+                CheckpointDescriptorFailure::Checksum,
+            ),
+        ];
+
+        for (generation, checksum, publication_state, reason) in cases {
+            let error =
+                validate_checkpoint_descriptor(bytes, checksum, publication_state, generation)
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                MetaError::InvalidCheckpointDescriptor { reason: actual } if actual == reason
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_descriptor_validator_rejects_missing_or_malformed_checksum() {
+        let bytes = b"checkpoint";
+        for checksum in [None, Some(&[0; 31][..])] {
+            let error = validate_checkpoint_descriptor(bytes, checksum, Some("published"), Some(1))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                MetaError::InvalidCheckpointDescriptor {
+                    reason: CheckpointDescriptorFailure::Checksum
+                }
+            ));
+        }
+
+        let digest = Sha256::digest(bytes);
+        let error = validate_checkpoint_descriptor(
+            bytes,
+            Some(digest.as_slice()),
+            Some("published"),
+            Some(-1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetaError::InvalidCheckpointDescriptor {
+                reason: CheckpointDescriptorFailure::Generation
+            }
+        ));
+    }
+
+    #[test]
+    fn newer_format_error_includes_upgrade_guidance() {
+        let error = MetaError::UnsupportedFormatVersion {
+            found: CURRENT_FORMAT_VERSION + 1,
+            expected: CURRENT_FORMAT_VERSION,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("matching StudioFS binary"));
+        assert!(message.contains("If the stored state is older"));
+    }
 
     #[test]
     fn test_open_meta_engine_missing_file_creates_redb() {

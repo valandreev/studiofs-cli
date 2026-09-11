@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema;
 use studiofs_meta::{
-    MetaError, connect_studiofs_postgres, ensure_studiofs_database, open_meta_engine,
+    MetaError, connect_studiofs_postgres, decode_format_info, ensure_studiofs_database,
+    ensure_supported_pg_sync_format_version, open_meta_engine, validate_checkpoint_descriptor,
 };
 use thiserror::Error;
 
@@ -38,12 +39,21 @@ struct DumpEvent {
 struct MetadataDump {
     dump_version: u16,
     volume: DumpVolume,
+    metadata_state_format_version: i16,
     metadata_state_version: i64,
     metadata_state_checkpoint_version: i64,
     metadata_state_snapshot: Vec<u8>,
+    metadata_state_checkpoint_sha256: Vec<u8>,
     metadata_state_format_info: Vec<u8>,
+    metadata_state_publication_state: String,
+    metadata_state_generation: i64,
     counters: Vec<DumpCounter>,
     event_log: Vec<DumpEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DumpHeader {
+    dump_version: u16,
 }
 
 #[derive(Debug, Error)]
@@ -115,7 +125,19 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             let row = client
                 .query_opt(
                     r#"
-            SELECT v.vol, v.name, v.uuid, v.block_size, ms.version, ms.checkpoint_version, ms.snapshot, ms.format_info
+            SELECT
+                v.vol,
+                v.name,
+                v.uuid,
+                v.block_size,
+                ms.metadata_format_version,
+                ms.version,
+                ms.checkpoint_version,
+                ms.snapshot,
+                ms.checkpoint_sha256,
+                ms.format_info,
+                ms.checkpoint_publication_state,
+                ms.checkpoint_generation
             FROM volumes v
             JOIN metadata_state ms ON ms.vol = v.vol
             WHERE v.vol = $1
@@ -137,10 +159,14 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 uuid: row.get(2),
                 block_size: row.get(3),
             };
-            let state_version: i64 = row.get(4);
-            let state_checkpoint_version: i64 = row.get(5);
-            let state_snapshot: Vec<u8> = row.get(6);
-            let state_format_info: Vec<u8> = row.get(7);
+            let state_format_version: i16 = row.get(4);
+            let state_version: i64 = row.get(5);
+            let state_checkpoint_version: i64 = row.get(6);
+            let state_snapshot: Vec<u8> = row.get(7);
+            let state_checkpoint_sha256: Vec<u8> = row.get(8);
+            let state_format_info: Vec<u8> = row.get(9);
+            let state_publication_state: String = row.get(10);
+            let state_generation: i64 = row.get(11);
 
             let counter_rows = client
                 .query(
@@ -181,12 +207,16 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 .collect();
 
             Ok(MetadataDump {
-                dump_version: 3,
+                dump_version: 4,
                 volume,
+                metadata_state_format_version: state_format_version,
                 metadata_state_version: state_version,
                 metadata_state_checkpoint_version: state_checkpoint_version,
                 metadata_state_snapshot: state_snapshot,
+                metadata_state_checkpoint_sha256: state_checkpoint_sha256,
                 metadata_state_format_info: state_format_info,
+                metadata_state_publication_state: state_publication_state,
+                metadata_state_generation: state_generation,
                 counters,
                 event_log,
             })
@@ -222,6 +252,7 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
         .ok_or_else(|| DumpLoadError::Message("volume is not postgres-backed".to_string()))?;
 
     let dump = load_remote_dump(&pg.url, pg.volume_id)?;
+    validate_dump(&dump)?;
 
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -236,7 +267,7 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
     Ok(())
 }
 
-fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64> {
+fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64> {
     crate::runtime_bridge::block_on(async move {
         let metadata_dsn = ensure_studiofs_database(postgres_address)
             .await
@@ -306,13 +337,17 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("clear metadata_state failed: {e}")))?;
             tx.execute(
-                "INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info) VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &target_vol,
+                    &dump.metadata_state_format_version,
                     &dump.metadata_state_version,
                     &dump.metadata_state_checkpoint_version,
                     &dump.metadata_state_snapshot,
+                    &dump.metadata_state_checkpoint_sha256,
                     &dump.metadata_state_format_info,
+                    &dump.metadata_state_publication_state,
+                    &dump.metadata_state_generation,
                 ],
             )
             .await
@@ -368,23 +403,41 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
     })
 }
 
+fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
+    ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
+    decode_format_info(&dump.metadata_state_format_info)?;
+    validate_checkpoint_descriptor(
+        &dump.metadata_state_snapshot,
+        Some(&dump.metadata_state_checkpoint_sha256),
+        Some(&dump.metadata_state_publication_state),
+        Some(dump.metadata_state_generation),
+    )?;
+    Ok(())
+}
+
 pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     let bytes = std::fs::read(input).map_err(|e| {
         DumpLoadError::Message(format!("failed to read dump {}: {e}", input.display()))
     })?;
-    let dump: MetadataDump = serde_json::from_slice(&bytes).map_err(|e| {
+    let header: DumpHeader = serde_json::from_slice(&bytes).map_err(|e| {
         DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
     })?;
-    let volume_name = dump.volume.name.clone();
 
-    if dump.dump_version != 3 {
+    if header.dump_version != 4 {
         return Err(DumpLoadError::Message(format!(
             "unsupported dump version: {}",
-            dump.dump_version
+            header.dump_version
         )));
     }
 
-    apply_dump(postgres_address, dump)?;
+    let dump: MetadataDump = serde_json::from_slice(&bytes).map_err(|e| {
+        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
+    })?;
+    let volume_name = dump.volume.name.as_str();
+
+    validate_dump(&dump)?;
+
+    apply_dump(postgres_address, &dump)?;
 
     println!("✓ Dump loaded into PostgreSQL");
     println!("  Volume: {}", volume_name);
@@ -395,6 +448,7 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn dump_parses_name_and_output_path() {
@@ -446,5 +500,103 @@ mod tests {
             }) => assert_eq!(postgresql_address, "postgres://user:pass@127.0.0.1:5432"),
             other => panic!("expected Load, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_rejects_legacy_dump_before_full_deserialization() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), br#"{"dump_version":3}"#).unwrap();
+
+        let err = load(input.path(), "postgres://unused").unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("unsupported dump version: 3")
+        ));
+    }
+
+    fn test_dump() -> MetadataDump {
+        let snapshot = vec![1, 2, 3];
+        MetadataDump {
+            dump_version: 4,
+            volume: DumpVolume {
+                vol: 1,
+                name: "test".to_string(),
+                uuid: "test".to_string(),
+                block_size: 4096,
+            },
+            metadata_state_format_version: 5,
+            metadata_state_version: 1,
+            metadata_state_checkpoint_version: 1,
+            metadata_state_snapshot: snapshot.clone(),
+            metadata_state_checkpoint_sha256: Sha256::digest(&snapshot).to_vec(),
+            metadata_state_format_info: serde_json::to_vec(
+                &studiofs_meta::FormatInfo::new(
+                    "test".to_string(),
+                    "test-uuid".to_string(),
+                    studiofs_meta::FormatInfoDataStore {
+                        endpoint: "http://localhost:9000".to_string(),
+                        bucket: "test-bucket".to_string(),
+                        access_key: "test".to_string(),
+                        secret_key: "test".to_string(),
+                        region: "us-east-1".to_string(),
+                    },
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            metadata_state_publication_state: "published".to_string(),
+            metadata_state_generation: 1,
+            counters: Vec::new(),
+            event_log: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dump_checkpoint_validation_rejects_checksum_mismatch() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_sha256[0] ^= 1;
+
+        let err = validate_dump(&dump).unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Meta(MetaError::InvalidCheckpointDescriptor {
+                reason: studiofs_meta::CheckpointDescriptorFailure::Checksum
+            })
+        ));
+    }
+
+    #[test]
+    fn dump_checkpoint_validation_rejects_legacy_metadata_format() {
+        let mut dump = test_dump();
+        dump.metadata_state_format_version = 4;
+
+        let err = validate_dump(&dump).unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Meta(MetaError::UnsupportedFormatVersion {
+                found: 4,
+                expected: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn dump_checkpoint_validation_rejects_incomplete_publication() {
+        let mut dump = test_dump();
+        dump.metadata_state_publication_state = "pending".to_string();
+
+        let err = validate_dump(&dump).unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Meta(MetaError::InvalidCheckpointDescriptor {
+                reason: studiofs_meta::CheckpointDescriptorFailure::PublicationState
+            })
+        ));
+    }
+
+    #[test]
+    fn valid_dump_passes_manifest_validation() {
+        validate_dump(&test_dump()).expect("valid dump should pass manifest validation");
     }
 }

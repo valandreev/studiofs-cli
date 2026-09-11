@@ -3,6 +3,7 @@ use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, COUNTER_LIMIT};
 use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::inode_allocator::AllocatorRuntime;
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod inode_allocator;
@@ -469,6 +470,8 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
         metadata_remote_head_version: AtomicI64::new(-1),
         metadata_source_connected: AtomicBool::new(false),
+        remote_format_validated: AtomicBool::new(false),
+        remote_format_validation_lock: Mutex::new(()),
     };
 
     PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");
@@ -620,15 +623,33 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
 
         let empty_checkpoint = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
+        let checkpoint_sha256 = Sha256::digest(&empty_checkpoint).to_vec();
+        let metadata_format_version = CURRENT_FORMAT_VERSION as i16;
         let format_info_bytes = serde_json::to_vec(&format_info(name, uuid, dsn, volume_id))
             .map_err(|e| MetaError::Serialization(format!("format info encode failed: {e}")))?;
         tx.execute(
             r#"
-                INSERT INTO metadata_state (vol, version, checkpoint_version, snapshot, format_info)
-                VALUES ($1, 0, 0, $2, $3)
+                INSERT INTO metadata_state (
+                    vol,
+                    metadata_format_version,
+                    version,
+                    checkpoint_version,
+                    snapshot,
+                    checkpoint_sha256,
+                    format_info,
+                    checkpoint_publication_state,
+                    checkpoint_generation
+                )
+                VALUES ($1, $2, 0, 0, $3, $4, $5, 'published', 1)
                 ON CONFLICT (vol) DO NOTHING
                 "#,
-            &[&volume_id, &empty_checkpoint, &format_info_bytes],
+            &[
+                &volume_id,
+                &metadata_format_version,
+                &empty_checkpoint,
+                &checkpoint_sha256,
+                &format_info_bytes,
+            ],
         )
         .await
         .map_err(|e| {

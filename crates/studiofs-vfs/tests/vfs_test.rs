@@ -14,6 +14,7 @@
 
 use bytes::Bytes;
 use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
@@ -1092,13 +1093,45 @@ fn setup_pg_volume(
             })?;
         let volume_id: i64 = row.get(0);
 
+        let checkpoint_dir = tempfile::tempdir().map_err(|e| {
+            studiofs_meta::MetaError::Storage(format!("failed to create checkpoint fixture: {e}"))
+        })?;
+        let checkpoint_db = checkpoint_dir.path().join("checkpoint.db");
+        let checkpoint_engine = RedbMetaEngine::open(&checkpoint_db)?;
+        let checkpoint_format = pg_format_info(name, uuid, dsn, volume_id);
+        checkpoint_engine.set_format_info(&checkpoint_format)?;
+        checkpoint_engine.init_root(0, 0)?;
+        let empty_checkpoint = checkpoint_engine.export_serving_checkpoint_bytes()?;
+        drop(checkpoint_engine);
+        let checkpoint_sha256 = Sha256::digest(&empty_checkpoint).to_vec();
+        let metadata_format_version = CURRENT_FORMAT_VERSION as i16;
+        let format_info_bytes = serde_json::to_vec(&checkpoint_format).map_err(|e| {
+            studiofs_meta::MetaError::Serialization(format!("format info encode failed: {e}"))
+        })?;
+
         tx.execute(
             r#"
-            INSERT INTO metadata_state (vol, version, snapshot)
-            VALUES ($1, 0, $2)
+            INSERT INTO metadata_state (
+                vol,
+                metadata_format_version,
+                version,
+                checkpoint_version,
+                snapshot,
+                checkpoint_sha256,
+                format_info,
+                checkpoint_publication_state,
+                checkpoint_generation
+            )
+            VALUES ($1, $2, 0, 0, $3, $4, $5, 'published', 1)
             ON CONFLICT (vol) DO NOTHING
             "#,
-            &[&volume_id, &Vec::<u8>::new()],
+            &[
+                &volume_id,
+                &metadata_format_version,
+                &empty_checkpoint,
+                &checkpoint_sha256,
+                &format_info_bytes,
+            ],
         )
         .await
         .map_err(|e| {

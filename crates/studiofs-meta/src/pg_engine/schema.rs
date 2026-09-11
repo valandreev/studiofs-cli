@@ -1,8 +1,5 @@
 use crate::engine::{MetaError, MetaResult};
 
-/// The PostgreSQL schema generation owned by the Snapshot v2 control plane.
-pub const STUDIOFS_PG_SCHEMA_VERSION: i32 = 6;
-
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
 /// This is the single schema definition used by initialization, dump/load, and
@@ -72,17 +69,36 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
 
         CREATE TABLE IF NOT EXISTS metadata_state (
             vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            metadata_format_version SMALLINT NOT NULL,
             version BIGINT NOT NULL,
             checkpoint_version BIGINT NOT NULL DEFAULT 0,
             snapshot BYTEA NOT NULL,
+            checkpoint_sha256 BYTEA NOT NULL
+                CHECK (octet_length(checkpoint_sha256) = 32),
             format_info BYTEA NOT NULL DEFAULT decode('', 'hex'),
+            checkpoint_publication_state TEXT NOT NULL
+                CHECK (checkpoint_publication_state IN ('pending', 'published')),
+            checkpoint_generation BIGINT NOT NULL
+                CHECK (checkpoint_generation >= 0),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
         ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS metadata_format_version SMALLINT NOT NULL DEFAULT 0;
+        ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_version BIGINT NOT NULL DEFAULT 0;
         ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_sha256 BYTEA NOT NULL
+                DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
+                CHECK (octet_length(checkpoint_sha256) = 32);
+        ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS format_info BYTEA NOT NULL DEFAULT decode('', 'hex');
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_publication_state TEXT NOT NULL DEFAULT 'published'
+                CHECK (checkpoint_publication_state IN ('pending', 'published'));
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_generation BIGINT NOT NULL DEFAULT 0
+                CHECK (checkpoint_generation >= 0);
 
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -716,4 +732,49 @@ where
         .batch_execute(studiofs_pg_schema_sql())
         .await
         .map_err(|_| MetaError::RemoteUnavailable("postgres schema ensure failed".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_declares_incompatible_sync_boundary_and_checkpoint_descriptor() {
+        let sql = studiofs_pg_schema_sql();
+        for fragment in [
+            "metadata_format_version SMALLINT NOT NULL",
+            "checkpoint_sha256 BYTEA NOT NULL",
+            "checkpoint_publication_state TEXT NOT NULL",
+            "checkpoint_generation BIGINT NOT NULL",
+        ] {
+            assert!(sql.contains(fragment), "schema is missing {fragment}");
+        }
+        assert!(sql.contains("octet_length(checkpoint_sha256) = 32"));
+        assert!(sql.contains("checkpoint_publication_state IN ('pending', 'published')"));
+        assert!(sql.contains("checkpoint_generation >= 0"));
+        assert!(
+            sql.matches("CHECK (octet_length(checkpoint_sha256) = 32)")
+                .count()
+                >= 2
+        );
+        assert!(
+            sql.matches("CHECK (checkpoint_publication_state IN ('pending', 'published'))")
+                .count()
+                >= 2
+        );
+        assert!(sql.matches("CHECK (checkpoint_generation >= 0)").count() >= 2);
+
+        let fresh_metadata_state = sql
+            .split("ALTER TABLE metadata_state")
+            .next()
+            .expect("fresh metadata_state DDL");
+        assert!(
+            !fresh_metadata_state
+                .contains("checkpoint_sha256 BYTEA NOT NULL\n                DEFAULT")
+        );
+        assert!(
+            !fresh_metadata_state.contains("checkpoint_publication_state TEXT NOT NULL DEFAULT")
+        );
+        assert!(!fresh_metadata_state.contains("checkpoint_generation BIGINT NOT NULL DEFAULT"));
+    }
 }
