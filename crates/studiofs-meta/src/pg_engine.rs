@@ -231,6 +231,7 @@ pub struct PgMetaEngine {
     metadata_remote_head_version: AtomicI64,
     /// Whether snapshot reachability bootstrap completed for this engine.
     snapshot_reachability_bootstrapped: AtomicBool,
+    snapshot_reachability_bootstrap_lock: Mutex<()>,
     /// Whether the most recent metadata synchronization command succeeded.
     metadata_source_connected: AtomicBool,
     /// Whether PostgreSQL's sync format was validated successfully for this
@@ -480,13 +481,13 @@ impl PgMetaEngine {
     fn update_pg_sync_lifecycle(
         &self,
         next_for_current: impl Fn(PgSyncLifecycle) -> PgSyncLifecycle,
-    ) {
+    ) -> bool {
         loop {
             let current_raw = self.pg_sync_lifecycle.load(Ordering::Acquire);
             let current = Self::pg_sync_lifecycle_from_raw(current_raw);
             let next = next_for_current(current);
             if current == next {
-                return;
+                return false;
             }
             if !current.can_transition_to(next) {
                 warn!(
@@ -495,14 +496,14 @@ impl PgMetaEngine {
                     volume_id = self.volume_id,
                     "invalid pg sync lifecycle transition"
                 );
-                return;
+                return false;
             }
             if self
                 .pg_sync_lifecycle
                 .compare_exchange(current_raw, next as u8, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return;
+                return true;
             }
         }
     }
@@ -554,13 +555,33 @@ impl PgMetaEngine {
             .local
             .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)?
             != 0;
-        if fresh_client_pending {
-            self.ensure_client_slot_for_fresh_client()?;
+        if fresh_client_pending && let Err(error) = self.ensure_client_slot_for_fresh_client() {
+            self.update_pg_sync_lifecycle(|current| match current {
+                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded => {
+                    PgSyncLifecycle::Degraded
+                }
+                current => current,
+            });
+            return Err(error);
         }
-        if current == PgSyncLifecycle::Degraded {
-            self.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+
+        let mut reached_target = false;
+        loop {
+            if !self.update_pg_sync_lifecycle(|current| match current {
+                PgSyncLifecycle::Degraded => PgSyncLifecycle::CatchingUp,
+                PgSyncLifecycle::CatchingUp => PgSyncLifecycle::TargetReached,
+                current => current,
+            }) {
+                break;
+            }
+            if self.current_pg_sync_lifecycle() == PgSyncLifecycle::TargetReached {
+                reached_target = true;
+                break;
+            }
         }
-        self.transition_pg_sync_lifecycle(PgSyncLifecycle::TargetReached);
+        if !reached_target {
+            return Ok(());
+        }
 
         if fresh_client_pending {
             self.local
@@ -979,6 +1000,7 @@ impl PgMetaEngine {
             metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             metadata_remote_head_version: AtomicI64::new(-1),
             snapshot_reachability_bootstrapped: AtomicBool::new(false),
+            snapshot_reachability_bootstrap_lock: Mutex::new(()),
             metadata_source_connected: AtomicBool::new(false),
             remote_format_validated: AtomicBool::new(remote_format_validated),
             remote_format_validation_lock: Mutex::new(()),
@@ -1042,7 +1064,10 @@ impl PgMetaEngine {
                 false
             }
         };
-        if fresh_client_pending && (!startup_bootstrap_succeeded || !startup_target_observed) {
+        let startup_failed = !startup_bootstrap_succeeded || !startup_target_observed;
+        if (fresh_client_pending && startup_failed)
+            || (!fresh_client_pending && !startup_bootstrap_succeeded)
+        {
             engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
         }
         if let Some(client_slot) = client_slot {

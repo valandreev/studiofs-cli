@@ -3,7 +3,7 @@
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaReplication, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::types::FileType;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -98,16 +98,16 @@ impl PgMetaEngine {
         const MAX_STARTUP_CATCHUP_ROUNDS: usize = 16;
 
         self.ensure_remote_format_validated()?;
-        let mut target_head = self.remote_metadata_head_version()?;
+        let target_head = self.remote_metadata_head_version()?;
         for _ in 0..MAX_STARTUP_CATCHUP_ROUNDS {
             if self.local_version.load(Ordering::SeqCst) >= target_head {
                 return Ok(());
             }
 
             let before = self.local_version.load(Ordering::SeqCst);
-            self.sync_metadata()?;
+            self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+            self.local.sync_local_metadata()?;
             let after = self.local_version.load(Ordering::SeqCst);
-            target_head = self.remote_metadata_head_version()?;
             if after >= target_head {
                 return Ok(());
             }
@@ -119,7 +119,7 @@ impl PgMetaEngine {
         }
 
         Err(MetaError::Storage(
-            "postgres metadata catch-up did not reach the current remote head".to_string(),
+            "postgres metadata catch-up did not reach the frozen remote head".to_string(),
         ))
     }
 

@@ -281,9 +281,10 @@ impl PgMetaEngine {
                         break;
                     };
                     let _ = engine.flush_due_pending();
-                    if let Ok(metadata_changed) =
+                    if let Ok(initial_changed) =
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
                     {
+                        let local_version_before = engine.local_version.load(Ordering::Acquire);
                         if let Err(error) = engine.backfill_current_reference_ledger_if_needed() {
                             warn!(
                                 error = %error,
@@ -291,7 +292,8 @@ impl PgMetaEngine {
                                 "postgres snapshot reachability bootstrap did not complete"
                             );
                         }
-                        if metadata_changed {
+                        let local_version_after = engine.local_version.load(Ordering::Acquire);
+                        if initial_changed || local_version_after > local_version_before {
                             engine.metadata_invalidation_notify.notify_one();
                         }
                     }

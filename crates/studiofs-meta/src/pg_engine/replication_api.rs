@@ -41,6 +41,7 @@ impl MetaReplication for PgMetaEngine {
 
     fn sync_metadata(&self) -> MetaResult<()> {
         let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+        self.backfill_current_reference_ledger_if_needed()?;
         self.local.sync_local_metadata()
     }
 

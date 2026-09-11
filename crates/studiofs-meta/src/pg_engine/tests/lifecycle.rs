@@ -21,7 +21,7 @@ where
 }
 
 struct EventLogLockGuard {
-    release_tx: Option<std::sync::mpsc::Sender<()>>,
+    release_tx: Option<tokio::sync::oneshot::Sender<()>>,
     lock_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -80,7 +80,7 @@ fn stale_local_open_does_not_replay_remote_event_tail() {
     drop(local);
 
     let (lock_ready_tx, lock_ready_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let lock_dsn = dsn.clone();
     let lock_thread = std::thread::spawn(move || {
         run_async(async move {
@@ -102,9 +102,9 @@ fn stale_local_open_does_not_replay_remote_event_tail() {
             lock_ready_tx
                 .send(())
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
-            release_rx
-                .recv()
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            release_rx.await.map_err(|_| {
+                MetaError::Storage("event-log lock release signal dropped".to_string())
+            })?;
             transaction
                 .rollback()
                 .await
@@ -696,6 +696,38 @@ fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
 }
 
 #[test]
+fn established_zero_version_startup_failure_is_degraded() {
+    let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
+    let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&db).expect("open local metadata");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "established-zero-version-startup-failure",
+            "established-zero-version-startup-failure-uuid",
+            "postgres://127.0.0.1:1/studiofs",
+            1,
+        ))
+        .expect("set format info");
+    PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+    drop(local);
+
+    let opened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("established local view should survive unavailable PostgreSQL");
+
+    assert_eq!(opened.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!opened.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
 fn fresh_client_startup_without_client_slot_is_degraded_and_marker_survives_reopen() {
     let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
     let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
@@ -814,6 +846,37 @@ fn catching_up_client_reaches_live_after_sync_reaches_remote_head() {
 }
 
 #[test]
+fn concurrent_catchup_completion_preserves_live_lifecycle() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    let engine = std::sync::Arc::new(engine);
+
+    let first = std::sync::Arc::clone(&engine);
+    let second = std::sync::Arc::clone(&engine);
+    let first = std::thread::spawn(move || first.try_complete_catchup_sync());
+    let second = std::thread::spawn(move || second.try_complete_catchup_sync());
+    first
+        .join()
+        .expect("first catch-up worker panicked")
+        .expect("first catch-up");
+    second
+        .join()
+        .expect("second catch-up worker panicked")
+        .expect("second catch-up");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+}
+
+#[test]
 fn catching_up_fresh_client_completes_slot_and_allocator_bootstrap() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
@@ -923,6 +986,32 @@ fn degraded_fresh_client_without_client_slot_stays_degraded_at_remote_head() {
         PgMetaEngine::load_persisted_client_slot(&engine.local).expect("read client slot"),
         None
     );
+}
+
+#[test]
+fn catching_up_fresh_client_slot_failure_becomes_degraded() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_CLIENT_SLOT_COUNTER, 0)
+        .expect("clear client slot");
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    assert!(engine.try_complete_catchup_sync().is_err());
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
 }
 
 #[test]

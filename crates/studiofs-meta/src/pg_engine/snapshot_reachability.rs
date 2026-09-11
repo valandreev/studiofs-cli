@@ -440,6 +440,19 @@ impl PgMetaEngine {
             return Ok(());
         }
 
+        let _guard = self
+            .snapshot_reachability_bootstrap_lock
+            .lock()
+            .map_err(|_| {
+                MetaError::Storage("snapshot reachability bootstrap lock poisoned".to_owned())
+            })?;
+        if self
+            .snapshot_reachability_bootstrapped
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
         self.backfill_current_reference_ledger()?;
         self.snapshot_reachability_bootstrapped
             .store(true, Ordering::Release);
@@ -482,19 +495,6 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        let version: i64 = tx
-                            .query_one(
-                                "SELECT version FROM metadata_state WHERE vol = $1 FOR UPDATE",
-                                &[&volume_id],
-                            )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot reachability bootstrap version query failed",
-                                    error,
-                                )
-                            })?
-                            .get(0);
                         let initialized = tx
                             .query_opt(
                                 "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",
@@ -517,25 +517,6 @@ impl PgMetaEngine {
                             return Ok(false);
                         }
 
-                        let local_version_before = checked_i64(
-                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
-                            "local metadata version",
-                        )?;
-                        let references = local.list_published_object_references()?;
-                        let local_version_after = checked_i64(
-                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
-                            "local metadata version",
-                        )?;
-                        if local_version_before != local_version_after
-                            || local_version_before != version
-                        {
-                            return Ok(true);
-                        }
-
-                        let objects = references
-                            .iter()
-                            .map(|(_, object_id)| *object_id)
-                            .collect::<BTreeSet<_>>();
                         let creating_snapshot = tx
                             .query_opt(
                                 "SELECT 1 FROM snapshot_catalog WHERE vol = $1 AND lifecycle = 'creating' LIMIT 1",
@@ -555,6 +536,39 @@ impl PgMetaEngine {
                             ));
                         }
 
+                        let version: i64 = tx
+                            .query_one(
+                                "SELECT version FROM metadata_state WHERE vol = $1 FOR UPDATE",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap version query failed",
+                                    error,
+                                )
+                            })?
+                            .get(0);
+
+                        let local_version_before = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        let references = local.list_published_object_references()?;
+                        let local_version_after = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        if local_version_before != local_version_after
+                            || local_version_before != version
+                        {
+                            return Ok(true);
+                        }
+
+                        let objects = references
+                            .iter()
+                            .map(|(_, object_id)| *object_id)
+                            .collect::<BTreeSet<_>>();
                         let inserted = tx
                             .execute(
                                 "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, $2) ON CONFLICT DO NOTHING",
