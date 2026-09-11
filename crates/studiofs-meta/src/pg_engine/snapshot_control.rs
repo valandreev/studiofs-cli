@@ -368,13 +368,7 @@ impl PgSnapshotBackend {
         if raw.format_info_bytes.is_empty() {
             return Err(SnapshotSourceError::MissingFormatInfo);
         }
-        let format_info: FormatInfo =
-            serde_json::from_slice(&raw.format_info_bytes).map_err(|_| {
-                SnapshotSourceError::permanent(snapshot_control_error(
-                    "snapshot format info is invalid",
-                ))
-            })?;
-        crate::ensure_supported_format_version(&format_info).map_err(|_| {
+        let format_info = crate::decode_format_info(&raw.format_info_bytes).map_err(|_| {
             SnapshotSourceError::permanent(snapshot_control_error(
                 "snapshot format info is invalid",
             ))

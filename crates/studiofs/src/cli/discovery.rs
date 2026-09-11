@@ -1,12 +1,12 @@
 //! `studiofs discover` — attach local metadata DB to an existing PG volume.
 
 use clap::Args;
-use sha2::{Digest, Sha256};
 use std::path::Path;
 use studiofs_meta::{
     FormatInfo, MetaFormat, MetaOpenOptions, RedbMetaEngine, connect_studiofs_postgres,
-    ensure_studiofs_database, ensure_supported_format_version,
+    decode_format_info as decode_persisted_format_info, ensure_studiofs_database,
     ensure_supported_pg_sync_format_version, open_meta_engine_with_options,
+    validate_checkpoint_descriptor,
 };
 use thiserror::Error;
 
@@ -14,8 +14,6 @@ use thiserror::Error;
 pub enum DiscoveryError {
     #[error("remote format info is missing")]
     MissingFormatInfo,
-    #[error("invalid remote format info: {0}")]
-    FormatInfoJson(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -66,11 +64,21 @@ struct DiscoveredState {
     format_info: FormatInfo,
 }
 
+struct RemoteVolumeState {
+    volume_id: i64,
+    serving_checkpoint: Vec<u8>,
+    format_info_bytes: Vec<u8>,
+    pg_format_version: Option<i16>,
+    checkpoint_sha256: Option<Vec<u8>>,
+    checkpoint_publication_state: Option<String>,
+    checkpoint_generation: Option<i64>,
+}
+
 fn decode_format_info(format_info_bytes: &[u8]) -> DiscoveryResult<FormatInfo> {
     if format_info_bytes.is_empty() {
         return Err(DiscoveryError::MissingFormatInfo);
     }
-    Ok(serde_json::from_slice(format_info_bytes)?)
+    Ok(decode_persisted_format_info(format_info_bytes)?)
 }
 
 fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<DiscoveredState> {
@@ -79,25 +87,16 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
             .await
             .map_err(|e| DiscoveryError::Message(e.to_string()))?
             .metadata_dsn;
-        let (
-            volume_id,
-            serving_checkpoint,
-            format_info_bytes,
-            pg_format_version,
-            checkpoint_sha256,
-            checkpoint_publication_state,
-            checkpoint_generation,
-        ) = fetch_remote_state(name, &postgres_dsn).await?;
+        let remote = fetch_remote_state(name, &postgres_dsn).await?;
 
-        ensure_supported_pg_sync_format_version(pg_format_version)?;
+        ensure_supported_pg_sync_format_version(remote.pg_format_version)?;
         validate_checkpoint_descriptor(
-            &serving_checkpoint,
-            checkpoint_sha256.as_deref(),
-            checkpoint_publication_state.as_deref(),
-            checkpoint_generation,
+            &remote.serving_checkpoint,
+            remote.checkpoint_sha256.as_deref(),
+            remote.checkpoint_publication_state.as_deref(),
+            remote.checkpoint_generation,
         )?;
-        let mut format_info = decode_format_info(&format_info_bytes)?;
-        ensure_supported_format_version(&format_info)?;
+        let mut format_info = decode_format_info(&remote.format_info_bytes)?;
         let pg = format_info
             .metadata
             .postgres
@@ -106,45 +105,17 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
                 "discovered format is not postgres-backed".to_string(),
             ))?;
         pg.url = postgres_dsn;
-        pg.volume_id = volume_id;
+        pg.volume_id = remote.volume_id;
 
         Ok(DiscoveredState {
-            volume_id,
-            serving_checkpoint,
+            volume_id: remote.volume_id,
+            serving_checkpoint: remote.serving_checkpoint,
             format_info,
         })
     })
 }
 
-fn validate_checkpoint_descriptor(
-    serving_checkpoint: &[u8],
-    checkpoint_sha256: Option<&[u8]>,
-    checkpoint_publication_state: Option<&str>,
-    checkpoint_generation: Option<i64>,
-) -> DiscoveryResult<()> {
-    if checkpoint_publication_state != Some("published")
-        || checkpoint_generation.unwrap_or_default() <= 0
-        || checkpoint_sha256 != Some(Sha256::digest(serving_checkpoint).as_slice())
-    {
-        return Err(DiscoveryError::Message(
-            "discovered serving checkpoint descriptor is invalid".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-async fn fetch_remote_state(
-    name: &str,
-    postgres_dsn: &str,
-) -> DiscoveryResult<(
-    i64,
-    Vec<u8>,
-    Vec<u8>,
-    Option<i16>,
-    Option<Vec<u8>>,
-    Option<String>,
-    Option<i64>,
-)> {
+async fn fetch_remote_state(name: &str, postgres_dsn: &str) -> DiscoveryResult<RemoteVolumeState> {
     let (client, connection) = connect_studiofs_postgres(postgres_dsn)
         .await
         .map_err(|e| DiscoveryError::Message(e.to_string()))?;
@@ -179,23 +150,15 @@ async fn fetch_remote_state(
             ))
         })?;
 
-        Ok::<(
-            i64,
-            Vec<u8>,
-            Vec<u8>,
-            Option<i16>,
-            Option<Vec<u8>>,
-            Option<String>,
-            Option<i64>,
-        ), DiscoveryError>((
-            row.get(0),
-            row.get(1),
-            row.get(2),
-            row.get(3),
-            row.get(4),
-            row.get(5),
-            row.get(6),
-        ))
+        Ok::<RemoteVolumeState, DiscoveryError>(RemoteVolumeState {
+            volume_id: row.get(0),
+            serving_checkpoint: row.get(1),
+            format_info_bytes: row.get(2),
+            pg_format_version: row.get(3),
+            checkpoint_sha256: row.get(4),
+            checkpoint_publication_state: row.get(5),
+            checkpoint_generation: row.get(6),
+        })
     }
     .await;
 
@@ -267,6 +230,7 @@ pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn discover_parses_name_and_meta_dsn() {
@@ -302,8 +266,9 @@ mod tests {
 
         assert!(matches!(
             err,
-            DiscoveryError::Message(message)
-                if message == "discovered serving checkpoint descriptor is invalid"
+            studiofs_meta::MetaError::InvalidCheckpointDescriptor {
+                reason: studiofs_meta::CheckpointDescriptorFailure::PublicationState
+            }
         ));
     }
 
@@ -319,8 +284,30 @@ mod tests {
 
         assert!(matches!(
             err,
-            DiscoveryError::Message(message)
-                if message == "discovered serving checkpoint descriptor is invalid"
+            studiofs_meta::MetaError::InvalidCheckpointDescriptor {
+                reason: studiofs_meta::CheckpointDescriptorFailure::Checksum
+            }
+        ));
+    }
+
+    #[test]
+    fn discover_rejects_non_positive_checkpoint_generation() {
+        let checkpoint = b"checkpoint";
+        let digest = Sha256::digest(checkpoint);
+
+        let err = validate_checkpoint_descriptor(
+            checkpoint,
+            Some(digest.as_slice()),
+            Some("published"),
+            Some(0),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            studiofs_meta::MetaError::InvalidCheckpointDescriptor {
+                reason: studiofs_meta::CheckpointDescriptorFailure::Generation
+            }
         ));
     }
 }

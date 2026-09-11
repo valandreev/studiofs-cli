@@ -74,14 +74,12 @@ impl PgMetaEngine {
         let checkpoint_generation: Option<i64> = row.get(6);
 
         crate::ensure_supported_pg_sync_format_version(metadata_format_version)?;
-        if checkpoint_publication_state.as_deref() != Some("published")
-            || checkpoint_generation.unwrap_or_default() <= 0
-            || checkpoint_sha256.as_deref() != Some(Sha256::digest(&bytes).as_slice())
-        {
-            return Err(MetaError::Storage(
-                "postgres serving checkpoint descriptor is invalid".to_string(),
-            ));
-        }
+        crate::validate_checkpoint_descriptor(
+            &bytes,
+            checkpoint_sha256.as_deref(),
+            checkpoint_publication_state.as_deref(),
+            checkpoint_generation,
+        )?;
 
         if checkpoint_version < 0 || checkpoint_version > version {
             return Err(MetaError::Storage(

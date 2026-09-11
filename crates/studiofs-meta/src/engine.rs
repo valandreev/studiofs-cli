@@ -57,6 +57,20 @@ pub struct MetadataBatchWriteObservability {
 // =============================================================================
 // Errors
 // =============================================================================
+/// Reason a PostgreSQL serving-checkpoint descriptor failed validation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub enum CheckpointDescriptorFailure {
+    /// The descriptor is not marked as a completed publication.
+    #[error("publication state is not published")]
+    PublicationState,
+    /// The descriptor has no positive publication generation.
+    #[error("publication generation is not positive")]
+    Generation,
+    /// The descriptor checksum does not match the checkpoint bytes.
+    #[error("SHA-256 checksum does not match checkpoint bytes")]
+    Checksum,
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 /// Common metadata-layer error surface shared by all engine backends.
 pub enum MetaError {
@@ -109,6 +123,13 @@ pub enum MetaError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The serving-checkpoint descriptor violates its publication contract.
+    #[error("checkpoint descriptor is invalid: {reason}")]
+    InvalidCheckpointDescriptor {
+        /// Specific descriptor invariant that failed.
+        reason: CheckpointDescriptorFailure,
+    },
+
     /// The metadata backend or remote service could not be reached.
     #[error("remote unavailable: {0}")]
     RemoteUnavailable(String),
@@ -135,7 +156,7 @@ pub enum MetaError {
 
     /// A persisted local or PostgreSQL metadata format is unsupported by this binary.
     #[error(
-        "unsupported metadata/PG sync format version: found {found}, expected {expected}; recreate the incompatible metadata or volume, then run `studiofs discover` for a fresh client"
+        "unsupported metadata/PG sync format version: found {found}, expected {expected}; use a matching StudioFS binary. If the stored state is older than this binary, recreate the incompatible metadata or volume, then run `studiofs discover` for a fresh client"
     )]
     UnsupportedFormatVersion {
         /// Version stored in local or PostgreSQL metadata.

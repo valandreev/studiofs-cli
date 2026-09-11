@@ -90,8 +90,7 @@ fn format_info_decode_reports_unsupported_version_before_missing_encryption() {
     });
 
     let err =
-        super::format::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice())
-            .unwrap_err();
+        crate::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice()).unwrap_err();
 
     assert!(matches!(
         err,
@@ -118,7 +117,7 @@ fn legacy_pg_sync_format_requires_recreate_or_discover() {
         "block_size": DEFAULT_BLOCK_SIZE
     });
 
-    let err = super::format::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice())
+    let err = crate::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice())
         .unwrap_err();
 
     assert!(matches!(

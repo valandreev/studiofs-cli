@@ -471,7 +471,7 @@ fn seed_pg_metadata_state(
             }
         });
 
-        client
+        let result = client
             .execute(
                 r#"
                 INSERT INTO metadata_state (
@@ -498,9 +498,12 @@ fn seed_pg_metadata_state(
                 ],
             )
             .await
-            .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"));
 
+        drop(client);
         conn_task.abort();
+        let _ = conn_task.await;
+        result?;
         Ok(())
     })
 }

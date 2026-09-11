@@ -1,25 +1,5 @@
 use super::*;
 
-#[derive(serde::Deserialize)]
-struct FormatVersionOnly {
-    format_version: u16,
-}
-
-pub(super) fn decode_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
-    let version: FormatVersionOnly =
-        serde_json::from_slice(bytes).map_err(|e| MetaError::Serialization(e.to_string()))?;
-    if version.format_version != CURRENT_FORMAT_VERSION {
-        return Err(MetaError::UnsupportedFormatVersion {
-            found: version.format_version,
-            expected: CURRENT_FORMAT_VERSION,
-        });
-    }
-    let info: FormatInfo =
-        serde_json::from_slice(bytes).map_err(|e| MetaError::Serialization(e.to_string()))?;
-    info.validate_format_contract()?;
-    Ok(info)
-}
-
 impl RedbMetaEngine {
     pub(super) fn read_format_info_from_read_txn(
         txn: &redb::ReadTransaction,
@@ -33,7 +13,7 @@ impl RedbMetaEngine {
             .get("format")
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .ok_or(MetaError::NotFormatted)?;
-        decode_format_info(entry.value())
+        crate::decode_format_info(entry.value())
     }
 
     /// Read persisted format metadata from a redb file without opening the full engine.
@@ -74,7 +54,7 @@ impl RedbMetaEngine {
             .get("format")
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .ok_or(MetaError::NotFormatted)?;
-        decode_format_info(entry.value())
+        crate::decode_format_info(entry.value())
     }
 }
 

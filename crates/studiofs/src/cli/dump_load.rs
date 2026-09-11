@@ -1,14 +1,13 @@
 //! `studiofs dump` / `studiofs load` — PostgreSQL metadata manifest backup/restore.
 
 use clap::Args;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema;
 use studiofs_meta::{
-    MetaError, connect_studiofs_postgres, ensure_studiofs_database,
-    ensure_supported_format_version, ensure_supported_pg_sync_format_version, open_meta_engine,
+    MetaError, connect_studiofs_postgres, decode_format_info, ensure_studiofs_database,
+    ensure_supported_pg_sync_format_version, open_meta_engine, validate_checkpoint_descriptor,
 };
 use thiserror::Error;
 
@@ -403,19 +402,15 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
     })
 }
 
-fn validate_checkpoint_descriptor(dump: &MetadataDump) -> DumpLoadResult<()> {
-    if dump.metadata_state_checkpoint_sha256.as_slice()
-        != Sha256::digest(&dump.metadata_state_snapshot).as_slice()
-    {
-        return Err(DumpLoadError::Message(
-            "dump checkpoint checksum does not match checkpoint bytes".to_string(),
-        ));
-    }
-    if dump.metadata_state_publication_state != "published" || dump.metadata_state_generation <= 0 {
-        return Err(DumpLoadError::Message(
-            "dump checkpoint descriptor is not a completed publication".to_string(),
-        ));
-    }
+fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
+    ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
+    decode_format_info(&dump.metadata_state_format_info)?;
+    validate_checkpoint_descriptor(
+        &dump.metadata_state_snapshot,
+        Some(&dump.metadata_state_checkpoint_sha256),
+        Some(&dump.metadata_state_publication_state),
+        Some(dump.metadata_state_generation),
+    )?;
     Ok(())
 }
 
@@ -439,11 +434,7 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     })?;
     let volume_name = dump.volume.name.as_str();
 
-    ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
-    let format_info: studiofs_meta::FormatInfo =
-        serde_json::from_slice(&dump.metadata_state_format_info)?;
-    ensure_supported_format_version(&format_info)?;
-    validate_checkpoint_descriptor(&dump)?;
+    validate_dump(&dump)?;
 
     apply_dump(postgres_address, &dump)?;
 
@@ -456,6 +447,7 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn dump_parses_name_and_output_path() {
@@ -536,7 +528,22 @@ mod tests {
             metadata_state_checkpoint_version: 1,
             metadata_state_snapshot: snapshot.clone(),
             metadata_state_checkpoint_sha256: Sha256::digest(&snapshot).to_vec(),
-            metadata_state_format_info: Vec::new(),
+            metadata_state_format_info: serde_json::to_vec(
+                &studiofs_meta::FormatInfo::new(
+                    "test".to_string(),
+                    "test-uuid".to_string(),
+                    studiofs_meta::FormatInfoDataStore {
+                        endpoint: "http://localhost:9000".to_string(),
+                        bucket: "test-bucket".to_string(),
+                        access_key: "test".to_string(),
+                        secret_key: "test".to_string(),
+                        region: "us-east-1".to_string(),
+                    },
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             metadata_state_publication_state: "published".to_string(),
             metadata_state_generation: 1,
             counters: Vec::new(),
@@ -549,11 +556,12 @@ mod tests {
         let mut dump = test_dump();
         dump.metadata_state_checkpoint_sha256[0] ^= 1;
 
-        let err = validate_checkpoint_descriptor(&dump).unwrap_err();
+        let err = validate_dump(&dump).unwrap_err();
         assert!(matches!(
             err,
-            DumpLoadError::Message(message)
-                if message == "dump checkpoint checksum does not match checkpoint bytes"
+            DumpLoadError::Meta(MetaError::InvalidCheckpointDescriptor {
+                reason: studiofs_meta::CheckpointDescriptorFailure::Checksum
+            })
         ));
     }
 
@@ -562,11 +570,17 @@ mod tests {
         let mut dump = test_dump();
         dump.metadata_state_publication_state = "pending".to_string();
 
-        let err = validate_checkpoint_descriptor(&dump).unwrap_err();
+        let err = validate_dump(&dump).unwrap_err();
         assert!(matches!(
             err,
-            DumpLoadError::Message(message)
-                if message == "dump checkpoint descriptor is not a completed publication"
+            DumpLoadError::Meta(MetaError::InvalidCheckpointDescriptor {
+                reason: studiofs_meta::CheckpointDescriptorFailure::PublicationState
+            })
         ));
+    }
+
+    #[test]
+    fn valid_dump_passes_manifest_validation() {
+        validate_dump(&test_dump()).expect("valid dump should pass manifest validation");
     }
 }
