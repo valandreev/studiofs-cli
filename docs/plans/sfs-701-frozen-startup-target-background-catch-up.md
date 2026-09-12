@@ -29,8 +29,9 @@ the frozen target while the stale client catches up.
 - [x] (2026-09-12) Complete an independent review pass; no Critical,
   Important, or Minor findings remain after the serialization/cancellation
   fixes.
-- [ ] Commit every intended task file.
-- [ ] Update this plan and the Linear issue with the final evidence.
+- [x] (2026-09-12) Commit every intended task file in `b4444184`.
+- [x] (2026-09-12) Update the Linear issue with the final implementation and
+  validation evidence; move SFS-701 to `Done`.
 
 ## Surprises & Discoveries
 
@@ -223,3 +224,5 @@ dependency contracts, the codebase graph, and the current background poll path.
 2026-09-12: Revised after review to serialize the startup session under the
 replication lock, defer lifecycle bookkeeping until unlock, and check
 shutdown/lifecycle state between pages.
+2026-09-12: Implementation committed as `b4444184`; Linear SFS-701 marked
+Done with the focused validation results.
