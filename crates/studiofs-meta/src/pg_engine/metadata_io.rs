@@ -382,14 +382,40 @@ impl PgMetaEngine {
             return Ok(ForeignEventPage::empty(rows));
         };
 
+        let first_batch_version = first_row
+            .try_get::<_, Option<i64>>("first_batch_version")
+            .map_err(|e| {
+                Self::classify_pg_error("postgres event page metadata decode failed", e)
+            })?;
+        let last_batch_version = first_row
+            .try_get::<_, Option<i64>>("last_batch_version")
+            .map_err(|e| {
+                Self::classify_pg_error("postgres event page metadata decode failed", e)
+            })?;
+        let batch_count = first_row.try_get::<_, i64>("batch_count").map_err(|e| {
+            Self::classify_pg_error("postgres event page metadata decode failed", e)
+        })?;
+        let event_count = first_row.try_get::<_, i64>("event_count").map_err(|e| {
+            Self::classify_pg_error("postgres event page metadata decode failed", e)
+        })?;
+        let response_bytes = first_row.try_get::<_, i64>("response_bytes").map_err(|e| {
+            Self::classify_pg_error("postgres event page metadata decode failed", e)
+        })?;
+        let has_more = first_row.try_get::<_, bool>("has_more").map_err(|e| {
+            Self::classify_pg_error("postgres event page metadata decode failed", e)
+        })?;
+        let oversized = first_row.try_get::<_, bool>("oversized").map_err(|e| {
+            Self::classify_pg_error("postgres event page metadata decode failed", e)
+        })?;
+
         Ok(ForeignEventPage {
-            first_batch_version: Some(first_row.get("first_batch_version")),
-            last_batch_version: Some(first_row.get("last_batch_version")),
-            batch_count: first_row.get("batch_count"),
-            event_count: first_row.get("event_count"),
-            response_bytes: first_row.get("response_bytes"),
-            has_more: first_row.get("has_more"),
-            oversized: first_row.get("oversized"),
+            first_batch_version,
+            last_batch_version,
+            batch_count,
+            event_count,
+            response_bytes,
+            has_more,
+            oversized,
             rows,
         })
     }

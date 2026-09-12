@@ -26,6 +26,7 @@ whether another page remains before the target.
 - [x] (2026-09-12) Review the final staged diff, commit all intended task files, and report remaining follow-up work.
 - [x] (2026-09-12) Apply the review annotation's two confirmed simplifications and rerun focused validation.
 - [x] (2026-09-12) Process the attached deep review: close confirmed cursor-boundary, SQL-size, metadata-mapping, and error-path coverage findings.
+- [x] (2026-09-12) Process the attached complete-batch review: remove the redundant head query, make page metadata decoding fallible, and add byte-budget cutoff coverage.
 
 ## Surprises & Discoveries
 
@@ -39,6 +40,7 @@ whether another page remains before the target.
 - Decision: Bound pages by maximum batch count and estimated PostgreSQL row response bytes. If the first batch exceeds the byte budget, return that complete batch alone with `oversized = true`; never split or silently skip it. Rationale: a complete batch is the atomic replay unit, and the issue explicitly requires pathological batches to be handled visibly. Date/Author: 2026-09-12, Codex.
 - Decision: Keep the durable replay cursor as `batch_version`; expose `seq_id` only as the existing row-order tie-breaker. Rationale: SFS-700 owns durable per-page progress and the sync contract forbids a separate sequence cursor. Date/Author: 2026-09-12, Codex.
 - Decision: Resolve an existing startup target before each pull; otherwise observe one remote head before the page query. Rationale: SFS-699 must provide a fixed upper bound without making SFS-701's background session part of this change. Date/Author: 2026-09-12, Codex.
+- Decision: Keep candidate-batch discovery separate from batch-size aggregation. Rationale: applying the batch-count `LIMIT` before aggregation bounds the candidate prefix work; merging the CTEs would scan and group the entire cursor-to-target tail before limiting. Date/Author: 2026-09-12, Codex.
 
 ## Outcomes & Retrospective
 
@@ -61,6 +63,14 @@ pull path before PostgreSQL pool checkout. Page payload sizing uses
 metadata is read by SQL column name. Focused offline tests cover invalid limits,
 invalid environment values, and the frozen-target cursor-overrun path; the live
 PostgreSQL set covers the empty target range and mixed-client rejection.
+
+The attached review follow-up records the remote head observation used as the
+page target in the diagnostic progress field, removing a redundant post-pull
+head query. Page metadata now uses fallible `try_get` decoding so malformed or
+NULL aggregate results return a typed PostgreSQL error instead of panicking.
+The SQL candidate and sizing CTEs remain separate to preserve early bounded
+batch selection. Live coverage now also proves that a fitting first batch is
+returned alone when the next batch would exceed the byte budget.
 
 Validation completed:
 
@@ -217,3 +227,10 @@ environment values, cursor-overrun recovery, the empty target range, and mixed
 client identities. Left the unmeasured allocation suggestion and rustdoc request
 out of scope: the former needs evidence, while the latter concerns `pub(super)`
 internal API rather than a public crate interface.
+
+2026-09-12: Verified the attached complete-batch review against the current call
+graph and sync contract. Removed the redundant post-pull head query by recording
+the frozen observation, replaced panic-prone page metadata reads with `try_get`,
+and added a live byte-budget cutoff test. Kept the separate candidate-batch CTE
+because merging it would weaken the early batch-count bound. Deferred multi-page
+orchestration and repeated page metadata transport to SFS-700/SFS-701.

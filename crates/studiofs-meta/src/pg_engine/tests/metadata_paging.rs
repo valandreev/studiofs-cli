@@ -165,6 +165,66 @@ fn pg_foreign_event_pages_respect_cursor_target_and_batch_budget() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_foreign_event_page_stops_before_byte_budget_without_oversizing() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-foreign-event-byte-budget");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let connection_task = tokio::spawn(connection);
+        insert_event_rows(
+            &client,
+            volume.volume_id,
+            &[
+                (1, b"first", "remote-a"),
+                (2, b"second", "remote-b"),
+                (3, b"third", "remote-c"),
+            ],
+        )
+        .await
+        .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+
+        let first_batch =
+            PgMetaEngine::query_foreign_event_page(&client, volume.volume_id, 0, 3, 1, 1_000_000)
+                .await?;
+        assert_eq!(first_batch.batch_count, 1);
+        assert_eq!(first_batch.event_count, 1);
+        assert!(first_batch.response_bytes > 0);
+
+        let page = PgMetaEngine::query_foreign_event_page(
+            &client,
+            volume.volume_id,
+            0,
+            3,
+            3,
+            first_batch.response_bytes,
+        )
+        .await?;
+        assert_eq!(page.first_batch_version, Some(1));
+        assert_eq!(page.last_batch_version, Some(1));
+        assert_eq!(page.batch_count, 1);
+        assert_eq!(page.event_count, 1);
+        assert_eq!(page.response_bytes, first_batch.response_bytes);
+        assert!(page.has_more);
+        assert!(!page.oversized);
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.get::<_, i64>(0))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1])
+        );
+
+        connection_task.abort();
+        Ok::<(), crate::engine::MetaError>(())
+    })
+    .expect("byte-budget foreign event page");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_foreign_event_page_keeps_oversized_first_batch_atomic() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-oversized-page");

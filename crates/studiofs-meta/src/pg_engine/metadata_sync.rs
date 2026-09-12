@@ -17,6 +17,8 @@ impl PgMetaEngine {
         }
 
         let observed_target = self.remote_metadata_head_version()?;
+        self.metadata_remote_head_version
+            .store(observed_target, Ordering::Release);
         if matches!(
             self.current_pg_sync_lifecycle(),
             PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
@@ -105,9 +107,6 @@ impl PgMetaEngine {
                 .lock()
                 .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
             let changed = self.pull_foreign_events_locked(None)?;
-            let remote_head = self.remote_metadata_head_version()?;
-            self.metadata_remote_head_version
-                .store(remote_head, Ordering::Release);
             Ok(changed)
         })();
         self.record_metadata_sync_result(source, &result);
