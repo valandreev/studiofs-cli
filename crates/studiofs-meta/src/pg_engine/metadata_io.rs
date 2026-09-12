@@ -21,7 +21,34 @@ pub(super) struct ForeignEventPage {
     pub(super) oversized: bool,
 }
 
+impl ForeignEventPage {
+    fn empty(rows: Vec<tokio_postgres::Row>) -> Self {
+        Self {
+            rows,
+            first_batch_version: None,
+            last_batch_version: None,
+            batch_count: 0,
+            event_count: 0,
+            response_bytes: 0,
+            has_more: false,
+            oversized: false,
+        }
+    }
+}
+
 impl PgMetaEngine {
+    pub(super) fn validate_foreign_event_page_limits(
+        max_batch_count: i64,
+        max_response_bytes: i64,
+    ) -> MetaResult<()> {
+        if max_batch_count <= 0 || max_response_bytes <= 0 {
+            return Err(MetaError::Storage(
+                "postgres foreign event page limits must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn pull_snapshot_locked(
         &self,
         import_mode: StartupSnapshotImportMode,
@@ -332,15 +359,9 @@ impl PgMetaEngine {
     where
         C: tokio_postgres::GenericClient + Sync,
     {
-        if max_batch_count <= 0 || max_response_bytes <= 0 {
-            return Err(MetaError::Storage(
-                "postgres foreign event page limits must be positive".to_string(),
-            ));
-        }
-        if target_batch_version < last_batch_version {
-            return Err(MetaError::Storage(
-                "postgres foreign event page target precedes the replay cursor".to_string(),
-            ));
+        Self::validate_foreign_event_page_limits(max_batch_count, max_response_bytes)?;
+        if target_batch_version <= last_batch_version {
+            return Ok(ForeignEventPage::empty(Vec::new()));
         }
 
         let rows = client
@@ -358,26 +379,17 @@ impl PgMetaEngine {
             .map_err(|e| Self::classify_pg_error("postgres event_log page select failed", e))?;
 
         let Some(first_row) = rows.first() else {
-            return Ok(ForeignEventPage {
-                rows,
-                first_batch_version: None,
-                last_batch_version: None,
-                batch_count: 0,
-                event_count: 0,
-                response_bytes: 0,
-                has_more: false,
-                oversized: false,
-            });
+            return Ok(ForeignEventPage::empty(rows));
         };
 
         Ok(ForeignEventPage {
-            first_batch_version: Some(first_row.get(5)),
-            last_batch_version: Some(first_row.get(6)),
-            batch_count: first_row.get(7),
-            event_count: first_row.get(8),
-            response_bytes: first_row.get(9),
-            has_more: first_row.get(10),
-            oversized: first_row.get(11),
+            first_batch_version: Some(first_row.get("first_batch_version")),
+            last_batch_version: Some(first_row.get("last_batch_version")),
+            batch_count: first_row.get("batch_count"),
+            event_count: first_row.get("event_count"),
+            response_bytes: first_row.get("response_bytes"),
+            has_more: first_row.get("has_more"),
+            oversized: first_row.get("oversized"),
             rows,
         })
     }

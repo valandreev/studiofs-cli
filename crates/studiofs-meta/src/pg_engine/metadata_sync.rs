@@ -160,10 +160,14 @@ impl PgMetaEngine {
         recent_flush: Option<&RecentFlush>,
         target_version: i64,
     ) -> MetaResult<bool> {
+        let last_seq = self.local_version.load(Ordering::SeqCst);
+        if last_seq >= target_version {
+            return Ok(false);
+        }
+
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.current_client_id()?;
-        let last_seq = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
         let sync_max_batches_per_page = self.sync_max_batches_per_page;
         let sync_max_response_bytes_per_page = self.sync_max_response_bytes_per_page;

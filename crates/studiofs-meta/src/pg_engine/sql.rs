@@ -77,7 +77,7 @@ pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
                 COALESCE(pg_column_size(e.batch_version), 0)::BIGINT
                 + COALESCE(pg_column_size(e.seq_id), 0)::BIGINT
                 + COALESCE(pg_column_size(e.event_type), 0)::BIGINT
-                + COALESCE(pg_column_size(e.event_payload), 0)::BIGINT
+                + COALESCE(octet_length(e.event_payload), 0)::BIGINT
                 + COALESCE(pg_column_size(e.client_id), 0)::BIGINT
             )::BIGINT AS response_bytes
         FROM event_log AS e
@@ -111,7 +111,7 @@ pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
             COUNT(*)::BIGINT AS batch_count,
             SUM(event_count)::BIGINT AS event_count,
             SUM(response_bytes)::BIGINT AS response_bytes,
-            BOOL_OR(response_bytes > $5::BIGINT) AS oversized
+            COALESCE(BOOL_OR(response_bytes > $5::BIGINT), false) AS oversized
         FROM selected_batches
     ),
     page_bounds AS (

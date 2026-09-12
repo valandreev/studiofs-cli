@@ -25,6 +25,7 @@ whether another page remains before the target.
 - [x] (2026-09-12) Run focused formatting, compilation, tests, clippy, and diff validation.
 - [x] (2026-09-12) Review the final staged diff, commit all intended task files, and report remaining follow-up work.
 - [x] (2026-09-12) Apply the review annotation's two confirmed simplifications and rerun focused validation.
+- [x] (2026-09-12) Process the attached deep review: close confirmed cursor-boundary, SQL-size, metadata-mapping, and error-path coverage findings.
 
 ## Surprises & Discoveries
 
@@ -54,6 +55,13 @@ the existing local replay transaction. Replay grouping now treats
 `batch_version` as the only atomic boundary and rejects malformed mixed-client
 rows instead of silently splitting one version.
 
+The review follow-up now treats `target <= cursor` as an empty page and exits the
+pull path before PostgreSQL pool checkout. Page payload sizing uses
+`octet_length`, nullable `BOOL_OR` metadata is normalized to `false`, and page
+metadata is read by SQL column name. Focused offline tests cover invalid limits,
+invalid environment values, and the frozen-target cursor-overrun path; the live
+PostgreSQL set covers the empty target range and mixed-client rejection.
+
 Validation completed:
 
 - `cargo fmt --all -- --check`
@@ -63,6 +71,8 @@ Validation completed:
 - `cargo test -p studiofs-meta foreign_event_page_query_is_bounded_and_exposes_page_metadata --lib` (1 passed)
 - `cargo test -p studiofs-meta pg_foreign_event_pages_respect_cursor_target_and_batch_budget --lib -- --ignored --nocapture --test-threads=1` (1 passed)
 - `cargo test -p studiofs-meta pg_foreign_event_page_keeps_oversized_first_batch_atomic --lib -- --ignored --nocapture --test-threads=1` (1 passed)
+- `cargo test -p studiofs-meta metadata_paging --lib --target-dir target\\sfs699-review` (4 passed; 3 ignored)
+- `cargo test -p studiofs-meta metadata_paging --lib --target-dir target\\sfs699-review -- --ignored --nocapture --test-threads=1` (3 passed)
 
 The live PostgreSQL tests used the existing `.env`-aware harness and passed.
 Workspace-wide and full ignored suites remain outside this task. Durable
@@ -198,3 +208,12 @@ follow-up review simplifications are included in the current changeset.
 sync contract. Removed the redundant page alias and moved one-use frozen-target
 plumbing into `pull_foreign_events_locked`; focused compile, clippy, portable,
 and live PostgreSQL checks passed again.
+
+2026-09-12: Verified the attached deep review against the current implementation.
+Applied the confirmed `target <= cursor` fast paths, replaced the payload size
+estimate with `octet_length`, normalized nullable page metadata, and removed
+positional metadata reads. Added focused tests for invalid limits, invalid
+environment values, cursor-overrun recovery, the empty target range, and mixed
+client identities. Left the unmeasured allocation suggestion and rustdoc request
+out of scope: the former needs evidence, while the latter concerns `pub(super)`
+internal API rather than a public crate interface.
