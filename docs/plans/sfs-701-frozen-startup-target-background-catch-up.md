@@ -35,6 +35,9 @@ the frozen target while the stale client catches up.
 - [x] (2026-09-12) Validate the follow-up review against the replay,
   invalidation, lifecycle, and telemetry contracts; apply the confirmed loop,
   documentation, and edge-test improvements.
+- [x] (2026-09-12) Validate the second review; add typed stall recovery,
+  explicit frozen-target page plumbing, and the zero-version fresh-client
+  regression while rejecting duplicate invalidation and telemetry claims.
 
 ## Surprises & Discoveries
 
@@ -79,6 +82,13 @@ the frozen target while the stale client catches up.
   Rationale: a large finite backlog must remain interruptible so worker
   shutdown can resume from the durable cursor instead of waiting for the
   entire backlog. Date/Author: 2026-09-12, Codex.
+- Decision: Treat a no-progress page as `MetaError::CatchUpStalled`, reset the
+  process-local target, and leave the lifecycle in `Degraded` for a later
+  recovery cycle. Rationale: a stale or pruned range must not pin retries to
+  one unattainable target. Date/Author: 2026-09-12, Codex.
+- Decision: Pass the already captured target directly to each page pull.
+  Rationale: the startup session owns one frozen target, so repeated atomic
+  target resolution is unnecessary. Date/Author: 2026-09-12, Codex.
 
 ## Outcomes & Retrospective
 
@@ -88,15 +98,17 @@ the frozen target while the stale client catches up.
 - Startup no longer preloads the process-local target during `open`; the
   background session captures it when catch-up actually begins, while the
   durable replay cursor remains the restart position.
-- The portable drain tests passed: 8 passed, 0 failed; the service-backed
-  regression remains explicitly ignored by the default test mode.
-- The focused lifecycle completion tests passed: 3 passed, 0 failed, 0
-  ignored; the complete lifecycle-module filter passed 43 tests with 10
-  service-backed tests ignored.
+- The portable startup catch-up filter passed: 9 passed, 0 failed; the two
+  service-backed regressions remain explicitly ignored by the default test
+  mode.
+- The complete lifecycle-module filter passed 49 tests with 11 service-backed
+  tests ignored.
+- The ignored PostgreSQL empty-volume fresh-client regression passed: 1
+  passed, 0 failed.
 - The ignored PostgreSQL moving-head regression passed: 1 passed, 0 failed.
   The existing ignored local-first startup regression also passed: 1 passed,
   0 failed.
-- `cargo fmt --all -- --check`, `cargo check -p studiofs-meta`,
+- `cargo fmt --all -- --check`, `cargo check -p studiofs-meta -p studiofs-vfs`,
   `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, and
   `git diff --check` passed. No workspace-wide or full ignored suite was run.
 
@@ -232,5 +244,9 @@ Done with the focused validation results.
 2026-09-12: Follow-up review confirmed that replay commits already publish
 per-page invalidation batches and that the session lock protects the frozen
 target from concurrent lifecycle completion; added drain-loop rustdoc and
-edge coverage, and kept the generic storage error variant out of this issue's
-scope.
+edge coverage.
+2026-09-12: Second review confirmed the need for a typed no-progress recovery
+path and explicit target plumbing; added `CatchUpStalled`, target reset to
+`Degraded`, and a zero-version fresh-client PostgreSQL regression. Notify,
+lock-granularity, and aggregate telemetry recommendations remained
+unsupported or contract-expanding.

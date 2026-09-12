@@ -68,7 +68,13 @@ fn startup_catch_up_drain_rejects_page_without_cursor_progress() {
     let error = drain_startup_catch_up_pages(1, || 0, || true, || Ok(false))
         .expect_err("a stalled startup catch-up must be reported");
 
-    assert!(error.to_string().contains("catch-up stalled"));
+    assert!(matches!(
+        error,
+        MetaError::CatchUpStalled {
+            local_version: 0,
+            target_version: 1
+        }
+    ));
 }
 
 #[test]
@@ -178,6 +184,25 @@ fn startup_catch_up_drain_reads_cursor_once_per_loop_iteration() {
 
     assert!(changed);
     assert_eq!(reads.get(), 3);
+}
+
+#[test]
+fn startup_catch_up_stall_resets_target_and_enters_degraded_lifecycle() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+    engine
+        .metadata_startup_target_version
+        .store(9, std::sync::atomic::Ordering::Release);
+
+    engine.reset_startup_catch_up_after_stall();
+
+    assert_eq!(
+        engine
+            .metadata_startup_target_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        -1
+    );
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
 }
 
 struct EventLogLockGuard {
@@ -391,6 +416,65 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     stale
         .lookup(ROOT_INO, b"post-target")
         .expect("post-target event should become visible during runtime sync");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn fresh_client_empty_volume_reaches_live_at_zero_target() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-fresh-client-empty-volume");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("fresh.redb");
+    seed_local(&db, &volume.format_info());
+
+    let fresh = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: true,
+            ..Default::default()
+        },
+    )
+    .expect("fresh empty volume should open with local serving state");
+
+    assert_eq!(fresh.local_version.load(Ordering::Acquire), 0);
+    assert_eq!(
+        fresh.pg_sync_status().lifecycle,
+        PgSyncLifecycle::CatchingUp
+    );
+    assert_eq!(
+        fresh
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_client_slot(&fresh.local)
+            .expect("read missing fresh-client slot"),
+        None
+    );
+
+    fresh
+        .sync_metadata()
+        .expect("zero-version startup sync should complete the fresh client");
+
+    assert_eq!(fresh.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(fresh.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        fresh
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read cleared fresh-client marker"),
+        0
+    );
+    assert!(
+        PgMetaEngine::load_persisted_client_slot(&fresh.local)
+            .expect("read assigned fresh-client slot")
+            .is_some()
+    );
 }
 
 #[test]

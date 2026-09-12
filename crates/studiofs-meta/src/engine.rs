@@ -123,6 +123,17 @@ pub enum MetaError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// A bounded PostgreSQL catch-up page completed without advancing its cursor.
+    #[error(
+        "postgres metadata catch-up stalled at local version {local_version} while startup target is {target_version}"
+    )]
+    CatchUpStalled {
+        /// Last local replay cursor observed by the catch-up loop.
+        local_version: i64,
+        /// Frozen startup target that the cursor could not reach.
+        target_version: i64,
+    },
+
     /// The local metadata serving view is unsafe to use.
     #[error("metadata serving lifecycle is fatal")]
     LifecycleFatal,

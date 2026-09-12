@@ -157,6 +157,15 @@ impl PgMetaEngine {
     ) -> MetaResult<bool> {
         self.ensure_remote_format_validated()?;
         let target_version = self.frozen_sync_target_version()?;
+        self.pull_foreign_events_locked_to_target(recent_flush, target_version)
+    }
+
+    pub(super) fn pull_foreign_events_locked_to_target(
+        &self,
+        recent_flush: Option<&RecentFlush>,
+        target_version: i64,
+    ) -> MetaResult<bool> {
+        self.ensure_remote_format_validated()?;
         let result = self.pull_foreign_events_locked_inner(recent_flush, target_version);
         self.record_remote_operation_result(result)
     }

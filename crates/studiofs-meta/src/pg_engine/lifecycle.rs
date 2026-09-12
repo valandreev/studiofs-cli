@@ -39,9 +39,10 @@ pub(super) fn drain_startup_catch_up_pages(
             return Ok(changed);
         }
         if next <= current {
-            return Err(MetaError::Storage(format!(
-                "postgres metadata catch-up stalled at local version {next} while startup target is {target_version}"
-            )));
+            return Err(MetaError::CatchUpStalled {
+                local_version: next,
+                target_version,
+            });
         }
         current = next;
     }
@@ -309,13 +310,22 @@ impl PgMetaEngine {
                             PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
                         )
                 },
-                || self.pull_foreign_events_locked(None),
+                || self.pull_foreign_events_locked_to_target(None, target_version),
             )
         })();
+        if matches!(result, Err(MetaError::CatchUpStalled { .. })) {
+            self.reset_startup_catch_up_after_stall();
+        }
         // Fresh-client completion reacquires replication_lock, so record the
         // aggregate session result only after the page-drain lock is released.
         self.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result);
         result
+    }
+
+    pub(super) fn reset_startup_catch_up_after_stall(&self) {
+        self.metadata_startup_target_version
+            .store(-1, Ordering::Release);
+        self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
     }
 
     pub(super) fn start_background_poll(
