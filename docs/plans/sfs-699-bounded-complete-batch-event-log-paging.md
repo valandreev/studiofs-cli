@@ -24,6 +24,7 @@ whether another page remains before the target.
 - [x] (2026-09-12) Add focused empty, multi-page, target-boundary, and oversized-batch coverage.
 - [x] (2026-09-12) Run focused formatting, compilation, tests, clippy, and diff validation.
 - [x] (2026-09-12) Review the final staged diff, commit all intended task files, and report remaining follow-up work.
+- [x] (2026-09-12) Apply the review annotation's two confirmed simplifications and rerun focused validation.
 
 ## Surprises & Discoveries
 
@@ -190,5 +191,10 @@ and background frozen-target sessions to SFS-700 and SFS-701.
 
 2026-09-12: Implemented and validated the bounded page query, frozen-target
 plumbing, runtime budgets, atomic replay guard, focused unit coverage, and live
-PostgreSQL coverage. The final staged diff was reviewed and committed as
-`4a7b5e3b`.
+PostgreSQL coverage. The final staged diff was reviewed and committed; the
+follow-up review simplifications are included in the current changeset.
+
+2026-09-12: Verified the attached review annotation against the call graph and
+sync contract. Removed the redundant page alias and moved one-use frozen-target
+plumbing into `pull_foreign_events_locked`; focused compile, clippy, portable,
+and live PostgreSQL checks passed again.

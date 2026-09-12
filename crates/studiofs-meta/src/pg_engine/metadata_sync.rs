@@ -104,8 +104,7 @@ impl PgMetaEngine {
                 .replication_lock
                 .lock()
                 .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-            let target_version = self.frozen_sync_target_version()?;
-            let changed = self.pull_foreign_events_locked(None, target_version)?;
+            let changed = self.pull_foreign_events_locked(None)?;
             let remote_head = self.remote_metadata_head_version()?;
             self.metadata_remote_head_version
                 .store(remote_head, Ordering::Release);
@@ -149,9 +148,9 @@ impl PgMetaEngine {
     pub(super) fn pull_foreign_events_locked(
         &self,
         recent_flush: Option<&RecentFlush>,
-        target_version: i64,
     ) -> MetaResult<bool> {
         self.ensure_remote_format_validated()?;
+        let target_version = self.frozen_sync_target_version()?;
         let result = self.pull_foreign_events_locked_inner(recent_flush, target_version);
         self.record_remote_operation_result(result)
     }
@@ -169,7 +168,7 @@ impl PgMetaEngine {
         let sync_max_batches_per_page = self.sync_max_batches_per_page;
         let sync_max_response_bytes_per_page = self.sync_max_response_bytes_per_page;
 
-        let rows = self.run_async(async move {
+        let page = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
@@ -218,7 +217,6 @@ impl PgMetaEngine {
         // Keep the local event position, serving-state reconcile, and pending
         // replay atomic with respect to local metadata mutations. The network
         // query above deliberately stays outside this critical section.
-        let page = rows;
         if page.batch_count > 0 {
             tracing::debug!(
                 volume_id = self.volume_id,
@@ -271,8 +269,7 @@ impl PgMetaEngine {
         &self,
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
-        let target_version = self.frozen_sync_target_version()?;
-        let mut changed = self.pull_foreign_events_locked(recent_flush, target_version)?;
+        let mut changed = self.pull_foreign_events_locked(recent_flush)?;
         let _pending_state = self
             .pending_state
             .lock()
