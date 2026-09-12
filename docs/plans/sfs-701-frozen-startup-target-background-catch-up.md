@@ -41,6 +41,8 @@ the frozen target while the stale client catches up.
 - [x] (2026-09-12) Validate the third review; propagate a fatal lifecycle as
   an error, correct the catch-up rustdocs, and add the overshoot regression
   while rejecting the duplicate invalidation-notification claim.
+- [x] (2026-09-12) Validate the session-bound review; cap each startup session
+  at 16 pages and return a typed resumable budget outcome.
 
 ## Surprises & Discoveries
 
@@ -97,6 +99,11 @@ the frozen target while the stale client catches up.
   lifecycle transition can stop the page loop before the target is reached;
   reporting success would mark the source connected and run reachability
   backfill on an unsafe serving view. Date/Author: 2026-09-12, Codex.
+- Decision: Limit one startup catch-up session to 16 replay pages and leave
+  the frozen target/cursor intact when that budget is reached. Rationale: the
+  session holds `replication_lock` across page pulls; a typed budget outcome
+  yields the lock while the durable cursor lets the next poll resume without
+  chasing a new target. Date/Author: 2026-09-12, Codex.
 
 ## Outcomes & Retrospective
 
@@ -121,6 +128,8 @@ the frozen target while the stale client catches up.
   `git diff --check` passed. No workspace-wide or full ignored suite was run.
 - The third-review catch-up filter passed with 11 tests passed, 0 failed, and
   1 PostgreSQL moving-head test ignored by the default mode.
+- The session-bound regression passed by stopping at 16 pages and resuming
+  the final page from the saved cursor.
 
 ## Context and Orientation
 

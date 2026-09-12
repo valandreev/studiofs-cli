@@ -8,6 +8,10 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+/// Maximum number of replay pages a startup session may apply while holding
+/// `replication_lock`; a later poll resumes from the durable local cursor.
+const MAX_STARTUP_CATCH_UP_PAGES: usize = 16;
+
 /// Drain bounded replay pages until the local cursor reaches a frozen target.
 ///
 /// The continuation callback is checked before each page, so cancellation or
@@ -27,13 +31,22 @@ pub(super) fn drain_startup_catch_up_pages(
     }
 
     let mut changed = false;
+    let mut pages = 0;
     let mut current = local_version();
     while current < target_version {
         if !should_continue() {
             return Ok(changed);
         }
+        if pages >= MAX_STARTUP_CATCH_UP_PAGES {
+            return Err(MetaError::CatchUpBudgetExceeded {
+                local_version: current,
+                target_version,
+                pages,
+            });
+        }
 
         changed |= pull_page()?;
+        pages += 1;
         let next = local_version();
         if next >= target_version {
             return Ok(changed);

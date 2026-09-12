@@ -64,6 +64,52 @@ fn startup_catch_up_drain_replays_pages_until_frozen_target() {
 }
 
 #[test]
+fn startup_catch_up_drain_yields_at_page_budget_and_resumes_from_cursor() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let error = drain_startup_catch_up_pages(
+        17,
+        || local_version.get(),
+        || true,
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect_err("a startup session must yield before monopolizing replication");
+
+    assert!(matches!(
+        error,
+        MetaError::CatchUpBudgetExceeded {
+            local_version: 16,
+            target_version: 17,
+            pages: 16
+        }
+    ));
+    assert_eq!(local_version.get(), 16);
+    assert_eq!(pulls.get(), 16);
+
+    let resumed_pulls = std::cell::Cell::new(0_usize);
+    let changed = drain_startup_catch_up_pages(
+        17,
+        || local_version.get(),
+        || true,
+        || {
+            resumed_pulls.set(resumed_pulls.get() + 1);
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("the next session must resume from the durable cursor");
+
+    assert!(changed);
+    assert_eq!(local_version.get(), 17);
+    assert_eq!(resumed_pulls.get(), 1);
+}
+
+#[test]
 fn startup_catch_up_drain_rejects_page_without_cursor_progress() {
     let error = drain_startup_catch_up_pages(1, || 0, || true, || Ok(false))
         .expect_err("a stalled startup catch-up must be reported");

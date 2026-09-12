@@ -134,6 +134,19 @@ pub enum MetaError {
         target_version: i64,
     },
 
+    /// A startup catch-up session yielded after exhausting its page budget.
+    #[error(
+        "postgres metadata startup catch-up page budget exhausted at local version {local_version} after {pages} pages while startup target is {target_version}"
+    )]
+    CatchUpBudgetExceeded {
+        /// Last local replay cursor observed by the catch-up session.
+        local_version: i64,
+        /// Frozen startup target that the next session must continue toward.
+        target_version: i64,
+        /// Number of complete pages applied by this session.
+        pages: usize,
+    },
+
     /// The local metadata serving view is unsafe to use.
     #[error("metadata serving lifecycle is fatal")]
     LifecycleFatal,

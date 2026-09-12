@@ -182,6 +182,11 @@ before each batch and rolls back without advancing the cursor when either is
 reached. The producer-side row/byte caps keep any one attempted batch bounded;
 the worker must not waive the operation-time bound for a large batch.
 
+The background startup session also has a finite page budget while it holds
+the replication lock. Reaching that budget returns a typed resumable outcome;
+the next session continues from the durable local cursor instead of extending
+one lock hold indefinitely.
+
 The cursor is durable progress, not an optimistic remote acknowledgment. A
 page boundary must never split a `batch_version` batch. The cursor advances to
 the last fully applied batch, so a page whose nominal row/byte budget would be
