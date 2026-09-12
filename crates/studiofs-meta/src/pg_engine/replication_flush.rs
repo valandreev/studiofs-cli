@@ -468,7 +468,10 @@ impl PgMetaEngine {
             }
             Err(err) => {
                 let recovered_from_remote = self
-                    .pull_foreign_events_locked(None)
+                    .frozen_sync_target_version()
+                    .and_then(|target_version| {
+                        self.pull_foreign_events_locked(None, target_version)
+                    })
                     .map(|_| self.flushed_event_seq.load(Ordering::SeqCst) >= batch.event_end)
                     .unwrap_or(false);
                 if recovered_from_remote {

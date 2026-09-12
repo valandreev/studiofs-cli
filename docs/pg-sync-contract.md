@@ -3,7 +3,7 @@
 ## Status
 
 This document is the canonical PostgreSQL sync contract for SFS-695 and the
-follow-up implementation issues SFS-696, SFS-697, and SFS-698. The local-only
+follow-up implementation issues SFS-696, SFS-697, SFS-698, and SFS-699. The local-only
 destroy boundary from SFS-721 is already implemented on `main`; this document
 retains it as a shipped invariant that the cleanup implementation must
 preserve.
@@ -304,14 +304,16 @@ The contract is intentionally defined before the runtime changes are complete:
   read/write authority lifecycle state.
 - SFS-698 removes remote catch-up from `PgMetaEngine` open and moves bounded
   replay behind local serving readiness.
+- SFS-699 adds the bounded complete-batch event-log page query used by runtime
+  replay; durable per-page progress and background session orchestration remain
+  follow-up work.
 - SFS-721 already implements the local-only destroy boundary on `main`; future
   changes must preserve that boundary without PostgreSQL or S3.
 
-Until SFS-696, SFS-697, and SFS-698 land, existing startup code and some
-integration tests may still exercise the superseded synchronous path. SFS-721
-is already shipped on `main`. This document is the target contract for the
-remaining migration; it is not a claim that those remaining runtime changes
-are already implemented.
+The remaining follow-up work includes durable per-page progress and background
+catch-up session orchestration. SFS-721 is already shipped on `main`. This
+document remains the contract for those follow-ups; it does not make the page
+query responsible for their durable state transitions.
 
 ## Validation Boundary
 

@@ -10,6 +10,17 @@ use crate::snapshot::ServingCheckpoint;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 
+pub(super) struct ForeignEventPage {
+    pub(super) rows: Vec<tokio_postgres::Row>,
+    pub(super) first_batch_version: Option<i64>,
+    pub(super) last_batch_version: Option<i64>,
+    pub(super) batch_count: i64,
+    pub(super) event_count: i64,
+    pub(super) response_bytes: i64,
+    pub(super) has_more: bool,
+    pub(super) oversized: bool,
+}
+
 impl PgMetaEngine {
     pub(super) fn pull_snapshot_locked(
         &self,
@@ -310,18 +321,65 @@ impl PgMetaEngine {
         self.record_remote_operation_result(result)
     }
 
-    pub(super) async fn query_foreign_event_rows<C>(
+    pub(super) async fn query_foreign_event_page<C>(
         client: &C,
         volume_id: i64,
-        last_seq: i64,
-    ) -> MetaResult<Vec<tokio_postgres::Row>>
+        last_batch_version: i64,
+        target_batch_version: i64,
+        max_batch_count: i64,
+        max_response_bytes: i64,
+    ) -> MetaResult<ForeignEventPage>
     where
         C: tokio_postgres::GenericClient + Sync,
     {
-        client
-            .query(sql::SELECT_FOREIGN_EVENT_ROWS, &[&volume_id, &last_seq])
+        if max_batch_count <= 0 || max_response_bytes <= 0 {
+            return Err(MetaError::Storage(
+                "postgres foreign event page limits must be positive".to_string(),
+            ));
+        }
+        if target_batch_version < last_batch_version {
+            return Err(MetaError::Storage(
+                "postgres foreign event page target precedes the replay cursor".to_string(),
+            ));
+        }
+
+        let rows = client
+            .query(
+                sql::SELECT_FOREIGN_EVENT_ROWS,
+                &[
+                    &volume_id,
+                    &last_batch_version,
+                    &target_batch_version,
+                    &max_batch_count,
+                    &max_response_bytes,
+                ],
+            )
             .await
-            .map_err(|e| Self::classify_pg_error("postgres event_log select failed", e))
+            .map_err(|e| Self::classify_pg_error("postgres event_log page select failed", e))?;
+
+        let Some(first_row) = rows.first() else {
+            return Ok(ForeignEventPage {
+                rows,
+                first_batch_version: None,
+                last_batch_version: None,
+                batch_count: 0,
+                event_count: 0,
+                response_bytes: 0,
+                has_more: false,
+                oversized: false,
+            });
+        };
+
+        Ok(ForeignEventPage {
+            first_batch_version: Some(first_row.get(5)),
+            last_batch_version: Some(first_row.get(6)),
+            batch_count: first_row.get(7),
+            event_count: first_row.get(8),
+            response_bytes: first_row.get(9),
+            has_more: first_row.get(10),
+            oversized: first_row.get(11),
+            rows,
+        })
     }
 
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {

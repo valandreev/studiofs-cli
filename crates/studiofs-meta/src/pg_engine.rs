@@ -25,6 +25,9 @@ use tracing::warn;
 pub const DEFAULT_PG_POOL_SIZE: usize = 4;
 
 const PG_POOL_SIZE_ENV_VAR: &str = "STUDIOFS_PG_POOL_SIZE";
+const PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR: &str = "STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE";
+const PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR: &str =
+    "STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE";
 
 #[cfg(test)]
 thread_local! {
@@ -119,6 +122,8 @@ const PG_RETIRED_INODE_COUNTER: &str = "next_inode";
 const PG_NEXT_ALLOCATOR_NAMESPACE_COUNTER: &str = "next_allocator_namespace";
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
+const DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE: i64 = 64;
+const DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE: i64 = 8 * 1024 * 1024;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
@@ -203,6 +208,8 @@ pub struct PgMetaEngine {
     flush_ops_threshold: u32,
     connect_timeout: Duration,
     command_timeout: Duration,
+    sync_max_batches_per_page: i64,
+    sync_max_response_bytes_per_page: i64,
     command_pool: Arc<runtime::PgConnectionPool>,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
@@ -609,6 +616,13 @@ impl PgMetaEngine {
         )
     }
 
+    fn env_positive_i64(key: &str, default: i64) -> i64 {
+        pg_env_var(key)
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
     fn default_connect_timeout() -> Duration {
         Self::env_duration_ms(
             "STUDIOFS_PG_CONNECT_TIMEOUT_MS",
@@ -912,6 +926,14 @@ impl PgMetaEngine {
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
+        let sync_max_batches_per_page = Self::env_positive_i64(
+            PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR,
+            DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE,
+        );
+        let sync_max_response_bytes_per_page = Self::env_positive_i64(
+            PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR,
+            DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
+        );
         let remote_format_validated = match Self::validate_postgres_schema(
             &pg.url,
             pg.volume_id,
@@ -975,6 +997,8 @@ impl PgMetaEngine {
             flush_ops_threshold,
             connect_timeout,
             command_timeout,
+            sync_max_batches_per_page,
+            sync_max_response_bytes_per_page,
             command_pool: Arc::new(runtime::PgConnectionPool::new(
                 pg.url.clone(),
                 connect_timeout,

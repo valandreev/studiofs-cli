@@ -643,6 +643,11 @@ PostgreSQL metadata invalidation uses push-plus-poll behavior:
   notification is missed or the listener reconnects.
 - `STUDIOFS_PG_CONNECT_TIMEOUT_MS` and `STUDIOFS_PG_COMMAND_TIMEOUT_MS` bound
   metadata listener reconnect and sync attempts.
+- `STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE` and
+  `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE` bound each foreign event-log
+  page. They default to `64` complete batches and `8388608` estimated response
+  bytes; the first oversized batch is returned atomically and marked for
+  explicit handling.
 - `STUDIOFS_PG_POOL_SIZE` sets the per-client PostgreSQL command-pool capacity;
   it defaults to `4` and overrides the runtime option field when present.
   Values must be positive integers within the runtime semaphore capacity; zero,

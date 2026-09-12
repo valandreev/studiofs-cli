@@ -12,6 +12,7 @@ mod lifecycle;
 mod lock_leases;
 mod lock_workers;
 mod metadata_notify;
+mod metadata_paging;
 mod remote_apply;
 mod replication_backlog;
 mod runtime;
@@ -437,6 +438,8 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         flush_ops_threshold: 8,
         connect_timeout: Duration::from_millis(50),
         command_timeout: Duration::from_millis(50),
+        sync_max_batches_per_page: 64,
+        sync_max_response_bytes_per_page: 8 * 1024 * 1024,
         command_pool: Arc::new(
             PgConnectionPool::new(
                 "postgres://127.0.0.1:1/studiofs".to_string(),

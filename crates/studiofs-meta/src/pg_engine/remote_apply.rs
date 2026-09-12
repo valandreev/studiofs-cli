@@ -1123,8 +1123,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
         while idx < rows.len() {
             let row_batch_version: i64 = rows[idx].get(0);
             let row_client: Option<&str> = rows[idx].get(4);
-            if row_batch_version != batch_version || row_client != batch_client {
+            if row_batch_version != batch_version {
                 break;
+            }
+            if row_client != batch_client {
+                return Err(MetaError::Storage(
+                    "postgres event_log batch contains mixed client identities".to_string(),
+                ));
             }
             let event_type: &str = rows[idx].get(2);
             let payload: &[u8] = rows[idx].get(3);

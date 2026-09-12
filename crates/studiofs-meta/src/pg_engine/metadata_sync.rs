@@ -10,6 +10,28 @@ use std::sync::atomic::Ordering;
 use tracing::warn;
 
 impl PgMetaEngine {
+    pub(super) fn frozen_sync_target_version(&self) -> MetaResult<i64> {
+        let current_target = self.metadata_startup_target_version.load(Ordering::Acquire);
+        if current_target >= 0 {
+            return Ok(current_target);
+        }
+
+        let observed_target = self.remote_metadata_head_version()?;
+        if matches!(
+            self.current_pg_sync_lifecycle(),
+            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+        ) {
+            let _ = self.metadata_startup_target_version.compare_exchange(
+                -1,
+                observed_target,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return Ok(self.metadata_startup_target_version.load(Ordering::Acquire));
+        }
+        Ok(observed_target)
+    }
+
     fn active_open_inode_overlay(&self) -> OverlayConflictSets {
         let mut overlay = OverlayConflictSets::default();
         let Ok(active) = self.active_open_inodes.lock() else {
@@ -82,21 +104,11 @@ impl PgMetaEngine {
                 .replication_lock
                 .lock()
                 .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-            let changed = self.pull_foreign_events_locked(None)?;
+            let target_version = self.frozen_sync_target_version()?;
+            let changed = self.pull_foreign_events_locked(None, target_version)?;
             let remote_head = self.remote_metadata_head_version()?;
             self.metadata_remote_head_version
                 .store(remote_head, Ordering::Release);
-            if matches!(
-                self.current_pg_sync_lifecycle(),
-                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
-            ) {
-                let _ = self.metadata_startup_target_version.compare_exchange(
-                    -1,
-                    remote_head,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
-            }
             Ok(changed)
         })();
         self.record_metadata_sync_result(source, &result);
@@ -137,21 +149,25 @@ impl PgMetaEngine {
     pub(super) fn pull_foreign_events_locked(
         &self,
         recent_flush: Option<&RecentFlush>,
+        target_version: i64,
     ) -> MetaResult<bool> {
         self.ensure_remote_format_validated()?;
-        let result = self.pull_foreign_events_locked_inner(recent_flush);
+        let result = self.pull_foreign_events_locked_inner(recent_flush, target_version);
         self.record_remote_operation_result(result)
     }
 
     fn pull_foreign_events_locked_inner(
         &self,
         recent_flush: Option<&RecentFlush>,
+        target_version: i64,
     ) -> MetaResult<bool> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.current_client_id()?;
         let last_seq = self.local_version.load(Ordering::SeqCst);
         let command_timeout = self.command_timeout;
+        let sync_max_batches_per_page = self.sync_max_batches_per_page;
+        let sync_max_response_bytes_per_page = self.sync_max_response_bytes_per_page;
 
         let rows = self.run_async(async move {
             Self::with_postgres_client_timeout(
@@ -180,11 +196,19 @@ impl PgMetaEngine {
                             .and_then(|row| row.get::<_, Option<i16>>(0));
                         crate::ensure_supported_pg_sync_format_version(found)?;
 
-                        let rows = Self::query_foreign_event_rows(&tx, volume_id, last_seq).await?;
+                        let page = Self::query_foreign_event_page(
+                            &tx,
+                            volume_id,
+                            last_seq,
+                            target_version,
+                            sync_max_batches_per_page,
+                            sync_max_response_bytes_per_page,
+                        )
+                        .await?;
                         tx.commit().await.map_err(|e| {
                             Self::classify_pg_error("postgres pull transaction commit failed", e)
                         })?;
-                        Ok(rows)
+                        Ok(page)
                     })
                 },
             )
@@ -194,6 +218,29 @@ impl PgMetaEngine {
         // Keep the local event position, serving-state reconcile, and pending
         // replay atomic with respect to local metadata mutations. The network
         // query above deliberately stays outside this critical section.
+        let page = rows;
+        if page.batch_count > 0 {
+            tracing::debug!(
+                volume_id = self.volume_id,
+                first_batch_version = ?page.first_batch_version,
+                last_batch_version = ?page.last_batch_version,
+                batch_count = page.batch_count,
+                event_count = page.event_count,
+                response_bytes = page.response_bytes,
+                has_more = page.has_more,
+                oversized = page.oversized,
+                "postgres foreign event page selected"
+            );
+        }
+        if page.oversized {
+            warn!(
+                volume_id = self.volume_id,
+                batch_version = ?page.first_batch_version,
+                response_bytes = page.response_bytes,
+                max_response_bytes = self.sync_max_response_bytes_per_page,
+                "postgres foreign event page contains an oversized atomic batch"
+            );
+        }
         let mut pending_state = self
             .pending_state
             .lock()
@@ -202,7 +249,7 @@ impl PgMetaEngine {
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
         let outcome = RemoteApplyCoordinator::new(&self.local).apply_event_rows(
-            rows,
+            page.rows,
             recent_flush,
             client_id.as_str(),
             super::RemoteReplayApplyContext {
@@ -224,7 +271,8 @@ impl PgMetaEngine {
         &self,
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
-        let mut changed = self.pull_foreign_events_locked(recent_flush)?;
+        let target_version = self.frozen_sync_target_version()?;
+        let mut changed = self.pull_foreign_events_locked(recent_flush, target_version)?;
         let _pending_state = self
             .pending_state
             .lock()
