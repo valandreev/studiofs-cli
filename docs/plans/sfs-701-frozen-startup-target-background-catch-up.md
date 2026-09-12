@@ -38,6 +38,9 @@ the frozen target while the stale client catches up.
 - [x] (2026-09-12) Validate the second review; add typed stall recovery,
   explicit frozen-target page plumbing, and the zero-version fresh-client
   regression while rejecting duplicate invalidation and telemetry claims.
+- [x] (2026-09-12) Validate the third review; propagate a fatal lifecycle as
+  an error, correct the catch-up rustdocs, and add the overshoot regression
+  while rejecting the duplicate invalidation-notification claim.
 
 ## Surprises & Discoveries
 
@@ -89,6 +92,11 @@ the frozen target while the stale client catches up.
 - Decision: Pass the already captured target directly to each page pull.
   Rationale: the startup session owns one frozen target, so repeated atomic
   target resolution is unnecessary. Date/Author: 2026-09-12, Codex.
+- Decision: Treat a fatal lifecycle observed after startup-session execution as
+  `MetaError::LifecycleFatal`, not as a successful no-op drain. Rationale: a
+  lifecycle transition can stop the page loop before the target is reached;
+  reporting success would mark the source connected and run reachability
+  backfill on an unsafe serving view. Date/Author: 2026-09-12, Codex.
 
 ## Outcomes & Retrospective
 
@@ -111,6 +119,8 @@ the frozen target while the stale client catches up.
 - `cargo fmt --all -- --check`, `cargo check -p studiofs-meta -p studiofs-vfs`,
   `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, and
   `git diff --check` passed. No workspace-wide or full ignored suite was run.
+- The third-review catch-up filter passed with 11 tests passed, 0 failed, and
+  1 PostgreSQL moving-head test ignored by the default mode.
 
 ## Context and Orientation
 

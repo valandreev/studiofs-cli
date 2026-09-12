@@ -151,6 +151,25 @@ fn startup_catch_up_drain_skips_pull_when_already_at_target() {
 }
 
 #[test]
+fn startup_catch_up_drain_skips_pull_when_local_cursor_exceeds_target() {
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || 5,
+        || panic!("continuation must not be checked past the target"),
+        || {
+            pulls.set(pulls.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("a cursor past the target should complete");
+
+    assert!(!changed);
+    assert_eq!(pulls.get(), 0);
+}
+
+#[test]
 fn startup_catch_up_drain_propagates_page_error() {
     let error = drain_startup_catch_up_pages(
         1,
@@ -203,6 +222,24 @@ fn startup_catch_up_stall_resets_target_and_enters_degraded_lifecycle() {
         -1
     );
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+}
+
+#[test]
+fn startup_catch_up_session_rejects_fatal_lifecycle_as_success() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::Fatal as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let error = engine
+        .run_startup_catch_up_session(&std::sync::atomic::AtomicBool::new(false))
+        .expect_err("fatal lifecycle must not be reported as a successful sync");
+
+    assert!(matches!(error, MetaError::LifecycleFatal));
 }
 
 struct EventLogLockGuard {

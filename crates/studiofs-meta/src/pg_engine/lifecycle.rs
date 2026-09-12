@@ -13,7 +13,7 @@ use tracing::warn;
 /// The continuation callback is checked before each page, so cancellation or
 /// a lifecycle transition stops the session cleanly. A successful page must
 /// advance the local cursor unless it reaches the target; otherwise the
-/// helper returns a storage error instead of spinning.
+/// helper returns `MetaError::CatchUpStalled` instead of spinning.
 pub(super) fn drain_startup_catch_up_pages(
     target_version: i64,
     mut local_version: impl FnMut() -> i64,
@@ -313,6 +313,12 @@ impl PgMetaEngine {
                 || self.pull_foreign_events_locked_to_target(None, target_version),
             )
         })();
+        let result = if result.is_ok() && self.current_pg_sync_lifecycle() == PgSyncLifecycle::Fatal
+        {
+            Err(MetaError::LifecycleFatal)
+        } else {
+            result
+        };
         if matches!(result, Err(MetaError::CatchUpStalled { .. })) {
             self.reset_startup_catch_up_after_stall();
         }
@@ -322,6 +328,8 @@ impl PgMetaEngine {
         result
     }
 
+    /// Clear the stalled startup target and leave the engine degraded so a
+    /// later poll can capture a fresh target and retry recovery.
     pub(super) fn reset_startup_catch_up_after_stall(&self) {
         self.metadata_startup_target_version
             .store(-1, Ordering::Release);

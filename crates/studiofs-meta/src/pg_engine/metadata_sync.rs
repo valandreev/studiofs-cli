@@ -160,6 +160,11 @@ impl PgMetaEngine {
         self.pull_foreign_events_locked_to_target(recent_flush, target_version)
     }
 
+    /// Pull and replay foreign events up to an already-frozen target version.
+    ///
+    /// The caller must hold `replication_lock`; keeping target resolution
+    /// outside this helper lets a startup session reuse one target for all
+    /// bounded replay pages.
     pub(super) fn pull_foreign_events_locked_to_target(
         &self,
         recent_flush: Option<&RecentFlush>,
