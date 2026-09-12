@@ -129,8 +129,8 @@ impl std::fmt::Debug for BootstrapCheckpointDescriptor {
 }
 
 impl BootstrapCheckpointDescriptor {
-    /// Validates all identity, version, publication, and payload invariants.
-    pub fn validate(&self) -> MetaResult<()> {
+    /// Validates the descriptor and decodes its serving checkpoint payload.
+    pub(crate) fn validate_and_decode(&self) -> MetaResult<crate::snapshot::ServingCheckpoint> {
         if self.volume_id <= 0 || self.volume_uuid.trim().is_empty() {
             return Err(MetaError::InvalidCheckpointDescriptor {
                 reason: CheckpointDescriptorFailure::VolumeIdentity,
@@ -180,11 +180,16 @@ impl BootstrapCheckpointDescriptor {
             });
         }
 
-        postcard::from_bytes::<crate::snapshot::ServingCheckpoint>(&self.checkpoint_bytes)
-            .map_err(|_| MetaError::InvalidCheckpointDescriptor {
+        postcard::from_bytes::<crate::snapshot::ServingCheckpoint>(&self.checkpoint_bytes).map_err(
+            |_| MetaError::InvalidCheckpointDescriptor {
                 reason: CheckpointDescriptorFailure::CheckpointBytes,
-            })?;
-        Ok(())
+            },
+        )
+    }
+
+    /// Validates all identity, version, publication, and payload invariants.
+    pub fn validate(&self) -> MetaResult<()> {
+        self.validate_and_decode().map(|_| ())
     }
 }
 

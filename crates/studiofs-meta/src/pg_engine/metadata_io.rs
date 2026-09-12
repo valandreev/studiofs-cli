@@ -23,54 +23,54 @@ fn descriptor_row_error(error: tokio_postgres::Error) -> MetaError {
 fn try_descriptor_from_row(row: &tokio_postgres::Row) -> MetaResult<BootstrapCheckpointDescriptor> {
     Ok(BootstrapCheckpointDescriptor {
         volume_id: row
-            .try_get::<_, Option<i64>>(0)
+            .try_get::<_, Option<i64>>("vol")
             .map_err(descriptor_row_error)?
             .unwrap_or_default(),
         volume_uuid: row
-            .try_get::<_, Option<String>>(1)
+            .try_get::<_, Option<String>>("uuid")
             .map_err(descriptor_row_error)?
             .unwrap_or_default(),
         metadata_format_version: row
-            .try_get::<_, Option<i16>>(2)
+            .try_get::<_, Option<i16>>("metadata_format_version")
             .map_err(descriptor_row_error)?
             .and_then(|version| u16::try_from(version).ok())
             .unwrap_or_default(),
         remote_head_version: row
-            .try_get::<_, Option<i64>>(3)
+            .try_get::<_, Option<i64>>("version")
             .map_err(descriptor_row_error)?
             .unwrap_or(-1),
         checkpoint_version: row
-            .try_get::<_, Option<i64>>(4)
+            .try_get::<_, Option<i64>>("checkpoint_version")
             .map_err(descriptor_row_error)?
             .unwrap_or(-1),
         checkpoint_bytes: row
-            .try_get::<_, Option<Vec<u8>>>(5)
+            .try_get::<_, Option<Vec<u8>>>("snapshot")
             .map_err(descriptor_row_error)?
             .unwrap_or_default(),
         checkpoint_sha256: row
-            .try_get::<_, Option<Vec<u8>>>(6)
+            .try_get::<_, Option<Vec<u8>>>("checkpoint_sha256")
             .map_err(descriptor_row_error)?
             .unwrap_or_default(),
         format_info_bytes: row
-            .try_get::<_, Option<Vec<u8>>>(7)
+            .try_get::<_, Option<Vec<u8>>>("format_info")
             .map_err(descriptor_row_error)?
             .unwrap_or_default(),
         publication_state: row
-            .try_get::<_, Option<String>>(8)
+            .try_get::<_, Option<String>>("checkpoint_publication_state")
             .map_err(descriptor_row_error)?
             .unwrap_or_default(),
         publication_generation: row
-            .try_get::<_, Option<i64>>(9)
+            .try_get::<_, Option<i64>>("checkpoint_generation")
             .map_err(descriptor_row_error)?
             .unwrap_or_default(),
     })
 }
 
-async fn read_bootstrap_checkpoint_with_pool(
+async fn read_bootstrap_checkpoint_and_decode_with_pool(
     command_pool: Arc<runtime::PgConnectionPool>,
     volume_id: i64,
     command_timeout: std::time::Duration,
-) -> MetaResult<BootstrapCheckpointDescriptor> {
+) -> MetaResult<(BootstrapCheckpointDescriptor, ServingCheckpoint)> {
     let row = PgMetaEngine::with_postgres_client_timeout(
         command_pool,
         command_timeout,
@@ -97,7 +97,18 @@ async fn read_bootstrap_checkpoint_with_pool(
     )
     .await?;
     let descriptor = try_descriptor_from_row(&row)?;
-    descriptor.validate()?;
+    let checkpoint = descriptor.validate_and_decode()?;
+    Ok((descriptor, checkpoint))
+}
+
+async fn read_bootstrap_checkpoint_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<BootstrapCheckpointDescriptor> {
+    let (descriptor, _) =
+        read_bootstrap_checkpoint_and_decode_with_pool(command_pool, volume_id, command_timeout)
+            .await?;
     Ok(descriptor)
 }
 
@@ -148,7 +159,19 @@ async fn read_remote_metadata_head_version_with_pool(
                             e,
                         )
                     })?;
-                Ok(row.map(|row| row.get(0)).unwrap_or(0))
+                let head = match row {
+                    Some(row) => row
+                        .try_get::<_, Option<i64>>(0)
+                        .map_err(|e| {
+                            PgMetaEngine::classify_pg_error(
+                                "postgres metadata head version row parse failed",
+                                e,
+                            )
+                        })?
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                Ok(head)
             })
         },
     )
@@ -178,7 +201,28 @@ async fn read_remote_metadata_head_and_checkpoint_version_with_pool(
                             e,
                         )
                     })?;
-                Ok(row.map(|row| (row.get(0), row.get(1))).unwrap_or((0, -1)))
+                let Some(row) = row else {
+                    return Ok((0, -1));
+                };
+                let head = row
+                    .try_get::<_, Option<i64>>(0)
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres metadata head version row parse failed",
+                            e,
+                        )
+                    })?
+                    .unwrap_or(0);
+                let checkpoint = row
+                    .try_get::<_, Option<i64>>(1)
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres checkpoint version row parse failed",
+                            e,
+                        )
+                    })?
+                    .unwrap_or(-1);
+                Ok((head, checkpoint))
             })
         },
     )
@@ -255,11 +299,12 @@ impl PgMetaEngine {
         if remote_head_version <= local_version || checkpoint_version < local_version {
             return Ok(false);
         }
-        let descriptor = self.run_async(read_bootstrap_checkpoint_with_pool(
-            self.command_pool.clone(),
-            self.volume_id,
-            self.command_timeout,
-        ))?;
+        let (descriptor, checkpoint) =
+            self.run_async(read_bootstrap_checkpoint_and_decode_with_pool(
+                self.command_pool.clone(),
+                self.volume_id,
+                self.command_timeout,
+            ))?;
         if descriptor.remote_head_version <= local_version {
             return Ok(false);
         }
@@ -267,10 +312,6 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
-        let checkpoint: ServingCheckpoint = postcard::from_bytes(&descriptor.checkpoint_bytes)
-            .map_err(|e| {
-                MetaError::Serialization(format!("serving checkpoint decode failed: {e}"))
-            })?;
         let replay_start_version = Self::snapshot_replay_start_version(
             descriptor.checkpoint_version,
             descriptor.remote_head_version,

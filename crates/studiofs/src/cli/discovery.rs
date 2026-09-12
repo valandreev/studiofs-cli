@@ -3,7 +3,7 @@
 use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
-    FormatInfo, MetaFormat, MetaOpenOptions, PgSnapshotBackend, RedbMetaEngine,
+    FormatInfo, MetaError, MetaFormat, MetaOpenOptions, PgSnapshotBackend, RedbMetaEngine,
     connect_studiofs_postgres, decode_format_info as decode_persisted_format_info,
     ensure_studiofs_database, open_meta_engine_with_options,
 };
@@ -61,6 +61,15 @@ struct DiscoveredState {
     format_info: FormatInfo,
 }
 
+const FETCH_REMOTE_VOLUME_ID_QUERY: &str = r#"
+    SELECT v.vol
+    FROM volumes v
+    INNER JOIN metadata_state ms ON ms.vol = v.vol
+    WHERE v.name = $1
+    ORDER BY v.vol DESC
+    LIMIT 1
+    "#;
+
 fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<DiscoveredState> {
     let (postgres_dsn, volume_id) = crate::runtime_bridge::block_on(async move {
         let postgres_dsn = ensure_studiofs_database(meta_dsn)
@@ -72,15 +81,24 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
     })?;
 
     let backend = PgSnapshotBackend::open(&postgres_dsn, volume_id)?;
-    let descriptor = backend.read_bootstrap_checkpoint()?;
+    let descriptor = backend
+        .read_bootstrap_checkpoint()
+        .map_err(|error| match error {
+            MetaError::Storage(message)
+                if message == "postgres bootstrap checkpoint descriptor is missing" =>
+            {
+                DiscoveryError::Message(format!(
+                    "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
+                ))
+            }
+            other => DiscoveryError::Meta(other),
+        })?;
     let mut format_info = decode_persisted_format_info(&descriptor.format_info_bytes)?;
     let pg = format_info
         .metadata
         .postgres
         .as_mut()
-        .ok_or(DiscoveryError::Message(
-            "discovered format is not postgres-backed".to_string(),
-        ))?;
+        .expect("descriptor validation guarantees postgres backend configuration");
     pg.url = postgres_dsn;
 
     Ok(DiscoveredState {
@@ -98,21 +116,15 @@ async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResu
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let row = client
-            .query_opt(
-                r#"
-            SELECT v.vol
-            FROM volumes v
-            WHERE v.name = $1
-            ORDER BY v.vol DESC
-            LIMIT 1
-                "#,
-                &[&name],
-            )
+            .query_opt(FETCH_REMOTE_VOLUME_ID_QUERY, &[&name])
             .await
             .map_err(|e| DiscoveryError::Message(format!("discover query failed: {e}")))?;
 
-        let row =
-            row.ok_or_else(|| DiscoveryError::Message(format!("volume '{name}' not found")))?;
+        let row = row.ok_or_else(|| {
+            DiscoveryError::Message(format!(
+                "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
+            ))
+        })?;
 
         Ok::<i64, DiscoveryError>(row.get(0))
     })
@@ -207,5 +219,11 @@ mod tests {
             }
             other => panic!("expected Discover, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn discover_volume_query_requires_metadata_state() {
+        assert!(FETCH_REMOTE_VOLUME_ID_QUERY.contains("INNER JOIN metadata_state"));
+        assert!(FETCH_REMOTE_VOLUME_ID_QUERY.contains("ms.vol = v.vol"));
     }
 }

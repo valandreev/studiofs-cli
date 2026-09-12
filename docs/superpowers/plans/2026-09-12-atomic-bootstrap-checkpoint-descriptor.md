@@ -146,7 +146,7 @@ Expected: the new public type and API compile without warnings.
 - Test: `crates/studiofs-meta/src/pg_engine/tests/lifecycle.rs`, `crates/studiofs/src/cli/discovery.rs`
 
 **Interfaces:**
-- `pull_snapshot_locked_inner` obtains one `BootstrapCheckpointDescriptor`, compares its `remote_head_version` with the local cursor, imports its decoded checkpoint, and persists `checkpoint_version` as the replay cursor.
+- `pull_snapshot_locked_inner` obtains one validated descriptor plus its decoded checkpoint, compares the remote versions with the local cursor, imports the checkpoint, and persists `checkpoint_version` as the replay cursor.
 - Discovery obtains the same descriptor through `PgSnapshotBackend` and no longer duplicates descriptor validation or field mapping.
 - Existing discovery local-install behavior remains unchanged; pure atomic local installation and skipping runtime open remain SFS-705.
 
@@ -166,16 +166,21 @@ checkpoint read path.
 
 - [x] **Step 3: Wire the shared descriptor**
 
-Remove the separate version read from `pull_snapshot_locked_inner`; call the descriptor reader and use its validated fields. Keep the existing import modes and regular-file reconciliation. Update discovery to open `PgSnapshotBackend` with the PostgreSQL DSN and volume ID obtained from its volume-name lookup, then use `read_bootstrap_checkpoint` for the descriptor payload.
+Preflight the remote head and checkpoint versions, then read one validated
+descriptor plus its decoded checkpoint in `pull_snapshot_locked_inner`; keep the
+existing import modes and regular-file reconciliation. Update discovery to
+select an initialized volume, open `PgSnapshotBackend` with the PostgreSQL DSN
+and volume ID, and use `read_bootstrap_checkpoint` for the descriptor payload.
 
 - [x] **Step 4: Run focused tests to verify green**
 
 Run:
 
-    cargo test -p studiofs-meta bootstrap_checkpoint_query
-    cargo test -p studiofs discover_rejects
+    cargo test -p studiofs-meta bootstrap_checkpoint_query_contains_all_descriptor_columns
+    cargo test -p studiofs-meta metadata_head_query_contains_checkpoint_version
+    cargo test -p studiofs --bin studiofs discover_parses_name_and_meta_dsn
 
-Expected: both commands execute nonzero test counts and pass.
+Expected: all commands execute nonzero test counts and pass.
 
 - [x] **Step 5: Run package checks**
 
@@ -202,7 +207,7 @@ Run:
 
     cargo test -p studiofs-meta checkpoint_descriptor
     cargo test -p studiofs-meta schema_declares_incompatible_sync_boundary_and_checkpoint_descriptor
-    cargo test -p studiofs discover_rejects
+    cargo test -p studiofs --bin studiofs discover_parses_name_and_meta_dsn
 
 Expected: every command runs at least one test and passes.
 
@@ -238,11 +243,12 @@ Mark completed steps with UTC timestamps, record any test or PostgreSQL-service 
 - [x] (2026-09-12 18:16Z) Replaced split runtime checkpoint reads and discovery field mapping with the shared descriptor path.
 - [x] (2026-09-12 18:16Z) Completed focused tests, package checks, Clippy, formatting, diff validation, and final diff inspection.
 - [x] (2026-09-12 18:51Z) Applied the over-engineering review: removed unreachable discovery error/decode wrapper, redundant format-version comparison, redundant helper return, and duplicate source-shape test.
+- [x] (2026-09-12 20:20Z) Applied the current review: removed runtime double postcard decode, made version and descriptor row reads fallible, filtered discovery to initialized volumes, restored missing-descriptor guidance, made the invariant explicit, and updated the verification commands.
 
 ## Surprises & Discoveries
 
 - The SFS-696 implementation already stores checksum, publication state, and generation in `metadata_state`, but it has no typed descriptor API.
-- `pull_snapshot_locked_inner` currently selects the metadata head first and the checkpoint row second, so it does not consume one captured descriptor record.
+- `pull_snapshot_locked_inner` preflights remote versions before fetching the potentially large checkpoint payload, then consumes one validated descriptor record.
 - `PgSnapshotBackend` already provides the no-local-redb PostgreSQL boundary needed by this issue.
 - The first `studiofs` test build required a full crate link and took several minutes; subsequent checks were incremental.
 - The ignored PostgreSQL descriptor test ran successfully with the configured local service, so this acceptance gate was not environment-gated in this run.
@@ -285,10 +291,13 @@ version preflight to skip stale snapshot BLOBs, routed runtime reads through
 the engine runtime and pool, made row mapping fallible with `try_get`, and
 used `Result::flatten` in discovery. Service-backed regressions cover pool
 health after logical descriptor rejection and skipping a stale checkpoint with
-invalid payload bytes. Double postcard deserialization remains intentional
-because the public descriptor must validate before returning exact serialized
-bytes; eliminating it would require a new decoded carrier and an API/ownership
-change not justified by current consumers.
+invalid payload bytes.
+
+Current review pass (2026-09-12): `validate_and_decode` now returns the
+checkpoint consumed by runtime, so the startup path deserializes postcard once.
+Version helpers and descriptor mapping propagate PostgreSQL row-conversion
+errors, discovery ignores uninitialized higher-volume rows and preserves
+missing-descriptor remediation, and the living plan references nonzero tests.
 
 ## Context and Orientation
 
@@ -297,9 +306,9 @@ change not justified by current consumers.
 existing metadata queries. `crates/studiofs-meta/src/pg_engine/metadata_io.rs`
 serializes and imports serving checkpoints. `PgSnapshotBackend` in
 `crates/studiofs-meta/src/pg_engine.rs` opens PostgreSQL without local redb or
-replication workers. `crates/studiofs/src/cli/discovery.rs` currently performs
-its own remote checkpoint query and validation. The local `RedbMetaEngine` is
-the foreground serving view and is not replaced by this work.
+replication workers. `crates/studiofs/src/cli/discovery.rs` uses the shared
+descriptor API for remote checkpoint reads. The local `RedbMetaEngine` is the
+foreground serving view and is not replaced by this work.
 
 ## Plan of Work
 

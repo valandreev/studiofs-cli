@@ -1686,6 +1686,17 @@ fn bootstrap_checkpoint_descriptor_validates_and_exposes_replay_floor() {
 }
 
 #[test]
+fn bootstrap_checkpoint_descriptor_validate_and_decode_returns_checkpoint() {
+    let descriptor = valid_bootstrap_checkpoint_descriptor();
+
+    let checkpoint = descriptor
+        .validate_and_decode()
+        .expect("complete bootstrap descriptor should decode");
+
+    assert_eq!(checkpoint, crate::snapshot::ServingCheckpoint::default());
+}
+
+#[test]
 fn bootstrap_checkpoint_descriptor_debug_redacts_format_info() {
     let descriptor = valid_bootstrap_checkpoint_descriptor();
     let debug = format!("{descriptor:?}");
@@ -1723,10 +1734,12 @@ fn assert_descriptor_failure(
     descriptor: crate::BootstrapCheckpointDescriptor,
     expected: CheckpointDescriptorFailure,
 ) {
-    assert!(matches!(
-        descriptor.validate(),
-        Err(MetaError::InvalidCheckpointDescriptor { reason }) if reason == expected
-    ));
+    match descriptor.validate() {
+        Err(MetaError::InvalidCheckpointDescriptor { reason }) => {
+            assert_eq!(reason, expected);
+        }
+        other => panic!("expected InvalidCheckpointDescriptor({expected:?}), got {other:?}"),
+    }
 }
 
 #[test]
