@@ -41,6 +41,54 @@ fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
     );
 }
 
+#[test]
+fn startup_catch_up_drain_replays_pages_until_frozen_target() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        3,
+        || local_version.get(),
+        || true,
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("startup catch-up should drain each bounded page");
+
+    assert!(changed);
+    assert_eq!(local_version.get(), 3);
+    assert_eq!(pulls.get(), 3);
+}
+
+#[test]
+fn startup_catch_up_drain_rejects_page_without_cursor_progress() {
+    let error = drain_startup_catch_up_pages(1, || 0, || true, || Ok(false))
+        .expect_err("a stalled startup catch-up must be reported");
+
+    assert!(error.to_string().contains("catch-up stalled"));
+}
+
+#[test]
+fn startup_catch_up_drain_stops_when_session_is_cancelled() {
+    let pulls = std::cell::Cell::new(0_usize);
+    let changed = drain_startup_catch_up_pages(
+        1,
+        || 0,
+        || false,
+        || {
+            pulls.set(pulls.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("cancelled startup catch-up should return cleanly");
+
+    assert!(!changed);
+    assert_eq!(pulls.get(), 0);
+}
+
 struct EventLogLockGuard {
     release_tx: Option<tokio::sync::oneshot::Sender<()>>,
     lock_thread: Option<std::thread::JoinHandle<()>>,
@@ -172,6 +220,86 @@ fn stale_local_open_does_not_replay_remote_event_tail() {
         .expect("catch up after event-log unlock");
     assert_eq!(opened.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
     assert!(opened.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _page_limit = set_test_env("STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE", "1");
+    let volume = PgTestVolume::new(&dsn, "pg-frozen-startup-target");
+
+    let stale_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_db = stale_dir.path().join("stale.redb");
+    seed_local(&stale_db, &volume.format_info());
+    let stale = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open stale metadata client");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 0);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+
+    for name in [b"backlog-1".as_slice(), b"backlog-2", b"backlog-3"] {
+        publisher
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create backlog event");
+        publisher.flush_metadata().expect("publish backlog event");
+    }
+
+    stale.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    stale.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+    let startup_target = stale
+        .frozen_sync_target_version()
+        .expect("capture frozen startup target");
+    assert_eq!(startup_target, 3);
+
+    publisher
+        .create_dir(ROOT_INO, b"post-target", 0, 0, 0o755)
+        .expect("create post-target event");
+    publisher
+        .flush_metadata()
+        .expect("publish post-target event");
+    assert_eq!(
+        stale
+            .remote_metadata_head_version()
+            .expect("read advanced remote head"),
+        4
+    );
+
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        stale
+            .run_startup_catch_up_session(&shutdown)
+            .expect("drain frozen startup target")
+    );
+    assert_eq!(stale.local_version.load(Ordering::Acquire), startup_target);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+
+    stale
+        .sync_metadata()
+        .expect("replicate post-target runtime event");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 4);
+    stale
+        .lookup(ROOT_INO, b"post-target")
+        .expect("post-target event should become visible during runtime sync");
 }
 
 #[test]

@@ -74,7 +74,11 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn record_metadata_sync_result(&self, source: MetadataSyncSource, result: &MetaResult<bool>) {
+    pub(super) fn record_metadata_sync_result(
+        &self,
+        source: MetadataSyncSource,
+        result: &MetaResult<bool>,
+    ) {
         match result {
             Ok(changed) => {
                 self.metadata_source_connected
