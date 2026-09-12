@@ -10,6 +10,7 @@ use crate::types::{FileType, Ino, InodeAttr};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
 
@@ -465,6 +466,17 @@ impl PgMetaEngine {
             Ok(recent_flush) => {
                 self.finish_claimed_batch(batch);
                 Ok(recent_flush)
+            }
+            Err(err @ MetaError::EventTooLarge { .. }) => {
+                self.finish_claimed_batch(batch);
+                warn!(
+                    error = %err,
+                    volume_id = self.volume_id,
+                    event_start = batch.event_start,
+                    event_end = batch.event_end,
+                    "postgres flush rejected an oversized event; pending claim was not restored"
+                );
+                Err(err)
             }
             Err(err) => {
                 let recovered_from_remote = self

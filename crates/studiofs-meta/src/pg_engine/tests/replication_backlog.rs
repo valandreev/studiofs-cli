@@ -930,6 +930,46 @@ fn claim_and_restore_pending_batch_updates_replication_backlog() {
 }
 
 #[test]
+fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    pg.remote_format_validated.store(true, Ordering::Release);
+    pg.sync_max_response_bytes_per_page = 1;
+
+    pg.create_dir(ROOT_INO, b"oversized-pending-event", 0, 0, 0o755)
+        .expect("create pending event");
+    let claimed = pg
+        .claim_pending_batch(true)
+        .expect("oversized event should be claimable");
+
+    let error = match pg.flush_pending_claimed_batch_with_restore(claimed) {
+        Ok(_) => panic!("oversized event must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MetaError::EventTooLarge { .. }));
+
+    let backlog = pg.replication_backlog();
+    assert_eq!(
+        backlog.pending_ops, 0,
+        "permanent error must not be retried"
+    );
+    assert_eq!(
+        backlog.inflight_ops, 0,
+        "claim must be completed once surfaced"
+    );
+
+    pg.sync_max_response_bytes_per_page = 8 * 1024 * 1024;
+    pg.create_dir(ROOT_INO, b"event-after-permanent-error", 0, 0, 0o755)
+        .expect("create event after permanent error");
+    let later = pg
+        .claim_pending_batch(true)
+        .expect("later events must not be head-of-line blocked");
+    assert!(
+        later.event_start >= claimed.event_end,
+        "later claim must start after the surfaced event range"
+    );
+}
+
+#[test]
 fn restore_pending_state_from_local_log_replays_unflushed_serving_state() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg

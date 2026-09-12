@@ -648,6 +648,12 @@ PostgreSQL metadata invalidation uses push-plus-poll behavior:
   page. They default to `64` complete batches and `8388608` estimated response
   bytes; the first oversized batch is returned atomically and marked for
   explicit handling.
+- Keep `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE` at or above the encoded
+  size of the largest single event that the client can publish. If a producer
+  event cannot fit, the flush returns the typed `EventTooLarge` error once and
+  does not restore that claim for retry; the event remains local and unflushed.
+  Raise the limit and restart the client to resume that event. This avoids
+  head-of-line blocking while preserving the local event and cursor.
 - `STUDIOFS_PG_POOL_SIZE` sets the per-client PostgreSQL command-pool capacity;
   it defaults to `4` and overrides the runtime option field when present.
   Values must be positive integers within the runtime semaphore capacity; zero,

@@ -252,3 +252,12 @@ individual event that cannot fit returns typed `EventTooLarge` without a version
 bump. Added live regressions for multi-version splitting and atomic oversized-event
 rejection, while retaining the SQL oversized-first-batch path for legacy/manual
 remote rows.
+
+2026-09-12: Addressed the follow-up review finding for permanent
+`EventTooLarge` producer failures. The flush layer now completes the claimed
+range without restoring it, returns the typed error to manual callers, and logs
+the configuration failure for background flushes; transient errors retain the
+remote-recovery and pending-restore path. Documented the required byte-cap
+relationship and restart procedure after correcting an undersized limit, with
+a focused regression proving that later local claims are not held behind the
+rejected range.
