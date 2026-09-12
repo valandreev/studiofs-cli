@@ -687,7 +687,7 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity((end_seq - start_seq).min(1024) as usize);
         for row in table
             .range(start_seq..end_seq)
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -1482,12 +1482,12 @@ impl RedbMetaEngine {
 
         for ino in inodes {
             Self::invalidate_replica_inode(txn, *ino, false)?;
-            let base_attr = base_attrs.get(ino).cloned().flatten();
+            let base_attr = base_attrs.get(ino).and_then(|attr| attr.as_ref());
 
             match base_attr {
                 Some(attr) if attr.kind == FileType::RegularFile => {
-                    let content_changed = Self::replica_content_identity_changed(txn, &attr)?;
-                    Self::set_inode_mirror_in_txn(txn, &attr)?;
+                    let content_changed = Self::replica_content_identity_changed(txn, attr)?;
+                    Self::set_inode_mirror_in_txn(txn, attr)?;
                     Self::remove_stale_dentries_for_base_entry(
                         txn,
                         &DirEntryValue {
@@ -1572,9 +1572,9 @@ impl RedbMetaEngine {
                 .map(|key| {
                     let (parent, name) = decode_dentry_key(key)?;
                     let entry = Self::lookup_in_opened_dentry_table(&base, parent, name)?;
-                    Ok((key.clone(), entry))
+                    Ok((key.as_slice(), entry))
                 })
-                .collect::<MetaResult<HashMap<Vec<u8>, Option<DirEntryValue>>>>()?
+                .collect::<MetaResult<HashMap<&[u8], Option<DirEntryValue>>>>()?
         };
 
         for key in dentry_keys {
@@ -1583,9 +1583,11 @@ impl RedbMetaEngine {
             }
             let (parent, name) = decode_dentry_key(key)?;
             Self::invalidate_replica_entry(txn, parent, name, None)?;
-            let base_entry = base_entries.get(key).cloned().flatten();
+            let base_entry = base_entries
+                .get(key.as_slice())
+                .and_then(|entry| entry.as_ref());
             if let Some(entry) = base_entry {
-                Self::set_dentry_mirror_in_txn(txn, parent, name, &entry)?;
+                Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
                 Self::invalidate_replica_inode(txn, entry.ino, false)?;
             } else {
                 Self::remove_dentry_mirror_in_txn(txn, parent, name)?;

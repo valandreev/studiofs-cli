@@ -61,7 +61,7 @@ impl PendingInvalidations {
         if matches!(self.intents.first(), Some(InvalidationIntent::Reset)) {
             return;
         }
-        if !self.seen.insert(intent.clone()) {
+        if self.seen.contains(&intent) {
             return;
         }
         let bytes = std::mem::size_of::<InvalidationIntent>()
@@ -90,6 +90,7 @@ impl PendingInvalidations {
             self.seen.insert(InvalidationIntent::Reset);
         } else {
             self.bytes += bytes;
+            self.seen.insert(intent.clone());
             self.intents.push(intent);
         }
     }

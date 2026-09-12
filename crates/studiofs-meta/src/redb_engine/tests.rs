@@ -360,6 +360,26 @@ fn coherence_journal_deduplicates_duplicate_intents_without_reset() {
 }
 
 #[test]
+fn update_counters_in_txn_persists_an_initial_zero() {
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().expect("begin counter transaction");
+    RedbMetaEngine::update_counters_in_txn(&txn, &[("pgLastAppliedBatchVersion", Some(0))])
+        .expect("persist initial replay counter");
+    txn.commit().expect("commit initial replay counter");
+
+    let txn = engine.begin_read_txn().expect("begin counter read");
+    let counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
+    assert_eq!(
+        counters
+            .get("pgLastAppliedBatchVersion")
+            .expect("read initial replay counter")
+            .expect("initial replay counter row")
+            .value(),
+        0
+    );
+}
+
+#[test]
 fn legacy_meta_event_fixture_replays_from_local_event_log() {
     let engine = temp_engine();
     let legacy_bytes = [1_u8, 42_u8];

@@ -220,6 +220,10 @@ impl PgMetaEngine {
             .await
         })?;
 
+        if page.rows.is_empty() {
+            return Ok(false);
+        }
+
         // Keep the local event position, serving-state reconcile, and pending
         // replay atomic with respect to local metadata mutations. The network
         // query above deliberately stays outside this critical section.

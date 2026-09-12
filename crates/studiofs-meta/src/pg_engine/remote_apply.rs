@@ -1408,7 +1408,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let has_aux_events = aux_events.peek().is_some();
         RedbMetaEngine::apply_replica_aux_state_in_txn(txn, aux_events)?;
         Ok(RemoteApplyBatchOutcome {
-            changed: applied_serving_state || has_aux_events || !grandfathered_attrs.is_empty(),
+            changed: applied_serving_state
+                || !protected_attr_merges.is_empty()
+                || has_aux_events
+                || !grandfathered_attrs.is_empty(),
             protected_overlay: current_regular_file_conflicts,
         })
     }
@@ -1551,6 +1554,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 &partial_publish_inodes,
             )?;
         }
+        let mut changed = false;
         for event in &batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
@@ -1569,6 +1573,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     new_name,
                     entry,
                 )?;
+                changed = true;
             }
         }
         let mut aux_events = batch_events
@@ -1582,12 +1587,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     )
             })
             .peekable();
-        if aux_events.peek().is_none() {
-            return Ok(false);
+        if aux_events.peek().is_some() {
+            RedbMetaEngine::apply_replica_aux_state_in_txn(txn, aux_events)?;
+            changed = true;
         }
 
-        RedbMetaEngine::apply_replica_aux_state_in_txn(txn, aux_events)?;
-        Ok(true)
+        Ok(changed)
     }
 
     fn stale_self_updating_regular_file_inodes_in_txn(
@@ -1698,7 +1703,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
             return Ok(None);
         }
         let local_events = RedbMetaEngine::read_events_range_in_write_txn(txn, start, end)?;
-        for consumed_events in 1..=local_events.len() {
+        if local_events.len() < batch_events.len() {
+            return Ok(None);
+        }
+        for consumed_events in batch_events.len()..=local_events.len() {
             let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
             if projected_prefix.events.len() != batch_events.len() {
                 continue;
@@ -1848,7 +1856,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             });
         }
 
-        let mut overlay = context.initial_overlay.clone();
+        let mut overlay = std::mem::take(&mut context.initial_overlay);
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;

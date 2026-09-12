@@ -529,11 +529,12 @@ impl RedbMetaEngine {
             let Some(value) = value else {
                 continue;
             };
-            let current = table
+            let stored = table
                 .get(name)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map_or(0, |stored| stored.value());
-            if value > current {
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let stored_value = stored.map(|stored| stored.value());
+            let should_insert = stored_value.is_none_or(|stored| value > stored);
+            if should_insert {
                 table
                     .insert(name, value)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;

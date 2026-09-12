@@ -1607,13 +1607,17 @@ fn protected_attr_merge_accepts_newer_remote_shrink_epoch() {
     remote.mtime = remote.mtime.saturating_add(1);
     remote.ctime = remote.ctime.saturating_add(1);
 
-    apply_foreign_batch(
+    let (changed, _) = apply_foreign_batch(
         &pg,
         &[MetaEvent::SetAttr { attr: remote }],
         &OverlayConflictSets::default(),
         &HashSet::from([file.ino]),
     )
     .expect("apply newer remote shrink");
+    assert!(
+        changed,
+        "a protected attribute merge must report a serving-state change"
+    );
 
     let applied = pg.get_attr(file.ino).expect("load applied attr");
     assert_eq!(
@@ -1623,6 +1627,39 @@ fn protected_attr_merge_accepts_newer_remote_shrink_epoch() {
     );
     assert_eq!(applied.content_epoch, 6);
     assert_eq!(applied.committed_content_epoch, 6);
+}
+
+#[test]
+fn visible_self_rename_reports_serving_reconciliation_change() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"self-old.txt", 77_031);
+    let rename = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"self-old.txt".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"self-new.txt".to_vec(),
+        entry: DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+
+    assert!(
+        apply_visible_self_batch(&pg, &[rename]).expect("apply visible self rename"),
+        "a self rename must report its serving reconciliation"
+    );
+    assert!(pg.lookup(ROOT_INO, b"self-old.txt").is_err());
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"self-new.txt")
+            .expect("lookup self rename destination")
+            .ino,
+        file.ino
+    );
 }
 
 #[test]

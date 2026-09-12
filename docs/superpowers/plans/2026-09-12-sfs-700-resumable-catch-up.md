@@ -26,6 +26,10 @@ After this change, a PostgreSQL-backed client that catches up through several bo
 - [x] (2026-09-12) Added exact pending-invalidation deduplication and a regression proving repeated scopes do not force `Reset`; preserved distinct entry binding data.
 - [x] (2026-09-12) Revalidated the narrow metadata replay and coherence suites after the review fixes; all executed tests pass.
 - [x] (2026-09-12) Committed the second-review fixes in a dedicated follow-up commit.
+- [x] (2026-09-12) Verified the supplied catch-up atomicity review against the current branch and classified all ten recommendations.
+- [x] (2026-09-12) Applied findings 1, 2, 4, 5, 6, 7, 8, 9, and 10 with focused regressions for initial-zero counter persistence, protected-attribute change reporting, and self-rename serving reconciliation.
+- [x] (2026-09-12) Rejected finding 3 after tracing the mutation/replay lock ordering: releasing `pending_state` during the redb replay can deadlock a local mutator that holds that mutex while waiting for the redb writer.
+- [x] (2026-09-12) Revalidated remote-apply, coherence, layout, check, clippy, formatting, and diff gates after the atomicity-review fixes.
 
 ## Surprises & Discoveries
 
@@ -37,6 +41,8 @@ After this change, a PostgreSQL-backed client that catches up through several bo
 - The second SFS-700 review's claim that `SetSymlinkTarget` and pending-deletion events are no-ops in auxiliary replay is stale: the current helper writes those tables. The `changed` calculation therefore retains the existing event-effect classifier; `Peekable` removes the iterator clone without changing semantics.
 - Keeping a preloaded redb table handle alive across reconciliation mutations is invalid because helpers may open the same table again. Reconciliation now opens each base table once to preload the bounded lookup set, releases the handle, and then performs the existing invalidation/mutation sequence.
 - Direct self-batch event comparison required `PartialEq/Eq` on `DirEntryValue`, which the review assumed already existed but current code did not provide. The derive is now explicit for the value type and `MetaEvent`.
+- A missing counter row and a stored counter value of zero are equivalent to `get_counter`, but not to raw table inspection or initialization diagnostics; transaction counter writes now preserve that distinction.
+- The pending-state mutex is part of the local mutation/replay exclusion boundary, not only a guard for post-replay queue restoration. A narrower scope around the final restoration would allow a mutator to hold the mutex while blocked on redb and deadlock replay's restoration step.
 
 ## Decision Log
 
@@ -52,14 +58,17 @@ After this change, a PostgreSQL-backed client that catches up through several bo
 - Decision: Do not add a second sequence cursor or a crash-recovery journal.
   Rationale: SFS-700 explicitly prefers `batch_version` as the durable page boundary, and the existing local event sequence is only needed for self-batch overlay acknowledgement.
   Date/Author: 2026-09-12 / Codex.
+- Decision: Keep `pending_state` held across the local replay transaction in `pull_foreign_events_locked_inner`.
+  Rationale: The mutex excludes `PgMetaEngine::mutate` from entering a redb write operation while replay is using the local event-prefix snapshot; narrowing it only until the outcome is known introduces a lock-order deadlock between the pending-state mutex and redb's writer lock.
+  Date/Author: 2026-09-12 / Codex.
 
 ## Outcomes & Retrospective
 
 Implemented the SFS-700 page durability boundary in `studiofs-meta`. A complete decoded PostgreSQL page now applies base, serving, auxiliary, reconciliation, and replay-position state through one `RedbWriteTransaction`; atomics publish only after the commit succeeds. Aborted and production-orchestration failure regressions prove mutation and cursor state do not persist, while the committed-page/reopen regression proves the next page resumes after the persisted version. Empty pages return before the write-transaction path and do not advance replay state.
 
-Changed files are the page orchestration and cursor code in `pg_engine`, the transaction-aware redb replication/read helpers, coherence/event value types, focused replay/coherence tests, and this plan. Second-review validation passed: `cargo test -p studiofs-meta remote_apply --lib` (`67 passed, 44 ignored`), `cargo test -p studiofs-meta coherence_journal --lib` (`9 passed`), `cargo test -p studiofs-meta --test pg_engine_test_layout` (`3 passed`), `cargo test -p studiofs-meta replay_position --lib` (`1 passed`), `cargo fmt --all -- --check`, `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, and `git diff --check`. The PostgreSQL ignored tests and native FUSE/WinFSP mounted acceptance were not run because they are outside the available metadata-only validation environment.
+Changed files are the page orchestration and cursor code in `pg_engine`, the transaction-aware redb replication/read helpers, coherence/event value types, focused replay/coherence tests, and this plan. Atomicity-review validation passed: `cargo test -p studiofs-meta remote_apply --lib` (`68 passed, 44 ignored`), `cargo test -p studiofs-meta coherence_journal --lib` (`9 passed`), `cargo test -p studiofs-meta update_counters_in_txn_persists_an_initial_zero --lib` (`1 passed`), `cargo test -p studiofs-meta --test pg_engine_test_layout` (`3 passed`), `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check`. The PostgreSQL ignored tests and native FUSE/WinFSP mounted acceptance were not run because they are outside the available metadata-only validation environment.
 
-Ponytail and SFS-700 review outcome: the blanket dead-code allowance and 11 unused production wrappers were removed, test-only compatibility wrappers were marked `cfg(test)`, the three repeated counter updates were reduced to one monotonic loop over one opened table, needless transaction borrows and redundant event clones/allocations were removed, and self-batch events now use direct `Eq` comparison with a length short-circuit. The transactional helper duplication remains justified by the existing public/test APIs and the required single-transaction composition.
+Ponytail and SFS-700 review outcome: the blanket dead-code allowance and 11 unused production wrappers were removed, test-only compatibility wrappers were marked `cfg(test)`, the three repeated counter updates were reduced to one monotonic loop over one opened table, needless transaction borrows and redundant event clones/allocations were removed, and self-batch events now use direct `Eq` comparison with a length short-circuit. The atomicity review additionally removed duplicate invalidation cloning, persists an initial zero counter row, avoids empty-page setup work, reports protected merges and rename reconciliation as changes, borrows preloaded reconciliation values, moves the initial overlay, and bounds prefix-event allocation. Finding 3 was rejected on lock-order correctness grounds. The transactional helper duplication remains justified by the existing public/test APIs and the required single-transaction composition.
 
 ## Context and Orientation
 
