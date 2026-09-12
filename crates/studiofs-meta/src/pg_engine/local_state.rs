@@ -92,36 +92,28 @@ impl PgMetaEngine {
         txn: &RedbWriteTransaction<'_>,
         outcome: &super::RemoteReplayApplyOutcome,
     ) -> MetaResult<()> {
-        if outcome.max_version >= 0 {
-            let current = RedbMetaEngine::get_counter_in_txn(txn, LOCAL_PG_VERSION_COUNTER)?;
-            if outcome.max_version as u64 > current {
-                RedbMetaEngine::set_counter_in_txn(
-                    txn,
-                    LOCAL_PG_VERSION_COUNTER,
-                    outcome.max_version as u64,
-                )?;
-            }
-        }
-        if outcome.max_namespace_version >= 0 {
-            let current =
-                RedbMetaEngine::get_counter_in_txn(txn, LOCAL_PG_NAMESPACE_VERSION_COUNTER)?;
-            if outcome.max_namespace_version as u64 > current {
-                RedbMetaEngine::set_counter_in_txn(
-                    txn,
-                    LOCAL_PG_NAMESPACE_VERSION_COUNTER,
-                    outcome.max_namespace_version as u64,
-                )?;
-            }
-        }
-        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
-            let current =
-                RedbMetaEngine::get_counter_in_txn(txn, LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)?;
-            if flushed_event_seq > current {
-                RedbMetaEngine::set_counter_in_txn(
-                    txn,
-                    LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
-                    flushed_event_seq,
-                )?;
+        let positions = [
+            (
+                LOCAL_PG_VERSION_COUNTER,
+                (outcome.max_version >= 0).then_some(outcome.max_version as u64),
+            ),
+            (
+                LOCAL_PG_NAMESPACE_VERSION_COUNTER,
+                (outcome.max_namespace_version >= 0)
+                    .then_some(outcome.max_namespace_version as u64),
+            ),
+            (
+                LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
+                outcome.flushed_event_seq,
+            ),
+        ];
+        for (name, value) in positions {
+            let Some(value) = value else {
+                continue;
+            };
+            let current = RedbMetaEngine::get_counter_in_txn(txn, name)?;
+            if value > current {
+                RedbMetaEngine::set_counter_in_txn(txn, name, value)?;
             }
         }
         Ok(())

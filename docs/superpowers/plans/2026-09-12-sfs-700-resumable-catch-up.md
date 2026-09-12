@@ -16,14 +16,16 @@ After this change, a PostgreSQL-backed client that catches up through several bo
 - [x] (2026-09-12) Added transaction-aware redb replay operations and transaction-scoped monotonic cursor writes.
 - [x] (2026-09-12) Routed foreign page apply through one local transaction and publish in-memory positions only after commit.
 - [x] (2026-09-12) Ran the focused replay, replication, paging, and replay-position tests, formatting, check, clippy, diff validation, and final diff inspection.
-- [x] (2026-09-12) Committed all intended SFS-700 files as `8166cb6d` with `fix: persist pg catch-up progress atomically`.
+- [x] (2026-09-12) Committed all intended SFS-700 files as `8aa77f12` with `fix: persist pg catch-up progress atomically`.
+- [x] (2026-09-12) Applied the two verified review simplifications and reran the target checks.
+- [x] (2026-09-12) Committed the review simplifications as `7e1d5c71` with `refactor: trim replay wrapper complexity`.
 
 ## Surprises & Discoveries
 
 - The SFS-699 bounded page query and frozen target are already present on `origin/main`, but the page application still calls separate redb commit helpers for base state, serving state, auxiliary state, reconciliation, and cursor counters.
 - `RedbWriteTransaction` already owns the writer lock and invalidation publication, and its `Deref<Target = redb::WriteTransaction>` lets existing transaction helpers be reused. The missing piece is passing that transaction through replay rather than starting a new transaction in each public helper.
 - Existing transaction-aware redb helpers use the write snapshot for merged reads (`get_attr_merged_in_write_txn`, `lookup_merged_in_write_txn`, and chunk-state helpers). These are required because later batches in one page must see earlier batches before the page commits.
-- The ponytail review found two cleanup candidates: the blanket dead-code allowance on `RemoteApplyCoordinator` and repeated counter monotonic-write blocks. The `_in_txn` variants themselves are required composition seams; replacing them with a generic abstraction would add indirection to a single transactional path.
+- The ponytail review identified the blanket dead-code allowance on `RemoteApplyCoordinator` and repeated counter monotonic-write blocks as removable complexity. The `_in_txn` variants themselves remain required composition seams; replacing them with a generic abstraction would add indirection to a single transactional path.
 
 ## Decision Log
 
@@ -46,7 +48,7 @@ Implemented the SFS-700 page durability boundary in `studiofs-meta`. A complete 
 
 Changed files are the page orchestration and cursor code in `pg_engine`, the transaction-aware redb replication/read helpers, the focused replay tests, and this plan. Validation passed: `cargo test -p studiofs-meta remote_apply --lib -- --nocapture` (`65 passed, 44 ignored`), `cargo test -p studiofs-meta replication --lib` (`29 passed, 1 ignored`), `cargo test -p studiofs-meta metadata_paging --lib` (`5 passed, 6 ignored`), `cargo test -p studiofs-meta replay_position --lib` (`1 passed`), `cargo test -p studiofs-meta replica --lib` (`53 passed, 1 ignored`), `cargo fmt --all -- --check`, `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, and `git diff --check`. The PostgreSQL ignored tests and native FUSE/WinFSP mounted acceptance were not run because they are outside the available metadata-only validation environment.
 
-Ponytail review outcome: the transactional helper duplication is justified by the existing public/test APIs and the required single-transaction composition. Cleanup candidates were recorded but not applied because `ponytail-review` is an audit-only skill.
+Ponytail review outcome: the blanket dead-code allowance and 11 unused production wrappers were removed, test-only compatibility wrappers were marked `cfg(test)`, and the three repeated counter updates were reduced to one monotonic loop. The transactional helper duplication remains justified by the existing public/test APIs and the required single-transaction composition.
 
 ## Context and Orientation
 

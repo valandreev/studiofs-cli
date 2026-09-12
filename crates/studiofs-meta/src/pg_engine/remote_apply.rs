@@ -1,4 +1,4 @@
-use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaResult};
+use crate::engine::{MetaError, MetaResult};
 use crate::events::{MetaEvent, decode_event_with_type, encode_event};
 use crate::redb_engine::layout::{encode_acl_rule_key, encode_dentry_key, encode_xattr_key};
 use crate::redb_engine::{RedbMetaEngine, RedbWriteTransaction};
@@ -61,7 +61,6 @@ pub(super) struct RemoteApplyCoordinator<'a> {
     pub(super) local: &'a RedbMetaEngine,
 }
 
-#[allow(dead_code)]
 impl<'a> RemoteApplyCoordinator<'a> {
     pub(super) fn new(local: &'a RedbMetaEngine) -> Self {
         Self { local }
@@ -564,24 +563,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .collect()
     }
 
-    pub(super) fn removed_inodes_for_batch(&self, batch_events: &[MetaEvent]) -> HashSet<Ino> {
-        let mut removed = HashSet::new();
-        for event in batch_events {
-            match event {
-                MetaEvent::RemoveEntry { parent, name } => {
-                    if let Ok(entry) = self.local.lookup(*parent, name) {
-                        removed.insert(entry.ino);
-                    }
-                }
-                MetaEvent::RemoveAttr { ino } => {
-                    removed.insert(*ino);
-                }
-                _ => {}
-            }
-        }
-        removed
-    }
-
     fn removed_inodes_for_batch_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -645,13 +626,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(!current_attr_is_committed_base)
     }
 
-    pub(super) fn removed_inode_has_local_regular_file_state_to_preserve(
-        &self,
-        ino: Ino,
-    ) -> MetaResult<bool> {
-        self.local_regular_file_state_needs_foreign_protection(ino)
-    }
-
     fn removed_inode_has_local_regular_file_state_to_preserve_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -660,6 +634,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         self.local_regular_file_state_needs_foreign_protection_in_txn(txn, ino)
     }
 
+    #[cfg(test)]
     pub(super) fn current_regular_file_overlay_conflicts_for_batch(
         &self,
         batch_events: &[MetaEvent],
@@ -721,16 +696,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(overlay)
     }
 
-    fn serving_ready_regular_files_for_batch(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<HashSet<Ino>> {
-        let txn = self.local.begin_write_txn()?;
-        let result = self.serving_ready_regular_files_for_batch_in_txn(&txn, batch_events);
-        let _ = txn.abort();
-        result
-    }
-
     fn serving_ready_regular_files_for_batch_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -765,16 +730,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             && attr.size == attr.committed_size
     }
 
-    pub(super) fn local_uploading_dentry_needs_foreign_protection(
-        &self,
-        ino: Ino,
-    ) -> MetaResult<bool> {
-        let txn = self.local.begin_write_txn()?;
-        let result = self.local_uploading_dentry_needs_foreign_protection_in_txn(&txn, ino);
-        let _ = txn.abort();
-        result
-    }
-
     fn local_uploading_dentry_needs_foreign_protection_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -789,16 +744,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             && attr.upload_state != UploadState::Ready
             && (attr.size <= attr.committed_size || attr.committed_size == 0)
             && RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, ino)?)
-    }
-
-    pub(super) fn grandfather_removed_local_regular_file_attrs(
-        &self,
-        inodes: &HashSet<Ino>,
-    ) -> MetaResult<Vec<MetaEvent>> {
-        let txn = self.local.begin_write_txn()?;
-        let result = self.grandfather_removed_local_regular_file_attrs_in_txn(&txn, inodes);
-        let _ = txn.abort();
-        result
     }
 
     fn grandfather_removed_local_regular_file_attrs_in_txn(
@@ -925,17 +870,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         false
     }
 
-    pub(super) fn preserve_published_content_state_for_attr_only_events(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<Vec<MetaEvent>> {
-        let txn = self.local.begin_write_txn()?;
-        let result =
-            self.preserve_published_content_state_for_attr_only_events_in_txn(&txn, batch_events);
-        let _ = txn.abort();
-        result
-    }
-
     fn preserve_published_content_state_for_attr_only_events_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -1031,21 +965,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .collect()
     }
 
-    pub(super) fn protected_base_range_preserve_inodes(
-        &self,
-        batch_events: &[MetaEvent],
-        protected_regular_file_inodes: &HashSet<Ino>,
-    ) -> MetaResult<HashSet<Ino>> {
-        let txn = self.local.begin_write_txn()?;
-        let result = self.protected_base_range_preserve_inodes_in_txn(
-            &txn,
-            batch_events,
-            protected_regular_file_inodes,
-        );
-        let _ = txn.abort();
-        result
-    }
-
     fn protected_base_range_preserve_inodes_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -1125,23 +1044,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
         }
         Ok(preserve_inodes)
-    }
-
-    pub(super) fn protected_regular_file_attr_merges(
-        &self,
-        batch_events: &[MetaEvent],
-        protected_regular_file_inodes: &HashSet<Ino>,
-        base_range_preserve_inodes: &HashSet<Ino>,
-    ) -> MetaResult<Vec<MetaEvent>> {
-        let txn = self.local.begin_write_txn()?;
-        let result = self.protected_regular_file_attr_merges_in_txn(
-            &txn,
-            batch_events,
-            protected_regular_file_inodes,
-            base_range_preserve_inodes,
-        );
-        let _ = txn.abort();
-        result
     }
 
     fn protected_regular_file_attr_merges_in_txn(
@@ -1308,6 +1210,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok((batch_version, idx, batch_events, is_self_batch))
     }
 
+    #[cfg(test)]
     pub(super) fn apply_foreign_batch(
         &self,
         batch_events: &[MetaEvent],
@@ -1524,41 +1427,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         })
     }
 
-    fn stale_older_ready_regular_file_inodes(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<HashSet<Ino>> {
-        let mut stale = HashSet::new();
-        for event in batch_events {
-            let MetaEvent::SetAttr { attr } = event else {
-                continue;
-            };
-            if attr.kind != FileType::RegularFile
-                || attr.upload_state != UploadState::Ready
-                || attr.size != attr.committed_size
-                || attr.content_epoch != attr.committed_content_epoch
-            {
-                continue;
-            }
-            let current = match self.local.get_attr(attr.ino) {
-                Ok(current) => current,
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            };
-            if current.kind == FileType::RegularFile
-                && current.upload_state == UploadState::Ready
-                && current.size == current.committed_size
-                && current.content_epoch == current.committed_content_epoch
-                && attr.committed_size > current.committed_size
-                && attr.mtime < current.mtime
-                && attr.ctime < current.ctime
-            {
-                stale.insert(attr.ino);
-            }
-        }
-        Ok(stale)
-    }
-
     fn stale_older_ready_regular_file_inodes_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -1610,37 +1478,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         ino.is_some_and(|ino| stale_inodes.contains(&ino))
     }
 
-    fn stale_older_updating_regular_file_inodes(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<HashSet<Ino>> {
-        let mut stale = HashSet::new();
-        for event in batch_events {
-            let MetaEvent::SetAttr { attr } = event else {
-                continue;
-            };
-            if attr.kind != FileType::RegularFile || attr.upload_state == UploadState::Ready {
-                continue;
-            }
-            let current = match self.local.get_attr(attr.ino) {
-                Ok(current) => current,
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            };
-            if current.kind == FileType::RegularFile
-                && current.upload_state == UploadState::Ready
-                && current.size == current.committed_size
-                && current.content_epoch == current.committed_content_epoch
-                && attr.mtime < current.mtime
-                && attr.ctime < current.ctime
-                && attr.committed_size > current.committed_size
-            {
-                stale.insert(attr.ino);
-            }
-        }
-        Ok(stale)
-    }
-
     fn stale_older_updating_regular_file_inodes_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -1673,6 +1510,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(stale)
     }
 
+    #[cfg(test)]
     pub(super) fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         let txn = self.local.begin_write_txn()?;
         let result = self.apply_visible_self_batch_in_txn(&txn, batch_events);
@@ -1767,40 +1605,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(true)
     }
 
-    fn stale_self_updating_regular_file_inodes(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<HashSet<Ino>> {
-        let mut stale = HashSet::new();
-        for event in batch_events {
-            let MetaEvent::SetAttr { attr } = event else {
-                continue;
-            };
-            if attr.kind != FileType::RegularFile || attr.upload_state == UploadState::Ready {
-                continue;
-            }
-            let current = match self.local.get_attr(attr.ino) {
-                Ok(current) => current,
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            };
-            if current.kind == FileType::RegularFile
-                && current.upload_state == UploadState::Ready
-                && current.size == current.committed_size
-                && current.content_epoch == current.committed_content_epoch
-                && ((attr.mtime < current.mtime
-                    && attr.ctime < current.ctime
-                    && attr.committed_size > current.committed_size)
-                    || (attr.committed_size >= current.committed_size
-                        && attr.content_epoch == current.content_epoch
-                        && attr.committed_content_epoch < current.committed_content_epoch))
-            {
-                stale.insert(attr.ino);
-            }
-        }
-        Ok(stale)
-    }
-
     fn stale_self_updating_regular_file_inodes_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -1861,6 +1665,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(Self::overlay_conflicts_for_events(&events))
     }
 
+    #[cfg(test)]
     pub(super) fn acknowledge_local_prefix_from_self_batch(
         &self,
         batch_events: &[MetaEvent],
