@@ -59,10 +59,92 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
     "#;
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
-    SELECT batch_version, seq_id, event_type, event_payload, client_id
-    FROM event_log
-    WHERE vol=$1 AND batch_version > $2
-    ORDER BY batch_version ASC, seq_id ASC
+    WITH candidate_batches AS (
+        SELECT batch_version
+        FROM event_log
+        WHERE vol = $1
+          AND batch_version > $2
+          AND batch_version <= $3
+        GROUP BY batch_version
+        ORDER BY batch_version ASC
+        LIMIT $4::BIGINT
+    ),
+    candidate_batch_sizes AS (
+        SELECT
+            e.batch_version,
+            COUNT(*)::BIGINT AS event_count,
+            SUM(
+                COALESCE(pg_column_size(e.batch_version), 0)::BIGINT
+                + COALESCE(pg_column_size(e.seq_id), 0)::BIGINT
+                + COALESCE(pg_column_size(e.event_type), 0)::BIGINT
+                + COALESCE(octet_length(e.event_payload), 0)::BIGINT
+                + COALESCE(pg_column_size(e.client_id), 0)::BIGINT
+            )::BIGINT AS response_bytes
+        FROM event_log AS e
+        INNER JOIN candidate_batches AS c
+            ON c.batch_version = e.batch_version
+        WHERE e.vol = $1
+        GROUP BY e.batch_version
+    ),
+    ranked_batches AS (
+        SELECT
+            batch_version,
+            event_count,
+            response_bytes,
+            ROW_NUMBER() OVER (ORDER BY batch_version ASC) AS batch_ordinal,
+            SUM(response_bytes) OVER (
+                ORDER BY batch_version ASC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS cumulative_response_bytes
+        FROM candidate_batch_sizes
+    ),
+    selected_batches AS (
+        SELECT batch_version, event_count, response_bytes
+        FROM ranked_batches
+        WHERE batch_ordinal = 1
+           OR cumulative_response_bytes <= $5::BIGINT
+    ),
+    page_metadata AS (
+        SELECT
+            MIN(batch_version) AS first_batch_version,
+            MAX(batch_version) AS last_batch_version,
+            COUNT(*)::BIGINT AS batch_count,
+            SUM(event_count)::BIGINT AS event_count,
+            SUM(response_bytes)::BIGINT AS response_bytes,
+            COALESCE(BOOL_OR(response_bytes > $5::BIGINT), false) AS oversized
+        FROM selected_batches
+    ),
+    page_bounds AS (
+        SELECT
+            p.*,
+            EXISTS (
+                SELECT 1
+                FROM event_log AS e
+                WHERE e.vol = $1
+                  AND e.batch_version > p.last_batch_version
+                  AND e.batch_version <= $3
+            ) AS has_more
+        FROM page_metadata AS p
+    )
+    SELECT
+        e.batch_version,
+        e.seq_id,
+        e.event_type,
+        e.event_payload,
+        e.client_id,
+        p.first_batch_version,
+        p.last_batch_version,
+        p.batch_count,
+        p.event_count,
+        p.response_bytes,
+        p.has_more,
+        p.oversized
+    FROM event_log AS e
+    INNER JOIN selected_batches AS s
+        ON s.batch_version = e.batch_version
+    CROSS JOIN page_bounds AS p
+    WHERE e.vol = $1
+    ORDER BY e.batch_version ASC, e.seq_id ASC
     "#;
 
 pub(super) const SELECT_SNAPSHOT_SOURCE: &str = r#"

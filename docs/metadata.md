@@ -104,8 +104,9 @@ Runtime behavior:
 - foreground ops (`create`, `rename`, `unlink`, `truncate`, block staging) mutate local `redb`
 - local mutations append to the local metadata event log
 - background flush projects remote-visible deltas into PostgreSQL `event_log`
-- background pull (SFS-695 target; runtime follow-ups SFS-697 and SFS-698)
-  applies only newer foreign delta pages toward a bounded, frozen target
+- background pull (SFS-699) applies newer foreign delta pages as complete
+  `batch_version` units toward an explicit frozen target, with batch-count and
+  response-byte limits
 - restart/reopen rebuilds pending replication state from the local event log when
   unpublished local overlay mutations still exist
 - foreign namespace/attr/symlink/xattr apply updates the local `base_*` view
@@ -115,10 +116,11 @@ Runtime behavior:
 - `metadata_state` is the checkpoint/bootstrap store, not the primary runtime
   sync channel
 
-The bounded, frozen pull behavior above is the SFS-695 target contract. Until
-SFS-696 through SFS-698 land, the current transitional pull path calls
-`query_foreign_event_rows`, which uses `SELECT_FOREIGN_EVENT_ROWS` without a
-page limit or frozen upper version bound.
+The bounded, frozen pull behavior above is implemented by
+`query_foreign_event_page`. Its SQL selects an ordered prefix of complete
+`batch_version` groups through the supplied target. The per-client defaults are
+64 batches and 8 MiB of estimated PostgreSQL row response bytes; an environment
+override may tune either limit without changing the volume schema.
 
 ### Backend Selection on Open
 
@@ -265,10 +267,6 @@ Operational note:
 
 ### Pull from PostgreSQL
 
-The procedure below describes the SFS-695 target contract, not the currently
-shipped SQL path. Until SFS-697 and SFS-698 land, the transitional pull does
-not yet enforce the frozen upper bound or bounded page query described here.
-
 1. Load only rows with `batch_version > local_version`.
 2. Freeze one target `metadata_state.version` for the current sync operation.
 3. Read and apply bounded pages in `(batch_version, seq_id)` order, never past
@@ -400,6 +398,8 @@ such as:
 - `STUDIOFS_PG_SYNC_POLL_SECS`
 - `STUDIOFS_PG_CONNECT_TIMEOUT_MS`
 - `STUDIOFS_PG_COMMAND_TIMEOUT_MS`
+- `STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE`
+- `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE`
 
 ## Schema
 
@@ -491,6 +491,8 @@ Not persisted in the volume format:
 - `STUDIOFS_PG_FLUSH_IDLE_MS = 5000`
 - `STUDIOFS_PG_SYNC_POLL_SECS = 2`
 - `STUDIOFS_PG_POOL_SIZE = 4`
+- `STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE = 64`
+- `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE = 8388608`
 
 `STUDIOFS_PG_POOL_SIZE` is a positive-integer per-client runtime override within
 the runtime semaphore capacity. It takes precedence over

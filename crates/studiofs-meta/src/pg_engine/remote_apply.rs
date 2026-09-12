@@ -1114,20 +1114,49 @@ impl<'a> RemoteApplyCoordinator<'a> {
         start_idx: usize,
         client_id: &str,
     ) -> MetaResult<(i64, usize, Vec<MetaEvent>, bool)> {
-        let batch_version: i64 = rows[start_idx].get(0);
-        let batch_client: Option<&str> = rows[start_idx].get(4);
+        let batch_version: i64 = rows[start_idx].try_get("batch_version").map_err(|error| {
+            MetaError::Storage(format!(
+                "postgres foreign event batch_version decode failed: {error}"
+            ))
+        })?;
+        let batch_client: Option<&str> = rows[start_idx].try_get("client_id").map_err(|error| {
+            MetaError::Storage(format!(
+                "postgres foreign event client_id decode failed: {error}"
+            ))
+        })?;
         let is_self_batch = batch_client == Some(client_id);
         let mut idx = start_idx;
         let mut batch_events = Vec::new();
 
         while idx < rows.len() {
-            let row_batch_version: i64 = rows[idx].get(0);
-            let row_client: Option<&str> = rows[idx].get(4);
-            if row_batch_version != batch_version || row_client != batch_client {
+            let row_batch_version: i64 = rows[idx].try_get("batch_version").map_err(|error| {
+                MetaError::Storage(format!(
+                    "postgres foreign event batch_version decode failed: {error}"
+                ))
+            })?;
+            let row_client: Option<&str> = rows[idx].try_get("client_id").map_err(|error| {
+                MetaError::Storage(format!(
+                    "postgres foreign event client_id decode failed: {error}"
+                ))
+            })?;
+            if row_batch_version != batch_version {
                 break;
             }
-            let event_type: &str = rows[idx].get(2);
-            let payload: &[u8] = rows[idx].get(3);
+            if row_client != batch_client {
+                return Err(MetaError::Storage(
+                    "postgres event_log batch contains mixed client identities".to_string(),
+                ));
+            }
+            let event_type: &str = rows[idx].try_get("event_type").map_err(|error| {
+                MetaError::Storage(format!(
+                    "postgres foreign event event_type decode failed: {error}"
+                ))
+            })?;
+            let payload: &[u8] = rows[idx].try_get("event_payload").map_err(|error| {
+                MetaError::Storage(format!(
+                    "postgres foreign event event_payload decode failed: {error}"
+                ))
+            })?;
             let event = decode_event_with_type(event_type, payload)?;
             batch_events.push(event);
             idx += 1;
