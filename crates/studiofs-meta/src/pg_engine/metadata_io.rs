@@ -2,13 +2,122 @@
 
 #[cfg(test)]
 use super::RemoteApplyCoordinator;
-use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
-use crate::engine::{MetaError, MetaFormat, MetaResult};
+use super::{
+    PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess,
+    StartupSnapshotImportMode, runtime, sql,
+};
+use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaFormat, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+fn descriptor_row_error(error: tokio_postgres::Error) -> MetaError {
+    MetaError::Storage(format!(
+        "postgres bootstrap checkpoint descriptor row is invalid: {error}"
+    ))
+}
+
+fn try_descriptor_from_row(row: &tokio_postgres::Row) -> MetaResult<BootstrapCheckpointDescriptor> {
+    Ok(BootstrapCheckpointDescriptor {
+        volume_id: row
+            .try_get::<_, Option<i64>>("vol")
+            .map_err(descriptor_row_error)?
+            .unwrap_or_default(),
+        volume_uuid: row
+            .try_get::<_, Option<String>>("uuid")
+            .map_err(descriptor_row_error)?
+            .unwrap_or_default(),
+        metadata_format_version: row
+            .try_get::<_, Option<i16>>("metadata_format_version")
+            .map_err(descriptor_row_error)?
+            .and_then(|version| u16::try_from(version).ok())
+            .unwrap_or_default(),
+        remote_head_version: row
+            .try_get::<_, Option<i64>>("version")
+            .map_err(descriptor_row_error)?
+            .unwrap_or(-1),
+        checkpoint_version: row
+            .try_get::<_, Option<i64>>("checkpoint_version")
+            .map_err(descriptor_row_error)?
+            .unwrap_or(-1),
+        checkpoint_bytes: row
+            .try_get::<_, Option<Vec<u8>>>("snapshot")
+            .map_err(descriptor_row_error)?
+            .unwrap_or_default(),
+        checkpoint_sha256: row
+            .try_get::<_, Option<Vec<u8>>>("checkpoint_sha256")
+            .map_err(descriptor_row_error)?
+            .unwrap_or_default(),
+        format_info_bytes: row
+            .try_get::<_, Option<Vec<u8>>>("format_info")
+            .map_err(descriptor_row_error)?
+            .unwrap_or_default(),
+        publication_state: row
+            .try_get::<_, Option<String>>("checkpoint_publication_state")
+            .map_err(descriptor_row_error)?
+            .unwrap_or_default(),
+        publication_generation: row
+            .try_get::<_, Option<i64>>("checkpoint_generation")
+            .map_err(descriptor_row_error)?
+            .unwrap_or_default(),
+    })
+}
+
+async fn read_bootstrap_checkpoint_and_decode_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<(BootstrapCheckpointDescriptor, ServingCheckpoint)> {
+    let row = PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "bootstrap checkpoint descriptor",
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
+                    .await
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres bootstrap checkpoint select failed",
+                            e,
+                        )
+                    })?
+                    .ok_or(MetaError::BootstrapCheckpointDescriptorMissing)?;
+                Ok(row)
+            })
+        },
+    )
+    .await?;
+    let descriptor = try_descriptor_from_row(&row)?;
+    let checkpoint = descriptor.validate_and_decode()?;
+    Ok((descriptor, checkpoint))
+}
+
+async fn read_bootstrap_checkpoint_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<BootstrapCheckpointDescriptor> {
+    let (descriptor, _) =
+        read_bootstrap_checkpoint_and_decode_with_pool(command_pool, volume_id, command_timeout)
+            .await?;
+    Ok(descriptor)
+}
+
+impl PgSnapshotBackend {
+    /// Reads and validates the one-row PostgreSQL bootstrap checkpoint record.
+    pub fn read_bootstrap_checkpoint(&self) -> MetaResult<BootstrapCheckpointDescriptor> {
+        PgMetaEngine::run_async_once(read_bootstrap_checkpoint_with_pool(
+            self.snapshot_command_pool(),
+            self.snapshot_volume_id(),
+            self.snapshot_command_timeout(),
+        ))
+    }
+}
 
 pub(super) struct ForeignEventPage {
     pub(super) rows: Vec<tokio_postgres::Row>,
@@ -24,6 +133,96 @@ pub(super) struct ForeignEventPage {
 struct EncodedRemoteEventBatch {
     events: Vec<MetaEvent>,
     payloads: Vec<Vec<u8>>,
+}
+
+async fn read_remote_metadata_head_version_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<i64> {
+    PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "metadata head version",
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
+                    .await
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres metadata head version select failed",
+                            e,
+                        )
+                    })?;
+                let head = match row {
+                    Some(row) => row
+                        .try_get::<_, Option<i64>>(0)
+                        .map_err(|e| {
+                            PgMetaEngine::classify_pg_error(
+                                "postgres metadata head version row parse failed",
+                                e,
+                            )
+                        })?
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                Ok(head)
+            })
+        },
+    )
+    .await
+}
+
+async fn read_remote_metadata_head_and_checkpoint_version_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<(i64, i64)> {
+    PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "metadata head and checkpoint version",
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(
+                        sql::SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION,
+                        &[&volume_id],
+                    )
+                    .await
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres metadata head and checkpoint version select failed",
+                            e,
+                        )
+                    })?;
+                let Some(row) = row else {
+                    return Ok((0, -1));
+                };
+                let head = row
+                    .try_get::<_, Option<i64>>(0)
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres metadata head version row parse failed",
+                            e,
+                        )
+                    })?
+                    .unwrap_or(0);
+                let checkpoint = row
+                    .try_get::<_, Option<i64>>(1)
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres checkpoint version row parse failed",
+                            e,
+                        )
+                    })?
+                    .unwrap_or(-1);
+                Ok((head, checkpoint))
+            })
+        },
+    )
+    .await
 }
 
 // Match the page query's sizing expression: two BIGINT columns plus a
@@ -90,86 +289,29 @@ impl PgMetaEngine {
         &self,
         import_mode: StartupSnapshotImportMode,
     ) -> MetaResult<bool> {
-        let command_pool = self.command_pool.clone();
-        let volume_id = self.volume_id;
         let local_version = self.local_version.load(Ordering::SeqCst);
-        let command_timeout = self.command_timeout;
-
-        let row = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                command_pool,
-                command_timeout,
-                "pull snapshot",
-                move |client| {
-                    Box::pin(async move {
-                        let version_row = client
-                            .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot version select failed",
-                                    e,
-                                )
-                            })?;
-
-                        let Some(version_row) = version_row else {
-                            return Ok(None);
-                        };
-                        let version: i64 = version_row.get(0);
-                        if version <= local_version {
-                            return Ok(None);
-                        }
-
-                        let row = client
-                            .query_one(sql::SELECT_METADATA_SNAPSHOT, &[&volume_id])
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres serving checkpoint select failed",
-                                    e,
-                                )
-                            })?;
-
-                        Ok(Some(row))
-                    })
-                },
-            )
-            .await
-        })?;
-
-        let Some(row) = row else {
+        let (remote_head_version, checkpoint_version) =
+            self.read_remote_metadata_head_and_checkpoint_version_unrecorded()?;
+        if remote_head_version <= local_version || checkpoint_version < local_version {
             return Ok(false);
-        };
-
-        let version: i64 = row.get(0);
-        let checkpoint_version: i64 = row.get(1);
-        let bytes: Vec<u8> = row.get(2);
-        let metadata_format_version = row.get::<_, Option<i16>>(3);
-        let checkpoint_sha256: Option<Vec<u8>> = row.get(4);
-        let checkpoint_publication_state: Option<String> = row.get(5);
-        let checkpoint_generation: Option<i64> = row.get(6);
-
-        crate::ensure_supported_pg_sync_format_version(metadata_format_version)?;
-        crate::validate_checkpoint_descriptor(
-            &bytes,
-            checkpoint_sha256.as_deref(),
-            checkpoint_publication_state.as_deref(),
-            checkpoint_generation,
-        )?;
-
-        if checkpoint_version < 0 || checkpoint_version > version {
-            return Err(MetaError::Storage(
-                "postgres serving checkpoint version is invalid".to_string(),
-            ));
         }
-        if checkpoint_version < local_version {
+        let (descriptor, checkpoint) =
+            self.run_async(read_bootstrap_checkpoint_and_decode_with_pool(
+                self.command_pool.clone(),
+                self.volume_id,
+                self.command_timeout,
+            ))?;
+        if descriptor.remote_head_version <= local_version {
+            return Ok(false);
+        }
+        if descriptor.checkpoint_version < local_version {
             return Ok(false);
         }
 
-        let checkpoint: ServingCheckpoint = postcard::from_bytes(&bytes).map_err(|e| {
-            MetaError::Serialization(format!("serving checkpoint decode failed: {e}"))
-        })?;
-        let replay_start_version = Self::snapshot_replay_start_version(checkpoint_version, version);
+        let replay_start_version = Self::snapshot_replay_start_version(
+            descriptor.checkpoint_version,
+            descriptor.remote_head_version,
+        );
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
                 self.local.import_serving_checkpoint(&checkpoint)?;
@@ -188,34 +330,27 @@ impl PgMetaEngine {
         Ok(true)
     }
 
+    fn read_remote_metadata_head_version_unrecorded(&self) -> MetaResult<i64> {
+        self.run_async(read_remote_metadata_head_version_with_pool(
+            self.command_pool.clone(),
+            self.volume_id,
+            self.command_timeout,
+        ))
+    }
+
+    fn read_remote_metadata_head_and_checkpoint_version_unrecorded(
+        &self,
+    ) -> MetaResult<(i64, i64)> {
+        self.run_async(read_remote_metadata_head_and_checkpoint_version_with_pool(
+            self.command_pool.clone(),
+            self.volume_id,
+            self.command_timeout,
+        ))
+    }
+
     pub(super) fn remote_metadata_head_version(&self) -> MetaResult<i64> {
         self.ensure_remote_format_validated()?;
-        let command_pool = self.command_pool.clone();
-        let volume_id = self.volume_id;
-        let command_timeout = self.command_timeout;
-
-        let result = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                command_pool,
-                command_timeout,
-                "metadata head version",
-                move |client| {
-                    Box::pin(async move {
-                        let row = client
-                            .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres metadata head version select failed",
-                                    e,
-                                )
-                            })?;
-                        Ok(row.map(|row| row.get(0)).unwrap_or(0))
-                    })
-                },
-            )
-            .await
-        });
+        let result = self.read_remote_metadata_head_version_unrecorded();
         self.record_remote_operation_result(result)
     }
 

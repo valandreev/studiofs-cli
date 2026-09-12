@@ -1,6 +1,25 @@
 pub(super) const SELECT_METADATA_VERSION: &str = "SELECT version FROM metadata_state WHERE vol=$1";
 
-pub(super) const SELECT_METADATA_SNAPSHOT: &str = "SELECT version, checkpoint_version, snapshot, metadata_format_version, checkpoint_sha256, checkpoint_publication_state, checkpoint_generation FROM metadata_state WHERE vol=$1";
+pub(super) const SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION: &str =
+    "SELECT version, checkpoint_version FROM metadata_state WHERE vol=$1";
+
+pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
+    SELECT
+        v.vol,
+        v.uuid,
+        ms.metadata_format_version,
+        ms.version,
+        ms.checkpoint_version,
+        ms.snapshot,
+        ms.checkpoint_sha256,
+        ms.format_info,
+        ms.checkpoint_publication_state,
+        ms.checkpoint_generation
+    FROM volumes AS v
+    INNER JOIN metadata_state AS ms ON ms.vol = v.vol
+    WHERE v.vol = $1
+    "#;
+
 pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =
     "SELECT metadata_format_version FROM metadata_state WHERE vol = $1";
 
