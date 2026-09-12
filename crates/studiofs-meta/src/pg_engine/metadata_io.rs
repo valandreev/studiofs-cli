@@ -21,6 +21,34 @@ pub(super) struct ForeignEventPage {
     pub(super) oversized: bool,
 }
 
+struct EncodedRemoteEventBatch {
+    events: Vec<MetaEvent>,
+    payloads: Vec<Vec<u8>>,
+}
+
+// Match the page query's sizing expression: two BIGINT columns plus a
+// conservative four-byte varlena header for each TEXT column.
+const PG_EVENT_FIXED_RESPONSE_BYTES: i64 = 8 + 8 + 4 + 4;
+
+fn encoded_event_response_bytes(
+    event_type: &str,
+    payload_len: usize,
+    client_id: &str,
+) -> MetaResult<i64> {
+    let payload_len = i64::try_from(payload_len)
+        .map_err(|_| MetaError::Storage("event payload length exceeds BIGINT".to_string()))?;
+    let event_type_len = i64::try_from(event_type.len())
+        .map_err(|_| MetaError::Storage("event type length exceeds BIGINT".to_string()))?;
+    let client_id_len = i64::try_from(client_id.len())
+        .map_err(|_| MetaError::Storage("client ID length exceeds BIGINT".to_string()))?;
+
+    PG_EVENT_FIXED_RESPONSE_BYTES
+        .checked_add(event_type_len)
+        .and_then(|bytes| bytes.checked_add(client_id_len))
+        .and_then(|bytes| bytes.checked_add(payload_len))
+        .ok_or_else(|| MetaError::Storage("event response size exceeds BIGINT".to_string()))
+}
+
 impl ForeignEventPage {
     fn empty(rows: Vec<tokio_postgres::Row>) -> Self {
         Self {
@@ -207,11 +235,15 @@ impl PgMetaEngine {
 
         self.ensure_remote_format_validated()?;
 
+        let client_id = self.current_client_id()?;
+        let batches = Self::split_projected_event_batches(
+            events,
+            &client_id,
+            self.sync_max_response_bytes_per_page,
+        )?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let client_id = self.current_client_id()?;
         let now_ms = Self::now_millis();
-        let events_vec = events;
         let expected_metadata_format_version =
             i16::try_from(CURRENT_FORMAT_VERSION).map_err(|_| {
                 MetaError::Storage(
@@ -231,121 +263,192 @@ impl PgMetaEngine {
                         .await
                         .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
-                    let batch_version_row = tx
-                        .query_opt(
-                            sql::BUMP_METADATA_VERSION,
-                            &[&volume_id, &expected_metadata_format_version],
-                        )
-                        .await
-                        .map_err(|e| {
-                            Self::classify_pg_error("postgres metadata_state bump failed", e)
-                        })?;
-                    let Some(batch_version_row) = batch_version_row else {
-                        let format_row = tx
-                            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
+                    let mut last_batch_version = None;
+                    for batch in batches {
+                        let batch_version_row = tx
+                            .query_opt(
+                                sql::BUMP_METADATA_VERSION,
+                                &[&volume_id, &expected_metadata_format_version],
+                            )
                             .await
                             .map_err(|e| {
                                 Self::classify_pg_error(
-                                    "postgres metadata format revalidation failed",
+                                    "postgres metadata_state bump failed",
                                     e,
                                 )
                             })?;
-                        let found = format_row
-                            .as_ref()
-                            .and_then(|row| row.get::<_, Option<i16>>(0));
-                        crate::ensure_supported_pg_sync_format_version(found)?;
-                        return Err(MetaError::Storage(
-                            "postgres metadata version bump did not update the current-format row"
-                                .to_string(),
-                        ));
-                    };
-                    let batch_version: i64 = batch_version_row.get(0);
-
-                    for chunk in events_vec.chunks(PG_EVENT_INSERT_CHUNK_SIZE) {
-                        let event_types: Vec<&str> =
-                            chunk.iter().map(|event| event.kind()).collect();
-                        let payloads: Vec<Vec<u8>> = chunk
-                            .iter()
-                            .map(encode_event)
-                            .collect::<MetaResult<Vec<_>>>()?;
-                        tx.execute(
-                            sql::INSERT_EVENT_LOG_BATCH,
-                            &[
-                                &volume_id,
-                                &batch_version,
-                                &client_id,
-                                &now_ms,
-                                &event_types,
-                                &payloads,
-                            ],
-                        )
-                        .await
-                        .map_err(|e| {
-                            Self::classify_pg_error("postgres event_log batch insert failed", e)
-                        })?;
-                    }
-
-                    for event in &events_vec {
-                        match event {
-                            MetaEvent::SetAclRule {
-                                ino,
-                                principal,
-                                access_level,
-                            } => {
-                                tx.execute(
-                                    r#"
-                                    INSERT INTO acl_rules (vol, ino, principal, access_level, updated_at)
-                                    VALUES ($1, $2, $3, $4, now())
-                                    ON CONFLICT (vol, ino, principal) DO UPDATE
-                                    SET access_level = EXCLUDED.access_level,
-                                        updated_at = now()
-                                    "#,
-                                    &[&volume_id, &(*ino as i64), principal, &(*access_level as i16)],
-                                )
+                        let Some(batch_version_row) = batch_version_row else {
+                            let format_row = tx
+                                .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
                                 .await
                                 .map_err(|e| {
-                                    Self::classify_pg_error("postgres acl_rules upsert failed", e)
+                                    Self::classify_pg_error(
+                                        "postgres metadata format revalidation failed",
+                                        e,
+                                    )
                                 })?;
-                            }
-                            MetaEvent::RemoveAclRule { ino, principal } => {
-                                tx.execute(
-                                    "DELETE FROM acl_rules WHERE vol=$1 AND ino=$2 AND principal=$3",
-                                    &[&volume_id, &(*ino as i64), principal],
+                            let found = format_row
+                                .as_ref()
+                                .and_then(|row| row.get::<_, Option<i16>>(0));
+                            crate::ensure_supported_pg_sync_format_version(found)?;
+                            return Err(MetaError::Storage(
+                                "postgres metadata version bump did not update the current-format row"
+                                    .to_string(),
+                            ));
+                        };
+                        let batch_version: i64 = batch_version_row.get(0);
+
+                        for (event_chunk, payload_chunk) in batch
+                            .events
+                            .chunks(PG_EVENT_INSERT_CHUNK_SIZE)
+                            .zip(batch.payloads.chunks(PG_EVENT_INSERT_CHUNK_SIZE))
+                        {
+                            let event_types: Vec<&str> =
+                                event_chunk.iter().map(|event| event.kind()).collect();
+                            let payloads = payload_chunk.to_vec();
+                            tx.execute(
+                                sql::INSERT_EVENT_LOG_BATCH,
+                                &[
+                                    &volume_id,
+                                    &batch_version,
+                                    &client_id,
+                                    &now_ms,
+                                    &event_types,
+                                    &payloads,
+                                ],
+                            )
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres event_log batch insert failed",
+                                    e,
                                 )
-                                .await
-                                .map_err(|e| {
-                                    Self::classify_pg_error("postgres acl_rules delete failed", e)
-                                })?;
-                            }
-                            _ => {}
+                            })?;
                         }
+
+                        for event in &batch.events {
+                            match event {
+                                MetaEvent::SetAclRule {
+                                    ino,
+                                    principal,
+                                    access_level,
+                                } => {
+                                    tx.execute(
+                                        r#"
+                                        INSERT INTO acl_rules (vol, ino, principal, access_level, updated_at)
+                                        VALUES ($1, $2, $3, $4, now())
+                                        ON CONFLICT (vol, ino, principal) DO UPDATE
+                                        SET access_level = EXCLUDED.access_level,
+                                            updated_at = now()
+                                        "#,
+                                        &[&volume_id, &(*ino as i64), principal, &(*access_level as i16)],
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        Self::classify_pg_error(
+                                            "postgres acl_rules upsert failed",
+                                            e,
+                                        )
+                                    })?;
+                                }
+                                MetaEvent::RemoveAclRule { ino, principal } => {
+                                    tx.execute(
+                                        "DELETE FROM acl_rules WHERE vol=$1 AND ino=$2 AND principal=$3",
+                                        &[&volume_id, &(*ino as i64), principal],
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        Self::classify_pg_error(
+                                            "postgres acl_rules delete failed",
+                                            e,
+                                        )
+                                    })?;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        super::snapshot_reachability::apply_object_lifetime_changes(
+                            &tx,
+                            volume_id,
+                            batch_version,
+                            &batch.events,
+                        )
+                        .await?;
+                        last_batch_version = Some(batch_version);
                     }
 
-                    super::snapshot_reachability::apply_object_lifetime_changes(
-                        &tx,
-                        volume_id,
-                        batch_version,
-                        &events_vec,
-                    )
-                    .await?;
+                    let last_batch_version = last_batch_version.ok_or_else(|| {
+                        MetaError::Storage("encoded event batches unexpectedly empty".to_string())
+                    })?;
 
                     let channel = Self::metadata_notify_channel(volume_id);
                     let _ = tx
                         .execute(
                             "SELECT pg_notify($1, $2)",
-                            &[&channel, &batch_version.to_string()],
+                            &[&channel, &last_batch_version.to_string()],
                         )
                         .await;
 
                     tx.commit()
                         .await
                         .map_err(|e| Self::classify_pg_error("postgres commit failed", e))?;
-                    Ok(batch_version)
+                    Ok(last_batch_version)
                 }),
             )
             .await
         });
         self.record_remote_operation_result(result)
+    }
+
+    fn split_projected_event_batches(
+        events: Vec<MetaEvent>,
+        client_id: &str,
+        max_response_bytes: i64,
+    ) -> MetaResult<Vec<EncodedRemoteEventBatch>> {
+        let mut batches = Vec::new();
+        let mut batch_events = Vec::new();
+        let mut batch_payloads = Vec::new();
+        let mut batch_response_bytes = 0_i64;
+
+        for event in events {
+            let payload = encode_event(&event)?;
+            let event_response_bytes =
+                encoded_event_response_bytes(event.kind(), payload.len(), client_id)?;
+            if event_response_bytes > max_response_bytes {
+                return Err(MetaError::EventTooLarge {
+                    estimated: event_response_bytes,
+                    limit: max_response_bytes,
+                });
+            }
+
+            let would_exceed = batch_response_bytes
+                .checked_add(event_response_bytes)
+                .is_none_or(|bytes| bytes > max_response_bytes);
+            if !batch_events.is_empty() && would_exceed {
+                batches.push(EncodedRemoteEventBatch {
+                    events: std::mem::take(&mut batch_events),
+                    payloads: std::mem::take(&mut batch_payloads),
+                });
+                batch_response_bytes = 0;
+            }
+
+            batch_response_bytes = batch_response_bytes
+                .checked_add(event_response_bytes)
+                .ok_or_else(|| {
+                    MetaError::Storage("event response size exceeds BIGINT".to_string())
+                })?;
+            batch_events.push(event);
+            batch_payloads.push(payload);
+        }
+
+        if !batch_events.is_empty() {
+            batches.push(EncodedRemoteEventBatch {
+                events: batch_events,
+                payloads: batch_payloads,
+            });
+        }
+        Ok(batches)
     }
 
     pub(super) async fn query_foreign_event_page<C>(

@@ -178,6 +178,17 @@ pub enum MetaError {
         limit: usize,
     },
 
+    /// A single event exceeds the PostgreSQL replay byte budget.
+    #[error(
+        "event exceeds PostgreSQL replay byte limit: estimated={estimated} bytes, limit={limit} bytes"
+    )]
+    EventTooLarge {
+        /// Conservative response-byte estimate for the encoded event row.
+        estimated: i64,
+        /// Maximum response-byte budget for one replay batch.
+        limit: i64,
+    },
+
     /// The local metadata store belongs to a different remote volume UUID.
     #[error("disk UUID mismatch: local={local}, remote={remote}")]
     UuidMismatch {

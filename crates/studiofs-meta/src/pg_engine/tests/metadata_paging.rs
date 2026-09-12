@@ -1,7 +1,7 @@
 use super::{
     DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE, DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
     PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR,
-    PgTestVolume, pg_dsn, run_async, set_test_env,
+    PgOpenOptions, PgTestVolume, pg_dsn, run_async, seed_local, set_test_env,
 };
 use crate::events::{MetaEvent, encode_event};
 use crate::pg_engine::PgMetaEngine;
@@ -331,4 +331,127 @@ fn pg_foreign_event_batch_rejects_mixed_client_identities() {
         Ok::<(), crate::engine::MetaError>(())
     })
     .expect("mixed-client foreign event batch");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_producer_splits_projected_batch_before_assigning_versions() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let _bytes = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "128");
+    let volume = PgTestVolume::new(&dsn, "pg-producer-bounded-batch");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    run_async(async {
+        let events = (1..=3)
+            .map(|ino| MetaEvent::RemoveAttr { ino })
+            .collect::<Vec<_>>();
+        engine.push_event_log_batch_locked(&events)?;
+
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let connection_task = tokio::spawn(connection);
+        let rows = client
+            .query(
+                "SELECT batch_version, COUNT(*)::BIGINT, \
+                 SUM(pg_column_size(batch_version) + pg_column_size(seq_id) \
+                     + pg_column_size(event_type) + octet_length(event_payload) \
+                     + COALESCE(pg_column_size(client_id), 0))::BIGINT \
+                 FROM event_log WHERE vol = $1 GROUP BY batch_version ORDER BY batch_version",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+
+        assert_eq!(rows.iter().map(|row| row.get::<_, i64>(1)).sum::<i64>(), 3);
+        assert!(rows.len() > 1, "producer must split the projected range");
+        for row in rows {
+            assert!(
+                row.get::<_, i64>(2) <= 128,
+                "published batch exceeded replay byte cap"
+            );
+        }
+
+        connection_task.abort();
+        Ok::<(), crate::engine::MetaError>(())
+    })
+    .expect("producer must publish bounded event batches");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_producer_rejects_single_event_over_byte_cap_before_version_bump() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let _bytes = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "1");
+    let volume = PgTestVolume::new(&dsn, "pg-producer-oversized-event");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let connection_task = tokio::spawn(connection);
+        let before = client
+            .query_one(
+                "SELECT version FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?
+            .get::<_, i64>(0);
+
+        let error = engine
+            .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 42 }])
+            .expect_err("a single event larger than the replay byte cap must be rejected");
+        assert!(matches!(
+            error,
+            crate::engine::MetaError::EventTooLarge { .. }
+        ));
+
+        let after = client
+            .query_one(
+                "SELECT version FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?
+            .get::<_, i64>(0);
+        assert_eq!(
+            after, before,
+            "rejected event must not bump metadata version"
+        );
+        let event_count = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM event_log WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?
+            .get::<_, i64>(0);
+        assert_eq!(event_count, 0, "rejected event must not be inserted");
+
+        connection_task.abort();
+        Ok::<(), crate::engine::MetaError>(())
+    })
+    .expect("oversized event must be rejected before publication");
 }

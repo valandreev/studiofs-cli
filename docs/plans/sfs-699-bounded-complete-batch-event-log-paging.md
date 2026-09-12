@@ -244,3 +244,11 @@ cursor name. Kept `ForeignEventPage` without derived `Debug` to avoid accidental
 payload logging, and did not add a direct fake-client fast-path test because the
 existing pull-level offline regression covers that behavior without overbuilding
 test infrastructure. Deferred repeated per-row page metadata to SFS-700/SFS-701.
+
+2026-09-12: Verified the P1 producer-envelope review comment against the current
+producer and PostgreSQL sync contract. Pre-encoded projected events are now split
+into response-byte-bounded batches before any metadata version is assigned; an
+individual event that cannot fit returns typed `EventTooLarge` without a version
+bump. Added live regressions for multi-version splitting and atomic oversized-event
+rejection, while retaining the SQL oversized-first-batch path for legacy/manual
+remote rows.
