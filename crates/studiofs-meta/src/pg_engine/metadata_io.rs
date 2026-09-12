@@ -86,11 +86,7 @@ async fn read_bootstrap_checkpoint_and_decode_with_pool(
                             e,
                         )
                     })?
-                    .ok_or_else(|| {
-                        MetaError::Storage(
-                            "postgres bootstrap checkpoint descriptor is missing".to_string(),
-                        )
-                    })?;
+                    .ok_or(MetaError::BootstrapCheckpointDescriptorMissing)?;
                 Ok(row)
             })
         },

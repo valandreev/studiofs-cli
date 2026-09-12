@@ -1702,14 +1702,14 @@ fn bootstrap_checkpoint_descriptor_debug_redacts_format_info() {
     let debug = format!("{descriptor:?}");
 
     assert!(debug.contains("format_info_bytes: \"<redacted>\""));
-    assert!(!debug.contains("postgres://studiofs"));
+    assert!(!debug.contains("test-postgres-dsn"));
 }
 
 fn valid_bootstrap_checkpoint_descriptor() -> crate::BootstrapCheckpointDescriptor {
     let format_info = format_info(
         "bootstrap-descriptor",
         "bootstrap-descriptor-uuid",
-        "postgres://studiofs:studiofs@127.0.0.1:5432",
+        "test-postgres-dsn",
         7,
     );
     let checkpoint_bytes = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())

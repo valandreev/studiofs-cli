@@ -84,9 +84,7 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
     let descriptor = backend
         .read_bootstrap_checkpoint()
         .map_err(|error| match error {
-            MetaError::Storage(message)
-                if message == "postgres bootstrap checkpoint descriptor is missing" =>
-            {
+            MetaError::BootstrapCheckpointDescriptorMissing => {
                 DiscoveryError::Message(format!(
                     "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
                 ))
@@ -94,11 +92,9 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
             other => DiscoveryError::Meta(other),
         })?;
     let mut format_info = decode_persisted_format_info(&descriptor.format_info_bytes)?;
-    let pg = format_info
-        .metadata
-        .postgres
-        .as_mut()
-        .expect("descriptor validation guarantees postgres backend configuration");
+    let pg = format_info.metadata.postgres.as_mut().ok_or_else(|| {
+        DiscoveryError::Message("discovered format is not postgres-backed".to_string())
+    })?;
     pg.url = postgres_dsn;
 
     Ok(DiscoveredState {
@@ -126,7 +122,9 @@ async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResu
             ))
         })?;
 
-        Ok::<i64, DiscoveryError>(row.get(0))
+        row.try_get::<_, i64>("vol").map_err(|error| {
+            DiscoveryError::Message(format!("discover volume id row parse failed: {error}"))
+        })
     })
     .await
     .map_err(|_| DiscoveryError::Message("discovery volume query timed out".to_string()))

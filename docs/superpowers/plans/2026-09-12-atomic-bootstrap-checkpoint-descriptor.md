@@ -244,6 +244,7 @@ Mark completed steps with UTC timestamps, record any test or PostgreSQL-service 
 - [x] (2026-09-12 18:16Z) Completed focused tests, package checks, Clippy, formatting, diff validation, and final diff inspection.
 - [x] (2026-09-12 18:51Z) Applied the over-engineering review: removed unreachable discovery error/decode wrapper, redundant format-version comparison, redundant helper return, and duplicate source-shape test.
 - [x] (2026-09-12 20:20Z) Applied the current review: removed runtime double postcard decode, made version and descriptor row reads fallible, filtered discovery to initialized volumes, restored missing-descriptor guidance, made the invariant explicit, and updated the verification commands.
+- [x] (2026-09-12 20:51Z) Removed the credential-bearing DSN from the descriptor fixture and recorded the exact focused validation commands and results.
 
 ## Surprises & Discoveries
 
@@ -268,14 +269,26 @@ joined query and validates before returning. Runtime pull and discovery share
 the API; foreground metadata remains local redb and SFS-703/704/705/711 remain
 out of scope.
 
-Validation evidence: focused descriptor/query/runtime tests passed; the ignored
-PostgreSQL read test passed against the configured local service; `cargo check`
-and `cargo clippy --all-targets -- -D warnings` passed for `studiofs-meta` and
-`studiofs`; formatting and `git diff --check` passed. The initial implementation
-is committed on the feature branch; the current review amendments remain
-uncommitted and no Linear status change was made. The follow-up simplification
-review removed 20 lines without changing behavior or coverage of the remaining
-descriptor tests.
+Validation evidence (2026-09-12):
+
+- `cargo test -p studiofs-meta checkpoint_descriptor` — 7 passed.
+- `cargo test -p studiofs-meta bootstrap_checkpoint_query_contains_all_descriptor_columns` — 1 passed.
+- `cargo test -p studiofs-meta metadata_head_query_contains_checkpoint_version` — 1 passed.
+- `cargo test -p studiofs-meta startup_snapshot_replay` — 3 passed.
+- `cargo test -p studiofs-meta startup_snapshot_skips_stale_checkpoint_without_downloading_payload -- --ignored --nocapture` — 1 passed.
+- `cargo test -p studiofs-meta invalid_bootstrap_descriptor_does_not_discard_healthy_pool_connection -- --ignored --nocapture` — 1 passed.
+- `cargo test -p studiofs-meta pg_snapshot_backend_reads_a_validated_bootstrap_descriptor -- --ignored --nocapture` — 1 passed.
+- `cargo test -p studiofs --bin studiofs discover_parses_name_and_meta_dsn` — 1 passed.
+- `cargo test -p studiofs --bin studiofs discover_volume_query_requires_metadata_state` — 1 passed.
+- `cargo check -p studiofs-meta` and `cargo check -p studiofs` — passed.
+- `cargo clippy -p studiofs-meta --all-targets -- -D warnings` and `cargo clippy -p studiofs --all-targets -- -D warnings` — passed; the latter emitted existing Xcode environment warnings but exited successfully.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+
+The PostgreSQL ignored tests passed against the configured local service. The
+implementation and prior review amendments are committed on the feature
+branch; the current inline-warning fixes remain uncommitted. No Linear status
+change was made. The follow-up simplification review removed 20 lines without
+changing behavior or coverage of the remaining descriptor tests.
 
 Review follow-up (2026-09-12): accepted the lightweight remote-head guard,
 bounded discovery query, corrected not-found message, dead assignment removal,
@@ -298,6 +311,11 @@ checkpoint consumed by runtime, so the startup path deserializes postcard once.
 Version helpers and descriptor mapping propagate PostgreSQL row-conversion
 errors, discovery ignores uninitialized higher-volume rows and preserves
 missing-descriptor remediation, and the living plan references nonzero tests.
+
+Inline warning pass (2026-09-12): removed the credential-bearing fixture DSN,
+recorded the exact validation commands and results, replaced the missing
+descriptor string match with a typed metadata error, kept discovery failures
+fallible at the format boundary, and made volume-id row conversion fallible.
 
 ## Context and Orientation
 

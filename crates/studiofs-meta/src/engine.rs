@@ -280,6 +280,10 @@ pub enum MetaError {
         reason: CheckpointDescriptorFailure,
     },
 
+    /// PostgreSQL has no initialized bootstrap checkpoint descriptor for the volume.
+    #[error("postgres bootstrap checkpoint descriptor is missing")]
+    BootstrapCheckpointDescriptorMissing,
+
     /// The metadata backend or remote service could not be reached.
     #[error("remote unavailable: {0}")]
     RemoteUnavailable(String),
