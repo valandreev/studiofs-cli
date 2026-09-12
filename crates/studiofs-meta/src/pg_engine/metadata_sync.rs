@@ -74,7 +74,11 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn record_metadata_sync_result(&self, source: MetadataSyncSource, result: &MetaResult<bool>) {
+    pub(super) fn record_metadata_sync_result(
+        &self,
+        source: MetadataSyncSource,
+        result: &MetaResult<bool>,
+    ) {
         match result {
             Ok(changed) => {
                 self.metadata_source_connected
@@ -153,6 +157,20 @@ impl PgMetaEngine {
     ) -> MetaResult<bool> {
         self.ensure_remote_format_validated()?;
         let target_version = self.frozen_sync_target_version()?;
+        self.pull_foreign_events_locked_to_target(recent_flush, target_version)
+    }
+
+    /// Pull and replay foreign events up to an already-frozen target version.
+    ///
+    /// The caller must hold `replication_lock`; keeping target resolution
+    /// outside this helper lets a startup session reuse one target for all
+    /// bounded replay pages.
+    pub(super) fn pull_foreign_events_locked_to_target(
+        &self,
+        recent_flush: Option<&RecentFlush>,
+        target_version: i64,
+    ) -> MetaResult<bool> {
+        self.ensure_remote_format_validated()?;
         let result = self.pull_foreign_events_locked_inner(recent_flush, target_version);
         self.record_remote_operation_result(result)
     }

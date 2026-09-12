@@ -2,11 +2,65 @@ use super::{
     MetadataSyncSource, PgBackgroundWorker, PgBackgroundWorkerState, PgBackgroundWorkers,
     PgMetaEngine,
 };
-use crate::engine::{MetaError, MetaResult};
+use crate::engine::{MetaError, MetaResult, PgSyncLifecycle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// Maximum number of replay pages a startup session may apply while holding
+/// `replication_lock`; a later poll resumes from the durable local cursor.
+const MAX_STARTUP_CATCH_UP_PAGES: usize = 16;
+
+/// Drain bounded replay pages until the local cursor reaches a frozen target.
+///
+/// The continuation callback is checked before each page, so cancellation or
+/// a lifecycle transition stops the session cleanly. A successful page must
+/// advance the local cursor unless it reaches the target; otherwise the
+/// helper returns `MetaError::CatchUpStalled` instead of spinning.
+pub(super) fn drain_startup_catch_up_pages(
+    target_version: i64,
+    mut local_version: impl FnMut() -> i64,
+    mut should_continue: impl FnMut() -> bool,
+    mut pull_page: impl FnMut() -> MetaResult<bool>,
+) -> MetaResult<bool> {
+    if target_version < 0 {
+        return Err(MetaError::Storage(
+            "postgres startup catch-up target must not be negative".to_string(),
+        ));
+    }
+
+    let mut changed = false;
+    let mut pages = 0;
+    let mut current = local_version();
+    while current < target_version {
+        if !should_continue() {
+            return Ok(changed);
+        }
+        if pages >= MAX_STARTUP_CATCH_UP_PAGES {
+            return Err(MetaError::CatchUpBudgetExceeded {
+                local_version: current,
+                target_version,
+                pages,
+            });
+        }
+
+        changed |= pull_page()?;
+        pages += 1;
+        let next = local_version();
+        if next >= target_version {
+            return Ok(changed);
+        }
+        if next <= current {
+            return Err(MetaError::CatchUpStalled {
+                local_version: next,
+                target_version,
+            });
+        }
+        current = next;
+    }
+    Ok(changed)
+}
 
 impl PgBackgroundWorkers {
     pub(super) fn new() -> Self {
@@ -239,6 +293,62 @@ impl PgMetaEngine {
         Self::env_duration_ms("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", 2_000)
     }
 
+    /// Run one interruptible startup catch-up session to the frozen target.
+    pub(super) fn run_startup_catch_up_session(&self, shutdown: &AtomicBool) -> MetaResult<bool> {
+        let result = (|| {
+            self.ensure_remote_format_validated()?;
+            let _guard = self
+                .replication_lock
+                .lock()
+                .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+            if shutdown.load(Ordering::Acquire)
+                || !matches!(
+                    self.current_pg_sync_lifecycle(),
+                    PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+                )
+            {
+                return Ok(false);
+            }
+
+            // Keep target capture and every page pull under one lock so a
+            // concurrent NOTIFY sync cannot clear the target mid-session.
+            let target_version = self.frozen_sync_target_version()?;
+            drain_startup_catch_up_pages(
+                target_version,
+                || self.local_version.load(Ordering::Acquire),
+                || {
+                    !shutdown.load(Ordering::Acquire)
+                        && matches!(
+                            self.current_pg_sync_lifecycle(),
+                            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+                        )
+                },
+                || self.pull_foreign_events_locked_to_target(None, target_version),
+            )
+        })();
+        let result = if result.is_ok() && self.current_pg_sync_lifecycle() == PgSyncLifecycle::Fatal
+        {
+            Err(MetaError::LifecycleFatal)
+        } else {
+            result
+        };
+        if matches!(result, Err(MetaError::CatchUpStalled { .. })) {
+            self.reset_startup_catch_up_after_stall();
+        }
+        // Fresh-client completion reacquires replication_lock, so record the
+        // aggregate session result only after the page-drain lock is released.
+        self.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result);
+        result
+    }
+
+    /// Clear the stalled startup target and leave the engine degraded so a
+    /// later poll can capture a fresh target and retry recovery.
+    pub(super) fn reset_startup_catch_up_after_stall(&self) {
+        self.metadata_startup_target_version
+            .store(-1, Ordering::Release);
+        self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    }
+
     pub(super) fn start_background_poll(
         engine: Weak<Self>,
         interval: Duration,
@@ -281,10 +391,16 @@ impl PgMetaEngine {
                         break;
                     };
                     let _ = engine.flush_due_pending();
-                    if let Ok(initial_changed) =
+                    let local_version_before = engine.local_version.load(Ordering::Acquire);
+                    let sync_result = if matches!(
+                        engine.current_pg_sync_lifecycle(),
+                        PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+                    ) {
+                        engine.run_startup_catch_up_session(&shutdown)
+                    } else {
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
-                    {
-                        let local_version_before = engine.local_version.load(Ordering::Acquire);
+                    };
+                    if let Ok(initial_changed) = sync_result {
                         if let Err(error) = engine.backfill_current_reference_ledger_if_needed() {
                             warn!(
                                 error = %error,
@@ -296,6 +412,12 @@ impl PgMetaEngine {
                         if initial_changed || local_version_after > local_version_before {
                             engine.metadata_invalidation_notify.notify_one();
                         }
+                    } else if let Err(error) = sync_result {
+                        warn!(
+                            error = %error,
+                            volume_id = engine.volume_id,
+                            "postgres background metadata synchronization did not complete"
+                        );
                     }
                 }
             })

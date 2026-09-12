@@ -41,6 +41,253 @@ fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
     );
 }
 
+#[test]
+fn startup_catch_up_drain_replays_pages_until_frozen_target() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        3,
+        || local_version.get(),
+        || true,
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("startup catch-up should drain each bounded page");
+
+    assert!(changed);
+    assert_eq!(local_version.get(), 3);
+    assert_eq!(pulls.get(), 3);
+}
+
+#[test]
+fn startup_catch_up_drain_yields_at_page_budget_and_resumes_from_cursor() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let error = drain_startup_catch_up_pages(
+        17,
+        || local_version.get(),
+        || true,
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect_err("a startup session must yield before monopolizing replication");
+
+    assert!(matches!(
+        error,
+        MetaError::CatchUpBudgetExceeded {
+            local_version: 16,
+            target_version: 17,
+            pages: 16
+        }
+    ));
+    assert_eq!(local_version.get(), 16);
+    assert_eq!(pulls.get(), 16);
+
+    let resumed_pulls = std::cell::Cell::new(0_usize);
+    let changed = drain_startup_catch_up_pages(
+        17,
+        || local_version.get(),
+        || true,
+        || {
+            resumed_pulls.set(resumed_pulls.get() + 1);
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("the next session must resume from the durable cursor");
+
+    assert!(changed);
+    assert_eq!(local_version.get(), 17);
+    assert_eq!(resumed_pulls.get(), 1);
+}
+
+#[test]
+fn startup_catch_up_drain_rejects_page_without_cursor_progress() {
+    let error = drain_startup_catch_up_pages(1, || 0, || true, || Ok(false))
+        .expect_err("a stalled startup catch-up must be reported");
+
+    assert!(matches!(
+        error,
+        MetaError::CatchUpStalled {
+            local_version: 0,
+            target_version: 1
+        }
+    ));
+}
+
+#[test]
+fn startup_catch_up_drain_stops_when_session_is_cancelled() {
+    let pulls = std::cell::Cell::new(0_usize);
+    let changed = drain_startup_catch_up_pages(
+        1,
+        || 0,
+        || false,
+        || {
+            pulls.set(pulls.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("cancelled startup catch-up should return cleanly");
+
+    assert!(!changed);
+    assert_eq!(pulls.get(), 0);
+}
+
+#[test]
+fn startup_catch_up_drain_stops_after_partial_progress_when_cancelled() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+    let continue_calls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || local_version.get(),
+        || {
+            let call = continue_calls.get();
+            continue_calls.set(call + 1);
+            call == 0
+        },
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(1);
+            Ok(true)
+        },
+    )
+    .expect("cancellation after a committed page should return cleanly");
+
+    assert!(changed);
+    assert_eq!(local_version.get(), 1);
+    assert_eq!(pulls.get(), 1);
+    assert_eq!(continue_calls.get(), 2);
+}
+
+#[test]
+fn startup_catch_up_drain_rejects_negative_target() {
+    let error = drain_startup_catch_up_pages(-1, || 0, || true, || Ok(false))
+        .expect_err("a startup catch-up target must not be negative");
+
+    assert!(error.to_string().contains("target must not be negative"));
+}
+
+#[test]
+fn startup_catch_up_drain_skips_pull_when_already_at_target() {
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        3,
+        || 3,
+        || panic!("continuation must not be checked at the target"),
+        || {
+            pulls.set(pulls.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("an already reached target should complete");
+
+    assert!(!changed);
+    assert_eq!(pulls.get(), 0);
+}
+
+#[test]
+fn startup_catch_up_drain_skips_pull_when_local_cursor_exceeds_target() {
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || 5,
+        || panic!("continuation must not be checked past the target"),
+        || {
+            pulls.set(pulls.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("a cursor past the target should complete");
+
+    assert!(!changed);
+    assert_eq!(pulls.get(), 0);
+}
+
+#[test]
+fn startup_catch_up_drain_propagates_page_error() {
+    let error = drain_startup_catch_up_pages(
+        1,
+        || 0,
+        || true,
+        || Err(MetaError::Storage("page failure".to_string())),
+    )
+    .expect_err("a page error must terminate startup catch-up");
+
+    assert!(error.to_string().contains("page failure"));
+}
+
+#[test]
+fn startup_catch_up_drain_reads_cursor_once_per_loop_iteration() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let reads = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || {
+            reads.set(reads.get() + 1);
+            local_version.get()
+        },
+        || true,
+        || {
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("cursor should reach the target");
+
+    assert!(changed);
+    assert_eq!(reads.get(), 3);
+}
+
+#[test]
+fn startup_catch_up_stall_resets_target_and_enters_degraded_lifecycle() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+    engine
+        .metadata_startup_target_version
+        .store(9, std::sync::atomic::Ordering::Release);
+
+    engine.reset_startup_catch_up_after_stall();
+
+    assert_eq!(
+        engine
+            .metadata_startup_target_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        -1
+    );
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+}
+
+#[test]
+fn startup_catch_up_session_rejects_fatal_lifecycle_as_success() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::Fatal as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let error = engine
+        .run_startup_catch_up_session(&std::sync::atomic::AtomicBool::new(false))
+        .expect_err("fatal lifecycle must not be reported as a successful sync");
+
+    assert!(matches!(error, MetaError::LifecycleFatal));
+}
+
 struct EventLogLockGuard {
     release_tx: Option<tokio::sync::oneshot::Sender<()>>,
     lock_thread: Option<std::thread::JoinHandle<()>>,
@@ -172,6 +419,145 @@ fn stale_local_open_does_not_replay_remote_event_tail() {
         .expect("catch up after event-log unlock");
     assert_eq!(opened.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
     assert!(opened.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _page_limit = set_test_env("STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE", "1");
+    let volume = PgTestVolume::new(&dsn, "pg-frozen-startup-target");
+
+    let stale_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_db = stale_dir.path().join("stale.redb");
+    seed_local(&stale_db, &volume.format_info());
+    let stale = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open stale metadata client");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 0);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+
+    for name in [b"backlog-1".as_slice(), b"backlog-2", b"backlog-3"] {
+        publisher
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create backlog event");
+        publisher.flush_metadata().expect("publish backlog event");
+    }
+
+    stale.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    stale.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+    let startup_target = stale
+        .frozen_sync_target_version()
+        .expect("capture frozen startup target");
+    assert_eq!(startup_target, 3);
+
+    publisher
+        .create_dir(ROOT_INO, b"post-target", 0, 0, 0o755)
+        .expect("create post-target event");
+    publisher
+        .flush_metadata()
+        .expect("publish post-target event");
+    assert_eq!(
+        stale
+            .remote_metadata_head_version()
+            .expect("read advanced remote head"),
+        4
+    );
+
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        stale
+            .run_startup_catch_up_session(&shutdown)
+            .expect("drain frozen startup target")
+    );
+    assert_eq!(stale.local_version.load(Ordering::Acquire), startup_target);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+
+    stale
+        .sync_metadata()
+        .expect("replicate post-target runtime event");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 4);
+    stale
+        .lookup(ROOT_INO, b"post-target")
+        .expect("post-target event should become visible during runtime sync");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn fresh_client_empty_volume_reaches_live_at_zero_target() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-fresh-client-empty-volume");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("fresh.redb");
+    seed_local(&db, &volume.format_info());
+
+    let fresh = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: true,
+            ..Default::default()
+        },
+    )
+    .expect("fresh empty volume should open with local serving state");
+
+    assert_eq!(fresh.local_version.load(Ordering::Acquire), 0);
+    assert_eq!(
+        fresh.pg_sync_status().lifecycle,
+        PgSyncLifecycle::CatchingUp
+    );
+    assert_eq!(
+        fresh
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_client_slot(&fresh.local)
+            .expect("read missing fresh-client slot"),
+        None
+    );
+
+    fresh
+        .sync_metadata()
+        .expect("zero-version startup sync should complete the fresh client");
+
+    assert_eq!(fresh.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(fresh.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        fresh
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read cleared fresh-client marker"),
+        0
+    );
+    assert!(
+        PgMetaEngine::load_persisted_client_slot(&fresh.local)
+            .expect("read assigned fresh-client slot")
+            .is_some()
+    );
 }
 
 #[test]

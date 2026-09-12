@@ -1102,15 +1102,6 @@ impl PgMetaEngine {
                 engine
                     .metadata_remote_head_version
                     .store(remote_head, Ordering::Release);
-                if fresh_client_pending
-                    || repair_local_graph_recovery_pending
-                    || !startup_bootstrap_succeeded
-                    || engine.local_version.load(Ordering::Acquire) < remote_head
-                {
-                    engine
-                        .metadata_startup_target_version
-                        .store(remote_head, Ordering::Release);
-                }
                 if engine.local_version.load(Ordering::Acquire) < remote_head {
                     engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                 }
