@@ -1,6 +1,7 @@
 use super::*;
-use crate::engine::MetaAcl;
+use crate::engine::{CheckpointDescriptorFailure, MetaAcl};
 use crate::redb_engine::RedbSnapshot;
+use sha2::{Digest, Sha256};
 
 async fn with_pg_test_client<T, F, Fut>(dsn: &str, f: F) -> Result<T, MetaError>
 where
@@ -1667,6 +1668,120 @@ fn startup_snapshot_replay_uses_previous_epoch_when_snapshot_has_no_cursor() {
         PgMetaEngine::snapshot_replay_start_version(0, 9),
         0,
         "a serving checkpoint always carries an explicit checkpoint version"
+    );
+}
+
+#[test]
+fn bootstrap_checkpoint_descriptor_validates_and_exposes_replay_floor() {
+    let format_info = format_info(
+        "bootstrap-descriptor",
+        "bootstrap-descriptor-uuid",
+        "postgres://studiofs:studiofs@127.0.0.1:5432",
+        7,
+    );
+    let checkpoint_bytes = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())
+        .expect("encode serving checkpoint");
+    let checkpoint_sha256 = Sha256::digest(&checkpoint_bytes).to_vec();
+
+    let descriptor = crate::BootstrapCheckpointDescriptor {
+        volume_id: 7,
+        volume_uuid: "bootstrap-descriptor-uuid".to_string(),
+        format_info_bytes: serde_json::to_vec(&format_info).expect("encode format info"),
+        metadata_format_version: CURRENT_FORMAT_VERSION,
+        remote_head_version: 3,
+        checkpoint_version: 3,
+        checkpoint_bytes,
+        checkpoint_sha256,
+        publication_state: "published".to_string(),
+        publication_generation: 1,
+    };
+
+    descriptor
+        .validate()
+        .expect("complete bootstrap descriptor should validate");
+    assert_eq!(descriptor.checkpoint_version, 3);
+    assert_eq!(
+        descriptor.remote_head_version, 3,
+        "the remote head is separate from the checkpoint replay floor"
+    );
+
+    let mut invalid = descriptor.clone();
+    invalid.volume_id = 0;
+    assert!(matches!(
+        invalid.validate(),
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::VolumeIdentity
+        })
+    ));
+
+    invalid = descriptor.clone();
+    invalid.checkpoint_version = 4;
+    assert!(matches!(
+        invalid.validate(),
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::Version
+        })
+    ));
+
+    invalid = descriptor.clone();
+    invalid.publication_state = "pending".to_string();
+    assert!(matches!(
+        invalid.validate(),
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::PublicationState
+        })
+    ));
+}
+
+#[test]
+fn bootstrap_checkpoint_query_reads_one_consistent_descriptor_row() {
+    let sql = super::sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR;
+
+    for fragment in [
+        "v.vol",
+        "v.uuid",
+        "ms.metadata_format_version",
+        "ms.version",
+        "ms.checkpoint_version",
+        "ms.snapshot",
+        "ms.checkpoint_sha256",
+        "ms.format_info",
+        "ms.checkpoint_publication_state",
+        "ms.checkpoint_generation",
+        "FROM volumes AS v",
+        "INNER JOIN metadata_state AS ms ON ms.vol = v.vol",
+        "WHERE v.vol = $1",
+    ] {
+        assert!(
+            sql.contains(fragment),
+            "bootstrap query is missing {fragment}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_snapshot_backend_reads_a_validated_bootstrap_descriptor() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-bootstrap-descriptor");
+    let backend = PgSnapshotBackend::open(&dsn, volume.volume_id).expect("open snapshot backend");
+    let descriptor = backend
+        .read_bootstrap_checkpoint()
+        .expect("read bootstrap checkpoint descriptor");
+
+    assert_eq!(descriptor.volume_id, volume.volume_id);
+    assert_eq!(descriptor.volume_uuid, volume.uuid);
+    assert_eq!(descriptor.metadata_format_version, CURRENT_FORMAT_VERSION);
+    assert_eq!(descriptor.remote_head_version, 0);
+    assert_eq!(descriptor.checkpoint_version, 0);
+    assert_eq!(descriptor.publication_state, "published");
+    assert_eq!(descriptor.publication_generation, 1);
+    assert_eq!(
+        descriptor.checkpoint_sha256,
+        Sha256::digest(&descriptor.checkpoint_bytes).to_vec()
     );
 }
 

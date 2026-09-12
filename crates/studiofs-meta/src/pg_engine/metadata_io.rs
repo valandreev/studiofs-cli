@@ -2,13 +2,80 @@
 
 #[cfg(test)]
 use super::RemoteApplyCoordinator;
-use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, StartupSnapshotImportMode, sql};
-use crate::engine::{MetaError, MetaFormat, MetaResult};
+use super::{
+    PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess,
+    StartupSnapshotImportMode, runtime, sql,
+};
+use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaFormat, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+fn descriptor_from_row(row: tokio_postgres::Row) -> BootstrapCheckpointDescriptor {
+    BootstrapCheckpointDescriptor {
+        volume_id: row.get::<_, Option<i64>>(0).unwrap_or_default(),
+        volume_uuid: row.get::<_, Option<String>>(1).unwrap_or_default(),
+        metadata_format_version: row
+            .get::<_, Option<i16>>(2)
+            .and_then(|version| u16::try_from(version).ok())
+            .unwrap_or_default(),
+        remote_head_version: row.get::<_, Option<i64>>(3).unwrap_or(-1),
+        checkpoint_version: row.get::<_, Option<i64>>(4).unwrap_or(-1),
+        checkpoint_bytes: row.get::<_, Option<Vec<u8>>>(5).unwrap_or_default(),
+        checkpoint_sha256: row.get::<_, Option<Vec<u8>>>(6).unwrap_or_default(),
+        format_info_bytes: row.get::<_, Option<Vec<u8>>>(7).unwrap_or_default(),
+        publication_state: row.get::<_, Option<String>>(8).unwrap_or_default(),
+        publication_generation: row.get::<_, Option<i64>>(9).unwrap_or_default(),
+    }
+}
+
+async fn read_bootstrap_checkpoint_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<BootstrapCheckpointDescriptor> {
+    PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "bootstrap checkpoint descriptor",
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
+                    .await
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres bootstrap checkpoint select failed",
+                            e,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "postgres bootstrap checkpoint descriptor is missing".to_string(),
+                        )
+                    })?;
+                let descriptor = descriptor_from_row(row);
+                descriptor.validate()?;
+                Ok(descriptor)
+            })
+        },
+    )
+    .await
+}
+
+impl PgSnapshotBackend {
+    /// Reads and validates the one-row PostgreSQL bootstrap checkpoint record.
+    pub fn read_bootstrap_checkpoint(&self) -> MetaResult<BootstrapCheckpointDescriptor> {
+        PgMetaEngine::run_async_once(read_bootstrap_checkpoint_with_pool(
+            self.snapshot_command_pool(),
+            self.snapshot_volume_id(),
+            self.snapshot_command_timeout(),
+        ))
+    }
+}
 
 pub(super) struct ForeignEventPage {
     pub(super) rows: Vec<tokio_postgres::Row>,
@@ -90,86 +157,23 @@ impl PgMetaEngine {
         &self,
         import_mode: StartupSnapshotImportMode,
     ) -> MetaResult<bool> {
-        let command_pool = self.command_pool.clone();
-        let volume_id = self.volume_id;
         let local_version = self.local_version.load(Ordering::SeqCst);
-        let command_timeout = self.command_timeout;
-
-        let row = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                command_pool,
-                command_timeout,
-                "pull snapshot",
-                move |client| {
-                    Box::pin(async move {
-                        let version_row = client
-                            .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot version select failed",
-                                    e,
-                                )
-                            })?;
-
-                        let Some(version_row) = version_row else {
-                            return Ok(None);
-                        };
-                        let version: i64 = version_row.get(0);
-                        if version <= local_version {
-                            return Ok(None);
-                        }
-
-                        let row = client
-                            .query_one(sql::SELECT_METADATA_SNAPSHOT, &[&volume_id])
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres serving checkpoint select failed",
-                                    e,
-                                )
-                            })?;
-
-                        Ok(Some(row))
-                    })
-                },
-            )
-            .await
-        })?;
-
-        let Some(row) = row else {
+        let descriptor = self.snapshot_backend().read_bootstrap_checkpoint()?;
+        if descriptor.remote_head_version <= local_version {
             return Ok(false);
-        };
-
-        let version: i64 = row.get(0);
-        let checkpoint_version: i64 = row.get(1);
-        let bytes: Vec<u8> = row.get(2);
-        let metadata_format_version = row.get::<_, Option<i16>>(3);
-        let checkpoint_sha256: Option<Vec<u8>> = row.get(4);
-        let checkpoint_publication_state: Option<String> = row.get(5);
-        let checkpoint_generation: Option<i64> = row.get(6);
-
-        crate::ensure_supported_pg_sync_format_version(metadata_format_version)?;
-        crate::validate_checkpoint_descriptor(
-            &bytes,
-            checkpoint_sha256.as_deref(),
-            checkpoint_publication_state.as_deref(),
-            checkpoint_generation,
-        )?;
-
-        if checkpoint_version < 0 || checkpoint_version > version {
-            return Err(MetaError::Storage(
-                "postgres serving checkpoint version is invalid".to_string(),
-            ));
         }
-        if checkpoint_version < local_version {
+        if descriptor.checkpoint_version < local_version {
             return Ok(false);
         }
 
-        let checkpoint: ServingCheckpoint = postcard::from_bytes(&bytes).map_err(|e| {
-            MetaError::Serialization(format!("serving checkpoint decode failed: {e}"))
-        })?;
-        let replay_start_version = Self::snapshot_replay_start_version(checkpoint_version, version);
+        let checkpoint: ServingCheckpoint = postcard::from_bytes(&descriptor.checkpoint_bytes)
+            .map_err(|e| {
+                MetaError::Serialization(format!("serving checkpoint decode failed: {e}"))
+            })?;
+        let replay_start_version = Self::snapshot_replay_start_version(
+            descriptor.checkpoint_version,
+            descriptor.remote_head_version,
+        );
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
                 self.local.import_serving_checkpoint(&checkpoint)?;

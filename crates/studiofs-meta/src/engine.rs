@@ -60,6 +60,12 @@ pub struct MetadataBatchWriteObservability {
 /// Reason a PostgreSQL serving-checkpoint descriptor failed validation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum CheckpointDescriptorFailure {
+    /// The descriptor does not identify a valid PostgreSQL volume.
+    #[error("volume identity is invalid")]
+    VolumeIdentity,
+    /// The checkpoint version is outside the remote head range.
+    #[error("checkpoint version is outside the remote head range")]
+    Version,
     /// The descriptor is not marked as a completed publication.
     #[error("publication state is not published")]
     PublicationState,
@@ -69,6 +75,100 @@ pub enum CheckpointDescriptorFailure {
     /// The descriptor checksum does not match the checkpoint bytes.
     #[error("SHA-256 checksum does not match checkpoint bytes")]
     Checksum,
+    /// The serialized format information does not match the volume descriptor.
+    #[error("format information does not match the volume descriptor")]
+    FormatInfo,
+    /// The checkpoint bytes are not a serving checkpoint payload.
+    #[error("checkpoint bytes are invalid")]
+    CheckpointBytes,
+}
+
+/// One self-consistent PostgreSQL record used to bootstrap a fresh client.
+///
+/// `checkpoint_version` is the exact event-log replay floor. A reader must
+/// request subsequent rows with `batch_version > checkpoint_version`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BootstrapCheckpointDescriptor {
+    /// PostgreSQL logical volume identifier.
+    pub volume_id: i64,
+    /// Stable volume UUID from the PostgreSQL `volumes` row.
+    pub volume_uuid: String,
+    /// Serialized local format information needed to create a client cache.
+    pub format_info_bytes: Vec<u8>,
+    /// PostgreSQL/local metadata format boundary.
+    pub metadata_format_version: u16,
+    /// Remote metadata head observed with this descriptor.
+    pub remote_head_version: i64,
+    /// Exact event-log version represented by the checkpoint and replay floor.
+    pub checkpoint_version: i64,
+    /// Serialized remote-visible serving checkpoint.
+    pub checkpoint_bytes: Vec<u8>,
+    /// SHA-256 digest of `checkpoint_bytes`.
+    pub checkpoint_sha256: Vec<u8>,
+    /// PostgreSQL publication state for this descriptor.
+    pub publication_state: String,
+    /// Monotonic publication generation.
+    pub publication_generation: i64,
+}
+
+impl BootstrapCheckpointDescriptor {
+    /// Validates all identity, version, publication, and payload invariants.
+    pub fn validate(&self) -> MetaResult<()> {
+        if self.volume_id <= 0 || self.volume_uuid.trim().is_empty() {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: CheckpointDescriptorFailure::VolumeIdentity,
+            });
+        }
+        if self.metadata_format_version != crate::schema::CURRENT_FORMAT_VERSION {
+            return Err(MetaError::UnsupportedFormatVersion {
+                found: self.metadata_format_version,
+                expected: crate::schema::CURRENT_FORMAT_VERSION,
+            });
+        }
+        if self.checkpoint_version < 0
+            || self.remote_head_version < 0
+            || self.checkpoint_version > self.remote_head_version
+        {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: CheckpointDescriptorFailure::Version,
+            });
+        }
+        crate::validate_checkpoint_descriptor(
+            &self.checkpoint_bytes,
+            Some(&self.checkpoint_sha256),
+            Some(&self.publication_state),
+            Some(self.publication_generation),
+        )?;
+
+        let format_info = crate::decode_format_info(&self.format_info_bytes).map_err(|error| {
+            if matches!(error, MetaError::UnsupportedFormatVersion { .. }) {
+                error
+            } else {
+                MetaError::InvalidCheckpointDescriptor {
+                    reason: CheckpointDescriptorFailure::FormatInfo,
+                }
+            }
+        })?;
+        let Some(postgres) = format_info.metadata.postgres.as_ref() else {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: CheckpointDescriptorFailure::FormatInfo,
+            });
+        };
+        if format_info.uuid != self.volume_uuid
+            || format_info.metadata.backend != MetadataBackend::Postgres
+            || postgres.volume_id != self.volume_id
+        {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: CheckpointDescriptorFailure::FormatInfo,
+            });
+        }
+
+        postcard::from_bytes::<crate::snapshot::ServingCheckpoint>(&self.checkpoint_bytes)
+            .map_err(|_| MetaError::InvalidCheckpointDescriptor {
+                reason: CheckpointDescriptorFailure::CheckpointBytes,
+            })?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

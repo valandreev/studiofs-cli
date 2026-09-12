@@ -3,17 +3,14 @@
 use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
-    FormatInfo, MetaFormat, MetaOpenOptions, RedbMetaEngine, connect_studiofs_postgres,
-    decode_format_info as decode_persisted_format_info, ensure_studiofs_database,
-    ensure_supported_pg_sync_format_version, open_meta_engine_with_options,
-    validate_checkpoint_descriptor,
+    FormatInfo, MetaFormat, MetaOpenOptions, PgSnapshotBackend, RedbMetaEngine,
+    connect_studiofs_postgres, decode_format_info as decode_persisted_format_info,
+    ensure_studiofs_database, open_meta_engine_with_options,
 };
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
-    #[error("remote format info is missing")]
-    MissingFormatInfo,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -64,58 +61,37 @@ struct DiscoveredState {
     format_info: FormatInfo,
 }
 
-struct RemoteVolumeState {
-    volume_id: i64,
-    serving_checkpoint: Vec<u8>,
-    format_info_bytes: Vec<u8>,
-    pg_format_version: Option<i16>,
-    checkpoint_sha256: Option<Vec<u8>>,
-    checkpoint_publication_state: Option<String>,
-    checkpoint_generation: Option<i64>,
-}
-
-fn decode_format_info(format_info_bytes: &[u8]) -> DiscoveryResult<FormatInfo> {
-    if format_info_bytes.is_empty() {
-        return Err(DiscoveryError::MissingFormatInfo);
-    }
-    Ok(decode_persisted_format_info(format_info_bytes)?)
-}
-
 fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<DiscoveredState> {
-    crate::runtime_bridge::block_on(async move {
+    let (postgres_dsn, volume_id) = crate::runtime_bridge::block_on(async move {
         let postgres_dsn = ensure_studiofs_database(meta_dsn)
             .await
             .map_err(|e| DiscoveryError::Message(e.to_string()))?
             .metadata_dsn;
-        let remote = fetch_remote_state(name, &postgres_dsn).await?;
+        let volume_id = fetch_remote_volume_id(name, &postgres_dsn).await?;
+        Ok::<_, DiscoveryError>((postgres_dsn, volume_id))
+    })?;
 
-        ensure_supported_pg_sync_format_version(remote.pg_format_version)?;
-        validate_checkpoint_descriptor(
-            &remote.serving_checkpoint,
-            remote.checkpoint_sha256.as_deref(),
-            remote.checkpoint_publication_state.as_deref(),
-            remote.checkpoint_generation,
-        )?;
-        let mut format_info = decode_format_info(&remote.format_info_bytes)?;
-        let pg = format_info
-            .metadata
-            .postgres
-            .as_mut()
-            .ok_or(DiscoveryError::Message(
-                "discovered format is not postgres-backed".to_string(),
-            ))?;
-        pg.url = postgres_dsn;
-        pg.volume_id = remote.volume_id;
+    let backend = PgSnapshotBackend::open(&postgres_dsn, volume_id)?;
+    let descriptor = backend.read_bootstrap_checkpoint()?;
+    let mut format_info = decode_persisted_format_info(&descriptor.format_info_bytes)?;
+    let pg = format_info
+        .metadata
+        .postgres
+        .as_mut()
+        .ok_or(DiscoveryError::Message(
+            "discovered format is not postgres-backed".to_string(),
+        ))?;
+    pg.url = postgres_dsn;
+    pg.volume_id = descriptor.volume_id;
 
-        Ok(DiscoveredState {
-            volume_id: remote.volume_id,
-            serving_checkpoint: remote.serving_checkpoint,
-            format_info,
-        })
+    Ok(DiscoveredState {
+        volume_id: descriptor.volume_id,
+        serving_checkpoint: descriptor.checkpoint_bytes,
+        format_info,
     })
 }
 
-async fn fetch_remote_state(name: &str, postgres_dsn: &str) -> DiscoveryResult<RemoteVolumeState> {
+async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResult<i64> {
     let (client, connection) = connect_studiofs_postgres(postgres_dsn)
         .await
         .map_err(|e| DiscoveryError::Message(e.to_string()))?;
@@ -125,16 +101,8 @@ async fn fetch_remote_state(name: &str, postgres_dsn: &str) -> DiscoveryResult<R
         let row = client
             .query_opt(
                 r#"
-            SELECT
-                v.vol,
-                ms.snapshot,
-                ms.format_info,
-                ms.metadata_format_version,
-                ms.checkpoint_sha256,
-                ms.checkpoint_publication_state,
-                ms.checkpoint_generation
+            SELECT v.vol
             FROM volumes v
-            JOIN metadata_state ms ON ms.vol = v.vol
             WHERE v.name = $1
             ORDER BY v.vol DESC
             LIMIT 1
@@ -150,15 +118,7 @@ async fn fetch_remote_state(name: &str, postgres_dsn: &str) -> DiscoveryResult<R
             ))
         })?;
 
-        Ok::<RemoteVolumeState, DiscoveryError>(RemoteVolumeState {
-            volume_id: row.get(0),
-            serving_checkpoint: row.get(1),
-            format_info_bytes: row.get(2),
-            pg_format_version: row.get(3),
-            checkpoint_sha256: row.get(4),
-            checkpoint_publication_state: row.get(5),
-            checkpoint_generation: row.get(6),
-        })
+        Ok::<i64, DiscoveryError>(row.get(0))
     }
     .await;
 
@@ -257,7 +217,7 @@ mod tests {
         let checkpoint = b"checkpoint";
         let digest = Sha256::digest(checkpoint);
 
-        let err = validate_checkpoint_descriptor(
+        let err = studiofs_meta::validate_checkpoint_descriptor(
             checkpoint,
             Some(digest.as_slice()),
             Some("pending"),
@@ -275,7 +235,7 @@ mod tests {
 
     #[test]
     fn discover_rejects_checkpoint_checksum_mismatch() {
-        let err = validate_checkpoint_descriptor(
+        let err = studiofs_meta::validate_checkpoint_descriptor(
             b"checkpoint",
             Some(&[0; 32]),
             Some("published"),
@@ -296,7 +256,7 @@ mod tests {
         let checkpoint = b"checkpoint";
         let digest = Sha256::digest(checkpoint);
 
-        let err = validate_checkpoint_descriptor(
+        let err = studiofs_meta::validate_checkpoint_descriptor(
             checkpoint,
             Some(digest.as_slice()),
             Some("published"),
