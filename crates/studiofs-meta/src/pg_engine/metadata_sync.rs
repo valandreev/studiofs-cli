@@ -252,10 +252,10 @@ impl PgMetaEngine {
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
-        let outcome = RemoteApplyCoordinator::new(&self.local).apply_event_rows(
-            page.rows,
+        let batches = RemoteApplyCoordinator::decode_event_rows(page.rows, client_id.as_str())?;
+        let outcome = self.apply_replay_page_atomically(
+            batches,
             recent_flush,
-            client_id.as_str(),
             super::RemoteReplayApplyContext {
                 last_seq: last_batch_version,
                 current_namespace_version: self.namespace_version.load(Ordering::SeqCst),
@@ -264,11 +264,44 @@ impl PgMetaEngine {
                 initial_overlay,
             },
         )?;
-        self.persist_replay_position(&outcome)?;
         if outcome.flushed_event_seq.is_some() {
             self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
         }
         Ok(outcome.changed)
+    }
+
+    pub(super) fn apply_replay_page_atomically(
+        &self,
+        batches: Vec<super::remote_apply::DecodedReplayBatch>,
+        recent_flush: Option<&super::RecentFlush>,
+        context: super::RemoteReplayApplyContext,
+    ) -> MetaResult<super::RemoteReplayApplyOutcome> {
+        let _position_guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        let txn = self.local.begin_write_txn()?;
+        let result = RemoteApplyCoordinator::new(&self.local).apply_decoded_batches_in_txn(
+            &txn,
+            batches,
+            recent_flush,
+            context,
+        );
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = txn.abort();
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.write_replay_position_in_txn(&txn, &outcome) {
+            let _ = txn.abort();
+            return Err(error);
+        }
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        self.publish_replay_position(&outcome);
+        Ok(outcome)
     }
 
     pub(super) fn pull_and_reconcile_foreign_events_locked(

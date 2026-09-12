@@ -4,6 +4,161 @@ use crate::events::encode_event;
 use crate::redb_engine::layout::encode_dentry_key;
 
 #[test]
+fn aborted_replay_page_does_not_persist_state_or_cursor() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let remote_ino = ROOT_INO + 700;
+    let remote_attr = InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755);
+    let batches = vec![DecodedReplayBatch {
+        batch_version: 1,
+        events: vec![
+            MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"page-one".to_vec(),
+                entry: DirEntryValue {
+                    ino: remote_ino,
+                    kind: FileType::Directory,
+                },
+            },
+        ],
+        is_self_batch: false,
+    }];
+    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let txn = pg.local.begin_write_txn().unwrap();
+    let outcome = RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches_in_txn(
+            &txn,
+            batches,
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: next_event_seq,
+                next_event_seq,
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .unwrap();
+    pg.write_replay_position_in_txn(&txn, &outcome).unwrap();
+    txn.abort().unwrap();
+
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 0);
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .unwrap(),
+        0
+    );
+    assert!(pg.local.lookup(ROOT_INO, b"page-one").is_err());
+    assert!(pg.local.get_attr(remote_ino).is_err());
+}
+
+#[test]
+fn committed_replay_pages_persist_state_and_resume_from_next_version() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    let first_ino = ROOT_INO + 701;
+    let second_ino = ROOT_INO + 702;
+    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+
+    let page = |batch_version: i64, ino: Ino, name: &[u8]| {
+        vec![DecodedReplayBatch {
+            batch_version,
+            events: vec![
+                MetaEvent::SetAttr {
+                    attr: InodeAttr::new_dir(ino, ROOT_INO, 0, 0, 0o755),
+                },
+                MetaEvent::AddEntry {
+                    parent: ROOT_INO,
+                    name: name.to_vec(),
+                    entry: DirEntryValue {
+                        ino,
+                        kind: FileType::Directory,
+                    },
+                },
+            ],
+            is_self_batch: false,
+        }]
+    };
+
+    let first = pg
+        .apply_replay_page_atomically(
+            page(1, first_ino, b"page-one"),
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: next_event_seq,
+                next_event_seq,
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .unwrap();
+    assert_eq!(first.max_version, 1);
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 1);
+    assert_eq!(
+        pg.local.lookup(ROOT_INO, b"page-one").unwrap().ino,
+        first_ino
+    );
+
+    let persisted_version = PgMetaEngine::load_persisted_local_version(&pg.local).unwrap();
+    assert_eq!(persisted_version, 1);
+
+    let txn = pg.local.begin_write_txn().unwrap();
+    let failed_page = RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches_in_txn(
+            &txn,
+            page(2, second_ino, b"page-two"),
+            None,
+            RemoteReplayApplyContext {
+                last_seq: persisted_version,
+                current_namespace_version: 1,
+                flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+                next_event_seq: pg.local.get_counter("nextEventSeq").unwrap(),
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .unwrap();
+    pg.write_replay_position_in_txn(&txn, &failed_page).unwrap();
+    txn.abort().unwrap();
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 1);
+    assert!(pg.local.lookup(ROOT_INO, b"page-two").is_err());
+
+    let second = pg
+        .apply_replay_page_atomically(
+            page(2, second_ino, b"page-two"),
+            None,
+            RemoteReplayApplyContext {
+                last_seq: persisted_version,
+                current_namespace_version: 1,
+                flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+                next_event_seq: pg.local.get_counter("nextEventSeq").unwrap(),
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .unwrap();
+    assert_eq!(second.max_version, 2);
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 2);
+    assert_eq!(
+        pg.local.lookup(ROOT_INO, b"page-two").unwrap().ino,
+        second_ino
+    );
+
+    drop(pg);
+    let reopened = RedbMetaEngine::open(dir.path().join("meta.redb")).unwrap();
+    assert_eq!(reopened.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 2);
+    assert_eq!(
+        reopened.lookup(ROOT_INO, b"page-one").unwrap().ino,
+        first_ino
+    );
+    assert_eq!(
+        reopened.lookup(ROOT_INO, b"page-two").unwrap().ino,
+        second_ino
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_remote_rename_overwrite_converges_to_source_inode() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");

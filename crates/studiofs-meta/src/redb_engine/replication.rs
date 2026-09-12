@@ -7,6 +7,10 @@ thread_local! {
     static REGULAR_FILE_SERVING_RECONCILE_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "transaction-aware replay delegates through RedbWriteTransaction deref"
+)]
 impl RedbMetaEngine {
     fn invalidation_binding(
         txn: &RedbWriteTransaction<'_>,
@@ -699,6 +703,28 @@ impl RedbMetaEngine {
         Ok(out)
     }
 
+    pub(crate) fn read_events_range_in_write_txn(
+        txn: &RedbWriteTransaction<'_>,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> MetaResult<Vec<crate::events::MetaEvent>> {
+        if end_seq <= start_seq {
+            return Ok(Vec::new());
+        }
+        let table = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .range(start_seq..end_seq)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(crate::events::decode_event(bytes.value())?);
+        }
+        Ok(out)
+    }
+
     /// Apply only remote-visible auxiliary state from foreign replica events
     /// without re-appending it to the local event log. Namespace/attr state is
     /// kept in `base_*`.
@@ -708,9 +734,22 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        Self::apply_replica_aux_state_in_txn(&txn, events)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_replica_aux_state_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        events: &[crate::events::MetaEvent],
+    ) -> MetaResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
 
         for event in events {
-            Self::invalidate_replica_event(&txn, event)?;
+            Self::invalidate_replica_event(txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { .. } => {}
                 crate::events::MetaEvent::RemoveAttr { ino } => {
@@ -835,8 +874,6 @@ impl RedbMetaEngine {
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -867,9 +904,23 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        Self::apply_replica_events_to_base_in_txn(&txn, events, protected_regular_file_inodes)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_replica_events_to_base_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        events: &[crate::events::MetaEvent],
+        protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
 
         for event in events {
-            Self::invalidate_replica_event(&txn, event)?;
+            Self::invalidate_replica_event(txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
                     let data = encode(attr)?;
@@ -1087,8 +1138,6 @@ impl RedbMetaEngine {
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -1108,13 +1157,6 @@ impl RedbMetaEngine {
         self.apply_replica_serving_state_inner(events, true)
     }
 
-    pub(crate) fn apply_replica_serving_state_for_protected_attr_merges(
-        &self,
-        events: &[crate::events::MetaEvent],
-    ) -> MetaResult<()> {
-        self.apply_replica_serving_state_inner(events, false)
-    }
-
     fn apply_replica_serving_state_inner(
         &self,
         events: &[crate::events::MetaEvent],
@@ -1125,9 +1167,23 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        Self::apply_replica_serving_state_in_txn(&txn, events, reject_stale_ready_growth)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_replica_serving_state_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        events: &[crate::events::MetaEvent],
+        reject_stale_ready_growth: bool,
+    ) -> MetaResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
 
         for event in events {
-            Self::invalidate_replica_event(&txn, event)?;
+            Self::invalidate_replica_event(txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
                     let current = match Self::get_attr_merged_in_write_txn(&txn, attr.ino) {
@@ -1371,8 +1427,6 @@ impl RedbMetaEngine {
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -1399,15 +1453,30 @@ impl RedbMetaEngine {
         if inodes.is_empty() {
             return Ok(false);
         }
-        #[cfg(test)]
-        REGULAR_FILE_SERVING_RECONCILE_CALLS
-            .set(REGULAR_FILE_SERVING_RECONCILE_CALLS.get().saturating_add(1));
-
         let txn = self.begin_write_txn()?;
+        let changed =
+            Self::reconcile_regular_file_serving_from_base_with_protected_dentries_in_txn(
+                &txn,
+                inodes,
+                protected_dentry_keys,
+            )?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(changed)
+    }
+
+    pub(crate) fn reconcile_regular_file_serving_from_base_with_protected_dentries_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        inodes: &HashSet<Ino>,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
+    ) -> MetaResult<bool> {
+        if inodes.is_empty() {
+            return Ok(false);
+        }
         let mut changed = false;
 
         for ino in inodes {
-            Self::invalidate_replica_inode(&txn, *ino, false)?;
+            Self::invalidate_replica_inode(txn, *ino, false)?;
             let base_attr = {
                 let base = txn
                     .open_table(BASE_INODES_TABLE)
@@ -1457,9 +1526,13 @@ impl RedbMetaEngine {
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_regular_file_serving_reconcile_call_for_test() {
+        REGULAR_FILE_SERVING_RECONCILE_CALLS
+            .set(REGULAR_FILE_SERVING_RECONCILE_CALLS.get().saturating_add(1));
     }
 
     /// Reconcile exact dentry keys from the authoritative base namespace into
@@ -1474,6 +1547,24 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        let changed = Self::reconcile_serving_dentries_from_base_in_txn(
+            &txn,
+            dentry_keys,
+            protected_dentry_keys,
+        )?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(changed)
+    }
+
+    pub(crate) fn reconcile_serving_dentries_from_base_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        dentry_keys: &HashSet<Vec<u8>>,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
+    ) -> MetaResult<bool> {
+        if dentry_keys.is_empty() {
+            return Ok(false);
+        }
         let mut changed = false;
 
         for key in dentry_keys {
@@ -1481,7 +1572,7 @@ impl RedbMetaEngine {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
-            Self::invalidate_replica_entry(&txn, parent, name, None)?;
+            Self::invalidate_replica_entry(txn, parent, name, None)?;
             let base_entry = {
                 let base = txn
                     .open_table(BASE_DENTRIES_TABLE)
@@ -1497,8 +1588,6 @@ impl RedbMetaEngine {
             changed = true;
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(changed)
     }
 
@@ -1644,23 +1733,37 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
-        if entry.kind == FileType::Directory {
-            Self::invalidate_directory_descendants(&txn, entry.ino)?;
-        }
-        Self::invalidate_replica_entry(&txn, parent, name, Some(entry.ino))?;
-        Self::invalidate_replica_entry(&txn, new_parent, new_name, Some(entry.ino))?;
-        Self::invalidate_replica_inode(&txn, entry.ino, false)?;
-
         Self::reconcile_serving_rename_from_base_in_txn(
             &txn, parent, name, new_parent, new_name, entry,
         )?;
-
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    fn reconcile_serving_rename_from_base_in_txn(
+    pub(crate) fn reconcile_serving_rename_from_base_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        if entry.kind == FileType::Directory {
+            Self::invalidate_directory_descendants(txn, entry.ino)?;
+        }
+        Self::invalidate_replica_entry(txn, parent, name, Some(entry.ino))?;
+        Self::invalidate_replica_entry(txn, new_parent, new_name, Some(entry.ino))?;
+        Self::invalidate_replica_inode(txn, entry.ino, false)?;
+
+        Self::reconcile_serving_rename_from_base_in_write_txn(
+            txn, parent, name, new_parent, new_name, entry,
+        )?;
+
+        Ok(())
+    }
+
+    fn reconcile_serving_rename_from_base_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],

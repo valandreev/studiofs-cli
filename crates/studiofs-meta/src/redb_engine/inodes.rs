@@ -40,6 +40,20 @@ impl RedbMetaEngine {
             .transpose()
     }
 
+    pub(crate) fn get_base_attr_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeAttr>> {
+        let table = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode::<InodeAttr>(value.value()))
+            .transpose()
+    }
+
     /// Ensure the inode lifecycle table exists and matches the current schema version.
     pub fn ensure_inode_lifecycle_table(&self) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
@@ -121,6 +135,51 @@ impl RedbMetaEngine {
                 || attr.committed_size > 0
                 || attr.committed_content_epoch > 0;
 
+        Ok(Some(Self::compute_inode_lifecycle_record(
+            &attr,
+            overlay_chunks.values(),
+            has_published_base,
+            stored_lifecycle.deferred_cleanup_object_ids,
+        )))
+    }
+
+    pub(crate) fn get_inode_lifecycle_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeLifecycleRecord>> {
+        let stored_lifecycle = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode::<InodeLifecycleRecord>(value.value()))
+            .transpose()?;
+        let Some(stored_lifecycle) = stored_lifecycle else {
+            return Ok(None);
+        };
+        if stored_lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
+            return Ok(Some(stored_lifecycle));
+        }
+        let attr = match Self::get_attr_merged_in_write_txn(txn, ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(Some(stored_lifecycle)),
+            Err(error) => return Err(error),
+        };
+        if attr.kind != FileType::RegularFile {
+            return Ok(Some(stored_lifecycle));
+        }
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        if overlay_chunks.is_empty() {
+            return Ok(Some(stored_lifecycle));
+        }
+        let has_published_base =
+            Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0;
         Ok(Some(Self::compute_inode_lifecycle_record(
             &attr,
             overlay_chunks.values(),

@@ -11,6 +11,15 @@ fn record_regular_file_object_usage(
         .or_insert(object_bytes);
 }
 
+impl RedbMetaEngine {
+    pub(crate) fn has_local_regular_file_overlay_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)
+    }
+}
+
 impl MetaPayloadObjects for RedbMetaEngine {
     fn lookup_regular_file_chunk_slices(
         &self,

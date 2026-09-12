@@ -44,7 +44,7 @@ impl RedbMetaEngine {
         Ok(states)
     }
 
-    pub(super) fn regular_file_chunk_states_for_inode_in_write_txn(
+    pub(crate) fn regular_file_chunk_states_for_inode_in_write_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -180,7 +180,7 @@ impl RedbMetaEngine {
         }
     }
 
-    pub(super) fn has_regular_file_chunk_rows_in_write_txn(
+    pub(crate) fn has_regular_file_chunk_rows_in_write_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -1122,9 +1122,7 @@ impl RedbMetaEngine {
         Self::regular_file_committed_size_from_base_table(&table, ino)
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn lookup_regular_file_slices_in_write_txn(
+    pub(crate) fn lookup_regular_file_slices_in_write_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         offset: u64,
