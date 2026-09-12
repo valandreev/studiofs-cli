@@ -26,12 +26,15 @@ the frozen target while the stale client catches up.
 - [x] (2026-09-12) Start the drain from the background synchronization cycle and preserve runtime replication after `Live`.
 - [x] (2026-09-12) Add focused unit and PostgreSQL moving-head coverage.
 - [x] (2026-09-12) Run focused formatting, compilation, tests, clippy, and diff validation.
-- [x] (2026-09-12) Complete an independent review pass; no Critical,
-  Important, or Minor findings remain after the serialization/cancellation
+- [x] (2026-09-12) Complete the initial independent review pass; no Critical,
+  Important, or Minor findings remained after the serialization/cancellation
   fixes.
 - [x] (2026-09-12) Commit every intended task file in `b4444184`.
 - [x] (2026-09-12) Update the Linear issue with the final implementation and
   validation evidence; move SFS-701 to `Done`.
+- [x] (2026-09-12) Validate the follow-up review against the replay,
+  invalidation, lifecycle, and telemetry contracts; apply the confirmed loop,
+  documentation, and edge-test improvements.
 
 ## Surprises & Discoveries
 
@@ -85,8 +88,8 @@ the frozen target while the stale client catches up.
 - Startup no longer preloads the process-local target during `open`; the
   background session captures it when catch-up actually begins, while the
   durable replay cursor remains the restart position.
-- The portable drain tests passed: 3 passed, 0 failed, 1 ignored (the
-  service-backed test is excluded by the default test mode).
+- The portable drain tests passed: 8 passed, 0 failed; the service-backed
+  regression remains explicitly ignored by the default test mode.
 - The focused lifecycle completion tests passed: 3 passed, 0 failed, 0
   ignored; the complete lifecycle-module filter passed 43 tests with 10
   service-backed tests ignored.
@@ -226,3 +229,8 @@ replication lock, defer lifecycle bookkeeping until unlock, and check
 shutdown/lifecycle state between pages.
 2026-09-12: Implementation committed as `b4444184`; Linear SFS-701 marked
 Done with the focused validation results.
+2026-09-12: Follow-up review confirmed that replay commits already publish
+per-page invalidation batches and that the session lock protects the frozen
+target from concurrent lifecycle completion; added drain-loop rustdoc and
+edge coverage, and kept the generic storage error variant out of this issue's
+scope.

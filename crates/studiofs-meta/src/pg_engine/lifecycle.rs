@@ -8,6 +8,12 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+/// Drain bounded replay pages until the local cursor reaches a frozen target.
+///
+/// The continuation callback is checked before each page, so cancellation or
+/// a lifecycle transition stops the session cleanly. A successful page must
+/// advance the local cursor unless it reaches the target; otherwise the
+/// helper returns a storage error instead of spinning.
 pub(super) fn drain_startup_catch_up_pages(
     target_version: i64,
     mut local_version: impl FnMut() -> i64,
@@ -21,26 +27,25 @@ pub(super) fn drain_startup_catch_up_pages(
     }
 
     let mut changed = false;
-    loop {
-        let before = local_version();
-        if before >= target_version {
-            return Ok(changed);
-        }
+    let mut current = local_version();
+    while current < target_version {
         if !should_continue() {
             return Ok(changed);
         }
 
         changed |= pull_page()?;
-        let after = local_version();
-        if after >= target_version {
+        let next = local_version();
+        if next >= target_version {
             return Ok(changed);
         }
-        if after <= before {
+        if next <= current {
             return Err(MetaError::Storage(format!(
-                "postgres metadata catch-up stalled at local version {after} while startup target is {target_version}"
+                "postgres metadata catch-up stalled at local version {next} while startup target is {target_version}"
             )));
         }
+        current = next;
     }
+    Ok(changed)
 }
 
 impl PgBackgroundWorkers {
@@ -274,6 +279,7 @@ impl PgMetaEngine {
         Self::env_duration_ms("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", 2_000)
     }
 
+    /// Run one interruptible startup catch-up session to the frozen target.
     pub(super) fn run_startup_catch_up_session(&self, shutdown: &AtomicBool) -> MetaResult<bool> {
         let result = (|| {
             self.ensure_remote_format_validated()?;

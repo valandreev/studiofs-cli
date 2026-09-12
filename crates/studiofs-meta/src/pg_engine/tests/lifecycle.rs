@@ -89,6 +89,97 @@ fn startup_catch_up_drain_stops_when_session_is_cancelled() {
     assert_eq!(pulls.get(), 0);
 }
 
+#[test]
+fn startup_catch_up_drain_stops_after_partial_progress_when_cancelled() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+    let continue_calls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || local_version.get(),
+        || {
+            let call = continue_calls.get();
+            continue_calls.set(call + 1);
+            call == 0
+        },
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(1);
+            Ok(true)
+        },
+    )
+    .expect("cancellation after a committed page should return cleanly");
+
+    assert!(changed);
+    assert_eq!(local_version.get(), 1);
+    assert_eq!(pulls.get(), 1);
+    assert_eq!(continue_calls.get(), 2);
+}
+
+#[test]
+fn startup_catch_up_drain_rejects_negative_target() {
+    let error = drain_startup_catch_up_pages(-1, || 0, || true, || Ok(false))
+        .expect_err("a startup catch-up target must not be negative");
+
+    assert!(error.to_string().contains("target must not be negative"));
+}
+
+#[test]
+fn startup_catch_up_drain_skips_pull_when_already_at_target() {
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        3,
+        || 3,
+        || panic!("continuation must not be checked at the target"),
+        || {
+            pulls.set(pulls.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("an already reached target should complete");
+
+    assert!(!changed);
+    assert_eq!(pulls.get(), 0);
+}
+
+#[test]
+fn startup_catch_up_drain_propagates_page_error() {
+    let error = drain_startup_catch_up_pages(
+        1,
+        || 0,
+        || true,
+        || Err(MetaError::Storage("page failure".to_string())),
+    )
+    .expect_err("a page error must terminate startup catch-up");
+
+    assert!(error.to_string().contains("page failure"));
+}
+
+#[test]
+fn startup_catch_up_drain_reads_cursor_once_per_loop_iteration() {
+    let local_version = std::cell::Cell::new(0_i64);
+    let reads = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || {
+            reads.set(reads.get() + 1);
+            local_version.get()
+        },
+        || true,
+        || {
+            local_version.set(local_version.get() + 1);
+            Ok(true)
+        },
+    )
+    .expect("cursor should reach the target");
+
+    assert!(changed);
+    assert_eq!(reads.get(), 3);
+}
+
 struct EventLogLockGuard {
     release_tx: Option<tokio::sync::oneshot::Sender<()>>,
     lock_thread: Option<std::thread::JoinHandle<()>>,
