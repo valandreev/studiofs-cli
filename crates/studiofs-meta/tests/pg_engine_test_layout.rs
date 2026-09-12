@@ -97,7 +97,7 @@ fn metadata_sync_delegates_atomic_replay_position_to_local_state() {
     let metadata_sync =
         fs::read_to_string(src_dir.join("metadata_sync.rs")).expect("read metadata_sync module");
     assert!(
-        metadata_sync.contains("self.write_replay_position_in_txn(&txn, &outcome)"),
+        metadata_sync.contains("Self::write_replay_position_in_txn(&txn, &outcome)"),
         "metadata_sync.rs should delegate atomic replay counter writes to local_state.rs"
     );
     assert!(

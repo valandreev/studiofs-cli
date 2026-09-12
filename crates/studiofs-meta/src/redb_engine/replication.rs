@@ -1159,19 +1159,19 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
-        let event_refs = events.iter().collect::<Vec<_>>();
-        Self::apply_replica_serving_state_in_txn(&txn, &event_refs, reject_stale_ready_growth)?;
+        Self::apply_replica_serving_state_in_txn(&txn, events, reject_stale_ready_growth)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    pub(crate) fn apply_replica_serving_state_in_txn(
+    pub(crate) fn apply_replica_serving_state_in_txn<E: Borrow<crate::events::MetaEvent>>(
         txn: &RedbWriteTransaction<'_>,
-        events: &[&crate::events::MetaEvent],
+        events: &[E],
         reject_stale_ready_growth: bool,
     ) -> MetaResult<()> {
-        for &event in events {
+        for event in events {
+            let event = event.borrow();
             Self::invalidate_replica_event(txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
@@ -1208,7 +1208,7 @@ impl RedbMetaEngine {
                         && attr.size > current.size
                         && ((attr.mtime < current.mtime && attr.ctime < current.ctime)
                             || !Self::ready_regular_file_growth_has_payload(
-                                events.iter().copied(),
+                                events.iter().map(Borrow::borrow),
                                 attr.ino,
                                 current.size,
                                 attr.size,
@@ -1463,18 +1463,26 @@ impl RedbMetaEngine {
             return Ok(false);
         }
         let mut changed = false;
+        let base_attrs = {
+            let base = txn
+                .open_table(BASE_INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            inodes
+                .iter()
+                .map(|ino| {
+                    let attr = base
+                        .get(*ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|value| decode::<InodeAttr>(value.value()))
+                        .transpose()?;
+                    Ok((*ino, attr))
+                })
+                .collect::<MetaResult<HashMap<Ino, Option<InodeAttr>>>>()?
+        };
 
         for ino in inodes {
             Self::invalidate_replica_inode(txn, *ino, false)?;
-            let base_attr = {
-                let base = txn
-                    .open_table(BASE_INODES_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                base.get(*ino)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                    .map(|value| decode::<InodeAttr>(value.value()))
-                    .transpose()?
-            };
+            let base_attr = base_attrs.get(ino).cloned().flatten();
 
             match base_attr {
                 Some(attr) if attr.kind == FileType::RegularFile => {
@@ -1555,6 +1563,19 @@ impl RedbMetaEngine {
             return Ok(false);
         }
         let mut changed = false;
+        let base_entries = {
+            let base = txn
+                .open_table(BASE_DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            dentry_keys
+                .iter()
+                .map(|key| {
+                    let (parent, name) = decode_dentry_key(key)?;
+                    let entry = Self::lookup_in_opened_dentry_table(&base, parent, name)?;
+                    Ok((key.clone(), entry))
+                })
+                .collect::<MetaResult<HashMap<Vec<u8>, Option<DirEntryValue>>>>()?
+        };
 
         for key in dentry_keys {
             if protected_dentry_keys.contains(key) {
@@ -1562,12 +1583,7 @@ impl RedbMetaEngine {
             }
             let (parent, name) = decode_dentry_key(key)?;
             Self::invalidate_replica_entry(txn, parent, name, None)?;
-            let base_entry = {
-                let base = txn
-                    .open_table(BASE_DENTRIES_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                Self::lookup_in_opened_dentry_table(&base, parent, name)?
-            };
+            let base_entry = base_entries.get(key).cloned().flatten();
             if let Some(entry) = base_entry {
                 Self::set_dentry_mirror_in_txn(txn, parent, name, &entry)?;
                 Self::invalidate_replica_inode(txn, entry.ino, false)?;

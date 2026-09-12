@@ -27,7 +27,7 @@ const TAG_REMOVE_PENDING_DELETION: u8 = 15;
 /// Represents a single mutation to the metadata state.
 /// These events are appended to a local journal and eventually pushed to S3
 /// to achieve Event Sourcing and Eventual Consistency.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaEvent {
     // ─── Core Inode Operations ───────────────────────────────────────────────
     /// Create or update an inode.

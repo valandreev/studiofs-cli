@@ -298,12 +298,22 @@ impl PgMetaEngine {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = txn.abort();
+                if let Err(abort_error) = txn.abort() {
+                    tracing::warn!(
+                        error = %abort_error,
+                        "failed to abort redb write transaction during catch-up rollback"
+                    );
+                }
                 return Err(error);
             }
         };
-        if let Err(error) = self.write_replay_position_in_txn(&txn, &outcome) {
-            let _ = txn.abort();
+        if let Err(error) = Self::write_replay_position_in_txn(&txn, &outcome) {
+            if let Err(abort_error) = txn.abort() {
+                tracing::warn!(
+                    error = %abort_error,
+                    "failed to abort redb write transaction during catch-up rollback"
+                );
+            }
             return Err(error);
         }
         txn.commit()

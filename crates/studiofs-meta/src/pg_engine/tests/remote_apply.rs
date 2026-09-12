@@ -41,7 +41,7 @@ fn aborted_replay_page_does_not_persist_state_or_cursor() {
             },
         )
         .unwrap();
-    pg.write_replay_position_in_txn(&txn, &outcome).unwrap();
+    PgMetaEngine::write_replay_position_in_txn(&txn, &outcome).unwrap();
     txn.abort().unwrap();
 
     assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 0);
@@ -51,6 +51,8 @@ fn aborted_replay_page_does_not_persist_state_or_cursor() {
             .unwrap(),
         0
     );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
+    assert_eq!(pg.namespace_version.load(Ordering::SeqCst), 0);
     assert!(pg.local.lookup(ROOT_INO, b"page-one").is_err());
     assert!(pg.local.get_attr(remote_ino).is_err());
 }
@@ -92,6 +94,14 @@ fn failed_replay_page_does_not_persist_state_or_cursor() {
 
     assert!(result.is_err());
     assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 0);
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .unwrap(),
+        0
+    );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
+    assert_eq!(pg.namespace_version.load(Ordering::SeqCst), 0);
     assert!(pg.local.get_attr(remote_ino).is_err());
 }
 
@@ -122,6 +132,8 @@ fn empty_replay_page_returns_without_advancing_replay_state() {
             .unwrap(),
         0
     );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
+    assert_eq!(pg.namespace_version.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -167,6 +179,17 @@ fn committed_replay_pages_persist_state_and_resume_from_next_version() {
     assert_eq!(first.max_version, 1);
     assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 1);
     assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .unwrap(),
+        first.max_namespace_version as u64
+    );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), first.max_version);
+    assert_eq!(
+        pg.namespace_version.load(Ordering::SeqCst),
+        first.max_namespace_version
+    );
+    assert_eq!(
         pg.local.lookup(ROOT_INO, b"page-one").unwrap().ino,
         first_ino
     );
@@ -189,9 +212,14 @@ fn committed_replay_pages_persist_state_and_resume_from_next_version() {
             },
         )
         .unwrap();
-    pg.write_replay_position_in_txn(&txn, &failed_page).unwrap();
+    PgMetaEngine::write_replay_position_in_txn(&txn, &failed_page).unwrap();
     txn.abort().unwrap();
     assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 1);
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), first.max_version);
+    assert_eq!(
+        pg.namespace_version.load(Ordering::SeqCst),
+        first.max_namespace_version
+    );
     assert!(pg.local.lookup(ROOT_INO, b"page-two").is_err());
 
     let second = pg
@@ -209,6 +237,17 @@ fn committed_replay_pages_persist_state_and_resume_from_next_version() {
         .unwrap();
     assert_eq!(second.max_version, 2);
     assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 2);
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .unwrap(),
+        second.max_namespace_version as u64
+    );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), second.max_version);
+    assert_eq!(
+        pg.namespace_version.load(Ordering::SeqCst),
+        second.max_namespace_version
+    );
     assert_eq!(
         pg.local.lookup(ROOT_INO, b"page-two").unwrap().ino,
         second_ino

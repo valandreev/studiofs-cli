@@ -342,6 +342,24 @@ fn coherence_journal_overflow_signals_reset() {
 }
 
 #[test]
+fn coherence_journal_deduplicates_duplicate_intents_without_reset() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    for _ in 0..8192 {
+        txn.invalidate(InvalidationIntent::Attributes { ino: 42 });
+    }
+    txn.commit().unwrap();
+
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].intents,
+        vec![InvalidationIntent::Attributes { ino: 42 }]
+    );
+}
+
+#[test]
 fn legacy_meta_event_fixture_replays_from_local_event_log() {
     let engine = temp_engine();
     let legacy_bytes = [1_u8, 42_u8];

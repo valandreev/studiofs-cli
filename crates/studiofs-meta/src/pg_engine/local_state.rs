@@ -88,7 +88,6 @@ impl PgMetaEngine {
     }
 
     pub(super) fn write_replay_position_in_txn(
-        &self,
         txn: &redb::WriteTransaction,
         outcome: &super::RemoteReplayApplyOutcome,
     ) -> MetaResult<()> {

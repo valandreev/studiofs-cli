@@ -10,9 +10,9 @@ use redb::{
     Database, Durability, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
     TableDefinition, WriteTransaction,
 };
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::Path;
