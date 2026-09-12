@@ -234,3 +234,13 @@ the frozen observation, replaced panic-prone page metadata reads with `try_get`,
 and added a live byte-budget cutoff test. Kept the separate candidate-batch CTE
 because merging it would weaken the early batch-count bound. Deferred multi-page
 orchestration and repeated page metadata transport to SFS-700/SFS-701.
+
+2026-09-12: Verified the attached bounded-event-paging review against the current
+implementation and lifecycle call graph. Fixed the frozen-target CAS return race,
+made foreign event decoding named and fallible, trimmed and diagnosed invalid page
+limit environment values, and added negative-limit/zero-value coverage. Also
+deduplicated page-metadata error mapping and clarified the local batch-version
+cursor name. Kept `ForeignEventPage` without derived `Debug` to avoid accidental
+payload logging, and did not add a direct fake-client fast-path test because the
+existing pull-level offline regression covers that behavior without overbuilding
+test infrastructure. Deferred repeated per-row page metadata to SFS-700/SFS-701.

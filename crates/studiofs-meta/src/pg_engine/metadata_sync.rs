@@ -23,13 +23,16 @@ impl PgMetaEngine {
             self.current_pg_sync_lifecycle(),
             PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
         ) {
-            let _ = self.metadata_startup_target_version.compare_exchange(
+            let target = match self.metadata_startup_target_version.compare_exchange(
                 -1,
                 observed_target,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            );
-            return Ok(self.metadata_startup_target_version.load(Ordering::Acquire));
+            ) {
+                Ok(_) => observed_target,
+                Err(existing) => existing,
+            };
+            return Ok(target);
         }
         Ok(observed_target)
     }
@@ -159,8 +162,8 @@ impl PgMetaEngine {
         recent_flush: Option<&RecentFlush>,
         target_version: i64,
     ) -> MetaResult<bool> {
-        let last_seq = self.local_version.load(Ordering::SeqCst);
-        if last_seq >= target_version {
+        let last_batch_version = self.local_version.load(Ordering::SeqCst);
+        if last_batch_version >= target_version {
             return Ok(false);
         }
 
@@ -201,7 +204,7 @@ impl PgMetaEngine {
                         let page = Self::query_foreign_event_page(
                             &tx,
                             volume_id,
-                            last_seq,
+                            last_batch_version,
                             target_version,
                             sync_max_batches_per_page,
                             sync_max_response_bytes_per_page,
@@ -254,7 +257,7 @@ impl PgMetaEngine {
             recent_flush,
             client_id.as_str(),
             super::RemoteReplayApplyContext {
-                last_seq,
+                last_seq: last_batch_version,
                 current_namespace_version: self.namespace_version.load(Ordering::SeqCst),
                 flushed_event_seq,
                 next_event_seq,

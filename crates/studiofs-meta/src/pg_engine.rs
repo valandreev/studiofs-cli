@@ -617,10 +617,32 @@ impl PgMetaEngine {
     }
 
     fn env_positive_i64(key: &str, default: i64) -> i64 {
-        pg_env_var(key)
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
+        let Some(raw) = pg_env_var(key) else {
+            return default;
+        };
+
+        match raw.trim().parse::<i64>() {
+            Ok(value) if value > 0 => value,
+            Ok(value) => {
+                tracing::warn!(
+                    key,
+                    value,
+                    default,
+                    "environment variable must be positive; using default"
+                );
+                default
+            }
+            Err(error) => {
+                tracing::warn!(
+                    key,
+                    value = %raw,
+                    %error,
+                    default,
+                    "invalid integer in environment variable; using default"
+                );
+                default
+            }
+        }
     }
 
     fn default_connect_timeout() -> Duration {

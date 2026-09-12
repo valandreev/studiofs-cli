@@ -42,7 +42,9 @@ fn foreign_event_page_query_is_bounded_and_exposes_page_metadata() {
 #[test]
 fn foreign_event_page_rejects_non_positive_limits_without_postgres() {
     assert!(PgMetaEngine::validate_foreign_event_page_limits(0, 1).is_err());
+    assert!(PgMetaEngine::validate_foreign_event_page_limits(-1, 1).is_err());
     assert!(PgMetaEngine::validate_foreign_event_page_limits(1, 0).is_err());
+    assert!(PgMetaEngine::validate_foreign_event_page_limits(1, -1).is_err());
 }
 
 #[test]
@@ -59,6 +61,27 @@ fn pg_sync_page_limits_fall_back_for_invalid_environment_values() {
             DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE,
         ),
         DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE
+    );
+    assert_eq!(
+        PgMetaEngine::env_positive_i64(
+            PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR,
+            DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
+        ),
+        DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE
+    );
+}
+
+#[test]
+fn pg_sync_page_limits_trim_whitespace_and_reject_zero() {
+    let _batches = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, " 128 ");
+    let _bytes = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "0");
+
+    assert_eq!(
+        PgMetaEngine::env_positive_i64(
+            PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR,
+            DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE,
+        ),
+        128
     );
     assert_eq!(
         PgMetaEngine::env_positive_i64(
