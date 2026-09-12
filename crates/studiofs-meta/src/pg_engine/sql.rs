@@ -1,5 +1,8 @@
 pub(super) const SELECT_METADATA_VERSION: &str = "SELECT version FROM metadata_state WHERE vol=$1";
 
+pub(super) const SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION: &str =
+    "SELECT version, checkpoint_version FROM metadata_state WHERE vol=$1";
+
 pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
     SELECT
         v.vol,

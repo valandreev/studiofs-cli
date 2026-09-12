@@ -82,7 +82,6 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
             "discovered format is not postgres-backed".to_string(),
         ))?;
     pg.url = postgres_dsn;
-    pg.volume_id = descriptor.volume_id;
 
     Ok(DiscoveredState {
         volume_id: descriptor.volume_id,
@@ -97,7 +96,7 @@ async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResu
         .map_err(|e| DiscoveryError::Message(e.to_string()))?;
     let conn_task = tokio::spawn(connection);
 
-    let result = async {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let row = client
             .query_opt(
                 r#"
@@ -112,15 +111,14 @@ async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResu
             .await
             .map_err(|e| DiscoveryError::Message(format!("discover query failed: {e}")))?;
 
-        let row = row.ok_or_else(|| {
-            DiscoveryError::Message(format!(
-                "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
-            ))
-        })?;
+        let row =
+            row.ok_or_else(|| DiscoveryError::Message(format!("volume '{name}' not found")))?;
 
         Ok::<i64, DiscoveryError>(row.get(0))
-    }
-    .await;
+    })
+    .await
+    .map_err(|_| DiscoveryError::Message("discovery volume query timed out".to_string()))
+    .flatten();
 
     drop(client);
     conn_task.abort();
@@ -191,7 +189,6 @@ pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
 
     #[test]
     fn discover_parses_name_and_meta_dsn() {
@@ -210,65 +207,5 @@ mod tests {
             }
             other => panic!("expected Discover, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn discover_rejects_incomplete_checkpoint_publication() {
-        let checkpoint = b"checkpoint";
-        let digest = Sha256::digest(checkpoint);
-
-        let err = studiofs_meta::validate_checkpoint_descriptor(
-            checkpoint,
-            Some(digest.as_slice()),
-            Some("pending"),
-            Some(1),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            studiofs_meta::MetaError::InvalidCheckpointDescriptor {
-                reason: studiofs_meta::CheckpointDescriptorFailure::PublicationState
-            }
-        ));
-    }
-
-    #[test]
-    fn discover_rejects_checkpoint_checksum_mismatch() {
-        let err = studiofs_meta::validate_checkpoint_descriptor(
-            b"checkpoint",
-            Some(&[0; 32]),
-            Some("published"),
-            Some(1),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            studiofs_meta::MetaError::InvalidCheckpointDescriptor {
-                reason: studiofs_meta::CheckpointDescriptorFailure::Checksum
-            }
-        ));
-    }
-
-    #[test]
-    fn discover_rejects_non_positive_checkpoint_generation() {
-        let checkpoint = b"checkpoint";
-        let digest = Sha256::digest(checkpoint);
-
-        let err = studiofs_meta::validate_checkpoint_descriptor(
-            checkpoint,
-            Some(digest.as_slice()),
-            Some("published"),
-            Some(0),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            studiofs_meta::MetaError::InvalidCheckpointDescriptor {
-                reason: studiofs_meta::CheckpointDescriptorFailure::Generation
-            }
-        ));
     }
 }

@@ -265,9 +265,30 @@ out of scope.
 Validation evidence: focused descriptor/query/runtime tests passed; the ignored
 PostgreSQL read test passed against the configured local service; `cargo check`
 and `cargo clippy --all-targets -- -D warnings` passed for `studiofs-meta` and
-`studiofs`; formatting and `git diff --check` passed. No commit or Linear status
-change was made. The follow-up simplification review removed 20 lines without
-changing behavior or coverage of the remaining descriptor tests.
+`studiofs`; formatting and `git diff --check` passed. The initial implementation
+is committed on the feature branch; the current review amendments remain
+uncommitted and no Linear status change was made. The follow-up simplification
+review removed 20 lines without changing behavior or coverage of the remaining
+descriptor tests.
+
+Review follow-up (2026-09-12): accepted the lightweight remote-head guard,
+bounded discovery query, corrected not-found message, dead assignment removal,
+complete descriptor invariant coverage, redacted `Debug`, and SQL test rename.
+The serialized descriptor contract remains unchanged: validation still decodes
+checkpoint bytes before returning, discovery keeps its separate one-time pool
+boundary, `FormatInfo` remains a typed redacted aggregate failure, checksum
+bytes remain `Vec<u8>`, and the public format version remains `u16`.
+
+Second review pass (2026-09-12): moved descriptor row mapping and validation
+outside the checked-out PostgreSQL connection, added a head-plus-checkpoint
+version preflight to skip stale snapshot BLOBs, routed runtime reads through
+the engine runtime and pool, made row mapping fallible with `try_get`, and
+used `Result::flatten` in discovery. Service-backed regressions cover pool
+health after logical descriptor rejection and skipping a stale checkpoint with
+invalid payload bytes. Double postcard deserialization remains intentional
+because the public descriptor must validate before returning exact serialized
+bytes; eliminating it would require a new decoded carrier and an API/ownership
+change not justified by current consumers.
 
 ## Context and Orientation
 

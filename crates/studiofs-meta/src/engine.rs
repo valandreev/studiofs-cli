@@ -111,6 +111,23 @@ pub struct BootstrapCheckpointDescriptor {
     pub publication_generation: i64,
 }
 
+impl std::fmt::Debug for BootstrapCheckpointDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapCheckpointDescriptor")
+            .field("volume_id", &self.volume_id)
+            .field("volume_uuid", &self.volume_uuid)
+            .field("metadata_format_version", &self.metadata_format_version)
+            .field("remote_head_version", &self.remote_head_version)
+            .field("checkpoint_version", &self.checkpoint_version)
+            .field("checkpoint_bytes_len", &self.checkpoint_bytes.len())
+            .field("checkpoint_sha256_len", &self.checkpoint_sha256.len())
+            .field("format_info_bytes", &"<redacted>")
+            .field("publication_state", &self.publication_state)
+            .field("publication_generation", &self.publication_generation)
+            .finish()
+    }
+}
+
 impl BootstrapCheckpointDescriptor {
     /// Validates all identity, version, publication, and payload invariants.
     pub fn validate(&self) -> MetaResult<()> {

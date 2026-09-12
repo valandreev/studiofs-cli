@@ -1673,6 +1673,28 @@ fn startup_snapshot_replay_uses_previous_epoch_when_snapshot_has_no_cursor() {
 
 #[test]
 fn bootstrap_checkpoint_descriptor_validates_and_exposes_replay_floor() {
+    let descriptor = valid_bootstrap_checkpoint_descriptor();
+
+    descriptor
+        .validate()
+        .expect("complete bootstrap descriptor should validate");
+    assert_eq!(descriptor.checkpoint_version, 3);
+    assert_eq!(
+        descriptor.remote_head_version, 3,
+        "the remote head is separate from the checkpoint replay floor"
+    );
+}
+
+#[test]
+fn bootstrap_checkpoint_descriptor_debug_redacts_format_info() {
+    let descriptor = valid_bootstrap_checkpoint_descriptor();
+    let debug = format!("{descriptor:?}");
+
+    assert!(debug.contains("format_info_bytes: \"<redacted>\""));
+    assert!(!debug.contains("postgres://studiofs"));
+}
+
+fn valid_bootstrap_checkpoint_descriptor() -> crate::BootstrapCheckpointDescriptor {
     let format_info = format_info(
         "bootstrap-descriptor",
         "bootstrap-descriptor-uuid",
@@ -1683,7 +1705,7 @@ fn bootstrap_checkpoint_descriptor_validates_and_exposes_replay_floor() {
         .expect("encode serving checkpoint");
     let checkpoint_sha256 = Sha256::digest(&checkpoint_bytes).to_vec();
 
-    let descriptor = crate::BootstrapCheckpointDescriptor {
+    crate::BootstrapCheckpointDescriptor {
         volume_id: 7,
         volume_uuid: "bootstrap-descriptor-uuid".to_string(),
         format_info_bytes: serde_json::to_vec(&format_info).expect("encode format info"),
@@ -1694,47 +1716,125 @@ fn bootstrap_checkpoint_descriptor_validates_and_exposes_replay_floor() {
         checkpoint_sha256,
         publication_state: "published".to_string(),
         publication_generation: 1,
-    };
+    }
+}
 
-    descriptor
-        .validate()
-        .expect("complete bootstrap descriptor should validate");
-    assert_eq!(descriptor.checkpoint_version, 3);
-    assert_eq!(
-        descriptor.remote_head_version, 3,
-        "the remote head is separate from the checkpoint replay floor"
-    );
-
-    let mut invalid = descriptor.clone();
-    invalid.volume_id = 0;
+fn assert_descriptor_failure(
+    descriptor: crate::BootstrapCheckpointDescriptor,
+    expected: CheckpointDescriptorFailure,
+) {
     assert!(matches!(
-        invalid.validate(),
-        Err(MetaError::InvalidCheckpointDescriptor {
-            reason: CheckpointDescriptorFailure::VolumeIdentity
-        })
-    ));
-
-    invalid = descriptor.clone();
-    invalid.checkpoint_version = 4;
-    assert!(matches!(
-        invalid.validate(),
-        Err(MetaError::InvalidCheckpointDescriptor {
-            reason: CheckpointDescriptorFailure::Version
-        })
-    ));
-
-    invalid = descriptor.clone();
-    invalid.publication_state = "pending".to_string();
-    assert!(matches!(
-        invalid.validate(),
-        Err(MetaError::InvalidCheckpointDescriptor {
-            reason: CheckpointDescriptorFailure::PublicationState
-        })
+        descriptor.validate(),
+        Err(MetaError::InvalidCheckpointDescriptor { reason }) if reason == expected
     ));
 }
 
 #[test]
-fn bootstrap_checkpoint_query_reads_one_consistent_descriptor_row() {
+fn bootstrap_checkpoint_descriptor_rejects_invalid_invariants() {
+    let descriptor = valid_bootstrap_checkpoint_descriptor();
+
+    let mut invalid = descriptor.clone();
+    invalid.volume_id = 0;
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::VolumeIdentity);
+
+    let mut invalid = descriptor.clone();
+    invalid.volume_uuid = "  ".to_string();
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::VolumeIdentity);
+
+    let mut invalid = descriptor.clone();
+    invalid.metadata_format_version = CURRENT_FORMAT_VERSION + 1;
+    assert!(matches!(
+        invalid.validate(),
+        Err(MetaError::UnsupportedFormatVersion { found, expected })
+            if found == CURRENT_FORMAT_VERSION + 1 && expected == CURRENT_FORMAT_VERSION
+    ));
+
+    let mut invalid = descriptor.clone();
+    invalid.checkpoint_version = -1;
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::Version);
+
+    let mut invalid = descriptor.clone();
+    invalid.checkpoint_version = 4;
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::Version);
+
+    let mut invalid = descriptor.clone();
+    invalid.remote_head_version = -1;
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::Version);
+
+    let mut invalid = descriptor.clone();
+    invalid.publication_state = "pending".to_string();
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::PublicationState);
+
+    let mut invalid = descriptor.clone();
+    invalid.publication_generation = 0;
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::Generation);
+
+    let mut invalid = descriptor.clone();
+    invalid.checkpoint_sha256 = vec![0; 31];
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::Checksum);
+
+    let mut invalid = descriptor.clone();
+    invalid.checkpoint_sha256 = vec![0; 32];
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::Checksum);
+
+    let mut invalid = descriptor.clone();
+    invalid.format_info_bytes = b"{".to_vec();
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::FormatInfo);
+
+    let mut missing_postgres = format_info(
+        "bootstrap-descriptor",
+        "bootstrap-descriptor-uuid",
+        "postgres://unused",
+        7,
+    );
+    missing_postgres.metadata.postgres = None;
+    let mut invalid = descriptor.clone();
+    invalid.format_info_bytes = serde_json::to_vec(&missing_postgres).expect("encode format info");
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::FormatInfo);
+
+    let mismatched_uuid = format_info("bootstrap-descriptor", "other-uuid", "postgres://unused", 7);
+    let mut invalid = descriptor.clone();
+    invalid.format_info_bytes = serde_json::to_vec(&mismatched_uuid).expect("encode format info");
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::FormatInfo);
+
+    let mut local_format = format_info(
+        "bootstrap-descriptor",
+        "bootstrap-descriptor-uuid",
+        "postgres://unused",
+        7,
+    );
+    local_format.metadata.backend = MetadataBackend::RedbLocal;
+    let mut invalid = descriptor.clone();
+    invalid.format_info_bytes = serde_json::to_vec(&local_format).expect("encode format info");
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::FormatInfo);
+
+    let mismatched_volume = format_info(
+        "bootstrap-descriptor",
+        "bootstrap-descriptor-uuid",
+        "postgres://unused",
+        8,
+    );
+    let mut invalid = descriptor.clone();
+    invalid.format_info_bytes = serde_json::to_vec(&mismatched_volume).expect("encode format info");
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::FormatInfo);
+
+    let mut invalid = descriptor;
+    invalid.checkpoint_bytes = b"invalid".to_vec();
+    invalid.checkpoint_sha256 = Sha256::digest(&invalid.checkpoint_bytes).to_vec();
+    assert_descriptor_failure(invalid, CheckpointDescriptorFailure::CheckpointBytes);
+}
+
+#[test]
+fn metadata_head_query_contains_checkpoint_version() {
+    let sql = super::sql::SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION;
+
+    assert!(sql.contains("SELECT version, checkpoint_version"));
+    assert!(sql.contains("FROM metadata_state"));
+    assert!(sql.contains("WHERE vol=$1"));
+}
+
+#[test]
+fn bootstrap_checkpoint_query_contains_all_descriptor_columns() {
     let sql = super::sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR;
 
     for fragment in [
@@ -1782,6 +1882,100 @@ fn pg_snapshot_backend_reads_a_validated_bootstrap_descriptor() {
     assert_eq!(
         descriptor.checkpoint_sha256,
         Sha256::digest(&descriptor.checkpoint_bytes).to_vec()
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn invalid_bootstrap_descriptor_does_not_discard_healthy_pool_connection() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-bootstrap-descriptor-pool");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET checkpoint_publication_state = 'pending' WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("mark checkpoint publication pending");
+
+    let before = engine.command_pool_stats();
+    let error = engine.snapshot_backend().read_bootstrap_checkpoint();
+
+    assert!(matches!(
+        error,
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::PublicationState
+        })
+    ));
+    let after = engine.command_pool_stats();
+    assert_eq!(
+        after.discarded - before.discarded,
+        0,
+        "logical descriptor rejection should return a healthy connection to the pool"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_snapshot_skips_stale_checkpoint_without_downloading_payload() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-bootstrap-stale-checkpoint");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+    engine.local_version.store(1, Ordering::SeqCst);
+
+    let snapshot = b"invalid serving checkpoint".to_vec();
+    let checksum = Sha256::digest(&snapshot).to_vec();
+    let volume_id = volume.volume_id;
+    run_async(with_pg_test_client(&dsn, move |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = $1, checkpoint_version = $2, snapshot = $3, checkpoint_sha256 = $4 WHERE vol = $5",
+                &[&2_i64, &0_i64, &snapshot, &checksum, &volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("seed stale checkpoint state");
+
+    assert!(
+        !engine
+            .pull_snapshot_locked(StartupSnapshotImportMode::PreserveLocalState)
+            .expect("stale checkpoint should be skipped")
     );
 }
 
