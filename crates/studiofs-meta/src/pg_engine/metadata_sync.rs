@@ -276,6 +276,14 @@ impl PgMetaEngine {
         recent_flush: Option<&super::RecentFlush>,
         context: super::RemoteReplayApplyContext,
     ) -> MetaResult<super::RemoteReplayApplyOutcome> {
+        if batches.is_empty() {
+            return Ok(super::RemoteReplayApplyOutcome {
+                changed: false,
+                max_version: context.last_seq,
+                max_namespace_version: context.current_namespace_version,
+                flushed_event_seq: None,
+            });
+        }
         let _position_guard = self
             .local_position_lock
             .lock()

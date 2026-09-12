@@ -1246,26 +1246,21 @@ impl<'a> RemoteApplyCoordinator<'a> {
     ) -> MetaResult<RemoteApplyBatchOutcome> {
         let batch_events =
             self.preserve_published_content_state_for_attr_only_events_in_txn(txn, batch_events)?;
+        let mut batch_events = batch_events;
         let stale_older_ready_inodes =
             self.stale_older_ready_regular_file_inodes_in_txn(txn, &batch_events)?;
-        let batch_events = batch_events
-            .into_iter()
-            .filter(|event| {
-                !Self::event_belongs_to_stale_older_ready_inode(event, &stale_older_ready_inodes)
-            })
-            .collect::<Vec<_>>();
+        batch_events.retain(|event| {
+            !Self::event_belongs_to_stale_older_ready_inode(event, &stale_older_ready_inodes)
+        });
         let stale_older_updating_inodes =
             self.stale_older_updating_regular_file_inodes_in_txn(txn, &batch_events)?;
-        let batch_events = batch_events
-            .into_iter()
-            .filter(|event| {
-                !matches!(
-                    event,
-                    MetaEvent::SetAttr { attr }
-                        if stale_older_updating_inodes.contains(&attr.ino)
-                )
-            })
-            .collect::<Vec<_>>();
+        batch_events.retain(|event| {
+            !matches!(
+                event,
+                MetaEvent::SetAttr { attr }
+                    if stale_older_updating_inodes.contains(&attr.ino)
+            )
+        });
         if batch_events.is_empty() {
             return Ok(RemoteApplyBatchOutcome {
                 changed: false,
@@ -1332,20 +1327,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         )?;
         RedbMetaEngine::apply_replica_events_to_base_in_txn(
             txn,
-            &batch_events
-                .iter()
-                .filter(|event| {
-                    !matches!(
-                        event,
-                        MetaEvent::SetAttr { attr }
-                            if stale_partial_ready_attr_inodes.contains(&attr.ino)
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
+            batch_events.iter().filter(|event| {
+                !matches!(
+                    event,
+                    MetaEvent::SetAttr { attr }
+                        if stale_partial_ready_attr_inodes.contains(&attr.ino)
+                )
+            }),
             &base_range_preserve_inodes,
         )?;
-        let serving_events: Vec<MetaEvent> = batch_events
+        let serving_events = batch_events
             .iter()
             .filter(|event| {
                 if let MetaEvent::SetAttr { attr } = event
@@ -1379,24 +1370,32 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &removed_inodes_with_local_regular_file_state,
                 )
             })
-            .cloned()
-            .collect();
+            .collect::<Vec<_>>();
         let applied_serving_state = !serving_events.is_empty();
         RedbMetaEngine::apply_replica_serving_state_in_txn(txn, &serving_events, false)?;
         if !protected_attr_merges.is_empty() {
-            RedbMetaEngine::apply_replica_serving_state_in_txn(txn, &protected_attr_merges, false)?;
+            let protected_attr_merge_refs = protected_attr_merges.iter().collect::<Vec<_>>();
+            RedbMetaEngine::apply_replica_serving_state_in_txn(
+                txn,
+                &protected_attr_merge_refs,
+                false,
+            )?;
         }
         let grandfathered_attrs = self.grandfather_removed_local_regular_file_attrs_in_txn(
             txn,
             &removed_inodes_with_local_regular_file_state,
         )?;
         if !grandfathered_attrs.is_empty() {
-            RedbMetaEngine::apply_replica_serving_state_in_txn(txn, &grandfathered_attrs, false)?;
+            let grandfathered_attr_refs = grandfathered_attrs.iter().collect::<Vec<_>>();
+            RedbMetaEngine::apply_replica_serving_state_in_txn(
+                txn,
+                &grandfathered_attr_refs,
+                false,
+            )?;
         }
-        let mut aux_events = Vec::new();
-        for event in &batch_events {
+        let aux_events = batch_events.iter().filter(|event| {
             if !Self::event_has_aux_apply_effect(event) {
-                continue;
+                return false;
             }
             if matches!(
                 event,
@@ -1404,25 +1403,19 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     if protected_regular_file_inodes.contains(ino)
                         || partial_publish_inodes.contains(ino)
             ) {
-                continue;
+                return false;
             }
-            if !Self::aux_event_conflicts_with_overlay(
+            !Self::aux_event_conflicts_with_overlay(
                 event,
                 &overlay,
                 &removed_inodes,
                 &removed_inodes_with_local_regular_file_state,
-            ) {
-                aux_events.push(event.clone());
-            }
-        }
-
-        if !aux_events.is_empty() {
-            RedbMetaEngine::apply_replica_aux_state_in_txn(txn, &aux_events)?;
-        }
+            )
+        });
+        let has_aux_events = aux_events.clone().next().is_some();
+        RedbMetaEngine::apply_replica_aux_state_in_txn(txn, aux_events)?;
         Ok(RemoteApplyBatchOutcome {
-            changed: applied_serving_state
-                || !aux_events.is_empty()
-                || !grandfathered_attrs.is_empty(),
+            changed: applied_serving_state || has_aux_events || !grandfathered_attrs.is_empty(),
             protected_overlay: current_regular_file_conflicts,
         })
     }
@@ -1716,14 +1709,20 @@ impl<'a> RemoteApplyCoordinator<'a> {
             return Ok(None);
         }
         let local_events = RedbMetaEngine::read_events_range_in_write_txn(txn, start, end)?;
+        let encoded_batch_events = batch_events
+            .iter()
+            .map(|event| encode_event(event).ok())
+            .collect::<Vec<_>>();
         for consumed_events in 1..=local_events.len() {
             let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
-            let matches_prefix = projected_prefix.events.iter().zip(batch_events.iter()).all(
-                |(local, remote)| match (encode_event(local), encode_event(remote)) {
-                    (Ok(local), Ok(remote)) => local == remote,
+            let matches_prefix = projected_prefix
+                .events
+                .iter()
+                .zip(encoded_batch_events.iter())
+                .all(|(local, remote)| match (encode_event(local), remote) {
+                    (Ok(local), Some(remote)) => local.as_slice() == remote.as_slice(),
                     _ => false,
-                },
-            );
+                });
             if projected_prefix.events.len() == batch_events.len() && matches_prefix {
                 let next_seq = start.max(1).saturating_add(consumed_events as u64);
                 return Ok(Some(next_seq));

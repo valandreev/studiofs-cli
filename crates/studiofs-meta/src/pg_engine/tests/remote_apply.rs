@@ -56,6 +56,75 @@ fn aborted_replay_page_does_not_persist_state_or_cursor() {
 }
 
 #[test]
+fn failed_replay_page_does_not_persist_state_or_cursor() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let remote_ino = ROOT_INO + 703;
+    let invalid_slice = SliceRecord {
+        slice_id: SliceId(u64::MAX),
+        order: SliceOrder(0),
+        range: SliceRange::new(0, 1).unwrap(),
+        payload: None,
+        payload_state: PayloadRefState::LocalOnly,
+    };
+    let result = pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: vec![
+                MetaEvent::SetAttr {
+                    attr: InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755),
+                },
+                MetaEvent::SetRegularFileOverlaySlices {
+                    ino: remote_ino,
+                    chunk_slices: vec![(ChunkId(0), vec![invalid_slice])],
+                },
+            ],
+            is_self_batch: false,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: 0,
+            next_event_seq: pg.local.get_counter("nextEventSeq").unwrap(),
+            initial_overlay: OverlayConflictSets::default(),
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 0);
+    assert!(pg.local.get_attr(remote_ino).is_err());
+}
+
+#[test]
+fn empty_replay_page_returns_without_advancing_replay_state() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let outcome = pg
+        .apply_replay_page_atomically(
+            Vec::new(),
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 3,
+                current_namespace_version: 2,
+                flushed_event_seq: 1,
+                next_event_seq: 1,
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .unwrap();
+
+    assert!(!outcome.changed);
+    assert_eq!(outcome.max_version, 3);
+    assert_eq!(outcome.max_namespace_version, 2);
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 0);
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn committed_replay_pages_persist_state_and_resume_from_next_version() {
     let (dir, pg) = temp_pg_engine_for_unit();
     let first_ino = ROOT_INO + 701;

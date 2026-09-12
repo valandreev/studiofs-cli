@@ -3,7 +3,7 @@ use super::{
     LOCAL_PG_VERSION_COUNTER, PgMetaEngine, StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
-use crate::redb_engine::{RedbMetaEngine, RedbWriteTransaction};
+use crate::redb_engine::RedbMetaEngine;
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
@@ -34,7 +34,7 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn persist_namespace_version(&self, version: i64) -> MetaResult<()> {
         if version < 0 {
             return Ok(());
@@ -70,7 +70,7 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn persist_replay_position(
         &self,
         outcome: &super::RemoteReplayApplyOutcome,
@@ -89,7 +89,7 @@ impl PgMetaEngine {
 
     pub(super) fn write_replay_position_in_txn(
         &self,
-        txn: &RedbWriteTransaction<'_>,
+        txn: &redb::WriteTransaction,
         outcome: &super::RemoteReplayApplyOutcome,
     ) -> MetaResult<()> {
         let positions = [
@@ -107,23 +107,18 @@ impl PgMetaEngine {
                 outcome.flushed_event_seq,
             ),
         ];
-        for (name, value) in positions {
-            let Some(value) = value else {
-                continue;
-            };
-            let current = RedbMetaEngine::get_counter_in_txn(txn, name)?;
-            if value > current {
-                RedbMetaEngine::set_counter_in_txn(txn, name, value)?;
-            }
-        }
-        Ok(())
+        RedbMetaEngine::update_counters_in_txn(txn, &positions)
     }
 
     pub(super) fn publish_replay_position(&self, outcome: &super::RemoteReplayApplyOutcome) {
-        self.local_version
-            .fetch_max(outcome.max_version, Ordering::SeqCst);
-        self.namespace_version
-            .fetch_max(outcome.max_namespace_version, Ordering::SeqCst);
+        if outcome.max_version >= 0 {
+            self.local_version
+                .fetch_max(outcome.max_version, Ordering::SeqCst);
+        }
+        if outcome.max_namespace_version >= 0 {
+            self.namespace_version
+                .fetch_max(outcome.max_namespace_version, Ordering::SeqCst);
+        }
         if let Some(flushed_event_seq) = outcome.flushed_event_seq {
             self.flushed_event_seq
                 .fetch_max(flushed_event_seq, Ordering::SeqCst);

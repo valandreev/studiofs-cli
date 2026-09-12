@@ -518,30 +518,27 @@ impl RedbWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
-    pub(crate) fn get_counter_in_txn(
-        txn: &RedbWriteTransaction<'_>,
-        name: &str,
-    ) -> MetaResult<u64> {
-        let table = txn
-            .open_table(COUNTERS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(table
-            .get(name)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .map_or(0, |value| value.value()))
-    }
-
-    pub(crate) fn set_counter_in_txn(
-        txn: &RedbWriteTransaction<'_>,
-        name: &str,
-        value: u64,
+    pub(crate) fn update_counters_in_txn(
+        txn: &WriteTransaction,
+        positions: &[(&str, Option<u64>)],
     ) -> MetaResult<()> {
         let mut table = txn
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        table
-            .insert(name, value)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for &(name, value) in positions {
+            let Some(value) = value else {
+                continue;
+            };
+            let current = table
+                .get(name)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map_or(0, |stored| stored.value());
+            if value > current {
+                table
+                    .insert(name, value)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
         Ok(())
     }
 

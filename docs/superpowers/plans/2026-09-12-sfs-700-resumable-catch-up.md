@@ -18,7 +18,10 @@ After this change, a PostgreSQL-backed client that catches up through several bo
 - [x] (2026-09-12) Ran the focused replay, replication, paging, and replay-position tests, formatting, check, clippy, diff validation, and final diff inspection.
 - [x] (2026-09-12) Committed all intended SFS-700 files as `8aa77f12` with `fix: persist pg catch-up progress atomically`.
 - [x] (2026-09-12) Applied the two verified review simplifications and reran the target checks.
-- [x] (2026-09-12) Committed the review simplifications as `7e1d5c71` with `refactor: trim replay wrapper complexity`.
+- [x] (2026-09-12) Committed the review simplifications as `7c114577` with `refactor: trim replay wrapper complexity`.
+- [x] (2026-09-12) Verified the supplied SFS-700 review against current code and addressed its layout-test contract, empty-page fast path, counter-table reuse, borrow lint, iterator/clone, rollback-test, test-only-wrapper, pre-encoding, version-guard, and transaction-reference recommendations.
+- [x] (2026-09-12) Added production-orchestration failure and empty-page regressions; focused replay, layout, check, clippy, formatting, and diff validation pass.
+- [x] (2026-09-12) Committed the review fixes in a dedicated commit with `fix: address sfs-700 review feedback`.
 
 ## Surprises & Discoveries
 
@@ -26,6 +29,7 @@ After this change, a PostgreSQL-backed client that catches up through several bo
 - `RedbWriteTransaction` already owns the writer lock and invalidation publication, and its `Deref<Target = redb::WriteTransaction>` lets existing transaction helpers be reused. The missing piece is passing that transaction through replay rather than starting a new transaction in each public helper.
 - Existing transaction-aware redb helpers use the write snapshot for merged reads (`get_attr_merged_in_write_txn`, `lookup_merged_in_write_txn`, and chunk-state helpers). These are required because later batches in one page must see earlier batches before the page commits.
 - The ponytail review identified the blanket dead-code allowance on `RemoteApplyCoordinator` and repeated counter monotonic-write blocks as removable complexity. The `_in_txn` variants themselves remain required composition seams; replacing them with a generic abstraction would add indirection to a single transactional path.
+- The SFS-700 review's stale layout assertion still described the pre-atomic `persist_replay_position` call; the test now checks the split write-in-transaction and post-commit publication contract. The review's dead-code item was already completed by the preceding cleanup commit, while the remaining test-only wrappers are now explicitly `cfg(test)`.
 
 ## Decision Log
 
@@ -44,11 +48,11 @@ After this change, a PostgreSQL-backed client that catches up through several bo
 
 ## Outcomes & Retrospective
 
-Implemented the SFS-700 page durability boundary in `studiofs-meta`. A complete decoded PostgreSQL page now applies base, serving, auxiliary, reconciliation, and replay-position state through one `RedbWriteTransaction`; atomics publish only after the commit succeeds. An aborted-page regression proves the mutation and cursor do not persist, while the committed-page/reopen regression proves the next page resumes after the persisted version.
+Implemented the SFS-700 page durability boundary in `studiofs-meta`. A complete decoded PostgreSQL page now applies base, serving, auxiliary, reconciliation, and replay-position state through one `RedbWriteTransaction`; atomics publish only after the commit succeeds. Aborted and production-orchestration failure regressions prove mutation and cursor state do not persist, while the committed-page/reopen regression proves the next page resumes after the persisted version. Empty pages return before the write-transaction path and do not advance replay state.
 
-Changed files are the page orchestration and cursor code in `pg_engine`, the transaction-aware redb replication/read helpers, the focused replay tests, and this plan. Validation passed: `cargo test -p studiofs-meta remote_apply --lib -- --nocapture` (`65 passed, 44 ignored`), `cargo test -p studiofs-meta replication --lib` (`29 passed, 1 ignored`), `cargo test -p studiofs-meta metadata_paging --lib` (`5 passed, 6 ignored`), `cargo test -p studiofs-meta replay_position --lib` (`1 passed`), `cargo test -p studiofs-meta replica --lib` (`53 passed, 1 ignored`), `cargo fmt --all -- --check`, `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, and `git diff --check`. The PostgreSQL ignored tests and native FUSE/WinFSP mounted acceptance were not run because they are outside the available metadata-only validation environment.
+Changed files are the page orchestration and cursor code in `pg_engine`, the transaction-aware redb replication/read helpers, the focused replay tests, and this plan. Review follow-up validation passed: `cargo test -p studiofs-meta failed_replay_page_does_not_persist_state_or_cursor --lib` (`1 passed`), `cargo test -p studiofs-meta empty_replay_page_returns_without_advancing_replay_state --lib` (`1 passed`), `cargo test -p studiofs-meta remote_apply --lib` (`67 passed, 44 ignored`), `cargo test -p studiofs-meta --test pg_engine_test_layout` (`3 passed`), `cargo test -p studiofs-meta replay_position --lib` (`1 passed`), `cargo fmt --all -- --check`, `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, and `git diff --check`. The PostgreSQL ignored tests and native FUSE/WinFSP mounted acceptance were not run because they are outside the available metadata-only validation environment.
 
-Ponytail review outcome: the blanket dead-code allowance and 11 unused production wrappers were removed, test-only compatibility wrappers were marked `cfg(test)`, and the three repeated counter updates were reduced to one monotonic loop. The transactional helper duplication remains justified by the existing public/test APIs and the required single-transaction composition.
+Ponytail and SFS-700 review outcome: the blanket dead-code allowance and 11 unused production wrappers were removed, test-only compatibility wrappers were marked `cfg(test)`, the three repeated counter updates were reduced to one monotonic loop over one opened table, needless transaction borrows and redundant event clones/allocations were removed, and self-batch remote events are encoded once. The transactional helper duplication remains justified by the existing public/test APIs and the required single-transaction composition.
 
 ## Context and Orientation
 
