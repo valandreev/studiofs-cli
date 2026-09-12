@@ -1,6 +1,7 @@
 //! Platform-neutral cache scopes produced by committed metadata changes.
 
 use crate::types::Ino;
+use std::collections::HashSet;
 
 /// A conservative scope whose cached view may no longer match local metadata.
 /// These are advisory notifications, never instructions to discard dirty writes.
@@ -52,11 +53,15 @@ const MAX_INVALIDATION_BYTES: usize = 1024 * 1024;
 pub(crate) struct PendingInvalidations {
     intents: Vec<InvalidationIntent>,
     bytes: usize,
+    seen: HashSet<InvalidationIntent>,
 }
 
 impl PendingInvalidations {
     pub(crate) fn push(&mut self, intent: InvalidationIntent) {
         if matches!(self.intents.first(), Some(InvalidationIntent::Reset)) {
+            return;
+        }
+        if self.seen.contains(&intent) {
             return;
         }
         let bytes = std::mem::size_of::<InvalidationIntent>()
@@ -79,10 +84,13 @@ impl PendingInvalidations {
             || bytes > MAX_INVALIDATION_BYTES.saturating_sub(self.bytes)
         {
             self.intents.clear();
-            self.intents.push(InvalidationIntent::Reset);
             self.bytes = 0;
+            self.seen.clear();
+            self.intents.push(InvalidationIntent::Reset);
+            self.seen.insert(InvalidationIntent::Reset);
         } else {
             self.bytes += bytes;
+            self.seen.insert(intent.clone());
             self.intents.push(intent);
         }
     }

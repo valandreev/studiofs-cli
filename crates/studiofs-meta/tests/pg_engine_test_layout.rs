@@ -81,20 +81,32 @@ fn pg_engine_data_path_modules_document_private_ownership_boundaries() {
 }
 
 #[test]
-fn metadata_sync_uses_one_local_replay_position_helper() {
+fn metadata_sync_delegates_atomic_replay_position_to_local_state() {
     let src_dir = pg_engine_src_dir();
     let local_state =
         fs::read_to_string(src_dir.join("local_state.rs")).expect("read local_state module");
     assert!(
-        local_state.contains("fn persist_replay_position("),
-        "local_state.rs should own replay version/counter advancement as one helper"
+        local_state.contains("fn write_replay_position_in_txn("),
+        "local_state.rs should own atomic replay counter writes"
+    );
+    assert!(
+        local_state.contains("fn publish_replay_position("),
+        "local_state.rs should own post-commit replay position publication"
     );
 
     let metadata_sync =
         fs::read_to_string(src_dir.join("metadata_sync.rs")).expect("read metadata_sync module");
     assert!(
-        metadata_sync.contains("self.persist_replay_position(&outcome)?"),
-        "metadata_sync.rs should delegate replay version/counter advancement to local_state.rs"
+        metadata_sync.contains("Self::write_replay_position_in_txn(&txn, &outcome)"),
+        "metadata_sync.rs should delegate atomic replay counter writes to local_state.rs"
+    );
+    assert!(
+        metadata_sync.contains("self.publish_replay_position(&outcome)"),
+        "metadata_sync.rs should delegate post-commit replay publication to local_state.rs"
+    );
+    assert!(
+        !metadata_sync.contains("self.persist_replay_position("),
+        "metadata_sync.rs should not use the obsolete non-atomic replay helper"
     );
     for direct_call in [
         "self.persist_local_version(",

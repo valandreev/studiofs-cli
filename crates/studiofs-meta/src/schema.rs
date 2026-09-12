@@ -554,7 +554,7 @@ impl SetattrArgs {
 ///
 /// Key: (parent_ino, name_hash) for O(1) lookup by path component.
 /// Name is not stored here - it's part of the key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntryValue {
     /// Inode number of the child.
     pub ino: Ino,

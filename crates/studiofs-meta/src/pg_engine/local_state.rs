@@ -34,6 +34,7 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn persist_namespace_version(&self, version: i64) -> MetaResult<()> {
         if version < 0 {
             return Ok(());
@@ -69,6 +70,7 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn persist_replay_position(
         &self,
         outcome: &super::RemoteReplayApplyOutcome,
@@ -83,6 +85,43 @@ impl PgMetaEngine {
             self.persist_flushed_event_seq(flushed_event_seq)?;
         }
         Ok(())
+    }
+
+    pub(super) fn write_replay_position_in_txn(
+        txn: &redb::WriteTransaction,
+        outcome: &super::RemoteReplayApplyOutcome,
+    ) -> MetaResult<()> {
+        let positions = [
+            (
+                LOCAL_PG_VERSION_COUNTER,
+                (outcome.max_version >= 0).then_some(outcome.max_version as u64),
+            ),
+            (
+                LOCAL_PG_NAMESPACE_VERSION_COUNTER,
+                (outcome.max_namespace_version >= 0)
+                    .then_some(outcome.max_namespace_version as u64),
+            ),
+            (
+                LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
+                outcome.flushed_event_seq,
+            ),
+        ];
+        RedbMetaEngine::update_counters_in_txn(txn, &positions)
+    }
+
+    pub(super) fn publish_replay_position(&self, outcome: &super::RemoteReplayApplyOutcome) {
+        if outcome.max_version >= 0 {
+            self.local_version
+                .fetch_max(outcome.max_version, Ordering::SeqCst);
+        }
+        if outcome.max_namespace_version >= 0 {
+            self.namespace_version
+                .fetch_max(outcome.max_namespace_version, Ordering::SeqCst);
+        }
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            self.flushed_event_seq
+                .fetch_max(flushed_event_seq, Ordering::SeqCst);
+        }
     }
 
     pub(super) fn has_any_local_overlay_mutation(local: &RedbMetaEngine) -> MetaResult<bool> {

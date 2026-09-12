@@ -582,7 +582,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn lookup_merged_in_write_txn(
+    pub(crate) fn lookup_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -643,7 +643,7 @@ impl RedbMetaEngine {
         })
     }
 
-    pub(super) fn get_attr_merged_in_write_txn(
+    pub(crate) fn get_attr_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<InodeAttr> {

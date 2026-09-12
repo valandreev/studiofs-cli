@@ -10,9 +10,9 @@ use redb::{
     Database, Durability, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
     TableDefinition, WriteTransaction,
 };
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::Path;
@@ -518,6 +518,31 @@ impl RedbWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn update_counters_in_txn(
+        txn: &WriteTransaction,
+        positions: &[(&str, Option<u64>)],
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for &(name, value) in positions {
+            let Some(value) = value else {
+                continue;
+            };
+            let stored = table
+                .get(name)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let stored_value = stored.map(|stored| stored.value());
+            let should_insert = stored_value.is_none_or(|stored| value > stored);
+            if should_insert {
+                table
+                    .insert(name, value)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn seal_relaxed_durability_for_close(&self) {
         if let Some(runtime) = &self.relaxed_durability {
             runtime.state.force_immediate.store(true, Ordering::Release);

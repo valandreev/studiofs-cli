@@ -687,7 +687,7 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity((end_seq - start_seq).min(1024) as usize);
         for row in table
             .range(start_seq..end_seq)
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -695,6 +695,28 @@ impl RedbMetaEngine {
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let ev = crate::events::decode_event(bytes.value())?;
             out.push(ev);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn read_events_range_in_write_txn(
+        txn: &redb::WriteTransaction,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> MetaResult<Vec<crate::events::MetaEvent>> {
+        if end_seq <= start_seq {
+            return Ok(Vec::new());
+        }
+        let table = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .range(start_seq..end_seq)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            out.push(crate::events::decode_event(bytes.value())?);
         }
         Ok(out)
     }
@@ -708,9 +730,18 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        Self::apply_replica_aux_state_in_txn(&txn, events.iter())?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
 
+    pub(crate) fn apply_replica_aux_state_in_txn<'event>(
+        txn: &RedbWriteTransaction<'_>,
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
+    ) -> MetaResult<()> {
         for event in events {
-            Self::invalidate_replica_event(&txn, event)?;
+            Self::invalidate_replica_event(txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { .. } => {}
                 crate::events::MetaEvent::RemoveAttr { ino } => {
@@ -741,7 +772,7 @@ impl RedbMetaEngine {
                         let _ = xattrs.remove(key.as_slice());
                     }
 
-                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
+                    Self::clear_regular_file_graph_in_txn(txn, *ino)?;
                 }
                 crate::events::MetaEvent::AddEntry { .. } => {}
                 crate::events::MetaEvent::RemoveEntry { .. } => {}
@@ -749,7 +780,7 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                     for (chunk_id, slices) in chunk_slices {
                         Self::set_regular_file_chunk_state_in_txn(
-                            &txn,
+                            txn,
                             REGULAR_FILE_BASE_TABLE,
                             false,
                             *ino,
@@ -759,11 +790,11 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { ino } => {
-                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
+                    Self::clear_regular_file_graph_in_txn(txn, *ino)?;
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
                     Self::merge_regular_file_base_publish_in_txn(
-                        &txn,
+                        txn,
                         *ino,
                         chunk_slices.as_slice(),
                         false,
@@ -781,7 +812,7 @@ impl RedbMetaEngine {
                     ino, name, value, ..
                 } => {
                     Self::set_xattr_value_in_table_in_txn(
-                        &txn,
+                        txn,
                         BASE_XATTRS_TABLE,
                         *ino,
                         name,
@@ -835,8 +866,6 @@ impl RedbMetaEngine {
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -867,9 +896,23 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        Self::apply_replica_events_to_base_in_txn(
+            &txn,
+            events.iter(),
+            protected_regular_file_inodes,
+        )?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
 
+    pub(crate) fn apply_replica_events_to_base_in_txn<'event>(
+        txn: &RedbWriteTransaction<'_>,
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
+        protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<()> {
         for event in events {
-            Self::invalidate_replica_event(&txn, event)?;
+            Self::invalidate_replica_event(txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
                     let data = encode(attr)?;
@@ -881,7 +924,7 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
-                    Self::remove_base_dentries_for_inode_in_txn(&txn, *ino)?;
+                    Self::remove_base_dentries_for_inode_in_txn(txn, *ino)?;
 
                     let mut table = txn
                         .open_table(BASE_INODES_TABLE)
@@ -941,10 +984,10 @@ impl RedbMetaEngine {
                     name,
                     entry,
                 } => {
-                    Self::set_base_dentry_in_txn(&txn, *parent, name, entry)?;
+                    Self::set_base_dentry_in_txn(txn, *parent, name, entry)?;
                 }
                 crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    Self::remove_base_dentry_in_txn(&txn, *parent, name)?;
+                    Self::remove_base_dentry_in_txn(txn, *parent, name)?;
                 }
                 crate::events::MetaEvent::RenameEntry {
                     parent,
@@ -959,13 +1002,13 @@ impl RedbMetaEngine {
                     new_parent_attr,
                 } => {
                     let src_matches =
-                        Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, *parent, name)?
+                        Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, *parent, name)?
                             .map(|current| current.ino == entry.ino && current.kind == entry.kind)
                             .unwrap_or(false);
                     if src_matches {
-                        Self::remove_base_dentry_in_txn(&txn, *parent, name)?;
+                        Self::remove_base_dentry_in_txn(txn, *parent, name)?;
                     } else {
-                        let prior_keys = Self::base_dentry_keys_for_rename_entry(&txn, entry)?;
+                        let prior_keys = Self::base_dentry_keys_for_rename_entry(txn, entry)?;
                         if prior_keys.len() > 1 {
                             tracing::warn!(
                                 ino = entry.ino,
@@ -978,11 +1021,11 @@ impl RedbMetaEngine {
                             );
                         } else if let Some(prior_key) = prior_keys.first() {
                             let (prior_parent, prior_name) = decode_dentry_key(prior_key)?;
-                            Self::remove_base_dentry_in_txn(&txn, prior_parent, prior_name)?;
+                            Self::remove_base_dentry_in_txn(txn, prior_parent, prior_name)?;
                         }
                     }
-                    Self::remove_base_dentry_in_txn(&txn, *new_parent, new_name)?;
-                    Self::set_base_dentry_in_txn(&txn, *new_parent, new_name, entry)?;
+                    Self::remove_base_dentry_in_txn(txn, *new_parent, new_name)?;
+                    Self::set_base_dentry_in_txn(txn, *new_parent, new_name, entry)?;
 
                     let mut inodes = txn
                         .open_table(BASE_INODES_TABLE)
@@ -1027,7 +1070,7 @@ impl RedbMetaEngine {
                     ino, name, value, ..
                 } => {
                     Self::set_xattr_value_in_table_in_txn(
-                        &txn,
+                        txn,
                         BASE_XATTRS_TABLE,
                         *ino,
                         name,
@@ -1064,7 +1107,7 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                     for (chunk_id, slices) in chunk_slices {
                         Self::set_regular_file_chunk_state_in_txn(
-                            &txn,
+                            txn,
                             REGULAR_FILE_BASE_TABLE,
                             false,
                             *ino,
@@ -1075,7 +1118,7 @@ impl RedbMetaEngine {
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
                     Self::merge_regular_file_base_publish_in_txn(
-                        &txn,
+                        txn,
                         *ino,
                         chunk_slices.as_slice(),
                         protected_regular_file_inodes.contains(ino),
@@ -1087,8 +1130,6 @@ impl RedbMetaEngine {
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -1108,13 +1149,6 @@ impl RedbMetaEngine {
         self.apply_replica_serving_state_inner(events, true)
     }
 
-    pub(crate) fn apply_replica_serving_state_for_protected_attr_merges(
-        &self,
-        events: &[crate::events::MetaEvent],
-    ) -> MetaResult<()> {
-        self.apply_replica_serving_state_inner(events, false)
-    }
-
     fn apply_replica_serving_state_inner(
         &self,
         events: &[crate::events::MetaEvent],
@@ -1125,12 +1159,23 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        Self::apply_replica_serving_state_in_txn(&txn, events, reject_stale_ready_growth)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
 
+    pub(crate) fn apply_replica_serving_state_in_txn<E: Borrow<crate::events::MetaEvent>>(
+        txn: &RedbWriteTransaction<'_>,
+        events: &[E],
+        reject_stale_ready_growth: bool,
+    ) -> MetaResult<()> {
         for event in events {
-            Self::invalidate_replica_event(&txn, event)?;
+            let event = event.borrow();
+            Self::invalidate_replica_event(txn, event)?;
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
-                    let current = match Self::get_attr_merged_in_write_txn(&txn, attr.ino) {
+                    let current = match Self::get_attr_merged_in_write_txn(txn, attr.ino) {
                         Ok(current) => Some(current),
                         Err(MetaError::InodeNotFound(_)) => None,
                         Err(err) => return Err(err),
@@ -1163,7 +1208,7 @@ impl RedbMetaEngine {
                         && attr.size > current.size
                         && ((attr.mtime < current.mtime && attr.ctime < current.ctime)
                             || !Self::ready_regular_file_growth_has_payload(
-                                events,
+                                events.iter().map(Borrow::borrow),
                                 attr.ino,
                                 current.size,
                                 attr.size,
@@ -1172,9 +1217,9 @@ impl RedbMetaEngine {
                         continue;
                     }
                     if let Some(base_attr) =
-                        Self::stale_ready_regular_file_base_attr_in_txn(&txn, attr)?
+                        Self::stale_ready_regular_file_base_attr_in_txn(txn, attr)?
                     {
-                        let current = Self::get_attr_merged_in_write_txn(&txn, attr.ino)?;
+                        let current = Self::get_attr_merged_in_write_txn(txn, attr.ino)?;
                         let current_is_newer = current.content_epoch > attr.content_epoch
                             || (current.content_epoch == attr.content_epoch
                                 && current.size > attr.size);
@@ -1190,32 +1235,32 @@ impl RedbMetaEngine {
                             && (current_matches_ready_attr
                                 || (attr.mtime > base_attr.mtime && attr.ctime > base_attr.ctime));
                         if !current_is_newer && !skip_stale_base {
-                            Self::set_inode_mirror_in_txn(&txn, &base_attr)?;
-                            Self::clear_regular_file_serving_overlay_in_txn(&txn, attr.ino)?;
+                            Self::set_inode_mirror_in_txn(txn, &base_attr)?;
+                            Self::clear_regular_file_serving_overlay_in_txn(txn, attr.ino)?;
                         }
                         continue;
                     }
-                    Self::set_inode_mirror_in_txn(&txn, attr)?;
-                    if Self::ready_regular_file_attr_can_follow_base_in_txn(&txn, attr)? {
-                        Self::clear_regular_file_serving_overlay_in_txn(&txn, attr.ino)?;
+                    Self::set_inode_mirror_in_txn(txn, attr)?;
+                    if Self::ready_regular_file_attr_can_follow_base_in_txn(txn, attr)? {
+                        Self::clear_regular_file_serving_overlay_in_txn(txn, attr.ino)?;
                     }
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
-                    Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
-                    Self::remove_inode_mirror_in_txn(&txn, *ino)?;
-                    Self::remove_symlink_mirror_in_txn(&txn, *ino)?;
+                    Self::remove_dentry_mirrors_for_inode_in_txn(txn, *ino)?;
+                    Self::remove_inode_mirror_in_txn(txn, *ino)?;
+                    Self::remove_symlink_mirror_in_txn(txn, *ino)?;
 
                     let current_keys =
-                        Self::keys_for_inode_in_write_table(&txn, XATTRS_TABLE, *ino)?;
+                        Self::keys_for_inode_in_write_table(txn, XATTRS_TABLE, *ino)?;
                     for key in current_keys {
                         let name = xattr_name_from_key(&key).to_vec();
-                        Self::remove_xattr_mirror_in_txn(&txn, *ino, &name)?;
+                        Self::remove_xattr_mirror_in_txn(txn, *ino, &name)?;
                     }
                     let base_keys =
-                        Self::keys_for_inode_in_write_table(&txn, BASE_XATTRS_TABLE, *ino)?;
+                        Self::keys_for_inode_in_write_table(txn, BASE_XATTRS_TABLE, *ino)?;
                     for key in base_keys {
                         let name = xattr_name_from_key(&key).to_vec();
-                        Self::remove_xattr_mirror_in_txn(&txn, *ino, &name)?;
+                        Self::remove_xattr_mirror_in_txn(txn, *ino, &name)?;
                     }
 
                     let prefix = acl_rule_prefix(*ino);
@@ -1238,18 +1283,18 @@ impl RedbMetaEngine {
                     for key in acl_rule_keys {
                         let _ = acl_rules.remove(key.as_slice());
                     }
-                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
-                    Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
+                    Self::clear_regular_file_graph_in_txn(txn, *ino)?;
+                    Self::clear_regular_file_serving_overlay_in_txn(txn, *ino)?;
                 }
                 crate::events::MetaEvent::AddEntry {
                     parent,
                     name,
                     entry,
                 } => {
-                    Self::set_dentry_mirror_in_txn(&txn, *parent, name, entry)?;
+                    Self::set_dentry_mirror_in_txn(txn, *parent, name, entry)?;
                 }
                 crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    Self::remove_dentry_overlay_in_txn(&txn, *parent, name)?;
+                    Self::remove_dentry_overlay_in_txn(txn, *parent, name)?;
                 }
                 crate::events::MetaEvent::RenameEntry {
                     parent,
@@ -1264,7 +1309,7 @@ impl RedbMetaEngine {
                     new_parent_attr,
                 } => {
                     Self::reconcile_serving_rename_from_base_in_txn(
-                        &txn,
+                        txn,
                         *parent,
                         name,
                         *new_parent,
@@ -1273,31 +1318,31 @@ impl RedbMetaEngine {
                     )?;
 
                     if let Some(attr) = displaced_set_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                        Self::set_inode_mirror_in_txn(txn, attr)?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
-                        Self::remove_inode_mirror_in_txn(&txn, *ino)?;
+                        Self::remove_inode_mirror_in_txn(txn, *ino)?;
                     }
                     if let Some(attr) = moved_dir_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                        Self::set_inode_mirror_in_txn(txn, attr)?;
                     }
                     if let Some(attr) = old_parent_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                        Self::set_inode_mirror_in_txn(txn, attr)?;
                     }
                     if let Some(attr) = new_parent_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                        Self::set_inode_mirror_in_txn(txn, attr)?;
                     }
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
-                    Self::set_symlink_mirror_in_txn(&txn, *ino, target)?;
+                    Self::set_symlink_mirror_in_txn(txn, *ino, target)?;
                 }
                 crate::events::MetaEvent::SetXattr {
                     ino, name, value, ..
                 } => {
-                    Self::set_xattr_mirror_in_txn(&txn, *ino, name, value)?;
+                    Self::set_xattr_mirror_in_txn(txn, *ino, name, value)?;
                 }
                 crate::events::MetaEvent::RemoveXattr { ino, name } => {
-                    Self::remove_xattr_mirror_in_txn(&txn, *ino, name)?;
+                    Self::remove_xattr_mirror_in_txn(txn, *ino, name)?;
                 }
                 crate::events::MetaEvent::SetAclRule {
                     ino,
@@ -1331,7 +1376,7 @@ impl RedbMetaEngine {
                 }
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                     let mut current = Self::regular_file_chunk_states_for_inode_in_write_txn(
-                        &txn,
+                        txn,
                         REGULAR_FILE_OVERLAY_TABLE,
                         *ino,
                     )?;
@@ -1346,7 +1391,7 @@ impl RedbMetaEngine {
                             }
                         }
                         let next = Self::set_regular_file_chunk_state_in_txn(
-                            &txn,
+                            txn,
                             REGULAR_FILE_OVERLAY_TABLE,
                             true,
                             *ino,
@@ -1361,8 +1406,8 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
-                    if Self::serving_overlay_can_follow_base_publish_in_txn(&txn, *ino)? {
-                        Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
+                    if Self::serving_overlay_can_follow_base_publish_in_txn(txn, *ino)? {
+                        Self::clear_regular_file_serving_overlay_in_txn(txn, *ino)?;
                     }
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
@@ -1371,8 +1416,6 @@ impl RedbMetaEngine {
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -1399,31 +1442,54 @@ impl RedbMetaEngine {
         if inodes.is_empty() {
             return Ok(false);
         }
-        #[cfg(test)]
-        REGULAR_FILE_SERVING_RECONCILE_CALLS
-            .set(REGULAR_FILE_SERVING_RECONCILE_CALLS.get().saturating_add(1));
-
         let txn = self.begin_write_txn()?;
+        let changed =
+            Self::reconcile_regular_file_serving_from_base_with_protected_dentries_in_txn(
+                &txn,
+                inodes,
+                protected_dentry_keys,
+            )?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(changed)
+    }
+
+    pub(crate) fn reconcile_regular_file_serving_from_base_with_protected_dentries_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        inodes: &HashSet<Ino>,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
+    ) -> MetaResult<bool> {
+        if inodes.is_empty() {
+            return Ok(false);
+        }
         let mut changed = false;
+        let base_attrs = {
+            let base = txn
+                .open_table(BASE_INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            inodes
+                .iter()
+                .map(|ino| {
+                    let attr = base
+                        .get(*ino)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|value| decode::<InodeAttr>(value.value()))
+                        .transpose()?;
+                    Ok((*ino, attr))
+                })
+                .collect::<MetaResult<HashMap<Ino, Option<InodeAttr>>>>()?
+        };
 
         for ino in inodes {
-            Self::invalidate_replica_inode(&txn, *ino, false)?;
-            let base_attr = {
-                let base = txn
-                    .open_table(BASE_INODES_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                base.get(*ino)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                    .map(|value| decode::<InodeAttr>(value.value()))
-                    .transpose()?
-            };
+            Self::invalidate_replica_inode(txn, *ino, false)?;
+            let base_attr = base_attrs.get(ino).and_then(|attr| attr.as_ref());
 
             match base_attr {
                 Some(attr) if attr.kind == FileType::RegularFile => {
-                    let content_changed = Self::replica_content_identity_changed(&txn, &attr)?;
-                    Self::set_inode_mirror_in_txn(&txn, &attr)?;
+                    let content_changed = Self::replica_content_identity_changed(txn, attr)?;
+                    Self::set_inode_mirror_in_txn(txn, attr)?;
                     Self::remove_stale_dentries_for_base_entry(
-                        &txn,
+                        txn,
                         &DirEntryValue {
                             ino: *ino,
                             kind: attr.kind,
@@ -1431,35 +1497,39 @@ impl RedbMetaEngine {
                         protected_dentry_keys,
                     )?;
                     Self::install_base_dentries_for_entry_in_txn(
-                        &txn,
+                        txn,
                         &DirEntryValue {
                             ino: *ino,
                             kind: attr.kind,
                         },
                         protected_dentry_keys,
                     )?;
-                    Self::invalidate_replica_inode(&txn, *ino, content_changed)?;
+                    Self::invalidate_replica_inode(txn, *ino, content_changed)?;
                     if attr.upload_state == UploadState::Ready
                         && attr.content_epoch == attr.committed_content_epoch
                         && attr.size == attr.committed_size
                     {
-                        Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
+                        Self::clear_regular_file_serving_overlay_in_txn(txn, *ino)?;
                     }
                     changed = true;
                 }
                 Some(_) => {}
                 None => {
-                    Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
-                    Self::remove_inode_mirror_in_txn(&txn, *ino)?;
-                    Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
+                    Self::remove_dentry_mirrors_for_inode_in_txn(txn, *ino)?;
+                    Self::remove_inode_mirror_in_txn(txn, *ino)?;
+                    Self::clear_regular_file_serving_overlay_in_txn(txn, *ino)?;
                     changed = true;
                 }
             }
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_regular_file_serving_reconcile_call_for_test() {
+        REGULAR_FILE_SERVING_RECONCILE_CALLS
+            .set(REGULAR_FILE_SERVING_RECONCILE_CALLS.get().saturating_add(1));
     }
 
     /// Reconcile exact dentry keys from the authoritative base namespace into
@@ -1474,31 +1544,57 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        let changed = Self::reconcile_serving_dentries_from_base_in_txn(
+            &txn,
+            dentry_keys,
+            protected_dentry_keys,
+        )?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(changed)
+    }
+
+    pub(crate) fn reconcile_serving_dentries_from_base_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        dentry_keys: &HashSet<Vec<u8>>,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
+    ) -> MetaResult<bool> {
+        if dentry_keys.is_empty() {
+            return Ok(false);
+        }
         let mut changed = false;
+        let base_entries = {
+            let base = txn
+                .open_table(BASE_DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            dentry_keys
+                .iter()
+                .map(|key| {
+                    let (parent, name) = decode_dentry_key(key)?;
+                    let entry = Self::lookup_in_opened_dentry_table(&base, parent, name)?;
+                    Ok((key.as_slice(), entry))
+                })
+                .collect::<MetaResult<HashMap<&[u8], Option<DirEntryValue>>>>()?
+        };
 
         for key in dentry_keys {
             if protected_dentry_keys.contains(key) {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
-            Self::invalidate_replica_entry(&txn, parent, name, None)?;
-            let base_entry = {
-                let base = txn
-                    .open_table(BASE_DENTRIES_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                Self::lookup_in_opened_dentry_table(&base, parent, name)?
-            };
+            Self::invalidate_replica_entry(txn, parent, name, None)?;
+            let base_entry = base_entries
+                .get(key.as_slice())
+                .and_then(|entry| entry.as_ref());
             if let Some(entry) = base_entry {
-                Self::set_dentry_mirror_in_txn(&txn, parent, name, &entry)?;
-                Self::invalidate_replica_inode(&txn, entry.ino, false)?;
+                Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
+                Self::invalidate_replica_inode(txn, entry.ino, false)?;
             } else {
-                Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
+                Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
             }
             changed = true;
         }
 
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(changed)
     }
 
@@ -1548,8 +1644,8 @@ impl RedbMetaEngine {
         }
     }
 
-    fn ready_regular_file_growth_has_payload(
-        events: &[crate::events::MetaEvent],
+    fn ready_regular_file_growth_has_payload<'event>(
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
         ino: Ino,
         required_start: u64,
         required_end: u64,
@@ -1644,23 +1740,37 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
-        if entry.kind == FileType::Directory {
-            Self::invalidate_directory_descendants(&txn, entry.ino)?;
-        }
-        Self::invalidate_replica_entry(&txn, parent, name, Some(entry.ino))?;
-        Self::invalidate_replica_entry(&txn, new_parent, new_name, Some(entry.ino))?;
-        Self::invalidate_replica_inode(&txn, entry.ino, false)?;
-
         Self::reconcile_serving_rename_from_base_in_txn(
             &txn, parent, name, new_parent, new_name, entry,
         )?;
-
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    fn reconcile_serving_rename_from_base_in_txn(
+    pub(crate) fn reconcile_serving_rename_from_base_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        if entry.kind == FileType::Directory {
+            Self::invalidate_directory_descendants(txn, entry.ino)?;
+        }
+        Self::invalidate_replica_entry(txn, parent, name, Some(entry.ino))?;
+        Self::invalidate_replica_entry(txn, new_parent, new_name, Some(entry.ino))?;
+        Self::invalidate_replica_inode(txn, entry.ino, false)?;
+
+        Self::reconcile_serving_rename_from_base_in_write_txn(
+            txn, parent, name, new_parent, new_name, entry,
+        )?;
+
+        Ok(())
+    }
+
+    fn reconcile_serving_rename_from_base_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
