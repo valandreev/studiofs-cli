@@ -7,6 +7,7 @@
 //!   cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -159,20 +160,9 @@ fn ensure_pg_schema(dsn: &str) {
             let _ = connection.await;
         });
 
-        client
-            .batch_execute(
-                r#"
-                CREATE TABLE IF NOT EXISTS volumes (
-                    vol BIGSERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    uuid TEXT NOT NULL UNIQUE,
-                    block_size INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                "#,
-            )
+        studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(&client)
             .await
-            .expect("create volumes table");
+            .expect("create StudioFS PostgreSQL schema");
 
         conn_task.abort();
     });
@@ -195,8 +185,36 @@ fn insert_pg_volume(dsn: &str, name: &str) -> (i64, String) {
             )
             .await
             .expect("insert volume");
-        conn_task.abort();
         let vol: i64 = row.get(0);
+        let metadata_format_version =
+            i16::try_from(CURRENT_FORMAT_VERSION).expect("current format fits PostgreSQL SMALLINT");
+        let empty_checkpoint = Vec::<u8>::new();
+        let checkpoint_sha256 = Sha256::digest(&empty_checkpoint).to_vec();
+        client
+            .execute(
+                r#"
+                INSERT INTO metadata_state (
+                    vol,
+                    metadata_format_version,
+                    version,
+                    checkpoint_version,
+                    snapshot,
+                    checkpoint_sha256,
+                    checkpoint_publication_state,
+                    checkpoint_generation
+                )
+                VALUES ($1, $2, 0, 0, $3, $4, 'published', 1)
+                "#,
+                &[
+                    &vol,
+                    &metadata_format_version,
+                    &empty_checkpoint,
+                    &checkpoint_sha256,
+                ],
+            )
+            .await
+            .expect("seed metadata state");
+        conn_task.abort();
         (vol, uuid)
     })
 }
