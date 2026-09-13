@@ -274,7 +274,6 @@ impl PgMetaEngine {
         let command_timeout = self.command_timeout;
         let volume_id = self.volume_id;
         let owner = owner.to_string();
-        let expected_owner = owner.clone();
         let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
@@ -303,7 +302,7 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        if actual_owner != expected_owner {
+                        if actual_owner != owner {
                             return Err(MetaError::Storage(
                                 "postgres bootstrap checkpoint lease owner changed during claim"
                                     .to_string(),
