@@ -394,6 +394,16 @@ impl MetaError {
     pub fn is_redb_repair_needed(&self) -> bool {
         matches!(self, MetaError::RepairRequired(_))
     }
+
+    /// Returns `true` when the remote metadata source could not be reached or
+    /// a bounded operation against it timed out.
+    #[must_use]
+    pub fn is_reachability_error(&self) -> bool {
+        matches!(
+            self,
+            MetaError::RemoteUnavailable(_) | MetaError::Timeout(_)
+        )
+    }
 }
 
 /// `setxattr` flag: create attribute, fail if key already exists.
@@ -1298,6 +1308,12 @@ pub trait MetaAcl: Send + Sync {
 pub trait MetaReplication: Send + Sync {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).
     fn check_consistency(&self) -> MetaResult<()>;
+
+    /// Verify metadata for mount admission, allowing a known-unreachable
+    /// PostgreSQL source to be handled by local-first startup policy.
+    fn check_consistency_for_mount_admission(&self) -> MetaResult<()> {
+        self.check_consistency()
+    }
 
     /// Flush pending metadata mutations to remote store (if any).
     fn flush_metadata(&self) -> MetaResult<()>;

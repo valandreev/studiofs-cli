@@ -897,25 +897,24 @@ fn metadata_notify_start_skips_start_lock_when_already_registered() {
 }
 
 #[test]
-fn postgres_startup_fallback_keeps_timeout_typed() {
-    assert!(PgMetaEngine::is_postgres_unavailable(
-        &MetaError::RemoteUnavailable("connection refused".to_string())
-    ));
-    assert!(!PgMetaEngine::is_postgres_unavailable(&MetaError::Storage(
-        "postgres connect failed: error connecting to server".to_string()
-    )));
+fn postgres_startup_reachability_classification_keeps_timeout_typed() {
+    assert!(MetaError::RemoteUnavailable("connection refused".to_string()).is_reachability_error());
+    assert!(
+        !MetaError::Storage("postgres connect failed: error connecting to server".to_string())
+            .is_reachability_error()
+    );
     let connection_timeout = PgMetaEngine::pg_timeout_error(
         PgTimeoutContext::Connection("validate postgres schema connect"),
         Duration::from_millis(10),
     );
-    assert!(!PgMetaEngine::is_postgres_unavailable(&connection_timeout));
+    assert!(connection_timeout.is_reachability_error());
     assert!(matches!(connection_timeout, MetaError::Timeout(_)));
 
     let command_timeout = PgMetaEngine::pg_timeout_error(
         PgTimeoutContext::Command("validate postgres schema"),
         Duration::from_millis(10),
     );
-    assert!(!PgMetaEngine::is_postgres_unavailable(&command_timeout));
+    assert!(command_timeout.is_reachability_error());
     assert!(matches!(command_timeout, MetaError::Timeout(_)));
 }
 
@@ -1183,7 +1182,7 @@ fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
 }
 
 #[test]
-fn consistency_check_short_circuits_after_startup_remote_transport_failure() {
+fn mount_admission_consistency_check_short_circuits_after_startup_remote_transport_failure() {
     let (_dir, mut engine) = temp_pg_engine_for_unit();
     engine
         .remote_transport_unavailable
@@ -1199,13 +1198,58 @@ fn consistency_check_short_circuits_after_startup_remote_transport_failure() {
     );
 
     let error = engine
-        .check_consistency()
+        .check_consistency_for_mount_admission()
         .expect_err("known startup transport failure should defer identity probing");
     assert!(matches!(
         error,
         MetaError::RemoteUnavailable(message)
-            if message == "remote PostgreSQL transport unavailable during startup"
+            if message == "remote PostgreSQL transport is currently unavailable"
     ));
+}
+
+#[test]
+fn regular_consistency_check_retries_after_startup_remote_transport_failure() {
+    let (_dir, mut engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_transport_unavailable
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.command_timeout = Duration::from_millis(1);
+    engine.command_pool = Arc::new(
+        PgConnectionPool::new(
+            "postgres://127.0.0.1:1/studiofs".to_string(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        )
+        .expect("non-zero command pool size"),
+    );
+
+    let error = engine
+        .check_consistency()
+        .expect_err("regular consistency checks must retry remote identity probing");
+    assert!(!matches!(
+        error,
+        MetaError::RemoteUnavailable(message)
+            if message == "remote PostgreSQL transport is currently unavailable"
+    ));
+}
+
+#[test]
+fn successful_remote_operation_clears_transport_unavailable() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_transport_unavailable
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    engine
+        .record_remote_operation_result::<()>(Ok(()))
+        .expect("successful remote operation");
+
+    assert!(
+        !engine
+            .remote_transport_unavailable
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 }
 
 #[test]

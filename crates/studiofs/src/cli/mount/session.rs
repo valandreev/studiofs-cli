@@ -1869,7 +1869,11 @@ fn read_live_mount_format_info<M: ?Sized + MountOpenMeta>(
     live_meta: &M,
 ) -> anyhow::Result<FormatInfo> {
     let format_info = live_meta.get_format_info()?;
-    admit_live_mount_format_info(name, format_info, live_meta.check_consistency())
+    admit_live_mount_format_info(
+        name,
+        format_info,
+        live_meta.check_consistency_for_mount_admission(),
+    )
 }
 
 fn admit_live_mount_format_info(
@@ -1878,7 +1882,7 @@ fn admit_live_mount_format_info(
     consistency: studiofs_meta::engine::MetaResult<()>,
 ) -> anyhow::Result<FormatInfo> {
     if let Err(error) = consistency {
-        match (error, format_info.metadata.backend) {
+        match (&error, format_info.metadata.backend) {
             (MetaError::UuidMismatch { local, remote }, _) => {
                 anyhow::bail!(
                     "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
@@ -1888,17 +1892,14 @@ fn admit_live_mount_format_info(
                     utils::format_cleanup_command(name)
                 );
             }
-            (
-                ref error @ (MetaError::RemoteUnavailable(_) | MetaError::Timeout(_)),
-                MetadataBackend::Postgres,
-            ) => {
+            (error, MetadataBackend::Postgres) if error.is_reachability_error() => {
                 warn!(
                     volume = %name,
                     error = %error,
                     "remote PostgreSQL identity check unavailable; continuing with local metadata"
                 );
             }
-            (error, _) => {
+            _ => {
                 return Err(anyhow::Error::new(error).context("metadata consistency check failed"));
             }
         }
@@ -2301,6 +2302,16 @@ mod tests {
             assert_eq!(actual.uuid, expected.uuid);
             assert_eq!(actual.metadata.backend, expected.metadata.backend);
         }
+    }
+
+    #[test]
+    fn admit_live_mount_format_info_accepts_consistent_metadata() {
+        let expected = postgres_format_info("demo");
+        let actual = admit_live_mount_format_info("demo", expected.clone(), Ok(()))
+            .expect("consistent metadata must be admitted");
+
+        assert_eq!(actual.uuid, expected.uuid);
+        assert_eq!(actual.metadata.backend, expected.metadata.backend);
     }
 
     #[test]

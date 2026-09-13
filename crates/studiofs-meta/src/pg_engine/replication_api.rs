@@ -157,17 +157,17 @@ impl MetaReplication for PgMetaEngine {
 
     fn check_consistency(&self) -> MetaResult<()> {
         let local_info = self.local.get_format_info()?;
-        if self.remote_transport_unavailable.load(Ordering::Acquire) {
-            return Err(MetaError::RemoteUnavailable(
-                "remote PostgreSQL transport unavailable during startup".to_string(),
-            ));
-        }
         let remote_uuid = match self.fetch_remote_uuid(self.volume_id) {
-            Ok(remote_uuid) => remote_uuid,
+            Ok(remote_uuid) => {
+                self.remote_transport_unavailable
+                    .store(false, Ordering::Release);
+                remote_uuid
+            }
             Err(error) => {
-                if Self::is_remote_reachability_error(&error) {
-                    self.remote_transport_unavailable
-                        .store(true, Ordering::Release);
+                self.remote_transport_unavailable
+                    .store(error.is_reachability_error(), Ordering::Release);
+                if error.is_reachability_error() {
+                    self.invalidate_remote_format_validation();
                 }
                 return Err(error);
             }
@@ -179,6 +179,15 @@ impl MetaReplication for PgMetaEngine {
             });
         }
         Ok(())
+    }
+
+    fn check_consistency_for_mount_admission(&self) -> MetaResult<()> {
+        if self.remote_transport_unavailable.load(Ordering::Acquire) {
+            return Err(MetaError::RemoteUnavailable(
+                "remote PostgreSQL transport is currently unavailable".to_string(),
+            ));
+        }
+        self.check_consistency()
     }
 
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {

@@ -703,7 +703,7 @@ impl PgMetaEngine {
             .await
             {
                 Ok(Ok(connection)) => connection,
-                Ok(Err(error)) if Self::is_remote_reachability_error(&error) => {
+                Ok(Err(error)) if error.is_reachability_error() => {
                     return Ok(StartupSchemaValidation::Fallback(error));
                 }
                 Ok(Err(error)) => return Err(error),
@@ -837,21 +837,13 @@ impl PgMetaEngine {
             let _ = connection_task.await;
             match result {
                 Ok(Ok(())) => Ok(StartupSchemaValidation::Available),
-                Ok(Err(error)) if Self::is_remote_reachability_error(&error) => {
+                Ok(Err(error)) if error.is_reachability_error() => {
                     Ok(StartupSchemaValidation::Fallback(error))
                 }
                 Ok(Err(error)) => Err(error),
                 Err(error) => Ok(StartupSchemaValidation::Fallback(error)),
             }
         })
-    }
-
-    fn is_postgres_unavailable(error: &MetaError) -> bool {
-        matches!(error, MetaError::RemoteUnavailable(_))
-    }
-
-    fn is_remote_reachability_error(error: &MetaError) -> bool {
-        Self::is_postgres_unavailable(error) || matches!(error, MetaError::Timeout(_))
     }
 
     fn ensure_remote_format_validated(&self) -> MetaResult<()> {
@@ -872,7 +864,7 @@ impl PgMetaEngine {
             }
             Err(error) => {
                 self.remote_transport_unavailable
-                    .store(Self::is_remote_reachability_error(error), Ordering::Release);
+                    .store(error.is_reachability_error(), Ordering::Release);
             }
         }
         result
@@ -919,7 +911,7 @@ impl PgMetaEngine {
             Err(error) => {
                 self.invalidate_remote_format_validation();
                 self.remote_transport_unavailable
-                    .store(Self::is_remote_reachability_error(error), Ordering::Release);
+                    .store(error.is_reachability_error(), Ordering::Release);
             }
         }
         result
