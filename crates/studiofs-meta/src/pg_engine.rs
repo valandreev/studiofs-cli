@@ -255,9 +255,16 @@ pub struct PgMetaEngine {
     metadata_source_connected: AtomicBool,
     /// Whether PostgreSQL's sync format was validated successfully for this
     /// runtime. A local-first startup may leave this pending while PostgreSQL
-    /// is unavailable; no remote pull or publication may pass that boundary.
+    /// is unavailable; remote pulls and publications also require validated
+    /// volume identity.
     remote_format_validated: AtomicBool,
-    remote_format_validation_lock: Mutex<()>,
+    /// Whether the PostgreSQL volume UUID was validated for this runtime. A
+    /// local-first startup keeps this pending until a later remote probe.
+    remote_identity_validated: AtomicBool,
+    /// Whether the last startup or remote command failed due to PostgreSQL
+    /// transport unavailability or a timeout.
+    remote_transport_unavailable: AtomicBool,
+    remote_validation_lock: Mutex<()>,
 }
 
 /// PostgreSQL-only snapshot capabilities for callers that must not open the
@@ -545,14 +552,15 @@ impl PgMetaEngine {
     pub(super) fn refresh_pg_sync_lifecycle_for_allocator(&self) {
         self.update_pg_sync_lifecycle(|current| {
             let authority_available = self.metadata_authority_status().allows_new_mutations();
-            match (current, authority_available) {
-                (PgSyncLifecycle::LocalReady, true)
-                | (PgSyncLifecycle::TargetReached, true)
-                | (PgSyncLifecycle::AllocatorPending, true) => PgSyncLifecycle::Live,
-                (PgSyncLifecycle::LocalReady, false)
-                | (PgSyncLifecycle::TargetReached, false)
-                | (PgSyncLifecycle::Live, false) => PgSyncLifecycle::AllocatorPending,
-                (lifecycle, _) => lifecycle,
+            let identity_validated = self.remote_identity_validated.load(Ordering::Acquire);
+            match (current, authority_available, identity_validated) {
+                (PgSyncLifecycle::LocalReady, true, true)
+                | (PgSyncLifecycle::TargetReached, true, true)
+                | (PgSyncLifecycle::AllocatorPending, true, true) => PgSyncLifecycle::Live,
+                (PgSyncLifecycle::LocalReady, false, _)
+                | (PgSyncLifecycle::TargetReached, false, _)
+                | (PgSyncLifecycle::Live, false, _) => PgSyncLifecycle::AllocatorPending,
+                (lifecycle, _, _) => lifecycle,
             }
         });
     }
@@ -565,6 +573,10 @@ impl PgMetaEngine {
             current,
             PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
         ) {
+            return Ok(());
+        }
+
+        if !self.remote_identity_validated.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -700,10 +712,7 @@ impl PgMetaEngine {
             .await
             {
                 Ok(Ok(connection)) => connection,
-                Ok(Err(error))
-                    if Self::is_postgres_unavailable(&error)
-                        || matches!(&error, MetaError::Timeout(_)) =>
-                {
+                Ok(Err(error)) if error.is_reachability_error() => {
                     return Ok(StartupSchemaValidation::Fallback(error));
                 }
                 Ok(Err(error)) => return Err(error),
@@ -837,10 +846,7 @@ impl PgMetaEngine {
             let _ = connection_task.await;
             match result {
                 Ok(Ok(())) => Ok(StartupSchemaValidation::Available),
-                Ok(Err(error)) if Self::is_postgres_unavailable(&error) => {
-                    Ok(StartupSchemaValidation::Fallback(error))
-                }
-                Ok(Err(error)) if matches!(&error, MetaError::Timeout(_)) => {
+                Ok(Err(error)) if error.is_reachability_error() => {
                     Ok(StartupSchemaValidation::Fallback(error))
                 }
                 Ok(Err(error)) => Err(error),
@@ -849,21 +855,69 @@ impl PgMetaEngine {
         })
     }
 
-    fn is_postgres_unavailable(error: &MetaError) -> bool {
-        matches!(error, MetaError::RemoteUnavailable(_))
-    }
-
+    /// Ensure the remote format and volume identity are validated before a
+    /// remote replication operation.
     fn ensure_remote_format_validated(&self) -> MetaResult<()> {
         let _guard = self
-            .remote_format_validation_lock
+            .remote_validation_lock
             .lock()
-            .map_err(|_| MetaError::Storage("pg format validation lock poisoned".to_string()))?;
-        if self.remote_format_validated.load(Ordering::Acquire) {
+            .map_err(|_| MetaError::Storage("pg remote validation lock poisoned".to_string()))?;
+        if !self.remote_format_validated.load(Ordering::Acquire) {
+            let result = self.validate_remote_format_version();
+            if let Err(error) = &result {
+                self.invalidate_remote_validation();
+                self.remote_transport_unavailable
+                    .store(error.is_reachability_error(), Ordering::Release);
+                return result;
+            }
+            self.remote_transport_unavailable
+                .store(false, Ordering::Release);
+            self.remote_format_validated.store(true, Ordering::Release);
+        }
+
+        if self.remote_identity_validated.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        self.validate_remote_format_version()?;
-        self.remote_format_validated.store(true, Ordering::Release);
+        self.validate_remote_identity()
+    }
+
+    pub(super) fn check_remote_identity(&self) -> MetaResult<()> {
+        let _guard = self
+            .remote_validation_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg remote validation lock poisoned".to_string()))?;
+        self.validate_remote_identity()
+    }
+
+    fn validate_remote_identity(&self) -> MetaResult<()> {
+        self.remote_identity_validated
+            .store(false, Ordering::Release);
+        let local_info = self.local.get_format_info()?;
+        let remote_uuid = match self.fetch_remote_uuid(self.volume_id) {
+            Ok(remote_uuid) => remote_uuid,
+            Err(error) => {
+                if error.is_reachability_error() {
+                    self.invalidate_remote_validation();
+                }
+                self.remote_transport_unavailable
+                    .store(error.is_reachability_error(), Ordering::Release);
+                return Err(error);
+            }
+        };
+
+        self.remote_transport_unavailable
+            .store(false, Ordering::Release);
+        if local_info.uuid != remote_uuid {
+            return Err(MetaError::UuidMismatch {
+                local: local_info.uuid,
+                remote: remote_uuid,
+            });
+        }
+
+        self.remote_identity_validated
+            .store(true, Ordering::Release);
+        self.refresh_pg_sync_lifecycle_for_allocator();
         Ok(())
     }
 
@@ -896,13 +950,22 @@ impl PgMetaEngine {
         })
     }
 
-    fn invalidate_remote_format_validation(&self) {
+    fn invalidate_remote_validation(&self) {
         self.remote_format_validated.store(false, Ordering::Release);
+        self.remote_identity_validated
+            .store(false, Ordering::Release);
     }
 
     fn record_remote_operation_result<T>(&self, result: MetaResult<T>) -> MetaResult<T> {
-        if result.is_err() {
-            self.invalidate_remote_format_validation();
+        match &result {
+            Ok(_) => self
+                .remote_transport_unavailable
+                .store(false, Ordering::Release),
+            Err(error) => {
+                self.invalidate_remote_validation();
+                self.remote_transport_unavailable
+                    .store(error.is_reachability_error(), Ordering::Release);
+            }
         }
         result
     }
@@ -993,22 +1056,24 @@ impl PgMetaEngine {
                 checkpoint_freshness::DEFAULT_MAX_CHECKPOINT_AGE_SECS,
             )),
         );
-        let remote_format_validated = match Self::validate_postgres_schema(
+        let remote_transport_unavailable = match Self::validate_postgres_schema(
             &pg.url,
             pg.volume_id,
             connect_timeout,
             command_timeout,
         ) {
-            Ok(StartupSchemaValidation::Available) => true,
+            Ok(StartupSchemaValidation::Available) => false,
             Ok(StartupSchemaValidation::Fallback(error)) => {
                 warn!(
                     error = %error,
                     "postgres schema validation unavailable; continuing with local-first startup"
                 );
-                false
+                true
             }
             Err(error) => return Err(error),
         };
+        let remote_format_validated = !remote_transport_unavailable;
+        let remote_identity_validated = false;
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
         let client_slot = match persisted_client_slot {
@@ -1098,7 +1163,9 @@ impl PgMetaEngine {
             snapshot_reachability_bootstrap_lock: Mutex::new(()),
             metadata_source_connected: AtomicBool::new(false),
             remote_format_validated: AtomicBool::new(remote_format_validated),
-            remote_format_validation_lock: Mutex::new(()),
+            remote_identity_validated: AtomicBool::new(remote_identity_validated),
+            remote_transport_unavailable: AtomicBool::new(remote_transport_unavailable),
+            remote_validation_lock: Mutex::new(()),
         });
         let _ = engine.self_weak.set(Arc::downgrade(&engine));
 
@@ -1140,23 +1207,28 @@ impl PgMetaEngine {
             engine.restore_pending_state_from_local_log()?;
             bootstrap_succeeded
         };
-        let startup_target_observed = match engine.remote_metadata_head_version() {
-            Ok(remote_head) => {
-                engine
-                    .metadata_remote_head_version
-                    .store(remote_head, Ordering::Release);
-                if engine.local_version.load(Ordering::Acquire) < remote_head {
-                    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+        let startup_target_observed = if engine.remote_transport_unavailable.load(Ordering::Acquire)
+        {
+            false
+        } else {
+            match engine.remote_metadata_head_version() {
+                Ok(remote_head) => {
+                    engine
+                        .metadata_remote_head_version
+                        .store(remote_head, Ordering::Release);
+                    if engine.local_version.load(Ordering::Acquire) < remote_head {
+                        engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                    }
+                    true
                 }
-                true
-            }
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    volume_id = engine.volume_id,
-                    "postgres startup head observation unavailable; continuing with local serving state"
-                );
-                false
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        volume_id = engine.volume_id,
+                        "postgres startup head observation unavailable; continuing with local serving state"
+                    );
+                    false
+                }
             }
         };
         let startup_failed = !startup_bootstrap_succeeded || !startup_target_observed;
