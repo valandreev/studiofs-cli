@@ -1,5 +1,5 @@
 use super::{PgMetaEngine, sql};
-use crate::engine::{MetaError, MetaFormat, MetaResult};
+use crate::engine::{MetaError, MetaFormat, MetaInodes, MetaResult};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -9,6 +9,7 @@ use tracing::warn;
 
 pub(super) const DEFAULT_CHECKPOINT_LEASE_SECS: u64 = 300;
 pub(super) const DEFAULT_CHECKPOINT_RETRY_MS: u64 = 1_000;
+const MAX_CHECKPOINT_RETRY_SECS: u64 = 30;
 const CHECKPOINT_LEASE_SECS_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_LEASE_SECS";
 const CHECKPOINT_RETRY_MS_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_RETRY_MS";
 
@@ -40,6 +41,7 @@ impl CheckpointCoordinatorState {
 #[derive(Clone, Copy)]
 struct CheckpointSourceCut {
     version: i64,
+    event_seq: u64,
     total_event_payload_bytes: i64,
 }
 
@@ -84,6 +86,7 @@ impl PgMetaEngine {
             .name("pg-meta-checkpoint".into())
             .spawn(move || {
                 let mut retry_pending = false;
+                let mut retry_delay = retry_interval;
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         return;
@@ -94,7 +97,9 @@ impl PgMetaEngine {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let wait_duration = if retry_pending {
-                        retry_interval
+                        let delay = retry_delay;
+                        retry_delay = next_checkpoint_retry_delay(retry_delay, retry_interval);
+                        delay
                     } else {
                         Duration::from_secs(24 * 60 * 60)
                     };
@@ -146,6 +151,7 @@ impl PgMetaEngine {
                     match engine.run_checkpoint_refresh_once(lease_duration) {
                         Ok(true) => {
                             retry_pending = false;
+                            retry_delay = retry_interval;
                         }
                         Ok(false) => {
                             engine.checkpoint_coordinator_state.request();
@@ -231,6 +237,10 @@ impl PgMetaEngine {
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
         let freshness = self.read_remote_checkpoint_freshness()?;
+        let Some(event_seq) = self.checkpoint_source_event_seq()? else {
+            self.record_checkpoint_freshness_observation(freshness);
+            return Ok(None);
+        };
         let local_version = self.local_version.load(Ordering::Acquire);
         let local_version_u64 = u64::try_from(local_version).map_err(|_| {
             MetaError::Storage("local metadata version must be nonnegative".to_string())
@@ -253,8 +263,31 @@ impl PgMetaEngine {
             })?;
         Ok(Some(CheckpointSourceCut {
             version: local_version,
+            event_seq,
             total_event_payload_bytes,
         }))
+    }
+
+    /// Return the local event position only when the serving snapshot has no
+    /// local replication work that has not reached PostgreSQL yet.
+    ///
+    /// The in-memory pending state is updated after the redb mutation commits,
+    /// so the durable event cursor closes the bookkeeping window between those
+    /// operations. Callers must hold `replication_lock`.
+    fn checkpoint_source_event_seq(&self) -> MetaResult<Option<u64>> {
+        let pending_state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let next_event_seq = self.local.get_counter("nextEventSeq")?;
+        let flushed_event_seq = self.flushed_event_seq.load(Ordering::Acquire);
+        let has_pending_state = pending_state.event_start.is_some()
+            || pending_state.ops > 0
+            || self.inflight_replication_ops.load(Ordering::Acquire) > 0;
+        if has_pending_state || next_event_seq > flushed_event_seq {
+            return Ok(None);
+        }
+        Ok(Some(next_event_seq))
     }
 
     pub(super) fn try_claim_checkpoint_lease(
@@ -368,7 +401,9 @@ impl PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        if self.local_version.load(Ordering::Acquire) != cut.version {
+        if self.local_version.load(Ordering::Acquire) != cut.version
+            || self.checkpoint_source_event_seq()? != Some(cut.event_seq)
+        {
             return Ok(None);
         }
 
@@ -419,6 +454,20 @@ impl PgMetaEngine {
     }
 }
 
+fn next_checkpoint_retry_delay(current: Duration, base: Duration) -> Duration {
+    let max_delay = base.max(Duration::from_secs(MAX_CHECKPOINT_RETRY_SECS));
+    let exponential = current
+        .checked_mul(2)
+        .map_or(max_delay, |delay| delay.min(max_delay));
+    let jitter_limit_ms =
+        u64::try_from((exponential.as_millis() / 4).min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+    if jitter_limit_ms == 0 {
+        return exponential;
+    }
+    let jitter = Duration::from_millis(rand::random_range(0..=jitter_limit_ms));
+    exponential.saturating_add(jitter).min(max_delay)
+}
+
 fn should_wait_for_checkpoint_wakeup(wakeup_set: bool, retry_pending: bool) -> bool {
     !wakeup_set || retry_pending
 }
@@ -442,6 +491,19 @@ mod tests {
         assert!(should_wait_for_checkpoint_wakeup(true, true));
         assert!(!should_wait_for_checkpoint_wakeup(true, false));
         assert!(should_wait_for_checkpoint_wakeup(false, false));
+    }
+
+    #[test]
+    fn checkpoint_retry_delay_backs_off_with_a_bounded_jitter() {
+        let base = Duration::from_secs(1);
+        let next = next_checkpoint_retry_delay(base, base);
+
+        assert!(next >= Duration::from_secs(2));
+        assert!(next <= Duration::from_millis(2_500));
+        assert_eq!(
+            next_checkpoint_retry_delay(Duration::from_secs(30), base),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

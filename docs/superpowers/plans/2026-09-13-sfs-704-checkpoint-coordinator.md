@@ -25,6 +25,9 @@ operations remain independent of checkpoint serialization.
 - [x] 2026-09-13: Added focused unit and service-backed regression tests for coalescing,
       fencing/takeover, exact version publication, and concurrent foreground
       progress architecture.
+- [x] 2026-09-13: Hardened source-cut capture/publication against pending and
+      in-flight local event-log mutations, and bounded failed coordination
+      retries with exponential backoff and jitter.
 - [ ] Run the final commit and update Linear.
 
 ## Surprises
@@ -36,6 +39,10 @@ operations remain independent of checkpoint serialization.
 - The current background poll worker observes freshness but has no dedicated
   checkpoint worker. `PgBackgroundWorkers` owns all joinable worker handles, so
   the coordinator must be added to the same shutdown/join path.
+- `local_version` advances only with remote replay. A local redb mutation can
+  commit before its in-memory pending bookkeeping is updated, so checkpoint
+  source cuts must also use the durable `nextEventSeq`/`flushed_event_seq`
+  position and the pending/in-flight state.
 - `export_serving_checkpoint_bytes()` obtains a consistent local redb read
   transaction but does not accept a version argument. The coordinator therefore
   needs a capture-before/build/verify-after protocol and must discard a payload
@@ -51,9 +58,9 @@ operations remain independent of checkpoint serialization.
    unable to publish after takeover while avoiding changes to the existing
    explicit flush checkpoint contract.
 3. Use one coalesced in-process wakeup per `PgMetaEngine`. A stale observation
-   sets a boolean request and signals the coordinator; the coordinator retries
-   with a bounded wait while the freshness state remains stale. Successful
-   `RETURNING` freshness observation clears the request state.
+   sets a boolean request and signals the coordinator; failed coordination
+   retries use bounded exponential backoff with jitter while freshness remains
+   stale. Successful `RETURNING` freshness observation clears the request state.
 4. The coordinator acquires `replication_lock` only around source-cut capture
    and final validation/publication. The expensive local export runs without
    that lock so ordinary replication and foreground local writes can proceed.
@@ -99,9 +106,11 @@ primary implementation seams are:
    volume coordinator worker into `PgBackgroundWorkers`; ensure startup,
    shutdown, `Drop`, and worker-slot test helpers own the handle correctly.
 3. Add a configured bounded lease/retry duration. On a stale observation, the
-   worker claims the lease, captures the local version and remote byte baseline,
-   exports the serving checkpoint outside `replication_lock`, reacquires the
-   lock, verifies the version did not move, and publishes with the fence.
+   worker claims the lease, captures the local version, event position, and
+   remote byte baseline, exports the serving checkpoint outside
+   `replication_lock`, reacquires the lock, verifies the source position did
+   not move, and publishes with the fence. Failed attempts back off with a
+   bounded jittered retry delay.
 4. Add red/green tests for the accepted contract. PostgreSQL integration tests
    remain `#[ignore]` where a real service is required and must be run
    explicitly with `.env`; local unit tests must be nonzero and service

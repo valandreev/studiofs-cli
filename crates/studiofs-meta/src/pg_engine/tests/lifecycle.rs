@@ -2552,6 +2552,75 @@ fn pg_background_checkpoint_coordinator_coalesces_two_clients_and_publishes_exac
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_coordinator_skips_unflushed_local_batch() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-pending");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    pg.create_dir(ROOT_INO, b"pending-dir", 0, 0, 0o755)
+        .expect("create unflushed local directory");
+    assert!(
+        pg.replication_backlog().pending_ops > 0,
+        "local mutation should remain pending before the checkpoint attempt"
+    );
+
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 10_000, total_event_payload_bytes = 10_000 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("advance remote metadata head");
+    pg.local_version.store(10_000, Ordering::Release);
+    pg.observe_checkpoint_freshness();
+
+    assert!(
+        !pg.run_checkpoint_refresh_once(Duration::from_secs(60))
+            .expect("checkpoint refresh should defer pending local state"),
+        "checkpoint refresh must not publish while local replication is pending"
+    );
+    {
+        let mut pending_state = pg.pending_state.lock().expect("pending state");
+        PgMetaEngine::clear_pending_state(&mut pending_state);
+    }
+    assert!(
+        !pg.run_checkpoint_refresh_once(Duration::from_secs(60))
+            .expect("checkpoint refresh should defer an unflushed event log"),
+        "checkpoint refresh must not publish while the local event log is unflushed"
+    );
+    let checkpoint_version = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT checkpoint_version FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<i64, MetaError>(row.get(0))
+    }))
+    .expect("read checkpoint version");
+    assert_eq!(checkpoint_version, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_checkpoint_promotion_preserves_post_capture_event_tail() {
     let Some(dsn) = pg_dsn() else {
         return;
