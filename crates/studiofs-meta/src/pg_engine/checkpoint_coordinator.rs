@@ -100,7 +100,7 @@ impl PgMetaEngine {
                     };
                     let deadline = Instant::now() + wait_duration;
                     let mut timed_out = false;
-                    while !*wakeup_guard {
+                    while should_wait_for_checkpoint_wakeup(*wakeup_guard, retry_pending) {
                         if shutdown.load(Ordering::Acquire) {
                             return;
                         }
@@ -121,6 +121,9 @@ impl PgMetaEngine {
                             Err(poisoned) => {
                                 wakeup_guard = poisoned.into_inner().0;
                             }
+                        }
+                        if retry_pending {
+                            *wakeup_guard = false;
                         }
                     }
                     *wakeup_guard = false;
@@ -167,14 +170,17 @@ impl PgMetaEngine {
             })
     }
 
-    fn run_checkpoint_refresh_once(&self, lease_duration: Duration) -> MetaResult<bool> {
+    pub(super) fn run_checkpoint_refresh_once(&self, lease_duration: Duration) -> MetaResult<bool> {
         self.ensure_remote_format_validated()?;
+        let Some(cut) = self.capture_checkpoint_source_cut()? else {
+            return Ok(!self.checkpoint_freshness_diagnostics().refresh_needed);
+        };
         let owner = self.current_client_id()?;
         let Some(lease) = self.try_claim_checkpoint_lease(&owner, lease_duration)? else {
             return Ok(false);
         };
 
-        let result = self.build_and_publish_checkpoint(&owner, lease);
+        let result = self.build_and_publish_checkpoint(&owner, lease, cut);
         if let Err(error) = self.release_checkpoint_lease(&owner, lease) {
             warn!(
                 error = %error,
@@ -189,11 +195,8 @@ impl PgMetaEngine {
         &self,
         owner: &str,
         lease: CheckpointLease,
+        cut: CheckpointSourceCut,
     ) -> MetaResult<bool> {
-        let Some(cut) = self.capture_checkpoint_source_cut()? else {
-            return Ok(!self.checkpoint_freshness_diagnostics().refresh_needed);
-        };
-
         // The local export is a consistent redb transaction. It intentionally
         // runs without replication_lock so ordinary replication can continue.
         let payload = self.local.export_serving_checkpoint_bytes()?;
@@ -417,6 +420,10 @@ impl PgMetaEngine {
     }
 }
 
+fn should_wait_for_checkpoint_wakeup(wakeup_set: bool, retry_pending: bool) -> bool {
+    !wakeup_set || retry_pending
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +436,28 @@ mod tests {
         assert!(state.request());
         state.clear();
         assert!(!state.take_request());
+    }
+
+    #[test]
+    fn retry_pending_does_not_skip_the_retry_interval_for_a_set_wakeup() {
+        assert!(should_wait_for_checkpoint_wakeup(true, true));
+        assert!(!should_wait_for_checkpoint_wakeup(true, false));
+        assert!(should_wait_for_checkpoint_wakeup(false, false));
+    }
+
+    #[test]
+    fn checkpoint_coordinator_stops_after_background_stop_signal() {
+        let workers = super::super::PgBackgroundWorkers::new();
+        let handle = PgMetaEngine::start_background_checkpoint_coordinator(
+            std::sync::Weak::new(),
+            workers.poll_shutdown(),
+            workers.checkpoint_wakeup(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .expect("checkpoint coordinator should start");
+
+        workers.signal_stop();
+        handle.join().expect("checkpoint coordinator should stop");
     }
 }

@@ -189,4 +189,7 @@ coalesces duplicate signals and can be safely rearmed after a failed attempt.
 The public `MetaEngine`/`MetaReplication` contracts remain unchanged. The
 coordinator is internal to `PgMetaEngine`; the only durable interface added to
 the shared PostgreSQL schema is the per-volume fenced lease table. Existing
-explicit `flush_metadata()` checkpoint behavior remains compatible.
+explicit `flush_metadata()` checkpoint behavior remains compatible. The lease
+table is part of the fresh required schema; existing databases without it are
+expected to follow the canonical recreate/provisioning boundary rather than an
+implicit runtime migration.

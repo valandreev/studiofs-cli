@@ -2666,6 +2666,26 @@ fn pg_checkpoint_skip_records_remote_stale_observation() {
     }))
     .expect("advance remote metadata head");
 
+    let refresh_result = pg
+        .run_checkpoint_refresh_once(Duration::from_secs(60))
+        .expect("skip checkpoint refresh while local state is stale");
+    assert!(!refresh_result);
+    let lease_exists = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM bootstrap_checkpoint_leases WHERE vol = $1)",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<bool, MetaError>(row.get(0))
+    }))
+    .expect("query stale checkpoint lease state");
+    assert!(
+        !lease_exists,
+        "stale local state must not claim a checkpoint lease"
+    );
+
     pg.write_checkpoint_locked()
         .expect("skip stale local checkpoint write");
     let diagnostics = pg.checkpoint_freshness_diagnostics();
