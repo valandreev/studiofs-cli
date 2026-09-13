@@ -773,7 +773,8 @@ impl PgMetaEngine {
                             FROM (
                                 VALUES
                                     ('metadata_state'::TEXT, 'metadata_format_version'::TEXT),
-                                    ('metadata_state'::TEXT, 'checkpoint_event_bytes'::TEXT),
+                                    ('metadata_state'::TEXT, 'total_event_payload_bytes'::TEXT),
+                                    ('metadata_state'::TEXT, 'checkpoint_total_event_bytes'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_sha256'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_publication_state'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_generation'::TEXT),

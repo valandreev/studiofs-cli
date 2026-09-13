@@ -10,7 +10,6 @@ use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaFormat, MetaRe
 use crate::events::{MetaEvent, encode_event};
 use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
-use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -227,11 +226,81 @@ async fn read_remote_metadata_head_and_checkpoint_version_with_pool(
     .await
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct CheckpointFreshnessObservation {
-    pub(super) head_version: i64,
-    pub(super) checkpoint_version: i64,
-    pub(super) event_payload_bytes: i64,
+    pub(super) head_version: u64,
+    pub(super) checkpoint_version: u64,
+    pub(super) event_payload_bytes: u64,
     pub(super) checkpoint_age: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CheckpointCapture {
+    pub(super) head_version: u64,
+    pub(super) total_event_payload_bytes: u64,
+}
+
+fn nonnegative_counter(value: i64, name: &str) -> MetaResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| MetaError::Storage(format!("postgres {name} must be nonnegative")))
+}
+
+fn row_i64(row: &tokio_postgres::Row, index: usize, name: &str) -> MetaResult<i64> {
+    row.try_get(index).map_err(|error| {
+        PgMetaEngine::classify_pg_error(format!("postgres {name} row parse failed"), error)
+    })
+}
+
+fn checkpoint_freshness_observation_from_row(
+    row: &tokio_postgres::Row,
+) -> MetaResult<CheckpointFreshnessObservation> {
+    let head_version = nonnegative_counter(
+        row_i64(row, 0, "checkpoint freshness head")?,
+        "head version",
+    )?;
+    let checkpoint_version = nonnegative_counter(
+        row_i64(row, 1, "checkpoint freshness checkpoint")?,
+        "checkpoint version",
+    )?;
+    let total_event_payload_bytes = nonnegative_counter(
+        row_i64(row, 2, "checkpoint freshness total byte counter")?,
+        "total event payload bytes",
+    )?;
+    let checkpoint_total_event_bytes = nonnegative_counter(
+        row_i64(row, 3, "checkpoint freshness checkpoint byte counter")?,
+        "checkpoint total event payload bytes",
+    )?;
+    let event_payload_bytes = total_event_payload_bytes
+        .checked_sub(checkpoint_total_event_bytes)
+        .ok_or_else(|| {
+            MetaError::Storage(
+                "postgres checkpoint byte counters are not monotonically ordered".to_string(),
+            )
+        })?;
+    let checkpoint_age_ms = nonnegative_counter(
+        row_i64(row, 4, "checkpoint freshness age")?,
+        "checkpoint age",
+    )?;
+
+    Ok(CheckpointFreshnessObservation {
+        head_version,
+        checkpoint_version,
+        event_payload_bytes,
+        checkpoint_age: std::time::Duration::from_millis(checkpoint_age_ms),
+    })
+}
+
+fn checkpoint_capture_from_row(row: &tokio_postgres::Row) -> MetaResult<CheckpointCapture> {
+    Ok(CheckpointCapture {
+        head_version: nonnegative_counter(
+            row_i64(row, 0, "checkpoint capture head")?,
+            "head version",
+        )?,
+        total_event_payload_bytes: nonnegative_counter(
+            row_i64(row, 1, "checkpoint capture total byte counter")?,
+            "total event payload bytes",
+        )?,
+    })
 }
 
 async fn read_checkpoint_freshness_with_pool(
@@ -260,39 +329,40 @@ async fn read_checkpoint_freshness_with_pool(
                                 .to_string(),
                         )
                     })?;
-                let head_version = row.try_get(0).map_err(|e| {
-                    PgMetaEngine::classify_pg_error(
-                        "postgres checkpoint freshness head parse failed",
-                        e,
-                    )
-                })?;
-                let checkpoint_version = row.try_get(1).map_err(|e| {
-                    PgMetaEngine::classify_pg_error(
-                        "postgres checkpoint freshness version parse failed",
-                        e,
-                    )
-                })?;
-                let event_payload_bytes = row.try_get(2).map_err(|e| {
-                    PgMetaEngine::classify_pg_error(
-                        "postgres checkpoint freshness byte counter parse failed",
-                        e,
-                    )
-                })?;
-                let checkpoint_updated_at: DateTime<Utc> = row.try_get(3).map_err(|e| {
-                    PgMetaEngine::classify_pg_error(
-                        "postgres checkpoint freshness timestamp parse failed",
-                        e,
-                    )
-                })?;
-                Ok(CheckpointFreshnessObservation {
-                    head_version,
-                    checkpoint_version,
-                    event_payload_bytes,
-                    checkpoint_age: super::checkpoint_freshness::checkpoint_age_since(
-                        checkpoint_updated_at,
-                        Utc::now(),
-                    ),
-                })
+                checkpoint_freshness_observation_from_row(&row)
+            })
+        },
+    )
+    .await
+}
+
+async fn read_checkpoint_capture_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<CheckpointCapture> {
+    PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "checkpoint capture",
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(sql::SELECT_CHECKPOINT_CAPTURE, &[&volume_id])
+                    .await
+                    .map_err(|error| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres checkpoint capture select failed",
+                            error,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "postgres metadata_state row missing during checkpoint capture"
+                                .to_string(),
+                        )
+                    })?;
+                checkpoint_capture_from_row(&row)
             })
         },
     )
@@ -342,6 +412,14 @@ impl PgMetaEngine {
         &self,
     ) -> MetaResult<CheckpointFreshnessObservation> {
         self.run_async(read_checkpoint_freshness_with_pool(
+            self.command_pool.clone(),
+            self.volume_id,
+            self.command_timeout,
+        ))
+    }
+
+    pub(super) fn read_remote_checkpoint_capture(&self) -> MetaResult<CheckpointCapture> {
+        self.run_async(read_checkpoint_capture_with_pool(
             self.command_pool.clone(),
             self.volume_id,
             self.command_timeout,
@@ -483,6 +561,7 @@ impl PgMetaEngine {
                         .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
                     let mut last_batch_version = None;
+                    let mut last_observation = None;
                     for batch in batches {
                         let batch_version_row = tx
                             .query_opt(
@@ -519,7 +598,16 @@ impl PgMetaEngine {
                                     .to_string(),
                             ));
                         };
-                        let batch_version: i64 = batch_version_row.get(0);
+                        let batch_observation = checkpoint_freshness_observation_from_row(
+                            &batch_version_row,
+                        )?;
+                        let batch_version = i64::try_from(batch_observation.head_version)
+                            .map_err(|_| {
+                                MetaError::Storage(
+                                    "postgres metadata head version exceeds BIGINT".to_string(),
+                                )
+                            })?;
+                        last_observation = Some(batch_observation);
 
                         for (event_chunk, payload_chunk) in batch
                             .events
@@ -528,7 +616,7 @@ impl PgMetaEngine {
                         {
                             let event_types: Vec<&str> =
                                 event_chunk.iter().map(|event| event.kind()).collect();
-                            let payloads = payload_chunk.to_vec();
+                            let payloads = payload_chunk;
                             tx.execute(
                                 sql::INSERT_EVENT_LOG_BATCH,
                                 &[
@@ -613,19 +701,26 @@ impl PgMetaEngine {
                         )
                         .await;
 
+                    let observation = last_observation.ok_or_else(|| {
+                        MetaError::Storage(
+                            "metadata publication did not return checkpoint freshness state"
+                                .to_string(),
+                        )
+                    })?;
+
                     tx.commit()
                         .await
                         .map_err(|e| Self::classify_pg_error("postgres commit failed", e))?;
-                    Ok(last_batch_version)
+                    Ok((last_batch_version, observation))
                 }),
             )
             .await
         });
         let result = self.record_remote_operation_result(result);
-        if result.is_ok() {
-            self.observe_checkpoint_freshness();
+        if let Ok((_, observation)) = &result {
+            self.record_checkpoint_freshness_observation(*observation);
         }
-        result
+        result.map(|(version, _)| version)
     }
 
     fn split_projected_event_batches(
@@ -763,6 +858,15 @@ impl PgMetaEngine {
 
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
         self.ensure_remote_format_validated()?;
+        let capture = self.read_remote_checkpoint_capture()?;
+        let local_version =
+            u64::try_from(self.local_version.load(Ordering::SeqCst)).map_err(|_| {
+                MetaError::Storage("local metadata version must be nonnegative".to_string())
+            })?;
+        if capture.head_version > local_version {
+            return Ok(());
+        }
+
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let payload = self.local.export_serving_checkpoint_bytes()?;
@@ -774,7 +878,15 @@ impl PgMetaEngine {
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
-        let version = self.local_version.load(Ordering::SeqCst);
+        let version = i64::try_from(local_version).map_err(|_| {
+            MetaError::Storage("local metadata version exceeds PostgreSQL BIGINT".to_string())
+        })?;
+        let checkpoint_total_event_bytes = i64::try_from(capture.total_event_payload_bytes)
+            .map_err(|_| {
+                MetaError::Storage(
+                    "checkpoint payload byte counter exceeds PostgreSQL BIGINT".to_string(),
+                )
+            })?;
         let command_timeout = self.command_timeout;
 
         let result = self.run_async(async move {
@@ -792,6 +904,7 @@ impl PgMetaEngine {
                                     &metadata_format_version,
                                     &version,
                                     &version,
+                                    &checkpoint_total_event_bytes,
                                     &payload,
                                     &checkpoint_sha256.as_slice(),
                                     &format_info,

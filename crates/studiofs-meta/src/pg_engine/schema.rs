@@ -72,8 +72,13 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             metadata_format_version SMALLINT NOT NULL,
             version BIGINT NOT NULL,
             checkpoint_version BIGINT NOT NULL DEFAULT 0,
-            checkpoint_event_bytes BIGINT NOT NULL DEFAULT 0
-                CHECK (checkpoint_event_bytes >= 0),
+            total_event_payload_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (total_event_payload_bytes >= 0),
+            checkpoint_total_event_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (
+                    checkpoint_total_event_bytes >= 0
+                    AND checkpoint_total_event_bytes <= total_event_payload_bytes
+                ),
             snapshot BYTEA NOT NULL,
             checkpoint_sha256 BYTEA NOT NULL
                 CHECK (octet_length(checkpoint_sha256) = 32),
@@ -91,8 +96,14 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_version BIGINT NOT NULL DEFAULT 0;
         ALTER TABLE metadata_state
-            ADD COLUMN IF NOT EXISTS checkpoint_event_bytes BIGINT NOT NULL DEFAULT 0
-                CHECK (checkpoint_event_bytes >= 0);
+            ADD COLUMN IF NOT EXISTS total_event_payload_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (total_event_payload_bytes >= 0);
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_total_event_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (
+                    checkpoint_total_event_bytes >= 0
+                    AND checkpoint_total_event_bytes <= total_event_payload_bytes
+                );
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_sha256 BYTEA NOT NULL
                 DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
@@ -751,7 +762,8 @@ mod tests {
         let sql = studiofs_pg_schema_sql();
         for fragment in [
             "metadata_format_version SMALLINT NOT NULL",
-            "checkpoint_event_bytes BIGINT NOT NULL",
+            "total_event_payload_bytes BIGINT NOT NULL",
+            "checkpoint_total_event_bytes BIGINT NOT NULL",
             "checkpoint_sha256 BYTEA NOT NULL",
             "checkpoint_publication_state TEXT NOT NULL",
             "checkpoint_generation BIGINT NOT NULL",
@@ -762,7 +774,8 @@ mod tests {
         assert!(sql.contains("octet_length(checkpoint_sha256) = 32"));
         assert!(sql.contains("checkpoint_publication_state IN ('pending', 'published')"));
         assert!(sql.contains("checkpoint_generation >= 0"));
-        assert!(sql.contains("checkpoint_event_bytes >= 0"));
+        assert!(sql.contains("total_event_payload_bytes >= 0"));
+        assert!(sql.contains("checkpoint_total_event_bytes >= 0"));
         assert!(
             sql.matches("CHECK (octet_length(checkpoint_sha256) = 32)")
                 .count()

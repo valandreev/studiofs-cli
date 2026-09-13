@@ -1,5 +1,4 @@
 use crate::engine::{MetadataCheckpointFreshnessDiagnostics, MetadataCheckpointRefreshReason};
-use chrono::{DateTime, Utc};
 use std::time::Duration;
 use tracing::warn;
 
@@ -31,33 +30,28 @@ impl CheckpointFreshnessPolicy {
         self,
         input: CheckpointFreshnessInput,
     ) -> CheckpointFreshnessDecision {
-        let head_version = u64::try_from(input.head_version).ok();
-        let checkpoint_version = u64::try_from(input.checkpoint_version).ok();
-        let version_lag = match (head_version, checkpoint_version) {
-            (Some(head), Some(checkpoint)) => head.saturating_sub(checkpoint),
-            _ => 0,
-        };
+        let version_lag = input.head_version.saturating_sub(input.checkpoint_version);
         let volume_changed = version_lag > 0;
         let checkpoint_age = volume_changed.then_some(input.checkpoint_age);
-        let event_payload_bytes = input.event_payload_bytes;
 
-        let reason = if volume_changed && version_lag >= self.max_version_lag {
+        let reason = if !volume_changed {
+            None
+        } else if version_lag >= self.max_version_lag {
             Some(MetadataCheckpointRefreshReason::VersionLag)
-        } else if volume_changed && event_payload_bytes >= self.max_event_payload_bytes {
+        } else if input.event_payload_bytes >= self.max_event_payload_bytes {
             Some(MetadataCheckpointRefreshReason::EventPayloadBytes)
-        } else if volume_changed && input.checkpoint_age >= self.max_checkpoint_age {
+        } else if input.checkpoint_age >= self.max_checkpoint_age {
             Some(MetadataCheckpointRefreshReason::Age)
         } else {
             None
         };
 
         CheckpointFreshnessDecision {
-            head_version,
-            checkpoint_version,
+            head_version: input.head_version,
+            checkpoint_version: input.checkpoint_version,
             version_lag,
-            event_payload_bytes,
+            event_payload_bytes: input.event_payload_bytes,
             reason,
-            refresh_needed: reason.is_some(),
             checkpoint_age_ms: checkpoint_age
                 .map(|age| age.as_millis().try_into().unwrap_or(u64::MAX)),
         }
@@ -76,20 +70,19 @@ impl Default for CheckpointFreshnessPolicy {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CheckpointFreshnessInput {
-    pub(super) head_version: i64,
-    pub(super) checkpoint_version: i64,
+    pub(super) head_version: u64,
+    pub(super) checkpoint_version: u64,
     pub(super) event_payload_bytes: u64,
     pub(super) checkpoint_age: Duration,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CheckpointFreshnessDecision {
-    pub(super) head_version: Option<u64>,
-    pub(super) checkpoint_version: Option<u64>,
+    pub(super) head_version: u64,
+    pub(super) checkpoint_version: u64,
     pub(super) version_lag: u64,
     pub(super) event_payload_bytes: u64,
     pub(super) reason: Option<MetadataCheckpointRefreshReason>,
-    pub(super) refresh_needed: bool,
     pub(super) checkpoint_age_ms: Option<u64>,
 }
 
@@ -118,14 +111,14 @@ impl CheckpointFreshnessState {
     ) {
         let decision = policy.checkpoint_refresh_needed(input);
         let was_needed = self.diagnostics.refresh_needed;
-        let refresh_needed = decision.refresh_needed;
+        let refresh_needed = decision.reason.is_some();
         let refresh_requests = self
             .diagnostics
             .refresh_requests
             .saturating_add(u64::from(!was_needed && refresh_needed));
         self.diagnostics = MetadataCheckpointFreshnessDiagnostics {
-            head_version: decision.head_version,
-            checkpoint_version: decision.checkpoint_version,
+            head_version: Some(decision.head_version),
+            checkpoint_version: Some(decision.checkpoint_version),
             version_lag: decision.version_lag,
             event_payload_bytes_since_checkpoint: decision.event_payload_bytes,
             checkpoint_age_ms: decision.checkpoint_age_ms,
@@ -169,28 +162,29 @@ impl super::PgMetaEngine {
                 return;
             }
         };
-        let Ok(event_payload_bytes) = u64::try_from(observation.event_payload_bytes) else {
-            warn!(
-                volume_id = self.volume_id,
-                event_payload_bytes = observation.event_payload_bytes,
-                "checkpoint freshness observation returned a negative byte counter"
-            );
-            return;
-        };
+        self.record_checkpoint_freshness_observation(observation);
+    }
 
-        let Ok(mut state) = self.checkpoint_freshness_state.lock() else {
-            warn!(
-                volume_id = self.volume_id,
-                "checkpoint freshness state lock was poisoned"
-            );
-            return;
-        };
+    pub(super) fn record_checkpoint_freshness_observation(
+        &self,
+        observation: super::metadata_io::CheckpointFreshnessObservation,
+    ) {
+        let mut state = self
+            .checkpoint_freshness_state
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    volume_id = self.volume_id,
+                    "checkpoint freshness state lock was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            });
         state.observe(
             &self.checkpoint_freshness_policy,
             CheckpointFreshnessInput {
                 head_version: observation.head_version,
                 checkpoint_version: observation.checkpoint_version,
-                event_payload_bytes,
+                event_payload_bytes: observation.event_payload_bytes,
                 checkpoint_age: observation.checkpoint_age,
             },
         );
@@ -202,14 +196,14 @@ impl super::PgMetaEngine {
         self.checkpoint_freshness_state
             .lock()
             .map(|state| state.diagnostics())
-            .unwrap_or_default()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    volume_id = self.volume_id,
+                    "checkpoint freshness state lock was poisoned; recovering state"
+                );
+                poisoned.into_inner().diagnostics()
+            })
     }
-}
-
-pub(super) fn checkpoint_age_since(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
-    now.signed_duration_since(timestamp)
-        .to_std()
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -219,8 +213,8 @@ mod tests {
     use std::time::Duration;
 
     fn input(
-        head_version: i64,
-        checkpoint_version: i64,
+        head_version: u64,
+        checkpoint_version: u64,
         event_payload_bytes: u64,
         checkpoint_age: Duration,
     ) -> CheckpointFreshnessInput {
@@ -240,7 +234,7 @@ mod tests {
     fn version_lag_requests_checkpoint_refresh() {
         let decision = policy().checkpoint_refresh_needed(input(15, 5, 0, Duration::ZERO));
 
-        assert!(decision.refresh_needed);
+        assert!(decision.reason.is_some());
         assert_eq!(
             decision.reason,
             Some(MetadataCheckpointRefreshReason::VersionLag)
@@ -252,7 +246,7 @@ mod tests {
     fn event_payload_bytes_request_checkpoint_refresh() {
         let decision = policy().checkpoint_refresh_needed(input(2, 1, 100, Duration::ZERO));
 
-        assert!(decision.refresh_needed);
+        assert!(decision.reason.is_some());
         assert_eq!(
             decision.reason,
             Some(MetadataCheckpointRefreshReason::EventPayloadBytes)
@@ -265,11 +259,39 @@ mod tests {
         let stale = policy().checkpoint_refresh_needed(input(2, 1, 0, Duration::from_secs(60)));
         let quiet = policy().checkpoint_refresh_needed(input(1, 1, 0, Duration::from_secs(600)));
 
-        assert!(stale.refresh_needed);
+        assert!(stale.reason.is_some());
         assert_eq!(stale.reason, Some(MetadataCheckpointRefreshReason::Age));
         assert_eq!(stale.checkpoint_age_ms, Some(60_000));
-        assert!(!quiet.refresh_needed);
+        assert!(quiet.reason.is_none());
         assert_eq!(quiet.checkpoint_age_ms, None);
+    }
+
+    #[test]
+    fn freshness_thresholds_are_inclusive_and_ordered_by_version_then_bytes_then_age() {
+        let version =
+            policy().checkpoint_refresh_needed(input(10, 0, 100, Duration::from_secs(60)));
+        let bytes = policy().checkpoint_refresh_needed(input(2, 1, 100, Duration::from_secs(60)));
+        let age = policy().checkpoint_refresh_needed(input(2, 1, 0, Duration::from_secs(60)));
+
+        assert_eq!(
+            version.reason,
+            Some(MetadataCheckpointRefreshReason::VersionLag)
+        );
+        assert_eq!(
+            bytes.reason,
+            Some(MetadataCheckpointRefreshReason::EventPayloadBytes)
+        );
+        assert_eq!(age.reason, Some(MetadataCheckpointRefreshReason::Age));
+    }
+
+    #[test]
+    fn inverted_versions_fail_closed_without_age_or_refresh_request() {
+        let decision =
+            policy().checkpoint_refresh_needed(input(4, 5, 100, Duration::from_secs(60)));
+
+        assert_eq!(decision.version_lag, 0);
+        assert_eq!(decision.reason, None);
+        assert_eq!(decision.checkpoint_age_ms, None);
     }
 
     #[test]

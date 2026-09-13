@@ -425,8 +425,8 @@ pub struct MetadataInvalidationDiagnostics {
     pub last_successful_sync_unix_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Signal explaining why a PostgreSQL bootstrap checkpoint should be refreshed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataCheckpointRefreshReason {
     /// The metadata head is beyond the configured version-lag limit.
     VersionLag,
@@ -436,8 +436,8 @@ pub enum MetadataCheckpointRefreshReason {
     Age,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Best-effort measurements and request state for bootstrap checkpoint freshness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetadataCheckpointFreshnessDiagnostics {
     /// Last observed metadata head version.
     pub head_version: Option<u64>,

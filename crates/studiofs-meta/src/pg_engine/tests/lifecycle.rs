@@ -1852,7 +1852,8 @@ fn checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping() {
     for fragment in [
         "version",
         "checkpoint_version",
-        "checkpoint_event_bytes",
+        "total_event_payload_bytes",
+        "checkpoint_total_event_bytes",
         "checkpoint_updated_at",
         "FROM metadata_state",
         "WHERE vol = $1",
@@ -1864,12 +1865,16 @@ fn checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping() {
     }
 
     let bump = super::sql::BUMP_METADATA_VERSION;
-    assert!(bump.contains("checkpoint_event_bytes = checkpoint_event_bytes + $3"));
+    assert!(bump.contains("total_event_payload_bytes = total_event_payload_bytes + $3"));
+    assert!(bump.contains("RETURNING"));
+    assert!(bump.contains("checkpoint_total_event_bytes"));
 
     let checkpoint = super::sql::UPSERT_METADATA_CHECKPOINT;
-    assert!(checkpoint.contains("checkpoint_event_bytes = 0"));
+    assert!(
+        checkpoint.contains("checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes")
+    );
     assert!(checkpoint.contains("checkpoint_updated_at = now()"));
-    assert!(checkpoint.contains("EXCLUDED.checkpoint_version >= metadata_state.version"));
+    assert!(!checkpoint.contains("EXCLUDED.checkpoint_version >= metadata_state.version"));
 }
 
 #[test]
@@ -2336,6 +2341,87 @@ fn pg_checkpoint_freshness_request_tracks_publication_and_reset() {
     assert!(!fresh.refresh_needed);
     assert_eq!(fresh.checkpoint_version, Some(batch_version as u64));
     assert_eq!(fresh.event_payload_bytes_since_checkpoint, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_promotion_preserves_post_capture_event_tail() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-tail");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    let batch_version = pg
+        .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 43 }])
+        .expect("publish event batch");
+    assert!(batch_version > 0);
+
+    let volume_id = volume.volume_id;
+    let format_version = CURRENT_FORMAT_VERSION as i16;
+    let version = 0_i64;
+    let checkpoint_version = 0_i64;
+    let checkpoint_total_event_bytes = 0_i64;
+    let snapshot = Vec::<u8>::new();
+    let checkpoint_sha256 = vec![0_u8; 32];
+    let format_info = Vec::<u8>::new();
+    let promoted = run_async(with_pg_test_client(&dsn, move |client| async move {
+        let row = client
+            .query_opt(
+                super::sql::UPSERT_METADATA_CHECKPOINT,
+                &[
+                    &volume_id,
+                    &format_version,
+                    &version,
+                    &checkpoint_version,
+                    &checkpoint_total_event_bytes,
+                    &snapshot,
+                    &checkpoint_sha256,
+                    &format_info,
+                ],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<bool, MetaError>(row.is_some())
+    }))
+    .expect("promote checkpoint after event publication");
+    assert!(
+        promoted,
+        "checkpoint promotion must not starve behind a newer head"
+    );
+
+    let state = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT version, checkpoint_version, total_event_payload_bytes, checkpoint_total_event_bytes FROM metadata_state WHERE vol=$1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<(i64, i64, i64, i64), MetaError>((
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+        ))
+    }))
+    .expect("query checkpoint tail state");
+
+    assert_eq!(state.0, batch_version);
+    assert_eq!(state.1, 0);
+    assert!(state.2 > state.3);
+    assert_eq!(state.3, 0);
 }
 
 #[test]

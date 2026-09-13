@@ -4,7 +4,7 @@
 
 **Goal:** Make PostgreSQL bootstrap checkpoints produce a bounded-lag refresh request when the metadata head is too far ahead by version, accumulated event-payload bytes, or elapsed time on a changing volume.
 
-**Architecture:** PostgreSQL `metadata_state` remains the authoritative place for the checkpoint version, the event-payload byte counter since that checkpoint, and the checkpoint timestamp. Event publication increments the byte counter in the same transaction that advances the metadata head. A small Rust policy evaluates one row of bookkeeping after successful publication or background synchronization and stores an observable, de-duplicated refresh request in the `PgMetaEngine`; it never builds a checkpoint on the foreground mutation path.
+**Architecture:** PostgreSQL `metadata_state` remains the authoritative place for the checkpoint version, monotonic event-payload byte counters, and checkpoint timestamp. Event publication increments the total byte counter in the same transaction that advances the metadata head. A small Rust policy evaluates one row of bookkeeping after successful publication or background synchronization and stores an observable, de-duplicated refresh request in the `PgMetaEngine`; it never builds a checkpoint on the foreground mutation path.
 
 **Tech Stack:** Rust 2024, `studiofs-meta`, PostgreSQL via `tokio-postgres`, `chrono`, redb-backed local metadata, focused Cargo unit tests.
 
@@ -28,6 +28,9 @@ After this change, a busy volume cannot silently accumulate an unbounded bootstr
 - [x] (2026-09-13) Run focused nonzero tests/checks, inspect the diff, and update this plan with evidence: policy/SQL/env 7/7, payload accounting 1/1, schema assertion 1/1, and live PostgreSQL publish/reset 1/1.
 - [x] (2026-09-13) Commit all intended SFS-703 files with the English conventional commit `feat: enforce checkpoint freshness policy`.
 - [x] (2026-09-13) Record the implementation and validation result on Linear SFS-703; the issue is Done and contains the commit/validation summary.
+- [x] (2026-09-13) Verify the attached review item-by-item: confirm the checkpoint starvation and lock-held observation issues, reject the nonexistent `LocalFlushFollowup` path, and confirm the persisted BIGINT boundary for the u64 parser suggestion.
+- [x] (2026-09-13) Fix review-confirmed issues with monotonic total/checkpoint byte counters, capture-before-serialization, PostgreSQL-side age calculation, same-transaction freshness `RETURNING`, poison recovery, typed nonnegative row decoding, threshold/inversion tests, and the redundant payload-vector clone.
+- [x] (2026-09-13) Run focused review regressions, including the live PostgreSQL checkpoint-tail and existing checkpoint-monotonicity tests; update this plan before the review-fix commit.
 
 ## Surprises & Discoveries
 
@@ -37,16 +40,18 @@ After this change, a busy volume cannot silently accumulate an unbounded bootstr
   Evidence: `crates/studiofs-meta/src/pg_engine/sql.rs` and `metadata_io.rs`; a dedicated `checkpoint_updated_at` column is required.
 - Observation: The existing replay-page query already calculates event payload sizes, but using a `SUM` over the event tail on every flush would violate SFS-703's normal-path cost constraint.
   Evidence: `SELECT_FOREIGN_EVENT_ROWS` in `crates/studiofs-meta/src/pg_engine/sql.rs`; the counter will instead be incremented from encoded payload lengths during publication.
-- Observation: A checkpoint writer can race a publication from another client, so blindly resetting the byte counter could discard bytes after the newly written checkpoint.
-  Evidence: `UPSERT_METADATA_CHECKPOINT` now accepts a checkpoint only when its version covers the observed metadata head; otherwise the existing counter and timestamp remain unchanged.
+- Observation: A checkpoint writer can race a publication from another client. A single resettable counter cannot distinguish bytes covered by the serialized checkpoint from bytes published while serialization is in progress.
+  Evidence: the writer now captures `(version, total_event_payload_bytes)` before serialization; promotion records that captured total as `checkpoint_total_event_bytes` and leaves the monotonic total untouched. The upsert no longer requires the serialized version to cover the current head, so a valid checkpoint promotion does not starve under concurrent writes.
+- Observation: PostgreSQL row decoding is the adapter boundary for freshness values. Negative BIGINT versions, counters, or server-computed ages must be rejected before entering the u64 policy domain.
+  Evidence: `metadata_io.rs` validates every freshness/capture BIGINT and rejects inverted byte counters with `MetaError::Storage`.
 
 ## Decision Log
 
 - Decision: Use three independently configurable limits: version lag, encoded event-payload bytes since checkpoint, and checkpoint age in seconds.
   Rationale: These are the three independent acceptance signals in SFS-703 and cover both high event count and high payload volume without scanning the event log.
   Date/Author: 2026-09-13 / Codex.
-- Decision: Persist `checkpoint_event_bytes` and `checkpoint_updated_at` in `metadata_state` and update them in the existing publication/checkpoint SQL.
-  Rationale: All clients then observe the same bounded-lag measurements, and the hot path performs scalar arithmetic rather than an aggregate tail scan.
+- Decision: Persist monotonic `total_event_payload_bytes`, checkpoint baseline `checkpoint_total_event_bytes`, and `checkpoint_updated_at` in `metadata_state` and update them in the existing publication/checkpoint SQL.
+  Rationale: All clients then observe the same bounded-lag measurements, concurrent publication remains visible as `total - checkpoint_total`, and the hot path performs scalar arithmetic rather than an aggregate tail scan.
   Date/Author: 2026-09-13 / Codex.
 - Decision: Expose freshness through a new defaulted `MetaReplication::metadata_checkpoint_freshness_diagnostics` method and forward it through `RuntimeMetaHandle`.
   Rationale: SFS-704 and tests can inspect the request without coupling to the concrete PostgreSQL engine; redb and read-only engines retain a safe default.
@@ -54,8 +59,8 @@ After this change, a busy volume cannot silently accumulate an unbounded bootstr
 - Decision: Deduplicate request transitions and count only `false → true` freshness transitions.
   Rationale: A quiet stale observation must not repeatedly enqueue equivalent refresh work; a later successful checkpoint observation clears the state and permits a future request.
   Date/Author: 2026-09-13 / Codex.
-- Decision: Require an accepted checkpoint version to be at least the current metadata head before resetting freshness bookkeeping.
-  Rationale: A stale checkpoint must not erase the byte count for event batches published concurrently by another client; the next observation will retain the request until a checkpoint covers the head.
+- Decision: Capture the remote head and total byte count before checkpoint serialization, skip serialization when the local head is already stale, and accept a serialized checkpoint without requiring it to cover a newer concurrent remote head.
+  Rationale: The captured baseline identifies exactly which bytes the checkpoint can cover. The monotonic total preserves bytes published after capture, while the absence of a current-head predicate avoids checkpoint starvation under active writes. A checkpoint that started from a stale local head is not attempted.
   Date/Author: 2026-09-13 / Codex.
 - Decision: Use conservative defaults of 10,000 versions, 64 MiB of event payloads, and 3,600 seconds of age; allow positive environment overrides named `STUDIOFS_PG_CHECKPOINT_MAX_VERSION_LAG`, `STUDIOFS_PG_CHECKPOINT_MAX_EVENT_BYTES`, and `STUDIOFS_PG_CHECKPOINT_MAX_AGE_SECS`.
   Rationale: SFS-718 will benchmark and tune thresholds; SFS-703 needs a deterministic configurable policy now.
@@ -63,7 +68,7 @@ After this change, a busy volume cannot silently accumulate an unbounded bootstr
 
 ## Outcomes & Retrospective
 
-The pure policy tests demonstrate independent version, payload-byte, and changing-volume age triggers; the tracker test demonstrates de-duplicated requests. The live PostgreSQL test demonstrates atomic publication bookkeeping and reset after an accepted checkpoint. Focused `studiofs-meta` and `studiofs-vfs` clippy checks pass with `-D warnings`, the application compile check passes, and formatting/diff checks pass. Linear SFS-703 is now Done with the commit and validation summary attached. No full workspace suite or mounted WinFSP benchmark was run, in accordance with the repository gate; SFS-704 still needs to consume `metadata_checkpoint_freshness_diagnostics` from its fenced background coordinator.
+The pure policy tests demonstrate independent version, payload-byte, and changing-volume age triggers, inclusive precedence boundaries, and fail-closed version inversion; the tracker test demonstrates de-duplicated requests. The live PostgreSQL tests demonstrate atomic publication bookkeeping/reset, checkpoint promotion with a post-capture event tail, and remote-head monotonicity. The review fixes also remove the publication-time freshness round trip, use PostgreSQL server time, recover poisoned diagnostics state, validate BIGINT values before policy evaluation, and remove the unnecessary payload-vector clone. Focused `studiofs-meta` and `studiofs-vfs` clippy checks, the application compile check, formatting, and diff checks remain the required validation boundary. No full workspace suite or mounted WinFSP benchmark was run; SFS-704 still needs to consume `metadata_checkpoint_freshness_diagnostics` from its fenced background coordinator.
 
 ## Context and Orientation
 
@@ -101,13 +106,13 @@ Run `cargo test -p studiofs-meta checkpoint_freshness --lib` and expect all four
 
 **Files:**
 
-- Modify: `crates/studiofs-meta/src/pg_engine/schema.rs` to add `checkpoint_event_bytes BIGINT NOT NULL DEFAULT 0 CHECK (checkpoint_event_bytes >= 0)` and `checkpoint_updated_at TIMESTAMPTZ NOT NULL DEFAULT now()` to fresh and additive `metadata_state` DDL.
+- Modify: `crates/studiofs-meta/src/pg_engine/schema.rs` to add monotonic `total_event_payload_bytes`, checkpoint baseline `checkpoint_total_event_bytes`, and `checkpoint_updated_at` to fresh and additive `metadata_state` DDL.
 - Modify: `crates/studiofs-meta/src/pg_engine.rs` schema validation to require both columns.
-- Modify: `crates/studiofs-meta/src/pg_engine/sql.rs` to add a one-row freshness query, make `BUMP_METADATA_VERSION` add the supplied payload-byte count, and make `UPSERT_METADATA_CHECKPOINT` reset the byte counter and timestamp whenever a checkpoint is promoted.
-- Modify: `crates/studiofs-meta/src/pg_engine/metadata_io.rs` to calculate the encoded payload-byte count while splitting batches, pass it to the bump query, and decode the one-row freshness observation using `chrono::DateTime<Utc>`.
+- Modify: `crates/studiofs-meta/src/pg_engine/sql.rs` to add one-row freshness/capture queries, make `BUMP_METADATA_VERSION` add the supplied payload-byte count and return freshness state, and make `UPSERT_METADATA_CHECKPOINT` advance the checkpoint baseline and timestamp without resetting the monotonic total.
+- Modify: `crates/studiofs-meta/src/pg_engine/metadata_io.rs` to calculate the encoded payload-byte count while splitting batches, pass it to the bump query, decode validated nonnegative BIGINT values, and use PostgreSQL server time for checkpoint age.
 - Modify: `crates/studiofs-meta/src/pg_engine/tests/lifecycle.rs` and `schema.rs` tests where SQL fragments are asserted.
 
-The byte count must be the exact sum of encoded `event_payload` lengths, checked against `BIGINT`; it must not count response framing or run an event-log aggregate. The increment and event inserts must remain in the same transaction. The checkpoint upsert must reset the counter and set `checkpoint_updated_at = now()` only on an accepted current-format checkpoint update. Existing additive schema statements must use `IF NOT EXISTS` and retain the existing default/check constraints.
+The byte count must be the exact sum of encoded `event_payload` lengths, checked against `BIGINT`; it must not count response framing or run an event-log aggregate. The increment and event inserts must remain in the same transaction. The checkpoint upsert must advance the checkpoint baseline and set `checkpoint_updated_at = now()` only on an accepted current-format checkpoint update. Existing additive schema statements must use `IF NOT EXISTS` and retain the nonnegative/cross-counter constraints.
 
 Run the schema/unit SQL tests and the focused metadata library tests. Do not run ignored PostgreSQL tests unless the requested environment is explicitly available; if it is unavailable, report that boundary instead of treating skipped tests as evidence.
 
@@ -140,7 +145,7 @@ Run only focused validation from `E:\dev\studiofs-cli`, at minimum:
     cargo check -p studiofs-vfs
     git diff --check
 
-If changed SQL or lifecycle behavior requires it and the local `.env` provides `STUDIOFS_TEST_PG_DSN`, run the named ignored SFS-703-focused PostgreSQL tests explicitly with `cargo test -p studiofs-meta <filter> --lib -- --ignored --nocapture`; otherwise state that PostgreSQL integration and native mount gates remain environment-gated. Inspect `git diff`, confirm the new tests ran nonzero tests, and commit with a message such as `feat: enforce checkpoint freshness policy`. Add an English Linear comment with the commit and exact focused validation; do not include DSNs or secrets.
+If changed SQL or lifecycle behavior requires it and the local `.env` provides `STUDIOFS_TEST_PG_DSN`, run the named ignored SFS-703-focused PostgreSQL tests explicitly with `cargo test -p studiofs-meta <filter> --lib -- --ignored --nocapture`; otherwise state that PostgreSQL integration and native mount gates remain environment-gated. Inspect `git diff`, confirm the new tests ran nonzero tests, and commit the review fixes with a conventional `fix:` message; do not include DSNs or secrets.
 
 ## Concrete Steps
 
@@ -152,9 +157,9 @@ After each green milestone, update `Progress` with the observed test count and e
 
 ## Validation and Acceptance
 
-The policy unit tests demonstrate the three independent triggers: a version lag at its threshold, an event-payload byte count at its threshold, and an old checkpoint age on a changed volume. The quiet-volume test demonstrates no request when head equals checkpoint and no repeated request while the same stale state is observed. SQL/schema tests demonstrate the persisted counter and timestamp exist in both fresh and additive schema paths, publication increments the counter transactionally, and checkpoint promotion resets it.
+The policy unit tests demonstrate the three independent triggers: a version lag at its threshold, an event-payload byte count at its threshold, and an old checkpoint age on a changed volume. They also cover inclusive precedence boundaries and fail-closed version inversion. The quiet-volume test demonstrates no request when head equals checkpoint and no repeated request while the same stale state is observed. SQL/schema tests demonstrate the persisted monotonic counters and timestamp exist in both fresh and additive schema paths, publication increments the total transactionally, and checkpoint promotion advances the baseline while preserving a post-capture tail.
 
-The implementation satisfies SFS-703 when a successful background publication or sync can make `metadata_checkpoint_freshness_diagnostics().refresh_needed == true` with a reason and measurements, while a current checkpoint reports false and does not increase `refresh_requests` on repeated observations. A future SFS-704 coordinator can consume this state and build the checkpoint in its fenced background path. Focused Rust checks must exit zero with nonzero matching test counts. Full workspace suites and live mount benchmarks are explicitly outside this task unless the user separately requests them.
+The implementation satisfies SFS-703 when a successful background publication or sync can make `metadata_checkpoint_freshness_diagnostics().refresh_needed == true` with a reason and measurements, while a current checkpoint reports false and does not increase `refresh_requests` on repeated observations. Checkpoint publication must preserve bytes added after serialization capture, and adapter decoding must reject negative or inconsistent persisted counters. A future SFS-704 coordinator can consume this state and build the checkpoint in its fenced background path. Focused Rust checks must exit zero with nonzero matching test counts. Full workspace suites and live mount benchmarks are explicitly outside this task unless the user separately requests them.
 
 ## Idempotence and Recovery
 
@@ -207,3 +212,5 @@ The policy depends only on `std::time::Duration` and scalar observations. The Po
 2026-09-13: Recorded the completed focused validation and commit milestone; the remaining delivery action is the Linear update.
 
 2026-09-13: Recorded the Linear completion update and marked the delivery milestone complete.
+
+2026-09-13: Incorporated the attached review: replaced the resettable byte counter with monotonic total/baseline bookkeeping, removed the strict current-head upsert predicate, added capture-before-serialization and server-side age, reused publication `RETURNING`, validated adapter values, recovered poisoned state, removed the payload clone, and added focused boundary/tail regressions. Review items describing `LocalFlushFollowup` were not applicable to the current code, and direct u64 config parsing was not adopted because persisted counters are PostgreSQL BIGINT values.
