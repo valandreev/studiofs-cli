@@ -6,11 +6,10 @@ use super::{
     PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess,
     StartupSnapshotImportMode, runtime, sql,
 };
-use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaFormat, MetaResult};
+use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -810,114 +809,6 @@ impl PgMetaEngine {
             oversized,
             rows,
         })
-    }
-
-    /// Publish a checkpoint only when the local version can advance the remote
-    /// checkpoint and is not already stale behind the remote head.
-    ///
-    /// An already-current checkpoint is skipped when its format metadata is
-    /// present; an empty format-info value remains a repairable metadata row.
-    pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
-        self.ensure_remote_format_validated()?;
-        let freshness = self.read_remote_checkpoint_freshness()?;
-        let local_version =
-            u64::try_from(self.local_version.load(Ordering::SeqCst)).map_err(|_| {
-                MetaError::Storage("local metadata version must be nonnegative".to_string())
-            })?;
-        if (freshness.head_version > local_version || freshness.checkpoint_version >= local_version)
-            && freshness.format_info_present
-        {
-            tracing::debug!(
-                volume_id = self.volume_id,
-                remote_head = freshness.head_version,
-                remote_checkpoint = freshness.checkpoint_version,
-                local_version,
-                "skipping checkpoint write because remote checkpoint is current or local version is behind remote head"
-            );
-            self.record_checkpoint_freshness_observation(freshness);
-            return Ok(());
-        }
-
-        let command_pool = self.command_pool.clone();
-        let volume_id = self.volume_id;
-        let payload = self.local.export_serving_checkpoint_bytes()?;
-        let format_info = self.local.get_format_info()?;
-        let metadata_format_version = i16::try_from(format_info.format_version).map_err(|_| {
-            MetaError::Storage("metadata format version exceeds PostgreSQL SMALLINT".to_string())
-        })?;
-        let checkpoint_sha256 = Sha256::digest(&payload);
-        let format_info = serde_json::to_vec(&format_info).map_err(|error| {
-            MetaError::Serialization(format!("format info encode failed: {error}"))
-        })?;
-        let version = i64::try_from(local_version).map_err(|_| {
-            MetaError::Storage("local metadata version exceeds PostgreSQL BIGINT".to_string())
-        })?;
-        let checkpoint_total_event_bytes = i64::try_from(freshness.total_event_payload_bytes)
-            .map_err(|_| {
-                MetaError::Storage(
-                    "checkpoint payload byte counter exceeds PostgreSQL BIGINT".to_string(),
-                )
-            })?;
-        let command_timeout = self.command_timeout;
-
-        let result = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                command_pool,
-                command_timeout,
-                "write checkpoint",
-                move |client| {
-                    Box::pin(async move {
-                        let upserted = client
-                            .query_opt(
-                                sql::UPSERT_METADATA_CHECKPOINT,
-                                &[
-                                    &volume_id,
-                                    &metadata_format_version,
-                                    &version,
-                                    &version,
-                                    &checkpoint_total_event_bytes,
-                                    &payload,
-                                    &checkpoint_sha256.as_slice(),
-                                    &format_info,
-                                ],
-                            )
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error("postgres checkpoint upsert failed", e)
-                            })?;
-
-                        let observation = upserted
-                            .as_ref()
-                            .map(checkpoint_freshness_observation_from_row)
-                            .transpose()?;
-
-                        if upserted.is_none() {
-                            let row = client
-                                .query_one(
-                                    "SELECT metadata_format_version FROM metadata_state WHERE vol = $1",
-                                    &[&volume_id],
-                                )
-                                .await
-                                .map_err(|e| {
-                                    Self::classify_pg_error(
-                                        "postgres checkpoint format revalidation failed",
-                                        e,
-                                    )
-                                })?;
-                            crate::ensure_supported_pg_sync_format_version(row.get(0))?;
-                        }
-
-                        Ok(observation)
-                    })
-                },
-            )
-            .await
-        });
-        let result = self.record_remote_operation_result(result);
-        if let Ok(Some(observation)) = &result {
-            self.record_checkpoint_freshness_observation(*observation);
-        }
-        result.map(|_| ())
     }
 }
 

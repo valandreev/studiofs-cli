@@ -290,20 +290,30 @@ fn join_worker_until(
     while !handle.is_finished() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let worker = worker_name(worker);
+            let worker_label = worker_name(worker);
+            if matches!(worker, PgBackgroundWorker::Checkpoint) {
+                warn!(
+                    worker = worker_label,
+                    "pg checkpoint thread exceeded shutdown join timeout; joining before releasing the metadata engine"
+                );
+                return join_worker(handle, worker_label);
+            }
             warn!(
-                worker,
+                worker = worker_label,
                 "pg background thread did not stop before shutdown join timeout"
             );
             return Err(MetaError::Storage(format!(
-                "pg {worker} background thread did not stop before shutdown join timeout"
+                "pg {worker_label} background thread did not stop before shutdown join timeout"
             )));
         }
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 
+    join_worker(handle, worker_name(worker))
+}
+
+fn join_worker(handle: std::thread::JoinHandle<()>, worker: &'static str) -> MetaResult<()> {
     handle.join().map_err(|_| {
-        let worker = worker_name(worker);
         warn!(worker, "pg background thread panicked during shutdown join");
         MetaError::Storage(format!(
             "pg {worker} background thread panicked during shutdown join"

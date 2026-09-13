@@ -15,19 +15,21 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn flush_metadata(&self) -> MetaResult<()> {
-        let _guard = self
-            .replication_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        self.ensure_remote_format_validated()?;
-        self.replay_local_upload_ledger()?;
-        let recent_flush = if let Some(batch) = self.claim_pending_batch(true) {
-            self.flush_pending_claimed_batch_with_restore(batch)?
-        } else {
-            None
-        };
-        let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
-        self.write_checkpoint_locked()?;
+        {
+            let _guard = self
+                .replication_lock
+                .lock()
+                .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+            self.ensure_remote_format_validated()?;
+            self.replay_local_upload_ledger()?;
+            let recent_flush = if let Some(batch) = self.claim_pending_batch(true) {
+                self.flush_pending_claimed_batch_with_restore(batch)?
+            } else {
+                None
+            };
+            let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
+        }
+        self.write_checkpoint_with_lease()?;
         self.local.flush_local_metadata()
     }
 

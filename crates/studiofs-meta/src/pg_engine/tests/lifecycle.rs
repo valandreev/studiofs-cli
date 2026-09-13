@@ -622,6 +622,55 @@ fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
 }
 
 #[test]
+fn prepare_for_close_joins_checkpoint_worker_before_releasing_redb() {
+    let (dir, engine) = temp_pg_engine_for_unit();
+    let local = Arc::clone(&engine.local);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("pg-test-slow-checkpoint-close".into())
+        .spawn(move || {
+            started_tx.send(()).expect("signal checkpoint worker start");
+            release_rx.recv().expect("release checkpoint worker");
+            drop(local);
+        })
+        .expect("spawn slow checkpoint worker");
+    engine
+        .background_workers
+        .install_handle(PgBackgroundWorker::Checkpoint, handle)
+        .expect("install slow checkpoint worker");
+    started_rx.recv().expect("wait for checkpoint worker start");
+
+    let engine = Arc::new(engine);
+    let closing_engine = Arc::clone(&engine);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let close_thread = std::thread::spawn(move || {
+        let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
+        result_tx
+            .send(closing_engine.prepare_for_close())
+            .expect("send checkpoint close result");
+    });
+
+    assert!(
+        result_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "checkpoint close must not release its worker after the bounded deadline"
+    );
+    release_tx.send(()).expect("release checkpoint worker");
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("checkpoint close should finish after worker release")
+        .expect("checkpoint worker should join successfully");
+    close_thread.join().expect("join checkpoint close thread");
+    drop(engine);
+
+    let reopened = RedbMetaEngine::open(dir.path().join("meta.redb"));
+    assert!(
+        reopened.is_ok(),
+        "redb should be reopenable after checkpoint worker join"
+    );
+}
+
+#[test]
 fn prepare_for_close_serializes_lazy_worker_registration() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     let engine = std::sync::Arc::new(engine);
@@ -2453,12 +2502,73 @@ fn pg_checkpoint_freshness_request_tracks_publication_and_reset() {
     assert!(stale.event_payload_bytes_since_checkpoint > 0);
 
     pg.local_version.store(batch_version, Ordering::SeqCst);
-    pg.write_checkpoint_locked()
+    pg.write_checkpoint_with_lease()
         .expect("write fresh checkpoint");
     let fresh = pg.checkpoint_freshness_diagnostics();
     assert!(!fresh.refresh_needed);
     assert_eq!(fresh.checkpoint_version, Some(batch_version as u64));
     assert_eq!(fresh.event_payload_bytes_since_checkpoint, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_explicit_flush_defers_checkpoint_while_another_lease_owner_is_active() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-explicit-checkpoint-lease");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+
+    create_published_small_file(&pg, ROOT_INO, b"lease-held.txt", 44_011);
+    let owner = "other-checkpoint-owner";
+    let lease = pg
+        .try_claim_checkpoint_lease(owner, Duration::from_secs(60))
+        .expect("claim competing checkpoint lease")
+        .expect("competing owner should acquire checkpoint lease");
+    let before = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT checkpoint_generation, checkpoint_version FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(i64, i64), MetaError>((row.get(0), row.get(1)))
+    }))
+    .expect("read checkpoint before explicit flush");
+
+    pg.flush_metadata()
+        .expect("explicit flush should defer checkpoint publication");
+
+    let after = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT checkpoint_generation, checkpoint_version FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(i64, i64), MetaError>((row.get(0), row.get(1)))
+    }))
+    .expect("read checkpoint after explicit flush");
+    assert_eq!(
+        after, before,
+        "explicit flush must not bypass the active lease"
+    );
+
+    pg.release_checkpoint_lease(owner, lease)
+        .expect("release competing checkpoint lease");
 }
 
 #[test]
@@ -2833,7 +2943,7 @@ fn pg_checkpoint_skip_records_remote_stale_observation() {
         "stale local state must not claim a checkpoint lease"
     );
 
-    pg.write_checkpoint_locked()
+    pg.write_checkpoint_with_lease()
         .expect("skip stale local checkpoint write");
     let diagnostics = pg.checkpoint_freshness_diagnostics();
     assert_eq!(diagnostics.head_version, Some(1));
@@ -2866,7 +2976,7 @@ fn pg_checkpoint_skip_when_remote_checkpoint_covers_local_version() {
         },
     )
     .expect("open pg");
-    pg.write_checkpoint_locked()
+    pg.write_checkpoint_with_lease()
         .expect("skip already-current checkpoint write");
 
     let checkpoint_generation = run_async(with_pg_test_client(&dsn, |client| async move {
@@ -2902,10 +3012,10 @@ fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
 
     let pg = PgMetaEngine::open(&db).expect("open pg");
     pg.local_version.store(10, Ordering::SeqCst);
-    pg.write_checkpoint_locked()
+    pg.write_checkpoint_with_lease()
         .expect("write newer checkpoint");
     pg.local_version.store(5, Ordering::SeqCst);
-    pg.write_checkpoint_locked()
+    pg.write_checkpoint_with_lease()
         .expect("write stale checkpoint");
 
     let version = run_async(with_pg_test_client(&dsn, |client| async move {
@@ -2953,7 +3063,7 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
     .expect("restore legacy metadata format");
 
     let error = pg
-        .write_checkpoint_locked()
+        .write_checkpoint_with_lease()
         .expect_err("checkpoint upsert must reject a legacy metadata row");
     assert!(
         matches!(
@@ -3067,7 +3177,7 @@ fn test_pg_checkpoint_repairs_missing_remote_format_info() {
     }))
     .expect("clear remote format info");
 
-    pg.write_checkpoint_locked()
+    pg.write_checkpoint_with_lease()
         .expect("write checkpoint with format info");
 
     let actual = run_async(with_pg_test_client(&dsn, |client| async move {

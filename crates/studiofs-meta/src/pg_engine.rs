@@ -219,6 +219,7 @@ pub struct PgMetaEngine {
     checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy,
     checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
     checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState,
+    checkpoint_single_flight: Mutex<()>,
     command_pool: Arc<runtime::PgConnectionPool>,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
@@ -1062,6 +1063,7 @@ impl PgMetaEngine {
                 checkpoint_freshness::CheckpointFreshnessState::new(&checkpoint_freshness_policy),
             ),
             checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
+            checkpoint_single_flight: Mutex::new(()),
             command_pool: Arc::new(runtime::PgConnectionPool::new(
                 pg.url.clone(),
                 connect_timeout,

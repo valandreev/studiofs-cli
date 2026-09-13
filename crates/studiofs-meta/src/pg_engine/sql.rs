@@ -77,7 +77,11 @@ pub(super) const INSERT_EVENT_LOG_BATCH: &str = r#"
     FROM UNNEST($5::text[], $6::bytea[]) AS batch(event_type, event_payload)
     "#;
 
-pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
+macro_rules! checkpoint_upsert {
+    ($prefix:expr, $values:expr, $conflict_where:expr) => {
+        concat!(
+            $prefix,
+            r#"
     INSERT INTO metadata_state (
         vol,
         metadata_format_version,
@@ -92,9 +96,12 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
         checkpoint_generation,
         checkpoint_updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, 'published', 1, now())
+    "#,
+            $values,
+            r#"
     ON CONFLICT (vol) DO UPDATE
-    SET version = GREATEST(metadata_state.version, EXCLUDED.version),
+    SET
+        version = GREATEST(metadata_state.version, EXCLUDED.version),
         checkpoint_version = EXCLUDED.checkpoint_version,
         checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes,
         snapshot = EXCLUDED.snapshot,
@@ -104,8 +111,9 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
         checkpoint_generation = metadata_state.checkpoint_generation + 1,
         checkpoint_updated_at = now(),
         updated_at = now()
-    WHERE metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
-      AND EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
+    "#,
+            $conflict_where,
+            r#"
     RETURNING
         version,
         checkpoint_version,
@@ -117,7 +125,22 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
         ) AS checkpoint_age_ms,
         octet_length(format_info) > 0 AS format_info_present,
         metadata_format_version
-    "#;
+    "#
+        )
+    };
+}
+
+#[cfg(test)]
+pub(super) const UPSERT_METADATA_CHECKPOINT: &str = checkpoint_upsert!(
+    "",
+    r#"
+    VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, 'published', 1, now())
+    "#,
+    r#"
+    WHERE metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
+      AND EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
+    "#
+);
 
 pub(super) const CLAIM_BOOTSTRAP_CHECKPOINT_LEASE: &str = r#"
     INSERT INTO bootstrap_checkpoint_leases (
@@ -162,7 +185,8 @@ pub(super) const RELEASE_BOOTSTRAP_CHECKPOINT_LEASE: &str = r#"
       AND fencing_token = $3
     "#;
 
-pub(super) const UPSERT_FENCED_METADATA_CHECKPOINT: &str = r#"
+pub(super) const UPSERT_FENCED_METADATA_CHECKPOINT: &str = checkpoint_upsert!(
+    r#"
     WITH active_lease AS MATERIALIZED (
         SELECT vol
         FROM bootstrap_checkpoint_leases
@@ -172,20 +196,8 @@ pub(super) const UPSERT_FENCED_METADATA_CHECKPOINT: &str = r#"
           AND lease_expires_at > clock_timestamp()
         FOR SHARE
     )
-    INSERT INTO metadata_state (
-        vol,
-        metadata_format_version,
-        version,
-        checkpoint_version,
-        total_event_payload_bytes,
-        checkpoint_total_event_bytes,
-        snapshot,
-        checkpoint_sha256,
-        format_info,
-        checkpoint_publication_state,
-        checkpoint_generation,
-        checkpoint_updated_at
-    )
+    "#,
+    r#"
     SELECT
         $1,
         $2,
@@ -200,35 +212,16 @@ pub(super) const UPSERT_FENCED_METADATA_CHECKPOINT: &str = r#"
         1,
         now()
     FROM active_lease
-    ON CONFLICT (vol) DO UPDATE
-    SET version = GREATEST(metadata_state.version, EXCLUDED.version),
-        checkpoint_version = EXCLUDED.checkpoint_version,
-        checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes,
-        snapshot = EXCLUDED.snapshot,
-        checkpoint_sha256 = EXCLUDED.checkpoint_sha256,
-        format_info = EXCLUDED.format_info,
-        checkpoint_publication_state = EXCLUDED.checkpoint_publication_state,
-        checkpoint_generation = metadata_state.checkpoint_generation + 1,
-        checkpoint_updated_at = now(),
-        updated_at = now()
+    "#,
+    r#"
     WHERE EXISTS (SELECT 1 FROM active_lease)
       AND metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
       AND (
           EXCLUDED.checkpoint_version > metadata_state.checkpoint_version
           OR COALESCE(octet_length(metadata_state.format_info), 0) = 0
       )
-    RETURNING
-        version,
-        checkpoint_version,
-        total_event_payload_bytes,
-        checkpoint_total_event_bytes,
-        GREATEST(
-            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
-            0::BIGINT
-        ) AS checkpoint_age_ms,
-        octet_length(format_info) > 0 AS format_info_present,
-        metadata_format_version
-    "#;
+    "#
+);
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
     WITH candidate_batches AS (

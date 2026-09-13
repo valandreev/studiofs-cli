@@ -181,6 +181,9 @@ impl PgMetaEngine {
     }
 
     pub(super) fn run_checkpoint_refresh_once(&self, lease_duration: Duration) -> MetaResult<bool> {
+        let _single_flight = self.checkpoint_single_flight.lock().map_err(|_| {
+            MetaError::Storage("pg checkpoint single-flight lock poisoned".to_string())
+        })?;
         self.ensure_remote_format_validated()?;
         let Some(cut) = self.capture_checkpoint_source_cut()? else {
             return Ok(!self.checkpoint_freshness_diagnostics().refresh_needed);
@@ -204,6 +207,11 @@ impl PgMetaEngine {
             );
         }
         result
+    }
+
+    pub(super) fn write_checkpoint_with_lease(&self) -> MetaResult<()> {
+        self.run_checkpoint_refresh_once(Self::default_checkpoint_lease_duration())
+            .map(|_| ())
     }
 
     fn build_and_publish_checkpoint(
@@ -241,16 +249,23 @@ impl PgMetaEngine {
     }
 
     fn capture_checkpoint_source_cut(&self) -> MetaResult<Option<CheckpointSourceCut>> {
+        let local_version_before = self.local_version.load(Ordering::Acquire);
         let freshness = self.read_remote_checkpoint_freshness()?;
         let _guard = self
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        let local_version = self.local_version.load(Ordering::Acquire);
+        let Some(local_version) =
+            checkpoint_source_version_if_stable(local_version_before, local_version)
+        else {
+            self.record_checkpoint_freshness_observation(freshness);
+            return Ok(None);
+        };
         let Some(event_seq) = self.checkpoint_source_event_seq()? else {
             self.record_checkpoint_freshness_observation(freshness);
             return Ok(None);
         };
-        let local_version = self.local_version.load(Ordering::Acquire);
         let local_version_u64 = u64::try_from(local_version).map_err(|_| {
             MetaError::Storage("local metadata version must be nonnegative".to_string())
         })?;
@@ -364,7 +379,11 @@ impl PgMetaEngine {
         self.record_remote_operation_result(result)
     }
 
-    fn release_checkpoint_lease(&self, owner: &str, lease: CheckpointLease) -> MetaResult<()> {
+    pub(super) fn release_checkpoint_lease(
+        &self,
+        owner: &str,
+        lease: CheckpointLease,
+    ) -> MetaResult<()> {
         let command_pool = Arc::clone(&self.command_pool);
         let command_timeout = self.command_timeout;
         let volume_id = self.volume_id;
@@ -460,6 +479,10 @@ impl PgMetaEngine {
         });
         self.record_remote_operation_result(result)
     }
+}
+
+fn checkpoint_source_version_if_stable(observed: i64, current: i64) -> Option<i64> {
+    (observed == current).then_some(current)
 }
 
 fn next_checkpoint_retry_delay(current: Duration, base: Duration) -> Duration {
@@ -585,6 +608,12 @@ mod tests {
             ..PendingReplicationState::default()
         };
         assert_eq!(checkpoint_source_event_seq_if_clean(pending, 7, 7, 0), None);
+    }
+
+    #[test]
+    fn checkpoint_source_version_must_not_advance_during_freshness_read() {
+        assert_eq!(checkpoint_source_version_if_stable(7, 7), Some(7));
+        assert_eq!(checkpoint_source_version_if_stable(7, 8), None);
     }
 
     #[test]
