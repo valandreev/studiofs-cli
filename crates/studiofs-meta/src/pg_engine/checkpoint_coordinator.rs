@@ -73,10 +73,6 @@ impl PgMetaEngine {
         }
     }
 
-    pub(super) fn clear_checkpoint_refresh_request(&self) {
-        self.checkpoint_coordinator_state.clear();
-    }
-
     pub(super) fn start_background_checkpoint_coordinator(
         engine: Weak<Self>,
         shutdown: Arc<AtomicBool>,
@@ -149,7 +145,7 @@ impl PgMetaEngine {
                             retry_pending = false;
                         }
                         Ok(false) => {
-                            engine.rearm_checkpoint_refresh();
+                            engine.checkpoint_coordinator_state.request();
                             retry_pending = true;
                         }
                         Err(error) => {
@@ -158,7 +154,7 @@ impl PgMetaEngine {
                                 volume_id = engine.volume_id,
                                 "postgres background checkpoint coordination did not complete"
                             );
-                            engine.rearm_checkpoint_refresh();
+                            engine.checkpoint_coordinator_state.request();
                             retry_pending = true;
                         }
                     }
@@ -169,10 +165,6 @@ impl PgMetaEngine {
                     "failed to spawn pg-meta-checkpoint thread: {error}"
                 ))
             })
-    }
-
-    fn rearm_checkpoint_refresh(&self) {
-        self.checkpoint_coordinator_state.request();
     }
 
     fn run_checkpoint_refresh_once(&self, lease_duration: Duration) -> MetaResult<bool> {

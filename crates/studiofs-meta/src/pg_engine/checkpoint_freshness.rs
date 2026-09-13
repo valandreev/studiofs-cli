@@ -206,7 +206,7 @@ impl super::PgMetaEngine {
         if refresh_needed {
             self.request_checkpoint_refresh();
         } else {
-            self.clear_checkpoint_refresh_request();
+            self.checkpoint_coordinator_state.clear();
         }
     }
 
