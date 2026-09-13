@@ -447,6 +447,8 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
                 &checkpoint_freshness::CheckpointFreshnessPolicy::default(),
             ),
         ),
+        checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
+        checkpoint_single_flight: Mutex::new(()),
         command_pool: Arc::new(
             PgConnectionPool::new(
                 "postgres://127.0.0.1:1/studiofs".to_string(),

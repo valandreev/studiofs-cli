@@ -668,6 +668,12 @@ PostgreSQL metadata invalidation uses push-plus-poll behavior:
   `STUDIOFS_PG_CHECKPOINT_MAX_AGE_SECS` values when measuring a deployment.
   The policy records the request reason in metadata diagnostics; it does not
   build a checkpoint in the foreground mutation path.
+- `STUDIOFS_PG_CHECKPOINT_LEASE_SECS` controls the PostgreSQL checkpoint lease
+  duration and defaults to `300` seconds. `STUDIOFS_PG_CHECKPOINT_RETRY_MS`
+  controls the initial retry interval and defaults to `1000` milliseconds.
+  Failed coordination attempts use exponential backoff with jitter, capped at
+  30 seconds (or the configured retry interval when it is larger).
+  Missing, malformed, zero, or negative values use these defaults.
 - Lock lease notifications stay on `studiofs_lock_vol_<volume_id>` and are not
   part of general namespace/attr/payload invalidation.
 
