@@ -230,6 +230,16 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
     })
 }
 
+fn rebind_postgres_volume_id(format_info_bytes: &[u8], volume_id: i64) -> DumpLoadResult<Vec<u8>> {
+    let mut format_info = decode_format_info(format_info_bytes)?;
+    let postgres =
+        format_info.metadata.postgres.as_mut().ok_or_else(|| {
+            DumpLoadError::Message("dump format is not postgres-backed".to_string())
+        })?;
+    postgres.volume_id = volume_id;
+    Ok(serde_json::to_vec(&format_info)?)
+}
+
 pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
@@ -303,6 +313,8 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 .await
                 .map_err(|e| DumpLoadError::Message(format!("upsert volume failed: {e}")))?;
             let target_vol: i64 = row.get(0);
+            let format_info_bytes =
+                rebind_postgres_volume_id(&dump.metadata_state_format_info, target_vol)?;
 
             let has_snapshot_v2_state: bool = tx
                 .query_one(
@@ -345,7 +357,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     &dump.metadata_state_checkpoint_version,
                     &dump.metadata_state_snapshot,
                     &dump.metadata_state_checkpoint_sha256,
-                    &dump.metadata_state_format_info,
+                    &format_info_bytes,
                     &dump.metadata_state_publication_state,
                     &dump.metadata_state_generation,
                 ],
@@ -593,6 +605,34 @@ mod tests {
                 reason: studiofs_meta::CheckpointDescriptorFailure::PublicationState
             })
         ));
+    }
+
+    #[test]
+    fn load_rebinds_persisted_postgres_volume_id() {
+        let mut format_info = studiofs_meta::FormatInfo::new(
+            "test".to_string(),
+            "test-uuid".to_string(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "http://localhost:9000".to_string(),
+                bucket: "test-bucket".to_string(),
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            4,
+        )
+        .unwrap();
+        format_info.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
+        format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
+            url: "postgres://localhost".to_string(),
+            volume_id: 7,
+        });
+        let bytes = serde_json::to_vec(&format_info).unwrap();
+
+        let rebound = rebind_postgres_volume_id(&bytes, 42).unwrap();
+        let rebound = studiofs_meta::decode_format_info(&rebound).unwrap();
+
+        assert_eq!(rebound.metadata.postgres.unwrap().volume_id, 42);
     }
 
     #[test]
