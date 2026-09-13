@@ -270,6 +270,76 @@ impl RedbMetaEngine {
         self.import_serving_checkpoint(&checkpoint)
     }
 
+    /// Initialize a local database from a validated PostgreSQL serving checkpoint.
+    ///
+    /// The caller remains responsible for installing the completed database at
+    /// its active path. This method records the replay positions and fresh
+    /// client gate together with the imported serving view, then forces the
+    /// local durability barrier before returning.
+    pub fn initialize_discovered_postgres_checkpoint(
+        &self,
+        format_info: &FormatInfo,
+        checkpoint_bytes: &[u8],
+        checkpoint_version: i64,
+    ) -> MetaResult<()> {
+        if checkpoint_version < 0 {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::Version,
+            });
+        }
+        if format_info.metadata.backend != MetadataBackend::Postgres {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::FormatInfo,
+            });
+        }
+        let Some(postgres) = format_info.metadata.postgres.as_ref() else {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::FormatInfo,
+            });
+        };
+        if postgres.url.trim().is_empty() {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::FormatInfo,
+            });
+        }
+        let checkpoint_version = u64::try_from(checkpoint_version).map_err(|_| {
+            MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::Version,
+            }
+        })?;
+        self.import_serving_checkpoint_bytes(checkpoint_bytes)?;
+        self.set_format_info(format_info)?;
+        let root_attr = self.get_attr(ROOT_INO)?;
+        if root_attr.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(ROOT_INO));
+        }
+
+        let txn = self.begin_write_txn()?;
+        {
+            let mut counters = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (name, value) in [
+                (
+                    crate::pg_engine::LOCAL_PG_VERSION_COUNTER,
+                    checkpoint_version,
+                ),
+                (
+                    crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER,
+                    checkpoint_version,
+                ),
+                (crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1),
+            ] {
+                counters
+                    .insert(name, value)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.sync_local_metadata()
+    }
+
     /// Replace the serving view while retaining the local event journal used
     /// by the repair/replay path.
     pub(crate) fn import_serving_checkpoint_preserving_local_event_log(

@@ -3,9 +3,8 @@
 use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
-    FormatInfo, MetaError, MetaFormat, MetaOpenOptions, PgSnapshotBackend, RedbMetaEngine,
-    connect_studiofs_postgres, decode_format_info as decode_persisted_format_info,
-    ensure_studiofs_database, open_meta_engine_with_options,
+    FormatInfo, MetaError, PgSnapshotBackend, RedbMetaEngine, connect_studiofs_postgres,
+    decode_format_info as decode_persisted_format_info, ensure_studiofs_database,
 };
 use thiserror::Error;
 
@@ -30,8 +29,8 @@ Download the latest PostgreSQL checkpoint for an existing shared volume and \
 create the local metadata cache for this client.
 
 Use this on additional machines or user profiles after the volume was created \
-with `studiofs init`. Runtime convergence after discovery continues through \
-PostgreSQL delta batches.")]
+with `studiofs init`. Discovery installs one validated local checkpoint; runtime \
+convergence starts later when the local metadata engine is mounted.")]
 #[command(after_help = "\
 EXAMPLES:
   Discover a volume from PostgreSQL:
@@ -57,6 +56,7 @@ impl DiscoverArgs {
 
 struct DiscoveredState {
     volume_id: i64,
+    checkpoint_version: i64,
     serving_checkpoint: Vec<u8>,
     format_info: FormatInfo,
 }
@@ -72,10 +72,7 @@ const FETCH_REMOTE_VOLUME_ID_QUERY: &str = r#"
 
 fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<DiscoveredState> {
     let (postgres_dsn, volume_id) = crate::runtime_bridge::block_on(async move {
-        let postgres_dsn = ensure_studiofs_database(meta_dsn)
-            .await
-            .map_err(|e| DiscoveryError::Message(e.to_string()))?
-            .metadata_dsn;
+        let postgres_dsn = ensure_studiofs_database(meta_dsn).await?.metadata_dsn;
         let volume_id = fetch_remote_volume_id(name, &postgres_dsn).await?;
         Ok::<_, DiscoveryError>((postgres_dsn, volume_id))
     })?;
@@ -99,15 +96,14 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
 
     Ok(DiscoveredState {
         volume_id: descriptor.volume_id,
+        checkpoint_version: descriptor.checkpoint_version,
         serving_checkpoint: descriptor.checkpoint_bytes,
         format_info,
     })
 }
 
 async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResult<i64> {
-    let (client, connection) = connect_studiofs_postgres(postgres_dsn)
-        .await
-        .map_err(|e| DiscoveryError::Message(e.to_string()))?;
+    let (client, connection) = connect_studiofs_postgres(postgres_dsn).await?;
     let conn_task = tokio::spawn(connection);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -136,56 +132,121 @@ async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResu
     result
 }
 
+fn install_staged_database(staged_db_path: &Path, active_db_path: &Path) -> DiscoveryResult<()> {
+    std::fs::hard_link(staged_db_path, active_db_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return DiscoveryError::Message(format!(
+                "local metadata already exists at {} (remove it first or use another name)",
+                active_db_path.display()
+            ));
+        }
+        if is_hard_link_unsupported(&error) {
+            return DiscoveryError::Message(format!(
+                "cannot atomically install local metadata at {}: the filesystem does not support hard links",
+                active_db_path.display()
+            ));
+        }
+        DiscoveryError::Io(error)
+    })
+}
+
+fn is_hard_link_unsupported(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        // FAT/exFAT may report missing hard-link support as these Win32 codes,
+        // which std maps to ErrorKind::Uncategorized.
+        match error.raw_os_error() {
+            Some(code) => code == 1 || code == 50, // ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED
+            None => false,
+        }
+    }
+    #[cfg(unix)]
+    {
+        // FAT/exFAT may report missing hard-link support as EPERM rather than
+        // the Unsupported error kind.
+        error.raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn sync_metadata_directory(meta_dir: &Path) {
+    // The redb file sync above is the required durability barrier. Directory
+    // fsync is an additional best-effort hint: once the complete database has
+    // been linked into the active name, returning an error here would leave a
+    // valid database installed while making a retry impossible.
+    let _ = std::fs::File::open(meta_dir).and_then(|directory| directory.sync_all());
+}
+
+#[cfg(not(unix))]
+fn sync_metadata_directory(_meta_dir: &Path) {
+    // Windows does not provide a portable directory-handle fsync operation.
+}
+
+fn ensure_active_database_absent(active_db_path: &Path) -> DiscoveryResult<()> {
+    match std::fs::symlink_metadata(active_db_path) {
+        Ok(_) => Err(DiscoveryError::Message(format!(
+            "local metadata already exists at {} (remove it first or use another name)",
+            active_db_path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DiscoveryError::Io(error)),
+    }
+}
+
 fn create_local_snapshot(
     name: &str,
     meta_dir: &Path,
     state: DiscoveredState,
 ) -> DiscoveryResult<std::path::PathBuf> {
-    std::fs::create_dir_all(meta_dir)?;
-    let db_path = meta_dir.join(format!("{name}.db"));
-    if db_path.exists() {
-        return Err(DiscoveryError::Message(format!(
-            "local metadata already exists at {} (remove it first or use another name)",
-            db_path.display()
-        )));
-    }
-
     let DiscoveredState {
+        checkpoint_version,
         serving_checkpoint,
         format_info,
         ..
     } = state;
-    let engine = RedbMetaEngine::open(&db_path)?;
-    engine.import_serving_checkpoint_bytes(&serving_checkpoint)?;
-    engine.set_format_info(&format_info)?;
-    let (uid, gid) = {
-        #[cfg(unix)]
-        // SAFETY: these libc calls are safe here; StudioFS trusts a valid OS process context.
-        unsafe {
-            (libc::getuid(), libc::getgid())
-        }
-        #[cfg(windows)]
-        {
-            (0, 0)
-        }
-    };
-    engine.init_root(uid, gid)?;
+    if checkpoint_version < 0 {
+        return Err(DiscoveryError::Message(
+            "discovered checkpoint version must not be negative".to_string(),
+        ));
+    }
+
+    std::fs::create_dir_all(meta_dir)?;
+    let active_db_path = meta_dir.join(format!("{name}.db"));
+    ensure_active_database_absent(&active_db_path)?;
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix(".discover-")
+        .tempdir_in(meta_dir)?;
+    let temp_db_path = temp_dir.path().join(format!("{name}.db"));
+
+    let engine = RedbMetaEngine::open(&temp_db_path)?;
+    engine.initialize_discovered_postgres_checkpoint(
+        &format_info,
+        &serving_checkpoint,
+        checkpoint_version,
+    )?;
     drop(engine);
 
-    let primed_engine = open_meta_engine_with_options(
-        &db_path,
-        MetaOpenOptions {
-            background_poll: false,
-            fresh_client: true,
-            ..Default::default()
-        },
-    )?;
-    drop(primed_engine);
+    // A hard link is atomic and no-replace, and fails if another process
+    // installed the active database while this checkpoint was being staged.
+    install_staged_database(&temp_db_path, &active_db_path)?;
+    sync_metadata_directory(meta_dir);
 
-    Ok(db_path)
+    Ok(active_db_path)
 }
 
 pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
+    let active_db_path = meta_dir.join(format!("{name}.db"));
+    ensure_active_database_absent(&active_db_path)?;
+
     let discovered = load_remote_discovery_state(name, meta_dsn)?;
     let volume_id = discovered.volume_id;
     let db_path = create_local_snapshot(name, meta_dir, discovered)?;
@@ -199,6 +260,9 @@ pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_meta::{
+        FormatInfoDataStore, MetaInodes, MetadataBackend, MetadataConfig, PostgresConfig,
+    };
 
     #[test]
     fn discover_parses_name_and_meta_dsn() {
@@ -223,5 +287,258 @@ mod tests {
     fn discover_volume_query_requires_metadata_state() {
         assert!(FETCH_REMOTE_VOLUME_ID_QUERY.contains("INNER JOIN metadata_state"));
         assert!(FETCH_REMOTE_VOLUME_ID_QUERY.contains("ms.vol = v.vol"));
+    }
+
+    fn test_discovered_state(serving_checkpoint: Vec<u8>) -> DiscoveredState {
+        let mut format_info = FormatInfo::new(
+            "discovered".to_string(),
+            "discovered-uuid".to_string(),
+            FormatInfoDataStore {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "studiofs-test".to_string(),
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            16,
+        )
+        .expect("create test format info");
+        format_info.metadata = MetadataConfig {
+            backend: MetadataBackend::Postgres,
+            remote: None,
+            postgres: Some(PostgresConfig {
+                url: "postgres://studiofs@localhost/studiofs".to_string(),
+                volume_id: 7,
+            }),
+        };
+
+        DiscoveredState {
+            volume_id: 7,
+            checkpoint_version: 42,
+            serving_checkpoint,
+            format_info,
+        }
+    }
+
+    #[test]
+    fn discover_installs_checkpoint_without_opening_runtime_engine() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        let checkpoint_dir = tempfile::tempdir().expect("create checkpoint source directory");
+        let checkpoint_source_path = checkpoint_dir.path().join("source.db");
+        let checkpoint_source =
+            RedbMetaEngine::open(&checkpoint_source_path).expect("open checkpoint source");
+        checkpoint_source
+            .init_root(0, 0)
+            .expect("initialize checkpoint source");
+        let checkpoint = checkpoint_source
+            .export_serving_checkpoint_bytes()
+            .expect("encode serving checkpoint");
+        drop(checkpoint_source);
+
+        let db_path = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(checkpoint),
+        )
+        .expect("install discovered checkpoint");
+
+        let engine = RedbMetaEngine::open(&db_path).expect("open installed local database");
+        assert_eq!(
+            engine
+                .get_counter("pgLastAppliedBatchVersion")
+                .expect("read replay cursor"),
+            42
+        );
+        assert_eq!(
+            engine
+                .get_counter("pgLastAppliedNamespaceBatchVersion")
+                .expect("read namespace replay cursor"),
+            42
+        );
+        assert_eq!(
+            engine
+                .get_counter("pgFreshClientPending")
+                .expect("read fresh-client marker"),
+            1
+        );
+        assert!(engine.get_attr(studiofs_meta::ROOT_INO).is_ok());
+        assert_eq!(
+            std::fs::read_dir(meta_dir.path())
+                .expect("read metadata directory")
+                .count(),
+            1,
+            "successful discovery must leave only the active database in metadata directory"
+        );
+    }
+
+    #[test]
+    fn discover_maps_active_database_install_race_to_domain_error() {
+        let dir = tempfile::tempdir().expect("create metadata directory");
+        let staged_path = dir.path().join("staged.db");
+        let active_path = dir.path().join("discovered.db");
+        std::fs::write(&staged_path, b"staged").expect("create staged database");
+        std::fs::write(&active_path, b"active").expect("create active database");
+
+        let error = install_staged_database(&staged_path, &active_path)
+            .expect_err("existing active database must reject installation");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
+    }
+
+    #[test]
+    fn discover_failure_does_not_install_partial_active_database() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+
+        let error = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(b"invalid checkpoint".to_vec()),
+        )
+        .expect_err("invalid checkpoint must fail discovery");
+
+        assert!(matches!(error, DiscoveryError::Meta(_)));
+        assert!(!meta_dir.path().join("discovered.db").exists());
+        assert_eq!(
+            std::fs::read_dir(meta_dir.path())
+                .expect("read metadata directory")
+                .count(),
+            0,
+            "failed discovery must clean its temporary database"
+        );
+    }
+
+    #[test]
+    fn discover_rejects_checkpoint_without_root() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        let checkpoint_dir = tempfile::tempdir().expect("create checkpoint source directory");
+        let checkpoint_source_path = checkpoint_dir.path().join("source.db");
+        let checkpoint_source =
+            RedbMetaEngine::open(&checkpoint_source_path).expect("open empty checkpoint source");
+        let checkpoint = checkpoint_source
+            .export_serving_checkpoint_bytes()
+            .expect("encode empty serving checkpoint");
+        drop(checkpoint_source);
+
+        let error = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(checkpoint),
+        )
+        .expect_err("checkpoint without root must fail discovery");
+
+        assert!(matches!(error, DiscoveryError::Meta(_)));
+        assert!(!meta_dir.path().join("discovered.db").exists());
+    }
+
+    #[test]
+    fn discover_rejects_negative_checkpoint_before_touching_metadata_directory() {
+        let meta_file = tempfile::NamedTempFile::new().expect("create metadata file");
+        let mut state = test_discovered_state(Vec::new());
+        state.checkpoint_version = -1;
+
+        let error = create_local_snapshot("discovered", meta_file.path(), state)
+            .expect_err("negative checkpoint version must fail before disk I/O");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::Message(message)
+                if message == "discovered checkpoint version must not be negative"
+        ));
+    }
+
+    #[test]
+    fn discover_refuses_existing_active_database() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        let active_db_path = meta_dir.path().join("discovered.db");
+        std::fs::write(&active_db_path, b"keep this database")
+            .expect("create existing active database");
+
+        let error = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(Vec::new()),
+        )
+        .expect_err("existing active database must be preserved");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
+        assert_eq!(
+            std::fs::read(&active_db_path).expect("read existing active database"),
+            b"keep this database"
+        );
+        assert_eq!(
+            std::fs::read_dir(meta_dir.path())
+                .expect("read metadata directory")
+                .count(),
+            1,
+            "existing active database must not create staging files"
+        );
+    }
+
+    #[test]
+    fn discover_refuses_existing_active_database_before_remote_work() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        std::fs::write(meta_dir.path().join("discovered.db"), b"keep this database")
+            .expect("create existing active database");
+
+        let error = run("discovered", "", meta_dir.path())
+            .expect_err("existing active database must fail before PostgreSQL access");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_directory_sync_is_best_effort() {
+        let dir = tempfile::tempdir().expect("create metadata directory");
+        let missing_directory = dir.path().join("missing");
+
+        sync_metadata_directory(&missing_directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_refuses_dangling_active_database_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        let active_db_path = meta_dir.path().join("discovered.db");
+        symlink("missing.db", &active_db_path).expect("create dangling active symlink");
+
+        let error = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(Vec::new()),
+        )
+        .expect_err("dangling active database symlink must be preserved");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
+        assert!(std::fs::symlink_metadata(active_db_path).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hard_link_unsupported_recognizes_uncategorized_win32_errors() {
+        assert!(is_hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(1)
+        ));
+        assert!(is_hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(50)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_unsupported_recognizes_eperm() {
+        assert!(is_hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(libc::EPERM,)
+        ));
     }
 }

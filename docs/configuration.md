@@ -127,8 +127,7 @@ Attaches another client to an existing PG-backed volume.
 studiofs discover <name> --meta <postgres-server-dsn>
 ```
 
-Target behavior (SFS-695; implemented by the runtime follow-ups SFS-696
-through SFS-698):
+Current behavior (SFS-695 through SFS-705):
 
 - reads one consistent latest remote-visible checkpoint and frozen startup
   target from PostgreSQL,
@@ -137,14 +136,12 @@ through SFS-698):
 - imports the checkpoint before bounded, paged, resumable replay of later
   PostgreSQL delta batches,
 - keeps the fresh client read-only until the startup target and write authority
-  are both available.
-
-Current transitional behavior: until SFS-696 through SFS-698 land,
-`fetch_remote_state` reads the volume, snapshot, and format bytes but does not
-yet return checkpoint/head versions. `create_local_snapshot` then primes a
-`PgMetaEngine`, whose current open path may synchronously catch up toward the
-moving PostgreSQL head. The current command does not yet expose an independent
-fresh-client authority state or the target read-only gate described above.
+  are both available,
+- persists the checkpoint replay cursor and fresh-client read-only marker,
+- installs the completed local redb database atomically after a durability
+  barrier, and
+- returns before constructing `PgMetaEngine` or replaying the PostgreSQL event
+  log. Runtime convergence begins when the local database is mounted.
 
 `discover` is the bootstrap path for a new client and a manual repair tool. A
 normal client restart/reopen should recover pending PG metadata convergence
