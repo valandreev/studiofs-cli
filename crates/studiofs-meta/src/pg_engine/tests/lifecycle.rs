@@ -1874,6 +1874,21 @@ fn checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping() {
         checkpoint.contains("checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes")
     );
     assert!(checkpoint.contains("checkpoint_updated_at = now()"));
+    for fragment in [
+        "RETURNING",
+        "version",
+        "checkpoint_version",
+        "total_event_payload_bytes",
+        "checkpoint_total_event_bytes",
+        "checkpoint_age_ms",
+        "format_info_present",
+        "metadata_format_version",
+    ] {
+        assert!(
+            checkpoint.contains(fragment),
+            "checkpoint upsert is missing {fragment}"
+        );
+    }
     assert!(!checkpoint.contains("EXCLUDED.checkpoint_version >= metadata_state.version"));
 }
 
@@ -2470,6 +2485,48 @@ fn pg_checkpoint_skip_records_remote_stale_observation() {
         diagnostics.refresh_reason,
         Some(MetadataCheckpointRefreshReason::VersionLag)
     );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_skip_when_remote_checkpoint_covers_local_version() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-current");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    pg.write_checkpoint_locked()
+        .expect("skip already-current checkpoint write");
+
+    let checkpoint_generation = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT checkpoint_generation FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<i64, MetaError>(row.get(0))
+    }))
+    .expect("query checkpoint generation");
+
+    assert_eq!(checkpoint_generation, 1);
+    let diagnostics = pg.checkpoint_freshness_diagnostics();
+    assert_eq!(diagnostics.head_version, Some(0));
+    assert_eq!(diagnostics.checkpoint_version, Some(0));
+    assert!(!diagnostics.refresh_needed);
 }
 
 #[test]

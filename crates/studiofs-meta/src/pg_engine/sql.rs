@@ -12,21 +12,9 @@ pub(super) const SELECT_CHECKPOINT_FRESHNESS: &str = r#"
         GREATEST(
             (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
             0::BIGINT
-        ) AS checkpoint_age_ms
-    FROM metadata_state
-    WHERE vol = $1
-    "#;
-
-pub(super) const SELECT_CHECKPOINT_CAPTURE: &str = r#"
-    SELECT
-        version,
-        checkpoint_version,
-        total_event_payload_bytes,
-        checkpoint_total_event_bytes,
-        GREATEST(
-            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
-            0::BIGINT
-        ) AS checkpoint_age_ms
+        ) AS checkpoint_age_ms,
+        octet_length(format_info) > 0 AS format_info_present,
+        metadata_format_version
     FROM metadata_state
     WHERE vol = $1
     "#;
@@ -65,7 +53,9 @@ pub(super) const BUMP_METADATA_VERSION: &str = r#"
         GREATEST(
             (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
             0::BIGINT
-        ) AS checkpoint_age_ms
+        ) AS checkpoint_age_ms,
+        octet_length(format_info) > 0 AS format_info_present,
+        metadata_format_version
     "#;
 
 pub(super) const INSERT_EVENT_LOG_BATCH: &str = r#"
@@ -116,7 +106,17 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
         updated_at = now()
     WHERE metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
       AND EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
-    RETURNING metadata_format_version
+    RETURNING
+        version,
+        checkpoint_version,
+        total_event_payload_bytes,
+        checkpoint_total_event_bytes,
+        GREATEST(
+            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
+            0::BIGINT
+        ) AS checkpoint_age_ms,
+        octet_length(format_info) > 0 AS format_info_present,
+        metadata_format_version
     "#;
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
