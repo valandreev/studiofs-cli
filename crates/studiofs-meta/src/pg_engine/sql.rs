@@ -3,6 +3,12 @@ pub(super) const SELECT_METADATA_VERSION: &str = "SELECT version FROM metadata_s
 pub(super) const SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION: &str =
     "SELECT version, checkpoint_version FROM metadata_state WHERE vol=$1";
 
+pub(super) const SELECT_CHECKPOINT_FRESHNESS: &str = r#"
+    SELECT version, checkpoint_version, checkpoint_event_bytes, checkpoint_updated_at
+    FROM metadata_state
+    WHERE vol = $1
+    "#;
+
 pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
     SELECT
         v.vol,
@@ -26,6 +32,7 @@ pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =
 pub(super) const BUMP_METADATA_VERSION: &str = r#"
     UPDATE metadata_state
     SET version = version + 1,
+        checkpoint_event_bytes = checkpoint_event_bytes + $3,
         updated_at = now()
     WHERE vol = $1 AND metadata_format_version = $2
     RETURNING version
@@ -56,24 +63,29 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
         metadata_format_version,
         version,
         checkpoint_version,
+        checkpoint_event_bytes,
         snapshot,
         checkpoint_sha256,
         format_info,
         checkpoint_publication_state,
-        checkpoint_generation
+        checkpoint_generation,
+        checkpoint_updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'published', 1)
+    VALUES ($1, $2, $3, $4, 0, $5, $6, $7, 'published', 1, now())
     ON CONFLICT (vol) DO UPDATE
     SET version = GREATEST(metadata_state.version, EXCLUDED.version),
         checkpoint_version = EXCLUDED.checkpoint_version,
+        checkpoint_event_bytes = 0,
         snapshot = EXCLUDED.snapshot,
         checkpoint_sha256 = EXCLUDED.checkpoint_sha256,
         format_info = EXCLUDED.format_info,
         checkpoint_publication_state = EXCLUDED.checkpoint_publication_state,
         checkpoint_generation = metadata_state.checkpoint_generation + 1,
+        checkpoint_updated_at = now(),
         updated_at = now()
     WHERE metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
       AND EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
+      AND EXCLUDED.checkpoint_version >= metadata_state.version
     RETURNING metadata_format_version
     "#;
 

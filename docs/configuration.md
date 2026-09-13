@@ -660,6 +660,14 @@ PostgreSQL metadata invalidation uses push-plus-poll behavior:
   malformed, or oversized values fail startup.
   Budget the sum of all client pool sizes below PostgreSQL `max_connections`,
   with headroom for administrative and other server connections.
+- Bootstrap checkpoint freshness requests use conservative defaults of `10000`
+  metadata versions, `67108864` encoded event-payload bytes, or `3600` seconds
+  of age while the volume is changing. Override them with positive
+  `STUDIOFS_PG_CHECKPOINT_MAX_VERSION_LAG`,
+  `STUDIOFS_PG_CHECKPOINT_MAX_EVENT_BYTES`, and
+  `STUDIOFS_PG_CHECKPOINT_MAX_AGE_SECS` values when measuring a deployment.
+  The policy records the request reason in metadata diagnostics; it does not
+  build a checkpoint in the foreground mutation path.
 - Lock lease notifications stay on `studiofs_lock_vol_<volume_id>` and are not
   part of general namespace/attr/payload invalidation.
 

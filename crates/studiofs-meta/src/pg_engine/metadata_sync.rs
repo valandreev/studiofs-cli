@@ -85,6 +85,7 @@ impl PgMetaEngine {
                     .store(true, Ordering::Release);
                 self.metadata_last_successful_sync_unix_ms
                     .store(Self::now_millis(), Ordering::Relaxed);
+                self.observe_checkpoint_freshness();
                 if source == MetadataSyncSource::FallbackPoll && *changed {
                     self.metadata_fallback_poll_discoveries
                         .fetch_add(1, Ordering::Relaxed);

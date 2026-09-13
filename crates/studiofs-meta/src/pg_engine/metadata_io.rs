@@ -10,6 +10,7 @@ use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaFormat, MetaRe
 use crate::events::{MetaEvent, encode_event};
 use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -133,6 +134,7 @@ pub(super) struct ForeignEventPage {
 struct EncodedRemoteEventBatch {
     events: Vec<MetaEvent>,
     payloads: Vec<Vec<u8>>,
+    payload_bytes: i64,
 }
 
 async fn read_remote_metadata_head_version_with_pool(
@@ -225,6 +227,78 @@ async fn read_remote_metadata_head_and_checkpoint_version_with_pool(
     .await
 }
 
+pub(super) struct CheckpointFreshnessObservation {
+    pub(super) head_version: i64,
+    pub(super) checkpoint_version: i64,
+    pub(super) event_payload_bytes: i64,
+    pub(super) checkpoint_age: std::time::Duration,
+}
+
+async fn read_checkpoint_freshness_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<CheckpointFreshnessObservation> {
+    PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "checkpoint freshness observation",
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(sql::SELECT_CHECKPOINT_FRESHNESS, &[&volume_id])
+                    .await
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres checkpoint freshness select failed",
+                            e,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "postgres metadata_state row missing during checkpoint freshness observation"
+                                .to_string(),
+                        )
+                    })?;
+                let head_version = row.try_get(0).map_err(|e| {
+                    PgMetaEngine::classify_pg_error(
+                        "postgres checkpoint freshness head parse failed",
+                        e,
+                    )
+                })?;
+                let checkpoint_version = row.try_get(1).map_err(|e| {
+                    PgMetaEngine::classify_pg_error(
+                        "postgres checkpoint freshness version parse failed",
+                        e,
+                    )
+                })?;
+                let event_payload_bytes = row.try_get(2).map_err(|e| {
+                    PgMetaEngine::classify_pg_error(
+                        "postgres checkpoint freshness byte counter parse failed",
+                        e,
+                    )
+                })?;
+                let checkpoint_updated_at: DateTime<Utc> = row.try_get(3).map_err(|e| {
+                    PgMetaEngine::classify_pg_error(
+                        "postgres checkpoint freshness timestamp parse failed",
+                        e,
+                    )
+                })?;
+                Ok(CheckpointFreshnessObservation {
+                    head_version,
+                    checkpoint_version,
+                    event_payload_bytes,
+                    checkpoint_age: super::checkpoint_freshness::checkpoint_age_since(
+                        checkpoint_updated_at,
+                        Utc::now(),
+                    ),
+                })
+            })
+        },
+    )
+    .await
+}
+
 // Match the page query's sizing expression: two BIGINT columns plus a
 // conservative four-byte varlena header for each TEXT column.
 const PG_EVENT_FIXED_RESPONSE_BYTES: i64 = 8 + 8 + 4 + 4;
@@ -264,6 +338,16 @@ impl ForeignEventPage {
 }
 
 impl PgMetaEngine {
+    pub(super) fn read_remote_checkpoint_freshness(
+        &self,
+    ) -> MetaResult<CheckpointFreshnessObservation> {
+        self.run_async(read_checkpoint_freshness_with_pool(
+            self.command_pool.clone(),
+            self.volume_id,
+            self.command_timeout,
+        ))
+    }
+
     pub(super) fn validate_foreign_event_page_limits(
         max_batch_count: i64,
         max_response_bytes: i64,
@@ -403,7 +487,11 @@ impl PgMetaEngine {
                         let batch_version_row = tx
                             .query_opt(
                                 sql::BUMP_METADATA_VERSION,
-                                &[&volume_id, &expected_metadata_format_version],
+                                &[
+                                    &volume_id,
+                                    &expected_metadata_format_version,
+                                    &batch.payload_bytes,
+                                ],
                             )
                             .await
                             .map_err(|e| {
@@ -533,7 +621,11 @@ impl PgMetaEngine {
             )
             .await
         });
-        self.record_remote_operation_result(result)
+        let result = self.record_remote_operation_result(result);
+        if result.is_ok() {
+            self.observe_checkpoint_freshness();
+        }
+        result
     }
 
     fn split_projected_event_batches(
@@ -545,9 +637,13 @@ impl PgMetaEngine {
         let mut batch_events = Vec::new();
         let mut batch_payloads = Vec::new();
         let mut batch_response_bytes = 0_i64;
+        let mut batch_payload_bytes = 0_i64;
 
         for event in events {
             let payload = encode_event(&event)?;
+            let payload_len = i64::try_from(payload.len()).map_err(|_| {
+                MetaError::Storage("event payload length exceeds BIGINT".to_string())
+            })?;
             let event_response_bytes =
                 encoded_event_response_bytes(event.kind(), payload.len(), client_id)?;
             if event_response_bytes > max_response_bytes {
@@ -564,8 +660,10 @@ impl PgMetaEngine {
                 batches.push(EncodedRemoteEventBatch {
                     events: std::mem::take(&mut batch_events),
                     payloads: std::mem::take(&mut batch_payloads),
+                    payload_bytes: batch_payload_bytes,
                 });
                 batch_response_bytes = 0;
+                batch_payload_bytes = 0;
             }
 
             batch_response_bytes = batch_response_bytes
@@ -573,6 +671,12 @@ impl PgMetaEngine {
                 .ok_or_else(|| {
                     MetaError::Storage("event response size exceeds BIGINT".to_string())
                 })?;
+            batch_payload_bytes =
+                batch_payload_bytes
+                    .checked_add(payload_len)
+                    .ok_or_else(|| {
+                        MetaError::Storage("event payload size exceeds BIGINT".to_string())
+                    })?;
             batch_events.push(event);
             batch_payloads.push(payload);
         }
@@ -581,6 +685,7 @@ impl PgMetaEngine {
             batches.push(EncodedRemoteEventBatch {
                 events: batch_events,
                 payloads: batch_payloads,
+                payload_bytes: batch_payload_bytes,
             });
         }
         Ok(batches)
@@ -719,6 +824,35 @@ impl PgMetaEngine {
             )
             .await
         });
-        self.record_remote_operation_result(result)
+        let result = self.record_remote_operation_result(result);
+        if result.is_ok() {
+            self.observe_checkpoint_freshness();
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_payload_byte_accounting_matches_event_payloads() {
+        let events = vec![
+            MetaEvent::RemoveAttr { ino: 1 },
+            MetaEvent::RemoveAttr { ino: 2 },
+            MetaEvent::RemoveAttr { ino: 3 },
+        ];
+        let expected = events
+            .iter()
+            .map(|event| encode_event(event).expect("test event should encode").len() as i64)
+            .sum::<i64>();
+
+        let batches =
+            PgMetaEngine::split_projected_event_batches(events, "client-slot:1", i64::MAX)
+                .expect("test events should fit in one batch");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].payload_bytes, expected);
     }
 }

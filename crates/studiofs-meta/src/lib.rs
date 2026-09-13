@@ -46,9 +46,10 @@ pub use engine::{
     BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, LocalStorageCompactionResult,
     MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes,
     MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult, MetaSymlink,
-    MetaXattr, MetadataBatchWriteObservability, MetadataCoherenceProgress,
-    MetadataWriteObservability, MetadataWriteStageTiming, NamespaceMutation, PgSyncLifecycle,
-    PgSyncStatus, RegularFileOverlayMutation,
+    MetaXattr, MetadataBatchWriteObservability, MetadataCheckpointFreshnessDiagnostics,
+    MetadataCheckpointRefreshReason, MetadataCoherenceProgress, MetadataWriteObservability,
+    MetadataWriteStageTiming, NamespaceMutation, PgSyncLifecycle, PgSyncStatus,
+    RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{
