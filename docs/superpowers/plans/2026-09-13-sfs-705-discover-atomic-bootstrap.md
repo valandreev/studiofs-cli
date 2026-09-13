@@ -1,0 +1,152 @@
+# SFS-705 atomic discover bootstrap
+
+This ExecPlan is a living document. It follows `.agent/PLANS.md` and records
+the implementation decisions and validation evidence for SFS-705.
+
+## Purpose / Big Picture
+
+Make `studiofs discover` install exactly one validated PostgreSQL serving
+checkpoint into a local redb database without opening `PgMetaEngine` or
+starting event-log catch-up. The active local database must appear only after
+the complete temporary database is durable; a failed import or durability step
+must leave no active partial database.
+
+## Progress
+
+- [x] 2026-09-13: Read the Linear SFS-705 contract, completed blockers SFS-702
+  and SFS-698, repository contracts, scoped metadata instructions, and the
+  existing descriptor/discovery implementation.
+- [x] 2026-09-13: Confirmed the branch is
+  `feature/sfs-705-make-discover-a-pure-atomic-checkpoint-bootstrap` and the
+  worktree is clean.
+- [x] 2026-09-13: Added focused discovery tests for atomic installation,
+  replay-cursor persistence, no runtime-engine open, and failed-install
+  cleanup.
+- [x] 2026-09-13: Implemented temporary redb installation, durable barrier,
+  and atomic active-path rename.
+- [x] 2026-09-13: Focused tests, checks, formatting, final diff inspection, and
+  commit preparation completed.
+
+## Surprises & Discoveries
+
+- SFS-702 already provides `PgSnapshotBackend::read_bootstrap_checkpoint`,
+  which validates volume identity, format, publication state, checksum, and
+  checkpoint bytes before discovery receives the descriptor.
+- `RedbMetaEngine::import_serving_checkpoint_bytes` replaces remote serving
+  state but intentionally does not persist PostgreSQL replay counters; the
+  normal runtime path adds the replay cursor after import. Discover must do
+  that directly because it must not construct `PgMetaEngine`.
+- `RedbMetaEngine` exposes the strict local durability barrier through the
+  public `MetaReplication::sync_local_metadata` contract. This is the existing
+  redb durability boundary and avoids adding an OS-specific fsync abstraction.
+
+## Decision Log
+
+- Decision: Use `tempfile::TempDir` inside the metadata directory and rename a
+  completed database file into the active path. Rationale: the temporary path
+  is unique, remains on the same filesystem, and is automatically cleaned when
+  import or durability fails.
+- Decision: Keep the existing refusal when the active `<name>.db` already
+  exists. Rationale: SFS-705 requires explicit replacement rules and must not
+  silently overwrite a valid unrelated local volume.
+- Decision: Persist `pgLastAppliedBatchVersion` at exactly the descriptor's
+  non-negative `checkpoint_version`, plus `pgFreshClientPending = 1` before
+  installation. Rationale: the next normal mount must start catch-up after the
+  imported checkpoint while retaining the fresh-client read-only gate.
+- Decision: Do not add a new metadata-engine API or remote read path. Rationale:
+  SFS-702's validated descriptor API is the intended bootstrap boundary, and
+  the CLI adapter can complete local installation with existing redb contracts.
+
+## Outcomes & Retrospective
+
+The implementation meets the portable SFS-705 acceptance checks: discovery
+imports the validated serving checkpoint into a temporary redb database,
+persists the exact checkpoint replay cursor and fresh-client marker, forces
+the existing immediate durability barrier, and only then renames the file to
+the active path. It no longer constructs `PgMetaEngine` or starts event-log
+catch-up. Invalid checkpoint bytes leave both the active path and temporary
+directory clean.
+
+Focused validation passed:
+
+- `cargo test -p studiofs --bin studiofs discover_` — 6 passed, 0 failed.
+- `cargo check -p studiofs` — passed.
+- `cargo clippy -p studiofs --all-targets -- -D warnings` — passed using a
+  task-specific temporary Cargo target directory because the repository
+  `target` directory returned Windows access-denied errors.
+- `cargo fmt --all -- --check` — passed.
+- `git diff --check` — passed.
+
+PostgreSQL service and mounted-E2E acceptance were not run; they remain
+environment-gated and are outside the focused validation boundary.
+
+## Context and Orientation
+
+`crates/studiofs/src/cli/discovery.rs` resolves a PostgreSQL volume name,
+reads the validated bootstrap descriptor through `PgSnapshotBackend`, and
+installs local metadata. `crates/studiofs-meta/src/pg_engine/metadata_io.rs`
+contains the shared descriptor read/validation path. The redb snapshot import
+is implemented by `RedbMetaEngine` in
+`crates/studiofs-meta/src/redb_engine/snapshots.rs`; its local durability
+barrier is in `crates/studiofs-meta/src/redb_engine.rs`. Normal mount opens the
+local database through `PgMetaEngine`, so discover must stop before that
+boundary.
+
+## Plan of Work
+
+1. Extend `DiscoveredState` with the descriptor checkpoint version and retain
+   the validated format/checkpoint bytes already obtained from PostgreSQL.
+2. Replace direct active-file creation in `create_local_snapshot` with a
+   unique temporary database. Import the checkpoint, persist format/root and
+   fresh-client/replay state, force the local durability barrier, close redb,
+   and rename the temporary file into the active path.
+3. Add focused unit tests that prove the helper succeeds without a usable
+   PostgreSQL runtime URL, persists the exact replay cursor and marker, refuses
+   an existing active database, and removes failed temporary installs without
+   leaving an active database.
+4. Update command documentation/plan evidence only where current transitional
+   behavior is contradicted by the new implementation. Run focused package
+   tests and checks; leave mounted/service acceptance explicitly reported when
+   prerequisites are unavailable.
+
+## Concrete Steps
+
+All commands run from `E:\dev\studiofs-cli`.
+
+- Add tests before the implementation and run:
+  `cargo test -p studiofs --bin studiofs discover_`
+- Implement the temporary install and run the same focused tests.
+- Run `cargo fmt --all -- --check`, `cargo check -p studiofs`,
+  `cargo clippy -p studiofs --all-targets -- -D warnings`, and
+  `git diff --check`.
+- Do not run workspace-wide or full ignored suites.
+
+## Validation and Acceptance
+
+Portable acceptance requires nonzero focused discovery tests proving that the
+active path is absent on import failure, the installed local counter equals
+`checkpoint_version`, and the installation completes with no runtime engine
+open. Compilation, Clippy, formatting, and diff checks must pass. PostgreSQL
+and mounted-E2E acceptance remain separate environment-gated checks unless the
+required services are available.
+
+## Idempotence and Recovery
+
+An existing active database is rejected before temporary work begins. A
+temporary directory owns the in-progress database and removes it on every
+failure path. The rename occurs only after redb's immediate durability barrier
+and after the engine handle is dropped.
+
+## Artifacts and Notes
+
+The implementation artifact is `crates/studiofs/src/cli/discovery.rs`; this
+living plan records decisions and validation. Credentials, DSNs, and secret
+format fields must not be copied into logs, tests, or this plan.
+
+## Interfaces and Dependencies
+
+Use the existing `PgSnapshotBackend::read_bootstrap_checkpoint`,
+`RedbMetaEngine::import_serving_checkpoint_bytes`, `MetaFormat`,
+`MetaInodes`, and `MetaReplication` contracts. Use the already-declared
+`tempfile` dependency for unique same-filesystem temporary directories. No
+new dependency or public runtime API is expected.
