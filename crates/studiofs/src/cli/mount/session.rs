@@ -24,6 +24,8 @@ use studiofs_cache::{
     DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalPayloadRuntime, prepare_local_payload_runtime,
 };
 use studiofs_data::{DataStoreConfig, normalize_s3_endpoint_transport};
+use studiofs_meta::engine::MetaError;
+use studiofs_meta::schema::MetadataBackend;
 use studiofs_meta::snapshot::SnapshotId;
 use studiofs_meta::{
     FormatInfo, MetaEngine, MetaFormat, MetaOpenOptions, MetaReplication, open_meta_engine,
@@ -1875,30 +1877,30 @@ fn admit_live_mount_format_info(
     format_info: FormatInfo,
     consistency: studiofs_meta::engine::MetaResult<()>,
 ) -> anyhow::Result<FormatInfo> {
-    if let Err(e) = consistency {
-        if let studiofs_meta::engine::MetaError::UuidMismatch { local, remote } = &e {
-            anyhow::bail!(
-                "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
-                name,
-                local,
-                remote,
-                utils::format_cleanup_command(name)
-            );
-        }
-        if matches!(
-            &format_info.metadata.backend,
-            studiofs_meta::schema::MetadataBackend::Postgres
-        ) && matches!(
-            &e,
-            studiofs_meta::engine::MetaError::RemoteUnavailable(_)
-                | studiofs_meta::engine::MetaError::Timeout(_)
-        ) {
-            warn!(
-                volume = %name,
-                "remote PostgreSQL identity check unavailable; continuing with local metadata"
-            );
-        } else {
-            return Err(anyhow::anyhow!("metadata consistency check failed: {e}"));
+    if let Err(error) = consistency {
+        match (error, format_info.metadata.backend) {
+            (MetaError::UuidMismatch { local, remote }, _) => {
+                anyhow::bail!(
+                    "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
+                    name,
+                    local,
+                    remote,
+                    utils::format_cleanup_command(name)
+                );
+            }
+            (
+                ref error @ (MetaError::RemoteUnavailable(_) | MetaError::Timeout(_)),
+                MetadataBackend::Postgres,
+            ) => {
+                warn!(
+                    volume = %name,
+                    error = %error,
+                    "remote PostgreSQL identity check unavailable; continuing with local metadata"
+                );
+            }
+            (error, _) => {
+                return Err(anyhow::Error::new(error).context("metadata consistency check failed"));
+            }
         }
     }
 
@@ -2284,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn read_live_mount_format_info_allows_postgres_transport_failures() {
+    fn admit_live_mount_format_info_allows_postgres_transport_failures() {
         for consistency_error in [
             studiofs_meta::engine::MetaError::RemoteUnavailable(
                 "test-postgres-unavailable".to_string(),
@@ -2302,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn read_live_mount_format_info_rejects_postgres_identity_mismatch() {
+    fn admit_live_mount_format_info_rejects_postgres_identity_mismatch() {
         let error = admit_live_mount_format_info(
             "demo",
             postgres_format_info("demo"),
@@ -2320,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn read_live_mount_format_info_rejects_postgres_storage_failures() {
+    fn admit_live_mount_format_info_rejects_postgres_storage_failures() {
         let error = admit_live_mount_format_info(
             "demo",
             postgres_format_info("demo"),
@@ -2328,11 +2330,49 @@ mod tests {
                 "test-postgres-storage-failure".to_string(),
             )),
         )
-        .expect_err("storage failure must reject the mount")
-        .to_string();
+        .expect_err("storage failure must reject the mount");
 
-        assert!(error.contains("metadata consistency check failed"));
-        assert!(error.contains("test-postgres-storage-failure"));
+        assert!(
+            error
+                .downcast_ref::<studiofs_meta::engine::MetaError>()
+                .is_some()
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("metadata consistency check failed")
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("test-postgres-storage-failure"))
+        );
+    }
+
+    #[test]
+    fn admit_live_mount_format_info_rejects_non_postgres_transport_failures() {
+        let mut format_info = postgres_format_info("demo");
+        format_info.metadata.backend = MetadataBackend::RedbLocal;
+        let error = admit_live_mount_format_info(
+            "demo",
+            format_info,
+            Err(MetaError::RemoteUnavailable(
+                "test-unexpected-transport-failure".to_string(),
+            )),
+        )
+        .expect_err("non-Postgres transport failure must reject the mount");
+
+        assert!(error.downcast_ref::<MetaError>().is_some());
+        assert!(
+            error
+                .to_string()
+                .contains("metadata consistency check failed")
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("test-unexpected-transport-failure")
+        }));
     }
 
     fn seed_mount_meta_db(

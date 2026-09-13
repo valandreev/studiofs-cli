@@ -1152,6 +1152,11 @@ fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
     let status = fresh.pg_sync_status();
     assert_eq!(status.lifecycle, PgSyncLifecycle::Degraded);
     assert!(!status.allows_new_mutations());
+    assert!(
+        fresh
+            .remote_transport_unavailable
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     assert_eq!(
         fresh
             .local
@@ -1175,6 +1180,32 @@ fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
         PgSyncLifecycle::Degraded,
         "ordinary reopen must not mistake an unfinished fresh bootstrap for an established client"
     );
+}
+
+#[test]
+fn consistency_check_short_circuits_after_startup_remote_transport_failure() {
+    let (_dir, mut engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_transport_unavailable
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.command_pool = Arc::new(
+        PgConnectionPool::new(
+            "test-postgres-dsn".to_string(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            1,
+        )
+        .expect("non-zero command pool size"),
+    );
+
+    let error = engine
+        .check_consistency()
+        .expect_err("known startup transport failure should defer identity probing");
+    assert!(matches!(
+        error,
+        MetaError::RemoteUnavailable(message)
+            if message == "remote PostgreSQL transport unavailable during startup"
+    ));
 }
 
 #[test]

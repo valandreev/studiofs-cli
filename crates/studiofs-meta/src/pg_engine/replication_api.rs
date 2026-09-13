@@ -157,7 +157,21 @@ impl MetaReplication for PgMetaEngine {
 
     fn check_consistency(&self) -> MetaResult<()> {
         let local_info = self.local.get_format_info()?;
-        let remote_uuid = self.fetch_remote_uuid(self.volume_id)?;
+        if self.remote_transport_unavailable.load(Ordering::Acquire) {
+            return Err(MetaError::RemoteUnavailable(
+                "remote PostgreSQL transport unavailable during startup".to_string(),
+            ));
+        }
+        let remote_uuid = match self.fetch_remote_uuid(self.volume_id) {
+            Ok(remote_uuid) => remote_uuid,
+            Err(error) => {
+                if Self::is_remote_reachability_error(&error) {
+                    self.remote_transport_unavailable
+                        .store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
         if local_info.uuid != remote_uuid {
             return Err(MetaError::UuidMismatch {
                 local: local_info.uuid,

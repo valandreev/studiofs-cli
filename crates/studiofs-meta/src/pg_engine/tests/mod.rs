@@ -487,6 +487,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         snapshot_reachability_bootstrap_lock: Mutex::new(()),
         metadata_source_connected: AtomicBool::new(false),
         remote_format_validated: AtomicBool::new(false),
+        remote_transport_unavailable: AtomicBool::new(false),
         remote_format_validation_lock: Mutex::new(()),
     };
 
