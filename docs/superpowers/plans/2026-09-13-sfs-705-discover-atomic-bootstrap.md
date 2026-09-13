@@ -23,9 +23,13 @@ must leave no active partial database.
   replay-cursor persistence, no runtime-engine open, and failed-install
   cleanup.
 - [x] 2026-09-13: Implemented temporary redb installation, durable barrier,
-  and atomic active-path rename.
+  and atomic no-replace active-path hard link.
 - [x] 2026-09-13: Focused tests, checks, formatting, final diff inspection, and
   commit preparation completed.
+- [x] 2026-09-13: Processed the attached review with red-green regressions;
+  fixed namespace cursor/root/early-validation/error-typing issues, moved
+  bootstrap state ownership into `studiofs-meta`, and made final installation
+  no-replace under concurrent creators.
 
 ## Surprises & Discoveries
 
@@ -42,43 +46,70 @@ must leave no active partial database.
 
 ## Decision Log
 
-- Decision: Use `tempfile::TempDir` inside the metadata directory and rename a
-  completed database file into the active path. Rationale: the temporary path
-  is unique, remains on the same filesystem, and is automatically cleaned when
-  import or durability fails.
+- Decision: Use `tempfile::TempDir` inside the metadata directory and hard-link
+  a completed database file into the active path. Rationale: the temporary
+  path is unique, remains on the same filesystem, and hard-link creation is an
+  atomic no-replace install; the temporary directory is automatically cleaned
+  when import or durability fails.
 - Decision: Keep the existing refusal when the active `<name>.db` already
   exists. Rationale: SFS-705 requires explicit replacement rules and must not
   silently overwrite a valid unrelated local volume.
-- Decision: Persist `pgLastAppliedBatchVersion` at exactly the descriptor's
-  non-negative `checkpoint_version`, plus `pgFreshClientPending = 1` before
+- Decision: Persist `pgLastAppliedBatchVersion` and
+  `pgLastAppliedNamespaceBatchVersion` at exactly the descriptor's non-negative
+  `checkpoint_version`, plus `pgFreshClientPending = 1` before
   installation. Rationale: the next normal mount must start catch-up after the
   imported checkpoint while retaining the fresh-client read-only gate.
-- Decision: Do not add a new metadata-engine API or remote read path. Rationale:
-  SFS-702's validated descriptor API is the intended bootstrap boundary, and
-  the CLI adapter can complete local installation with existing redb contracts.
+- Decision: Add one metadata-engine bootstrap method but no new remote read
+  path. Rationale: SFS-702's validated descriptor API remains the remote
+  boundary, while `studiofs-meta` owns the checkpoint counters and root
+  invariant instead of exposing their representation to the CLI adapter.
 
 ## Outcomes & Retrospective
 
 The implementation meets the portable SFS-705 acceptance checks: discovery
 imports the validated serving checkpoint into a temporary redb database,
-persists the exact checkpoint replay cursor and fresh-client marker, forces
-the existing immediate durability barrier, and only then renames the file to
-the active path. It no longer constructs `PgMetaEngine` or starts event-log
-catch-up. Invalid checkpoint bytes leave both the active path and temporary
-directory clean.
+persists the exact checkpoint and namespace replay cursors plus the
+fresh-client marker, forces the existing immediate durability barrier, and
+only then creates the active name with a no-replace hard link. It no longer
+constructs `PgMetaEngine` or starts event-log catch-up. Invalid, rootless, or
+negative-version inputs leave the active path and temporary directory clean.
 
 Focused validation passed:
 
-- `cargo test -p studiofs --bin studiofs discover_` — 6 passed, 0 failed.
-- `cargo check -p studiofs` — passed.
-- `cargo clippy -p studiofs --all-targets -- -D warnings` — passed using a
-  task-specific temporary Cargo target directory because the repository
-  `target` directory returned Windows access-denied errors.
+- `cargo test -p studiofs --bin studiofs discover_` — 9 passed, 0 failed.
+- `cargo check -p studiofs-meta -p studiofs` — passed.
+- `cargo clippy -p studiofs-meta -p studiofs --all-targets -- -D warnings` —
+  passed using a task-specific temporary Cargo target directory because the
+  repository `target` directory returned Windows access-denied errors.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
 
 PostgreSQL service and mounted-E2E acceptance were not run; they remain
 environment-gated and are outside the focused validation boundary.
+
+## Review Disposition
+
+The attached review was checked against the current implementation and the
+PostgreSQL sync contract:
+
+- Accepted: initialize both replay cursors, reject a rootless imported
+  checkpoint, validate the checkpoint version before staging, preserve typed
+  `MetaError` propagation, and add focused regressions.
+- Accepted with a narrower implementation: encapsulate checkpoint bootstrap in
+  `RedbMetaEngine::initialize_discovered_checkpoint`; the CLI now owns only
+  path staging and installation.
+- Accepted: use `hard_link` for the final same-filesystem install. It creates
+  the active name atomically and fails with an existing-target error if a
+  concurrent process wins the name, preserving the no-silent-replacement
+  rule on supported filesystems.
+- Not accepted: an abort-on-drop guard for the PostgreSQL connection task.
+  The current code aborts and awaits the task on every normal return,
+  including timeout; the review's remaining case is an uncaught panic, not a
+  timeout result, and no reachable panic path was identified in this helper.
+- Not added: a separate non-PostgreSQL-format test. The branch is pre-existing
+  descriptor validation in `load_remote_discovery_state`, not part of the new
+  local atomic-install behavior; exercising it requires the PostgreSQL-backed
+  descriptor seam.
 
 ## Context and Orientation
 
@@ -97,9 +128,10 @@ boundary.
 1. Extend `DiscoveredState` with the descriptor checkpoint version and retain
    the validated format/checkpoint bytes already obtained from PostgreSQL.
 2. Replace direct active-file creation in `create_local_snapshot` with a
-   unique temporary database. Import the checkpoint, persist format/root and
-   fresh-client/replay state, force the local durability barrier, close redb,
-   and rename the temporary file into the active path.
+   unique temporary database. Ask `RedbMetaEngine` to import the checkpoint,
+   persist format/root and fresh-client/replay state, and force the local
+   durability barrier. Close redb and create the active name with a
+   same-filesystem no-replace hard link.
 3. Add focused unit tests that prove the helper succeeds without a usable
    PostgreSQL runtime URL, persists the exact replay cursor and marker, refuses
    an existing active database, and removes failed temporary installs without
@@ -134,8 +166,9 @@ required services are available.
 
 An existing active database is rejected before temporary work begins. A
 temporary directory owns the in-progress database and removes it on every
-failure path. The rename occurs only after redb's immediate durability barrier
-and after the engine handle is dropped.
+failure path. The hard-link install occurs only after redb's immediate
+durability barrier and after the engine handle is dropped; an active target
+that appears during staging makes the link fail instead of replacing it.
 
 ## Artifacts and Notes
 
@@ -145,8 +178,8 @@ format fields must not be copied into logs, tests, or this plan.
 
 ## Interfaces and Dependencies
 
-Use the existing `PgSnapshotBackend::read_bootstrap_checkpoint`,
-`RedbMetaEngine::import_serving_checkpoint_bytes`, `MetaFormat`,
-`MetaInodes`, and `MetaReplication` contracts. Use the already-declared
-`tempfile` dependency for unique same-filesystem temporary directories. No
-new dependency or public runtime API is expected.
+Use the existing `PgSnapshotBackend::read_bootstrap_checkpoint` and
+`RedbMetaEngine::import_serving_checkpoint_bytes` contracts, plus the new
+`RedbMetaEngine::initialize_discovered_checkpoint` local bootstrap seam. Use
+the already-declared `tempfile` dependency for unique same-filesystem
+temporary directories. No new dependency or remote read path is expected.

@@ -270,6 +270,33 @@ impl RedbMetaEngine {
         self.import_serving_checkpoint(&checkpoint)
     }
 
+    /// Initialize a local database from a validated remote serving checkpoint.
+    ///
+    /// The caller remains responsible for installing the completed database at
+    /// its active path. This method records the replay positions and fresh
+    /// client gate together with the imported serving view, then forces the
+    /// local durability barrier before returning.
+    pub fn initialize_discovered_checkpoint(
+        &self,
+        format_info: &FormatInfo,
+        checkpoint_bytes: &[u8],
+        checkpoint_version: u64,
+    ) -> MetaResult<()> {
+        self.import_serving_checkpoint_bytes(checkpoint_bytes)?;
+        self.set_format_info(format_info)?;
+        self.get_attr(ROOT_INO)?;
+        self.set_counter(
+            crate::pg_engine::LOCAL_PG_VERSION_COUNTER,
+            checkpoint_version,
+        )?;
+        self.set_counter(
+            crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER,
+            checkpoint_version,
+        )?;
+        self.set_counter(crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
+        self.sync_local_metadata()
+    }
+
     /// Replace the serving view while retaining the local event journal used
     /// by the repair/replay path.
     pub(crate) fn import_serving_checkpoint_preserving_local_event_log(

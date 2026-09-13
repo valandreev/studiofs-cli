@@ -102,8 +102,8 @@ fn resolve_pg_pool_size(configured: usize) -> MetaResult<usize> {
     Ok(configured)
 }
 
-const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
-const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
+pub(crate) const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
+pub(crate) const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
 pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =

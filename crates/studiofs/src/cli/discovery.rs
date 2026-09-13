@@ -3,9 +3,8 @@
 use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
-    FormatInfo, MetaError, MetaFormat, MetaInodes, MetaReplication, PgSnapshotBackend,
-    RedbMetaEngine, connect_studiofs_postgres, decode_format_info as decode_persisted_format_info,
-    ensure_studiofs_database,
+    FormatInfo, MetaError, PgSnapshotBackend, RedbMetaEngine, connect_studiofs_postgres,
+    decode_format_info as decode_persisted_format_info, ensure_studiofs_database,
 };
 use thiserror::Error;
 
@@ -62,9 +61,6 @@ struct DiscoveredState {
     format_info: FormatInfo,
 }
 
-const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
-const LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER: &str = "pgFreshClientPending";
-
 const FETCH_REMOTE_VOLUME_ID_QUERY: &str = r#"
     SELECT v.vol
     FROM volumes v
@@ -76,10 +72,7 @@ const FETCH_REMOTE_VOLUME_ID_QUERY: &str = r#"
 
 fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<DiscoveredState> {
     let (postgres_dsn, volume_id) = crate::runtime_bridge::block_on(async move {
-        let postgres_dsn = ensure_studiofs_database(meta_dsn)
-            .await
-            .map_err(|e| DiscoveryError::Message(e.to_string()))?
-            .metadata_dsn;
+        let postgres_dsn = ensure_studiofs_database(meta_dsn).await?.metadata_dsn;
         let volume_id = fetch_remote_volume_id(name, &postgres_dsn).await?;
         Ok::<_, DiscoveryError>((postgres_dsn, volume_id))
     })?;
@@ -110,9 +103,7 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
 }
 
 async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResult<i64> {
-    let (client, connection) = connect_studiofs_postgres(postgres_dsn)
-        .await
-        .map_err(|e| DiscoveryError::Message(e.to_string()))?;
+    let (client, connection) = connect_studiofs_postgres(postgres_dsn).await?;
     let conn_task = tokio::spawn(connection);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -146,6 +137,16 @@ fn create_local_snapshot(
     meta_dir: &Path,
     state: DiscoveredState,
 ) -> DiscoveryResult<std::path::PathBuf> {
+    let DiscoveredState {
+        checkpoint_version,
+        serving_checkpoint,
+        format_info,
+        ..
+    } = state;
+    let checkpoint_version = u64::try_from(checkpoint_version).map_err(|_| {
+        DiscoveryError::Message("discovered checkpoint version must not be negative".to_string())
+    })?;
+
     std::fs::create_dir_all(meta_dir)?;
     let active_db_path = meta_dir.join(format!("{name}.db"));
     if active_db_path.exists() {
@@ -160,36 +161,17 @@ fn create_local_snapshot(
         .tempdir_in(meta_dir)?;
     let temp_db_path = temp_dir.path().join(format!("{name}.db"));
 
-    let DiscoveredState {
-        checkpoint_version,
-        serving_checkpoint,
-        format_info,
-        ..
-    } = state;
     let engine = RedbMetaEngine::open(&temp_db_path)?;
-    engine.import_serving_checkpoint_bytes(&serving_checkpoint)?;
-    engine.set_format_info(&format_info)?;
-    let (uid, gid) = {
-        #[cfg(unix)]
-        // SAFETY: these libc calls are safe here; StudioFS trusts a valid OS process context.
-        unsafe {
-            (libc::getuid(), libc::getgid())
-        }
-        #[cfg(windows)]
-        {
-            (0, 0)
-        }
-    };
-    engine.init_root(uid, gid)?;
-    let checkpoint_version = u64::try_from(checkpoint_version).map_err(|_| {
-        DiscoveryError::Message("discovered checkpoint version must not be negative".to_string())
-    })?;
-    engine.set_counter(LOCAL_PG_VERSION_COUNTER, checkpoint_version)?;
-    engine.set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
-    MetaReplication::sync_local_metadata(&engine)?;
+    engine.initialize_discovered_checkpoint(
+        &format_info,
+        &serving_checkpoint,
+        checkpoint_version,
+    )?;
     drop(engine);
 
-    std::fs::rename(&temp_db_path, &active_db_path)?;
+    // hard_link is atomic and fails if another process installed the active
+    // database while this checkpoint was being staged.
+    std::fs::hard_link(&temp_db_path, &active_db_path)?;
 
     Ok(active_db_path)
 }
@@ -208,7 +190,9 @@ pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_meta::{FormatInfoDataStore, MetadataBackend, MetadataConfig, PostgresConfig};
+    use studiofs_meta::{
+        FormatInfoDataStore, MetaInodes, MetadataBackend, MetadataConfig, PostgresConfig,
+    };
 
     #[test]
     fn discover_parses_name_and_meta_dsn() {
@@ -291,13 +275,19 @@ mod tests {
         let engine = RedbMetaEngine::open(&db_path).expect("open installed local database");
         assert_eq!(
             engine
-                .get_counter(LOCAL_PG_VERSION_COUNTER)
+                .get_counter("pgLastAppliedBatchVersion")
                 .expect("read replay cursor"),
             42
         );
         assert_eq!(
             engine
-                .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+                .get_counter("pgLastAppliedNamespaceBatchVersion")
+                .expect("read namespace replay cursor"),
+            42
+        );
+        assert_eq!(
+            engine
+                .get_counter("pgFreshClientPending")
                 .expect("read fresh-client marker"),
             1
         );
@@ -323,6 +313,75 @@ mod tests {
                 .count(),
             0,
             "failed discovery must clean its temporary database"
+        );
+    }
+
+    #[test]
+    fn discover_rejects_checkpoint_without_root() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        let checkpoint_dir = tempfile::tempdir().expect("create checkpoint source directory");
+        let checkpoint_source_path = checkpoint_dir.path().join("source.db");
+        let checkpoint_source =
+            RedbMetaEngine::open(&checkpoint_source_path).expect("open empty checkpoint source");
+        let checkpoint = checkpoint_source
+            .export_serving_checkpoint_bytes()
+            .expect("encode empty serving checkpoint");
+        drop(checkpoint_source);
+
+        let error = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(checkpoint),
+        )
+        .expect_err("checkpoint without root must fail discovery");
+
+        assert!(matches!(error, DiscoveryError::Meta(_)));
+        assert!(!meta_dir.path().join("discovered.db").exists());
+    }
+
+    #[test]
+    fn discover_rejects_negative_checkpoint_before_touching_metadata_directory() {
+        let meta_file = tempfile::NamedTempFile::new().expect("create metadata file");
+        let mut state = test_discovered_state(Vec::new());
+        state.checkpoint_version = -1;
+
+        let error = create_local_snapshot("discovered", meta_file.path(), state)
+            .expect_err("negative checkpoint version must fail before disk I/O");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::Message(message)
+                if message == "discovered checkpoint version must not be negative"
+        ));
+    }
+
+    #[test]
+    fn discover_refuses_existing_active_database() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        let active_db_path = meta_dir.path().join("discovered.db");
+        std::fs::write(&active_db_path, b"keep this database")
+            .expect("create existing active database");
+
+        let error = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(Vec::new()),
+        )
+        .expect_err("existing active database must be preserved");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
+        assert_eq!(
+            std::fs::read(&active_db_path).expect("read existing active database"),
+            b"keep this database"
+        );
+        assert_eq!(
+            std::fs::read_dir(meta_dir.path())
+                .expect("read metadata directory")
+                .count(),
+            1,
+            "existing active database must not create staging files"
         );
     }
 }
