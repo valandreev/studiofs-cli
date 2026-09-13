@@ -4056,6 +4056,16 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
             )
             .await
             .map_err(|e| MetaError::Storage(format!("insert remote batch failed: {e}")))?;
+
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 2 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| {
+                MetaError::Storage(format!("advance remote metadata version failed: {e}"))
+            })?;
         conn_task.abort();
         Ok(())
     })
