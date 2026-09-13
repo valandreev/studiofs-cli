@@ -437,7 +437,7 @@ pub enum MetadataCheckpointRefreshReason {
 }
 
 /// Best-effort measurements and request state for bootstrap checkpoint freshness.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataCheckpointFreshnessDiagnostics {
     /// Last observed metadata head version.
     pub head_version: Option<u64>,

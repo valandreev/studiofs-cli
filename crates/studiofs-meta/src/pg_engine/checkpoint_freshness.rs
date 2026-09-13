@@ -86,7 +86,7 @@ pub(super) struct CheckpointFreshnessDecision {
     pub(super) checkpoint_age_ms: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct CheckpointFreshnessState {
     diagnostics: MetadataCheckpointFreshnessDiagnostics,
 }
@@ -136,7 +136,18 @@ impl CheckpointFreshnessState {
     }
 
     pub(super) fn diagnostics(&self) -> MetadataCheckpointFreshnessDiagnostics {
-        self.diagnostics
+        self.diagnostics.clone()
+    }
+}
+
+impl From<super::metadata_io::CheckpointFreshnessObservation> for CheckpointFreshnessInput {
+    fn from(observation: super::metadata_io::CheckpointFreshnessObservation) -> Self {
+        Self {
+            head_version: observation.head_version,
+            checkpoint_version: observation.checkpoint_version,
+            event_payload_bytes: observation.event_payload_bytes,
+            checkpoint_age: observation.checkpoint_age,
+        }
     }
 }
 
@@ -169,6 +180,15 @@ impl super::PgMetaEngine {
         &self,
         observation: super::metadata_io::CheckpointFreshnessObservation,
     ) {
+        if observation.head_version < observation.checkpoint_version {
+            warn!(
+                volume_id = self.volume_id,
+                head_version = observation.head_version,
+                checkpoint_version = observation.checkpoint_version,
+                "postgres metadata checkpoint version exceeds metadata head"
+            );
+        }
+
         let mut state = self
             .checkpoint_freshness_state
             .lock()
@@ -179,15 +199,7 @@ impl super::PgMetaEngine {
                 );
                 poisoned.into_inner()
             });
-        state.observe(
-            &self.checkpoint_freshness_policy,
-            CheckpointFreshnessInput {
-                head_version: observation.head_version,
-                checkpoint_version: observation.checkpoint_version,
-                event_payload_bytes: observation.event_payload_bytes,
-                checkpoint_age: observation.checkpoint_age,
-            },
-        );
+        state.observe(&self.checkpoint_freshness_policy, observation.into());
     }
 
     pub(super) fn checkpoint_freshness_diagnostics(

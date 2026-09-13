@@ -31,6 +31,8 @@ After this change, a busy volume cannot silently accumulate an unbounded bootstr
 - [x] (2026-09-13) Verify the attached review item-by-item: confirm the checkpoint starvation and lock-held observation issues, reject the nonexistent `LocalFlushFollowup` path, and confirm the persisted BIGINT boundary for the u64 parser suggestion.
 - [x] (2026-09-13) Fix review-confirmed issues with monotonic total/checkpoint byte counters, capture-before-serialization, PostgreSQL-side age calculation, same-transaction freshness `RETURNING`, poison recovery, typed nonnegative row decoding, threshold/inversion tests, and the redundant payload-vector clone.
 - [x] (2026-09-13) Run focused review regressions, including the live PostgreSQL checkpoint-tail and existing checkpoint-monotonicity tests; update this plan before the review-fix commit.
+- [x] (2026-09-13) Re-review the follow-up findings against the current call graph: preserve one capture query under `replication_lock`, log stale-skip and version-inversion diagnostics, remove public diagnostics `Copy`, add the typed conversion boundary, and enforce the checkpoint-version DDL invariant.
+- [x] (2026-09-13) Run the follow-up focused policy, live PostgreSQL freshness/tail/monotonicity/legacy tests, clippy, and application checks; the follow-up review-fix commit remains the delivery step.
 
 ## Surprises & Discoveries
 
@@ -44,6 +46,8 @@ After this change, a busy volume cannot silently accumulate an unbounded bootstr
   Evidence: the writer now captures `(version, total_event_payload_bytes)` before serialization; promotion records that captured total as `checkpoint_total_event_bytes` and leaves the monotonic total untouched. The upsert no longer requires the serialized version to cover the current head, so a valid checkpoint promotion does not starve under concurrent writes.
 - Observation: PostgreSQL row decoding is the adapter boundary for freshness values. Negative BIGINT versions, counters, or server-computed ages must be rejected before entering the u64 policy domain.
   Evidence: `metadata_io.rs` validates every freshness/capture BIGINT and rejects inverted byte counters with `MetaError::Storage`.
+- Observation: `flush_metadata` holds `replication_lock` while calling `write_checkpoint_locked`; adding a second freshness query on the stale-local early return would preserve diagnostics at avoidable lock-held network cost.
+  Evidence: the existing capture query now returns the complete freshness row, so the stale-skip path logs and records that observation without another round-trip.
 
 ## Decision Log
 
@@ -68,7 +72,7 @@ After this change, a busy volume cannot silently accumulate an unbounded bootstr
 
 ## Outcomes & Retrospective
 
-The pure policy tests demonstrate independent version, payload-byte, and changing-volume age triggers, inclusive precedence boundaries, and fail-closed version inversion; the tracker test demonstrates de-duplicated requests. The live PostgreSQL tests demonstrate atomic publication bookkeeping/reset, checkpoint promotion with a post-capture event tail, and remote-head monotonicity. The review fixes also remove the publication-time freshness round trip, use PostgreSQL server time, recover poisoned diagnostics state, validate BIGINT values before policy evaluation, and remove the unnecessary payload-vector clone. Focused `studiofs-meta` and `studiofs-vfs` clippy checks, the application compile check, formatting, and diff checks remain the required validation boundary. No full workspace suite or mounted WinFSP benchmark was run; SFS-704 still needs to consume `metadata_checkpoint_freshness_diagnostics` from its fenced background coordinator.
+The pure policy tests demonstrate independent version, payload-byte, and changing-volume age triggers, inclusive precedence boundaries, and fail-closed version inversion; the tracker test demonstrates de-duplicated requests. The live PostgreSQL tests demonstrate atomic publication bookkeeping/reset, checkpoint promotion with a post-capture event tail, remote-head monotonicity, legacy-format refusal, and diagnostics on a stale-local checkpoint skip. The review fixes also remove the publication-time freshness round trip, use PostgreSQL server time, recover poisoned diagnostics state, validate BIGINT values before policy evaluation, remove the unnecessary payload-vector clone, avoid large public `Copy` values, and enforce the checkpoint-version DDL invariant. Focused `studiofs-meta` and `studiofs-vfs` clippy checks, the application compile check, formatting, and diff checks remain the required validation boundary. No full workspace suite or mounted WinFSP benchmark was run; SFS-704 still needs to consume `metadata_checkpoint_freshness_diagnostics` from its fenced background coordinator.
 
 ## Context and Orientation
 
@@ -214,3 +218,5 @@ The policy depends only on `std::time::Duration` and scalar observations. The Po
 2026-09-13: Recorded the Linear completion update and marked the delivery milestone complete.
 
 2026-09-13: Incorporated the attached review: replaced the resettable byte counter with monotonic total/baseline bookkeeping, removed the strict current-head upsert predicate, added capture-before-serialization and server-side age, reused publication `RETURNING`, validated adapter values, recovered poisoned state, removed the payload clone, and added focused boundary/tail regressions. Review items describing `LocalFlushFollowup` were not applicable to the current code, and direct u64 config parsing was not adopted because persisted counters are PostgreSQL BIGINT values.
+
+2026-09-13: Incorporated the follow-up review: the stale-local skip now records the already captured server observation and logs the reason, version inversion is warned, the public diagnostics use explicit `Clone`, the adapter observation converts through `From`, and metadata schema enforces `checkpoint_version <= version`. The proposal to expose age on unchanged volumes remains out of scope because the current diagnostics contract defines age as a changing-volume freshness signal; the i64 batch-version cast is simplified at the row boundary.

@@ -18,7 +18,15 @@ pub(super) const SELECT_CHECKPOINT_FRESHNESS: &str = r#"
     "#;
 
 pub(super) const SELECT_CHECKPOINT_CAPTURE: &str = r#"
-    SELECT version, total_event_payload_bytes
+    SELECT
+        version,
+        checkpoint_version,
+        total_event_payload_bytes,
+        checkpoint_total_event_bytes,
+        GREATEST(
+            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
+            0::BIGINT
+        ) AS checkpoint_age_ms
     FROM metadata_state
     WHERE vol = $1
     "#;

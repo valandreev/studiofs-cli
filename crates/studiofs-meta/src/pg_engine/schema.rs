@@ -88,7 +88,9 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             checkpoint_generation BIGINT NOT NULL
                 CHECK (checkpoint_generation >= 0),
             checkpoint_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT metadata_state_checkpoint_version_valid
+                CHECK (checkpoint_version >= 0 AND checkpoint_version <= version)
         );
 
         ALTER TABLE metadata_state
@@ -118,6 +120,21 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 CHECK (checkpoint_generation >= 0);
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'metadata_state'::regclass
+                  AND conname = 'metadata_state_checkpoint_version_valid'
+            ) THEN
+                ALTER TABLE metadata_state
+                    ADD CONSTRAINT metadata_state_checkpoint_version_valid
+                    CHECK (checkpoint_version >= 0 AND checkpoint_version <= version);
+            END IF;
+        END
+        $$;
 
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -776,6 +793,7 @@ mod tests {
         assert!(sql.contains("checkpoint_generation >= 0"));
         assert!(sql.contains("total_event_payload_bytes >= 0"));
         assert!(sql.contains("checkpoint_total_event_bytes >= 0"));
+        assert!(sql.contains("checkpoint_version >= 0 AND checkpoint_version <= version"));
         assert!(
             sql.matches("CHECK (octet_length(checkpoint_sha256) = 32)")
                 .count()

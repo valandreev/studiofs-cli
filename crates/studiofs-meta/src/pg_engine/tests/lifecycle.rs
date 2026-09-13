@@ -2426,6 +2426,54 @@ fn pg_checkpoint_promotion_preserves_post_capture_event_tail() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_skip_records_remote_stale_observation() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _lag = set_test_env(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, "1");
+    let _bytes = set_test_env(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, "9223372036854775807");
+    let _age = set_test_env(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, "3600");
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-stale-skip");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 1, total_event_payload_bytes = 10 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("advance remote metadata head");
+
+    pg.write_checkpoint_locked()
+        .expect("skip stale local checkpoint write");
+    let diagnostics = pg.checkpoint_freshness_diagnostics();
+    assert_eq!(diagnostics.head_version, Some(1));
+    assert_eq!(diagnostics.checkpoint_version, Some(0));
+    assert_eq!(diagnostics.event_payload_bytes_since_checkpoint, 10);
+    assert!(diagnostics.refresh_needed);
+    assert_eq!(
+        diagnostics.refresh_reason,
+        Some(MetadataCheckpointRefreshReason::VersionLag)
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
     let Some(dsn) = pg_dsn() else {
         return;

@@ -236,8 +236,8 @@ pub(super) struct CheckpointFreshnessObservation {
 
 #[derive(Clone, Copy)]
 pub(super) struct CheckpointCapture {
-    pub(super) head_version: u64,
     pub(super) total_event_payload_bytes: u64,
+    pub(super) freshness: CheckpointFreshnessObservation,
 }
 
 fn nonnegative_counter(value: i64, name: &str) -> MetaResult<u64> {
@@ -291,15 +291,13 @@ fn checkpoint_freshness_observation_from_row(
 }
 
 fn checkpoint_capture_from_row(row: &tokio_postgres::Row) -> MetaResult<CheckpointCapture> {
+    let freshness = checkpoint_freshness_observation_from_row(row)?;
     Ok(CheckpointCapture {
-        head_version: nonnegative_counter(
-            row_i64(row, 0, "checkpoint capture head")?,
-            "head version",
-        )?,
         total_event_payload_bytes: nonnegative_counter(
-            row_i64(row, 1, "checkpoint capture total byte counter")?,
+            row_i64(row, 2, "checkpoint capture total byte counter")?,
             "total event payload bytes",
         )?,
+        freshness,
     })
 }
 
@@ -598,15 +596,13 @@ impl PgMetaEngine {
                                     .to_string(),
                             ));
                         };
-                        let batch_observation = checkpoint_freshness_observation_from_row(
+                        let batch_version = row_i64(
                             &batch_version_row,
+                            0,
+                            "postgres metadata batch version",
                         )?;
-                        let batch_version = i64::try_from(batch_observation.head_version)
-                            .map_err(|_| {
-                                MetaError::Storage(
-                                    "postgres metadata head version exceeds BIGINT".to_string(),
-                                )
-                            })?;
+                        let batch_observation =
+                            checkpoint_freshness_observation_from_row(&batch_version_row)?;
                         last_observation = Some(batch_observation);
 
                         for (event_chunk, payload_chunk) in batch
@@ -863,7 +859,14 @@ impl PgMetaEngine {
             u64::try_from(self.local_version.load(Ordering::SeqCst)).map_err(|_| {
                 MetaError::Storage("local metadata version must be nonnegative".to_string())
             })?;
-        if capture.head_version > local_version {
+        if capture.freshness.head_version > local_version {
+            tracing::debug!(
+                volume_id = self.volume_id,
+                remote_head = capture.freshness.head_version,
+                local_version,
+                "skipping checkpoint write because local version is behind remote head"
+            );
+            self.record_checkpoint_freshness_observation(capture.freshness);
             return Ok(());
         }
 
