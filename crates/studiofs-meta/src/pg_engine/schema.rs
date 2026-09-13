@@ -72,6 +72,13 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             metadata_format_version SMALLINT NOT NULL,
             version BIGINT NOT NULL,
             checkpoint_version BIGINT NOT NULL DEFAULT 0,
+            total_event_payload_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (total_event_payload_bytes >= 0),
+            checkpoint_total_event_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (
+                    checkpoint_total_event_bytes >= 0
+                    AND checkpoint_total_event_bytes <= total_event_payload_bytes
+                ),
             snapshot BYTEA NOT NULL,
             checkpoint_sha256 BYTEA NOT NULL
                 CHECK (octet_length(checkpoint_sha256) = 32),
@@ -80,13 +87,25 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 CHECK (checkpoint_publication_state IN ('pending', 'published')),
             checkpoint_generation BIGINT NOT NULL
                 CHECK (checkpoint_generation >= 0),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            checkpoint_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT metadata_state_checkpoint_version_valid
+                CHECK (checkpoint_version >= 0 AND checkpoint_version <= version)
         );
 
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS metadata_format_version SMALLINT NOT NULL DEFAULT 0;
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_version BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS total_event_payload_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (total_event_payload_bytes >= 0);
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_total_event_bytes BIGINT NOT NULL DEFAULT 0
+                CHECK (
+                    checkpoint_total_event_bytes >= 0
+                    AND checkpoint_total_event_bytes <= total_event_payload_bytes
+                );
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_sha256 BYTEA NOT NULL
                 DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
@@ -99,6 +118,30 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_generation BIGINT NOT NULL DEFAULT 0
                 CHECK (checkpoint_generation >= 0);
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS checkpoint_updated_at TIMESTAMPTZ;
+        UPDATE metadata_state
+            SET checkpoint_updated_at = 'epoch'::timestamptz
+            WHERE checkpoint_updated_at IS NULL;
+        ALTER TABLE metadata_state
+            ALTER COLUMN checkpoint_updated_at SET DEFAULT now();
+        ALTER TABLE metadata_state
+            ALTER COLUMN checkpoint_updated_at SET NOT NULL;
+
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'metadata_state'::regclass
+                  AND conname = 'metadata_state_checkpoint_version_valid'
+            ) THEN
+                ALTER TABLE metadata_state
+                    ADD CONSTRAINT metadata_state_checkpoint_version_valid
+                    CHECK (checkpoint_version >= 0 AND checkpoint_version <= version);
+            END IF;
+        END
+        $$;
 
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -743,15 +786,36 @@ mod tests {
         let sql = studiofs_pg_schema_sql();
         for fragment in [
             "metadata_format_version SMALLINT NOT NULL",
+            "total_event_payload_bytes BIGINT NOT NULL",
+            "checkpoint_total_event_bytes BIGINT NOT NULL",
             "checkpoint_sha256 BYTEA NOT NULL",
             "checkpoint_publication_state TEXT NOT NULL",
             "checkpoint_generation BIGINT NOT NULL",
+            "checkpoint_updated_at TIMESTAMPTZ NOT NULL",
         ] {
             assert!(sql.contains(fragment), "schema is missing {fragment}");
         }
         assert!(sql.contains("octet_length(checkpoint_sha256) = 32"));
         assert!(sql.contains("checkpoint_publication_state IN ('pending', 'published')"));
         assert!(sql.contains("checkpoint_generation >= 0"));
+        assert!(sql.contains("total_event_payload_bytes >= 0"));
+        assert!(sql.contains("checkpoint_total_event_bytes >= 0"));
+        assert!(sql.contains("checkpoint_version >= 0 AND checkpoint_version <= version"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS checkpoint_updated_at TIMESTAMPTZ;"));
+        assert!(sql.contains("SET checkpoint_updated_at = 'epoch'::timestamptz"));
+        assert!(sql.contains("ALTER COLUMN checkpoint_updated_at SET DEFAULT now()"));
+        assert!(sql.contains("ALTER COLUMN checkpoint_updated_at SET NOT NULL"));
+        let stale_backfill = sql
+            .find("SET checkpoint_updated_at = 'epoch'::timestamptz")
+            .expect("checkpoint migration must conservatively backfill old rows");
+        let default_after_backfill = sql
+            .find("ALTER COLUMN checkpoint_updated_at SET DEFAULT now()")
+            .expect("checkpoint migration must set the default for new rows");
+        let not_null_after_default = sql
+            .find("ALTER COLUMN checkpoint_updated_at SET NOT NULL")
+            .expect("checkpoint migration must restore the non-null invariant");
+        assert!(stale_backfill < default_after_backfill);
+        assert!(default_after_backfill < not_null_after_default);
         assert!(
             sql.matches("CHECK (octet_length(checkpoint_sha256) = 32)")
                 .count()

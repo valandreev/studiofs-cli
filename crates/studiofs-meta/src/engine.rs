@@ -425,6 +425,44 @@ pub struct MetadataInvalidationDiagnostics {
     pub last_successful_sync_unix_ms: Option<i64>,
 }
 
+/// Signal explaining why a PostgreSQL bootstrap checkpoint should be refreshed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataCheckpointRefreshReason {
+    /// The metadata head is beyond the configured version-lag limit.
+    VersionLag,
+    /// Event-log payload bytes since the checkpoint reached the configured limit.
+    EventPayloadBytes,
+    /// The checkpoint is old enough while the volume has changed.
+    Age,
+}
+
+/// Best-effort measurements and request state for bootstrap checkpoint freshness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataCheckpointFreshnessDiagnostics {
+    /// Last observed metadata head version.
+    pub head_version: Option<u64>,
+    /// Last observed bootstrap checkpoint version.
+    pub checkpoint_version: Option<u64>,
+    /// Nonnegative version distance between the head and checkpoint.
+    pub version_lag: u64,
+    /// Encoded event-payload bytes recorded after the checkpoint.
+    pub event_payload_bytes_since_checkpoint: u64,
+    /// Checkpoint age in milliseconds when the volume has changed.
+    pub checkpoint_age_ms: Option<u64>,
+    /// Configured maximum version distance before requesting a refresh.
+    pub max_version_lag: u64,
+    /// Configured maximum event-payload bytes before requesting a refresh.
+    pub max_event_payload_bytes: u64,
+    /// Configured maximum changing-volume checkpoint age in milliseconds.
+    pub max_checkpoint_age_ms: u64,
+    /// Whether the latest observation requests a checkpoint refresh.
+    pub refresh_needed: bool,
+    /// Deterministic reason for the latest refresh request, if any.
+    pub refresh_reason: Option<MetadataCheckpointRefreshReason>,
+    /// Number of transitions from fresh to refresh-needed state.
+    pub refresh_requests: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Progress evidence used by the mount-local coherence health tracker.
 pub struct MetadataCoherenceProgress {
@@ -1301,6 +1339,11 @@ pub trait MetaReplication: Send + Sync {
     /// Best-effort diagnostics for push-plus-poll metadata invalidation.
     fn metadata_invalidation_diagnostics(&self) -> MetadataInvalidationDiagnostics {
         MetadataInvalidationDiagnostics::default()
+    }
+
+    /// Best-effort diagnostics for the PostgreSQL bootstrap checkpoint refresh policy.
+    fn metadata_checkpoint_freshness_diagnostics(&self) -> MetadataCheckpointFreshnessDiagnostics {
+        MetadataCheckpointFreshnessDiagnostics::default()
     }
 
     /// Return progress evidence for mount-local coherence health decisions.

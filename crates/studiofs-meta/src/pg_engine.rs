@@ -124,6 +124,9 @@ const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE: i64 = 64;
 const DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE: i64 = 8 * 1024 * 1024;
+const PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_VERSION_LAG";
+const PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_EVENT_BYTES";
+const PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_AGE_SECS";
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
@@ -210,6 +213,8 @@ pub struct PgMetaEngine {
     command_timeout: Duration,
     sync_max_batches_per_page: i64,
     sync_max_response_bytes_per_page: i64,
+    checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy,
+    checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
     command_pool: Arc<runtime::PgConnectionPool>,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
@@ -379,6 +384,8 @@ struct ClaimedPendingBatch {
     event_end: u64,
 }
 
+#[path = "pg_engine/checkpoint_freshness.rs"]
+mod checkpoint_freshness;
 #[path = "pg_engine/engine_core.rs"]
 mod engine_core;
 #[path = "pg_engine/inode_allocator.rs"]
@@ -645,6 +652,11 @@ impl PgMetaEngine {
         }
     }
 
+    fn env_positive_u64(key: &str, default: u64) -> u64 {
+        let default_i64 = i64::try_from(default).unwrap_or(i64::MAX);
+        u64::try_from(Self::env_positive_i64(key, default_i64)).unwrap_or(default)
+    }
+
     fn default_connect_timeout() -> Duration {
         Self::env_duration_ms(
             "STUDIOFS_PG_CONNECT_TIMEOUT_MS",
@@ -761,9 +773,12 @@ impl PgMetaEngine {
                             FROM (
                                 VALUES
                                     ('metadata_state'::TEXT, 'metadata_format_version'::TEXT),
+                                    ('metadata_state'::TEXT, 'total_event_payload_bytes'::TEXT),
+                                    ('metadata_state'::TEXT, 'checkpoint_total_event_bytes'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_sha256'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_publication_state'::TEXT),
-                                    ('metadata_state'::TEXT, 'checkpoint_generation'::TEXT)
+                                    ('metadata_state'::TEXT, 'checkpoint_generation'::TEXT),
+                                    ('metadata_state'::TEXT, 'checkpoint_updated_at'::TEXT)
                             ) AS required(table_name, column_name)
                             LEFT JOIN information_schema.columns AS column_info
                                 ON column_info.table_schema = current_schema()
@@ -956,6 +971,20 @@ impl PgMetaEngine {
             PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR,
             DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
         );
+        let checkpoint_freshness_policy = checkpoint_freshness::CheckpointFreshnessPolicy::new(
+            Self::env_positive_u64(
+                PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR,
+                checkpoint_freshness::DEFAULT_MAX_VERSION_LAG,
+            ),
+            Self::env_positive_u64(
+                PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR,
+                checkpoint_freshness::DEFAULT_MAX_EVENT_PAYLOAD_BYTES,
+            ),
+            Duration::from_secs(Self::env_positive_u64(
+                PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR,
+                checkpoint_freshness::DEFAULT_MAX_CHECKPOINT_AGE_SECS,
+            )),
+        );
         let remote_format_validated = match Self::validate_postgres_schema(
             &pg.url,
             pg.volume_id,
@@ -1021,6 +1050,10 @@ impl PgMetaEngine {
             command_timeout,
             sync_max_batches_per_page,
             sync_max_response_bytes_per_page,
+            checkpoint_freshness_policy,
+            checkpoint_freshness_state: Mutex::new(
+                checkpoint_freshness::CheckpointFreshnessState::new(&checkpoint_freshness_policy),
+            ),
             command_pool: Arc::new(runtime::PgConnectionPool::new(
                 pg.url.clone(),
                 connect_timeout,

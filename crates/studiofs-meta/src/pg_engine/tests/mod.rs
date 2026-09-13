@@ -441,6 +441,12 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         command_timeout: Duration::from_millis(50),
         sync_max_batches_per_page: 64,
         sync_max_response_bytes_per_page: 8 * 1024 * 1024,
+        checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy::default(),
+        checkpoint_freshness_state: Mutex::new(
+            checkpoint_freshness::CheckpointFreshnessState::new(
+                &checkpoint_freshness::CheckpointFreshnessPolicy::default(),
+            ),
+        ),
         command_pool: Arc::new(
             PgConnectionPool::new(
                 "postgres://127.0.0.1:1/studiofs".to_string(),

@@ -133,6 +133,7 @@ pub(super) struct ForeignEventPage {
 struct EncodedRemoteEventBatch {
     events: Vec<MetaEvent>,
     payloads: Vec<Vec<u8>>,
+    payload_bytes: i64,
 }
 
 async fn read_remote_metadata_head_version_with_pool(
@@ -225,6 +226,114 @@ async fn read_remote_metadata_head_and_checkpoint_version_with_pool(
     .await
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct CheckpointFreshnessObservation {
+    pub(super) head_version: u64,
+    pub(super) checkpoint_version: u64,
+    pub(super) total_event_payload_bytes: u64,
+    pub(super) format_info_present: bool,
+    pub(super) event_payload_bytes: u64,
+    pub(super) checkpoint_age: std::time::Duration,
+}
+
+fn nonnegative_counter(value: i64, name: &str) -> MetaResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| MetaError::Storage(format!("postgres {name} must be nonnegative")))
+}
+
+fn row_i64(row: &tokio_postgres::Row, index: usize, name: &str) -> MetaResult<i64> {
+    row.try_get(index).map_err(|error| {
+        PgMetaEngine::classify_pg_error(format!("postgres {name} row parse failed"), error)
+    })
+}
+
+fn checkpoint_freshness_observation_from_row(
+    row: &tokio_postgres::Row,
+) -> MetaResult<CheckpointFreshnessObservation> {
+    let head_version = nonnegative_counter(
+        row_i64(row, 0, "checkpoint freshness head")?,
+        "head version",
+    )?;
+    let checkpoint_version = nonnegative_counter(
+        row_i64(row, 1, "checkpoint freshness checkpoint")?,
+        "checkpoint version",
+    )?;
+    let total_event_payload_bytes = nonnegative_counter(
+        row_i64(row, 2, "checkpoint freshness total byte counter")?,
+        "total event payload bytes",
+    )?;
+    let checkpoint_total_event_bytes = nonnegative_counter(
+        row_i64(row, 3, "checkpoint freshness checkpoint byte counter")?,
+        "checkpoint total event payload bytes",
+    )?;
+    let event_payload_bytes = total_event_payload_bytes
+        .checked_sub(checkpoint_total_event_bytes)
+        .ok_or_else(|| {
+            MetaError::Storage(
+                "postgres checkpoint byte counters are not monotonically ordered".to_string(),
+            )
+        })?;
+    let checkpoint_age_ms = nonnegative_counter(
+        row_i64(row, 4, "checkpoint freshness age")?,
+        "checkpoint age",
+    )?;
+    let format_info_present = row.try_get(5).map_err(|error| {
+        PgMetaEngine::classify_pg_error(
+            "postgres checkpoint freshness format-info flag parse failed",
+            error,
+        )
+    })?;
+    let metadata_format_version = row.try_get::<_, Option<i16>>(6).map_err(|error| {
+        PgMetaEngine::classify_pg_error(
+            "postgres checkpoint freshness format version parse failed",
+            error,
+        )
+    })?;
+    crate::ensure_supported_pg_sync_format_version(metadata_format_version)?;
+
+    Ok(CheckpointFreshnessObservation {
+        head_version,
+        checkpoint_version,
+        total_event_payload_bytes,
+        format_info_present,
+        event_payload_bytes,
+        checkpoint_age: std::time::Duration::from_millis(checkpoint_age_ms),
+    })
+}
+
+async fn read_checkpoint_freshness_with_pool(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+) -> MetaResult<CheckpointFreshnessObservation> {
+    PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "checkpoint freshness observation",
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(sql::SELECT_CHECKPOINT_FRESHNESS, &[&volume_id])
+                    .await
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres checkpoint freshness select failed",
+                            e,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "postgres metadata_state row missing during checkpoint freshness observation"
+                                .to_string(),
+                        )
+                    })?;
+                checkpoint_freshness_observation_from_row(&row)
+            })
+        },
+    )
+    .await
+}
+
 // Match the page query's sizing expression: two BIGINT columns plus a
 // conservative four-byte varlena header for each TEXT column.
 const PG_EVENT_FIXED_RESPONSE_BYTES: i64 = 8 + 8 + 4 + 4;
@@ -264,6 +373,16 @@ impl ForeignEventPage {
 }
 
 impl PgMetaEngine {
+    pub(super) fn read_remote_checkpoint_freshness(
+        &self,
+    ) -> MetaResult<CheckpointFreshnessObservation> {
+        self.run_async(read_checkpoint_freshness_with_pool(
+            self.command_pool.clone(),
+            self.volume_id,
+            self.command_timeout,
+        ))
+    }
+
     pub(super) fn validate_foreign_event_page_limits(
         max_batch_count: i64,
         max_response_bytes: i64,
@@ -399,11 +518,16 @@ impl PgMetaEngine {
                         .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
                     let mut last_batch_version = None;
+                    let mut last_observation = None;
                     for batch in batches {
                         let batch_version_row = tx
                             .query_opt(
                                 sql::BUMP_METADATA_VERSION,
-                                &[&volume_id, &expected_metadata_format_version],
+                                &[
+                                    &volume_id,
+                                    &expected_metadata_format_version,
+                                    &batch.payload_bytes,
+                                ],
                             )
                             .await
                             .map_err(|e| {
@@ -431,7 +555,14 @@ impl PgMetaEngine {
                                     .to_string(),
                             ));
                         };
-                        let batch_version: i64 = batch_version_row.get(0);
+                        let batch_version = row_i64(
+                            &batch_version_row,
+                            0,
+                            "postgres metadata batch version",
+                        )?;
+                        let batch_observation =
+                            checkpoint_freshness_observation_from_row(&batch_version_row)?;
+                        last_observation = Some(batch_observation);
 
                         for (event_chunk, payload_chunk) in batch
                             .events
@@ -440,7 +571,7 @@ impl PgMetaEngine {
                         {
                             let event_types: Vec<&str> =
                                 event_chunk.iter().map(|event| event.kind()).collect();
-                            let payloads = payload_chunk.to_vec();
+                            let payloads = payload_chunk;
                             tx.execute(
                                 sql::INSERT_EVENT_LOG_BATCH,
                                 &[
@@ -525,15 +656,26 @@ impl PgMetaEngine {
                         )
                         .await;
 
+                    let observation = last_observation.ok_or_else(|| {
+                        MetaError::Storage(
+                            "metadata publication did not return checkpoint freshness state"
+                                .to_string(),
+                        )
+                    })?;
+
                     tx.commit()
                         .await
                         .map_err(|e| Self::classify_pg_error("postgres commit failed", e))?;
-                    Ok(last_batch_version)
+                    Ok((last_batch_version, observation))
                 }),
             )
             .await
         });
-        self.record_remote_operation_result(result)
+        let result = self.record_remote_operation_result(result);
+        if let Ok((_, observation)) = &result {
+            self.record_checkpoint_freshness_observation(*observation);
+        }
+        result.map(|(version, _)| version)
     }
 
     fn split_projected_event_batches(
@@ -542,12 +684,17 @@ impl PgMetaEngine {
         max_response_bytes: i64,
     ) -> MetaResult<Vec<EncodedRemoteEventBatch>> {
         let mut batches = Vec::new();
-        let mut batch_events = Vec::new();
-        let mut batch_payloads = Vec::new();
+        let batch_capacity = events.len().min(PG_EVENT_INSERT_CHUNK_SIZE);
+        let mut batch_events = Vec::with_capacity(batch_capacity);
+        let mut batch_payloads = Vec::with_capacity(batch_capacity);
         let mut batch_response_bytes = 0_i64;
+        let mut batch_payload_bytes = 0_i64;
 
         for event in events {
             let payload = encode_event(&event)?;
+            let payload_len = i64::try_from(payload.len()).map_err(|_| {
+                MetaError::Storage("event payload length exceeds BIGINT".to_string())
+            })?;
             let event_response_bytes =
                 encoded_event_response_bytes(event.kind(), payload.len(), client_id)?;
             if event_response_bytes > max_response_bytes {
@@ -564,8 +711,10 @@ impl PgMetaEngine {
                 batches.push(EncodedRemoteEventBatch {
                     events: std::mem::take(&mut batch_events),
                     payloads: std::mem::take(&mut batch_payloads),
+                    payload_bytes: batch_payload_bytes,
                 });
                 batch_response_bytes = 0;
+                batch_payload_bytes = 0;
             }
 
             batch_response_bytes = batch_response_bytes
@@ -573,6 +722,12 @@ impl PgMetaEngine {
                 .ok_or_else(|| {
                     MetaError::Storage("event response size exceeds BIGINT".to_string())
                 })?;
+            batch_payload_bytes =
+                batch_payload_bytes
+                    .checked_add(payload_len)
+                    .ok_or_else(|| {
+                        MetaError::Storage("event payload size exceeds BIGINT".to_string())
+                    })?;
             batch_events.push(event);
             batch_payloads.push(payload);
         }
@@ -581,6 +736,7 @@ impl PgMetaEngine {
             batches.push(EncodedRemoteEventBatch {
                 events: batch_events,
                 payloads: batch_payloads,
+                payload_bytes: batch_payload_bytes,
             });
         }
         Ok(batches)
@@ -656,8 +812,32 @@ impl PgMetaEngine {
         })
     }
 
+    /// Publish a checkpoint only when the local version can advance the remote
+    /// checkpoint and is not already stale behind the remote head.
+    ///
+    /// An already-current checkpoint is skipped when its format metadata is
+    /// present; an empty format-info value remains a repairable metadata row.
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
         self.ensure_remote_format_validated()?;
+        let freshness = self.read_remote_checkpoint_freshness()?;
+        let local_version =
+            u64::try_from(self.local_version.load(Ordering::SeqCst)).map_err(|_| {
+                MetaError::Storage("local metadata version must be nonnegative".to_string())
+            })?;
+        if (freshness.head_version > local_version || freshness.checkpoint_version >= local_version)
+            && freshness.format_info_present
+        {
+            tracing::debug!(
+                volume_id = self.volume_id,
+                remote_head = freshness.head_version,
+                remote_checkpoint = freshness.checkpoint_version,
+                local_version,
+                "skipping checkpoint write because remote checkpoint is current or local version is behind remote head"
+            );
+            self.record_checkpoint_freshness_observation(freshness);
+            return Ok(());
+        }
+
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let payload = self.local.export_serving_checkpoint_bytes()?;
@@ -669,7 +849,15 @@ impl PgMetaEngine {
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
-        let version = self.local_version.load(Ordering::SeqCst);
+        let version = i64::try_from(local_version).map_err(|_| {
+            MetaError::Storage("local metadata version exceeds PostgreSQL BIGINT".to_string())
+        })?;
+        let checkpoint_total_event_bytes = i64::try_from(freshness.total_event_payload_bytes)
+            .map_err(|_| {
+                MetaError::Storage(
+                    "checkpoint payload byte counter exceeds PostgreSQL BIGINT".to_string(),
+                )
+            })?;
         let command_timeout = self.command_timeout;
 
         let result = self.run_async(async move {
@@ -687,6 +875,7 @@ impl PgMetaEngine {
                                     &metadata_format_version,
                                     &version,
                                     &version,
+                                    &checkpoint_total_event_bytes,
                                     &payload,
                                     &checkpoint_sha256.as_slice(),
                                     &format_info,
@@ -696,6 +885,11 @@ impl PgMetaEngine {
                             .map_err(|e| {
                                 Self::classify_pg_error("postgres checkpoint upsert failed", e)
                             })?;
+
+                        let observation = upserted
+                            .as_ref()
+                            .map(checkpoint_freshness_observation_from_row)
+                            .transpose()?;
 
                         if upserted.is_none() {
                             let row = client
@@ -713,12 +907,41 @@ impl PgMetaEngine {
                             crate::ensure_supported_pg_sync_format_version(row.get(0))?;
                         }
 
-                        Ok(())
+                        Ok(observation)
                     })
                 },
             )
             .await
         });
-        self.record_remote_operation_result(result)
+        let result = self.record_remote_operation_result(result);
+        if let Ok(Some(observation)) = &result {
+            self.record_checkpoint_freshness_observation(*observation);
+        }
+        result.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_payload_byte_accounting_matches_event_payloads() {
+        let events = vec![
+            MetaEvent::RemoveAttr { ino: 1 },
+            MetaEvent::RemoveAttr { ino: 2 },
+            MetaEvent::RemoveAttr { ino: 3 },
+        ];
+        let expected = events
+            .iter()
+            .map(|event| encode_event(event).expect("test event should encode").len() as i64)
+            .sum::<i64>();
+
+        let batches =
+            PgMetaEngine::split_projected_event_batches(events, "client-slot:1", i64::MAX)
+                .expect("test events should fit in one batch");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].payload_bytes, expected);
     }
 }

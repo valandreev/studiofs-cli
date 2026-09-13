@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::{CheckpointDescriptorFailure, MetaAcl};
+use crate::engine::{CheckpointDescriptorFailure, MetaAcl, MetadataCheckpointRefreshReason};
 use crate::redb_engine::RedbSnapshot;
 use sha2::{Digest, Sha256};
 
@@ -1847,6 +1847,52 @@ fn metadata_head_query_contains_checkpoint_version() {
 }
 
 #[test]
+fn checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping() {
+    let freshness = super::sql::SELECT_CHECKPOINT_FRESHNESS;
+    for fragment in [
+        "version",
+        "checkpoint_version",
+        "total_event_payload_bytes",
+        "checkpoint_total_event_bytes",
+        "checkpoint_updated_at",
+        "FROM metadata_state",
+        "WHERE vol = $1",
+    ] {
+        assert!(
+            freshness.contains(fragment),
+            "freshness query is missing {fragment}"
+        );
+    }
+
+    let bump = super::sql::BUMP_METADATA_VERSION;
+    assert!(bump.contains("total_event_payload_bytes = total_event_payload_bytes + $3"));
+    assert!(bump.contains("RETURNING"));
+    assert!(bump.contains("checkpoint_total_event_bytes"));
+
+    let checkpoint = super::sql::UPSERT_METADATA_CHECKPOINT;
+    assert!(
+        checkpoint.contains("checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes")
+    );
+    assert!(checkpoint.contains("checkpoint_updated_at = now()"));
+    for fragment in [
+        "RETURNING",
+        "version",
+        "checkpoint_version",
+        "total_event_payload_bytes",
+        "checkpoint_total_event_bytes",
+        "checkpoint_age_ms",
+        "format_info_present",
+        "metadata_format_version",
+    ] {
+        assert!(
+            checkpoint.contains(fragment),
+            "checkpoint upsert is missing {fragment}"
+        );
+    }
+    assert!(!checkpoint.contains("EXCLUDED.checkpoint_version >= metadata_state.version"));
+}
+
+#[test]
 fn bootstrap_checkpoint_query_contains_all_descriptor_columns() {
     let sql = super::sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR;
 
@@ -2266,6 +2312,221 @@ fn test_pg_flush_advances_checkpoint_version() {
         .unwrap_or(false)
     });
     assert!(ok, "expected metadata_state version >= 1");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_freshness_request_tracks_publication_and_reset() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _lag = set_test_env(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, "1");
+    let _bytes = set_test_env(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, "9223372036854775807");
+    let _age = set_test_env(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, "3600");
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-freshness");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    let batch_version = pg
+        .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 42 }])
+        .expect("publish event batch");
+    let stale = pg.checkpoint_freshness_diagnostics();
+    assert!(stale.refresh_needed);
+    assert_eq!(
+        stale.refresh_reason,
+        Some(MetadataCheckpointRefreshReason::VersionLag)
+    );
+    assert_eq!(stale.head_version, Some(batch_version as u64));
+    assert!(stale.event_payload_bytes_since_checkpoint > 0);
+
+    pg.local_version.store(batch_version, Ordering::SeqCst);
+    pg.write_checkpoint_locked()
+        .expect("write fresh checkpoint");
+    let fresh = pg.checkpoint_freshness_diagnostics();
+    assert!(!fresh.refresh_needed);
+    assert_eq!(fresh.checkpoint_version, Some(batch_version as u64));
+    assert_eq!(fresh.event_payload_bytes_since_checkpoint, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_promotion_preserves_post_capture_event_tail() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-tail");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    let batch_version = pg
+        .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 43 }])
+        .expect("publish event batch");
+    assert!(batch_version > 0);
+
+    let volume_id = volume.volume_id;
+    let format_version = CURRENT_FORMAT_VERSION as i16;
+    let version = 0_i64;
+    let checkpoint_version = 0_i64;
+    let checkpoint_total_event_bytes = 0_i64;
+    let snapshot = Vec::<u8>::new();
+    let checkpoint_sha256 = vec![0_u8; 32];
+    let format_info = Vec::<u8>::new();
+    let promoted = run_async(with_pg_test_client(&dsn, move |client| async move {
+        let row = client
+            .query_opt(
+                super::sql::UPSERT_METADATA_CHECKPOINT,
+                &[
+                    &volume_id,
+                    &format_version,
+                    &version,
+                    &checkpoint_version,
+                    &checkpoint_total_event_bytes,
+                    &snapshot,
+                    &checkpoint_sha256,
+                    &format_info,
+                ],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<bool, MetaError>(row.is_some())
+    }))
+    .expect("promote checkpoint after event publication");
+    assert!(
+        promoted,
+        "checkpoint promotion must not starve behind a newer head"
+    );
+
+    let state = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT version, checkpoint_version, total_event_payload_bytes, checkpoint_total_event_bytes FROM metadata_state WHERE vol=$1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<(i64, i64, i64, i64), MetaError>((
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+        ))
+    }))
+    .expect("query checkpoint tail state");
+
+    assert_eq!(state.0, batch_version);
+    assert_eq!(state.1, 0);
+    assert!(state.2 > state.3);
+    assert_eq!(state.3, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_skip_records_remote_stale_observation() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _lag = set_test_env(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, "1");
+    let _bytes = set_test_env(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, "9223372036854775807");
+    let _age = set_test_env(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, "3600");
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-stale-skip");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 1, total_event_payload_bytes = 10 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("advance remote metadata head");
+
+    pg.write_checkpoint_locked()
+        .expect("skip stale local checkpoint write");
+    let diagnostics = pg.checkpoint_freshness_diagnostics();
+    assert_eq!(diagnostics.head_version, Some(1));
+    assert_eq!(diagnostics.checkpoint_version, Some(0));
+    assert_eq!(diagnostics.event_payload_bytes_since_checkpoint, 10);
+    assert!(diagnostics.refresh_needed);
+    assert_eq!(
+        diagnostics.refresh_reason,
+        Some(MetadataCheckpointRefreshReason::VersionLag)
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_skip_when_remote_checkpoint_covers_local_version() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-current");
+    seed_local(&db, &volume.format_info());
+
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    pg.write_checkpoint_locked()
+        .expect("skip already-current checkpoint write");
+
+    let checkpoint_generation = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT checkpoint_generation FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok::<i64, MetaError>(row.get(0))
+    }))
+    .expect("query checkpoint generation");
+
+    assert_eq!(checkpoint_generation, 1);
+    let diagnostics = pg.checkpoint_freshness_diagnostics();
+    assert_eq!(diagnostics.head_version, Some(0));
+    assert_eq!(diagnostics.checkpoint_version, Some(0));
+    assert!(!diagnostics.refresh_needed);
 }
 
 #[test]

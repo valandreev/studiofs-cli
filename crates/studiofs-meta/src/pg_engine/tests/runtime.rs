@@ -85,3 +85,43 @@ fn pg_snapshot_backend_uses_pool_size_override() {
         "standalone snapshot backend should use the shared pool-size resolver"
     );
 }
+
+#[test]
+fn checkpoint_freshness_environment_overrides_use_positive_values() {
+    let _lag = set_test_env(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, "7");
+    let _bytes = set_test_env(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, "2048");
+    let _age = set_test_env(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, "90");
+
+    assert_eq!(
+        PgMetaEngine::env_positive_u64(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, 10),
+        7
+    );
+    assert_eq!(
+        PgMetaEngine::env_positive_u64(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, 100),
+        2048
+    );
+    assert_eq!(
+        PgMetaEngine::env_positive_u64(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, 60),
+        90
+    );
+}
+
+#[test]
+fn checkpoint_freshness_environment_overrides_fall_back_when_invalid() {
+    let _lag = set_test_env(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, "0");
+    let _bytes = set_test_env(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, "not-a-number");
+    let _age = set_test_env(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, "-1");
+
+    assert_eq!(
+        PgMetaEngine::env_positive_u64(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, 10),
+        10
+    );
+    assert_eq!(
+        PgMetaEngine::env_positive_u64(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, 100),
+        100
+    );
+    assert_eq!(
+        PgMetaEngine::env_positive_u64(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, 60),
+        60
+    );
+}

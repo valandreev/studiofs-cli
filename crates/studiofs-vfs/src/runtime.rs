@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use studiofs_meta::engine::{
-    DeferredDeleteRecord, MetadataAuthorityStatus, MetadataCoherenceProgress,
-    MetadataInvalidationDiagnostics, MetadataReplicationBacklog, MetadataWriteObservability,
-    PendingCreateRecord, PgSyncStatus, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, MetadataAuthorityStatus, MetadataCheckpointFreshnessDiagnostics,
+    MetadataCoherenceProgress, MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
+    MetadataWriteObservability, PendingCreateRecord, PgSyncStatus, UndoLogKind, UndoLogRecord,
 };
 use studiofs_meta::snapshot_ports::{
     SnapshotCleanupStore, SnapshotJobStore, SnapshotPolicyStore, SnapshotSourceReader,
@@ -589,6 +589,11 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     );
     forward_method!(
         fn metadata_invalidation_diagnostics(&self) -> MetadataInvalidationDiagnostics
+    );
+    forward_method!(
+        fn metadata_checkpoint_freshness_diagnostics(
+            &self,
+        ) -> MetadataCheckpointFreshnessDiagnostics
     );
     forward_method!(fn metadata_coherence_progress(&self) -> MetadataCoherenceProgress);
     forward_method!(fn request_eager_flush(&self));

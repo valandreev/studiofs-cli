@@ -3,6 +3,22 @@ pub(super) const SELECT_METADATA_VERSION: &str = "SELECT version FROM metadata_s
 pub(super) const SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION: &str =
     "SELECT version, checkpoint_version FROM metadata_state WHERE vol=$1";
 
+pub(super) const SELECT_CHECKPOINT_FRESHNESS: &str = r#"
+    SELECT
+        version,
+        checkpoint_version,
+        total_event_payload_bytes,
+        checkpoint_total_event_bytes,
+        GREATEST(
+            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
+            0::BIGINT
+        ) AS checkpoint_age_ms,
+        octet_length(format_info) > 0 AS format_info_present,
+        metadata_format_version
+    FROM metadata_state
+    WHERE vol = $1
+    "#;
+
 pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
     SELECT
         v.vol,
@@ -26,9 +42,20 @@ pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =
 pub(super) const BUMP_METADATA_VERSION: &str = r#"
     UPDATE metadata_state
     SET version = version + 1,
+        total_event_payload_bytes = total_event_payload_bytes + $3,
         updated_at = now()
     WHERE vol = $1 AND metadata_format_version = $2
-    RETURNING version
+    RETURNING
+        version,
+        checkpoint_version,
+        total_event_payload_bytes,
+        checkpoint_total_event_bytes,
+        GREATEST(
+            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
+            0::BIGINT
+        ) AS checkpoint_age_ms,
+        octet_length(format_info) > 0 AS format_info_present,
+        metadata_format_version
     "#;
 
 pub(super) const INSERT_EVENT_LOG_BATCH: &str = r#"
@@ -56,25 +83,40 @@ pub(super) const UPSERT_METADATA_CHECKPOINT: &str = r#"
         metadata_format_version,
         version,
         checkpoint_version,
+        total_event_payload_bytes,
+        checkpoint_total_event_bytes,
         snapshot,
         checkpoint_sha256,
         format_info,
         checkpoint_publication_state,
-        checkpoint_generation
+        checkpoint_generation,
+        checkpoint_updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'published', 1)
+    VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, 'published', 1, now())
     ON CONFLICT (vol) DO UPDATE
     SET version = GREATEST(metadata_state.version, EXCLUDED.version),
         checkpoint_version = EXCLUDED.checkpoint_version,
+        checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes,
         snapshot = EXCLUDED.snapshot,
         checkpoint_sha256 = EXCLUDED.checkpoint_sha256,
         format_info = EXCLUDED.format_info,
         checkpoint_publication_state = EXCLUDED.checkpoint_publication_state,
         checkpoint_generation = metadata_state.checkpoint_generation + 1,
+        checkpoint_updated_at = now(),
         updated_at = now()
     WHERE metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
       AND EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
-    RETURNING metadata_format_version
+    RETURNING
+        version,
+        checkpoint_version,
+        total_event_payload_bytes,
+        checkpoint_total_event_bytes,
+        GREATEST(
+            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
+            0::BIGINT
+        ) AS checkpoint_age_ms,
+        octet_length(format_info) > 0 AS format_info_present,
+        metadata_format_version
     "#;
 
 pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
