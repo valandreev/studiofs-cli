@@ -76,7 +76,7 @@ negative-version inputs leave the active path and temporary directory clean.
 
 Focused validation passed:
 
-- `cargo test -p studiofs --bin studiofs discover_` — 10 passed, 0 failed.
+- `cargo test -p studiofs --bin studiofs discover_` — 11 passed, 0 failed.
 - `cargo test -p studiofs-meta initialize_discovered_postgres_checkpoint --lib` — 3 passed, 0 failed.
 - `cargo test -p studiofs --bin studiofs hard_link_unsupported` — 1 passed, 0 failed.
 - `cargo check -p studiofs-meta -p studiofs` — passed.
@@ -85,6 +85,9 @@ Focused validation passed:
   repository `target` directory returned Windows access-denied errors.
 - `cargo fmt --all -- --check` — passed.
 - `git diff --check` — passed.
+- `cargo check -p studiofs-meta -p studiofs --target x86_64-unknown-linux-gnu` —
+  not completed because the host lacks `x86_64-linux-gnu-gcc`, required by the
+  `ring` build script; the Windows-targeted checks passed.
 
 PostgreSQL service and mounted-E2E acceptance were not run; they remain
 environment-gated and are outside the focused validation boundary.
@@ -115,20 +118,26 @@ PostgreSQL sync contract:
   malformed/root-invalid checkpoints, backend rejection, and the durability
   barrier; extend CLI tests to cover install-race mapping and successful
   temporary-directory cleanup.
-- Accepted from the follow-up review: reject checkpoint versions above the
-  PostgreSQL `i64` range at the metadata seam, reject missing or blank
-  PostgreSQL configuration before checkpoint import, inspect the active path
-  with `symlink_metadata`, and sync the parent metadata directory on Unix
-  after installation. Windows hard-link failures reported as
-  `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED` are mapped to the same
-  actionable capability message as `ErrorKind::Unsupported`.
-- Not accepted from the follow-up review: replacing the hard-link install with
-  `std::fs::rename` on Windows. The standard-library implementation uses
-  `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which would silently replace
-  an existing active database and violate SFS-705. A broad `DiscoveryError`
-  variant refactor and public exposure of internal counter-key strings are
-  likewise outside the behavior required here; neither has a production
-  caller or fixes a demonstrated failure.
+- Accepted from the follow-up review: keep the checkpoint version as `i64`
+  across the PostgreSQL-to-local bootstrap boundary and reject negative values
+  in the metadata seam; return the existing typed descriptor-validation error
+  for invalid bootstrap format/version inputs; recognize Unix `EPERM` hard-link
+  failures; preflight the active path before remote PostgreSQL work; and keep
+  parent-directory synchronization best-effort after installation. Windows
+  hard-link failures reported as `ERROR_INVALID_FUNCTION` or
+  `ERROR_NOT_SUPPORTED` remain mapped to the actionable capability message.
+- Not accepted from the follow-up review: rolling back the active hard link
+  after a directory-sync error, because a concurrent consumer could already
+  have opened the fully-built database; the directory sync is therefore
+  best-effort and cannot make a valid install unretryable. Replacing the
+  hard-link install with `std::fs::rename` is also rejected: the standard
+  library uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which would
+  violate SFS-705's no-silent-replacement contract. Double deserialization is
+  left unchanged because avoiding it requires exposing or wrapping the
+  crate-private checkpoint type across the metadata/CLI boundary without a
+  measured SFS-705 requirement. A broad `DiscoveryError` variant refactor and
+  public exposure of internal counter-key strings are likewise out of scope;
+  neither fixes a demonstrated failure or has a production caller.
 - Not accepted: an abort-on-drop guard for the PostgreSQL connection task.
   The current code aborts and awaits the task on every normal return,
   including timeout; the review's remaining case is an uncaught panic, not a
@@ -192,12 +201,12 @@ required services are available.
 ## Idempotence and Recovery
 
 An existing active database (including a dangling symlink) is rejected before
-temporary work begins. A temporary directory owns the in-progress database and
-removes it on every failure path. The hard-link install occurs only after
-redb's immediate durability barrier and after the engine handle is dropped; an
-active target that appears during staging makes the link fail instead of
-replacing it. Unix also syncs the containing directory after creating the
-active name.
+remote work and before temporary staging. A temporary directory owns the
+in-progress database and removes it on every import failure. The hard-link
+install occurs only after redb's immediate durability barrier and after the
+engine handle is dropped; an active target that appears during staging makes
+the link fail instead of replacing it. Unix best-effort syncs the containing
+directory after creating the active name.
 
 ## Artifacts and Notes
 

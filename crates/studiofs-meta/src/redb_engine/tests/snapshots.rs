@@ -60,6 +60,8 @@ fn postgres_test_format_info() -> FormatInfo {
     format_info
 }
 
+use crate::CheckpointDescriptorFailure;
+
 #[test]
 fn initialize_discovered_postgres_checkpoint_persists_ready_local_state() {
     let source = temp_engine();
@@ -112,7 +114,9 @@ fn initialize_discovered_postgres_checkpoint_rejects_invalid_root_and_bytes() {
         .expect_err("local-only format must not use the PostgreSQL bootstrap seam");
     assert!(matches!(
         local_backend_error,
-        MetaError::Storage(message) if message.contains("requires Postgres metadata backend")
+        MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::FormatInfo
+        }
     ));
 
     let empty_dir = studiofs_test_support::workspace_target_tempdir("discovered-empty-");
@@ -171,7 +175,9 @@ fn initialize_discovered_postgres_checkpoint_rejects_unusable_format_and_version
             &checkpoint,
             42,
         ),
-        Err(MetaError::Storage(message)) if message.contains("Postgres configuration")
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::FormatInfo
+        })
     ));
 
     let blank_url_dir = studiofs_test_support::workspace_target_tempdir("discovered-blank-url-");
@@ -185,18 +191,22 @@ fn initialize_discovered_postgres_checkpoint_rejects_unusable_format_and_version
         .url = "  ".to_string();
     assert!(matches!(
         blank_url_target.initialize_discovered_postgres_checkpoint(&blank_url, &checkpoint, 42),
-        Err(MetaError::Storage(message)) if message.contains("Postgres configuration")
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::FormatInfo
+        })
     ));
 
-    let oversized_dir = studiofs_test_support::workspace_target_tempdir("discovered-version-");
-    let oversized_target = RedbMetaEngine::open(oversized_dir.path().join("target.db")).unwrap();
+    let negative_dir = studiofs_test_support::workspace_target_tempdir("discovered-version-");
+    let negative_target = RedbMetaEngine::open(negative_dir.path().join("target.db")).unwrap();
     assert!(matches!(
-        oversized_target.initialize_discovered_postgres_checkpoint(
+        negative_target.initialize_discovered_postgres_checkpoint(
             &postgres_test_format_info(),
             &checkpoint,
-            u64::MAX,
+            -1,
         ),
-        Err(MetaError::Storage(message)) if message.contains("i64::MAX")
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::Version
+        })
     ));
 }
 

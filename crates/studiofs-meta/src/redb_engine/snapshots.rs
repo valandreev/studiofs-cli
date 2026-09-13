@@ -280,28 +280,33 @@ impl RedbMetaEngine {
         &self,
         format_info: &FormatInfo,
         checkpoint_bytes: &[u8],
-        checkpoint_version: u64,
+        checkpoint_version: i64,
     ) -> MetaResult<()> {
-        if checkpoint_version > i64::MAX as u64 {
-            return Err(MetaError::Storage(
-                "discovered checkpoint version exceeds i64::MAX".to_string(),
-            ));
+        if checkpoint_version < 0 {
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::Version,
+            });
         }
         if format_info.metadata.backend != MetadataBackend::Postgres {
-            return Err(MetaError::Storage(
-                "discovered checkpoint requires Postgres metadata backend".to_string(),
-            ));
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::FormatInfo,
+            });
         }
         let Some(postgres) = format_info.metadata.postgres.as_ref() else {
-            return Err(MetaError::Storage(
-                "discovered checkpoint requires Postgres configuration".to_string(),
-            ));
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::FormatInfo,
+            });
         };
         if postgres.url.trim().is_empty() {
-            return Err(MetaError::Storage(
-                "discovered checkpoint requires Postgres configuration".to_string(),
-            ));
+            return Err(MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::FormatInfo,
+            });
         }
+        let checkpoint_version = u64::try_from(checkpoint_version).map_err(|_| {
+            MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::Version,
+            }
+        })?;
         self.import_serving_checkpoint_bytes(checkpoint_bytes)?;
         self.set_format_info(format_info)?;
         let root_attr = self.get_attr(ROOT_INO)?;

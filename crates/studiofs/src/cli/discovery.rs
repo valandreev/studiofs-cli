@@ -164,22 +164,41 @@ fn is_hard_link_unsupported(error: &std::io::Error) -> bool {
             None => false,
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        // FAT/exFAT may report missing hard-link support as EPERM rather than
+        // the Unsupported error kind.
+        error.raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
 }
 
 #[cfg(unix)]
-fn sync_metadata_directory(meta_dir: &Path) -> DiscoveryResult<()> {
-    std::fs::File::open(meta_dir)?.sync_all()?;
-    Ok(())
+fn sync_metadata_directory(meta_dir: &Path) {
+    // The redb file sync above is the required durability barrier. Directory
+    // fsync is an additional best-effort hint: once the complete database has
+    // been linked into the active name, returning an error here would leave a
+    // valid database installed while making a retry impossible.
+    let _ = std::fs::File::open(meta_dir).and_then(|directory| directory.sync_all());
 }
 
 #[cfg(not(unix))]
-fn sync_metadata_directory(_meta_dir: &Path) -> DiscoveryResult<()> {
+fn sync_metadata_directory(_meta_dir: &Path) {
     // Windows does not provide a portable directory-handle fsync operation.
-    Ok(())
+}
+
+fn ensure_active_database_absent(active_db_path: &Path) -> DiscoveryResult<()> {
+    match std::fs::symlink_metadata(active_db_path) {
+        Ok(_) => Err(DiscoveryError::Message(format!(
+            "local metadata already exists at {} (remove it first or use another name)",
+            active_db_path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DiscoveryError::Io(error)),
+    }
 }
 
 fn create_local_snapshot(
@@ -193,22 +212,15 @@ fn create_local_snapshot(
         format_info,
         ..
     } = state;
-    let checkpoint_version = u64::try_from(checkpoint_version).map_err(|_| {
-        DiscoveryError::Message("discovered checkpoint version must not be negative".to_string())
-    })?;
+    if checkpoint_version < 0 {
+        return Err(DiscoveryError::Message(
+            "discovered checkpoint version must not be negative".to_string(),
+        ));
+    }
 
     std::fs::create_dir_all(meta_dir)?;
     let active_db_path = meta_dir.join(format!("{name}.db"));
-    match std::fs::symlink_metadata(&active_db_path) {
-        Ok(_) => {
-            return Err(DiscoveryError::Message(format!(
-                "local metadata already exists at {} (remove it first or use another name)",
-                active_db_path.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(DiscoveryError::Io(error)),
-    }
+    ensure_active_database_absent(&active_db_path)?;
 
     let temp_dir = tempfile::Builder::new()
         .prefix(".discover-")
@@ -226,12 +238,15 @@ fn create_local_snapshot(
     // A hard link is atomic and no-replace, and fails if another process
     // installed the active database while this checkpoint was being staged.
     install_staged_database(&temp_db_path, &active_db_path)?;
-    sync_metadata_directory(meta_dir)?;
+    sync_metadata_directory(meta_dir);
 
     Ok(active_db_path)
 }
 
 pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
+    let active_db_path = meta_dir.join(format!("{name}.db"));
+    ensure_active_database_absent(&active_db_path)?;
+
     let discovered = load_remote_discovery_state(name, meta_dsn)?;
     let volume_id = discovered.volume_id;
     let db_path = create_local_snapshot(name, meta_dir, discovered)?;
@@ -463,6 +478,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn discover_refuses_existing_active_database_before_remote_work() {
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        std::fs::write(meta_dir.path().join("discovered.db"), b"keep this database")
+            .expect("create existing active database");
+
+        let error = run("discovered", "", meta_dir.path())
+            .expect_err("existing active database must fail before PostgreSQL access");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_directory_sync_is_best_effort() {
+        let dir = tempfile::tempdir().expect("create metadata directory");
+        let missing_directory = dir.path().join("missing");
+
+        sync_metadata_directory(&missing_directory);
+    }
+
     #[cfg(unix)]
     #[test]
     fn discover_refuses_dangling_active_database_symlink() {
@@ -493,6 +531,14 @@ mod tests {
         ));
         assert!(is_hard_link_unsupported(
             &std::io::Error::from_raw_os_error(50)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_unsupported_recognizes_eperm() {
+        assert!(is_hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(libc::EPERM,)
         ));
     }
 }
