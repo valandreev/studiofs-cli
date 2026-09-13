@@ -247,7 +247,7 @@ fn row_i64(row: &tokio_postgres::Row, index: usize, name: &str) -> MetaResult<i6
     })
 }
 
-fn checkpoint_freshness_observation_from_row(
+pub(super) fn checkpoint_freshness_observation_from_row(
     row: &tokio_postgres::Row,
 ) -> MetaResult<CheckpointFreshnessObservation> {
     let head_version = nonnegative_counter(

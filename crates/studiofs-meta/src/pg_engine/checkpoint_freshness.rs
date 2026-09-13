@@ -189,17 +189,25 @@ impl super::PgMetaEngine {
             );
         }
 
-        let mut state = self
-            .checkpoint_freshness_state
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!(
-                    volume_id = self.volume_id,
-                    "checkpoint freshness state lock was poisoned; recovering state"
-                );
-                poisoned.into_inner()
-            });
-        state.observe(&self.checkpoint_freshness_policy, observation.into());
+        let refresh_needed = {
+            let mut state = self
+                .checkpoint_freshness_state
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    warn!(
+                        volume_id = self.volume_id,
+                        "checkpoint freshness state lock was poisoned; recovering state"
+                    );
+                    poisoned.into_inner()
+                });
+            state.observe(&self.checkpoint_freshness_policy, observation.into());
+            state.diagnostics().refresh_needed
+        };
+        if refresh_needed {
+            self.request_checkpoint_refresh();
+        } else {
+            self.clear_checkpoint_refresh_request();
+        }
     }
 
     pub(super) fn checkpoint_freshness_diagnostics(

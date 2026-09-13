@@ -161,6 +161,7 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
 struct PgBackgroundWorkers {
     poll_shutdown: Arc<AtomicBool>,
     poll_wakeup: Arc<(Mutex<bool>, Condvar)>,
+    checkpoint_wakeup: Arc<(Mutex<bool>, Condvar)>,
     lock_notify_cancel: CancellationToken,
     metadata_notify_cancel: CancellationToken,
     state: Mutex<PgBackgroundWorkerState>,
@@ -169,6 +170,7 @@ struct PgBackgroundWorkers {
 
 struct PgBackgroundWorkerState {
     poll_handle: Option<std::thread::JoinHandle<()>>,
+    checkpoint_handle: Option<std::thread::JoinHandle<()>>,
     metadata_notify_handle: Option<std::thread::JoinHandle<()>>,
     lock_notify_handle: Option<std::thread::JoinHandle<()>>,
     lock_renew_handle: Option<std::thread::JoinHandle<()>>,
@@ -180,6 +182,7 @@ struct PgBackgroundWorkerState {
 #[derive(Clone, Copy)]
 enum PgBackgroundWorker {
     Poll,
+    Checkpoint,
     MetadataNotify,
     LockNotify,
     LockRenew,
@@ -215,6 +218,7 @@ pub struct PgMetaEngine {
     sync_max_response_bytes_per_page: i64,
     checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy,
     checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
+    checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState,
     command_pool: Arc<runtime::PgConnectionPool>,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
@@ -384,6 +388,8 @@ struct ClaimedPendingBatch {
     event_end: u64,
 }
 
+#[path = "pg_engine/checkpoint_coordinator.rs"]
+mod checkpoint_coordinator;
 #[path = "pg_engine/checkpoint_freshness.rs"]
 mod checkpoint_freshness;
 #[path = "pg_engine/engine_core.rs"]
@@ -723,6 +729,7 @@ impl PgMetaEngine {
                                     ('counters'::TEXT),
                                     ('event_log'::TEXT),
                                     ('metadata_state'::TEXT),
+                                    ('bootstrap_checkpoint_leases'::TEXT),
                                     ('acl_rules'::TEXT),
                                     ('file_lock_leases'::TEXT),
                                     ('snapshot_catalog'::TEXT),
@@ -1054,6 +1061,7 @@ impl PgMetaEngine {
             checkpoint_freshness_state: Mutex::new(
                 checkpoint_freshness::CheckpointFreshnessState::new(&checkpoint_freshness_policy),
             ),
+            checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
             command_pool: Arc::new(runtime::PgConnectionPool::new(
                 pg.url.clone(),
                 connect_timeout,
@@ -1172,6 +1180,16 @@ impl PgMetaEngine {
             engine
                 .background_workers
                 .install_handle(PgBackgroundWorker::Poll, handle)?;
+            let checkpoint_handle = Self::start_background_checkpoint_coordinator(
+                Arc::downgrade(&engine),
+                engine.background_workers.poll_shutdown(),
+                engine.background_workers.checkpoint_wakeup(),
+                Self::default_checkpoint_retry_interval(),
+                Self::default_checkpoint_lease_duration(),
+            )?;
+            engine
+                .background_workers
+                .install_handle(PgBackgroundWorker::Checkpoint, checkpoint_handle)?;
         }
         Ok(engine)
     }

@@ -67,10 +67,12 @@ impl PgBackgroundWorkers {
         Self {
             poll_shutdown: Arc::new(AtomicBool::new(false)),
             poll_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
+            checkpoint_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
             lock_notify_cancel: tokio_util::sync::CancellationToken::new(),
             metadata_notify_cancel: tokio_util::sync::CancellationToken::new(),
             state: Mutex::new(PgBackgroundWorkerState {
                 poll_handle: None,
+                checkpoint_handle: None,
                 metadata_notify_handle: None,
                 lock_notify_handle: None,
                 lock_renew_handle: None,
@@ -88,6 +90,10 @@ impl PgBackgroundWorkers {
 
     pub(super) fn poll_wakeup(&self) -> Arc<(Mutex<bool>, Condvar)> {
         self.poll_wakeup.clone()
+    }
+
+    pub(super) fn checkpoint_wakeup(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        self.checkpoint_wakeup.clone()
     }
 
     pub(super) fn lock_notify_cancel(&self) -> tokio_util::sync::CancellationToken {
@@ -151,11 +157,21 @@ impl PgBackgroundWorkers {
         wakeup_cv.notify_one();
     }
 
+    pub(super) fn signal_checkpoint_wakeup(&self) {
+        let (wakeup_lock, wakeup_cv) = &*self.checkpoint_wakeup;
+        let mut wakeup_guard = wakeup_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *wakeup_guard = true;
+        wakeup_cv.notify_one();
+    }
+
     pub(super) fn signal_stop(&self) {
         self.lock_notify_cancel.cancel();
         self.metadata_notify_cancel.cancel();
         self.poll_shutdown.store(true, Ordering::Release);
         self.signal_poll_wakeup();
+        self.signal_checkpoint_wakeup();
     }
 
     pub(super) fn shutdown(&self, timeout: Duration) -> MetaResult<()> {
@@ -180,6 +196,10 @@ impl PgBackgroundWorkers {
             state.shutdown_in_progress = true;
             [
                 (PgBackgroundWorker::Poll, state.poll_handle.take()),
+                (
+                    PgBackgroundWorker::Checkpoint,
+                    state.checkpoint_handle.take(),
+                ),
                 (
                     PgBackgroundWorker::MetadataNotify,
                     state.metadata_notify_handle.take(),
@@ -232,6 +252,7 @@ fn worker_slot(
 ) -> Option<&std::thread::JoinHandle<()>> {
     match worker {
         PgBackgroundWorker::Poll => state.poll_handle.as_ref(),
+        PgBackgroundWorker::Checkpoint => state.checkpoint_handle.as_ref(),
         PgBackgroundWorker::MetadataNotify => state.metadata_notify_handle.as_ref(),
         PgBackgroundWorker::LockNotify => state.lock_notify_handle.as_ref(),
         PgBackgroundWorker::LockRenew => state.lock_renew_handle.as_ref(),
@@ -244,6 +265,7 @@ fn worker_slot_mut(
 ) -> &mut Option<std::thread::JoinHandle<()>> {
     match worker {
         PgBackgroundWorker::Poll => &mut state.poll_handle,
+        PgBackgroundWorker::Checkpoint => &mut state.checkpoint_handle,
         PgBackgroundWorker::MetadataNotify => &mut state.metadata_notify_handle,
         PgBackgroundWorker::LockNotify => &mut state.lock_notify_handle,
         PgBackgroundWorker::LockRenew => &mut state.lock_renew_handle,
@@ -253,6 +275,7 @@ fn worker_slot_mut(
 fn worker_name(worker: PgBackgroundWorker) -> &'static str {
     match worker {
         PgBackgroundWorker::Poll => "poll",
+        PgBackgroundWorker::Checkpoint => "checkpoint",
         PgBackgroundWorker::MetadataNotify => "metadata-notify",
         PgBackgroundWorker::LockNotify => "notify",
         PgBackgroundWorker::LockRenew => "renew",

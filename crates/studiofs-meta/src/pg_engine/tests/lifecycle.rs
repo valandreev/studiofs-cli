@@ -3,6 +3,31 @@ use crate::engine::{CheckpointDescriptorFailure, MetaAcl, MetadataCheckpointRefr
 use crate::redb_engine::RedbSnapshot;
 use sha2::{Digest, Sha256};
 
+#[test]
+fn checkpoint_coordinator_coalesces_requests_until_consumed() {
+    let state = super::checkpoint_coordinator::CheckpointCoordinatorState::new();
+
+    assert!(state.request());
+    assert!(!state.request());
+    assert!(state.take_request());
+    assert!(!state.take_request());
+    assert!(state.request());
+}
+
+#[test]
+fn checkpoint_lease_sql_is_fenced_and_short_lived() {
+    let claim = super::sql::CLAIM_BOOTSTRAP_CHECKPOINT_LEASE;
+    assert!(claim.contains("lease_expires_at"));
+    assert!(claim.contains("fencing_token"));
+    assert!(claim.contains("clock_timestamp()"));
+    assert!(claim.contains("RETURNING"));
+
+    let publish = super::sql::UPSERT_FENCED_METADATA_CHECKPOINT;
+    assert!(publish.contains("fencing_token"));
+    assert!(publish.contains("lease_expires_at > clock_timestamp()"));
+    assert!(publish.contains("RETURNING"));
+}
+
 async fn with_pg_test_client<T, F, Fut>(dsn: &str, f: F) -> Result<T, MetaError>
 where
     F: FnOnce(tokio_postgres::Client) -> Fut,
@@ -2356,6 +2381,173 @@ fn pg_checkpoint_freshness_request_tracks_publication_and_reset() {
     assert!(!fresh.refresh_needed);
     assert_eq!(fresh.checkpoint_version, Some(batch_version as u64));
     assert_eq!(fresh.event_payload_bytes_since_checkpoint, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_lease_takeover_advances_fence_and_rejects_old_owner() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-lease");
+    let first_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let first_db = first_dir.path().join("meta.redb");
+    seed_local(&first_db, &volume.format_info());
+    let first = PgMetaEngine::open_with_options(
+        &first_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open first pg engine");
+
+    let first_owner = "checkpoint-owner-a";
+    let second_owner = "checkpoint-owner-b";
+    let first_lease = first
+        .try_claim_checkpoint_lease(first_owner, Duration::from_secs(60))
+        .expect("claim first checkpoint lease")
+        .expect("first owner should acquire checkpoint lease");
+    assert_eq!(first_lease.fencing_token, 1);
+    assert!(
+        first
+            .try_claim_checkpoint_lease(second_owner, Duration::from_secs(60))
+            .expect("check active checkpoint lease")
+            .is_none(),
+        "a live checkpoint lease must exclude a peer"
+    );
+
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE bootstrap_checkpoint_leases SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("expire first checkpoint lease");
+
+    let second_lease = first
+        .try_claim_checkpoint_lease(second_owner, Duration::from_secs(60))
+        .expect("claim takeover checkpoint lease")
+        .expect("expired checkpoint lease should be taken over");
+    assert!(second_lease.fencing_token > first_lease.fencing_token);
+
+    let format_version = CURRENT_FORMAT_VERSION as i16;
+    let version = 0_i64;
+    let checkpoint_bytes = Vec::<u8>::new();
+    let checkpoint_sha256 = vec![0_u8; 32];
+    let format_info = Vec::<u8>::new();
+    let old_owner_publish = run_async(with_pg_test_client(&dsn, move |client| async move {
+        let row = client
+            .query_opt(
+                super::sql::UPSERT_FENCED_METADATA_CHECKPOINT,
+                &[
+                    &volume.volume_id,
+                    &format_version,
+                    &version,
+                    &version,
+                    &version,
+                    &checkpoint_bytes,
+                    &checkpoint_sha256,
+                    &format_info,
+                    &first_owner,
+                    &first_lease.fencing_token,
+                ],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<bool, MetaError>(row.is_some())
+    }))
+    .expect("attempt old-owner checkpoint publication");
+    assert!(
+        !old_owner_publish,
+        "a builder with an expired fencing token must not publish"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_background_checkpoint_coordinator_coalesces_two_clients_and_publishes_exact_cut() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-coordinator");
+    let first_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let first_db = first_dir.path().join("meta.redb");
+    seed_local(&first_db, &volume.format_info());
+    let second_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let second_db = second_dir.path().join("meta.redb");
+    seed_local(&second_db, &volume.format_info());
+
+    let first = PgMetaEngine::open(&first_db).expect("open first background pg engine");
+    let second = PgMetaEngine::open(&second_db).expect("open second background pg engine");
+
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 10000, total_event_payload_bytes = 10_000 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("advance remote head for checkpoint refresh");
+    first.local_version.store(10_000, Ordering::Release);
+    second.local_version.store(10_000, Ordering::Release);
+    first.observe_checkpoint_freshness();
+    second.observe_checkpoint_freshness();
+
+    let published = wait_until(Duration::from_secs(15), || {
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_opt(
+                    "SELECT checkpoint_generation FROM metadata_state WHERE vol = $1 AND checkpoint_version = 10000",
+                    &[&volume.volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<bool, MetaError>(row.is_some_and(|row| row.get::<_, i64>(0) >= 2))
+        }))
+        .unwrap_or(false)
+    });
+    assert!(
+        published,
+        "background coordinator should publish a checkpoint"
+    );
+
+    first.prepare_for_close().expect("close first pg engine");
+    second.prepare_for_close().expect("close second pg engine");
+
+    let (generation, version, checkpoint_version, snapshot, checkpoint_sha256) =
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT checkpoint_generation, version, checkpoint_version, snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+                    &[&volume.volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(i64, i64, i64, Vec<u8>, Vec<u8>), MetaError>((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+            ))
+        }))
+        .expect("read published checkpoint");
+    assert_eq!(generation, 2, "coalesced clients must publish once");
+    assert_eq!(version, 10_000);
+    assert_eq!(checkpoint_version, 10_000);
+    assert_eq!(checkpoint_sha256, Sha256::digest(&snapshot).to_vec());
+    assert!(!first.checkpoint_freshness_diagnostics().refresh_needed);
+    assert!(!second.checkpoint_freshness_diagnostics().refresh_needed);
 }
 
 #[test]

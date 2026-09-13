@@ -143,6 +143,15 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         END
         $$;
 
+        CREATE TABLE IF NOT EXISTS bootstrap_checkpoint_leases (
+            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            owner TEXT NOT NULL,
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            fencing_token BIGINT NOT NULL CHECK (fencing_token >= 0),
+            acquired_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            renewed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        );
+
         CREATE TABLE IF NOT EXISTS acl_rules (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
             ino BIGINT NOT NULL,
@@ -801,6 +810,10 @@ mod tests {
         assert!(sql.contains("total_event_payload_bytes >= 0"));
         assert!(sql.contains("checkpoint_total_event_bytes >= 0"));
         assert!(sql.contains("checkpoint_version >= 0 AND checkpoint_version <= version"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS bootstrap_checkpoint_leases"));
+        assert!(sql.contains("lease_expires_at TIMESTAMPTZ NOT NULL"));
+        assert!(sql.contains("fencing_token BIGINT NOT NULL CHECK (fencing_token >= 0)"));
+        assert!(sql.contains("REFERENCES volumes(vol) ON DELETE CASCADE"));
         assert!(sql.contains("ADD COLUMN IF NOT EXISTS checkpoint_updated_at TIMESTAMPTZ;"));
         assert!(sql.contains("SET checkpoint_updated_at = 'epoch'::timestamptz"));
         assert!(sql.contains("ALTER COLUMN checkpoint_updated_at SET DEFAULT now()"));
