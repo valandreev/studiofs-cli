@@ -1160,7 +1160,8 @@ impl PgMetaEngine {
             engine.restore_pending_state_from_local_log()?;
             bootstrap_succeeded
         };
-        let startup_target_observed = if remote_transport_unavailable {
+        let startup_target_observed = if engine.remote_transport_unavailable.load(Ordering::Acquire)
+        {
             false
         } else {
             match engine.remote_metadata_head_version() {
