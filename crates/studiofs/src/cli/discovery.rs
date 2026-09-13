@@ -132,6 +132,20 @@ async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResu
     result
 }
 
+fn install_staged_database(staged_db_path: &Path, active_db_path: &Path) -> DiscoveryResult<()> {
+    std::fs::hard_link(staged_db_path, active_db_path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => DiscoveryError::Message(format!(
+            "local metadata already exists at {} (remove it first or use another name)",
+            active_db_path.display()
+        )),
+        std::io::ErrorKind::Unsupported => DiscoveryError::Message(format!(
+            "cannot atomically install local metadata at {}: the filesystem does not support hard links",
+            active_db_path.display()
+        )),
+        _ => DiscoveryError::Io(error),
+    })
+}
+
 fn create_local_snapshot(
     name: &str,
     meta_dir: &Path,
@@ -162,16 +176,16 @@ fn create_local_snapshot(
     let temp_db_path = temp_dir.path().join(format!("{name}.db"));
 
     let engine = RedbMetaEngine::open(&temp_db_path)?;
-    engine.initialize_discovered_checkpoint(
+    engine.initialize_discovered_postgres_checkpoint(
         &format_info,
         &serving_checkpoint,
         checkpoint_version,
     )?;
     drop(engine);
 
-    // hard_link is atomic and fails if another process installed the active
-    // database while this checkpoint was being staged.
-    std::fs::hard_link(&temp_db_path, &active_db_path)?;
+    // A hard link is atomic and no-replace, and fails if another process
+    // installed the active database while this checkpoint was being staged.
+    install_staged_database(&temp_db_path, &active_db_path)?;
 
     Ok(active_db_path)
 }
@@ -292,6 +306,29 @@ mod tests {
             1
         );
         assert!(engine.get_attr(studiofs_meta::ROOT_INO).is_ok());
+        assert_eq!(
+            std::fs::read_dir(meta_dir.path())
+                .expect("read metadata directory")
+                .count(),
+            1,
+            "successful discovery must leave only the active database in metadata directory"
+        );
+    }
+
+    #[test]
+    fn discover_maps_active_database_install_race_to_domain_error() {
+        let dir = tempfile::tempdir().expect("create metadata directory");
+        let staged_path = dir.path().join("staged.db");
+        let active_path = dir.path().join("discovered.db");
+        std::fs::write(&staged_path, b"staged").expect("create staged database");
+        std::fs::write(&active_path, b"active").expect("create active database");
+
+        let error = install_staged_database(&staged_path, &active_path)
+            .expect_err("existing active database must reject installation");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
     }
 
     #[test]

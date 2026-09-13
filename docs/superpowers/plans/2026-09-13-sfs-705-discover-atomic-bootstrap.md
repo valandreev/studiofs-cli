@@ -89,19 +89,30 @@ environment-gated and are outside the focused validation boundary.
 
 ## Review Disposition
 
-The attached review was checked against the current implementation and the
+The attached review reports were checked against the current implementation and the
 PostgreSQL sync contract:
 
 - Accepted: initialize both replay cursors, reject a rootless imported
   checkpoint, validate the checkpoint version before staging, preserve typed
   `MetaError` propagation, and add focused regressions.
 - Accepted with a narrower implementation: encapsulate checkpoint bootstrap in
-  `RedbMetaEngine::initialize_discovered_checkpoint`; the CLI now owns only
+  `RedbMetaEngine::initialize_discovered_postgres_checkpoint`; the CLI now owns only
   path staging and installation.
 - Accepted: use `hard_link` for the final same-filesystem install. It creates
   the active name atomically and fails with an existing-target error if a
   concurrent process wins the name, preserving the no-silent-replacement
   rule on supported filesystems.
+- Accepted: map the no-replace install race to the existing domain message and
+  report an explicit filesystem-capability message for `Unsupported` hard-link
+  failures. A platform-specific fallback is not included because the portable
+  path must retain atomic no-replace semantics.
+- Accepted: validate that the imported root inode is a directory, batch the
+  three PG bootstrap counters in one local write transaction, and make the
+  bootstrap API explicitly PostgreSQL-only with a backend guard.
+- Accepted: add direct `studiofs-meta` tests for successful initialization,
+  malformed/root-invalid checkpoints, backend rejection, and the durability
+  barrier; extend CLI tests to cover install-race mapping and successful
+  temporary-directory cleanup.
 - Not accepted: an abort-on-drop guard for the PostgreSQL connection task.
   The current code aborts and awaits the task on every normal return,
   including timeout; the review's remaining case is an uncaught panic, not a
@@ -180,6 +191,6 @@ format fields must not be copied into logs, tests, or this plan.
 
 Use the existing `PgSnapshotBackend::read_bootstrap_checkpoint` and
 `RedbMetaEngine::import_serving_checkpoint_bytes` contracts, plus the new
-`RedbMetaEngine::initialize_discovered_checkpoint` local bootstrap seam. Use
+`RedbMetaEngine::initialize_discovered_postgres_checkpoint` local bootstrap seam. Use
 the already-declared `tempfile` dependency for unique same-filesystem
 temporary directories. No new dependency or remote read path is expected.

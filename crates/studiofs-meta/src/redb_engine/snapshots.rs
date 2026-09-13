@@ -270,30 +270,53 @@ impl RedbMetaEngine {
         self.import_serving_checkpoint(&checkpoint)
     }
 
-    /// Initialize a local database from a validated remote serving checkpoint.
+    /// Initialize a local database from a validated PostgreSQL serving checkpoint.
     ///
     /// The caller remains responsible for installing the completed database at
     /// its active path. This method records the replay positions and fresh
     /// client gate together with the imported serving view, then forces the
     /// local durability barrier before returning.
-    pub fn initialize_discovered_checkpoint(
+    pub fn initialize_discovered_postgres_checkpoint(
         &self,
         format_info: &FormatInfo,
         checkpoint_bytes: &[u8],
         checkpoint_version: u64,
     ) -> MetaResult<()> {
+        if format_info.metadata.backend != MetadataBackend::Postgres {
+            return Err(MetaError::Storage(
+                "discovered checkpoint requires Postgres metadata backend".to_string(),
+            ));
+        }
         self.import_serving_checkpoint_bytes(checkpoint_bytes)?;
         self.set_format_info(format_info)?;
-        self.get_attr(ROOT_INO)?;
-        self.set_counter(
-            crate::pg_engine::LOCAL_PG_VERSION_COUNTER,
-            checkpoint_version,
-        )?;
-        self.set_counter(
-            crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER,
-            checkpoint_version,
-        )?;
-        self.set_counter(crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
+        let root_attr = self.get_attr(ROOT_INO)?;
+        if root_attr.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(ROOT_INO));
+        }
+
+        let txn = self.begin_write_txn()?;
+        {
+            let mut counters = txn
+                .open_table(COUNTERS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (name, value) in [
+                (
+                    crate::pg_engine::LOCAL_PG_VERSION_COUNTER,
+                    checkpoint_version,
+                ),
+                (
+                    crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER,
+                    checkpoint_version,
+                ),
+                (crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1),
+            ] {
+                counters
+                    .insert(name, value)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         self.sync_local_metadata()
     }
 

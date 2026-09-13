@@ -47,6 +47,111 @@ fn import_serving_checkpoint_rebuilds_local_counters() {
     assert!(target.lookup(ROOT_INO, b"discovered.bin").is_ok());
 }
 
+fn postgres_test_format_info() -> FormatInfo {
+    let mut format_info = test_format_info("discovered");
+    format_info.metadata = MetadataConfig {
+        backend: MetadataBackend::Postgres,
+        remote: None,
+        postgres: Some(PostgresConfig {
+            url: "postgres://studiofs@localhost/studiofs".to_string(),
+            volume_id: 7,
+        }),
+    };
+    format_info
+}
+
+#[test]
+fn initialize_discovered_postgres_checkpoint_persists_ready_local_state() {
+    let source = temp_engine();
+    let checkpoint = source.export_serving_checkpoint_bytes().unwrap();
+
+    let dir = studiofs_test_support::workspace_target_tempdir("discovered-checkpoint-");
+    let target = RedbMetaEngine::open_relaxed_for_test(dir.path().join("target.db"));
+    let format_info = postgres_test_format_info();
+
+    target
+        .initialize_discovered_postgres_checkpoint(&format_info, &checkpoint, 42)
+        .unwrap();
+
+    assert_eq!(target.get_attr(ROOT_INO).unwrap().kind, FileType::Directory);
+    assert_eq!(
+        target.get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER).unwrap(),
+        42
+    );
+    assert_eq!(
+        target
+            .get_counter(crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .unwrap(),
+        42
+    );
+    assert_eq!(
+        target
+            .get_counter(crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        target.get_format_info().unwrap().metadata.backend,
+        MetadataBackend::Postgres
+    );
+    assert!(
+        !target.relaxed_pending_for_test(),
+        "discovered initialization must execute its local durability barrier"
+    );
+}
+
+#[test]
+fn initialize_discovered_postgres_checkpoint_rejects_invalid_root_and_bytes() {
+    let format_info = postgres_test_format_info();
+
+    let local_backend_dir = studiofs_test_support::workspace_target_tempdir("discovered-local-");
+    let local_backend_target =
+        RedbMetaEngine::open(local_backend_dir.path().join("target.db")).unwrap();
+    let local_backend_error = local_backend_target
+        .initialize_discovered_postgres_checkpoint(&test_format_info("local"), b"invalid", 42)
+        .expect_err("local-only format must not use the PostgreSQL bootstrap seam");
+    assert!(matches!(
+        local_backend_error,
+        MetaError::Storage(message) if message.contains("requires Postgres metadata backend")
+    ));
+
+    let empty_dir = studiofs_test_support::workspace_target_tempdir("discovered-empty-");
+    let empty_source = RedbMetaEngine::open(empty_dir.path().join("source.db")).unwrap();
+    let empty_checkpoint = empty_source.export_serving_checkpoint_bytes().unwrap();
+    let empty_target = RedbMetaEngine::open(empty_dir.path().join("target.db")).unwrap();
+    assert!(matches!(
+        empty_target.initialize_discovered_postgres_checkpoint(
+            &format_info,
+            &empty_checkpoint,
+            42
+        ),
+        Err(MetaError::InodeNotFound(ROOT_INO))
+    ));
+
+    let malformed_target = RedbMetaEngine::open(empty_dir.path().join("malformed.db")).unwrap();
+    assert!(matches!(
+        malformed_target.initialize_discovered_postgres_checkpoint(&format_info, b"invalid", 42),
+        Err(MetaError::Serialization(_))
+    ));
+
+    let wrong_root_dir = studiofs_test_support::workspace_target_tempdir("discovered-root-");
+    let wrong_root_source = RedbMetaEngine::open(wrong_root_dir.path().join("source.db")).unwrap();
+    wrong_root_source.init_root(0, 0).unwrap();
+    let mut root = wrong_root_source.get_attr(ROOT_INO).unwrap();
+    root.kind = FileType::RegularFile;
+    wrong_root_source.set_attr(&root).unwrap();
+    let wrong_root_checkpoint = wrong_root_source.export_serving_checkpoint_bytes().unwrap();
+    let wrong_root_target = RedbMetaEngine::open(wrong_root_dir.path().join("target.db")).unwrap();
+    assert!(matches!(
+        wrong_root_target.initialize_discovered_postgres_checkpoint(
+            &format_info,
+            &wrong_root_checkpoint,
+            42
+        ),
+        Err(MetaError::NotADirectory(ROOT_INO))
+    ));
+}
+
 #[test]
 fn import_remote_snapshot_preserves_fresh_client_pending_marker() {
     let local = temp_engine();
