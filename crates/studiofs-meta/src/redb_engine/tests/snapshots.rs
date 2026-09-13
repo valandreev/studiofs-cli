@@ -153,6 +153,54 @@ fn initialize_discovered_postgres_checkpoint_rejects_invalid_root_and_bytes() {
 }
 
 #[test]
+fn initialize_discovered_postgres_checkpoint_rejects_unusable_format_and_version() {
+    let source_dir = studiofs_test_support::workspace_target_tempdir("discovered-validation-");
+    let source = RedbMetaEngine::open(source_dir.path().join("source.db")).unwrap();
+    source.init_root(0, 0).unwrap();
+    let checkpoint = source.export_serving_checkpoint_bytes().unwrap();
+
+    let missing_postgres_dir =
+        studiofs_test_support::workspace_target_tempdir("discovered-missing-postgres-");
+    let missing_postgres_target =
+        RedbMetaEngine::open(missing_postgres_dir.path().join("target.db")).unwrap();
+    let mut missing_postgres = postgres_test_format_info();
+    missing_postgres.metadata.postgres = None;
+    assert!(matches!(
+        missing_postgres_target.initialize_discovered_postgres_checkpoint(
+            &missing_postgres,
+            &checkpoint,
+            42,
+        ),
+        Err(MetaError::Storage(message)) if message.contains("Postgres configuration")
+    ));
+
+    let blank_url_dir = studiofs_test_support::workspace_target_tempdir("discovered-blank-url-");
+    let blank_url_target = RedbMetaEngine::open(blank_url_dir.path().join("target.db")).unwrap();
+    let mut blank_url = postgres_test_format_info();
+    blank_url
+        .metadata
+        .postgres
+        .as_mut()
+        .unwrap()
+        .url = "  ".to_string();
+    assert!(matches!(
+        blank_url_target.initialize_discovered_postgres_checkpoint(&blank_url, &checkpoint, 42),
+        Err(MetaError::Storage(message)) if message.contains("Postgres configuration")
+    ));
+
+    let oversized_dir = studiofs_test_support::workspace_target_tempdir("discovered-version-");
+    let oversized_target = RedbMetaEngine::open(oversized_dir.path().join("target.db")).unwrap();
+    assert!(matches!(
+        oversized_target.initialize_discovered_postgres_checkpoint(
+            &postgres_test_format_info(),
+            &checkpoint,
+            u64::MAX,
+        ),
+        Err(MetaError::Storage(message)) if message.contains("i64::MAX")
+    ));
+}
+
+#[test]
 fn import_remote_snapshot_preserves_fresh_client_pending_marker() {
     let local = temp_engine();
     local

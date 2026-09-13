@@ -282,9 +282,24 @@ impl RedbMetaEngine {
         checkpoint_bytes: &[u8],
         checkpoint_version: u64,
     ) -> MetaResult<()> {
+        if checkpoint_version > i64::MAX as u64 {
+            return Err(MetaError::Storage(
+                "discovered checkpoint version exceeds i64::MAX".to_string(),
+            ));
+        }
         if format_info.metadata.backend != MetadataBackend::Postgres {
             return Err(MetaError::Storage(
                 "discovered checkpoint requires Postgres metadata backend".to_string(),
+            ));
+        }
+        let Some(postgres) = format_info.metadata.postgres.as_ref() else {
+            return Err(MetaError::Storage(
+                "discovered checkpoint requires Postgres configuration".to_string(),
+            ));
+        };
+        if postgres.url.trim().is_empty() {
+            return Err(MetaError::Storage(
+                "discovered checkpoint requires Postgres configuration".to_string(),
             ));
         }
         self.import_serving_checkpoint_bytes(checkpoint_bytes)?;

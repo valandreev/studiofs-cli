@@ -133,17 +133,53 @@ async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResu
 }
 
 fn install_staged_database(staged_db_path: &Path, active_db_path: &Path) -> DiscoveryResult<()> {
-    std::fs::hard_link(staged_db_path, active_db_path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::AlreadyExists => DiscoveryError::Message(format!(
-            "local metadata already exists at {} (remove it first or use another name)",
-            active_db_path.display()
-        )),
-        std::io::ErrorKind::Unsupported => DiscoveryError::Message(format!(
-            "cannot atomically install local metadata at {}: the filesystem does not support hard links",
-            active_db_path.display()
-        )),
-        _ => DiscoveryError::Io(error),
+    std::fs::hard_link(staged_db_path, active_db_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return DiscoveryError::Message(format!(
+                "local metadata already exists at {} (remove it first or use another name)",
+                active_db_path.display()
+            ));
+        }
+        if is_hard_link_unsupported(&error) {
+            return DiscoveryError::Message(format!(
+                "cannot atomically install local metadata at {}: the filesystem does not support hard links",
+                active_db_path.display()
+            ));
+        }
+        DiscoveryError::Io(error)
     })
+}
+
+fn is_hard_link_unsupported(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        // FAT/exFAT may report missing hard-link support as these Win32 codes,
+        // which std maps to ErrorKind::Uncategorized.
+        match error.raw_os_error() {
+            Some(code) => code == 1 || code == 50, // ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED
+            None => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn sync_metadata_directory(meta_dir: &Path) -> DiscoveryResult<()> {
+    std::fs::File::open(meta_dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_metadata_directory(_meta_dir: &Path) -> DiscoveryResult<()> {
+    // Windows does not provide a portable directory-handle fsync operation.
+    Ok(())
 }
 
 fn create_local_snapshot(
@@ -163,11 +199,15 @@ fn create_local_snapshot(
 
     std::fs::create_dir_all(meta_dir)?;
     let active_db_path = meta_dir.join(format!("{name}.db"));
-    if active_db_path.exists() {
-        return Err(DiscoveryError::Message(format!(
-            "local metadata already exists at {} (remove it first or use another name)",
-            active_db_path.display()
-        )));
+    match std::fs::symlink_metadata(&active_db_path) {
+        Ok(_) => {
+            return Err(DiscoveryError::Message(format!(
+                "local metadata already exists at {} (remove it first or use another name)",
+                active_db_path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DiscoveryError::Io(error)),
     }
 
     let temp_dir = tempfile::Builder::new()
@@ -186,6 +226,7 @@ fn create_local_snapshot(
     // A hard link is atomic and no-replace, and fails if another process
     // installed the active database while this checkpoint was being staged.
     install_staged_database(&temp_db_path, &active_db_path)?;
+    sync_metadata_directory(meta_dir)?;
 
     Ok(active_db_path)
 }
@@ -251,7 +292,7 @@ mod tests {
             backend: MetadataBackend::Postgres,
             remote: None,
             postgres: Some(PostgresConfig {
-                url: String::new(),
+                url: "postgres://studiofs@localhost/studiofs".to_string(),
                 volume_id: 7,
             }),
         };
@@ -420,5 +461,38 @@ mod tests {
             1,
             "existing active database must not create staging files"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_refuses_dangling_active_database_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let meta_dir = tempfile::tempdir().expect("create metadata directory");
+        let active_db_path = meta_dir.path().join("discovered.db");
+        symlink("missing.db", &active_db_path).expect("create dangling active symlink");
+
+        let error = create_local_snapshot(
+            "discovered",
+            meta_dir.path(),
+            test_discovered_state(Vec::new()),
+        )
+        .expect_err("dangling active database symlink must be preserved");
+
+        assert!(
+            matches!(error, DiscoveryError::Message(message) if message.contains("already exists"))
+        );
+        assert!(std::fs::symlink_metadata(active_db_path).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hard_link_unsupported_recognizes_uncategorized_win32_errors() {
+        assert!(is_hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(1)
+        ));
+        assert!(is_hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(50)
+        ));
     }
 }
