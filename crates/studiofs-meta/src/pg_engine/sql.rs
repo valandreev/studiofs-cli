@@ -213,7 +213,10 @@ pub(super) const UPSERT_FENCED_METADATA_CHECKPOINT: &str = r#"
         updated_at = now()
     WHERE EXISTS (SELECT 1 FROM active_lease)
       AND metadata_state.metadata_format_version = EXCLUDED.metadata_format_version
-      AND EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version
+      AND (
+          EXCLUDED.checkpoint_version > metadata_state.checkpoint_version
+          OR COALESCE(octet_length(metadata_state.format_info), 0) = 0
+      )
     RETURNING
         version,
         checkpoint_version,

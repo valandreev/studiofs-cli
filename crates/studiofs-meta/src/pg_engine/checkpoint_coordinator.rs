@@ -1,4 +1,4 @@
-use super::{PgMetaEngine, sql};
+use super::{PendingReplicationState, PgMetaEngine, sql};
 use crate::engine::{MetaError, MetaFormat, MetaInodes, MetaResult};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,7 +83,7 @@ impl PgMetaEngine {
         lease_duration: Duration,
     ) -> MetaResult<JoinHandle<()>> {
         std::thread::Builder::new()
-            .name("pg-meta-checkpoint".into())
+            .name("pg-meta-chkpt".into())
             .spawn(move || {
                 let mut retry_pending = false;
                 let mut retry_delay = retry_interval;
@@ -144,7 +144,11 @@ impl PgMetaEngine {
                     let retry_due =
                         timed_out && engine.checkpoint_freshness_diagnostics().refresh_needed;
                     if !requested && !retry_due {
-                        retry_pending = false;
+                        reset_checkpoint_retry_state(
+                            &mut retry_pending,
+                            &mut retry_delay,
+                            retry_interval,
+                        );
                         continue;
                     }
 
@@ -183,6 +187,11 @@ impl PgMetaEngine {
         };
         let owner = self.current_client_id()?;
         let Some(lease) = self.try_claim_checkpoint_lease(&owner, lease_duration)? else {
+            tracing::debug!(
+                volume_id = self.volume_id,
+                owner = %owner,
+                "checkpoint lease is currently held by another node; backing off"
+            );
             return Ok(false);
         };
 
@@ -232,11 +241,11 @@ impl PgMetaEngine {
     }
 
     fn capture_checkpoint_source_cut(&self) -> MetaResult<Option<CheckpointSourceCut>> {
+        let freshness = self.read_remote_checkpoint_freshness()?;
         let _guard = self
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        let freshness = self.read_remote_checkpoint_freshness()?;
         let Some(event_seq) = self.checkpoint_source_event_seq()? else {
             self.record_checkpoint_freshness_observation(freshness);
             return Ok(None);
@@ -281,13 +290,12 @@ impl PgMetaEngine {
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::Acquire);
-        let has_pending_state = pending_state.event_start.is_some()
-            || pending_state.ops > 0
-            || self.inflight_replication_ops.load(Ordering::Acquire) > 0;
-        if has_pending_state || next_event_seq > flushed_event_seq {
-            return Ok(None);
-        }
-        Ok(Some(next_event_seq))
+        Ok(checkpoint_source_event_seq_if_clean(
+            *pending_state,
+            next_event_seq,
+            flushed_event_seq,
+            self.inflight_replication_ops.load(Ordering::Acquire),
+        ))
     }
 
     pub(super) fn try_claim_checkpoint_lease(
@@ -457,6 +465,7 @@ impl PgMetaEngine {
 fn next_checkpoint_retry_delay(current: Duration, base: Duration) -> Duration {
     let max_delay = base.max(Duration::from_secs(MAX_CHECKPOINT_RETRY_SECS));
     let exponential = current
+        .max(base)
         .checked_mul(2)
         .map_or(max_delay, |delay| delay.min(max_delay));
     let jitter_limit_ms =
@@ -464,8 +473,39 @@ fn next_checkpoint_retry_delay(current: Duration, base: Duration) -> Duration {
     if jitter_limit_ms == 0 {
         return exponential;
     }
-    let jitter = Duration::from_millis(rand::random_range(0..=jitter_limit_ms));
-    exponential.saturating_add(jitter).min(max_delay)
+    let jitter_ms = if exponential == max_delay {
+        rand::random_range(1..=jitter_limit_ms)
+    } else {
+        rand::random_range(0..=jitter_limit_ms)
+    };
+    let jitter = Duration::from_millis(jitter_ms);
+    if exponential == max_delay {
+        exponential.saturating_sub(jitter)
+    } else {
+        exponential.saturating_add(jitter).min(max_delay)
+    }
+}
+
+fn checkpoint_source_event_seq_if_clean(
+    pending_state: PendingReplicationState,
+    next_event_seq: u64,
+    flushed_event_seq: u64,
+    inflight_replication_ops: u32,
+) -> Option<u64> {
+    let has_pending_state = pending_state.event_start.is_some() || pending_state.ops > 0;
+    if has_pending_state || inflight_replication_ops > 0 || next_event_seq > flushed_event_seq {
+        return None;
+    }
+    Some(next_event_seq)
+}
+
+fn reset_checkpoint_retry_state(
+    retry_pending: &mut bool,
+    retry_delay: &mut Duration,
+    retry_interval: Duration,
+) {
+    *retry_pending = false;
+    *retry_delay = retry_interval;
 }
 
 fn should_wait_for_checkpoint_wakeup(wakeup_set: bool, retry_pending: bool) -> bool {
@@ -500,10 +540,51 @@ mod tests {
 
         assert!(next >= Duration::from_secs(2));
         assert!(next <= Duration::from_millis(2_500));
-        assert_eq!(
-            next_checkpoint_retry_delay(Duration::from_secs(30), base),
-            Duration::from_secs(30)
+        assert!(
+            next_checkpoint_retry_delay(Duration::from_secs(30), base) < Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn checkpoint_retry_delay_handles_zero_and_large_base() {
+        let next = next_checkpoint_retry_delay(Duration::ZERO, Duration::from_secs(1));
+        assert!(next >= Duration::from_secs(2));
+        assert!(next <= Duration::from_millis(2_500));
+
+        let next = next_checkpoint_retry_delay(Duration::from_secs(60), Duration::from_secs(60));
+        assert!(next >= Duration::from_secs(45));
+        assert!(next < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn checkpoint_retry_state_resets_after_external_resolution() {
+        let retry_interval = Duration::from_secs(1);
+        let mut retry_pending = true;
+        let mut retry_delay = Duration::from_secs(30);
+
+        reset_checkpoint_retry_state(&mut retry_pending, &mut retry_delay, retry_interval);
+
+        assert!(!retry_pending);
+        assert_eq!(retry_delay, retry_interval);
+    }
+
+    #[test]
+    fn checkpoint_source_event_position_requires_a_clean_local_tail() {
+        let pending = PendingReplicationState::default();
+        assert_eq!(
+            checkpoint_source_event_seq_if_clean(pending, 7, 7, 0),
+            Some(7)
+        );
+
+        assert_eq!(checkpoint_source_event_seq_if_clean(pending, 8, 7, 0), None);
+
+        assert_eq!(checkpoint_source_event_seq_if_clean(pending, 7, 7, 1), None);
+
+        let pending = PendingReplicationState {
+            ops: 1,
+            ..PendingReplicationState::default()
+        };
+        assert_eq!(checkpoint_source_event_seq_if_clean(pending, 7, 7, 0), None);
     }
 
     #[test]

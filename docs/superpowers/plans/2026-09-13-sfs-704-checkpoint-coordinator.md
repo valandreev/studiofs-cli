@@ -28,6 +28,10 @@ operations remain independent of checkpoint serialization.
 - [x] 2026-09-13: Hardened source-cut capture/publication against pending and
       in-flight local event-log mutations, and bounded failed coordination
       retries with exponential backoff and jitter.
+- [x] 2026-09-13: Applied the follow-up review corrections: reset leaked retry
+      state, preserve jitter at the retry cap, keep remote freshness I/O outside
+      `replication_lock`, make fenced equal-version publication idempotent, and
+      add focused unit/service coverage plus operational documentation.
 - [ ] Run the final commit and update Linear.
 
 ## Surprises
@@ -43,6 +47,10 @@ operations remain independent of checkpoint serialization.
   commit before its in-memory pending bookkeeping is updated, so checkpoint
   source cuts must also use the durable `nextEventSeq`/`flushed_event_seq`
   position and the pending/in-flight state.
+- Remote freshness is an observation used to decide whether a source cut may
+  advance; it does not need to share the local replication mutex. Reading it
+  before acquiring `replication_lock` avoids holding the lock over PostgreSQL
+  command latency while the local event position is still checked under lock.
 - `export_serving_checkpoint_bytes()` obtains a consistent local redb read
   transaction but does not accept a version argument. The coordinator therefore
   needs a capture-before/build/verify-after protocol and must discard a payload
@@ -60,14 +68,18 @@ operations remain independent of checkpoint serialization.
 3. Use one coalesced in-process wakeup per `PgMetaEngine`. A stale observation
    sets a boolean request and signals the coordinator; failed coordination
    retries use bounded exponential backoff with jitter while freshness remains
-   stale. Successful `RETURNING` freshness observation clears the request state.
-4. The coordinator acquires `replication_lock` only around source-cut capture
-   and final validation/publication. The expensive local export runs without
-   that lock so ordinary replication and foreground local writes can proceed.
+   stale. Retry state returns to the configured base after external resolution,
+   and jitter remains effective at the cap. Successful `RETURNING` freshness
+   observation clears the request state.
+4. Read remote freshness before acquiring `replication_lock`; hold the lock
+   only for the local source-position check and final validation/publication.
+   The expensive local export runs without that lock so ordinary replication
+   and foreground local writes can proceed.
 5. A publication is accepted only when the lease owner and fencing token are
    still current, the lease has not expired, the metadata format matches, and
-   the checkpoint version is monotonic. Losing the fence is a defer condition,
-   not a stale-state reset.
+   the checkpoint version is monotonic. Equal-version fenced publication is
+   permitted only to initialize an empty format-info row. Losing the fence is
+   a defer condition, not a stale-state reset.
 6. The two-client PostgreSQL regression uses a synthetic remote head of 10000
    to cross the default inclusive freshness threshold without test-thread
    environment overrides leaking into worker threads.
@@ -106,12 +118,15 @@ primary implementation seams are:
    volume coordinator worker into `PgBackgroundWorkers`; ensure startup,
    shutdown, `Drop`, and worker-slot test helpers own the handle correctly.
 3. Add a configured bounded lease/retry duration. On a stale observation, the
-   worker claims the lease, captures the local version, event position, and
-   remote byte baseline, exports the serving checkpoint outside
-   `replication_lock`, reacquires the lock, verifies the source position did
-   not move, and publishes with the fence. Failed attempts back off with a
-   bounded jittered retry delay.
-4. Add red/green tests for the accepted contract. PostgreSQL integration tests
+   worker claims the lease, observes remote freshness, captures the local
+   version and event position under `replication_lock`, and records the remote
+   byte baseline. It exports the serving checkpoint outside the lock,
+   reacquires the lock, verifies the source position did not move, and
+   publishes with the fence. Failed attempts back off with a bounded jittered
+   retry delay that resets after external resolution.
+4. Add red/green tests for the accepted contract, including retry state/cap
+   boundaries, clean source-event positions, and idempotent equal-version
+   fenced publication. PostgreSQL integration tests
    remain `#[ignore]` where a real service is required and must be run
    explicitly with `.env`; local unit tests must be nonzero and service
    failures must be reported separately from code failures.
@@ -157,9 +172,10 @@ primary implementation seams are:
 
 ### Exact cut and publication
 
-- Reuse the local serving export. Capture the source version and remote byte
-  baseline under the narrow lock, export bytes outside the lock, and verify the
-  local version again before fenced publication.
+- Reuse the local serving export. Observe remote freshness before taking the
+  narrow lock, capture the local source version/event position and remote byte
+  baseline under that lock, export bytes outside it, and verify the local
+  position again before fenced publication.
 - If the source version moved, do not publish the old payload; rearm the stale
   request for a later bounded retry. If the lease fence was lost, release is
   conditional and the request remains stale.

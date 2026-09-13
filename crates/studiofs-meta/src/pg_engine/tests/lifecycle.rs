@@ -1918,6 +1918,84 @@ fn checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping() {
 }
 
 #[test]
+fn fenced_checkpoint_sql_skips_identical_initialized_versions() {
+    let checkpoint = super::sql::UPSERT_FENCED_METADATA_CHECKPOINT;
+
+    assert!(checkpoint.contains("EXCLUDED.checkpoint_version > metadata_state.checkpoint_version"));
+    assert!(checkpoint.contains("COALESCE(octet_length(metadata_state.format_info), 0) = 0"));
+    assert!(
+        !checkpoint.contains("EXCLUDED.checkpoint_version >= metadata_state.checkpoint_version")
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_fenced_checkpoint_does_not_republish_identical_initialized_version() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-idempotent");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+    let owner = "checkpoint-idempotent-owner";
+    let lease = pg
+        .try_claim_checkpoint_lease(owner, Duration::from_secs(60))
+        .expect("claim checkpoint lease")
+        .expect("checkpoint lease should be available");
+    let format_version = CURRENT_FORMAT_VERSION as i16;
+    let version = 0_i64;
+    let checkpoint_bytes = Vec::<u8>::new();
+    let checkpoint_sha256 = vec![0_u8; 32];
+    let format_info = Vec::<u8>::new();
+    let published = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_opt(
+                super::sql::UPSERT_FENCED_METADATA_CHECKPOINT,
+                &[
+                    &volume.volume_id,
+                    &format_version,
+                    &version,
+                    &version,
+                    &version,
+                    &checkpoint_bytes,
+                    &checkpoint_sha256,
+                    &format_info,
+                    &owner,
+                    &lease.fencing_token,
+                ],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<bool, MetaError>(row.is_some())
+    }))
+    .expect("attempt identical checkpoint publication");
+    assert!(!published);
+
+    let generation = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT checkpoint_generation FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<i64, MetaError>(row.get(0))
+    }))
+    .expect("read checkpoint generation");
+    assert_eq!(generation, 1);
+}
+
+#[test]
 fn bootstrap_checkpoint_query_contains_all_descriptor_columns() {
     let sql = super::sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR;
 
