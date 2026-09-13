@@ -119,7 +119,14 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             ADD COLUMN IF NOT EXISTS checkpoint_generation BIGINT NOT NULL DEFAULT 0
                 CHECK (checkpoint_generation >= 0);
         ALTER TABLE metadata_state
-            ADD COLUMN IF NOT EXISTS checkpoint_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+            ADD COLUMN IF NOT EXISTS checkpoint_updated_at TIMESTAMPTZ;
+        UPDATE metadata_state
+            SET checkpoint_updated_at = 'epoch'::timestamptz
+            WHERE checkpoint_updated_at IS NULL;
+        ALTER TABLE metadata_state
+            ALTER COLUMN checkpoint_updated_at SET DEFAULT now();
+        ALTER TABLE metadata_state
+            ALTER COLUMN checkpoint_updated_at SET NOT NULL;
 
         DO $$
         BEGIN
@@ -794,6 +801,21 @@ mod tests {
         assert!(sql.contains("total_event_payload_bytes >= 0"));
         assert!(sql.contains("checkpoint_total_event_bytes >= 0"));
         assert!(sql.contains("checkpoint_version >= 0 AND checkpoint_version <= version"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS checkpoint_updated_at TIMESTAMPTZ;"));
+        assert!(sql.contains("SET checkpoint_updated_at = 'epoch'::timestamptz"));
+        assert!(sql.contains("ALTER COLUMN checkpoint_updated_at SET DEFAULT now()"));
+        assert!(sql.contains("ALTER COLUMN checkpoint_updated_at SET NOT NULL"));
+        let stale_backfill = sql
+            .find("SET checkpoint_updated_at = 'epoch'::timestamptz")
+            .expect("checkpoint migration must conservatively backfill old rows");
+        let default_after_backfill = sql
+            .find("ALTER COLUMN checkpoint_updated_at SET DEFAULT now()")
+            .expect("checkpoint migration must set the default for new rows");
+        let not_null_after_default = sql
+            .find("ALTER COLUMN checkpoint_updated_at SET NOT NULL")
+            .expect("checkpoint migration must restore the non-null invariant");
+        assert!(stale_backfill < default_after_backfill);
+        assert!(default_after_backfill < not_null_after_default);
         assert!(
             sql.matches("CHECK (octet_length(checkpoint_sha256) = 32)")
                 .count()
