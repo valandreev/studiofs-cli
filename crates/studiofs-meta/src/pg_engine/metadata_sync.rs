@@ -99,7 +99,7 @@ impl PgMetaEngine {
                 }
             }
             Err(_) => {
-                self.invalidate_remote_format_validation();
+                self.invalidate_remote_validation();
                 self.metadata_source_connected
                     .store(false, Ordering::Release);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);

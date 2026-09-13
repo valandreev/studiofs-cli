@@ -1,6 +1,6 @@
 use super::{MetadataSyncSource, PgMetaEngine, sql};
 use crate::engine::{
-    MetaError, MetaFormat, MetaReplication, MetaResult, MetadataAuthorityStatus,
+    MetaError, MetaReplication, MetaResult, MetadataAuthorityStatus,
     MetadataCheckpointFreshnessDiagnostics, MetadataCoherenceProgress,
     MetadataInvalidationDiagnostics, MetadataReplicationBacklog, PgSyncStatus,
 };
@@ -156,29 +156,7 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn check_consistency(&self) -> MetaResult<()> {
-        let local_info = self.local.get_format_info()?;
-        let remote_uuid = match self.fetch_remote_uuid(self.volume_id) {
-            Ok(remote_uuid) => {
-                self.remote_transport_unavailable
-                    .store(false, Ordering::Release);
-                remote_uuid
-            }
-            Err(error) => {
-                self.remote_transport_unavailable
-                    .store(error.is_reachability_error(), Ordering::Release);
-                if error.is_reachability_error() {
-                    self.invalidate_remote_format_validation();
-                }
-                return Err(error);
-            }
-        };
-        if local_info.uuid != remote_uuid {
-            return Err(MetaError::UuidMismatch {
-                local: local_info.uuid,
-                remote: remote_uuid,
-            });
-        }
-        Ok(())
+        self.check_remote_identity()
     }
 
     fn check_consistency_for_mount_admission(&self) -> MetaResult<()> {

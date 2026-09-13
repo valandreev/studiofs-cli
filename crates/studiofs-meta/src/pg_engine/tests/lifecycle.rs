@@ -1156,6 +1156,11 @@ fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
             .remote_transport_unavailable
             .load(std::sync::atomic::Ordering::Acquire)
     );
+    assert!(
+        !fresh
+            .remote_identity_validated
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     assert_eq!(
         fresh
             .local
@@ -1232,6 +1237,58 @@ fn regular_consistency_check_retries_after_startup_remote_transport_failure() {
         MetaError::RemoteUnavailable(message)
             if message == "remote PostgreSQL transport is currently unavailable"
     ));
+}
+
+#[test]
+fn remote_pull_requires_remote_identity_validation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_identity_validated
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .local_version
+        .store(1, std::sync::atomic::Ordering::Release);
+
+    let error = engine
+        .pull_foreign_events_locked_to_target(None, 0)
+        .expect_err("remote pulls must validate remote identity first");
+
+    assert!(error.is_reachability_error());
+    assert_eq!(
+        engine
+            .local_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "identity-pending remote pull must not advance the local cursor"
+    );
+}
+
+#[test]
+fn allocator_ready_client_stays_read_only_until_identity_is_validated() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_identity_validated
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::TargetReached as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    engine.refresh_pg_sync_lifecycle_for_allocator();
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::TargetReached,
+        "allocator readiness must not bypass the identity gate"
+    );
+
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.refresh_pg_sync_lifecycle_for_allocator();
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
 }
 
 #[test]
