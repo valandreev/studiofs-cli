@@ -869,6 +869,17 @@ impl FsKitSession {
         let mut shutdown_deadline = None;
         let loop_result = (|| -> io::Result<()> {
             loop {
+                if mount_ready_thread
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    let Some(thread) = mount_ready_thread.take() else {
+                        return Err(io::Error::other("mount-ready callback handle disappeared"));
+                    };
+                    thread
+                        .join()
+                        .map_err(|_| io::Error::other("mount-ready callback panicked"))?;
+                }
                 match self.mount_result.try_recv() {
                     Ok(Ok(())) => {
                         mounted = true;
@@ -963,7 +974,7 @@ impl FsKitSession {
                     .map_err(|_| io::Error::other("mount-ready callback panicked"))
             })
             .unwrap_or(Ok(()));
-        loop_result.or(callback_result)
+        loop_result.and(callback_result)
     }
 }
 

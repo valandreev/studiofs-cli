@@ -808,10 +808,6 @@ fn winfsp_async_callback_drain_timeout() -> std::time::Duration {
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
 /// external process (`studiofs umount`) can signal a graceful shutdown.
 pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
-    mount_and_serve_inner(request)
-}
-
-fn mount_and_serve_inner(request: WinfspMountRequest) -> std::io::Result<()> {
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
     use crate::context::PreparedWinfspNotifications;

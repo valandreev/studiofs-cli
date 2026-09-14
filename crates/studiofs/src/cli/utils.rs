@@ -137,6 +137,18 @@ pub(crate) enum MountRecordStatus {
     Failed,
 }
 
+impl std::fmt::Display for MountRecordStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Starting => "starting",
+            Self::Mounted => "mounted",
+            Self::Live => "live",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+        })
+    }
+}
+
 /// JSON state shared by a foreground mount child and detached parent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MountRecordInfo {
@@ -288,15 +300,18 @@ fn write_mount_record_file(path: &Path, record: &MountRecordInfo) -> Result<()> 
     temporary.as_file_mut().flush()?;
     temporary.as_file().sync_all()?;
     let mut temporary = Some(temporary);
-    for attempt in 0..3 {
+    for attempt in 0..5 {
         let file = temporary
             .take()
             .ok_or_else(|| anyhow!("mount record replacement file was lost"))?;
         match file.persist(path) {
             Ok(_) => return Ok(()),
-            Err(error) if attempt < 2 && is_retryable_mount_record_replace_error(&error.error) => {
+            Err(error)
+                if attempt + 1 < 5 && is_retryable_mount_record_replace_error(&error.error) =>
+            {
                 temporary = Some(error.file);
-                std::thread::sleep(Duration::from_millis(5 << attempt));
+                let delay_ms = [10, 25, 50, 100][attempt];
+                std::thread::sleep(Duration::from_millis(delay_ms));
             }
             Err(error) => {
                 return Err(anyhow!(
@@ -427,7 +442,7 @@ fn read_mount_record_for_update(
 
 fn parse_mount_record(data: &str, normalized_mount_point: &str) -> Result<MountRecordInfo> {
     let mut record: MountRecordInfo =
-        serde_json::from_str(data).map_err(|_| anyhow!("corrupt PID file"))?;
+        serde_json::from_str(data).context("corrupt mount record PID file")?;
     if record.mount_point.is_empty() {
         record.mount_point = normalized_mount_point.to_string();
     }

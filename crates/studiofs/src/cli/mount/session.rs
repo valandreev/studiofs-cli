@@ -1564,11 +1564,24 @@ impl MountStatusMonitor {
 
     fn mark_failed(&self) {
         self.shared.state.lock().failed = true;
-        if matches!(
-            Self::publish_state(&self.shared),
-            MountStatusPublishOutcome::Stop
-        ) {
-            self.stop.store(true, Ordering::Release);
+        const RETRIES: usize = 3;
+        for attempt in 0..RETRIES {
+            match Self::publish_state(&self.shared) {
+                MountStatusPublishOutcome::Published => return,
+                MountStatusPublishOutcome::Stop => {
+                    self.stop.store(true, Ordering::Release);
+                    return;
+                }
+                MountStatusPublishOutcome::Retry if attempt + 1 < RETRIES => {
+                    std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+                }
+                MountStatusPublishOutcome::Retry => {
+                    warn!(
+                        mount_point = %self.shared.mount_point,
+                        "failed to publish final mount failure state after retries"
+                    );
+                }
+            }
         }
     }
 
@@ -1675,10 +1688,23 @@ impl MountStatusMonitor {
     }
 }
 
+impl Drop for MountStatusMonitor {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 enum MountStatusPublishOutcome {
     Published,
     Retry,
     Stop,
+}
+
+fn should_retain_failed_mount_record(
+    command_detach: bool,
+    daemon_mount_point_env_present: bool,
+) -> bool {
+    command_detach || daemon_mount_point_env_present
 }
 
 fn mount_record_state(
@@ -1737,7 +1763,12 @@ impl MountRuntimeGuard {
 
     fn launch(mut self) -> anyhow::Result<()> {
         let mount_result = self.launch_mount();
-        let retain_failed_record = mount_result.is_err() && self.mount_status_monitor.is_some();
+        let retain_failed_record = mount_result.is_err()
+            && self.mount_status_monitor.is_some()
+            && should_retain_failed_mount_record(
+                self.prepared.plan.command.detach,
+                std::env::var_os(daemon_mount_point_env_key()).is_some(),
+            );
         let cleanup_error = self.cleanup_with_record_removal(!retain_failed_record);
         finish_mount_result(mount_result, cleanup_error)
     }
@@ -2377,7 +2408,7 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
 
     let status = record.status;
     println!(
-        "✓ Volume '{}' mounted at '{}' in background (PID: {}, status: {:?}, sync: {})",
+        "✓ Volume '{}' mounted at '{}' in background (PID: {}, status: {}, sync: {})",
         name,
         mount_point,
         pid,
@@ -3610,7 +3641,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_mount_launch_failure_leaves_failed_record_for_observation() {
+    fn prepared_mount_launch_failure_removes_foreground_record() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
@@ -3641,12 +3672,18 @@ mod tests {
 
         assert!(err.to_string().contains("FakeBackend error: boom"));
         assert_eq!(events.lock().expect("lock events").len(), 1);
-        let record = utils::read_mount_record(&actual_mount_path)
-            .expect("backend failure should leave a failed mount record");
-        assert_eq!(record.status, utils::MountRecordStatus::Failed);
+        assert!(
+            utils::read_mount_record(&actual_mount_path).is_err(),
+            "foreground backend failure should remove the mount record"
+        );
         assert!(!utils::mount_is_active(&actual_mount_path).expect("check mount lock"));
+    }
 
-        utils::remove_pid_file(&actual_mount_path).expect("remove failed mount record");
+    #[test]
+    fn failed_mount_record_is_retained_only_for_detached_processes() {
+        assert!(should_retain_failed_mount_record(true, false));
+        assert!(should_retain_failed_mount_record(false, true));
+        assert!(!should_retain_failed_mount_record(false, false));
     }
 
     #[test]
