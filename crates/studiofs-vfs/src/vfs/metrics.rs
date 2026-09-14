@@ -6,8 +6,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use super::file_session::VfsFileSessionStats;
-use studiofs_meta::MetadataWriteObservability;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
+use studiofs_meta::{MetadataWriteObservability, PgSyncDiagnostics};
 
 /// Current version of the cross-platform runtime stats snapshot schema.
 pub const RUNTIME_STATS_SCHEMA_VERSION: u16 = 1;
@@ -2249,6 +2249,9 @@ pub struct VfsSynchronizationStateSnapshot {
     /// Mount-local replication and invalidation coherence health.
     #[serde(default)]
     pub coherence: crate::coherence::CoherenceHealthSnapshot,
+    /// PostgreSQL synchronization lifecycle, progress, and authority details.
+    #[serde(default)]
+    pub pg_sync: PgSyncDiagnostics,
 }
 
 /// Runtime event emitted by metrics stream.
@@ -2296,6 +2299,26 @@ mod tests {
         assert_eq!(stats.encrypted_bytes_read, 0);
         assert_eq!(stats.encrypted_object_read_failures, 0);
         assert_eq!(stats.malformed_encrypted_objects, 0);
+    }
+
+    #[test]
+    fn synchronization_state_deserializes_without_new_pg_sync_diagnostics() {
+        let mut legacy = serde_json::to_value(VfsSynchronizationStateSnapshot::default())
+            .expect("serialize legacy synchronization state");
+        legacy
+            .as_object_mut()
+            .expect("snapshot serializes as object")
+            .remove("pg_sync");
+        legacy["pending_metadata_ops"] = serde_json::json!(2);
+
+        let snapshot: VfsSynchronizationStateSnapshot =
+            serde_json::from_value(legacy).expect("deserialize legacy synchronization state");
+
+        assert_eq!(snapshot.pending_metadata_ops, 2);
+        assert_eq!(
+            snapshot.pg_sync.lifecycle,
+            studiofs_meta::PgSyncLifecycle::LocalReady
+        );
     }
 
     #[test]

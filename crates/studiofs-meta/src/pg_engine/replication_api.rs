@@ -2,7 +2,7 @@ use super::{MetadataSyncSource, PgMetaEngine, sql};
 use crate::engine::{
     MetaError, MetaReplication, MetaResult, MetadataAuthorityStatus,
     MetadataCheckpointFreshnessDiagnostics, MetadataCoherenceProgress,
-    MetadataInvalidationDiagnostics, MetadataReplicationBacklog, PgSyncStatus,
+    MetadataInvalidationDiagnostics, MetadataReplicationBacklog, PgSyncDiagnostics, PgSyncStatus,
 };
 use crate::types::Ino;
 use std::sync::Arc;
@@ -155,6 +155,52 @@ impl MetaReplication for PgMetaEngine {
         )
     }
 
+    fn pg_sync_diagnostics(&self) -> PgSyncDiagnostics {
+        let status = self.pg_sync_status();
+        let progress = self.pg_sync_progress_snapshot();
+        let raw_local_version = self.local_version.load(Ordering::Acquire);
+        let raw_startup_target_version =
+            self.metadata_startup_target_version.load(Ordering::Acquire);
+        let local_applied_version = u64::try_from(raw_local_version).ok();
+        let startup_target_version = u64::try_from(raw_startup_target_version).ok();
+        let observed_remote_head_version =
+            u64::try_from(self.metadata_remote_head_version.load(Ordering::Acquire)).ok();
+        let checkpoint = self.metadata_checkpoint_freshness_diagnostics();
+        let remote_head_version = match (observed_remote_head_version, checkpoint.head_version) {
+            (Some(observed), Some(checkpoint)) => Some(observed.max(checkpoint)),
+            (observed, checkpoint) => observed.or(checkpoint),
+        };
+        let remaining_version_distance = (raw_startup_target_version >= 0).then(|| {
+            u64::try_from(
+                raw_startup_target_version
+                    .saturating_sub(raw_local_version)
+                    .max(0),
+            )
+            .unwrap_or_default()
+        });
+        let last_successful_sync_unix_ms = self
+            .metadata_last_successful_sync_unix_ms
+            .load(Ordering::Acquire);
+        let last_successful_sync_unix_ms =
+            (last_successful_sync_unix_ms > 0).then_some(last_successful_sync_unix_ms);
+
+        PgSyncDiagnostics {
+            local_applied_version,
+            startup_target_version,
+            remote_head_version,
+            remaining_version_distance,
+            current_page: progress.current_page,
+            last_page: progress.last_page,
+            last_sync_error: progress.last_sync_error,
+            checkpoint,
+            rebootstrap_required: progress.rebootstrap_required,
+            source_connected: self.metadata_source_connected.load(Ordering::Acquire),
+            sync_errors: self.metadata_sync_errors.load(Ordering::Relaxed),
+            last_successful_sync_unix_ms,
+            ..PgSyncDiagnostics::from_status(status)
+        }
+    }
+
     fn check_consistency(&self) -> MetaResult<()> {
         self.check_remote_identity()
     }
@@ -191,8 +237,9 @@ impl MetaReplication for PgMetaEngine {
                 },
             )
             .await
-        })?;
-        Ok(Some(size))
+        });
+        self.record_metadata_source_result(&size);
+        Ok(Some(size?))
     }
 
     fn prepare_for_close(&self) -> MetaResult<()> {

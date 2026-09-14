@@ -119,6 +119,7 @@ impl DiagnosticsRuntimeSnapshot {
                     pending_metadata_ops: 0,
                     inflight_metadata_ops: 0,
                     coherence: health.coherence,
+                    pg_sync: studiofs_meta::PgSyncDiagnostics::default(),
                 },
             },
             coherence: health.coherence,

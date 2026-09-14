@@ -1,5 +1,8 @@
 use super::*;
-use crate::engine::{CheckpointDescriptorFailure, MetaAcl, MetadataCheckpointRefreshReason};
+use crate::engine::{
+    CheckpointDescriptorFailure, MetaAcl, MetaError, MetadataCheckpointRefreshReason,
+    PgSyncFailure, PgSyncPageDiagnostics,
+};
 use crate::redb_engine::RedbSnapshot;
 use sha2::{Digest, Sha256};
 
@@ -64,6 +67,229 @@ fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
     assert_eq!(
         PgMetaEngine::pg_sync_lifecycle_from_raw(u8::MAX),
         PgSyncLifecycle::Fatal
+    );
+}
+
+#[test]
+fn pg_sync_diagnostics_reports_frozen_target_and_remaining_distance() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local_version
+        .store(4, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(12, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(10, std::sync::atomic::Ordering::Release);
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let diagnostics = engine.pg_sync_diagnostics();
+
+    assert_eq!(diagnostics.lifecycle, PgSyncLifecycle::CatchingUp);
+    assert_eq!(diagnostics.local_applied_version, Some(4));
+    assert_eq!(diagnostics.startup_target_version, Some(10));
+    assert_eq!(diagnostics.remote_head_version, Some(12));
+    assert_eq!(diagnostics.remaining_version_distance, Some(6));
+}
+
+#[test]
+fn pg_sync_diagnostics_reports_distance_from_uninitialized_cursor() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local_version
+        .store(-1, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(100, std::sync::atomic::Ordering::Release);
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let diagnostics = engine.pg_sync_diagnostics();
+
+    assert_eq!(diagnostics.local_applied_version, None);
+    assert_eq!(diagnostics.startup_target_version, Some(100));
+    assert_eq!(diagnostics.remaining_version_distance, Some(101));
+}
+
+#[test]
+fn pg_sync_diagnostics_prefers_newer_checkpoint_head_observation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .metadata_remote_head_version
+        .store(10, std::sync::atomic::Ordering::Release);
+    engine.record_checkpoint_freshness_observation(
+        super::super::metadata_io::CheckpointFreshnessObservation {
+            head_version: 14,
+            checkpoint_version: 10,
+            total_event_payload_bytes: 0,
+            format_info_present: true,
+            event_payload_bytes: 0,
+            checkpoint_age: Duration::ZERO,
+        },
+    );
+
+    assert_eq!(engine.pg_sync_diagnostics().remote_head_version, Some(14));
+}
+
+#[test]
+fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let failure = MetaError::RemoteUnavailable("test-postgres-dsn".into());
+    engine.record_pg_sync_failure(&failure);
+
+    let failed = engine.pg_sync_diagnostics();
+    assert_eq!(
+        failed.last_sync_error,
+        Some(PgSyncFailure::RemoteUnavailable)
+    );
+    assert!(
+        !serde_json::to_string(&failed)
+            .unwrap()
+            .contains("test-postgres-dsn")
+    );
+
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: 4,
+        first_available_version: 8,
+        target_version: 12,
+    });
+    let gap = engine.pg_sync_diagnostics();
+    assert!(gap.rebootstrap_required);
+    assert!(matches!(
+        gap.last_sync_error,
+        Some(PgSyncFailure::ReplayGap { .. })
+    ));
+
+    let first_page = PgSyncPageDiagnostics {
+        first_batch_version: Some(1),
+        last_batch_version: Some(4),
+        batch_count: 2,
+        event_count: 3,
+        response_bytes: 64,
+        has_more: true,
+        oversized: false,
+    };
+    let next_page = PgSyncPageDiagnostics {
+        first_batch_version: Some(5),
+        last_batch_version: Some(8),
+        has_more: false,
+        ..first_page
+    };
+
+    assert!(engine.record_pg_sync_page_selected(first_page));
+    engine.record_pg_sync_failure(&MetaError::RemoteUnavailable("test-postgres-dsn".into()));
+    assert_eq!(engine.pg_sync_diagnostics().current_page, None);
+
+    assert!(!engine.record_pg_sync_page_selected(first_page));
+    assert!(!engine.record_pg_sync_page_selected(first_page));
+    assert!(engine.record_pg_sync_page_selected(next_page));
+    assert_eq!(engine.pg_sync_diagnostics().current_page, Some(next_page));
+
+    engine.record_pg_sync_page_applied(next_page);
+    assert_eq!(engine.pg_sync_diagnostics().current_page, None);
+    assert_eq!(engine.pg_sync_diagnostics().last_page, Some(next_page));
+
+    engine.record_pg_sync_success();
+    assert_eq!(engine.pg_sync_diagnostics().last_sync_error, None);
+}
+
+#[test]
+fn pg_sync_success_clears_rebootstrap_requirement() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: -1,
+        first_available_version: 1,
+        target_version: 3,
+    });
+    assert!(engine.pg_sync_diagnostics().rebootstrap_required);
+
+    engine.record_pg_sync_success();
+
+    assert!(!engine.pg_sync_diagnostics().rebootstrap_required);
+}
+
+#[test]
+fn idle_degraded_sync_success_keeps_rebootstrap_requirement() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: 1,
+        first_available_version: 2,
+        target_version: 3,
+    });
+
+    engine.record_pg_sync_success();
+
+    assert!(engine.pg_sync_diagnostics().rebootstrap_required);
+}
+
+#[test]
+fn pg_sync_failure_classifies_nested_and_oversized_errors() {
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::EventTooLarge {
+            estimated: 10,
+            limit: 5,
+        }),
+        PgSyncFailure::Storage
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::RepairRequired("repair".into())),
+        PgSyncFailure::Storage
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::Serialization("decode".into())),
+        PgSyncFailure::Storage
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::RegularFileOverlayBatchOperation {
+            index: 0,
+            source: Box::new(MetaError::RemoteUnavailable("test-postgres-dsn".into(),)),
+        }),
+        PgSyncFailure::RemoteUnavailable
+    );
+}
+
+#[test]
+fn pg_sync_failure_preserves_uninitialized_versions() {
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::ReplayGap {
+            local_version: -1,
+            first_available_version: 1,
+            target_version: 3,
+        }),
+        PgSyncFailure::ReplayGap {
+            local_version: None,
+            first_available_version: Some(1),
+            target_version: Some(3),
+        }
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::CatchUpStalled {
+            local_version: -1,
+            target_version: 3,
+        }),
+        PgSyncFailure::CatchUpStalled {
+            local_version: None,
+            target_version: Some(3),
+        }
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::CatchUpBudgetExceeded {
+            local_version: -1,
+            target_version: 3,
+            pages: 0,
+        }),
+        PgSyncFailure::CatchUpBudgetExceeded {
+            local_version: None,
+            target_version: Some(3),
+            pages: 0,
+        }
     );
 }
 
@@ -1307,6 +1533,34 @@ fn successful_remote_operation_clears_transport_unavailable() {
             .remote_transport_unavailable
             .load(std::sync::atomic::Ordering::Acquire)
     );
+    assert!(
+        engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    engine
+        .record_remote_operation_result::<()>(Err(MetaError::UuidMismatch {
+            local: "local-volume".to_string(),
+            remote: "remote-volume".to_string(),
+        }))
+        .expect_err("remote identity mismatch");
+    assert!(
+        engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    engine
+        .record_remote_operation_result::<()>(Err(MetaError::RemoteUnavailable(
+            "test-postgres-dsn".to_string(),
+        )))
+        .expect_err("unavailable remote operation");
+    assert!(
+        !engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 }
 
 #[test]
@@ -1349,6 +1603,11 @@ fn metadata_sync_replay_gap_records_degraded_lifecycle() {
 
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
     assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert!(
+        engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 }
 
 #[test]
@@ -1464,6 +1723,11 @@ fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
     engine
         .metadata_startup_target_version
         .store(7, std::sync::atomic::Ordering::Release);
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: 5,
+        first_available_version: 6,
+        target_version: 7,
+    });
     engine
         .try_complete_catchup_sync()
         .expect("complete degraded fresh-client sync");
@@ -1480,6 +1744,7 @@ fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
             .expect("read fresh-client marker"),
         0
     );
+    assert!(!engine.pg_sync_diagnostics().rebootstrap_required);
 }
 
 #[test]

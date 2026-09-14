@@ -3,7 +3,8 @@ use crate::engine::{
     MetaEngineCore, MetaFsOps, MetaGc, MetaNamespace, MetaPayloadObjects, MetaSymlink, MetaXattr,
 };
 use crate::engine::{
-    MetaError, MetaFormat, MetaInodes, MetaReplication, MetaResult, PgSyncLifecycle,
+    MetaError, MetaFormat, MetaInodes, MetaReplication, MetaResult, PgSyncFailure, PgSyncLifecycle,
+    PgSyncPageDiagnostics,
 };
 #[cfg(test)]
 use crate::events::MetaEvent;
@@ -221,6 +222,7 @@ pub struct PgMetaEngine {
     event_log_prune_batches: i64,
     checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy,
     checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
+    pg_sync_progress_state: Mutex<PgSyncProgressState>,
     checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState,
     checkpoint_single_flight: Mutex<()>,
     command_pool: Arc<runtime::PgConnectionPool>,
@@ -254,7 +256,7 @@ pub struct PgMetaEngine {
     /// Whether snapshot reachability bootstrap completed for this engine.
     snapshot_reachability_bootstrapped: AtomicBool,
     snapshot_reachability_bootstrap_lock: Mutex<()>,
-    /// Whether the most recent metadata synchronization command succeeded.
+    /// Whether the metadata source was reachable for the most recent command.
     metadata_source_connected: AtomicBool,
     /// Whether PostgreSQL's sync format was validated successfully for this
     /// runtime. A local-first startup may leave this pending while PostgreSQL
@@ -483,6 +485,23 @@ struct HeldFileLockLease {
     next_renew_at: Instant,
 }
 
+#[derive(Default)]
+struct PgSyncProgressState {
+    current_page: Option<PgSyncPageDiagnostics>,
+    last_page: Option<PgSyncPageDiagnostics>,
+    last_sync_error: Option<PgSyncFailure>,
+    rebootstrap_required: bool,
+    last_progress_log_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct PgSyncProgressSnapshot {
+    pub(super) current_page: Option<PgSyncPageDiagnostics>,
+    pub(super) last_page: Option<PgSyncPageDiagnostics>,
+    pub(super) last_sync_error: Option<PgSyncFailure>,
+    pub(super) rebootstrap_required: bool,
+}
+
 impl PgMetaEngine {
     const LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
     const LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS: u64 = 30_000;
@@ -511,6 +530,60 @@ impl PgMetaEngine {
 
     fn current_pg_sync_lifecycle(&self) -> PgSyncLifecycle {
         Self::pg_sync_lifecycle_from_raw(self.pg_sync_lifecycle.load(Ordering::Acquire))
+    }
+
+    pub(super) fn record_pg_sync_page_selected(&self, page: PgSyncPageDiagnostics) -> bool {
+        let Ok(mut progress) = self.pg_sync_progress_state.lock() else {
+            return false;
+        };
+        progress.current_page = Some(page);
+        let should_log = !page.has_more
+            || progress.last_progress_log_at.is_none()
+            || progress
+                .last_progress_log_at
+                .is_some_and(|last| last.elapsed() >= Duration::from_secs(1));
+        if should_log {
+            progress.last_progress_log_at = Some(Instant::now());
+        }
+        should_log
+    }
+
+    pub(super) fn record_pg_sync_page_applied(&self, page: PgSyncPageDiagnostics) {
+        if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
+            progress.current_page = None;
+            progress.last_page = Some(page);
+        }
+    }
+
+    pub(super) fn record_pg_sync_success(&self) {
+        if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
+            progress.last_sync_error = None;
+            if self.current_pg_sync_lifecycle() != PgSyncLifecycle::Degraded {
+                progress.rebootstrap_required = false;
+            }
+        }
+    }
+
+    pub(super) fn record_pg_sync_failure(&self, error: &MetaError) {
+        if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
+            progress.current_page = None;
+            if matches!(error, MetaError::ReplayGap { .. }) {
+                progress.rebootstrap_required = true;
+            }
+            progress.last_sync_error = Some(PgSyncFailure::from_error(error));
+        }
+    }
+
+    pub(super) fn pg_sync_progress_snapshot(&self) -> PgSyncProgressSnapshot {
+        self.pg_sync_progress_state
+            .lock()
+            .map(|progress| PgSyncProgressSnapshot {
+                current_page: progress.current_page,
+                last_page: progress.last_page,
+                last_sync_error: progress.last_sync_error,
+                rebootstrap_required: progress.rebootstrap_required,
+            })
+            .unwrap_or_default()
     }
 
     fn update_pg_sync_lifecycle(
@@ -637,6 +710,9 @@ impl PgMetaEngine {
             self.bootstrap_allocator_state();
         } else {
             self.refresh_pg_sync_lifecycle_for_allocator();
+        }
+        if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
+            progress.rebootstrap_required = false;
         }
         // A later recovery cycle must capture its own startup target.
         self.metadata_startup_target_version
@@ -878,6 +954,7 @@ impl PgMetaEngine {
         if !self.remote_format_validated.load(Ordering::Acquire) {
             let result = self.validate_remote_format_version();
             if let Err(error) = &result {
+                self.record_metadata_source_result(&result);
                 self.invalidate_remote_validation();
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
@@ -889,10 +966,14 @@ impl PgMetaEngine {
         }
 
         if self.remote_identity_validated.load(Ordering::Acquire) {
+            self.metadata_source_connected
+                .store(true, Ordering::Release);
             return Ok(());
         }
 
-        self.validate_remote_identity()
+        let result = self.validate_remote_identity();
+        self.record_metadata_source_result(&result);
+        result
     }
 
     pub(super) fn check_remote_identity(&self) -> MetaResult<()> {
@@ -900,7 +981,9 @@ impl PgMetaEngine {
             .remote_validation_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg remote validation lock poisoned".to_string()))?;
-        self.validate_remote_identity()
+        let result = self.validate_remote_identity();
+        self.record_metadata_source_result(&result);
+        result
     }
 
     fn validate_remote_identity(&self) -> MetaResult<()> {
@@ -969,7 +1052,17 @@ impl PgMetaEngine {
             .store(false, Ordering::Release);
     }
 
+    fn record_metadata_source_result<T>(&self, result: &MetaResult<T>) {
+        let connected = match result {
+            Ok(_) => true,
+            Err(error) => !error.is_reachability_error(),
+        };
+        self.metadata_source_connected
+            .store(connected, Ordering::Release);
+    }
+
     fn record_remote_operation_result<T>(&self, result: MetaResult<T>) -> MetaResult<T> {
+        self.record_metadata_source_result(&result);
         match &result {
             Ok(_) => self
                 .remote_transport_unavailable
@@ -978,6 +1071,7 @@ impl PgMetaEngine {
                 self.invalidate_remote_validation();
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
+                self.record_pg_sync_failure(error);
                 if matches!(error, MetaError::ReplayGap { .. }) {
                     self.mark_replay_gap_recovery_required();
                 }
@@ -1148,6 +1242,7 @@ impl PgMetaEngine {
             checkpoint_freshness_state: Mutex::new(
                 checkpoint_freshness::CheckpointFreshnessState::new(&checkpoint_freshness_policy),
             ),
+            pg_sync_progress_state: Mutex::new(PgSyncProgressState::default()),
             checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
             checkpoint_single_flight: Mutex::new(()),
             command_pool: Arc::new(runtime::PgConnectionPool::new(

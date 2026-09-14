@@ -5,11 +5,13 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use studiofs_cache::runtime::{
     CacheIndex, LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
+use studiofs_meta::{PgSyncDiagnostics, PgSyncPageDiagnostics};
 use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
 #[cfg(test)]
 use uuid::Uuid;
@@ -97,6 +99,165 @@ fn detect_backends(cache_path: &Path) -> Option<LocalPayloadRuntimeDetection> {
 
 fn format_ms(value: f64) -> String {
     format!("{value:.3}ms")
+}
+
+fn format_version(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn mounted_pg_sync_diagnostics(volume_name: &str) -> Option<PgSyncDiagnostics> {
+    let discovery = crate::diagnostics::discover_local_sessions()
+        .ok()?
+        .into_iter()
+        .find(|session| session.volume == volume_name)?;
+    let client = crate::diagnostics::LocalDiagnosticsClient::new(discovery);
+    crate::runtime_bridge::block_on(async move {
+        client
+            .runtime_snapshot()
+            .await
+            .map(|snapshot| snapshot.synchronization.state.pg_sync)
+    })
+    .ok()
+}
+
+fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
+    let Some(page) = page else {
+        return "none".to_string();
+    };
+    let first = format_version(page.first_batch_version);
+    let last = format_version(page.last_batch_version);
+    let batch_unit = if page.batch_count == 1 {
+        "batch"
+    } else {
+        "batches"
+    };
+    let event_unit = if page.event_count == 1 {
+        "event"
+    } else {
+        "events"
+    };
+    let oversized = if page.oversized { ", oversized" } else { "" };
+    format!(
+        "{first}..{last} ({} {batch_unit}, {} {event_unit}, {}, more={}{oversized})",
+        page.batch_count,
+        page.event_count,
+        format_bytes(page.response_bytes),
+        page.has_more
+    )
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+fn format_last_successful_sync(timestamp: Option<i64>, now_ms: u64) -> String {
+    let Some(timestamp) = timestamp.and_then(|timestamp| u64::try_from(timestamp).ok()) else {
+        return "unknown".to_string();
+    };
+    let age_ms = now_ms.saturating_sub(timestamp);
+    if age_ms < 1_000 {
+        format!("{age_ms}ms ago")
+    } else if age_ms < 60_000 {
+        format!("{:.1}s ago", age_ms as f64 / 1_000.0)
+    } else if age_ms < 3_600_000 {
+        format!("{:.1}m ago", age_ms as f64 / 60_000.0)
+    } else {
+        format!("{:.1}h ago", age_ms as f64 / 3_600_000.0)
+    }
+}
+
+fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
+    println!("\nPostgreSQL Sync");
+    println!("────────────────");
+    println!("  Lifecycle:              {:?}", diagnostics.lifecycle);
+    if let Some(target) = diagnostics.startup_target_version {
+        println!(
+            "  Local applied/target:   {}/{}",
+            format_version(diagnostics.local_applied_version),
+            target
+        );
+        println!(
+            "  Target remaining:       {}",
+            format_version(diagnostics.remaining_version_distance)
+        );
+    } else {
+        println!(
+            "  Local applied version:  {}",
+            format_version(diagnostics.local_applied_version)
+        );
+    }
+    println!(
+        "  Remote head:            {}",
+        format_version(diagnostics.remote_head_version)
+    );
+    println!(
+        "  Checkpoint version:     {}",
+        format_version(diagnostics.checkpoint.checkpoint_version)
+    );
+    let refresh_state = if diagnostics.checkpoint.refresh_needed {
+        "needed"
+    } else {
+        "not needed"
+    };
+    if let Some(reason) = diagnostics.checkpoint.refresh_reason {
+        println!("  Checkpoint refresh:     {refresh_state} ({reason})");
+    } else {
+        println!("  Checkpoint refresh:     {refresh_state}");
+    }
+    println!(
+        "  Current page:           {}",
+        format_page(diagnostics.current_page.as_ref())
+    );
+    println!(
+        "  Last page:              {}",
+        format_page(diagnostics.last_page.as_ref())
+    );
+    println!(
+        "  Write authority:        {}",
+        if diagnostics.write_authority {
+            "read-write"
+        } else {
+            "read-only"
+        }
+    );
+    if let Some(reason) = diagnostics.write_authority_reason {
+        println!("  Authority reason:       {reason}");
+    }
+    println!(
+        "  Source connected:       {}",
+        if diagnostics.source_connected {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("  Sync errors:            {}", diagnostics.sync_errors);
+    println!(
+        "  Last successful sync:   {}",
+        format_last_successful_sync(diagnostics.last_successful_sync_unix_ms, current_unix_ms(),)
+    );
+    println!(
+        "  Last sync error:        {}",
+        diagnostics
+            .last_sync_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!(
+        "  Rebootstrap required:   {}",
+        if diagnostics.rebootstrap_required {
+            "yes"
+        } else {
+            "no"
+        }
+    );
 }
 
 fn format_finite_ms(value: f64) -> String {
@@ -477,30 +638,55 @@ pub fn run(
 
     let engine = match studiofs_meta::open_meta_engine(&db_path) {
         Ok(engine) => engine,
-        Err(error) if verbosity.is_verbose() => {
-            eprintln!(
-                "warning: failed to open volume metadata at '{}': {error}",
-                db_path.display()
-            );
-            println!("StudioFS Volume Status");
-            println!("──────────────────────");
-            println!("  Name:       {}", name);
-            println!("  Metadata:   {:?}", db_path);
-            println!(
-                "  Warning:    metadata DB is locked; showing mounted write-path metrics only"
-            );
-            let cache_root = cache_dir
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| meta_dir.join("cache"));
-            println!("\nLocal Cache");
-            println!("───────────");
-            println!("  Root:                {}", cache_root.display());
-            print_mounted_write_path_fallback(read_write_path_observability_from_cache_root(
-                &cache_root,
-            ));
-            return Ok(());
+        Err(error) => {
+            if let Some(pg_sync) = mounted_pg_sync_diagnostics(name) {
+                eprintln!(
+                    "warning: failed to open volume metadata at '{}': {error}",
+                    db_path.display()
+                );
+                println!("StudioFS Volume Status");
+                println!("──────────────────────");
+                println!("  Name:       {}", name);
+                println!("  Metadata:   {:?}", db_path);
+                println!(
+                    "  Warning:    metadata DB is locked; showing mounted process diagnostics"
+                );
+                print_pg_sync_diagnostics(&pg_sync);
+                if verbosity.is_verbose() {
+                    let cache_root = cache_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| meta_dir.join("cache"));
+                    print_mounted_write_path_fallback(
+                        read_write_path_observability_from_cache_root(&cache_root),
+                    );
+                }
+                return Ok(());
+            }
+            if verbosity.is_verbose() {
+                eprintln!(
+                    "warning: failed to open volume metadata at '{}': {error}",
+                    db_path.display()
+                );
+                println!("StudioFS Volume Status");
+                println!("──────────────────────");
+                println!("  Name:       {}", name);
+                println!("  Metadata:   {:?}", db_path);
+                println!(
+                    "  Warning:    metadata DB is locked; showing mounted write-path metrics only"
+                );
+                let cache_root = cache_dir
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| meta_dir.join("cache"));
+                println!("\nLocal Cache");
+                println!("───────────");
+                println!("  Root:                {}", cache_root.display());
+                print_mounted_write_path_fallback(read_write_path_observability_from_cache_root(
+                    &cache_root,
+                ));
+                return Ok(());
+            }
+            return Err(error.into());
         }
-        Err(error) => return Err(error.into()),
     };
     let format_info = engine.get_format_info()?;
 
@@ -531,7 +717,15 @@ pub fn run(
         None
     };
 
-    let remote_size = engine.remote_metadata_size()?.unwrap_or(0);
+    let remote_size = match engine.remote_metadata_size() {
+        Ok(size) => size,
+        Err(_) => {
+            eprintln!(
+                "warning: remote metadata size is unavailable; continuing with synchronization diagnostics"
+            );
+            None
+        }
+    };
     let local_db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     println!("StudioFS Volume Status");
@@ -550,7 +744,12 @@ pub fn run(
         println!("\n  Meta backend: Postgres");
         println!("  Postgres URL:  {}", pg.url);
         println!("  Postgres vol:  {}", pg.volume_id);
-        println!("  Postgres size: {}", format_bytes(remote_size));
+        if let Some(remote_size) = remote_size {
+            println!("  Postgres size: {}", format_bytes(remote_size));
+        } else {
+            println!("  Postgres size: unavailable");
+        }
+        print_pg_sync_diagnostics(&engine.pg_sync_diagnostics());
     } else {
         println!("\n  Meta backend: {:?}", format_info.metadata.backend);
     }
@@ -1185,6 +1384,53 @@ mod tests {
             metrics_volume_path(&metrics_path),
             Some(Path::new("/cache-root/volume-uuid"))
         );
+    }
+
+    #[test]
+    fn pg_sync_page_format_includes_boundaries_and_progress_counts() {
+        let page = PgSyncPageDiagnostics {
+            first_batch_version: Some(4),
+            last_batch_version: Some(9),
+            batch_count: 3,
+            event_count: 7,
+            response_bytes: 128,
+            has_more: true,
+            oversized: true,
+        };
+
+        assert_eq!(
+            format_page(Some(&page)),
+            "4..9 (3 batches, 7 events, 128B, more=true, oversized)"
+        );
+    }
+
+    #[test]
+    fn pg_sync_page_format_pluralizes_single_counts() {
+        let page = PgSyncPageDiagnostics {
+            first_batch_version: Some(1),
+            last_batch_version: Some(1),
+            batch_count: 1,
+            event_count: 1,
+            response_bytes: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            format_page(Some(&page)),
+            "1..1 (1 batch, 1 event, 1B, more=false)"
+        );
+    }
+
+    #[test]
+    fn pg_sync_last_successful_sync_format_reports_age() {
+        assert_eq!(format_last_successful_sync(Some(1_234), 2_000), "766ms ago");
+        assert_eq!(format_last_successful_sync(Some(1_000), 2_500), "1.5s ago");
+        assert_eq!(format_last_successful_sync(Some(1_000), 61_000), "1.0m ago");
+        assert_eq!(
+            format_last_successful_sync(Some(1_000), 3_601_000),
+            "1.0h ago"
+        );
+        assert_eq!(format_last_successful_sync(None, 2_000), "unknown");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 use studiofs_cache::CachedStoreWriterConfig;
 use studiofs_meta::engine::{MetaEngineCore, MetaInodes, MetaPayloadObjects};
-use studiofs_meta::engine::{MetadataAuthorityStatus, PgSyncLifecycle};
+use studiofs_meta::engine::{MetadataAuthorityStatus, PgSyncLifecycle, PgSyncWriteAuthorityReason};
 use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, InodeLifecycleState,
     MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
@@ -19909,6 +19909,13 @@ fn sync_status_reports_effective_read_only_mount_authority() {
         MetadataAuthorityStatus::read_only(),
         "public VFS sync status must include the read-only mount override"
     );
+    let diagnostics = vfs.sync_diagnostics();
+    assert_eq!(diagnostics.authority, MetadataAuthorityStatus::read_only());
+    assert!(!diagnostics.write_authority);
+    assert_eq!(
+        diagnostics.write_authority_reason,
+        Some(PgSyncWriteAuthorityReason::ReadOnlyMount)
+    );
     let set_error = vfs
         .set_acl_rule(ROOT_INO, "review-principal", AccessLevel::ReadOnly)
         .expect_err("read-only mount must block ACL insertion");
@@ -19946,6 +19953,7 @@ fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
         PgSyncLifecycle::AllocatorPending,
     ] {
         vfs.set_pg_sync_lifecycle_for_test(Some(lifecycle));
+        assert_eq!(vfs.sync_diagnostics().lifecycle, lifecycle);
 
         assert!(
             vfs.getattr(attr.ino).is_ok(),

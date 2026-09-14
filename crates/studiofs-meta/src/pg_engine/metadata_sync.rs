@@ -3,7 +3,7 @@
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle};
+use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
 use crate::types::FileType;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -81,6 +81,7 @@ impl PgMetaEngine {
     ) {
         match result {
             Ok(changed) => {
+                self.record_pg_sync_success();
                 self.metadata_source_connected
                     .store(true, Ordering::Release);
                 self.metadata_last_successful_sync_unix_ms
@@ -91,6 +92,7 @@ impl PgMetaEngine {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 if let Err(error) = self.try_complete_catchup_sync() {
+                    self.record_pg_sync_failure(&error);
                     warn!(
                         error = %error,
                         volume_id = self.volume_id,
@@ -99,9 +101,9 @@ impl PgMetaEngine {
                 }
             }
             Err(error) => {
+                self.record_pg_sync_failure(error);
                 self.invalidate_remote_validation();
-                self.metadata_source_connected
-                    .store(false, Ordering::Release);
+                self.record_metadata_source_result(result);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
                 if matches!(error, MetaError::ReplayGap { .. }) {
                     self.mark_replay_gap_recovery_required();
@@ -246,12 +248,31 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
+        let page_diagnostics = PgSyncPageDiagnostics {
+            first_batch_version: page
+                .first_batch_version
+                .and_then(|value| value.try_into().ok()),
+            last_batch_version: page
+                .last_batch_version
+                .and_then(|value| value.try_into().ok()),
+            batch_count: page.batch_count.try_into().unwrap_or_default(),
+            event_count: page.event_count.try_into().unwrap_or_default(),
+            response_bytes: page.response_bytes.try_into().unwrap_or_default(),
+            has_more: page.has_more,
+            oversized: page.oversized,
+        };
+        let should_log = self.record_pg_sync_page_selected(page_diagnostics);
         // Keep the local event position, serving-state reconcile, and pending
         // replay atomic with respect to local metadata mutations. The network
         // query above deliberately stays outside this critical section.
-        if page.batch_count > 0 {
+        if page.batch_count > 0 && should_log {
             tracing::debug!(
                 volume_id = self.volume_id,
+                local_applied_version = last_batch_version,
+                target_version,
+                remaining_version_distance = target_version
+                    .saturating_sub(last_batch_version)
+                    .max(0),
                 first_batch_version = ?page.first_batch_version,
                 last_batch_version = ?page.last_batch_version,
                 batch_count = page.batch_count,
@@ -298,6 +319,8 @@ impl PgMetaEngine {
         if outcome.flushed_event_seq.is_some() {
             self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
         }
+        drop(pending_state);
+        self.record_pg_sync_page_applied(page_diagnostics);
         Ok(outcome.changed)
     }
 
