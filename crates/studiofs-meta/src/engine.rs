@@ -635,7 +635,7 @@ impl PgSyncLifecycle {
 /// `lifecycle` describes local serving/catch-up health. `authority` describes
 /// the paired allocator headroom. New mutations require both dimensions to
 /// allow them; reads require only a non-fatal lifecycle.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PgSyncStatus {
     /// Current local serving and synchronization lifecycle.
     pub lifecycle: PgSyncLifecycle,

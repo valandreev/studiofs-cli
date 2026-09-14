@@ -7493,20 +7493,15 @@ impl StudioVfs {
     fn metadata_sync_diagnostics(&self) -> PgSyncDiagnostics {
         let mut diagnostics = self.meta.sync_view().pg_sync_diagnostics();
         #[cfg(test)]
-        if !self.read_only_mount
-            && let Some(authority_override) = *self.metadata_authority_override.lock()
         {
-            diagnostics.authority = authority_override;
-            let gate = PgSyncDiagnostics::from_status(PgSyncStatus::new(
-                diagnostics.lifecycle,
-                diagnostics.authority,
-            ));
-            diagnostics.write_authority = gate.write_authority;
-            diagnostics.write_authority_reason = gate.write_authority_reason;
-        }
-        #[cfg(test)]
-        if let Some(lifecycle_override) = *self.metadata_sync_lifecycle_override.lock() {
-            diagnostics.lifecycle = lifecycle_override;
+            if !self.read_only_mount
+                && let Some(authority_override) = *self.metadata_authority_override.lock()
+            {
+                diagnostics.authority = authority_override;
+            }
+            if let Some(lifecycle_override) = *self.metadata_sync_lifecycle_override.lock() {
+                diagnostics.lifecycle = lifecycle_override;
+            }
             let gate = PgSyncDiagnostics::from_status(PgSyncStatus::new(
                 diagnostics.lifecycle,
                 diagnostics.authority,

@@ -176,22 +176,19 @@ impl MetaReplication for PgMetaEngine {
             (last_successful_sync_unix_ms > 0).then_some(last_successful_sync_unix_ms);
 
         PgSyncDiagnostics {
-            lifecycle: status.lifecycle,
             local_applied_version,
             startup_target_version,
             remote_head_version,
             remaining_version_distance,
             current_page,
             last_page,
-            authority: status.authority,
-            write_authority: status.allows_new_mutations(),
-            write_authority_reason: PgSyncDiagnostics::from_status(status).write_authority_reason,
             last_sync_error,
             checkpoint,
             rebootstrap_required,
             source_connected: self.metadata_source_connected.load(Ordering::Acquire),
             sync_errors: self.metadata_sync_errors.load(Ordering::Relaxed),
             last_successful_sync_unix_ms,
+            ..PgSyncDiagnostics::from_status(status)
         }
     }
 
