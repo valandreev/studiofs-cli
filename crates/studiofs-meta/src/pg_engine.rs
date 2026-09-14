@@ -800,7 +800,9 @@ impl PgMetaEngine {
                                     ('metadata_state'::TEXT, 'checkpoint_sha256'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_publication_state'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_generation'::TEXT),
-                                    ('metadata_state'::TEXT, 'checkpoint_updated_at'::TEXT)
+                                    ('metadata_state'::TEXT, 'checkpoint_updated_at'::TEXT),
+                                    ('metadata_state'::TEXT, 'event_log_prune_floor'::TEXT),
+                                    ('metadata_state'::TEXT, 'event_log_pruned_rows'::TEXT)
                             ) AS required(table_name, column_name)
                             LEFT JOIN information_schema.columns AS column_info
                                 ON column_info.table_schema = current_schema()

@@ -30,7 +30,6 @@ async fn insert_event_rows(
 fn foreign_event_page_query_is_bounded_and_exposes_page_metadata() {
     assert!(sql::SELECT_FOREIGN_EVENT_ROWS.contains("LIMIT $4::BIGINT"));
     assert!(sql::SELECT_FOREIGN_EVENT_ROWS.contains("batch_version <= $3"));
-    assert!(sql::SELECT_EVENT_LOG_PRUNE_FLOOR.contains("event_log_prune_floor"));
     assert!(sql::SELECT_FOREIGN_EVENT_ROWS.contains("p.has_more"));
     assert!(sql::SELECT_FOREIGN_EVENT_ROWS.contains("p.oversized"));
     assert!(sql::SELECT_FOREIGN_EVENT_ROWS.contains("octet_length(e.event_payload)"));
@@ -232,7 +231,7 @@ fn pg_foreign_event_page_rejects_a_pruned_replay_gap() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn pg_foreign_event_page_rejects_an_empty_pruned_replay_window() {
+fn pg_foreign_event_page_rejects_an_empty_replay_window() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-empty-gap");
 
@@ -243,7 +242,7 @@ fn pg_foreign_event_page_rejects_an_empty_pruned_replay_window() {
         let connection_task = tokio::spawn(connection);
         client
             .execute(
-                "UPDATE metadata_state SET version = 60, checkpoint_version = 60, event_log_prune_floor = 50 WHERE vol = $1",
+                "UPDATE metadata_state SET version = 60, checkpoint_version = 60, event_log_prune_floor = 0 WHERE vol = $1",
                 &[&volume.volume_id],
             )
             .await
@@ -266,7 +265,7 @@ fn pg_foreign_event_page_rejects_an_empty_pruned_replay_window() {
             error,
             crate::engine::MetaError::ReplayGap {
                 local_version: 5,
-                first_available_version: 51,
+                first_available_version: 6,
                 target_version: 60,
             }
         ));

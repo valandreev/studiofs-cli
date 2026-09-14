@@ -765,18 +765,12 @@ impl PgMetaEngine {
     fn validate_empty_foreign_event_page(
         cursor_batch_version: i64,
         target_batch_version: i64,
-        prune_floor: i64,
     ) -> MetaResult<()> {
-        if prune_floor < 0 {
-            return Err(MetaError::Storage(
-                "postgres event-log prune floor must be nonnegative".to_string(),
-            ));
-        }
-        if cursor_batch_version >= prune_floor {
+        if cursor_batch_version >= target_batch_version {
             return Ok(());
         }
-        let first_available_version = prune_floor.checked_add(1).ok_or_else(|| {
-            MetaError::Storage("postgres event-log prune floor exceeds BIGINT".to_string())
+        let first_available_version = cursor_batch_version.checked_add(1).ok_or_else(|| {
+            MetaError::Storage("postgres metadata replay cursor exceeds BIGINT".to_string())
         })?;
         Err(MetaError::ReplayGap {
             local_version: cursor_batch_version,
@@ -816,23 +810,7 @@ impl PgMetaEngine {
             .map_err(|e| Self::classify_pg_error("postgres event_log page select failed", e))?;
 
         let Some(first_row) = rows.first() else {
-            let Some(prune_floor_row) = client
-                .query_opt(sql::SELECT_EVENT_LOG_PRUNE_FLOOR, &[&volume_id])
-                .await
-                .map_err(|e| {
-                    Self::classify_pg_error("postgres event-log prune floor select failed", e)
-                })?
-            else {
-                return Ok(ForeignEventPage::empty(rows));
-            };
-            let prune_floor = prune_floor_row.try_get::<_, i64>(0).map_err(|e| {
-                Self::classify_pg_error("postgres event-log prune floor decode failed", e)
-            })?;
-            Self::validate_empty_foreign_event_page(
-                cursor_batch_version,
-                target_batch_version,
-                prune_floor,
-            )?;
+            Self::validate_empty_foreign_event_page(cursor_batch_version, target_batch_version)?;
             return Ok(ForeignEventPage::empty(rows));
         };
 
@@ -914,5 +892,36 @@ mod tests {
         ));
         assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, Some(6), 60).is_ok());
         assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, None, 60).is_ok());
+    }
+
+    #[test]
+    fn empty_foreign_event_page_rejects_a_lagging_cursor() {
+        assert!(matches!(
+            PgMetaEngine::validate_empty_foreign_event_page(5, 60),
+            Err(MetaError::ReplayGap {
+                local_version: 5,
+                first_available_version: 6,
+                target_version: 60,
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_foreign_event_page_accepts_a_cursor_at_target() {
+        assert!(PgMetaEngine::validate_empty_foreign_event_page(60, 60).is_ok());
+    }
+
+    #[test]
+    fn empty_foreign_event_page_handles_the_maximum_version_boundary() {
+        assert!(matches!(
+            PgMetaEngine::validate_empty_foreign_event_page(i64::MAX - 1, i64::MAX),
+            Err(MetaError::ReplayGap {
+                local_version: version,
+                first_available_version: first,
+                target_version: target,
+            }) if version == i64::MAX - 1
+                && first == i64::MAX
+                && target == i64::MAX
+        ));
     }
 }

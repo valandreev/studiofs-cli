@@ -27,6 +27,8 @@ fn event_log_prune_floor_uses_the_oldest_retained_source() {
 fn event_log_prune_sql_is_fenced_and_batch_bounded() {
     assert!(sql::SELECT_EVENT_LOG_PRUNE_STATE.contains("FOR UPDATE"));
     assert!(sql::TRY_EVENT_LOG_PRUNE_ADVISORY_LOCK.contains("pg_try_advisory_xact_lock"));
+    assert!(sql::SELECT_EVENT_LOG_PRUNE_PROGRESS.contains("checkpoint_version"));
+    assert!(!sql::SELECT_EVENT_LOG_PRUNE_PROGRESS.contains("FOR UPDATE"));
     assert!(sql::SELECT_EVENT_LOG_SOURCE_PRUNE_FLOOR.contains("lifecycle <> 'deleted'"));
     assert!(sql::DELETE_EVENT_LOG_PRUNE_BATCH.contains("GROUP BY batch_version"));
     assert!(sql::DELETE_EVENT_LOG_PRUNE_BATCH.contains("LIMIT $3::BIGINT"));

@@ -46,6 +46,11 @@ range intact.
       lock non-blocking, documented the prune limit, skipped pruning after
       failed sync, fixed the normative contract sentence, and tested both
       source-guard release and an entirely pruned replay window.
+- [x] (2026-09-14) Re-verified the second review: isolated prune failures from
+      sync validation state, added startup column checks, avoided no-op locks,
+      restricted pruning to established lifecycle states, documented failed
+      snapshot guards and all focused PG regressions, and added empty-page
+      boundary unit tests.
 
 ## Surprises & Discoveries
 
@@ -67,8 +72,8 @@ range intact.
 - Observation: SFS-711 owns checkpoint import/rebootstrap recovery and
   automatic rebootstrap is SFS-712. SFS-709 now rejects a non-contiguous page
   with `MetaError::ReplayGap` so it cannot silently skip pruned history; an
-  empty page also reports that result when the persisted floor is ahead of the
-  cursor. It does not add the recovery flow.
+  empty page also reports that result whenever the cursor is below its frozen
+  target. It does not add the recovery flow.
   Evidence: the current Linear relation graph for SFS-709, SFS-711, and
   SFS-712.
 
@@ -152,9 +157,8 @@ version 7 onward through its cut, so pruning may advance only through version
 
 The current local replay page query in `sql.rs` still returns ordered complete
 batch groups. It rejects a non-empty page whose first batch is not exactly the
-next version after the local cursor, and rejects an empty page when the
-persisted prune floor proves that the cursor is too old, before rows reach
-foreign apply.
+next version after the local cursor, and rejects any empty page while the
+cursor is below the requested target, before rows reach foreign apply.
 
 ## Plan of Work
 
@@ -192,7 +196,9 @@ synchronization. A failed prune will be logged as a maintenance failure and
 retried by a later poll; a failed synchronization skips pruning for that poll,
 and neither case will make an otherwise successful foreground flush fail. Include
 the candidate floor, durable floor, deleted rows, and cumulative rows in the
-structured maintenance log when a prune attempt reaches PostgreSQL.
+structured maintenance log when a prune attempt reaches PostgreSQL. Only
+`Live` and `TargetReached` lifecycle states run this maintenance; catching-up
+and degraded clients skip it.
 
 Finally, add focused tests in a new
 `crates/studiofs-meta/src/pg_engine/tests/event_log_pruning.rs` module. Portable

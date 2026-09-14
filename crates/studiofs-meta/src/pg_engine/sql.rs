@@ -312,9 +312,6 @@ pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
     ORDER BY e.batch_version ASC, e.seq_id ASC
     "#;
 
-pub(super) const SELECT_EVENT_LOG_PRUNE_FLOOR: &str =
-    "SELECT event_log_prune_floor FROM metadata_state WHERE vol = $1";
-
 pub(super) const SELECT_EVENT_LOG_PRUNE_STATE: &str = r#"
     SELECT checkpoint_version, event_log_prune_floor
     FROM metadata_state
@@ -324,6 +321,13 @@ pub(super) const SELECT_EVENT_LOG_PRUNE_STATE: &str = r#"
     "#;
 
 pub(super) const TRY_EVENT_LOG_PRUNE_ADVISORY_LOCK: &str = "SELECT pg_try_advisory_xact_lock($1)";
+
+pub(super) const SELECT_EVENT_LOG_PRUNE_PROGRESS: &str = r#"
+    SELECT checkpoint_version, event_log_prune_floor
+    FROM metadata_state
+    WHERE vol = $1
+      AND checkpoint_publication_state = 'published'
+    "#;
 
 pub(super) const SELECT_EVENT_LOG_SOURCE_PRUNE_FLOOR: &str = r#"
     SELECT MIN(

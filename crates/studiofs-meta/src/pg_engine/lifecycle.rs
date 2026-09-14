@@ -445,7 +445,11 @@ impl PgMetaEngine {
                         if initial_changed || local_version_after > local_version_before {
                             engine.metadata_invalidation_notify.notify_one();
                         }
-                        if let Err(error) = engine.run_event_log_prune_once() {
+                        if matches!(
+                            engine.current_pg_sync_lifecycle(),
+                            PgSyncLifecycle::Live | PgSyncLifecycle::TargetReached
+                        ) && let Err(error) = engine.run_event_log_prune_once()
+                        {
                             warn!(
                                 error = %error,
                                 volume_id = engine.volume_id,

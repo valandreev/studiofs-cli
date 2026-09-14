@@ -365,9 +365,9 @@ flush/pull replication flow as other metadata events.
 
 Background PostgreSQL maintenance prunes only complete event batches at or
 below the minimum of the fully published checkpoint and every retained
-Snapshot v2 source's first event version minus one. Creating, ready, and
-deleting source rows remain guards until their immutable source row is removed;
-empty sources do not pin event history. Each transaction removes a bounded
+Snapshot v2 source's first event version minus one. Creating, ready, failed,
+and deleting source rows remain guards until their immutable source row is
+removed; empty sources do not pin event history. Each transaction removes a bounded
 number of batch groups and advances `event_log_prune_floor` only when all lower
 rows are gone. This work is outside foreground writes, flushes, and startup;
 SFS-711 owns explicit replay-gap/rebootstrap-required reporting for cursors

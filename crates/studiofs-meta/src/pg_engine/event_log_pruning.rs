@@ -64,6 +64,36 @@ impl PgMetaEngine {
                 "prune postgres event log",
                 move |client| {
                     Box::pin(async move {
+                        let skip_prune = if let Some(state) = client
+                            .query_opt(sql::SELECT_EVENT_LOG_PRUNE_PROGRESS, &[&volume_id])
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres event-log prune progress query failed",
+                                    error,
+                                )
+                            })? {
+                            let checkpoint_version =
+                                state.try_get::<_, i64>(0).map_err(|error| {
+                                    Self::classify_pg_error(
+                                        "postgres event-log checkpoint version parse failed",
+                                        error,
+                                    )
+                                })?;
+                            let current_floor = state.try_get::<_, i64>(1).map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres event-log prune floor parse failed",
+                                    error,
+                                )
+                            })?;
+                            current_floor >= checkpoint_version
+                        } else {
+                            false
+                        };
+                        if skip_prune {
+                            return Ok(None);
+                        }
+
                         let tx = client.transaction().await.map_err(|error| {
                             Self::classify_pg_error(
                                 "postgres event-log prune transaction failed",
@@ -246,7 +276,6 @@ impl PgMetaEngine {
             )
             .await
         });
-        let result = self.record_remote_operation_result(result);
         if let Ok(Some(prune)) = &result {
             debug!(
                 volume_id = self.volume_id,
