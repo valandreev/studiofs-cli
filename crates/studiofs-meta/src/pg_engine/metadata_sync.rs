@@ -98,11 +98,14 @@ impl PgMetaEngine {
                     );
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 self.invalidate_remote_validation();
                 self.metadata_source_connected
                     .store(false, Ordering::Release);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
+                if matches!(error, MetaError::ReplayGap { .. }) {
+                    self.mark_replay_gap_recovery_required();
+                }
             }
         }
     }
@@ -276,6 +279,11 @@ impl PgMetaEngine {
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
         let batches = RemoteApplyCoordinator::decode_event_rows(page.rows, client_id.as_str())?;
+        RemoteApplyCoordinator::validate_decoded_batch_continuity(
+            last_batch_version,
+            &batches,
+            target_version,
+        )?;
         let outcome = self.apply_replay_page_atomically(
             batches,
             recent_flush,

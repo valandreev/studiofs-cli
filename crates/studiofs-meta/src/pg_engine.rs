@@ -28,6 +28,7 @@ const PG_POOL_SIZE_ENV_VAR: &str = "STUDIOFS_PG_POOL_SIZE";
 const PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR: &str = "STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE";
 const PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR: &str =
     "STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE";
+const PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR: &str = "STUDIOFS_PG_EVENT_LOG_PRUNE_BATCHES";
 
 #[cfg(test)]
 thread_local! {
@@ -124,6 +125,7 @@ const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE: i64 = 64;
 const DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE: i64 = 8 * 1024 * 1024;
+const DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES: i64 = 64;
 const PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_VERSION_LAG";
 const PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_EVENT_BYTES";
 const PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_AGE_SECS";
@@ -216,6 +218,7 @@ pub struct PgMetaEngine {
     command_timeout: Duration,
     sync_max_batches_per_page: i64,
     sync_max_response_bytes_per_page: i64,
+    event_log_prune_batches: i64,
     checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy,
     checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
     checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState,
@@ -402,6 +405,8 @@ mod checkpoint_coordinator;
 mod checkpoint_freshness;
 #[path = "pg_engine/engine_core.rs"]
 mod engine_core;
+#[path = "pg_engine/event_log_pruning.rs"]
+mod event_log_pruning;
 #[path = "pg_engine/inode_allocator.rs"]
 mod inode_allocator;
 #[path = "pg_engine/janitor.rs"]
@@ -536,6 +541,12 @@ impl PgMetaEngine {
                 return true;
             }
         }
+    }
+
+    fn mark_replay_gap_recovery_required(&self) {
+        self.metadata_startup_target_version
+            .store(-1, Ordering::Release);
+        self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
     }
 
     pub(super) fn transition_pg_sync_lifecycle(&self, next: PgSyncLifecycle) {
@@ -795,7 +806,9 @@ impl PgMetaEngine {
                                     ('metadata_state'::TEXT, 'checkpoint_sha256'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_publication_state'::TEXT),
                                     ('metadata_state'::TEXT, 'checkpoint_generation'::TEXT),
-                                    ('metadata_state'::TEXT, 'checkpoint_updated_at'::TEXT)
+                                    ('metadata_state'::TEXT, 'checkpoint_updated_at'::TEXT),
+                                    ('metadata_state'::TEXT, 'event_log_prune_floor'::TEXT),
+                                    ('metadata_state'::TEXT, 'event_log_pruned_rows'::TEXT)
                             ) AS required(table_name, column_name)
                             LEFT JOIN information_schema.columns AS column_info
                                 ON column_info.table_schema = current_schema()
@@ -965,6 +978,9 @@ impl PgMetaEngine {
                 self.invalidate_remote_validation();
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
+                if matches!(error, MetaError::ReplayGap { .. }) {
+                    self.mark_replay_gap_recovery_required();
+                }
             }
         }
         result
@@ -1041,6 +1057,10 @@ impl PgMetaEngine {
         let sync_max_response_bytes_per_page = Self::env_positive_i64(
             PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR,
             DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
+        );
+        let event_log_prune_batches = Self::env_positive_i64(
+            PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR,
+            DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES,
         );
         let checkpoint_freshness_policy = checkpoint_freshness::CheckpointFreshnessPolicy::new(
             Self::env_positive_u64(
@@ -1123,6 +1143,7 @@ impl PgMetaEngine {
             command_timeout,
             sync_max_batches_per_page,
             sync_max_response_bytes_per_page,
+            event_log_prune_batches,
             checkpoint_freshness_policy,
             checkpoint_freshness_state: Mutex::new(
                 checkpoint_freshness::CheckpointFreshnessState::new(&checkpoint_freshness_policy),

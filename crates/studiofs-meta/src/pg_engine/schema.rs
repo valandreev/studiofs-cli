@@ -79,6 +79,10 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     checkpoint_total_event_bytes >= 0
                     AND checkpoint_total_event_bytes <= total_event_payload_bytes
                 ),
+            event_log_prune_floor BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_prune_floor >= 0),
+            event_log_pruned_rows BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_pruned_rows >= 0),
             snapshot BYTEA NOT NULL,
             checkpoint_sha256 BYTEA NOT NULL
                 CHECK (octet_length(checkpoint_sha256) = 32),
@@ -106,6 +110,12 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     checkpoint_total_event_bytes >= 0
                     AND checkpoint_total_event_bytes <= total_event_payload_bytes
                 );
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS event_log_prune_floor BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_prune_floor >= 0);
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS event_log_pruned_rows BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_pruned_rows >= 0);
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_sha256 BYTEA NOT NULL
                 DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
@@ -362,10 +372,10 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     FROM snapshot_source_checkpoints AS s
                     INNER JOIN snapshot_catalog AS c
                         ON c.vol = s.vol AND c.id = s.snapshot_id
-                    WHERE c.lifecycle = 'creating'
+                    WHERE c.lifecycle <> 'deleted'
                       AND s.event_row_count > 0
                 ) THEN
-                    RAISE EXCEPTION 'event rows are retained by a creating snapshot'
+                    RAISE EXCEPTION 'event rows are retained by a snapshot'
                         USING ERRCODE = 'restrict_violation';
                 END IF;
                 RETURN NULL;
@@ -375,7 +385,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 FROM snapshot_source_checkpoints AS s
                 INNER JOIN snapshot_catalog AS c
                     ON c.vol = s.vol AND c.id = s.snapshot_id
-                WHERE c.lifecycle = 'creating'
+                WHERE c.lifecycle <> 'deleted'
                   AND s.vol = OLD.vol
                   AND s.event_row_count > 0
                   AND s.event_start_seq IS NOT NULL
@@ -384,7 +394,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                   AND OLD.batch_version > s.checkpoint_version
                   AND OLD.batch_version <= s.cut_version
             ) THEN
-                RAISE EXCEPTION 'event row is retained by a creating snapshot'
+                RAISE EXCEPTION 'event row is retained by a snapshot'
                     USING ERRCODE = 'restrict_violation';
             END IF;
             RETURN OLD;
@@ -797,6 +807,8 @@ mod tests {
             "metadata_format_version SMALLINT NOT NULL",
             "total_event_payload_bytes BIGINT NOT NULL",
             "checkpoint_total_event_bytes BIGINT NOT NULL",
+            "event_log_prune_floor BIGINT NOT NULL",
+            "event_log_pruned_rows BIGINT NOT NULL",
             "checkpoint_sha256 BYTEA NOT NULL",
             "checkpoint_publication_state TEXT NOT NULL",
             "checkpoint_generation BIGINT NOT NULL",
@@ -804,6 +816,9 @@ mod tests {
         ] {
             assert!(sql.contains(fragment), "schema is missing {fragment}");
         }
+        assert!(sql.contains("WHERE c.lifecycle <> 'deleted'"));
+        assert!(sql.contains("event rows are retained by a snapshot"));
+        assert!(sql.contains("event row is retained by a snapshot"));
         assert!(sql.contains("octet_length(checkpoint_sha256) = 32"));
         assert!(sql.contains("checkpoint_publication_state IN ('pending', 'published')"));
         assert!(sql.contains("checkpoint_generation >= 0"));

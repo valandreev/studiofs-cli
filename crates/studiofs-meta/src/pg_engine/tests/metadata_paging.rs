@@ -188,6 +188,96 @@ fn pg_foreign_event_pages_respect_cursor_target_and_batch_budget() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_foreign_event_page_rejects_a_pruned_replay_gap() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-foreign-event-gap");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let connection_task = tokio::spawn(connection);
+        insert_event_rows(&client, volume.volume_id, &[(51, b"after-gap", "remote")])
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+
+        let error = match PgMetaEngine::query_foreign_event_page(
+            &client,
+            volume.volume_id,
+            5,
+            60,
+            8,
+            1_000,
+        )
+        .await
+        {
+            Ok(_) => panic!("a page after a pruned range must not be replayed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            crate::engine::MetaError::ReplayGap {
+                local_version: 5,
+                first_available_version: 51,
+                target_version: 60,
+            }
+        ));
+
+        connection_task.abort();
+        Ok::<(), crate::engine::MetaError>(())
+    })
+    .expect("foreign event page must reject a replay gap");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_foreign_event_page_rejects_an_empty_replay_window() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-foreign-event-empty-gap");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 60, checkpoint_version = 60, event_log_prune_floor = 0 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+
+        let error = match PgMetaEngine::query_foreign_event_page(
+            &client,
+            volume.volume_id,
+            5,
+            60,
+            8,
+            1_000,
+        )
+        .await
+        {
+            Ok(_) => panic!("an empty pruned window must not be treated as a clean page"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            crate::engine::MetaError::ReplayGap {
+                local_version: 5,
+                first_available_version: 6,
+                target_version: 60,
+            }
+        ));
+
+        connection_task.abort();
+        Ok::<(), crate::engine::MetaError>(())
+    })
+    .expect("empty foreign event page must reject a replay gap");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_foreign_event_page_stops_before_byte_budget_without_oversizing() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-byte-budget");

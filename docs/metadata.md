@@ -121,6 +121,11 @@ The bounded, frozen pull behavior above is implemented by
 `batch_version` groups through the supplied target. The per-client defaults are
 64 batches and 8 MiB of estimated PostgreSQL row response bytes; an environment
 override may tune either limit without changing the volume schema.
+Before returning a non-empty page, the query requires its first batch to be
+exactly the next version after the local cursor. A missing range returns a
+typed `MetaError::ReplayGap` and is not passed to foreign apply. The runtime
+records the client as `Degraded` and read-only until the later checkpoint
+import/rebootstrap recovery owned by SFS-711 is available.
 
 ### Backend Selection on Open
 
@@ -355,7 +360,19 @@ flush/pull replication flow as other metadata events.
 `event_log` is the runtime delta stream. `metadata_state` stores:
 - the monotonic `version`
 - the latest remote-visible `ServingCheckpoint` and its `checkpoint_version`
+- the inclusive `event_log_prune_floor` and cumulative `event_log_pruned_rows`
+  retention diagnostics
 - bounded bootstrap `format_info`, kept separate from serving state
+
+Background PostgreSQL maintenance prunes only complete event batches at or
+below the minimum of the fully published checkpoint and every retained
+Snapshot v2 source's first event version minus one. Creating, ready, failed,
+and deleting source rows remain guards until their immutable source row is
+removed; empty sources do not pin event history. Each transaction removes a bounded
+number of batch groups and advances `event_log_prune_floor` only when all lower
+rows are gone. This work is outside foreground writes, flushes, and startup;
+SFS-711 owns explicit replay-gap/rebootstrap-required reporting for cursors
+below the persisted floor.
 
 `snapshot_catalog` stores thin lifecycle/control rows. The immutable source
 row stores only the captured serving-checkpoint bytes, checksum, checkpoint

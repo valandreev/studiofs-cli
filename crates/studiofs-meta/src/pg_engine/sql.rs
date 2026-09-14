@@ -312,6 +312,76 @@ pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
     ORDER BY e.batch_version ASC, e.seq_id ASC
     "#;
 
+pub(super) const SELECT_EVENT_LOG_PRUNE_STATE: &str = r#"
+    SELECT checkpoint_version, event_log_prune_floor
+    FROM metadata_state
+    WHERE vol = $1
+      AND checkpoint_publication_state = 'published'
+    FOR UPDATE
+    "#;
+
+pub(super) const TRY_EVENT_LOG_PRUNE_ADVISORY_LOCK: &str = "SELECT pg_try_advisory_xact_lock($1)";
+
+pub(super) const SELECT_EVENT_LOG_PRUNE_PROGRESS: &str = r#"
+    SELECT checkpoint_version, event_log_prune_floor
+    FROM metadata_state
+    WHERE vol = $1
+      AND checkpoint_publication_state = 'published'
+    "#;
+
+pub(super) const SELECT_EVENT_LOG_SOURCE_PRUNE_FLOOR: &str = r#"
+    SELECT MIN(
+        CASE
+            WHEN source.event_row_count > 0
+            THEN GREATEST(COALESCE(source.event_start_version, 0) - 1, 0)
+        END
+    ) AS source_prune_floor
+    FROM snapshot_source_checkpoints AS source
+    INNER JOIN snapshot_catalog AS catalog
+        ON catalog.vol = source.vol
+       AND catalog.id = source.snapshot_id
+    WHERE source.vol = $1
+      AND catalog.lifecycle <> 'deleted'
+    "#;
+
+pub(super) const DELETE_EVENT_LOG_PRUNE_BATCH: &str = r#"
+    WITH candidate_batches AS MATERIALIZED (
+        SELECT batch_version
+        FROM event_log
+        WHERE vol = $1
+          AND batch_version <= $2
+        GROUP BY batch_version
+        ORDER BY batch_version ASC
+        LIMIT $3::BIGINT
+    ),
+    deleted_batches AS (
+        DELETE FROM event_log AS event
+        USING candidate_batches AS candidate
+        WHERE event.vol = $1
+          AND event.batch_version = candidate.batch_version
+        RETURNING event.batch_version
+    )
+    SELECT COUNT(*)::BIGINT AS pruned_rows, MAX(batch_version) AS max_deleted_batch
+    FROM deleted_batches
+    "#;
+
+pub(super) const SELECT_EVENT_LOG_REMAINING_BELOW_FLOOR: &str = r#"
+    SELECT 1
+    FROM event_log
+    WHERE vol = $1
+      AND batch_version <= $2
+    LIMIT 1
+    "#;
+
+pub(super) const UPDATE_EVENT_LOG_PRUNE_STATE: &str = r#"
+    UPDATE metadata_state
+    SET event_log_prune_floor = GREATEST(event_log_prune_floor, $2),
+        event_log_pruned_rows = event_log_pruned_rows + $3,
+        updated_at = clock_timestamp()
+    WHERE vol = $1
+    RETURNING event_log_prune_floor, event_log_pruned_rows
+    "#;
+
 pub(super) const SELECT_SNAPSHOT_SOURCE: &str = r#"
     SELECT
         c.cut_version,

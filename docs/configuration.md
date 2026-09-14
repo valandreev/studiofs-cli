@@ -176,6 +176,9 @@ Notes:
   separate runtime observations. A fresh discovered client may serve its
   imported local state read-only while catch-up continues.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
+- `STUDIOFS_PG_EVENT_LOG_PRUNE_BATCHES` limits complete event-log batch groups
+  removed by one background maintenance transaction; it defaults to `64`, and
+  nonpositive or invalid values use the default.
 - Ordinary local redb commits use `Durability::None`. Each metadata-engine instance supplies its own idle-progress worker with a one-second maximum group-commit interval; explicit sync and clean shutdown execute an immediate barrier.
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
 - If neither `--foreground` nor `--detach` is provided, StudioFS mounts in the foreground by default.

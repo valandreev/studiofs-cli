@@ -1310,6 +1310,48 @@ fn successful_remote_operation_clears_transport_unavailable() {
 }
 
 #[test]
+fn replay_gap_downgrades_live_client_and_resets_stale_startup_target() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Live);
+    engine
+        .metadata_startup_target_version
+        .store(60, std::sync::atomic::Ordering::Release);
+
+    let error = MetaError::ReplayGap {
+        local_version: 5,
+        first_available_version: 51,
+        target_version: 60,
+    };
+    let returned = engine.record_remote_operation_result::<bool>(Err(error));
+
+    assert!(matches!(returned, Err(MetaError::ReplayGap { .. })));
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .metadata_startup_target_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        -1
+    );
+}
+
+#[test]
+fn metadata_sync_replay_gap_records_degraded_lifecycle() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Live);
+    let result = Err(MetaError::ReplayGap {
+        local_version: 5,
+        first_available_version: 6,
+        target_version: 60,
+    });
+
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result);
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
 fn established_zero_version_startup_failure_is_degraded() {
     let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
     let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
