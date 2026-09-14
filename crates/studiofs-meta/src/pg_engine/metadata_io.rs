@@ -760,14 +760,14 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn empty_foreign_event_page_gap(
+    fn empty_foreign_event_page_gap<T>(
         cursor_batch_version: i64,
         target_batch_version: i64,
-    ) -> MetaResult<MetaError> {
+    ) -> MetaResult<T> {
         let first_available_version = cursor_batch_version.checked_add(1).ok_or_else(|| {
             MetaError::Storage("postgres metadata replay cursor exceeds BIGINT".to_string())
         })?;
-        Ok(MetaError::ReplayGap {
+        Err(MetaError::ReplayGap {
             local_version: cursor_batch_version,
             first_available_version,
             target_version: target_batch_version,
@@ -805,10 +805,7 @@ impl PgMetaEngine {
             .map_err(|e| Self::classify_pg_error("postgres event_log page select failed", e))?;
 
         let Some(first_row) = rows.first() else {
-            return Err(Self::empty_foreign_event_page_gap(
-                cursor_batch_version,
-                target_batch_version,
-            )?);
+            return Self::empty_foreign_event_page_gap(cursor_batch_version, target_batch_version);
         };
 
         let decode_err =
@@ -899,25 +896,29 @@ mod tests {
 
     #[test]
     fn empty_foreign_event_page_rejects_a_lagging_cursor() {
+        let error = PgMetaEngine::empty_foreign_event_page_gap::<()>(5, 60)
+            .expect_err("lagging empty page must fail");
         assert!(matches!(
-            PgMetaEngine::empty_foreign_event_page_gap(5, 60),
-            Ok(MetaError::ReplayGap {
+            error,
+            MetaError::ReplayGap {
                 local_version: 5,
                 first_available_version: 6,
                 target_version: 60,
-            })
+            }
         ));
     }
 
     #[test]
     fn empty_foreign_event_page_handles_the_maximum_version_boundary() {
+        let error = PgMetaEngine::empty_foreign_event_page_gap::<()>(i64::MAX - 1, i64::MAX)
+            .expect_err("maximum cursor boundary must produce a replay gap");
         assert!(matches!(
-            PgMetaEngine::empty_foreign_event_page_gap(i64::MAX - 1, i64::MAX),
-            Ok(MetaError::ReplayGap {
+            error,
+            MetaError::ReplayGap {
                 local_version: version,
                 first_available_version: first,
                 target_version: target,
-            }) if version == i64::MAX - 1
+            } if version == i64::MAX - 1
                 && first == i64::MAX
                 && target == i64::MAX
         ));

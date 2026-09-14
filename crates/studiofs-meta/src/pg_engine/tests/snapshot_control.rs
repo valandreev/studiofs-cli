@@ -539,6 +539,25 @@ fn capture_is_one_transaction_and_one_durable_job() {
             Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION)
         );
 
+        client
+            .execute(
+                "UPDATE snapshot_catalog SET lifecycle = 'ready', ready_at = clock_timestamp() WHERE vol = $1 AND id = $2",
+                &[&volume.volume_id, &entry.snapshot_id.to_string()],
+            )
+            .await
+            .expect("mark captured snapshot ready");
+        let ready_event_prune_error = client
+            .execute(
+                "DELETE FROM event_log WHERE vol = $1 AND batch_version = 1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect_err("ready snapshot event range must not be prunable");
+        assert_eq!(
+            ready_event_prune_error.code(),
+            Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION)
+        );
+
         let error = client
             .execute(
                 "DELETE FROM snapshot_catalog WHERE vol = $1 AND id = $2",

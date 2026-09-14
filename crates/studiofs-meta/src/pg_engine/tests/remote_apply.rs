@@ -4,6 +4,32 @@ use crate::events::encode_event;
 use crate::redb_engine::layout::encode_dentry_key;
 
 #[test]
+fn decoded_replay_batches_reject_an_intra_page_gap() {
+    let batches = vec![
+        DecodedReplayBatch {
+            batch_version: 6,
+            events: Vec::new(),
+            is_self_batch: false,
+        },
+        DecodedReplayBatch {
+            batch_version: 8,
+            events: Vec::new(),
+            is_self_batch: false,
+        },
+    ];
+    let error = RemoteApplyCoordinator::validate_decoded_batch_continuity(5, &batches, 8)
+        .expect_err("intra-page replay gap must be rejected");
+    assert!(matches!(
+        error,
+        MetaError::ReplayGap {
+            local_version: 6,
+            first_available_version: 8,
+            target_version: 8,
+        }
+    ));
+}
+
+#[test]
 fn aborted_replay_page_does_not_persist_state_or_cursor() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let remote_ino = ROOT_INO + 700;

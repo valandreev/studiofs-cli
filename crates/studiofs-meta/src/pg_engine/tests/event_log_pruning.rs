@@ -33,6 +33,10 @@ fn event_log_prune_floor_uses_the_oldest_retained_source() {
         10
     );
     assert_eq!(
+        calculate_safe_prune_floor(10, Some(0), 0).expect("zero source floor is valid"),
+        0
+    );
+    assert_eq!(
         calculate_safe_prune_floor(10, None, 10).expect("equal floor is stable"),
         10
     );
@@ -58,14 +62,17 @@ fn event_log_prune_sql_is_fenced_and_batch_bounded() {
 
 #[test]
 fn event_log_prune_batch_limit_falls_back_for_invalid_environment_values() {
-    let _limit = set_test_env(PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR, "0");
-    assert_eq!(
-        PgMetaEngine::env_positive_i64(
-            PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR,
+    for invalid in ["abc", "-5", "0"] {
+        let _limit = set_test_env(PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR, invalid);
+        assert_eq!(
+            PgMetaEngine::env_positive_i64(
+                PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR,
+                DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES,
+            ),
             DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES,
-        ),
-        DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES
-    );
+            "invalid value {invalid} must use the default"
+        );
+    }
     assert!(PgMetaEngine::validate_event_log_prune_batch_limit(0).is_err());
     assert!(PgMetaEngine::validate_event_log_prune_batch_limit(-1).is_err());
     assert!(PgMetaEngine::validate_event_log_prune_batch_limit(1).is_ok());

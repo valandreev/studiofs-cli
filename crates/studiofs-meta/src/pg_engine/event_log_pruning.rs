@@ -3,11 +3,16 @@ use crate::engine::{MetaError, MetaResult};
 use std::sync::Arc;
 use tracing::debug;
 
+/// Diagnostics returned after one bounded event-log prune transaction.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) struct EventLogPruneResult {
+    /// Candidate floor selected from the published checkpoint and retained sources.
     pub(super) safe_floor: i64,
+    /// Highest complete batch version removed or confirmed durable after this run.
     pub(super) durable_floor: i64,
+    /// Number of event rows removed by this transaction.
     pub(super) pruned_rows: i64,
+    /// Cumulative number of rows removed for the volume.
     pub(super) total_pruned_rows: i64,
 }
 
@@ -20,6 +25,7 @@ fn nonnegative(value: i64, name: &str) -> MetaResult<i64> {
     Ok(value)
 }
 
+/// Reports whether the published checkpoint has no event-log history left to prune.
 pub(super) fn should_skip_event_log_prune(progress: Option<(i64, i64)>) -> bool {
     progress.is_none_or(|(checkpoint_version, current_floor)| current_floor >= checkpoint_version)
 }
@@ -53,6 +59,10 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    /// Runs one bounded, lock-fenced event-log retention transaction.
+    ///
+    /// Returns `None` when pruning is not currently eligible or another
+    /// maintenance attempt owns the per-volume advisory lock.
     pub(super) fn run_event_log_prune_once(&self) -> MetaResult<Option<EventLogPruneResult>> {
         Self::validate_event_log_prune_batch_limit(self.event_log_prune_batches)?;
 

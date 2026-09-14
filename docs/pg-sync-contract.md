@@ -255,9 +255,10 @@ not part of foreground writes, flushes, or startup.
 If a replay cursor is below the persisted floor, the client must use the finite
 remote checkpoint import flow to rebootstrap before resuming event replay.
 The bounded event-page query also rejects any non-empty page whose first batch
-is not exactly the next version after the local cursor, returning a typed
-`MetaError::ReplayGap` instead of silently skipping the missing range. The
-same result is returned for any empty page while the cursor is below the
+is not exactly the next version after the local cursor, and the decoded sync
+path rejects gaps between adjacent batches in one page. Both paths return a
+typed `MetaError::ReplayGap` instead of silently skipping the missing range.
+The same result is returned for any empty page while the cursor is below the
 requested target. For an empty page, `first_available_version` is set to the
 cursor plus one as an empty-window marker; it does not claim that this batch
 exists remotely. Checkpoint import/rebootstrap recovery that consumes this

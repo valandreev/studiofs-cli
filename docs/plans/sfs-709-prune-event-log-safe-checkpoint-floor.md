@@ -169,7 +169,8 @@ version 7 onward through its cut, so pruning may advance only through version
 The current local replay page query in `sql.rs` still returns ordered complete
 batch groups. It rejects a non-empty page whose first batch is not exactly the
 next version after the local cursor, and rejects any empty page while the
-cursor is below the requested target, before rows reach foreign apply.
+cursor is below the requested target. After decoding, the sync path also
+rejects gaps between batches in one page before foreign apply.
 
 ## Plan of Work
 
@@ -225,7 +226,7 @@ not unnecessarily pin the floor. The tests will use the existing `.env`-aware
 Update `docs/metadata.md` and the relevant section of
 `docs/pg-sync-contract.md` to describe the inclusive persisted prune floor,
 Snapshot v2 source constraint, bounded background transactions, and the fact
-that replay-gap reporting remains SFS-711. Keep credentials, DSNs, and secret
+that replay-gap recovery remains SFS-711. Keep credentials, DSNs, and secret
 configuration out of all documentation and diagnostics.
 
 ## Concrete Steps
@@ -305,6 +306,17 @@ Latest third-review validation on 2026-09-14:
 - `cargo check -p studiofs-meta`, clippy with `-D warnings`, formatting, and
   `git diff --check` passed after the review fixes.
 
+Latest fourth-review validation on 2026-09-14:
+
+- The decoded replay path now rejects gaps between batches in one page before
+  applying any events, and the empty-page helper returns `MetaResult<T>`
+  directly with the `ReplayGap` error.
+- The event-log trigger now protects source rows in every catalog lifecycle
+  except `deleted`, matching the pruning floor query; the focused PostgreSQL
+  snapshot test covers a retained `ready` source as well as `creating`.
+- Added the zero source-floor and invalid batch-limit environment cases
+  (`abc`, `-5`, and `0`) to the portable pruning tests.
+
 ## Idempotence and Recovery
 
 Schema setup is additive and uses `IF NOT EXISTS`/`ADD COLUMN IF NOT EXISTS`.
@@ -342,7 +354,7 @@ parsing, tracing, and `PgTestVolume` fixtures.
 2026-09-14: Initial SFS-709 ExecPlan created after reading the Linear contract,
 the PostgreSQL sync and Snapshot v2 contracts, the current checkpoint/poll
 lifecycle, and the Codebase Memory call paths. The plan deliberately leaves
-replay-gap classification to SFS-711 and automatic rebase to SFS-712.
+replay-gap recovery to SFS-711 and automatic rebase to SFS-712.
 2026-09-14: Implemented the additive schema, locked bounded maintenance
 transaction, background wiring, focused tests, and operational documentation;
 all listed focused validation passed. Commit evidence is recorded in the

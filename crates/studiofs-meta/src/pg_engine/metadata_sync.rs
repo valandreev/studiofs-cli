@@ -276,6 +276,11 @@ impl PgMetaEngine {
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
         let batches = RemoteApplyCoordinator::decode_event_rows(page.rows, client_id.as_str())?;
+        RemoteApplyCoordinator::validate_decoded_batch_continuity(
+            last_batch_version,
+            &batches,
+            target_version,
+        )?;
         let outcome = self.apply_replay_page_atomically(
             batches,
             recent_flush,

@@ -120,12 +120,14 @@ cargo test -p studiofs-meta pg_event_log_prune_preserves_retained_snapshot_sourc
 cargo test -p studiofs-meta pg_event_log_prune_defers_when_the_janitor_lock_is_contended --lib -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-meta pg_foreign_event_page_rejects_a_pruned_replay_gap --lib -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-meta pg_foreign_event_page_rejects_an_empty_replay_window --lib -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-meta decoded_replay_batches_reject_an_intra_page_gap --lib -- --nocapture
 ```
 
 The PostgreSQL tests require `STUDIOFS_TEST_PG_DSN` with a local
 PostgreSQL instance. They verify bounded complete-batch deletion, persisted
 floor/counter progress, retention of event rows required by a retained Snapshot
-v2 source, non-blocking janitor contention, and replay-gap rejection.
+v2 source, non-blocking janitor contention, and replay-gap rejection,
+including gaps between batches in one decoded page.
 
 ### SFS-647 Secret Redaction and Error Category Regressions
 

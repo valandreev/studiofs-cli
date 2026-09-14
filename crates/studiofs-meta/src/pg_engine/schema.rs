@@ -372,10 +372,10 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     FROM snapshot_source_checkpoints AS s
                     INNER JOIN snapshot_catalog AS c
                         ON c.vol = s.vol AND c.id = s.snapshot_id
-                    WHERE c.lifecycle = 'creating'
+                    WHERE c.lifecycle <> 'deleted'
                       AND s.event_row_count > 0
                 ) THEN
-                    RAISE EXCEPTION 'event rows are retained by a creating snapshot'
+                    RAISE EXCEPTION 'event rows are retained by a snapshot'
                         USING ERRCODE = 'restrict_violation';
                 END IF;
                 RETURN NULL;
@@ -385,7 +385,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                 FROM snapshot_source_checkpoints AS s
                 INNER JOIN snapshot_catalog AS c
                     ON c.vol = s.vol AND c.id = s.snapshot_id
-                WHERE c.lifecycle = 'creating'
+                WHERE c.lifecycle <> 'deleted'
                   AND s.vol = OLD.vol
                   AND s.event_row_count > 0
                   AND s.event_start_seq IS NOT NULL
@@ -394,7 +394,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                   AND OLD.batch_version > s.checkpoint_version
                   AND OLD.batch_version <= s.cut_version
             ) THEN
-                RAISE EXCEPTION 'event row is retained by a creating snapshot'
+                RAISE EXCEPTION 'event row is retained by a snapshot'
                     USING ERRCODE = 'restrict_violation';
             END IF;
             RETURN OLD;
@@ -816,6 +816,9 @@ mod tests {
         ] {
             assert!(sql.contains(fragment), "schema is missing {fragment}");
         }
+        assert!(sql.contains("WHERE c.lifecycle <> 'deleted'"));
+        assert!(sql.contains("event rows are retained by a snapshot"));
+        assert!(sql.contains("event row is retained by a snapshot"));
         assert!(sql.contains("octet_length(checkpoint_sha256) = 32"));
         assert!(sql.contains("checkpoint_publication_state IN ('pending', 'published')"));
         assert!(sql.contains("checkpoint_generation >= 0"));

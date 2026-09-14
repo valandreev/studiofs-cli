@@ -1961,6 +1961,30 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(batches)
     }
 
+    /// Rejects a decoded replay page that skips any batch after the local cursor.
+    pub(super) fn validate_decoded_batch_continuity(
+        cursor_batch_version: i64,
+        batches: &[DecodedReplayBatch],
+        target_batch_version: i64,
+    ) -> MetaResult<()> {
+        let mut previous_batch_version = cursor_batch_version;
+        for batch in batches {
+            let expected_batch_version =
+                previous_batch_version.checked_add(1).ok_or_else(|| {
+                    MetaError::Storage("postgres metadata replay cursor exceeds BIGINT".to_string())
+                })?;
+            if batch.batch_version != expected_batch_version {
+                return Err(MetaError::ReplayGap {
+                    local_version: previous_batch_version,
+                    first_available_version: batch.batch_version,
+                    target_version: target_batch_version,
+                });
+            }
+            previous_batch_version = batch.batch_version;
+        }
+        Ok(())
+    }
+
     pub(super) fn reconcile_recent_flush(
         &self,
         recent_flush: Option<&RecentFlush>,
