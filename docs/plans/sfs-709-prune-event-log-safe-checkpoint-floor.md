@@ -51,6 +51,11 @@ range intact.
       restricted pruning to established lifecycle states, documented failed
       snapshot guards and all focused PG regressions, and added empty-page
       boundary unit tests.
+- [x] (2026-09-14) Re-verified the third review: skipped pruning when no
+      published checkpoint exists, made empty-window diagnostics explicit
+      without expanding the ReplayGap field contract, removed unreachable
+      empty-page handling, rejected missing page metadata, renamed the cursor
+      parameter, and covered prune-floor edge cases.
 
 ## Surprises & Discoveries
 
@@ -114,6 +119,12 @@ range intact.
   allocations, and background maintenance must defer rather than block
   publication behind another janitor transaction. Date/Author: 2026-09-14,
   Codex.
+- Decision: Keep `ReplayGap.first_available_version` as an integer and use
+  `local_version + 1` as the explicit empty-window marker. Rationale: the
+  SFS-711 recovery consumer is not part of SFS-709, so changing the error field
+  type would expand the current contract prematurely; the marker is documented
+  and cannot be confused with a non-contiguous populated page. Date/Author:
+  2026-09-14, Codex.
 - Decision: Serialize pruning with Snapshot v2 capture using the existing
   per-volume janitor advisory lock, then lock `metadata_state FOR UPDATE` in
   the same transaction before computing the floor and deleting rows. Rationale:
@@ -282,6 +293,17 @@ Validation evidence from 2026-09-14:
 - `cargo clippy -p studiofs-meta --all-targets --target-dir
   target\\sfs709-clippy -- -D warnings`, `cargo fmt --all -- --check`, and
   `git diff --check` passed.
+
+Latest third-review validation on 2026-09-14:
+
+- `cargo test -p studiofs-meta foreign_event_page --lib` passed with 5
+  executed and 5 ignored unit tests; the two focused ignored PostgreSQL
+  replay-gap tests passed.
+- `cargo test -p studiofs-meta event_log_prune --lib` passed with 4 executed
+  and 3 ignored unit tests; the three focused ignored PostgreSQL pruning tests
+  passed.
+- `cargo check -p studiofs-meta`, clippy with `-D warnings`, formatting, and
+  `git diff --check` passed after the review fixes.
 
 ## Idempotence and Recovery
 

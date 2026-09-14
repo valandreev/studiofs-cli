@@ -20,6 +20,10 @@ fn nonnegative(value: i64, name: &str) -> MetaResult<i64> {
     Ok(value)
 }
 
+pub(super) fn should_skip_event_log_prune(progress: Option<(i64, i64)>) -> bool {
+    progress.is_none_or(|(checkpoint_version, current_floor)| current_floor >= checkpoint_version)
+}
+
 pub(super) fn calculate_safe_prune_floor(
     checkpoint_version: i64,
     source_floor: Option<i64>,
@@ -64,7 +68,7 @@ impl PgMetaEngine {
                 "prune postgres event log",
                 move |client| {
                     Box::pin(async move {
-                        let skip_prune = if let Some(state) = client
+                        let progress = if let Some(state) = client
                             .query_opt(sql::SELECT_EVENT_LOG_PRUNE_PROGRESS, &[&volume_id])
                             .await
                             .map_err(|error| {
@@ -86,11 +90,11 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            current_floor >= checkpoint_version
+                            Some((checkpoint_version, current_floor))
                         } else {
-                            false
+                            None
                         };
-                        if skip_prune {
+                        if should_skip_event_log_prune(progress) {
                             return Ok(None);
                         }
 

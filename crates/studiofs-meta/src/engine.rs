@@ -259,12 +259,14 @@ pub enum MetaError {
     /// The next required PostgreSQL event batch is no longer present in the
     /// finite remote history.
     #[error(
-        "postgres metadata replay gap after local version {local_version}: first available batch is {first_available_version} while target is {target_version}"
+        "postgres metadata replay gap after local version {local_version}: replay boundary is {first_available_version} while target is {target_version}"
     )]
     ReplayGap {
         /// Last local replay cursor observed before the missing range.
         local_version: i64,
-        /// First event batch returned after the local cursor.
+        /// First event batch returned after the local cursor. For an empty
+        /// replay window, this is `local_version + 1` as an explicit marker
+        /// that no batch is available through `target_version`.
         first_available_version: i64,
         /// Frozen remote target being caught up to.
         target_version: i64,

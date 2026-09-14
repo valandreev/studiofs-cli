@@ -742,19 +742,17 @@ impl PgMetaEngine {
     }
 
     fn validate_foreign_event_page_continuity(
-        last_batch_version: i64,
-        first_batch_version: Option<i64>,
+        cursor_batch_version: i64,
+        first_batch_version: i64,
         target_batch_version: i64,
     ) -> MetaResult<()> {
-        let Some(first_batch_version) = first_batch_version else {
-            return Ok(());
-        };
-        let expected_first_batch_version = last_batch_version.checked_add(1).ok_or_else(|| {
-            MetaError::Storage("postgres metadata replay cursor exceeds BIGINT".to_string())
-        })?;
+        let expected_first_batch_version =
+            cursor_batch_version.checked_add(1).ok_or_else(|| {
+                MetaError::Storage("postgres metadata replay cursor exceeds BIGINT".to_string())
+            })?;
         if first_batch_version != expected_first_batch_version {
             return Err(MetaError::ReplayGap {
-                local_version: last_batch_version,
+                local_version: cursor_batch_version,
                 first_available_version: first_batch_version,
                 target_version: target_batch_version,
             });
@@ -762,17 +760,14 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn validate_empty_foreign_event_page(
+    fn empty_foreign_event_page_gap(
         cursor_batch_version: i64,
         target_batch_version: i64,
-    ) -> MetaResult<()> {
-        if cursor_batch_version >= target_batch_version {
-            return Ok(());
-        }
+    ) -> MetaResult<MetaError> {
         let first_available_version = cursor_batch_version.checked_add(1).ok_or_else(|| {
             MetaError::Storage("postgres metadata replay cursor exceeds BIGINT".to_string())
         })?;
-        Err(MetaError::ReplayGap {
+        Ok(MetaError::ReplayGap {
             local_version: cursor_batch_version,
             first_available_version,
             target_version: target_batch_version,
@@ -810,15 +805,22 @@ impl PgMetaEngine {
             .map_err(|e| Self::classify_pg_error("postgres event_log page select failed", e))?;
 
         let Some(first_row) = rows.first() else {
-            Self::validate_empty_foreign_event_page(cursor_batch_version, target_batch_version)?;
-            return Ok(ForeignEventPage::empty(rows));
+            return Err(Self::empty_foreign_event_page_gap(
+                cursor_batch_version,
+                target_batch_version,
+            )?);
         };
 
         let decode_err =
             |error| Self::classify_pg_error("postgres event page metadata decode failed", error);
         let first_batch_version = first_row
             .try_get::<_, Option<i64>>("first_batch_version")
-            .map_err(decode_err)?;
+            .map_err(decode_err)?
+            .ok_or_else(|| {
+                MetaError::Storage(
+                    "postgres foreign event page missing first batch version".to_string(),
+                )
+            })?;
         let last_batch_version = first_row
             .try_get::<_, Option<i64>>("last_batch_version")
             .map_err(decode_err)?;
@@ -844,7 +846,7 @@ impl PgMetaEngine {
         )?;
 
         Ok(ForeignEventPage {
-            first_batch_version,
+            first_batch_version: Some(first_batch_version),
             last_batch_version,
             batch_count,
             event_count,
@@ -883,22 +885,23 @@ mod tests {
     #[test]
     fn foreign_event_page_rejects_a_missing_next_batch() {
         assert!(matches!(
-            PgMetaEngine::validate_foreign_event_page_continuity(5, Some(51), 60),
+            PgMetaEngine::validate_foreign_event_page_continuity(5, 51, 60),
             Err(MetaError::ReplayGap {
                 local_version: 5,
                 first_available_version: 51,
                 target_version: 60,
             })
         ));
-        assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, Some(6), 60).is_ok());
-        assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, None, 60).is_ok());
+        assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, 6, 60).is_ok());
+        assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, 0, 60).is_err());
+        assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, -1, 60).is_err());
     }
 
     #[test]
     fn empty_foreign_event_page_rejects_a_lagging_cursor() {
         assert!(matches!(
-            PgMetaEngine::validate_empty_foreign_event_page(5, 60),
-            Err(MetaError::ReplayGap {
+            PgMetaEngine::empty_foreign_event_page_gap(5, 60),
+            Ok(MetaError::ReplayGap {
                 local_version: 5,
                 first_available_version: 6,
                 target_version: 60,
@@ -907,15 +910,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_foreign_event_page_accepts_a_cursor_at_target() {
-        assert!(PgMetaEngine::validate_empty_foreign_event_page(60, 60).is_ok());
-    }
-
-    #[test]
     fn empty_foreign_event_page_handles_the_maximum_version_boundary() {
         assert!(matches!(
-            PgMetaEngine::validate_empty_foreign_event_page(i64::MAX - 1, i64::MAX),
-            Err(MetaError::ReplayGap {
+            PgMetaEngine::empty_foreign_event_page_gap(i64::MAX - 1, i64::MAX),
+            Ok(MetaError::ReplayGap {
                 local_version: version,
                 first_available_version: first,
                 target_version: target,

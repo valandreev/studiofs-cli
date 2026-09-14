@@ -3,11 +3,20 @@ use super::{
     PgTestVolume, pg_dsn, run_async, seed_local, set_test_env,
 };
 use crate::pg_engine::PgMetaEngine;
-use crate::pg_engine::event_log_pruning::calculate_safe_prune_floor;
+use crate::pg_engine::event_log_pruning::{
+    calculate_safe_prune_floor, should_skip_event_log_prune,
+};
 use crate::pg_engine::janitor::pg_janitor_lock_key;
 use crate::pg_engine::sql;
 use crate::snapshot::ServingCheckpoint;
 use sha2::{Digest, Sha256};
+
+#[test]
+fn event_log_prune_skips_without_a_published_checkpoint() {
+    assert!(should_skip_event_log_prune(None));
+    assert!(should_skip_event_log_prune(Some((4, 4))));
+    assert!(!should_skip_event_log_prune(Some((4, 3))));
+}
 
 #[test]
 fn event_log_prune_floor_uses_the_oldest_retained_source() {
@@ -19,8 +28,18 @@ fn event_log_prune_floor_uses_the_oldest_retained_source() {
         calculate_safe_prune_floor(10, None, 4).expect("valid prune floor"),
         10
     );
+    assert_eq!(
+        calculate_safe_prune_floor(10, Some(20), 0).expect("checkpoint bounds floor"),
+        10
+    );
+    assert_eq!(
+        calculate_safe_prune_floor(10, None, 10).expect("equal floor is stable"),
+        10
+    );
     assert!(calculate_safe_prune_floor(10, Some(4), 5).is_err());
     assert!(calculate_safe_prune_floor(-1, None, 0).is_err());
+    assert!(calculate_safe_prune_floor(10, Some(-1), 0).is_err());
+    assert!(calculate_safe_prune_floor(10, None, -1).is_err());
 }
 
 #[test]

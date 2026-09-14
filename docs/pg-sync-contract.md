@@ -258,7 +258,9 @@ The bounded event-page query also rejects any non-empty page whose first batch
 is not exactly the next version after the local cursor, returning a typed
 `MetaError::ReplayGap` instead of silently skipping the missing range. The
 same result is returned for any empty page while the cursor is below the
-requested target. Checkpoint import/rebootstrap recovery that consumes this
+requested target. For an empty page, `first_available_version` is set to the
+cursor plus one as an empty-window marker; it does not claim that this batch
+exists remotely. Checkpoint import/rebootstrap recovery that consumes this
 signal remains owned by SFS-711; automatic client rebase is owned by SFS-712.
 
 ## Finite Remote History and Recovery
