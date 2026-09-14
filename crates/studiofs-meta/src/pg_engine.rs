@@ -256,7 +256,7 @@ pub struct PgMetaEngine {
     /// Whether snapshot reachability bootstrap completed for this engine.
     snapshot_reachability_bootstrapped: AtomicBool,
     snapshot_reachability_bootstrap_lock: Mutex<()>,
-    /// Whether the most recent metadata synchronization command succeeded.
+    /// Whether the metadata source was reachable for the most recent command.
     metadata_source_connected: AtomicBool,
     /// Whether PostgreSQL's sync format was validated successfully for this
     /// runtime. A local-first startup may leave this pending while PostgreSQL
@@ -1053,8 +1053,12 @@ impl PgMetaEngine {
     }
 
     fn record_metadata_source_result<T>(&self, result: &MetaResult<T>) {
+        let connected = match result {
+            Ok(_) => true,
+            Err(error) => !error.is_reachability_error(),
+        };
         self.metadata_source_connected
-            .store(result.is_ok(), Ordering::Release);
+            .store(connected, Ordering::Release);
     }
 
     fn record_remote_operation_result<T>(&self, result: MetaResult<T>) -> MetaResult<T> {

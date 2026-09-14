@@ -1540,6 +1540,18 @@ fn successful_remote_operation_clears_transport_unavailable() {
     );
 
     engine
+        .record_remote_operation_result::<()>(Err(MetaError::UuidMismatch {
+            local: "local-volume".to_string(),
+            remote: "remote-volume".to_string(),
+        }))
+        .expect_err("remote identity mismatch");
+    assert!(
+        engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    engine
         .record_remote_operation_result::<()>(Err(MetaError::RemoteUnavailable(
             "test-postgres-dsn".to_string(),
         )))
@@ -1591,6 +1603,11 @@ fn metadata_sync_replay_gap_records_degraded_lifecycle() {
 
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
     assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert!(
+        engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 }
 
 #[test]

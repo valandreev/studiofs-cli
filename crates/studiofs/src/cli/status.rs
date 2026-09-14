@@ -636,54 +636,57 @@ pub fn run(
         return Ok(());
     }
 
-    let mounted_pg_sync = mounted_pg_sync_diagnostics(name);
     let engine = match studiofs_meta::open_meta_engine(&db_path) {
         Ok(engine) => engine,
-        Err(error) if let Some(pg_sync) = mounted_pg_sync.as_ref() => {
-            eprintln!(
-                "warning: failed to open volume metadata at '{}': {error}",
-                db_path.display()
-            );
-            println!("StudioFS Volume Status");
-            println!("──────────────────────");
-            println!("  Name:       {}", name);
-            println!("  Metadata:   {:?}", db_path);
-            println!("  Warning:    metadata DB is locked; showing mounted process diagnostics");
-            print_pg_sync_diagnostics(pg_sync);
+        Err(error) => {
+            if let Some(pg_sync) = mounted_pg_sync_diagnostics(name) {
+                eprintln!(
+                    "warning: failed to open volume metadata at '{}': {error}",
+                    db_path.display()
+                );
+                println!("StudioFS Volume Status");
+                println!("──────────────────────");
+                println!("  Name:       {}", name);
+                println!("  Metadata:   {:?}", db_path);
+                println!(
+                    "  Warning:    metadata DB is locked; showing mounted process diagnostics"
+                );
+                print_pg_sync_diagnostics(&pg_sync);
+                if verbosity.is_verbose() {
+                    let cache_root = cache_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| meta_dir.join("cache"));
+                    print_mounted_write_path_fallback(
+                        read_write_path_observability_from_cache_root(&cache_root),
+                    );
+                }
+                return Ok(());
+            }
             if verbosity.is_verbose() {
+                eprintln!(
+                    "warning: failed to open volume metadata at '{}': {error}",
+                    db_path.display()
+                );
+                println!("StudioFS Volume Status");
+                println!("──────────────────────");
+                println!("  Name:       {}", name);
+                println!("  Metadata:   {:?}", db_path);
+                println!(
+                    "  Warning:    metadata DB is locked; showing mounted write-path metrics only"
+                );
                 let cache_root = cache_dir
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| meta_dir.join("cache"));
+                println!("\nLocal Cache");
+                println!("───────────");
+                println!("  Root:                {}", cache_root.display());
                 print_mounted_write_path_fallback(read_write_path_observability_from_cache_root(
                     &cache_root,
                 ));
+                return Ok(());
             }
-            return Ok(());
+            return Err(error.into());
         }
-        Err(error) if verbosity.is_verbose() => {
-            eprintln!(
-                "warning: failed to open volume metadata at '{}': {error}",
-                db_path.display()
-            );
-            println!("StudioFS Volume Status");
-            println!("──────────────────────");
-            println!("  Name:       {}", name);
-            println!("  Metadata:   {:?}", db_path);
-            println!(
-                "  Warning:    metadata DB is locked; showing mounted write-path metrics only"
-            );
-            let cache_root = cache_dir
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| meta_dir.join("cache"));
-            println!("\nLocal Cache");
-            println!("───────────");
-            println!("  Root:                {}", cache_root.display());
-            print_mounted_write_path_fallback(read_write_path_observability_from_cache_root(
-                &cache_root,
-            ));
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
     };
     let format_info = engine.get_format_info()?;
 

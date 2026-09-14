@@ -885,7 +885,7 @@ pub struct PgSyncDiagnostics {
     pub checkpoint: MetadataCheckpointFreshnessDiagnostics,
     /// Whether a replay gap requires the existing rebootstrap recovery path.
     pub rebootstrap_required: bool,
-    /// Whether the most recent metadata command path succeeded.
+    /// Whether the metadata source was reachable for the most recent command.
     pub source_connected: bool,
     /// Number of metadata synchronization attempts that returned an error.
     pub sync_errors: u64,
