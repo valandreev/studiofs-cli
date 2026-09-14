@@ -98,11 +98,14 @@ impl PgMetaEngine {
                     );
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 self.invalidate_remote_validation();
                 self.metadata_source_connected
                     .store(false, Ordering::Release);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
+                if matches!(error, MetaError::ReplayGap { .. }) {
+                    self.mark_replay_gap_recovery_required();
+                }
             }
         }
     }

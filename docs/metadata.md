@@ -123,8 +123,9 @@ The bounded, frozen pull behavior above is implemented by
 override may tune either limit without changing the volume schema.
 Before returning a non-empty page, the query requires its first batch to be
 exactly the next version after the local cursor. A missing range returns a
-typed `MetaError::ReplayGap` and is not passed to foreign apply; the later
-checkpoint import/rebootstrap recovery remains the SFS-711 follow-up.
+typed `MetaError::ReplayGap` and is not passed to foreign apply. The runtime
+records the client as `Degraded` and read-only until the later checkpoint
+import/rebootstrap recovery owned by SFS-711 is available.
 
 ### Backend Selection on Open
 

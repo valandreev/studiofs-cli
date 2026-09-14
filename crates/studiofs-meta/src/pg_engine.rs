@@ -543,6 +543,12 @@ impl PgMetaEngine {
         }
     }
 
+    fn mark_replay_gap_recovery_required(&self) {
+        self.metadata_startup_target_version
+            .store(-1, Ordering::Release);
+        self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    }
+
     pub(super) fn transition_pg_sync_lifecycle(&self, next: PgSyncLifecycle) {
         self.update_pg_sync_lifecycle(|_| next);
     }
@@ -972,6 +978,9 @@ impl PgMetaEngine {
                 self.invalidate_remote_validation();
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
+                if matches!(error, MetaError::ReplayGap { .. }) {
+                    self.mark_replay_gap_recovery_required();
+                }
             }
         }
         result

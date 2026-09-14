@@ -56,6 +56,10 @@ range intact.
       without expanding the ReplayGap field contract, removed unreachable
       empty-page handling, rejected missing page metadata, renamed the cursor
       parameter, and covered prune-floor edge cases.
+- [x] (2026-09-14) Re-verified the fifth review: a replay gap now clears any
+      stale startup target, transitions the client to `Degraded` read-only
+      lifecycle, and is covered at both remote-operation and metadata-sync
+      result seams; checkpoint rebootstrap remains SFS-711.
 
 ## Surprises & Discoveries
 
@@ -78,7 +82,9 @@ range intact.
   automatic rebootstrap is SFS-712. SFS-709 now rejects a non-contiguous page
   with `MetaError::ReplayGap` so it cannot silently skip pruned history; an
   empty page also reports that result whenever the cursor is below its frozen
-  target. It does not add the recovery flow.
+  target. On either replay result seam, the runtime clears the frozen target
+  and moves the client to `Degraded` read-only so it cannot publish on a stale
+  base. It does not add the checkpoint recovery flow.
   Evidence: the current Linear relation graph for SFS-709, SFS-711, and
   SFS-712.
 
@@ -139,8 +145,10 @@ The repository now has a durable per-volume pruning floor, bounded
 complete-batch event deletion, retryable background execution, a defensive
 non-contiguous-page guard for both populated and empty windows, and focused
 evidence that retained Snapshot v2 replay rows survive and later release
-pruning. The later SFS-711 checkpoint recovery can consume
-`MetaError::ReplayGap`; automatic rebootstrap remains outside this task.
+pruning. A `MetaError::ReplayGap` also fences the local client in `Degraded`
+read-only lifecycle and clears the stale startup target. The later SFS-711
+checkpoint recovery can consume the error; automatic rebootstrap remains
+outside this task.
 
 ## Context and Orientation
 
@@ -316,6 +324,15 @@ Latest fourth-review validation on 2026-09-14:
   snapshot test covers a retained `ready` source as well as `creating`.
 - Added the zero source-floor and invalid batch-limit environment cases
   (`abc`, `-5`, and `0`) to the portable pruning tests.
+
+Latest fifth-review validation on 2026-09-14:
+
+- `cargo test -p studiofs-meta replay_gap --lib -- --nocapture` passed with 2
+  executed and 1 ignored test; both lifecycle regressions passed.
+- The remote-operation seam regression verifies that a `Live` client becomes
+  `Degraded`, blocks new mutations, and discards a stale startup target. The
+  metadata-sync seam regression verifies the same lifecycle fence for the
+  review-named recorder.
 
 ## Idempotence and Recovery
 
