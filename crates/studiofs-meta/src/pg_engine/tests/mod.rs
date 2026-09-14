@@ -449,6 +449,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
                 &checkpoint_freshness::CheckpointFreshnessPolicy::default(),
             ),
         ),
+        pg_sync_progress_state: Mutex::new(PgSyncProgressState::default()),
         checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
         checkpoint_single_flight: Mutex::new(()),
         command_pool: Arc::new(

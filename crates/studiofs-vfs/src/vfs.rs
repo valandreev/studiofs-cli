@@ -182,7 +182,9 @@ use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
 #[cfg(test)]
 use studiofs_meta::engine::PgSyncLifecycle;
-use studiofs_meta::engine::{MetadataAuthorityStatus, PgSyncStatus};
+use studiofs_meta::engine::{
+    MetadataAuthorityStatus, PgSyncDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason,
+};
 use studiofs_meta::schema::{
     ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass,
     ROOT_INO, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
@@ -3998,6 +4000,7 @@ impl StudioVfs {
             pending_metadata_ops: metadata_backlog.pending_ops,
             inflight_metadata_ops: metadata_backlog.inflight_ops,
             coherence: self.coherence_health_snapshot(),
+            pg_sync: self.sync_diagnostics(),
         }
     }
 
@@ -6748,6 +6751,11 @@ impl StudioVfs {
         self.metadata_sync_status()
     }
 
+    /// Return the effective PostgreSQL synchronization diagnostics for this mount.
+    pub fn sync_diagnostics(&self) -> PgSyncDiagnostics {
+        self.metadata_sync_diagnostics()
+    }
+
     /// Get volume name.
     pub fn volume_name(&self) -> VfsResult<String> {
         self.meta
@@ -7480,6 +7488,38 @@ impl StudioVfs {
             status.lifecycle = lifecycle_override;
         }
         status
+    }
+
+    fn metadata_sync_diagnostics(&self) -> PgSyncDiagnostics {
+        let mut diagnostics = self.meta.sync_view().pg_sync_diagnostics();
+        #[cfg(test)]
+        if !self.read_only_mount
+            && let Some(authority_override) = *self.metadata_authority_override.lock()
+        {
+            diagnostics.authority = authority_override;
+            let gate = PgSyncDiagnostics::from_status(PgSyncStatus::new(
+                diagnostics.lifecycle,
+                diagnostics.authority,
+            ));
+            diagnostics.write_authority = gate.write_authority;
+            diagnostics.write_authority_reason = gate.write_authority_reason;
+        }
+        #[cfg(test)]
+        if let Some(lifecycle_override) = *self.metadata_sync_lifecycle_override.lock() {
+            diagnostics.lifecycle = lifecycle_override;
+            let gate = PgSyncDiagnostics::from_status(PgSyncStatus::new(
+                diagnostics.lifecycle,
+                diagnostics.authority,
+            ));
+            diagnostics.write_authority = gate.write_authority;
+            diagnostics.write_authority_reason = gate.write_authority_reason;
+        }
+        if self.read_only_mount {
+            diagnostics.authority = MetadataAuthorityStatus::read_only();
+            diagnostics.write_authority = false;
+            diagnostics.write_authority_reason = Some(PgSyncWriteAuthorityReason::ReadOnlyMount);
+        }
+        diagnostics
     }
 
     pub(super) fn enforce_metadata_serving_lifecycle(&self) -> VfsResult<()> {

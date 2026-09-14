@@ -1,5 +1,8 @@
 use super::*;
-use crate::engine::{CheckpointDescriptorFailure, MetaAcl, MetadataCheckpointRefreshReason};
+use crate::engine::{
+    CheckpointDescriptorFailure, MetaAcl, MetaError, MetadataCheckpointRefreshReason,
+    PgSyncFailure, PgSyncPageDiagnostics,
+};
 use crate::redb_engine::RedbSnapshot;
 use sha2::{Digest, Sha256};
 
@@ -65,6 +68,93 @@ fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
         PgMetaEngine::pg_sync_lifecycle_from_raw(u8::MAX),
         PgSyncLifecycle::Fatal
     );
+}
+
+#[test]
+fn pg_sync_diagnostics_reports_frozen_target_and_remaining_distance() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local_version
+        .store(4, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_remote_head_version
+        .store(12, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(10, std::sync::atomic::Ordering::Release);
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let diagnostics = engine.pg_sync_diagnostics();
+
+    assert_eq!(diagnostics.lifecycle, PgSyncLifecycle::CatchingUp);
+    assert_eq!(diagnostics.local_applied_version, Some(4));
+    assert_eq!(diagnostics.startup_target_version, Some(10));
+    assert_eq!(diagnostics.remote_head_version, Some(12));
+    assert_eq!(diagnostics.remaining_version_distance, Some(6));
+}
+
+#[test]
+fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let failure = MetaError::RemoteUnavailable("test-postgres-dsn".into());
+    engine.record_pg_sync_failure(&failure);
+
+    let failed = engine.pg_sync_diagnostics();
+    assert_eq!(
+        failed.last_sync_error,
+        Some(PgSyncFailure::RemoteUnavailable)
+    );
+    assert!(
+        !serde_json::to_string(&failed)
+            .unwrap()
+            .contains("test-postgres-dsn")
+    );
+
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: 4,
+        first_available_version: 8,
+        target_version: 12,
+    });
+    let gap = engine.pg_sync_diagnostics();
+    assert!(gap.rebootstrap_required);
+    assert!(matches!(
+        gap.last_sync_error,
+        Some(PgSyncFailure::ReplayGap { .. })
+    ));
+
+    let first_page = PgSyncPageDiagnostics {
+        first_batch_version: Some(1),
+        last_batch_version: Some(4),
+        batch_count: 2,
+        event_count: 3,
+        response_bytes: 64,
+        has_more: true,
+        oversized: false,
+    };
+    let next_page = PgSyncPageDiagnostics {
+        first_batch_version: Some(5),
+        last_batch_version: Some(8),
+        has_more: false,
+        ..first_page.clone()
+    };
+
+    assert!(engine.record_pg_sync_page_selected(first_page.clone()));
+    assert!(!engine.record_pg_sync_page_selected(first_page.clone()));
+    assert!(!engine.record_pg_sync_page_selected(next_page.clone()));
+    assert_eq!(
+        engine.pg_sync_diagnostics().current_page,
+        Some(next_page.clone())
+    );
+
+    engine.record_pg_sync_page_applied(next_page.clone());
+    assert_eq!(engine.pg_sync_diagnostics().current_page, None);
+    assert_eq!(engine.pg_sync_diagnostics().last_page, Some(next_page));
+
+    engine.record_pg_sync_success();
+    assert_eq!(engine.pg_sync_diagnostics().last_sync_error, None);
 }
 
 #[test]

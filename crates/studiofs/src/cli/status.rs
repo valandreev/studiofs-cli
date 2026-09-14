@@ -10,6 +10,7 @@ use studiofs_cache::runtime::{
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
+use studiofs_meta::{PgSyncDiagnostics, PgSyncPageDiagnostics};
 use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
 #[cfg(test)]
 use uuid::Uuid;
@@ -97,6 +98,97 @@ fn detect_backends(cache_path: &Path) -> Option<LocalPayloadRuntimeDetection> {
 
 fn format_ms(value: f64) -> String {
     format!("{value:.3}ms")
+}
+
+fn format_version(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
+    let Some(page) = page else {
+        return "none".to_string();
+    };
+    let first = format_version(page.first_batch_version);
+    let last = format_version(page.last_batch_version);
+    format!(
+        "{first}..{last} ({} batches, {} events, {} bytes, more={})",
+        page.batch_count, page.event_count, page.response_bytes, page.has_more
+    )
+}
+
+fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
+    println!("\nPostgreSQL Sync");
+    println!("────────────────");
+    println!("  Lifecycle:              {:?}", diagnostics.lifecycle);
+    println!(
+        "  Local applied/target:   {}/{}",
+        format_version(diagnostics.local_applied_version),
+        format_version(diagnostics.startup_target_version)
+    );
+    println!(
+        "  Remote head/remaining:  {}/{}",
+        format_version(diagnostics.remote_head_version),
+        format_version(diagnostics.remaining_version_distance)
+    );
+    println!(
+        "  Checkpoint version:     {}",
+        format_version(diagnostics.checkpoint.checkpoint_version)
+    );
+    println!(
+        "  Checkpoint refresh:     {} ({:?})",
+        if diagnostics.checkpoint.refresh_needed {
+            "needed"
+        } else {
+            "not needed"
+        },
+        diagnostics.checkpoint.refresh_reason
+    );
+    println!(
+        "  Current page:           {}",
+        format_page(diagnostics.current_page.as_ref())
+    );
+    println!(
+        "  Last page:              {}",
+        format_page(diagnostics.last_page.as_ref())
+    );
+    println!(
+        "  Write authority:        {}",
+        if diagnostics.write_authority {
+            "read-write"
+        } else {
+            "read-only"
+        }
+    );
+    if let Some(reason) = diagnostics.write_authority_reason {
+        println!("  Authority reason:       {reason:?}");
+    }
+    println!(
+        "  Source connected:        {}",
+        if diagnostics.source_connected {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("  Sync errors:             {}", diagnostics.sync_errors);
+    println!(
+        "  Last sync error:         {}",
+        diagnostics
+            .last_sync_error
+            .as_ref()
+            .map(|error| format!("{error:?}"))
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!(
+        "  Rebootstrap required:    {}",
+        if diagnostics.rebootstrap_required {
+            "yes"
+        } else {
+            "no"
+        }
+    );
 }
 
 fn format_finite_ms(value: f64) -> String {
@@ -551,6 +643,7 @@ pub fn run(
         println!("  Postgres URL:  {}", pg.url);
         println!("  Postgres vol:  {}", pg.volume_id);
         println!("  Postgres size: {}", format_bytes(remote_size));
+        print_pg_sync_diagnostics(&engine.pg_sync_diagnostics());
     } else {
         println!("\n  Meta backend: {:?}", format_info.metadata.backend);
     }
@@ -1184,6 +1277,24 @@ mod tests {
         assert_eq!(
             metrics_volume_path(&metrics_path),
             Some(Path::new("/cache-root/volume-uuid"))
+        );
+    }
+
+    #[test]
+    fn pg_sync_page_format_includes_boundaries_and_progress_counts() {
+        let page = PgSyncPageDiagnostics {
+            first_batch_version: Some(4),
+            last_batch_version: Some(9),
+            batch_count: 3,
+            event_count: 7,
+            response_bytes: 128,
+            has_more: true,
+            oversized: false,
+        };
+
+        assert_eq!(
+            format_page(Some(&page)),
+            "4..9 (3 batches, 7 events, 128 bytes, more=true)"
         );
     }
 

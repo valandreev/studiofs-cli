@@ -48,8 +48,8 @@ pub use engine::{
     MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult, MetaSymlink,
     MetaXattr, MetadataBatchWriteObservability, MetadataCheckpointFreshnessDiagnostics,
     MetadataCheckpointRefreshReason, MetadataCoherenceProgress, MetadataWriteObservability,
-    MetadataWriteStageTiming, NamespaceMutation, PgSyncLifecycle, PgSyncStatus,
-    RegularFileOverlayMutation,
+    MetadataWriteStageTiming, NamespaceMutation, PgSyncDiagnostics, PgSyncFailure, PgSyncLifecycle,
+    PgSyncPageDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason, RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
 pub use pg_dsn::{

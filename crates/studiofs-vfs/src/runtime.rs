@@ -5,7 +5,8 @@ use std::time::Duration;
 use studiofs_meta::engine::{
     DeferredDeleteRecord, MetadataAuthorityStatus, MetadataCheckpointFreshnessDiagnostics,
     MetadataCoherenceProgress, MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
-    MetadataWriteObservability, PendingCreateRecord, PgSyncStatus, UndoLogKind, UndoLogRecord,
+    MetadataWriteObservability, PendingCreateRecord, PgSyncDiagnostics, PgSyncStatus, UndoLogKind,
+    UndoLogRecord,
 };
 use studiofs_meta::snapshot_ports::{
     SnapshotCleanupStore, SnapshotJobStore, SnapshotPolicyStore, SnapshotSourceReader,
@@ -603,6 +604,7 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn replication_backlog(&self) -> MetadataReplicationBacklog);
     forward_method!(fn metadata_authority_status(&self) -> MetadataAuthorityStatus);
     forward_method!(fn pg_sync_status(&self) -> PgSyncStatus);
+    forward_method!(fn pg_sync_diagnostics(&self) -> PgSyncDiagnostics);
     forward_method!(fn remote_metadata_size(&self) -> MetaResult<Option<u64>>);
     forward_method!(fn prepare_for_close(&self) -> MetaResult<()>);
 }

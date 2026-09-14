@@ -452,7 +452,8 @@ pub struct MetadataInvalidationDiagnostics {
 }
 
 /// Signal explaining why a PostgreSQL bootstrap checkpoint should be refreshed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MetadataCheckpointRefreshReason {
     /// The metadata head is beyond the configured version-lag limit.
     VersionLag,
@@ -463,7 +464,7 @@ pub enum MetadataCheckpointRefreshReason {
 }
 
 /// Best-effort measurements and request state for bootstrap checkpoint freshness.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataCheckpointFreshnessDiagnostics {
     /// Last observed metadata head version.
     pub head_version: Option<u64>,
@@ -513,7 +514,7 @@ pub enum LocalStorageCompactionResult {
     NoWork,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Whether this engine instance is still allowed to accept new mutations.
 pub struct MetadataAuthorityStatus {
     /// `true` when inode id allocation still has local headroom.
@@ -557,7 +558,8 @@ impl Default for MetadataAuthorityStatus {
 /// A local view can be readable while it is catching up, and an established
 /// client can retain write authority while PostgreSQL is temporarily
 /// unavailable.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum PgSyncLifecycle {
     /// The local serving view is open and safe for reads, but startup gates
@@ -633,7 +635,7 @@ impl PgSyncLifecycle {
 /// `lifecycle` describes local serving/catch-up health. `authority` describes
 /// the paired allocator headroom. New mutations require both dimensions to
 /// allow them; reads require only a non-fatal lifecycle.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgSyncStatus {
     /// Current local serving and synchronization lifecycle.
     pub lifecycle: PgSyncLifecycle,
@@ -655,6 +657,216 @@ impl PgSyncStatus {
     pub const fn allows_new_mutations(self) -> bool {
         self.lifecycle.allows_new_mutations() && self.authority.allows_new_mutations()
     }
+}
+
+/// Safe failure categories retained for PostgreSQL synchronization diagnostics.
+///
+/// Remote error text is intentionally discarded because it can contain a DSN,
+/// credential, or backend-specific detail that is not suitable for status output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PgSyncFailure {
+    /// The remote metadata service could not be reached.
+    RemoteUnavailable,
+    /// A bounded synchronization operation exceeded its deadline.
+    Timeout,
+    /// The local cursor fell behind the retained remote event history.
+    ReplayGap {
+        /// Last local replay cursor before the missing range.
+        local_version: u64,
+        /// First available remote batch after the local cursor.
+        first_available_version: u64,
+        /// Frozen target for the catch-up session.
+        target_version: u64,
+    },
+    /// A catch-up page did not advance the local cursor.
+    CatchUpStalled {
+        /// Last local replay cursor observed by the stalled session.
+        local_version: u64,
+        /// Frozen target for the stalled session.
+        target_version: u64,
+    },
+    /// A bounded catch-up session yielded after consuming its page budget.
+    CatchUpBudgetExceeded {
+        /// Last local replay cursor observed by the session.
+        local_version: u64,
+        /// Frozen target for the session.
+        target_version: u64,
+        /// Number of complete pages applied by the session.
+        pages: u64,
+    },
+    /// The remote serving checkpoint could not be used.
+    InvalidCheckpoint,
+    /// The local binary and persisted PostgreSQL metadata use different formats.
+    UnsupportedFormat {
+        /// Format version found in persisted metadata.
+        found: u16,
+        /// Format version expected by this binary.
+        expected: u16,
+    },
+    /// The local and remote volume identities differ.
+    UuidMismatch,
+    /// The local serving lifecycle entered its fatal state.
+    LifecycleFatal,
+    /// A local or backend storage operation failed.
+    Storage,
+    /// A synchronization failure did not match a more specific safe category.
+    Other,
+}
+
+impl PgSyncFailure {
+    /// Classify a metadata error without retaining potentially sensitive detail.
+    pub(crate) fn from_error(error: &MetaError) -> Self {
+        match error {
+            MetaError::RemoteUnavailable(_) => Self::RemoteUnavailable,
+            MetaError::Timeout(_) => Self::Timeout,
+            MetaError::ReplayGap {
+                local_version,
+                first_available_version,
+                target_version,
+            } => Self::ReplayGap {
+                local_version: (*local_version).try_into().unwrap_or_default(),
+                first_available_version: (*first_available_version).try_into().unwrap_or_default(),
+                target_version: (*target_version).try_into().unwrap_or_default(),
+            },
+            MetaError::CatchUpStalled {
+                local_version,
+                target_version,
+            } => Self::CatchUpStalled {
+                local_version: (*local_version).try_into().unwrap_or_default(),
+                target_version: (*target_version).try_into().unwrap_or_default(),
+            },
+            MetaError::CatchUpBudgetExceeded {
+                local_version,
+                target_version,
+                pages,
+            } => Self::CatchUpBudgetExceeded {
+                local_version: (*local_version).try_into().unwrap_or_default(),
+                target_version: (*target_version).try_into().unwrap_or_default(),
+                pages: (*pages).try_into().unwrap_or_default(),
+            },
+            MetaError::InvalidCheckpointDescriptor { .. }
+            | MetaError::BootstrapCheckpointDescriptorMissing => Self::InvalidCheckpoint,
+            MetaError::UnsupportedFormatVersion { found, expected } => Self::UnsupportedFormat {
+                found: *found,
+                expected: *expected,
+            },
+            MetaError::UuidMismatch { .. } => Self::UuidMismatch,
+            MetaError::LifecycleFatal => Self::LifecycleFatal,
+            MetaError::Storage(_) => Self::Storage,
+            MetaError::NamespaceBatchOperation { source, .. } => Self::from_error(source),
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Reason why the current engine does not have write authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PgSyncWriteAuthorityReason {
+    /// The synchronization lifecycle is not `Live`.
+    LifecycleNotLive,
+    /// The inode allocator has no local headroom.
+    InodeIdHeadroomUnavailable,
+    /// The object-id allocator has no local headroom.
+    ObjectIdHeadroomUnavailable,
+    /// Both paired allocators have no local headroom.
+    BothAllocatorsHeadroomUnavailable,
+    /// The metadata engine is wrapped by an explicitly read-only mount.
+    ReadOnlyMount,
+}
+
+/// Structured, low-cost PostgreSQL synchronization diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgSyncDiagnostics {
+    /// Current PostgreSQL synchronization lifecycle.
+    pub lifecycle: PgSyncLifecycle,
+    /// Highest metadata version applied to the local serving view.
+    pub local_applied_version: Option<u64>,
+    /// Frozen target for the current startup catch-up session.
+    pub startup_target_version: Option<u64>,
+    /// Most recent bounded observation of the remote metadata head.
+    pub remote_head_version: Option<u64>,
+    /// Remaining distance from local applied version to the frozen target.
+    pub remaining_version_distance: Option<u64>,
+    /// Page currently fetched or being applied, if any.
+    pub current_page: Option<PgSyncPageDiagnostics>,
+    /// Last page applied successfully by the local replay path.
+    pub last_page: Option<PgSyncPageDiagnostics>,
+    /// Paired allocator headroom used by the mutation gate.
+    pub authority: MetadataAuthorityStatus,
+    /// Whether the current snapshot allows new mutations.
+    pub write_authority: bool,
+    /// Why write authority is unavailable, when it is unavailable.
+    pub write_authority_reason: Option<PgSyncWriteAuthorityReason>,
+    /// Last meaningful synchronization failure, with sensitive detail removed.
+    pub last_sync_error: Option<PgSyncFailure>,
+    /// Existing checkpoint freshness and refresh-request state.
+    pub checkpoint: MetadataCheckpointFreshnessDiagnostics,
+    /// Whether a replay gap requires the existing rebootstrap recovery path.
+    pub rebootstrap_required: bool,
+    /// Whether the most recent metadata command path succeeded.
+    pub source_connected: bool,
+    /// Number of metadata synchronization attempts that returned an error.
+    pub sync_errors: u64,
+    /// Unix timestamp for the last successful metadata synchronization.
+    pub last_successful_sync_unix_ms: Option<i64>,
+}
+
+impl PgSyncDiagnostics {
+    /// Build a backend-neutral diagnostic snapshot from the lifecycle gate.
+    pub fn from_status(status: PgSyncStatus) -> Self {
+        let write_authority = status.allows_new_mutations();
+        let write_authority_reason = if write_authority {
+            None
+        } else if !matches!(
+            status.lifecycle,
+            PgSyncLifecycle::TargetReached
+                | PgSyncLifecycle::AllocatorPending
+                | PgSyncLifecycle::Live
+        ) {
+            Some(PgSyncWriteAuthorityReason::LifecycleNotLive)
+        } else {
+            Some(
+                match (
+                    status.authority.inode_id_headroom,
+                    status.authority.object_id_headroom,
+                ) {
+                    (false, false) => PgSyncWriteAuthorityReason::BothAllocatorsHeadroomUnavailable,
+                    (false, true) => PgSyncWriteAuthorityReason::InodeIdHeadroomUnavailable,
+                    (true, false) => PgSyncWriteAuthorityReason::ObjectIdHeadroomUnavailable,
+                    (true, true) => PgSyncWriteAuthorityReason::LifecycleNotLive,
+                },
+            )
+        };
+
+        Self {
+            lifecycle: status.lifecycle,
+            authority: status.authority,
+            write_authority,
+            write_authority_reason,
+            ..Self::default()
+        }
+    }
+}
+
+/// Metadata returned for one bounded PostgreSQL replay page.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgSyncPageDiagnostics {
+    /// First batch version returned by the page.
+    pub first_batch_version: Option<u64>,
+    /// Last batch version returned by the page.
+    pub last_batch_version: Option<u64>,
+    /// Number of event batches in the page.
+    pub batch_count: u64,
+    /// Number of individual events in the page.
+    pub event_count: u64,
+    /// Estimated encoded response bytes for the page.
+    pub response_bytes: u64,
+    /// Whether more pages are needed to reach the target.
+    pub has_more: bool,
+    /// Whether one atomic batch exceeded the configured page byte budget.
+    pub oversized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1417,6 +1629,11 @@ pub trait MetaReplication: Send + Sync {
         PgSyncStatus::new(PgSyncLifecycle::Live, self.metadata_authority_status())
     }
 
+    /// Return a low-cost structured PostgreSQL synchronization diagnostic.
+    fn pg_sync_diagnostics(&self) -> PgSyncDiagnostics {
+        PgSyncDiagnostics::from_status(self.pg_sync_status())
+    }
+
     /// Return the estimated size of remote metadata in bytes, if applicable.
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
 
@@ -1564,6 +1781,34 @@ mod tests {
                 },
             )
             .allows_new_mutations()
+        );
+    }
+
+    #[test]
+    fn pg_sync_diagnostics_redacts_remote_error_details() {
+        let failure = PgSyncFailure::from_error(&MetaError::RemoteUnavailable(
+            "test-postgres-dsn".to_string(),
+        ));
+
+        assert_eq!(failure, PgSyncFailure::RemoteUnavailable);
+        let encoded = serde_json::to_string(&failure).expect("diagnostic failure serializes");
+        assert!(!encoded.contains("test-postgres-dsn"));
+    }
+
+    #[test]
+    fn pg_sync_diagnostics_explains_allocator_pending_authority() {
+        let diagnostics = PgSyncDiagnostics::from_status(PgSyncStatus::new(
+            PgSyncLifecycle::AllocatorPending,
+            MetadataAuthorityStatus {
+                inode_id_headroom: true,
+                object_id_headroom: false,
+            },
+        ));
+
+        assert!(!diagnostics.write_authority);
+        assert_eq!(
+            diagnostics.write_authority_reason,
+            Some(PgSyncWriteAuthorityReason::ObjectIdHeadroomUnavailable)
         );
     }
 }

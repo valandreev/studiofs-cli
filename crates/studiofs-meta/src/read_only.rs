@@ -547,6 +547,14 @@ where
         )
     }
 
+    fn pg_sync_diagnostics(&self) -> PgSyncDiagnostics {
+        let mut diagnostics = self.inner.pg_sync_diagnostics();
+        diagnostics.authority = MetadataAuthorityStatus::read_only();
+        diagnostics.write_authority = false;
+        diagnostics.write_authority_reason = Some(PgSyncWriteAuthorityReason::ReadOnlyMount);
+        diagnostics
+    }
+
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
         self.inner.remote_metadata_size()
     }
