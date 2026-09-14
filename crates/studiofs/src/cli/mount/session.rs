@@ -11,6 +11,7 @@ use crate::diagnostics::{
 };
 use anyhow::Context;
 use chrono::Utc;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,7 @@ use studiofs_cache::{
     DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalPayloadRuntime, prepare_local_payload_runtime,
 };
 use studiofs_data::{DataStoreConfig, normalize_s3_endpoint_transport};
-use studiofs_meta::engine::MetaError;
+use studiofs_meta::engine::{MetaError, PgSyncLifecycle, PgSyncStatus};
 use studiofs_meta::schema::MetadataBackend;
 use studiofs_meta::snapshot::SnapshotId;
 use studiofs_meta::{
@@ -44,6 +45,7 @@ use tracing::{debug, info, warn};
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MOUNT_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV: &str =
     "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL";
 type MountProfileFinish = Box<dyn FnMut()>;
@@ -1162,18 +1164,79 @@ impl MountPlan {
         }
 
         let mount_lock = acquire_mount_lock(&self.actual_mount_path)?;
+        fn cleanup_failed_preparation(
+            mount_lock: &utils::MountLockGuard,
+            mount_point: &str,
+            volume: &str,
+            retain_record: bool,
+        ) {
+            if retain_record {
+                if let Err(error) = mount_lock.persist_record_state(
+                    mount_point,
+                    volume,
+                    std::process::id(),
+                    None,
+                    utils::MountRecordStatus::Failed,
+                    None,
+                ) {
+                    warn!(
+                        error = ?error,
+                        mount_point = %mount_point,
+                        "failed to publish failed preparation mount record"
+                    );
+                }
+            } else if let Err(error) = utils::remove_pid_file(mount_point) {
+                warn!(
+                    error = ?error,
+                    mount_point = %mount_point,
+                    "failed to remove foreground preparation mount record"
+                );
+            }
+        }
+
+        let retain_failed_record = should_retain_failed_mount_record(
+            self.command.detach,
+            std::env::var_os(daemon_mount_point_env_key()).is_some(),
+        );
+
+        mount_lock
+            .persist_record_state(
+                &self.actual_mount_path,
+                &self.command.name,
+                std::process::id(),
+                None,
+                utils::MountRecordStatus::Starting,
+                None,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to publish starting mount state for '{}'",
+                    self.actual_mount_path
+                )
+            })?;
 
         let MountMetaSession {
             source_meta,
             meta,
             format_info,
             read_only_mount,
-        } = resolve_mount_meta_session(
+        } = match resolve_mount_meta_session(
             &self.command.name,
             &self.command.meta_dir,
             self.command.endpoint.as_deref(),
             self.command.read_only,
-        )?;
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                cleanup_failed_preparation(
+                    &mount_lock,
+                    &self.actual_mount_path,
+                    &self.command.name,
+                    retain_failed_record,
+                );
+                return Err(error);
+            }
+        };
         debug_assert_eq!(self.read_only_mount, read_only_mount);
 
         let prepared_foreground = (|| -> anyhow::Result<PreparedForegroundRuntime> {
@@ -1380,7 +1443,15 @@ impl MountPlan {
                 foreground: Some(foreground),
                 mount_lock: Some(mount_lock),
             }),
-            Err(error) => Err(error),
+            Err(error) => {
+                cleanup_failed_preparation(
+                    &mount_lock,
+                    &self.actual_mount_path,
+                    &self.command.name,
+                    retain_failed_record,
+                );
+                Err(error)
+            }
         }
     }
 }
@@ -1437,11 +1508,13 @@ impl PreparedMount {
         )?;
         if let Some(mount_lock) = self.mount_lock.as_ref() {
             mount_lock
-                .persist_record(
+                .persist_record_state(
                     &self.plan.actual_mount_path,
                     &self.plan.command.name,
                     std::process::id(),
                     Some(&prepared.cache_path),
+                    utils::MountRecordStatus::Starting,
+                    None,
                 )
                 .with_context(|| {
                     format!(
@@ -1454,9 +1527,243 @@ impl PreparedMount {
     }
 }
 
+/// Mutable lifecycle state shared by the monitor thread and the native attach callback.
+struct MountStatusMonitorState {
+    attached: bool,
+    failed: bool,
+    last_published: Option<(utils::MountRecordStatus, Option<&'static str>)>,
+}
+
+/// Immutable monitor configuration and synchronized publication state.
+///
+/// `state` protects only lifecycle flags and the last successfully published
+/// value. `publication_lock` serializes the read-modify-write of the JSON
+/// record, while synchronous file I/O happens without holding `state`.
+struct MountStatusMonitorShared {
+    vfs: Arc<StudioVfs>,
+    mount_point: String,
+    instance_id: String,
+    state: Mutex<MountStatusMonitorState>,
+    publication_lock: Mutex<()>,
+}
+
+/// Publishes native mount readiness and PostgreSQL lifecycle transitions.
+struct MountStatusMonitor {
+    shared: Arc<MountStatusMonitorShared>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl MountStatusMonitor {
+    fn new_shared(
+        vfs: Arc<StudioVfs>,
+        mount_point: String,
+        instance_id: String,
+    ) -> Arc<MountStatusMonitorShared> {
+        Arc::new(MountStatusMonitorShared {
+            vfs,
+            mount_point,
+            instance_id,
+            state: Mutex::new(MountStatusMonitorState {
+                attached: false,
+                failed: false,
+                last_published: None,
+            }),
+            publication_lock: Mutex::new(()),
+        })
+    }
+
+    fn mark_attached(shared: &Arc<MountStatusMonitorShared>) -> MountStatusPublishOutcome {
+        shared.state.lock().attached = true;
+        Self::publish_state(shared)
+    }
+
+    fn mark_failed(&self) {
+        self.shared.state.lock().failed = true;
+        const RETRIES: usize = 3;
+        for attempt in 0..RETRIES {
+            match Self::publish_state(&self.shared) {
+                MountStatusPublishOutcome::Published => return,
+                MountStatusPublishOutcome::Stop => {
+                    self.stop.store(true, Ordering::Release);
+                    return;
+                }
+                MountStatusPublishOutcome::Retry if attempt + 1 < RETRIES => {
+                    std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+                }
+                MountStatusPublishOutcome::Retry => {
+                    warn!(
+                        mount_point = %self.shared.mount_point,
+                        "failed to publish final mount failure state after retries"
+                    );
+                }
+            }
+        }
+    }
+
+    fn publish_state(shared: &Arc<MountStatusMonitorShared>) -> MountStatusPublishOutcome {
+        let _publication_guard = shared.publication_lock.lock();
+        let (attached, failed, last_published) = {
+            let state = shared.state.lock();
+            (state.attached, state.failed, state.last_published)
+        };
+        let next = mount_record_state(attached, failed, shared.vfs.sync_status());
+        if last_published == Some(next) {
+            return MountStatusPublishOutcome::Published;
+        }
+
+        match utils::update_mount_record_status(
+            &shared.mount_point,
+            &shared.instance_id,
+            next.0,
+            next.1,
+        ) {
+            Ok(()) => {
+                let (attached, failed) = {
+                    let state = shared.state.lock();
+                    (state.attached, state.failed)
+                };
+                let current = mount_record_state(attached, failed, shared.vfs.sync_status());
+                if current == next {
+                    shared.state.lock().last_published = Some(next);
+                }
+                MountStatusPublishOutcome::Published
+            }
+            Err(
+                utils::MountRecordUpdateError::InstanceChanged { .. }
+                | utils::MountRecordUpdateError::NotFound { .. },
+            ) => {
+                debug!(
+                    mount_point = %shared.mount_point,
+                    "stopping mount lifecycle monitor after mount record replacement or removal"
+                );
+                MountStatusPublishOutcome::Stop
+            }
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    mount_point = %shared.mount_point,
+                    "failed to publish mount lifecycle status"
+                );
+                MountStatusPublishOutcome::Retry
+            }
+        }
+    }
+
+    fn start(
+        vfs: Arc<StudioVfs>,
+        mount_point: String,
+        instance_id: String,
+    ) -> anyhow::Result<Self> {
+        let shared = Self::new_shared(vfs, mount_point, instance_id);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread_shared = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("studiofs-mount-status".to_string())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    if matches!(
+                        Self::publish_state(&thread_shared),
+                        MountStatusPublishOutcome::Stop
+                    ) {
+                        break;
+                    }
+                    std::thread::park_timeout(MOUNT_STATUS_POLL_INTERVAL);
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("failed to start mount status monitor: {error}"))?;
+        Ok(Self {
+            shared,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            if thread.join().is_err() {
+                warn!("mount status monitor panicked during shutdown");
+            }
+        }
+    }
+
+    fn ready_callback(&self) -> Box<dyn FnOnce() + Send> {
+        let shared = self.shared.clone();
+        let stop = self.stop.clone();
+        Box::new(move || {
+            if matches!(
+                Self::mark_attached(&shared),
+                MountStatusPublishOutcome::Stop
+            ) {
+                stop.store(true, Ordering::Release);
+            }
+        })
+    }
+}
+
+impl Drop for MountStatusMonitor {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+enum MountStatusPublishOutcome {
+    Published,
+    Retry,
+    Stop,
+}
+
+fn should_retain_failed_mount_record(
+    command_detach: bool,
+    daemon_mount_point_env_present: bool,
+) -> bool {
+    command_detach || daemon_mount_point_env_present
+}
+
+fn mount_record_state(
+    attached: bool,
+    failed: bool,
+    sync_status: PgSyncStatus,
+) -> (utils::MountRecordStatus, Option<&'static str>) {
+    if !attached {
+        return (
+            if failed {
+                utils::MountRecordStatus::Failed
+            } else {
+                utils::MountRecordStatus::Starting
+            },
+            None,
+        );
+    }
+
+    let (status, lifecycle) = match sync_status.lifecycle {
+        PgSyncLifecycle::LocalReady => (utils::MountRecordStatus::Mounted, "local_ready"),
+        PgSyncLifecycle::CatchingUp => (utils::MountRecordStatus::Mounted, "catching_up"),
+        PgSyncLifecycle::TargetReached => (utils::MountRecordStatus::Mounted, "target_reached"),
+        PgSyncLifecycle::AllocatorPending => {
+            (utils::MountRecordStatus::Mounted, "allocator_pending")
+        }
+        PgSyncLifecycle::Live => (utils::MountRecordStatus::Live, "live"),
+        PgSyncLifecycle::Degraded => (utils::MountRecordStatus::Degraded, "degraded"),
+        PgSyncLifecycle::Fatal => (utils::MountRecordStatus::Failed, "fatal"),
+    };
+    (
+        if failed {
+            utils::MountRecordStatus::Failed
+        } else {
+            status
+        },
+        Some(lifecycle),
+    )
+}
+
 struct MountRuntimeGuard {
     prepared: PreparedMount,
     diagnostics_host: Option<LocalDiagnosticsHost>,
+    mount_status_monitor: Option<MountStatusMonitor>,
     cleanup_completed: bool,
 }
 
@@ -1465,20 +1772,62 @@ impl MountRuntimeGuard {
         Self {
             prepared,
             diagnostics_host: None,
+            mount_status_monitor: None,
             cleanup_completed: false,
         }
     }
 
     fn launch(mut self) -> anyhow::Result<()> {
         let mount_result = self.launch_mount();
-        let cleanup_error = self.cleanup();
+        let retain_failed_record = mount_result.is_err()
+            && self.mount_status_monitor.is_some()
+            && should_retain_failed_mount_record(
+                self.prepared.plan.command.detach,
+                std::env::var_os(daemon_mount_point_env_key()).is_some(),
+            );
+        let cleanup_error = self.cleanup_with_record_removal(!retain_failed_record);
         finish_mount_result(mount_result, cleanup_error)
     }
 
     fn launch_mount(&mut self) -> anyhow::Result<()> {
         self.prepared.write_pid_file()?;
-        self.prepared.print_ready()?;
-        self.serve_foreground()
+        self.start_mount_status_monitor()?;
+        let result = (|| -> anyhow::Result<()> {
+            self.prepared.print_ready()?;
+            self.serve_foreground()
+        })();
+        if result.is_err()
+            && let Some(monitor) = self.mount_status_monitor.as_ref()
+        {
+            monitor.mark_failed();
+        }
+        result
+    }
+
+    fn start_mount_status_monitor(&mut self) -> anyhow::Result<()> {
+        let foreground = self.prepared.foreground.as_ref().context(
+            "foreground mount session is missing prepared runtime before status monitoring",
+        )?;
+        let instance_id = self
+            .prepared
+            .mount_lock
+            .as_ref()
+            .context("foreground mount session is missing lifecycle lock")?
+            .instance_id()
+            .to_string();
+        let monitor = MountStatusMonitor::start(
+            foreground.vfs.clone(),
+            self.prepared.plan.actual_mount_path.clone(),
+            instance_id,
+        )?;
+        self.mount_status_monitor = Some(monitor);
+        Ok(())
+    }
+
+    fn stop_mount_status_monitor(&mut self) {
+        if let Some(mut monitor) = self.mount_status_monitor.take() {
+            monitor.stop_and_join();
+        }
     }
 
     fn serve_foreground(&mut self) -> anyhow::Result<()> {
@@ -1519,27 +1868,32 @@ impl MountRuntimeGuard {
             diagnostics_source,
             profiling_backend,
         );
-        let serve_result = self
+        let foreground = self
             .prepared
             .foreground
             .as_ref()
-            .expect("foreground runtime checked above")
-            .backend
-            .serve(BackendLaunch {
-                vfs,
-                runtime_handle,
-                mount_point: actual_mount_path,
-                volume_name: format_info_name,
-                read_only: read_only_mount,
-                #[cfg(all(unix, not(target_os = "linux")))]
-                run_in_foreground,
-            });
+            .context("foreground runtime disappeared before backend launch")?;
+        let monitor = self
+            .mount_status_monitor
+            .as_ref()
+            .context("mount status monitor was not started before backend launch")?;
+        let serve_result = foreground.backend.serve(BackendLaunch {
+            vfs,
+            runtime_handle,
+            mount_point: actual_mount_path,
+            volume_name: format_info_name,
+            read_only: read_only_mount,
+            mount_ready_callback: monitor.ready_callback(),
+            #[cfg(all(unix, not(target_os = "linux")))]
+            run_in_foreground,
+        });
 
         serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))
     }
 
-    fn cleanup(&mut self) -> Option<anyhow::Error> {
+    fn cleanup_with_record_removal(&mut self, remove_mount_record: bool) -> Option<anyhow::Error> {
         let mut first_error = None;
+        self.stop_mount_status_monitor();
         let foreground = self.prepared.foreground.take();
 
         if let Some(PreparedForegroundRuntime {
@@ -1634,11 +1988,13 @@ impl MountRuntimeGuard {
             }
         }
 
-        record_cleanup_error(
-            &mut first_error,
-            "mount record removal",
-            utils::remove_pid_file(&self.prepared.plan.actual_mount_path),
-        );
+        if remove_mount_record {
+            record_cleanup_error(
+                &mut first_error,
+                "mount record removal",
+                utils::remove_pid_file(&self.prepared.plan.actual_mount_path),
+            );
+        }
         drop(self.prepared.mount_lock.take());
 
         self.cleanup_completed = true;
@@ -1652,6 +2008,7 @@ impl Drop for MountRuntimeGuard {
             return;
         }
 
+        self.stop_mount_status_monitor();
         if let Err(error) = utils::remove_pid_file(&self.prepared.plan.actual_mount_path) {
             warn!(
                 error = ?error,
@@ -2056,17 +2413,23 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("failed to spawn background mount process: {e}"))?;
     let pid = child.id();
 
-    wait_for_daemon_mount_record(
+    let record = wait_for_daemon_mount_record(
         mount_point,
         pid,
         &mut child,
         DAEMON_RECORD_PUBLISH_TIMEOUT,
         DAEMON_RECORD_PUBLISH_POLL_INTERVAL,
-    )?;
+    )
+    .with_context(|| format!("check daemon log file at '{}'", plan.log_path.display()))?;
 
+    let status = record.status;
     println!(
-        "✓ Volume '{}' mounting at '{}' in background (PID: {})",
-        name, mount_point, pid
+        "✓ Volume '{}' mounted at '{}' in background (PID: {}, status: {}, sync: {})",
+        name,
+        mount_point,
+        pid,
+        status,
+        record.sync_lifecycle.as_deref().unwrap_or("unknown")
     );
     println!("  Log file: {}", plan.log_path.display());
     println!("  To unmount: studiofs umount \"{}\"", mount_point);
@@ -2080,13 +2443,13 @@ fn wait_for_daemon_mount_record(
     child: &mut std::process::Child,
     timeout: Duration,
     poll_interval: Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<utils::MountRecordInfo> {
     wait_for_daemon_mount_record_with(
         mount_point,
         expected_pid,
         timeout,
         poll_interval,
-        utils::read_pid_file,
+        utils::read_mount_record,
         || Ok(child.try_wait()?.is_none()),
     )
 }
@@ -2098,18 +2461,36 @@ fn wait_for_daemon_mount_record_with<ReadPid, IsChildAlive>(
     poll_interval: Duration,
     read_pid_file: ReadPid,
     mut is_child_alive: IsChildAlive,
-) -> anyhow::Result<()>
+) -> anyhow::Result<utils::MountRecordInfo>
 where
-    ReadPid: Fn(&str) -> anyhow::Result<(u32, String, String)>,
+    ReadPid: Fn(&str) -> anyhow::Result<utils::MountRecordInfo>,
     IsChildAlive: FnMut() -> anyhow::Result<bool>,
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if matches!(
-            read_pid_file(mount_point),
-            Ok((pid, _, _)) if pid == expected_pid
-        ) {
-            return Ok(());
+        if let Ok(record) = read_pid_file(mount_point)
+            && record.pid == expected_pid
+        {
+            match record.status {
+                utils::MountRecordStatus::Mounted
+                | utils::MountRecordStatus::Live
+                | utils::MountRecordStatus::Degraded => {
+                    if is_child_alive()? {
+                        return Ok(record);
+                    }
+                    anyhow::bail!(
+                        "background mount process exited after publishing mount state for '{}'",
+                        mount_point
+                    );
+                }
+                utils::MountRecordStatus::Failed => {
+                    anyhow::bail!(
+                        "background mount process reported failed mount state for '{}'",
+                        mount_point
+                    );
+                }
+                utils::MountRecordStatus::Starting => {}
+            }
         }
 
         if !is_child_alive()? {
@@ -2251,6 +2632,7 @@ mod tests {
             if self.fail {
                 Err(io::Error::other("boom"))
             } else {
+                (launch.mount_ready_callback)();
                 Ok(())
             }
         }
@@ -3061,6 +3443,40 @@ mod tests {
     }
 
     #[test]
+    fn foreground_preparation_failure_removes_mount_record() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let missing_meta_dir = temp.path().join("missing-meta");
+        let mount_point = startup_mount_point(&temp);
+        let plan = MountPlan::resolve(MountRequest {
+            command: mount_command(
+                "demo",
+                &missing_meta_dir,
+                Some(mount_point.to_string()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved");
+        let actual_mount_path = plan.actual_mount_path.clone();
+
+        let result = plan.prepare(|| {
+            Box::new(FakeBackend {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+                inspect: None,
+            })
+        });
+
+        assert!(result.is_err(), "missing metadata should fail preparation");
+        assert!(
+            utils::read_mount_record(&actual_mount_path).is_err(),
+            "foreground preparation failure should remove the mount record"
+        );
+        assert!(!utils::mount_is_active(&actual_mount_path).expect("check mount lock"));
+    }
+
+    #[test]
     fn default_mount_backend_matches_platform() {
         let backend = default_mount_backend();
         #[cfg(target_os = "linux")]
@@ -3108,7 +3524,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_daemon_mount_record_accepts_child_record_once_published() {
+    fn wait_for_daemon_mount_record_accepts_child_record_once_mounted() {
         let attempts = Arc::new(Mutex::new(0usize));
         wait_for_daemon_mount_record_with(
             "/tmp/demo",
@@ -3120,8 +3536,22 @@ mod tests {
                 move |_| {
                     let mut attempts = attempts.lock().expect("lock attempts");
                     *attempts += 1;
-                    if *attempts >= 2 {
-                        Ok((4242, "/tmp/demo".to_string(), "demo".to_string()))
+                    if *attempts >= 3 {
+                        Ok(utils::MountRecordInfo {
+                            record_version: 2,
+                            pid: 4242,
+                            mount_point: "/tmp/demo".to_string(),
+                            volume: "demo".to_string(),
+                            cache_path: None,
+                            instance_id: Some("test-instance".to_string()),
+                            status: if *attempts == 3 {
+                                utils::MountRecordStatus::Mounted
+                            } else {
+                                utils::MountRecordStatus::Live
+                            },
+                            sync_lifecycle: Some("catching_up".to_string()),
+                            diagnostics: None,
+                        })
                     } else {
                         Err(anyhow::anyhow!("record not ready"))
                     }
@@ -3130,6 +3560,36 @@ mod tests {
             || Ok(true),
         )
         .expect("daemon record should eventually appear");
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_rejects_dead_child_with_starting_record() {
+        let err = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| {
+                Ok(utils::MountRecordInfo {
+                    record_version: 2,
+                    pid: 4242,
+                    mount_point: "/tmp/demo".to_string(),
+                    volume: "demo".to_string(),
+                    cache_path: None,
+                    instance_id: Some("test-instance".to_string()),
+                    status: utils::MountRecordStatus::Starting,
+                    sync_lifecycle: None,
+                    diagnostics: None,
+                })
+            },
+            || Ok(false),
+        )
+        .expect_err("dead child should fail even with a starting record");
+
+        assert!(
+            err.to_string()
+                .contains("exited before publishing mount state")
+        );
     }
 
     #[test]
@@ -3149,6 +3609,48 @@ mod tests {
                 .contains("exited before publishing mount state"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_rejects_failed_child_state() {
+        let err = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| {
+                Ok(utils::MountRecordInfo {
+                    record_version: 2,
+                    pid: 4242,
+                    mount_point: "/tmp/demo".to_string(),
+                    volume: "demo".to_string(),
+                    cache_path: None,
+                    instance_id: Some("test-instance".to_string()),
+                    status: utils::MountRecordStatus::Failed,
+                    sync_lifecycle: None,
+                    diagnostics: None,
+                })
+            },
+            || Ok(false),
+        )
+        .expect_err("failed child state should fail readiness wait");
+
+        assert!(err.to_string().contains("reported failed mount state"));
+    }
+
+    #[test]
+    fn mount_record_state_maps_pg_catch_up_without_claiming_live() {
+        let (status, lifecycle) = mount_record_state(
+            true,
+            false,
+            PgSyncStatus::new(
+                PgSyncLifecycle::CatchingUp,
+                studiofs_meta::engine::MetadataAuthorityStatus::read_only(),
+            ),
+        );
+
+        assert_eq!(status, utils::MountRecordStatus::Mounted);
+        assert_eq!(lifecycle, Some("catching_up"));
     }
 
     #[test]
@@ -3192,7 +3694,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_mount_launch_failure_removes_pid_file() {
+    fn prepared_mount_launch_failure_removes_foreground_record() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
@@ -3224,9 +3726,17 @@ mod tests {
         assert!(err.to_string().contains("FakeBackend error: boom"));
         assert_eq!(events.lock().expect("lock events").len(), 1);
         assert!(
-            utils::read_pid_file(&actual_mount_path).is_err(),
-            "backend failure should remove pid file"
+            utils::read_mount_record(&actual_mount_path).is_err(),
+            "foreground backend failure should remove the mount record"
         );
+        assert!(!utils::mount_is_active(&actual_mount_path).expect("check mount lock"));
+    }
+
+    #[test]
+    fn failed_mount_record_is_retained_only_for_detached_processes() {
+        assert!(should_retain_failed_mount_record(true, false));
+        assert!(should_retain_failed_mount_record(false, true));
+        assert!(!should_retain_failed_mount_record(false, false));
     }
 
     #[test]
@@ -3301,7 +3811,7 @@ mod tests {
         std::fs::create_dir(&pid_path).expect("replace mount record with directory");
 
         let cleanup_error = guard
-            .cleanup()
+            .cleanup_with_record_removal(true)
             .expect("mount record cleanup failure should be returned");
         let pid_path_removed = std::fs::remove_dir(&pid_path).is_ok();
 

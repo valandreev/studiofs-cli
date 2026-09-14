@@ -3,7 +3,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub(crate) const CLIENT_ROOT_ENV: &str = "STUDIOFS_CLIENT_ROOT";
@@ -118,7 +120,37 @@ fn default_mount_record_version() -> u32 {
     MOUNT_RECORD_VERSION
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Lifecycle state persisted in a mount record.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MountRecordStatus {
+    /// The child owns the mount lock but native attach has not completed.
+    #[default]
+    Starting,
+    /// The native mount is attached while metadata synchronization may continue.
+    Mounted,
+    /// The native mount and metadata synchronization are live.
+    Live,
+    /// The native mount remains usable with degraded synchronization.
+    Degraded,
+    /// Mount preparation or serving failed.
+    Failed,
+}
+
+impl std::fmt::Display for MountRecordStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Starting => "starting",
+            Self::Mounted => "mounted",
+            Self::Live => "live",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+/// JSON state shared by a foreground mount child and detached parent.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MountRecordInfo {
     #[serde(default = "default_mount_record_version")]
     pub record_version: u32,
@@ -131,6 +163,45 @@ pub(crate) struct MountRecordInfo {
     pub cache_path: Option<String>,
     #[serde(default)]
     pub instance_id: Option<String>,
+    /// Local/native lifecycle state used by the detached handshake.
+    #[serde(default)]
+    pub status: MountRecordStatus,
+    /// PostgreSQL synchronization lifecycle, when known.
+    #[serde(default)]
+    pub sync_lifecycle: Option<String>,
+    /// Local diagnostics endpoint and authentication material, when published.
+    #[serde(default)]
+    pub diagnostics: Option<crate::diagnostics::LocalDiagnosticsDiscovery>,
+}
+
+impl std::fmt::Debug for MountRecordInfo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountRecordInfo")
+            .field("record_version", &self.record_version)
+            .field("pid", &self.pid)
+            .field("mount_point", &self.mount_point)
+            .field("volume", &self.volume)
+            .field("cache_path", &self.cache_path)
+            .field("instance_id", &self.instance_id)
+            .field("status", &self.status)
+            .field("sync_lifecycle", &self.sync_lifecycle)
+            .field(
+                "diagnostics",
+                &self.diagnostics.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MountRecordUpdateError {
+    #[error("mount record instance changed for '{mount_point}'")]
+    InstanceChanged { mount_point: String },
+    #[error("mount record not found for '{mount_point}'")]
+    NotFound { mount_point: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 pub(crate) struct MountLockGuard {
@@ -143,12 +214,14 @@ impl MountLockGuard {
         &self.instance_id
     }
 
-    pub(crate) fn persist_record(
+    pub(crate) fn persist_record_state(
         &self,
         mount_point: &str,
         volume: &str,
         pid: u32,
         cache_path: Option<&Path>,
+        status: MountRecordStatus,
+        sync_lifecycle: Option<&str>,
     ) -> Result<()> {
         write_mount_record_with_cache_and_instance(
             mount_point,
@@ -156,6 +229,8 @@ impl MountLockGuard {
             pid,
             cache_path,
             Some(self.instance_id()),
+            status,
+            sync_lifecycle,
         )
     }
 }
@@ -221,6 +296,8 @@ fn write_mount_record_with_cache_and_instance(
     pid: u32,
     cache_path: Option<&Path>,
     instance_id: Option<&str>,
+    status: MountRecordStatus,
+    sync_lifecycle: Option<&str>,
 ) -> Result<()> {
     let path = pid_file_path(mount_point)?;
     let record = MountRecordInfo {
@@ -230,9 +307,95 @@ fn write_mount_record_with_cache_and_instance(
         volume: volume.to_string(),
         cache_path: cache_path.map(|path| path.to_string_lossy().into_owned()),
         instance_id: instance_id.map(str::to_string),
+        status,
+        sync_lifecycle: sync_lifecycle.map(str::to_string),
+        diagnostics: None,
     };
-    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
-    Ok(())
+    write_mount_record_file(&path, &record)
+}
+
+fn write_mount_record_file(path: &Path, record: &MountRecordInfo) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("mount record path has no parent directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary mount record near '{}'", path.display()))?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), record)?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+    let mut temporary = Some(temporary);
+    for attempt in 0..5 {
+        let file = temporary
+            .take()
+            .ok_or_else(|| anyhow!("mount record replacement file was lost"))?;
+        match file.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if attempt + 1 < 5 && is_retryable_mount_record_replace_error(&error.error) =>
+            {
+                temporary = Some(error.file);
+                let delay_ms = [10, 25, 50, 100][attempt];
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "replace mount record '{}': {}",
+                    path.display(),
+                    error.error
+                ));
+            }
+        }
+    }
+    Err(anyhow!("mount record replacement attempts exhausted"))
+}
+
+fn is_retryable_mount_record_replace_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+        ) || matches!(error.raw_os_error(), Some(5 | 32))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+pub(crate) fn update_mount_record_status(
+    mount_point: &str,
+    expected_instance_id: &str,
+    status: MountRecordStatus,
+    sync_lifecycle: Option<&str>,
+) -> std::result::Result<(), MountRecordUpdateError> {
+    let path = pid_file_path(mount_point).map_err(MountRecordUpdateError::Other)?;
+    update_mount_record_status_at(
+        &path,
+        mount_point,
+        expected_instance_id,
+        status,
+        sync_lifecycle,
+    )
+}
+
+fn update_mount_record_status_at(
+    path: &Path,
+    mount_point: &str,
+    expected_instance_id: &str,
+    status: MountRecordStatus,
+    sync_lifecycle: Option<&str>,
+) -> std::result::Result<(), MountRecordUpdateError> {
+    let mut record = read_mount_record_for_update(path, mount_point)?;
+    if record.instance_id.as_deref() != Some(expected_instance_id) {
+        return Err(MountRecordUpdateError::InstanceChanged {
+            mount_point: mount_point.to_string(),
+        });
+    }
+    record.status = status;
+    record.sync_lifecycle = sync_lifecycle.map(str::to_string);
+    write_mount_record_file(path, &record).map_err(MountRecordUpdateError::Other)
 }
 
 pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<MountRecordInfo>> {
@@ -253,11 +416,18 @@ pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<Moun
             Ok(record) if record.volume == volume => record,
             _ => continue,
         };
-        if mount_is_active(&record.mount_point)? {
+        if mount_record_is_active_candidate(&record) && mount_is_active(&record.mount_point)? {
             return Ok(Some(record));
         }
     }
     Ok(None)
+}
+
+fn mount_record_is_active_candidate(record: &MountRecordInfo) -> bool {
+    matches!(
+        record.status,
+        MountRecordStatus::Mounted | MountRecordStatus::Live | MountRecordStatus::Degraded
+    ) || (record.instance_id.is_none() && record.status == MountRecordStatus::Starting)
 }
 
 /// Read PID file → `(pid, mount_point, volume)`.
@@ -271,10 +441,34 @@ pub(crate) fn read_mount_record(mount_point: &str) -> Result<MountRecordInfo> {
     let path = pid_file_path(&normalized)?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("No mount found for '{mount_point}'. Is it mounted?"))?;
+    parse_mount_record(&data, &normalized)
+}
+
+fn read_mount_record_for_update(
+    path: &Path,
+    mount_point: &str,
+) -> std::result::Result<MountRecordInfo, MountRecordUpdateError> {
+    let data = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            MountRecordUpdateError::NotFound {
+                mount_point: mount_point.to_string(),
+            }
+        } else {
+            MountRecordUpdateError::Other(
+                anyhow::Error::new(error)
+                    .context(format!("read mount record '{}'", path.display())),
+            )
+        }
+    })?;
+    parse_mount_record(&data, &normalize_mount_point(mount_point))
+        .map_err(MountRecordUpdateError::Other)
+}
+
+fn parse_mount_record(data: &str, normalized_mount_point: &str) -> Result<MountRecordInfo> {
     let mut record: MountRecordInfo =
-        serde_json::from_str(&data).map_err(|_| anyhow!("corrupt PID file"))?;
+        serde_json::from_str(data).context("corrupt mount record PID file")?;
     if record.mount_point.is_empty() {
-        record.mount_point = normalized;
+        record.mount_point = normalized_mount_point.to_string();
     }
     if record.volume.is_empty() {
         record.volume = "unknown".to_string();
@@ -371,9 +565,11 @@ pub fn write_pid_file_in(
         volume: volume.to_string(),
         cache_path: None,
         instance_id: None,
+        status: MountRecordStatus::Starting,
+        sync_lifecycle: None,
+        diagnostics: None,
     };
-    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
-    Ok(())
+    write_mount_record_file(&path, &record)
 }
 
 /// Read a PID file from the given directory.
@@ -624,6 +820,168 @@ mod tests {
         let (pid, _, vol) = read_pid_file_in(tmp.path(), mp).unwrap();
         assert_eq!(pid, 200);
         assert_eq!(vol, "vol2");
+    }
+
+    #[test]
+    fn mount_record_lifecycle_fields_are_backward_compatible() {
+        let record: MountRecordInfo = serde_json::from_str(
+            r#"{
+                "record_version": 2,
+                "pid": 123,
+                "mount_point": "T:",
+                "volume": "demo",
+                "cache_path": null,
+                "instance_id": null
+            }"#,
+        )
+        .expect("legacy mount record should deserialize");
+
+        assert_eq!(record.status, MountRecordStatus::Starting);
+        assert_eq!(record.sync_lifecycle, None);
+        assert_eq!(record.diagnostics, None);
+    }
+
+    #[test]
+    fn mount_record_status_update_preserves_diagnostics_discovery() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = tmp.path().join("mount.json");
+        let endpoint = {
+            #[cfg(windows)]
+            {
+                crate::diagnostics::LocalDiagnosticsEndpoint::WindowsNamedPipe {
+                    name: r"\\.\pipe\studiofs-demo-diagnostics".to_string(),
+                }
+            }
+            #[cfg(unix)]
+            {
+                crate::diagnostics::LocalDiagnosticsEndpoint::UnixSocket {
+                    path: "/tmp/studiofs-demo-diagnostics.sock".to_string(),
+                }
+            }
+        };
+        let diagnostics = crate::diagnostics::LocalDiagnosticsDiscovery {
+            protocol_version: 1,
+            session_id: "session-id".to_string(),
+            volume: "demo".to_string(),
+            volume_uuid: "demo-uuid".to_string(),
+            bridge: "test".to_string(),
+            mount_point: "T:".to_string(),
+            pid: 123,
+            cache_path: "cache/demo".to_string(),
+            read_only: false,
+            started_unix_ms: 456,
+            endpoint,
+            auth_token: "test-auth-token".to_string(),
+        };
+
+        write_mount_record_file(
+            &path,
+            &MountRecordInfo {
+                record_version: MOUNT_RECORD_VERSION,
+                pid: 123,
+                mount_point: "T:".to_string(),
+                volume: "demo".to_string(),
+                cache_path: None,
+                instance_id: Some("current-instance".to_string()),
+                status: MountRecordStatus::Starting,
+                sync_lifecycle: None,
+                diagnostics: Some(diagnostics.clone()),
+            },
+        )
+        .expect("write mount record");
+
+        update_mount_record_status_at(
+            &path,
+            "T:",
+            "current-instance",
+            MountRecordStatus::Mounted,
+            Some("local_ready"),
+        )
+        .expect("update mount record status");
+
+        let updated: MountRecordInfo =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read mount record"))
+                .expect("parse updated mount record");
+        assert_eq!(updated.status, MountRecordStatus::Mounted);
+        assert_eq!(updated.sync_lifecycle.as_deref(), Some("local_ready"));
+        assert_eq!(updated.diagnostics, Some(diagnostics));
+        let debug = format!("{updated:?}");
+        assert!(!debug.contains("test-auth-token"));
+        assert!(!debug.contains("studiofs-demo-diagnostics"));
+    }
+
+    #[test]
+    fn mount_record_status_update_reports_instance_change_without_rereading() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = tmp.path().join("mount.json");
+        write_mount_record_file(
+            &path,
+            &MountRecordInfo {
+                record_version: MOUNT_RECORD_VERSION,
+                pid: 123,
+                mount_point: "T:".to_string(),
+                volume: "demo".to_string(),
+                cache_path: None,
+                instance_id: Some("current-instance".to_string()),
+                status: MountRecordStatus::Starting,
+                sync_lifecycle: None,
+                diagnostics: None,
+            },
+        )
+        .expect("write mount record");
+
+        let error = update_mount_record_status_at(
+            &path,
+            "T:",
+            "replaced-instance",
+            MountRecordStatus::Mounted,
+            Some("local_ready"),
+        )
+        .expect_err("replaced instance should stop publication");
+
+        assert!(matches!(
+            error,
+            MountRecordUpdateError::InstanceChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn mount_record_status_update_reports_removed_record() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let error = update_mount_record_status_at(
+            &tmp.path().join("missing.json"),
+            "T:",
+            "current-instance",
+            MountRecordStatus::Mounted,
+            Some("local_ready"),
+        )
+        .expect_err("removed mount record should stop publication");
+
+        assert!(matches!(error, MountRecordUpdateError::NotFound { .. }));
+    }
+
+    #[test]
+    fn active_mount_record_candidate_preserves_legacy_records_only() {
+        let mut record = MountRecordInfo {
+            record_version: MOUNT_RECORD_VERSION,
+            pid: 123,
+            mount_point: "T:".to_string(),
+            volume: "demo".to_string(),
+            cache_path: None,
+            instance_id: None,
+            status: MountRecordStatus::Starting,
+            sync_lifecycle: None,
+            diagnostics: None,
+        };
+
+        assert!(mount_record_is_active_candidate(&record));
+
+        record.instance_id = Some("current-instance".to_string());
+        assert!(!mount_record_is_active_candidate(&record));
+
+        record.instance_id = None;
+        record.status = MountRecordStatus::Failed;
+        assert!(!mount_record_is_active_candidate(&record));
     }
 
     #[test]

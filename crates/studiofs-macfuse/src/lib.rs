@@ -37,6 +37,7 @@ pub struct MacFuseMountRequest {
     run_in_foreground: bool,
     signal_handling: SignalHandling,
     unmount_signal: Option<MacFuseUnmountSignal>,
+    mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl MacFuseMountRequest {
@@ -56,6 +57,7 @@ impl MacFuseMountRequest {
             run_in_foreground: false,
             signal_handling: SignalHandling::default(),
             unmount_signal: None,
+            mount_ready_callback: None,
         }
     }
 
@@ -80,6 +82,15 @@ impl MacFuseMountRequest {
     /// Set a caller-owned signal for requesting graceful unmount.
     pub fn with_unmount_signal(mut self, unmount_signal: MacFuseUnmountSignal) -> Self {
         self.unmount_signal = Some(unmount_signal);
+        self
+    }
+
+    /// Set a callback invoked after the native mount point is attached.
+    pub fn with_mount_ready_callback<F>(mut self, callback: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.mount_ready_callback = Some(Box::new(callback));
         self
     }
 }
@@ -259,6 +270,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         run_in_foreground,
         signal_handling,
         unmount_signal,
+        mount_ready_callback,
     } = request;
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
@@ -290,6 +302,9 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     )?;
     session.attach_invalidation_metrics(&vfs);
     vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
+    if let Some(callback) = mount_ready_callback {
+        callback();
+    }
     let result = session.run();
     vfs.clear_kernel_invalidator();
     // Async namespace callbacks retain raw macFUSE requests after returning

@@ -86,6 +86,19 @@ pub struct WinfspMountRequest {
     pub read_only: bool,
     /// Optional named shutdown event used to trigger a graceful unmount/shutdown.
     pub shutdown_event_name: Option<String>,
+    /// Optional one-shot callback invoked after the native mount is attached.
+    pub mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl WinfspMountRequest {
+    /// Set a callback invoked after the native mount point is attached.
+    pub fn with_mount_ready_callback<F>(mut self, callback: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.mount_ready_callback = Some(Box::new(callback));
+        self
+    }
 }
 
 fn winfsp_dll_stem_for_arch(target_arch: &str) -> Option<&'static str> {
@@ -808,6 +821,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
         volume_label,
         read_only,
         shutdown_event_name,
+        mount_ready_callback,
     } = request;
 
     let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;
@@ -884,7 +898,6 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
 this usually means Administrator privileges are required, or WinFSP must be configured with MountUseMountmgrFromFSD=1"
         ))
     })?;
-
     // Register the kernel cache invalidator with the VFS so metadata updates
     // can proactively enqueue inodes for WinFSP notification.
     let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(invalidation_queue.clone()));
@@ -893,6 +906,9 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
     host.start_with_threads(options.dispatcher_threads)
         .map_err(|err| std::io::Error::other(format!("failed to start WinFSP host: {err}")))?;
+    if let Some(callback) = mount_ready_callback {
+        callback();
+    }
 
     // Block until Ctrl+C or external shutdown event
     let (tx, rx) = std::sync::mpsc::channel::<()>();
