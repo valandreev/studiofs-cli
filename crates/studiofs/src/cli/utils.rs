@@ -118,6 +118,17 @@ fn default_mount_record_version() -> u32 {
     MOUNT_RECORD_VERSION
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MountRecordStatus {
+    #[default]
+    Starting,
+    Mounted,
+    Live,
+    Degraded,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MountRecordInfo {
     #[serde(default = "default_mount_record_version")]
@@ -131,6 +142,10 @@ pub(crate) struct MountRecordInfo {
     pub cache_path: Option<String>,
     #[serde(default)]
     pub instance_id: Option<String>,
+    #[serde(default)]
+    pub status: MountRecordStatus,
+    #[serde(default)]
+    pub sync_lifecycle: Option<String>,
 }
 
 pub(crate) struct MountLockGuard {
@@ -156,6 +171,28 @@ impl MountLockGuard {
             pid,
             cache_path,
             Some(self.instance_id()),
+            MountRecordStatus::Starting,
+            None,
+        )
+    }
+
+    pub(crate) fn persist_record_state(
+        &self,
+        mount_point: &str,
+        volume: &str,
+        pid: u32,
+        cache_path: Option<&Path>,
+        status: MountRecordStatus,
+        sync_lifecycle: Option<&str>,
+    ) -> Result<()> {
+        write_mount_record_with_cache_and_instance(
+            mount_point,
+            volume,
+            pid,
+            cache_path,
+            Some(self.instance_id()),
+            status,
+            sync_lifecycle,
         )
     }
 }
@@ -221,6 +258,8 @@ fn write_mount_record_with_cache_and_instance(
     pid: u32,
     cache_path: Option<&Path>,
     instance_id: Option<&str>,
+    status: MountRecordStatus,
+    sync_lifecycle: Option<&str>,
 ) -> Result<()> {
     let path = pid_file_path(mount_point)?;
     let record = MountRecordInfo {
@@ -230,7 +269,26 @@ fn write_mount_record_with_cache_and_instance(
         volume: volume.to_string(),
         cache_path: cache_path.map(|path| path.to_string_lossy().into_owned()),
         instance_id: instance_id.map(str::to_string),
+        status,
+        sync_lifecycle: sync_lifecycle.map(str::to_string),
     };
+    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+    Ok(())
+}
+
+pub(crate) fn update_mount_record_status(
+    mount_point: &str,
+    expected_instance_id: &str,
+    status: MountRecordStatus,
+    sync_lifecycle: Option<&str>,
+) -> Result<()> {
+    let mut record = read_mount_record(mount_point)?;
+    if record.instance_id.as_deref() != Some(expected_instance_id) {
+        anyhow::bail!("mount record instance changed for '{mount_point}'");
+    }
+    record.status = status;
+    record.sync_lifecycle = sync_lifecycle.map(str::to_string);
+    let path = pid_file_path(&normalize_mount_point(mount_point))?;
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
     Ok(())
 }
@@ -371,6 +429,8 @@ pub fn write_pid_file_in(
         volume: volume.to_string(),
         cache_path: None,
         instance_id: None,
+        status: MountRecordStatus::Starting,
+        sync_lifecycle: None,
     };
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
     Ok(())
@@ -624,6 +684,24 @@ mod tests {
         let (pid, _, vol) = read_pid_file_in(tmp.path(), mp).unwrap();
         assert_eq!(pid, 200);
         assert_eq!(vol, "vol2");
+    }
+
+    #[test]
+    fn mount_record_lifecycle_fields_are_backward_compatible() {
+        let record: MountRecordInfo = serde_json::from_str(
+            r#"{
+                "record_version": 2,
+                "pid": 123,
+                "mount_point": "T:",
+                "volume": "demo",
+                "cache_path": null,
+                "instance_id": null
+            }"#,
+        )
+        .expect("legacy mount record should deserialize");
+
+        assert_eq!(record.status, MountRecordStatus::Starting);
+        assert_eq!(record.sync_lifecycle, None);
     }
 
     #[test]

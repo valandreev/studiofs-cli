@@ -856,14 +856,24 @@ impl FsKitSession {
             .map_err(|_| io::Error::other("FSKit unmount worker panicked"))
     }
 
-    fn run(&mut self, dispatcher: &FsKitDispatcher) -> io::Result<()> {
+    fn run(
+        &mut self,
+        dispatcher: &FsKitDispatcher,
+        mount_ready_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> io::Result<()> {
         // macFUSE 5.3.3 local mounts send INIT before MFMount returns. Keep
         // dispatching during startup or mount and receive wait on each other.
         let mut mounted = false;
+        let mut mount_ready_callback = mount_ready_callback;
         let mut shutdown_deadline = None;
         loop {
             match self.mount_result.try_recv() {
-                Ok(Ok(())) => mounted = true,
+                Ok(Ok(())) => {
+                    mounted = true;
+                    if let Some(callback) = mount_ready_callback.take() {
+                        callback();
+                    }
+                }
                 Ok(Err(result)) => return Err(mount_result_error(result)),
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) if !mounted => {
@@ -2443,6 +2453,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         run_in_foreground: _,
         signal_handling,
         unmount_signal,
+        mount_ready_callback,
     } = request;
     crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let mut session = FsKitSession::mount(&mount_point, &volume_name)?;
@@ -2469,7 +2480,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
             control: Arc::clone(&session.control),
         },
     )));
-    let result = session.run(&dispatcher);
+    let result = session.run(&dispatcher, mount_ready_callback);
     drop(signal_watcher);
     dispatcher.cancel_pending();
     vfs.clear_kernel_invalidator();
@@ -2642,7 +2653,7 @@ mod tests {
         );
         let (done_sender, done_receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = session.run(&dispatcher);
+            let result = session.run(&dispatcher, None);
             done_sender.send(result).expect("report session result");
         });
 
@@ -2721,7 +2732,7 @@ mod tests {
         );
         let (done_sender, done_receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = session.run(&dispatcher);
+            let result = session.run(&dispatcher, None);
             done_sender.send(result).expect("report session result");
         });
 
@@ -2830,7 +2841,7 @@ mod tests {
             fixture.runtime().handle().clone(),
             control,
         );
-        let worker = std::thread::spawn(move || session.run(&dispatcher));
+        let worker = std::thread::spawn(move || session.run(&dispatcher, None));
         let mut init = vec![0_u8; size_of::<FuseInHeader>() + size_of::<FuseInitIn>()];
         let len = init.len() as u32;
         init[..4].copy_from_slice(&len.to_ne_bytes());

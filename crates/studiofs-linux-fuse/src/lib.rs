@@ -61,6 +61,7 @@ pub struct LinuxFuseMountRequest {
     volume_name: String,
     read_only: bool,
     connection_config: LinuxFuseConnectionConfig,
+    mount_ready_callback: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl LinuxFuseMountRequest {
@@ -79,7 +80,14 @@ impl LinuxFuseMountRequest {
             volume_name: volume_name.into(),
             read_only,
             connection_config: LinuxFuseConnectionConfig::default(),
+            mount_ready_callback: None,
         }
+    }
+
+    /// Set a callback invoked after libfuse has attached the mount point.
+    pub fn with_mount_ready_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.mount_ready_callback = Some(callback);
+        self
     }
 
     /// Override Linux libfuse3 connection-level queue bounds.
@@ -99,6 +107,7 @@ pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
         volume_name,
         read_only,
         connection_config,
+        mount_ready_callback,
     } = request;
     let connection_config = connection_config.validate()?;
     let mut session = low_level::Session::mount(
@@ -106,6 +115,9 @@ pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
         mount_point,
         volume_name,
     )?;
+    if let Some(callback) = mount_ready_callback {
+        callback();
+    }
     session.install_signal_handlers()?;
     session.run()
 }

@@ -13,6 +13,7 @@ pub(crate) struct BackendLaunch {
     pub(crate) mount_point: String,
     pub(crate) volume_name: String,
     pub(crate) read_only: bool,
+    pub(crate) mount_ready_callback: Arc<dyn Fn() + Send + Sync>,
     #[cfg(all(unix, not(target_os = "linux")))]
     pub(crate) run_in_foreground: bool,
 }
@@ -74,6 +75,7 @@ impl MountBackend for MacFuseMountBackend {
         )
         .with_read_only(launch.read_only)
         .with_run_in_foreground(launch.run_in_foreground)
+        .with_mount_ready_callback(launch.mount_ready_callback)
         .with_signal_handling(studiofs_macfuse::SignalHandling::InstallForCli);
         studiofs_macfuse::mount_with_request(request)
     }
@@ -97,6 +99,7 @@ impl MountBackend for MacFuseFsKitMountBackend {
         )
         .with_read_only(launch.read_only)
         .with_run_in_foreground(launch.run_in_foreground)
+        .with_mount_ready_callback(launch.mount_ready_callback)
         .with_signal_handling(studiofs_macfuse::SignalHandling::InstallForCli);
         studiofs_macfuse::mount_with_fskit_request(request)
     }
@@ -118,6 +121,7 @@ impl MountBackend for LinuxFuseMountBackend {
             mount_point,
             volume_name,
             read_only,
+            mount_ready_callback,
         } = launch;
         let request = studiofs_linux_fuse::LinuxFuseMountRequest::new(
             vfs,
@@ -125,7 +129,8 @@ impl MountBackend for LinuxFuseMountBackend {
             mount_point,
             volume_name,
             read_only,
-        );
+        )
+        .with_mount_ready_callback(mount_ready_callback);
         studiofs_linux_fuse::mount_with_request(request)
     }
 }
@@ -167,14 +172,17 @@ impl MountBackend for WinfspMountBackend {
 
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
         let shutdown_event_name = crate::cli::utils::shutdown_event_name(&launch.mount_point);
-        studiofs_winfsp::mount_and_serve(studiofs_winfsp::WinfspMountRequest {
-            vfs: launch.vfs,
-            runtime_handle: launch.runtime_handle,
-            mount_point: launch.mount_point,
-            volume_label: launch.volume_name,
-            read_only: launch.read_only,
-            shutdown_event_name: Some(shutdown_event_name),
-        })
+        studiofs_winfsp::mount_and_serve_with_ready_callback(
+            studiofs_winfsp::WinfspMountRequest {
+                vfs: launch.vfs,
+                runtime_handle: launch.runtime_handle,
+                mount_point: launch.mount_point,
+                volume_label: launch.volume_name,
+                read_only: launch.read_only,
+                shutdown_event_name: Some(shutdown_event_name),
+            },
+            Some(launch.mount_ready_callback),
+        )
     }
 }
 

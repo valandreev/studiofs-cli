@@ -795,6 +795,15 @@ fn winfsp_async_callback_drain_timeout() -> std::time::Duration {
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
 /// external process (`studiofs umount`) can signal a graceful shutdown.
 pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
+    mount_and_serve_with_ready_callback(request, None)
+}
+
+/// Start WinFSP and invoke `mount_ready_callback` after the mount point is
+/// attached, before the serving loop starts.
+pub fn mount_and_serve_with_ready_callback(
+    request: WinfspMountRequest,
+    mount_ready_callback: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> std::io::Result<()> {
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
     use crate::context::PreparedWinfspNotifications;
@@ -884,6 +893,9 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
 this usually means Administrator privileges are required, or WinFSP must be configured with MountUseMountmgrFromFSD=1"
         ))
     })?;
+    if let Some(callback) = mount_ready_callback {
+        callback();
+    }
 
     // Register the kernel cache invalidator with the VFS so metadata updates
     // can proactively enqueue inodes for WinFSP notification.
