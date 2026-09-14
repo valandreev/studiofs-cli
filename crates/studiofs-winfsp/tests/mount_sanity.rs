@@ -717,6 +717,7 @@ where
             volume_label: "StudioFS-Test".to_string(),
             read_only: false,
             shutdown_event_name: Some(event_for_thread),
+            mount_ready_callback: None,
         })
         .map_err(|e| e.to_string())
     });

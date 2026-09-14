@@ -86,6 +86,16 @@ pub struct WinfspMountRequest {
     pub read_only: bool,
     /// Optional named shutdown event used to trigger a graceful unmount/shutdown.
     pub shutdown_event_name: Option<String>,
+    /// Optional one-shot callback invoked after the native mount is attached.
+    pub mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl WinfspMountRequest {
+    /// Set a callback invoked after the native mount point is attached.
+    pub fn with_mount_ready_callback(mut self, callback: Box<dyn FnOnce() + Send>) -> Self {
+        self.mount_ready_callback = Some(callback);
+        self
+    }
 }
 
 fn winfsp_dll_stem_for_arch(target_arch: &str) -> Option<&'static str> {
@@ -795,15 +805,20 @@ fn winfsp_async_callback_drain_timeout() -> std::time::Duration {
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
 /// external process (`studiofs umount`) can signal a graceful shutdown.
 pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
-    mount_and_serve_with_ready_callback(request, None)
+    mount_and_serve_inner(request)
 }
 
 /// Start WinFSP and invoke `mount_ready_callback` after the mount point is
 /// attached, before the serving loop starts.
 pub fn mount_and_serve_with_ready_callback(
-    request: WinfspMountRequest,
+    mut request: WinfspMountRequest,
     mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
 ) -> std::io::Result<()> {
+    request.mount_ready_callback = mount_ready_callback;
+    mount_and_serve_inner(request)
+}
+
+fn mount_and_serve_inner(request: WinfspMountRequest) -> std::io::Result<()> {
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
     use crate::context::PreparedWinfspNotifications;
@@ -817,6 +832,7 @@ pub fn mount_and_serve_with_ready_callback(
         volume_label,
         read_only,
         shutdown_event_name,
+        mount_ready_callback,
     } = request;
 
     let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;

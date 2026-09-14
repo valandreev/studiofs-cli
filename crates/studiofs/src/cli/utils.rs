@@ -3,8 +3,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub(crate) const CLIENT_ROOT_ENV: &str = "STUDIOFS_CLIENT_ROOT";
@@ -119,17 +120,24 @@ fn default_mount_record_version() -> u32 {
     MOUNT_RECORD_VERSION
 }
 
+/// Lifecycle state persisted in a mount record.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MountRecordStatus {
+    /// The child owns the mount lock but native attach has not completed.
     #[default]
     Starting,
+    /// The native mount is attached while metadata synchronization may continue.
     Mounted,
+    /// The native mount and metadata synchronization are live.
     Live,
+    /// The native mount remains usable with degraded synchronization.
     Degraded,
+    /// Mount preparation or serving failed.
     Failed,
 }
 
+/// JSON state shared by a foreground mount child and detached parent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MountRecordInfo {
     #[serde(default = "default_mount_record_version")]
@@ -143,8 +151,10 @@ pub(crate) struct MountRecordInfo {
     pub cache_path: Option<String>,
     #[serde(default)]
     pub instance_id: Option<String>,
+    /// Local/native lifecycle state used by the detached handshake.
     #[serde(default)]
     pub status: MountRecordStatus,
+    /// PostgreSQL synchronization lifecycle, when known.
     #[serde(default)]
     pub sync_lifecycle: Option<String>,
 }
@@ -267,10 +277,42 @@ fn write_mount_record_file(path: &Path, record: &MountRecordInfo) -> Result<()> 
     serde_json::to_writer_pretty(temporary.as_file_mut(), record)?;
     temporary.as_file_mut().flush()?;
     temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| anyhow!("replace mount record '{}': {}", path.display(), error.error))?;
-    Ok(())
+    let mut temporary = Some(temporary);
+    for attempt in 0..3 {
+        let file = temporary
+            .take()
+            .ok_or_else(|| anyhow!("mount record replacement file was lost"))?;
+        match file.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt < 2 && is_retryable_mount_record_replace_error(&error.error) => {
+                temporary = Some(error.file);
+                std::thread::sleep(Duration::from_millis(5 << attempt));
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "replace mount record '{}': {}",
+                    path.display(),
+                    error.error
+                ));
+            }
+        }
+    }
+    Err(anyhow!("mount record replacement attempts exhausted"))
+}
+
+fn is_retryable_mount_record_replace_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+        ) || matches!(error.raw_os_error(), Some(5 | 32))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 pub(crate) fn update_mount_record_status(
@@ -307,15 +349,18 @@ pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<Moun
             Ok(record) if record.volume == volume => record,
             _ => continue,
         };
-        if matches!(
-            record.status,
-            MountRecordStatus::Mounted | MountRecordStatus::Live | MountRecordStatus::Degraded
-        ) && mount_is_active(&record.mount_point)?
-        {
+        if mount_record_is_active_candidate(&record) && mount_is_active(&record.mount_point)? {
             return Ok(Some(record));
         }
     }
     Ok(None)
+}
+
+fn mount_record_is_active_candidate(record: &MountRecordInfo) -> bool {
+    matches!(
+        record.status,
+        MountRecordStatus::Mounted | MountRecordStatus::Live | MountRecordStatus::Degraded
+    ) || (record.instance_id.is_none() && record.status == MountRecordStatus::Starting)
 }
 
 /// Read PID file → `(pid, mount_point, volume)`.
@@ -701,6 +746,29 @@ mod tests {
 
         assert_eq!(record.status, MountRecordStatus::Starting);
         assert_eq!(record.sync_lifecycle, None);
+    }
+
+    #[test]
+    fn active_mount_record_candidate_preserves_legacy_records_only() {
+        let mut record = MountRecordInfo {
+            record_version: MOUNT_RECORD_VERSION,
+            pid: 123,
+            mount_point: "T:".to_string(),
+            volume: "demo".to_string(),
+            cache_path: None,
+            instance_id: None,
+            status: MountRecordStatus::Starting,
+            sync_lifecycle: None,
+        };
+
+        assert!(mount_record_is_active_candidate(&record));
+
+        record.instance_id = Some("current-instance".to_string());
+        assert!(!mount_record_is_active_candidate(&record));
+
+        record.instance_id = None;
+        record.status = MountRecordStatus::Failed;
+        assert!(!mount_record_is_active_candidate(&record));
     }
 
     #[test]

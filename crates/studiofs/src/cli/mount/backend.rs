@@ -172,17 +172,17 @@ impl MountBackend for WinfspMountBackend {
 
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
         let shutdown_event_name = crate::cli::utils::shutdown_event_name(&launch.mount_point);
-        studiofs_winfsp::mount_and_serve_with_ready_callback(
-            studiofs_winfsp::WinfspMountRequest {
-                vfs: launch.vfs,
-                runtime_handle: launch.runtime_handle,
-                mount_point: launch.mount_point,
-                volume_label: launch.volume_name,
-                read_only: launch.read_only,
-                shutdown_event_name: Some(shutdown_event_name),
-            },
-            Some(launch.mount_ready_callback),
-        )
+        let request = studiofs_winfsp::WinfspMountRequest {
+            vfs: launch.vfs,
+            runtime_handle: launch.runtime_handle,
+            mount_point: launch.mount_point,
+            volume_label: launch.volume_name,
+            read_only: launch.read_only,
+            shutdown_event_name: Some(shutdown_event_name),
+            mount_ready_callback: None,
+        }
+        .with_mount_ready_callback(launch.mount_ready_callback);
+        studiofs_winfsp::mount_and_serve(request)
     }
 }
 
