@@ -673,25 +673,25 @@ pub enum PgSyncFailure {
     /// The local cursor fell behind the retained remote event history.
     ReplayGap {
         /// Last local replay cursor before the missing range.
-        local_version: u64,
+        local_version: Option<u64>,
         /// First available remote batch after the local cursor.
-        first_available_version: u64,
+        first_available_version: Option<u64>,
         /// Frozen target for the catch-up session.
-        target_version: u64,
+        target_version: Option<u64>,
     },
     /// A catch-up page did not advance the local cursor.
     CatchUpStalled {
         /// Last local replay cursor observed by the stalled session.
-        local_version: u64,
+        local_version: Option<u64>,
         /// Frozen target for the stalled session.
-        target_version: u64,
+        target_version: Option<u64>,
     },
     /// A bounded catch-up session yielded after consuming its page budget.
     CatchUpBudgetExceeded {
         /// Last local replay cursor observed by the session.
-        local_version: u64,
+        local_version: Option<u64>,
         /// Frozen target for the session.
-        target_version: u64,
+        target_version: Option<u64>,
         /// Number of complete pages applied by the session.
         pages: u64,
     },
@@ -725,24 +725,24 @@ impl PgSyncFailure {
                 first_available_version,
                 target_version,
             } => Self::ReplayGap {
-                local_version: (*local_version).try_into().unwrap_or_default(),
-                first_available_version: (*first_available_version).try_into().unwrap_or_default(),
-                target_version: (*target_version).try_into().unwrap_or_default(),
+                local_version: (*local_version).try_into().ok(),
+                first_available_version: (*first_available_version).try_into().ok(),
+                target_version: (*target_version).try_into().ok(),
             },
             MetaError::CatchUpStalled {
                 local_version,
                 target_version,
             } => Self::CatchUpStalled {
-                local_version: (*local_version).try_into().unwrap_or_default(),
-                target_version: (*target_version).try_into().unwrap_or_default(),
+                local_version: (*local_version).try_into().ok(),
+                target_version: (*target_version).try_into().ok(),
             },
             MetaError::CatchUpBudgetExceeded {
                 local_version,
                 target_version,
                 pages,
             } => Self::CatchUpBudgetExceeded {
-                local_version: (*local_version).try_into().unwrap_or_default(),
-                target_version: (*target_version).try_into().unwrap_or_default(),
+                local_version: (*local_version).try_into().ok(),
+                target_version: (*target_version).try_into().ok(),
                 pages: (*pages).try_into().unwrap_or_default(),
             },
             MetaError::InvalidCheckpointDescriptor { .. }

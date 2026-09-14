@@ -494,6 +494,14 @@ struct PgSyncProgressState {
     last_progress_log_at: Option<Instant>,
 }
 
+#[derive(Default)]
+pub(super) struct PgSyncProgressSnapshot {
+    pub(super) current_page: Option<PgSyncPageDiagnostics>,
+    pub(super) last_page: Option<PgSyncPageDiagnostics>,
+    pub(super) last_sync_error: Option<PgSyncFailure>,
+    pub(super) rebootstrap_required: bool,
+}
+
 impl PgMetaEngine {
     const LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
     const LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS: u64 = 30_000;
@@ -550,6 +558,7 @@ impl PgMetaEngine {
     pub(super) fn record_pg_sync_success(&self) {
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
             progress.last_sync_error = None;
+            progress.rebootstrap_required = false;
         }
     }
 
@@ -563,23 +572,14 @@ impl PgMetaEngine {
         }
     }
 
-    pub(super) fn pg_sync_progress_snapshot(
-        &self,
-    ) -> (
-        Option<PgSyncPageDiagnostics>,
-        Option<PgSyncPageDiagnostics>,
-        Option<PgSyncFailure>,
-        bool,
-    ) {
+    pub(super) fn pg_sync_progress_snapshot(&self) -> PgSyncProgressSnapshot {
         self.pg_sync_progress_state
             .lock()
-            .map(|progress| {
-                (
-                    progress.current_page,
-                    progress.last_page,
-                    progress.last_sync_error,
-                    progress.rebootstrap_required,
-                )
+            .map(|progress| PgSyncProgressSnapshot {
+                current_page: progress.current_page,
+                last_page: progress.last_page,
+                last_sync_error: progress.last_sync_error,
+                rebootstrap_required: progress.rebootstrap_required,
             })
             .unwrap_or_default()
     }

@@ -157,8 +157,7 @@ impl MetaReplication for PgMetaEngine {
 
     fn pg_sync_diagnostics(&self) -> PgSyncDiagnostics {
         let status = self.pg_sync_status();
-        let (current_page, last_page, last_sync_error, rebootstrap_required) =
-            self.pg_sync_progress_snapshot();
+        let progress = self.pg_sync_progress_snapshot();
         let local_applied_version = u64::try_from(self.local_version.load(Ordering::Acquire)).ok();
         let startup_target_version =
             u64::try_from(self.metadata_startup_target_version.load(Ordering::Acquire)).ok();
@@ -183,11 +182,11 @@ impl MetaReplication for PgMetaEngine {
             startup_target_version,
             remote_head_version,
             remaining_version_distance,
-            current_page,
-            last_page,
-            last_sync_error,
+            current_page: progress.current_page,
+            last_page: progress.last_page,
+            last_sync_error: progress.last_sync_error,
             checkpoint,
-            rebootstrap_required,
+            rebootstrap_required: progress.rebootstrap_required,
             source_connected: self.metadata_source_connected.load(Ordering::Acquire),
             sync_errors: self.metadata_sync_errors.load(Ordering::Relaxed),
             last_successful_sync_unix_ms,

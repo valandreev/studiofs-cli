@@ -11,7 +11,7 @@ use studiofs_cache::runtime::{
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
-use studiofs_meta::{PgSyncDiagnostics, PgSyncPageDiagnostics};
+use studiofs_meta::{PgSyncDiagnostics, PgSyncLifecycle, PgSyncPageDiagnostics};
 use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
 #[cfg(test)]
 use uuid::Uuid;
@@ -113,9 +113,13 @@ fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
     };
     let first = format_version(page.first_batch_version);
     let last = format_version(page.last_batch_version);
+    let oversized = if page.oversized { ", oversized" } else { "" };
     format!(
-        "{first}..{last} ({} batches, {} events, {} bytes, more={})",
-        page.batch_count, page.event_count, page.response_bytes, page.has_more
+        "{first}..{last} ({} batches, {} events, {}, more={}{oversized})",
+        page.batch_count,
+        page.event_count,
+        format_bytes(page.response_bytes),
+        page.has_more
     )
 }
 
@@ -138,18 +142,25 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
     println!("\nPostgreSQL Sync");
     println!("────────────────");
     println!("  Lifecycle:              {:?}", diagnostics.lifecycle);
-    println!(
-        "  Local applied/target:   {}/{}",
-        format_version(diagnostics.local_applied_version),
-        format_version(diagnostics.startup_target_version)
-    );
+    if diagnostics.lifecycle == PgSyncLifecycle::Live {
+        println!(
+            "  Local applied version:  {}",
+            format_version(diagnostics.local_applied_version)
+        );
+    } else {
+        println!(
+            "  Local applied/target:   {}/{}",
+            format_version(diagnostics.local_applied_version),
+            format_version(diagnostics.startup_target_version)
+        );
+        println!(
+            "  Target remaining:       {}",
+            format_version(diagnostics.remaining_version_distance)
+        );
+    }
     println!(
         "  Remote head:            {}",
         format_version(diagnostics.remote_head_version)
-    );
-    println!(
-        "  Target remaining:       {}",
-        format_version(diagnostics.remaining_version_distance)
     );
     println!(
         "  Checkpoint version:     {}",
@@ -185,20 +196,20 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
         println!("  Authority reason:       {reason:?}");
     }
     println!(
-        "  Source connected:        {}",
+        "  Source connected:       {}",
         if diagnostics.source_connected {
             "yes"
         } else {
             "no"
         }
     );
-    println!("  Sync errors:             {}", diagnostics.sync_errors);
+    println!("  Sync errors:            {}", diagnostics.sync_errors);
     println!(
         "  Last successful sync:   {}",
         format_last_successful_sync(diagnostics.last_successful_sync_unix_ms, current_unix_ms(),)
     );
     println!(
-        "  Last sync error:         {}",
+        "  Last sync error:        {}",
         diagnostics
             .last_sync_error
             .as_ref()
@@ -206,7 +217,7 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
             .unwrap_or_else(|| "none".to_string())
     );
     println!(
-        "  Rebootstrap required:    {}",
+        "  Rebootstrap required:   {}",
         if diagnostics.rebootstrap_required {
             "yes"
         } else {
@@ -1313,12 +1324,12 @@ mod tests {
             event_count: 7,
             response_bytes: 128,
             has_more: true,
-            oversized: false,
+            oversized: true,
         };
 
         assert_eq!(
             format_page(Some(&page)),
-            "4..9 (3 batches, 7 events, 128 bytes, more=true)"
+            "4..9 (3 batches, 7 events, 128B, more=true, oversized)"
         );
     }
 

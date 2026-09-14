@@ -270,8 +270,10 @@ impl PgMetaEngine {
             tracing::debug!(
                 volume_id = self.volume_id,
                 local_applied_version = last_batch_version,
-                startup_target_version = target_version,
-                remaining_version_distance = target_version.saturating_sub(last_batch_version),
+                target_version,
+                remaining_version_distance = target_version
+                    .saturating_sub(last_batch_version)
+                    .max(0),
                 first_batch_version = ?page.first_batch_version,
                 last_batch_version = ?page.last_batch_version,
                 batch_count = page.batch_count,
@@ -318,6 +320,7 @@ impl PgMetaEngine {
         if outcome.flushed_event_seq.is_some() {
             self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
         }
+        drop(pending_state);
         self.record_pg_sync_page_applied(page_diagnostics);
         Ok(outcome.changed)
     }

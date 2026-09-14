@@ -179,6 +179,21 @@ fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
 }
 
 #[test]
+fn pg_sync_success_clears_rebootstrap_requirement() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: -1,
+        first_available_version: 1,
+        target_version: 3,
+    });
+    assert!(engine.pg_sync_diagnostics().rebootstrap_required);
+
+    engine.record_pg_sync_success();
+
+    assert!(!engine.pg_sync_diagnostics().rebootstrap_required);
+}
+
+#[test]
 fn pg_sync_failure_classifies_nested_and_oversized_errors() {
     assert_eq!(
         PgSyncFailure::from_error(&MetaError::EventTooLarge {
@@ -193,6 +208,44 @@ fn pg_sync_failure_classifies_nested_and_oversized_errors() {
             source: Box::new(MetaError::RemoteUnavailable("test-postgres-dsn".into(),)),
         }),
         PgSyncFailure::RemoteUnavailable
+    );
+}
+
+#[test]
+fn pg_sync_failure_preserves_uninitialized_versions() {
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::ReplayGap {
+            local_version: -1,
+            first_available_version: 1,
+            target_version: 3,
+        }),
+        PgSyncFailure::ReplayGap {
+            local_version: None,
+            first_available_version: Some(1),
+            target_version: Some(3),
+        }
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::CatchUpStalled {
+            local_version: -1,
+            target_version: 3,
+        }),
+        PgSyncFailure::CatchUpStalled {
+            local_version: None,
+            target_version: Some(3),
+        }
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::CatchUpBudgetExceeded {
+            local_version: -1,
+            target_version: 3,
+            pages: 0,
+        }),
+        PgSyncFailure::CatchUpBudgetExceeded {
+            local_version: None,
+            target_version: Some(3),
+            pages: 0,
+        }
     );
 }
 

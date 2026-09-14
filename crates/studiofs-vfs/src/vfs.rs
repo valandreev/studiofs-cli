@@ -7494,20 +7494,25 @@ impl StudioVfs {
         let mut diagnostics = self.meta.sync_view().pg_sync_diagnostics();
         #[cfg(test)]
         {
+            let mut overridden = false;
             if !self.read_only_mount
                 && let Some(authority_override) = *self.metadata_authority_override.lock()
             {
                 diagnostics.authority = authority_override;
+                overridden = true;
             }
             if let Some(lifecycle_override) = *self.metadata_sync_lifecycle_override.lock() {
                 diagnostics.lifecycle = lifecycle_override;
+                overridden = true;
             }
-            let gate = PgSyncDiagnostics::from_status(PgSyncStatus::new(
-                diagnostics.lifecycle,
-                diagnostics.authority,
-            ));
-            diagnostics.write_authority = gate.write_authority;
-            diagnostics.write_authority_reason = gate.write_authority_reason;
+            if overridden {
+                let gate = PgSyncDiagnostics::from_status(PgSyncStatus::new(
+                    diagnostics.lifecycle,
+                    diagnostics.authority,
+                ));
+                diagnostics.write_authority = gate.write_authority;
+                diagnostics.write_authority_reason = gate.write_authority_reason;
+            }
         }
         if self.read_only_mount {
             diagnostics.authority = MetadataAuthorityStatus::read_only();
