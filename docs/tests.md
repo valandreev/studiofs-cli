@@ -108,6 +108,22 @@ run those through the focused Snapshot v2 integration/E2E commands rather than
 claiming them from parser-only evidence. Do not replace these commands with a
 filter that reports `running 0 tests`.
 
+### SFS-709 Event-log retention
+
+Run the portable floor/SQL/configuration checks and the explicitly ignored
+PostgreSQL retention regressions:
+
+```powershell
+cargo test -p studiofs-meta event_log_pruning --lib -- --nocapture
+cargo test -p studiofs-meta pg_event_log_prune_deletes_complete_batches_in_bounded_transactions --lib -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-meta pg_event_log_prune_preserves_retained_snapshot_source_events --lib -- --ignored --nocapture --test-threads=1
+```
+
+The two PostgreSQL tests require `STUDIOFS_TEST_PG_DSN` with a local
+PostgreSQL instance. They verify bounded complete-batch deletion, persisted
+floor/counter progress, and retention of event rows required by a retained
+Snapshot v2 source.
+
 ### SFS-647 Secret Redaction and Error Category Regressions
 
 Run these focused checks when changing persisted-config diagnostics, PostgreSQL

@@ -79,6 +79,10 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     checkpoint_total_event_bytes >= 0
                     AND checkpoint_total_event_bytes <= total_event_payload_bytes
                 ),
+            event_log_prune_floor BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_prune_floor >= 0),
+            event_log_pruned_rows BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_pruned_rows >= 0),
             snapshot BYTEA NOT NULL,
             checkpoint_sha256 BYTEA NOT NULL
                 CHECK (octet_length(checkpoint_sha256) = 32),
@@ -106,6 +110,12 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     checkpoint_total_event_bytes >= 0
                     AND checkpoint_total_event_bytes <= total_event_payload_bytes
                 );
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS event_log_prune_floor BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_prune_floor >= 0);
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS event_log_pruned_rows BIGINT NOT NULL DEFAULT 0
+                CHECK (event_log_pruned_rows >= 0);
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_sha256 BYTEA NOT NULL
                 DEFAULT decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex')
@@ -797,6 +807,8 @@ mod tests {
             "metadata_format_version SMALLINT NOT NULL",
             "total_event_payload_bytes BIGINT NOT NULL",
             "checkpoint_total_event_bytes BIGINT NOT NULL",
+            "event_log_prune_floor BIGINT NOT NULL",
+            "event_log_pruned_rows BIGINT NOT NULL",
             "checkpoint_sha256 BYTEA NOT NULL",
             "checkpoint_publication_state TEXT NOT NULL",
             "checkpoint_generation BIGINT NOT NULL",

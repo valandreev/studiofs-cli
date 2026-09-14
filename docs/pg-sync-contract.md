@@ -50,6 +50,7 @@ No caller may infer one of these states from another.
 | `local serving view` | The local `redb` view used by foreground mounted reads and metadata operations. It resolves local overlay state over the last remote-visible base state. |
 | `serving checkpoint` | A serialized snapshot of remote-visible metadata: namespace, attributes, regular-file base graph, symlinks, xattrs, and ACL rules. |
 | `checkpoint_version` | The remote event-log version represented by a serving checkpoint. |
+| `event_log_prune_floor` | The highest complete event-log batch version durably removed by background retention maintenance. Replay cursors below this floor require checkpoint rebootstrap handling. |
 | `remote head` | The monotonic `metadata_state.version` observed at one point in time. It can advance after the observation. |
 | `replay cursor` | The scalar `batch_version` of the last fully applied remote batch. The cursor advances only after the corresponding complete page has been applied locally; `seq_id` orders rows within a batch but is not a separate persisted cursor component. |
 | `startup target` | One remote version captured for a client startup or catch-up operation. It is frozen for that operation and is not re-read as a moving completion target. |
@@ -232,6 +233,29 @@ transaction lock keyed by volume). A publisher that cannot acquire the claim
 must defer and report the attempt rather than serialize a duplicate checkpoint
 concurrently. A process-local replication mutex is not sufficient coordination
 across clients.
+
+## Event-Log Retention
+
+After a fully published checkpoint is available, background PostgreSQL
+maintenance may prune obsolete `event_log` rows. The candidate floor is the
+minimum of that published `checkpoint_version` and every retained Snapshot v2
+source's first required event version minus one. Source rows belonging to
+`creating`, `ready`, or `deleting` snapshots remain retention guards until the
+source row is removed; a source with no event rows does not lower the floor.
+
+The maintenance transaction takes the per-volume janitor advisory lock and the
+published `metadata_state` row lock before calculating the floor. It removes
+only complete `batch_version` groups, limited by the configured number of
+groups per transaction, and advances the persisted
+`metadata_state.event_log_prune_floor` only after no lower rows remain. The
+`event_log_pruned_rows` counter and structured maintenance record expose the
+amount removed without exposing credentials or connection details. Pruning is
+not part of foreground writes, flushes, or startup.
+
+If a replay cursor is below the persisted floor, the client must use the finite
+history recovery path. Explicit replay-gap classification and the typed
+rebootstrap-required outcome are owned by SFS-711; automatic client rebase is
+owned by SFS-712.
 
 ## Finite Remote History and Recovery
 

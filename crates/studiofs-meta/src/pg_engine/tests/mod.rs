@@ -7,6 +7,7 @@ use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod event_log_pruning;
 mod inode_allocator;
 mod janitor;
 mod lifecycle;
@@ -441,6 +442,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         command_timeout: Duration::from_millis(50),
         sync_max_batches_per_page: 64,
         sync_max_response_bytes_per_page: 8 * 1024 * 1024,
+        event_log_prune_batches: 64,
         checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy::default(),
         checkpoint_freshness_state: Mutex::new(
             checkpoint_freshness::CheckpointFreshnessState::new(

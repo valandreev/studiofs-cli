@@ -452,6 +452,13 @@ impl PgMetaEngine {
                             "postgres background metadata synchronization did not complete"
                         );
                     }
+                    if let Err(error) = engine.run_event_log_prune_once() {
+                        warn!(
+                            error = %error,
+                            volume_id = engine.volume_id,
+                            "postgres background event-log pruning did not complete"
+                        );
+                    }
                 }
             })
             .map_err(|error| {
