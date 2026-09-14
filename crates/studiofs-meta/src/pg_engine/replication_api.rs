@@ -165,7 +165,10 @@ impl MetaReplication for PgMetaEngine {
         let observed_remote_head_version =
             u64::try_from(self.metadata_remote_head_version.load(Ordering::Acquire)).ok();
         let checkpoint = self.metadata_checkpoint_freshness_diagnostics();
-        let remote_head_version = observed_remote_head_version.or(checkpoint.head_version);
+        let remote_head_version = match (observed_remote_head_version, checkpoint.head_version) {
+            (Some(observed), Some(checkpoint)) => Some(observed.max(checkpoint)),
+            (observed, checkpoint) => observed.or(checkpoint),
+        };
         let remaining_version_distance = startup_target_version
             .zip(local_applied_version)
             .map(|(target, local)| target.saturating_sub(local));

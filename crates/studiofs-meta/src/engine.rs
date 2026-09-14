@@ -663,7 +663,7 @@ impl PgSyncStatus {
 ///
 /// Remote error text is intentionally discarded because it can contain a DSN,
 /// credential, or backend-specific detail that is not suitable for status output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PgSyncFailure {
     /// The remote metadata service could not be reached.
@@ -753,8 +753,12 @@ impl PgSyncFailure {
             },
             MetaError::UuidMismatch { .. } => Self::UuidMismatch,
             MetaError::LifecycleFatal => Self::LifecycleFatal,
+            MetaError::EventTooLarge { .. } => Self::Storage,
             MetaError::Storage(_) => Self::Storage,
-            MetaError::NamespaceBatchOperation { source, .. } => Self::from_error(source),
+            MetaError::NamespaceBatchOperation { source, .. }
+            | MetaError::RegularFileOverlayBatchOperation { source, .. } => {
+                Self::from_error(source)
+            }
             _ => Self::Other,
         }
     }
@@ -851,7 +855,7 @@ impl PgSyncDiagnostics {
 }
 
 /// Metadata returned for one bounded PostgreSQL replay page.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgSyncPageDiagnostics {
     /// First batch version returned by the page.
     pub first_batch_version: Option<u64>,

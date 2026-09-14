@@ -262,7 +262,7 @@ impl PgMetaEngine {
             has_more: page.has_more,
             oversized: page.oversized,
         };
-        let should_log = self.record_pg_sync_page_selected(page_diagnostics.clone());
+        let should_log = self.record_pg_sync_page_selected(page_diagnostics);
         // Keep the local event position, serving-state reconcile, and pending
         // replay atomic with respect to local metadata mutations. The network
         // query above deliberately stays outside this critical section.

@@ -528,8 +528,9 @@ impl PgMetaEngine {
         let Ok(mut progress) = self.pg_sync_progress_state.lock() else {
             return false;
         };
-        progress.current_page = Some(page.clone());
-        let should_log = progress.last_progress_log_at.is_none()
+        progress.current_page = Some(page);
+        let should_log = !page.has_more
+            || progress.last_progress_log_at.is_none()
             || progress
                 .last_progress_log_at
                 .is_some_and(|last| last.elapsed() >= Duration::from_secs(1));
@@ -554,6 +555,7 @@ impl PgMetaEngine {
 
     pub(super) fn record_pg_sync_failure(&self, error: &MetaError) {
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
+            progress.current_page = None;
             if matches!(error, MetaError::ReplayGap { .. }) {
                 progress.rebootstrap_required = true;
             }
@@ -573,9 +575,9 @@ impl PgMetaEngine {
             .lock()
             .map(|progress| {
                 (
-                    progress.current_page.clone(),
-                    progress.last_page.clone(),
-                    progress.last_sync_error.clone(),
+                    progress.current_page,
+                    progress.last_page,
+                    progress.last_sync_error,
                     progress.rebootstrap_required,
                 )
             })
@@ -613,9 +615,6 @@ impl PgMetaEngine {
     }
 
     fn mark_replay_gap_recovery_required(&self) {
-        if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
-            progress.rebootstrap_required = true;
-        }
         self.metadata_startup_target_version
             .store(-1, Ordering::Release);
         self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);

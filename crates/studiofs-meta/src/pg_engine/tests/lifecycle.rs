@@ -97,6 +97,26 @@ fn pg_sync_diagnostics_reports_frozen_target_and_remaining_distance() {
 }
 
 #[test]
+fn pg_sync_diagnostics_prefers_newer_checkpoint_head_observation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .metadata_remote_head_version
+        .store(10, std::sync::atomic::Ordering::Release);
+    engine.record_checkpoint_freshness_observation(
+        super::super::metadata_io::CheckpointFreshnessObservation {
+            head_version: 14,
+            checkpoint_version: 10,
+            total_event_payload_bytes: 0,
+            format_info_present: true,
+            event_payload_bytes: 0,
+            checkpoint_age: Duration::ZERO,
+        },
+    );
+
+    assert_eq!(engine.pg_sync_diagnostics().remote_head_version, Some(14));
+}
+
+#[test]
 fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     let failure = MetaError::RemoteUnavailable("test-postgres-dsn".into());
@@ -138,23 +158,42 @@ fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
         first_batch_version: Some(5),
         last_batch_version: Some(8),
         has_more: false,
-        ..first_page.clone()
+        ..first_page
     };
 
-    assert!(engine.record_pg_sync_page_selected(first_page.clone()));
-    assert!(!engine.record_pg_sync_page_selected(first_page.clone()));
-    assert!(!engine.record_pg_sync_page_selected(next_page.clone()));
-    assert_eq!(
-        engine.pg_sync_diagnostics().current_page,
-        Some(next_page.clone())
-    );
+    assert!(engine.record_pg_sync_page_selected(first_page));
+    engine.record_pg_sync_failure(&MetaError::RemoteUnavailable("test-postgres-dsn".into()));
+    assert_eq!(engine.pg_sync_diagnostics().current_page, None);
 
-    engine.record_pg_sync_page_applied(next_page.clone());
+    assert!(!engine.record_pg_sync_page_selected(first_page));
+    assert!(!engine.record_pg_sync_page_selected(first_page));
+    assert!(engine.record_pg_sync_page_selected(next_page));
+    assert_eq!(engine.pg_sync_diagnostics().current_page, Some(next_page));
+
+    engine.record_pg_sync_page_applied(next_page);
     assert_eq!(engine.pg_sync_diagnostics().current_page, None);
     assert_eq!(engine.pg_sync_diagnostics().last_page, Some(next_page));
 
     engine.record_pg_sync_success();
     assert_eq!(engine.pg_sync_diagnostics().last_sync_error, None);
+}
+
+#[test]
+fn pg_sync_failure_classifies_nested_and_oversized_errors() {
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::EventTooLarge {
+            estimated: 10,
+            limit: 5,
+        }),
+        PgSyncFailure::Storage
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::RegularFileOverlayBatchOperation {
+            index: 0,
+            source: Box::new(MetaError::RemoteUnavailable("test-postgres-dsn".into(),)),
+        }),
+        PgSyncFailure::RemoteUnavailable
+    );
 }
 
 #[test]

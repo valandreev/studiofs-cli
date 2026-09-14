@@ -5,6 +5,7 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use studiofs_cache::runtime::{
     CacheIndex, LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
@@ -118,6 +119,21 @@ fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
     )
 }
 
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+fn format_last_successful_sync(timestamp: Option<i64>, now_ms: u64) -> String {
+    let Some(timestamp) = timestamp.and_then(|timestamp| u64::try_from(timestamp).ok()) else {
+        return "unknown".to_string();
+    };
+    format!("{}ms ago", now_ms.saturating_sub(timestamp))
+}
+
 fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
     println!("\nPostgreSQL Sync");
     println!("────────────────");
@@ -128,23 +144,27 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
         format_version(diagnostics.startup_target_version)
     );
     println!(
-        "  Remote head/remaining:  {}/{}",
-        format_version(diagnostics.remote_head_version),
+        "  Remote head:            {}",
+        format_version(diagnostics.remote_head_version)
+    );
+    println!(
+        "  Target remaining:       {}",
         format_version(diagnostics.remaining_version_distance)
     );
     println!(
         "  Checkpoint version:     {}",
         format_version(diagnostics.checkpoint.checkpoint_version)
     );
-    println!(
-        "  Checkpoint refresh:     {} ({:?})",
-        if diagnostics.checkpoint.refresh_needed {
-            "needed"
-        } else {
-            "not needed"
-        },
-        diagnostics.checkpoint.refresh_reason
-    );
+    let refresh_state = if diagnostics.checkpoint.refresh_needed {
+        "needed"
+    } else {
+        "not needed"
+    };
+    if let Some(reason) = diagnostics.checkpoint.refresh_reason {
+        println!("  Checkpoint refresh:     {refresh_state} ({reason:?})");
+    } else {
+        println!("  Checkpoint refresh:     {refresh_state}");
+    }
     println!(
         "  Current page:           {}",
         format_page(diagnostics.current_page.as_ref())
@@ -173,6 +193,10 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
         }
     );
     println!("  Sync errors:             {}", diagnostics.sync_errors);
+    println!(
+        "  Last successful sync:   {}",
+        format_last_successful_sync(diagnostics.last_successful_sync_unix_ms, current_unix_ms(),)
+    );
     println!(
         "  Last sync error:         {}",
         diagnostics
@@ -1296,6 +1320,12 @@ mod tests {
             format_page(Some(&page)),
             "4..9 (3 batches, 7 events, 128 bytes, more=true)"
         );
+    }
+
+    #[test]
+    fn pg_sync_last_successful_sync_format_reports_age() {
+        assert_eq!(format_last_successful_sync(Some(1_234), 2_000), "766ms ago");
+        assert_eq!(format_last_successful_sync(None, 2_000), "unknown");
     }
 
     #[test]
