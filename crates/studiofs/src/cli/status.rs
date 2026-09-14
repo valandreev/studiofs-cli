@@ -107,6 +107,21 @@ fn format_version(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn mounted_pg_sync_diagnostics(volume_name: &str) -> Option<PgSyncDiagnostics> {
+    let discovery = crate::diagnostics::discover_local_sessions()
+        .ok()?
+        .into_iter()
+        .find(|session| session.volume == volume_name)?;
+    let client = crate::diagnostics::LocalDiagnosticsClient::new(discovery);
+    crate::runtime_bridge::block_on(async move {
+        client
+            .runtime_snapshot()
+            .await
+            .map(|snapshot| snapshot.synchronization.state.pg_sync)
+    })
+    .ok()
+}
+
 fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
     let Some(page) = page else {
         return "none".to_string();
@@ -621,8 +636,30 @@ pub fn run(
         return Ok(());
     }
 
+    let mounted_pg_sync = mounted_pg_sync_diagnostics(name);
     let engine = match studiofs_meta::open_meta_engine(&db_path) {
         Ok(engine) => engine,
+        Err(error) if let Some(pg_sync) = mounted_pg_sync.as_ref() => {
+            eprintln!(
+                "warning: failed to open volume metadata at '{}': {error}",
+                db_path.display()
+            );
+            println!("StudioFS Volume Status");
+            println!("──────────────────────");
+            println!("  Name:       {}", name);
+            println!("  Metadata:   {:?}", db_path);
+            println!("  Warning:    metadata DB is locked; showing mounted process diagnostics");
+            print_pg_sync_diagnostics(pg_sync);
+            if verbosity.is_verbose() {
+                let cache_root = cache_dir
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| meta_dir.join("cache"));
+                print_mounted_write_path_fallback(read_write_path_observability_from_cache_root(
+                    &cache_root,
+                ));
+            }
+            return Ok(());
+        }
         Err(error) if verbosity.is_verbose() => {
             eprintln!(
                 "warning: failed to open volume metadata at '{}': {error}",
@@ -677,7 +714,15 @@ pub fn run(
         None
     };
 
-    let remote_size = engine.remote_metadata_size()?.unwrap_or(0);
+    let remote_size = match engine.remote_metadata_size() {
+        Ok(size) => size,
+        Err(_) => {
+            eprintln!(
+                "warning: remote metadata size is unavailable; continuing with synchronization diagnostics"
+            );
+            None
+        }
+    };
     let local_db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     println!("StudioFS Volume Status");
@@ -696,7 +741,11 @@ pub fn run(
         println!("\n  Meta backend: Postgres");
         println!("  Postgres URL:  {}", pg.url);
         println!("  Postgres vol:  {}", pg.volume_id);
-        println!("  Postgres size: {}", format_bytes(remote_size));
+        if let Some(remote_size) = remote_size {
+            println!("  Postgres size: {}", format_bytes(remote_size));
+        } else {
+            println!("  Postgres size: unavailable");
+        }
         print_pg_sync_diagnostics(&engine.pg_sync_diagnostics());
     } else {
         println!("\n  Meta backend: {:?}", format_info.metadata.backend);

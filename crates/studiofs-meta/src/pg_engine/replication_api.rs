@@ -237,8 +237,9 @@ impl MetaReplication for PgMetaEngine {
                 },
             )
             .await
-        })?;
-        Ok(Some(size))
+        });
+        self.record_metadata_source_result(&size);
+        Ok(Some(size?))
     }
 
     fn prepare_for_close(&self) -> MetaResult<()> {

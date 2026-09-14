@@ -1533,6 +1533,22 @@ fn successful_remote_operation_clears_transport_unavailable() {
             .remote_transport_unavailable
             .load(std::sync::atomic::Ordering::Acquire)
     );
+    assert!(
+        engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    engine
+        .record_remote_operation_result::<()>(Err(MetaError::RemoteUnavailable(
+            "test-postgres-dsn".to_string(),
+        )))
+        .expect_err("unavailable remote operation");
+    assert!(
+        !engine
+            .metadata_source_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 }
 
 #[test]

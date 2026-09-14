@@ -954,6 +954,7 @@ impl PgMetaEngine {
         if !self.remote_format_validated.load(Ordering::Acquire) {
             let result = self.validate_remote_format_version();
             if let Err(error) = &result {
+                self.record_metadata_source_result(&result);
                 self.invalidate_remote_validation();
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
@@ -965,10 +966,14 @@ impl PgMetaEngine {
         }
 
         if self.remote_identity_validated.load(Ordering::Acquire) {
+            self.metadata_source_connected
+                .store(true, Ordering::Release);
             return Ok(());
         }
 
-        self.validate_remote_identity()
+        let result = self.validate_remote_identity();
+        self.record_metadata_source_result(&result);
+        result
     }
 
     pub(super) fn check_remote_identity(&self) -> MetaResult<()> {
@@ -976,7 +981,9 @@ impl PgMetaEngine {
             .remote_validation_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg remote validation lock poisoned".to_string()))?;
-        self.validate_remote_identity()
+        let result = self.validate_remote_identity();
+        self.record_metadata_source_result(&result);
+        result
     }
 
     fn validate_remote_identity(&self) -> MetaResult<()> {
@@ -1045,7 +1052,13 @@ impl PgMetaEngine {
             .store(false, Ordering::Release);
     }
 
+    fn record_metadata_source_result<T>(&self, result: &MetaResult<T>) {
+        self.metadata_source_connected
+            .store(result.is_ok(), Ordering::Release);
+    }
+
     fn record_remote_operation_result<T>(&self, result: MetaResult<T>) -> MetaResult<T> {
+        self.record_metadata_source_result(&result);
         match &result {
             Ok(_) => self
                 .remote_transport_unavailable
