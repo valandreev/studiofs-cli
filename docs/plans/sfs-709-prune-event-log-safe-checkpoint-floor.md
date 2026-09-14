@@ -41,6 +41,10 @@ range intact.
       evidence.
 - [x] (2026-09-14) Inspected the final diff, ran formatting/lint/diff checks,
       and committed all intended SFS-709 files.
+- [x] (2026-09-14) Re-verified the attached review: added replay-gap fencing,
+      removed idle metadata writes, aggregated DELETE results, made the janitor
+      lock non-blocking, documented the prune limit, skipped pruning after
+      failed sync, and tested source-guard release.
 
 ## Surprises & Discoveries
 
@@ -59,9 +63,10 @@ range intact.
   with events must constrain pruning through its first event version minus one.
   Evidence: `SELECT_SNAPSHOT_EVENT_ROWS` and the source validation in
   `snapshot_control.rs`.
-- Observation: SFS-711 owns explicit replay-gap detection and automatic
-  rebootstrap is SFS-712. SFS-709 will persist the floor needed by those
-  follow-ups but will not add their typed catch-up outcome or recovery flow.
+- Observation: SFS-711 owns checkpoint import/rebootstrap recovery and
+  automatic rebootstrap is SFS-712. SFS-709 now rejects a non-contiguous page
+  with `MetaError::ReplayGap` so it cannot silently skip pruned history, but it
+  does not add the recovery flow.
   Evidence: the current Linear relation graph for SFS-709, SFS-711, and
   SFS-712.
 
@@ -96,6 +101,12 @@ range intact.
   and retries failed maintenance every interval, while keeping pruning off the
   checkpoint worker avoids delaying later ordinary publication behind an
   advisory-lock wait. Date/Author: 2026-09-14, Codex.
+- Decision: Treat an already-reached prune floor as a no-op, aggregate DELETE
+  counts in PostgreSQL, and use `pg_try_advisory_xact_lock`. Rationale: idle
+  polls must not dirty `metadata_state`, one scalar result avoids per-row
+  allocations, and background maintenance must defer rather than block
+  publication behind another janitor transaction. Date/Author: 2026-09-14,
+  Codex.
 - Decision: Serialize pruning with Snapshot v2 capture using the existing
   per-volume janitor advisory lock, then lock `metadata_state FOR UPDATE` in
   the same transaction before computing the floor and deleting rows. Rationale:
@@ -107,10 +118,11 @@ range intact.
 ## Outcomes & Retrospective
 
 The repository now has a durable per-volume pruning floor, bounded
-complete-batch event deletion, retryable background execution, and focused
-evidence that retained Snapshot v2 replay rows survive. The later SFS-711 gap
-detector can consume the persisted floor, but this task does not claim that
-detector or automatic rebootstrap is implemented.
+complete-batch event deletion, retryable background execution, a defensive
+non-contiguous-page guard, and focused evidence that retained Snapshot v2
+replay rows survive and later release pruning. The later SFS-711 checkpoint
+recovery can consume `MetaError::ReplayGap`; automatic rebootstrap remains
+outside this task.
 
 ## Context and Orientation
 
@@ -136,9 +148,10 @@ The source reader uses those bounds to reconstruct the snapshot. A source with
 version 7 onward through its cut, so pruning may advance only through version
 6 while that source remains retained.
 
-The current local replay page query in `sql.rs` remains unchanged except for
-the new persisted floor being available to later SFS-711 work. This task does
-not silently reinterpret an empty page as a replay gap.
+The current local replay page query in `sql.rs` still returns ordered complete
+batch groups and does not reinterpret an empty page as a replay gap. It now
+rejects a non-empty page whose first batch is not exactly the next version
+after the local cursor, before the rows reach foreign apply.
 
 ## Plan of Work
 
@@ -160,17 +173,21 @@ transaction, take the existing `pg_janitor_lock_key` advisory lock, lock the
 volume's published `metadata_state` row, compute the source-constrained floor,
 delete only the earliest complete event batches up to that floor, and advance
 the persisted floor only through versions with no remaining rows below the
-candidate. It will commit one bounded transaction and redact all backend error
-text through the existing error classification conventions.
+candidate. The DELETE returns one aggregate count/max-batch row; an
+already-reached floor skips DELETE and UPDATE, and a contended janitor lock
+defers via `pg_try_advisory_xact_lock`. It will commit one bounded transaction
+and redact all backend error text through the existing error classification
+conventions.
 
 Add `STUDIOFS_PG_EVENT_LOG_PRUNE_BATCHES` with a positive default to
 `pg_engine.rs`, load it through the existing environment parsing helper, and
 store it in `PgMetaEngine`. Add the field to the unit fixture so portable tests
 continue to construct the engine explicitly.
 
-Wire the method into the existing background poll after synchronization. A
-failed prune will be logged as a maintenance failure and retried by a later
-poll; it will not make an otherwise successful foreground flush fail. Include
+Wire the method into the existing background poll after a successful
+synchronization. A failed prune will be logged as a maintenance failure and
+retried by a later poll; a failed synchronization skips pruning for that poll,
+and neither case will make an otherwise successful foreground flush fail. Include
 the candidate floor, durable floor, deleted rows, and cumulative rows in the
 structured maintenance log when a prune attempt reaches PostgreSQL.
 

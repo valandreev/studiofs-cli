@@ -320,6 +320,8 @@ pub(super) const SELECT_EVENT_LOG_PRUNE_STATE: &str = r#"
     FOR UPDATE
     "#;
 
+pub(super) const TRY_EVENT_LOG_PRUNE_ADVISORY_LOCK: &str = "SELECT pg_try_advisory_xact_lock($1)";
+
 pub(super) const SELECT_EVENT_LOG_SOURCE_PRUNE_FLOOR: &str = r#"
     SELECT MIN(
         CASE
@@ -344,12 +346,16 @@ pub(super) const DELETE_EVENT_LOG_PRUNE_BATCH: &str = r#"
         GROUP BY batch_version
         ORDER BY batch_version ASC
         LIMIT $3::BIGINT
+    ),
+    deleted_batches AS (
+        DELETE FROM event_log AS event
+        USING candidate_batches AS candidate
+        WHERE event.vol = $1
+          AND event.batch_version = candidate.batch_version
+        RETURNING event.batch_version
     )
-    DELETE FROM event_log AS event
-    USING candidate_batches AS candidate
-    WHERE event.vol = $1
-      AND event.batch_version = candidate.batch_version
-    RETURNING event.batch_version
+    SELECT COUNT(*)::BIGINT AS pruned_rows, MAX(batch_version) AS max_deleted_batch
+    FROM deleted_batches
     "#;
 
 pub(super) const SELECT_EVENT_LOG_REMAINING_BELOW_FLOOR: &str = r#"

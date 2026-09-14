@@ -70,14 +70,25 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
+                        let lock_acquired = tx
+                            .query_one(sql::TRY_EVENT_LOG_PRUNE_ADVISORY_LOCK, &[&lock_key])
                             .await
                             .map_err(|error| {
                                 Self::classify_pg_error(
                                     "postgres event-log prune advisory lock failed",
                                     error,
                                 )
+                            })?
+                            .try_get::<_, bool>(0)
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres event-log prune advisory lock result parse failed",
+                                    error,
+                                )
                             })?;
+                        if !lock_acquired {
+                            return Ok(None);
+                        }
 
                         let Some(state) = tx
                             .query_opt(sql::SELECT_EVENT_LOG_PRUNE_STATE, &[&volume_id])
@@ -134,8 +145,12 @@ impl PgMetaEngine {
                             current_floor,
                         )?;
 
-                        let deleted_rows = tx
-                            .query(
+                        if current_floor >= safe_floor {
+                            return Ok(None);
+                        }
+
+                        let deleted = tx
+                            .query_one(
                                 sql::DELETE_EVENT_LOG_PRUNE_BATCH,
                                 &[&volume_id, &safe_floor, &batch_limit],
                             )
@@ -146,27 +161,27 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                        let pruned_rows = i64::try_from(deleted_rows.len()).map_err(|_| {
-                            MetaError::Storage(
-                                "postgres event-log prune row count exceeds BIGINT".to_string(),
-                            )
-                        })?;
-                        let mut max_deleted_batch = None;
-                        for row in deleted_rows {
-                            let batch_version = nonnegative(
-                                row.try_get(0).map_err(|error| {
-                                    Self::classify_pg_error(
-                                        "postgres event-log deleted batch version parse failed",
-                                        error,
-                                    )
-                                })?,
-                                "deleted batch version",
-                            )?;
-                            max_deleted_batch =
-                                Some(max_deleted_batch.map_or(batch_version, |current: i64| {
-                                    current.max(batch_version)
-                                }));
-                        }
+                        let pruned_rows = nonnegative(
+                            deleted.try_get(0).map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres event-log pruned-row count parse failed",
+                                    error,
+                                )
+                            })?,
+                            "pruned rows",
+                        )?;
+                        let max_deleted_batch = deleted
+                            .try_get::<_, Option<i64>>(1)
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres event-log deleted batch version parse failed",
+                                    error,
+                                )
+                            })?
+                            .map(|batch_version| {
+                                nonnegative(batch_version, "deleted batch version")
+                            })
+                            .transpose()?;
 
                         let has_remaining = tx
                             .query_opt(

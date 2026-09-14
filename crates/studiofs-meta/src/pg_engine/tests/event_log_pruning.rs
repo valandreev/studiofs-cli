@@ -4,6 +4,7 @@ use super::{
 };
 use crate::pg_engine::PgMetaEngine;
 use crate::pg_engine::event_log_pruning::calculate_safe_prune_floor;
+use crate::pg_engine::janitor::pg_janitor_lock_key;
 use crate::pg_engine::sql;
 use crate::snapshot::ServingCheckpoint;
 use sha2::{Digest, Sha256};
@@ -25,9 +26,12 @@ fn event_log_prune_floor_uses_the_oldest_retained_source() {
 #[test]
 fn event_log_prune_sql_is_fenced_and_batch_bounded() {
     assert!(sql::SELECT_EVENT_LOG_PRUNE_STATE.contains("FOR UPDATE"));
+    assert!(sql::TRY_EVENT_LOG_PRUNE_ADVISORY_LOCK.contains("pg_try_advisory_xact_lock"));
     assert!(sql::SELECT_EVENT_LOG_SOURCE_PRUNE_FLOOR.contains("lifecycle <> 'deleted'"));
     assert!(sql::DELETE_EVENT_LOG_PRUNE_BATCH.contains("GROUP BY batch_version"));
     assert!(sql::DELETE_EVENT_LOG_PRUNE_BATCH.contains("LIMIT $3::BIGINT"));
+    assert!(sql::DELETE_EVENT_LOG_PRUNE_BATCH.contains("COUNT(*)::BIGINT"));
+    assert!(sql::DELETE_EVENT_LOG_PRUNE_BATCH.contains("MAX(batch_version)"));
     assert!(sql::UPDATE_EVENT_LOG_PRUNE_STATE.contains("GREATEST(event_log_prune_floor, $2)"));
 }
 
@@ -121,6 +125,12 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
         assert_eq!(third.durable_floor, 3);
         assert_eq!(third.pruned_rows, 2);
         assert_eq!(third.total_pruned_rows, 6);
+        assert!(
+            engine
+                .run_event_log_prune_once()?
+                .is_none(),
+            "an already-advanced prune floor must not issue another maintenance update"
+        );
 
         let (floor, rows) = client
             .query_one(
@@ -136,6 +146,51 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
         Ok::<(), crate::engine::MetaError>(())
     })
     .expect("event-log pruning should delete bounded complete batches");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_event_log_prune_defers_when_the_janitor_lock_is_contended() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-event-log-prune-contended");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    run_async(async {
+        let (mut client, connection) =
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let connection_task = tokio::spawn(connection);
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&pg_janitor_lock_key(volume.volume_id)],
+        )
+        .await
+        .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+
+        assert!(engine.run_event_log_prune_once()?.is_none());
+
+        tx.rollback()
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        connection_task.abort();
+        Ok::<(), crate::engine::MetaError>(())
+    })
+    .expect("contended pruning should defer without waiting for the lock");
 }
 
 #[test]
@@ -250,6 +305,49 @@ fn pg_event_log_prune_preserves_retained_snapshot_source_events() {
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?
             .get::<_, i64>(0);
         assert_eq!(source_count, 1);
+
+        client
+            .execute(
+                "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = 'retained-source'",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        client
+            .execute(
+                "UPDATE snapshot_catalog SET lifecycle = 'deleted' WHERE vol = $1 AND id = 'retained-source'",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+
+        let released = engine
+            .run_event_log_prune_once()?
+            .expect("published metadata state should be prunable after source release");
+        assert_eq!(released.safe_floor, 5);
+        assert_eq!(released.durable_floor, 5);
+        assert_eq!(released.pruned_rows, 3);
+        assert_eq!(released.total_pruned_rows, 5);
+
+        let remaining = client
+            .query_one(
+                "SELECT count(*)::BIGINT FROM event_log WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?
+            .get::<_, i64>(0);
+        assert_eq!(remaining, 0);
+
+        let (floor, rows) = client
+            .query_one(
+                "SELECT event_log_prune_floor, event_log_pruned_rows FROM metadata_state WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))
+            .map(|row| (row.get::<_, i64>(0), row.get::<_, i64>(1)))?;
+        assert_eq!((floor, rows), (5, 5));
 
         connection_task.abort();
         Ok::<(), crate::engine::MetaError>(())

@@ -121,6 +121,10 @@ The bounded, frozen pull behavior above is implemented by
 `batch_version` groups through the supplied target. The per-client defaults are
 64 batches and 8 MiB of estimated PostgreSQL row response bytes; an environment
 override may tune either limit without changing the volume schema.
+Before returning a non-empty page, the query requires its first batch to be
+exactly the next version after the local cursor. A missing range returns a
+typed `MetaError::ReplayGap` and is not passed to foreign apply; the later
+checkpoint import/rebootstrap recovery remains the SFS-711 follow-up.
 
 ### Backend Selection on Open
 

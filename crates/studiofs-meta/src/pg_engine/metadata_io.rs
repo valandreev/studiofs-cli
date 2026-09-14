@@ -741,10 +741,31 @@ impl PgMetaEngine {
         Ok(batches)
     }
 
+    fn validate_foreign_event_page_continuity(
+        last_batch_version: i64,
+        first_batch_version: Option<i64>,
+        target_batch_version: i64,
+    ) -> MetaResult<()> {
+        let Some(first_batch_version) = first_batch_version else {
+            return Ok(());
+        };
+        let expected_first_batch_version = last_batch_version.checked_add(1).ok_or_else(|| {
+            MetaError::Storage("postgres metadata replay cursor exceeds BIGINT".to_string())
+        })?;
+        if first_batch_version != expected_first_batch_version {
+            return Err(MetaError::ReplayGap {
+                local_version: last_batch_version,
+                first_available_version: first_batch_version,
+                target_version: target_batch_version,
+            });
+        }
+        Ok(())
+    }
+
     pub(super) async fn query_foreign_event_page<C>(
         client: &C,
         volume_id: i64,
-        last_batch_version: i64,
+        cursor_batch_version: i64,
         target_batch_version: i64,
         max_batch_count: i64,
         max_response_bytes: i64,
@@ -753,7 +774,7 @@ impl PgMetaEngine {
         C: tokio_postgres::GenericClient + Sync,
     {
         Self::validate_foreign_event_page_limits(max_batch_count, max_response_bytes)?;
-        if target_batch_version <= last_batch_version {
+        if target_batch_version <= cursor_batch_version {
             return Ok(ForeignEventPage::empty(Vec::new()));
         }
 
@@ -762,7 +783,7 @@ impl PgMetaEngine {
                 sql::SELECT_FOREIGN_EVENT_ROWS,
                 &[
                     &volume_id,
-                    &last_batch_version,
+                    &cursor_batch_version,
                     &target_batch_version,
                     &max_batch_count,
                     &max_response_bytes,
@@ -798,6 +819,11 @@ impl PgMetaEngine {
         let oversized = first_row
             .try_get::<_, bool>("oversized")
             .map_err(decode_err)?;
+        Self::validate_foreign_event_page_continuity(
+            cursor_batch_version,
+            first_batch_version,
+            target_batch_version,
+        )?;
 
         Ok(ForeignEventPage {
             first_batch_version,
@@ -834,5 +860,19 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].payload_bytes, expected);
+    }
+
+    #[test]
+    fn foreign_event_page_rejects_a_missing_next_batch() {
+        assert!(matches!(
+            PgMetaEngine::validate_foreign_event_page_continuity(5, Some(51), 60),
+            Err(MetaError::ReplayGap {
+                local_version: 5,
+                first_available_version: 51,
+                target_version: 60,
+            })
+        ));
+        assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, Some(6), 60).is_ok());
+        assert!(PgMetaEngine::validate_foreign_event_page_continuity(5, None, 60).is_ok());
     }
 }
