@@ -1600,19 +1600,17 @@ impl MountStatusMonitor {
                 }
                 MountStatusPublishOutcome::Published
             }
+            Err(
+                utils::MountRecordUpdateError::InstanceChanged { .. }
+                | utils::MountRecordUpdateError::NotFound { .. },
+            ) => {
+                debug!(
+                    mount_point = %shared.mount_point,
+                    "stopping mount lifecycle monitor after mount record replacement or removal"
+                );
+                MountStatusPublishOutcome::Stop
+            }
             Err(error) => {
-                let instance_changed = utils::read_mount_record(&shared.mount_point)
-                    .map(|record| {
-                        record.instance_id.as_deref() != Some(shared.instance_id.as_str())
-                    })
-                    .unwrap_or(false);
-                if instance_changed {
-                    warn!(
-                        mount_point = %shared.mount_point,
-                        "stopping mount lifecycle monitor after instance change"
-                    );
-                    return MountStatusPublishOutcome::Stop;
-                }
                 warn!(
                     error = ?error,
                     mount_point = %shared.mount_point,
@@ -1739,15 +1737,18 @@ impl MountRuntimeGuard {
 
     fn launch(mut self) -> anyhow::Result<()> {
         let mount_result = self.launch_mount();
-        let cleanup_error = self.cleanup();
+        let retain_failed_record = mount_result.is_err() && self.mount_status_monitor.is_some();
+        let cleanup_error = self.cleanup_with_record_removal(!retain_failed_record);
         finish_mount_result(mount_result, cleanup_error)
     }
 
     fn launch_mount(&mut self) -> anyhow::Result<()> {
         self.prepared.write_pid_file()?;
         self.start_mount_status_monitor()?;
-        self.prepared.print_ready()?;
-        let result = self.serve_foreground();
+        let result = (|| -> anyhow::Result<()> {
+            self.prepared.print_ready()?;
+            self.serve_foreground()
+        })();
         if result.is_err()
             && let Some(monitor) = self.mount_status_monitor.as_ref()
         {
@@ -1843,7 +1844,7 @@ impl MountRuntimeGuard {
         serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))
     }
 
-    fn cleanup(&mut self) -> Option<anyhow::Error> {
+    fn cleanup_with_record_removal(&mut self, remove_mount_record: bool) -> Option<anyhow::Error> {
         let mut first_error = None;
         self.stop_mount_status_monitor();
         let foreground = self.prepared.foreground.take();
@@ -1940,11 +1941,13 @@ impl MountRuntimeGuard {
             }
         }
 
-        record_cleanup_error(
-            &mut first_error,
-            "mount record removal",
-            utils::remove_pid_file(&self.prepared.plan.actual_mount_path),
-        );
+        if remove_mount_record {
+            record_cleanup_error(
+                &mut first_error,
+                "mount record removal",
+                utils::remove_pid_file(&self.prepared.plan.actual_mount_path),
+            );
+        }
         drop(self.prepared.mount_lock.take());
 
         self.cleanup_completed = true;
@@ -2369,19 +2372,10 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         &mut child,
         DAEMON_RECORD_PUBLISH_TIMEOUT,
         DAEMON_RECORD_PUBLISH_POLL_INTERVAL,
-    )?;
+    )
+    .with_context(|| format!("check daemon log file at '{}'", plan.log_path.display()))?;
 
     let status = record.status;
-    if !matches!(
-        status,
-        utils::MountRecordStatus::Mounted
-            | utils::MountRecordStatus::Live
-            | utils::MountRecordStatus::Degraded
-    ) {
-        anyhow::bail!(
-            "background mount process returned non-ready state '{status:?}' for '{mount_point}'"
-        );
-    }
     println!(
         "✓ Volume '{}' mounted at '{}' in background (PID: {}, status: {:?}, sync: {})",
         name,
@@ -3616,7 +3610,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_mount_launch_failure_removes_pid_file() {
+    fn prepared_mount_launch_failure_leaves_failed_record_for_observation() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
@@ -3647,10 +3641,12 @@ mod tests {
 
         assert!(err.to_string().contains("FakeBackend error: boom"));
         assert_eq!(events.lock().expect("lock events").len(), 1);
-        assert!(
-            utils::read_pid_file(&actual_mount_path).is_err(),
-            "backend failure should remove pid file"
-        );
+        let record = utils::read_mount_record(&actual_mount_path)
+            .expect("backend failure should leave a failed mount record");
+        assert_eq!(record.status, utils::MountRecordStatus::Failed);
+        assert!(!utils::mount_is_active(&actual_mount_path).expect("check mount lock"));
+
+        utils::remove_pid_file(&actual_mount_path).expect("remove failed mount record");
     }
 
     #[test]
@@ -3725,7 +3721,7 @@ mod tests {
         std::fs::create_dir(&pid_path).expect("replace mount record with directory");
 
         let cleanup_error = guard
-            .cleanup()
+            .cleanup_with_record_removal(true)
             .expect("mount record cleanup failure should be returned");
         let pid_path_removed = std::fs::remove_dir(&pid_path).is_ok();
 

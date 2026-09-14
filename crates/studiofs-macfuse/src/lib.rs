@@ -86,8 +86,11 @@ impl MacFuseMountRequest {
     }
 
     /// Set a callback invoked after the native mount point is attached.
-    pub fn with_mount_ready_callback(mut self, callback: Box<dyn FnOnce() + Send>) -> Self {
-        self.mount_ready_callback = Some(callback);
+    pub fn with_mount_ready_callback<F>(mut self, callback: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.mount_ready_callback = Some(Box::new(callback));
         self
     }
 }

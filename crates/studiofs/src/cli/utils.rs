@@ -159,6 +159,16 @@ pub(crate) struct MountRecordInfo {
     pub sync_lifecycle: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MountRecordUpdateError {
+    #[error("mount record instance changed for '{mount_point}'")]
+    InstanceChanged { mount_point: String },
+    #[error("mount record not found for '{mount_point}'")]
+    NotFound { mount_point: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 pub(crate) struct MountLockGuard {
     lock_file: File,
     instance_id: String,
@@ -320,15 +330,33 @@ pub(crate) fn update_mount_record_status(
     expected_instance_id: &str,
     status: MountRecordStatus,
     sync_lifecycle: Option<&str>,
-) -> Result<()> {
-    let mut record = read_mount_record(mount_point)?;
+) -> std::result::Result<(), MountRecordUpdateError> {
+    let path = pid_file_path(mount_point).map_err(MountRecordUpdateError::Other)?;
+    update_mount_record_status_at(
+        &path,
+        mount_point,
+        expected_instance_id,
+        status,
+        sync_lifecycle,
+    )
+}
+
+fn update_mount_record_status_at(
+    path: &Path,
+    mount_point: &str,
+    expected_instance_id: &str,
+    status: MountRecordStatus,
+    sync_lifecycle: Option<&str>,
+) -> std::result::Result<(), MountRecordUpdateError> {
+    let mut record = read_mount_record_for_update(path, mount_point)?;
     if record.instance_id.as_deref() != Some(expected_instance_id) {
-        anyhow::bail!("mount record instance changed for '{mount_point}'");
+        return Err(MountRecordUpdateError::InstanceChanged {
+            mount_point: mount_point.to_string(),
+        });
     }
     record.status = status;
     record.sync_lifecycle = sync_lifecycle.map(str::to_string);
-    let path = pid_file_path(mount_point)?;
-    write_mount_record_file(&path, &record)
+    write_mount_record_file(path, &record).map_err(MountRecordUpdateError::Other)
 }
 
 pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<MountRecordInfo>> {
@@ -374,10 +402,34 @@ pub(crate) fn read_mount_record(mount_point: &str) -> Result<MountRecordInfo> {
     let path = pid_file_path(&normalized)?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("No mount found for '{mount_point}'. Is it mounted?"))?;
+    parse_mount_record(&data, &normalized)
+}
+
+fn read_mount_record_for_update(
+    path: &Path,
+    mount_point: &str,
+) -> std::result::Result<MountRecordInfo, MountRecordUpdateError> {
+    let data = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            MountRecordUpdateError::NotFound {
+                mount_point: mount_point.to_string(),
+            }
+        } else {
+            MountRecordUpdateError::Other(
+                anyhow::Error::new(error)
+                    .context(format!("read mount record '{}'", path.display())),
+            )
+        }
+    })?;
+    parse_mount_record(&data, &normalize_mount_point(mount_point))
+        .map_err(MountRecordUpdateError::Other)
+}
+
+fn parse_mount_record(data: &str, normalized_mount_point: &str) -> Result<MountRecordInfo> {
     let mut record: MountRecordInfo =
-        serde_json::from_str(&data).map_err(|_| anyhow!("corrupt PID file"))?;
+        serde_json::from_str(data).map_err(|_| anyhow!("corrupt PID file"))?;
     if record.mount_point.is_empty() {
-        record.mount_point = normalized;
+        record.mount_point = normalized_mount_point.to_string();
     }
     if record.volume.is_empty() {
         record.volume = "unknown".to_string();
@@ -746,6 +798,55 @@ mod tests {
 
         assert_eq!(record.status, MountRecordStatus::Starting);
         assert_eq!(record.sync_lifecycle, None);
+    }
+
+    #[test]
+    fn mount_record_status_update_reports_instance_change_without_rereading() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = tmp.path().join("mount.json");
+        write_mount_record_file(
+            &path,
+            &MountRecordInfo {
+                record_version: MOUNT_RECORD_VERSION,
+                pid: 123,
+                mount_point: "T:".to_string(),
+                volume: "demo".to_string(),
+                cache_path: None,
+                instance_id: Some("current-instance".to_string()),
+                status: MountRecordStatus::Starting,
+                sync_lifecycle: None,
+            },
+        )
+        .expect("write mount record");
+
+        let error = update_mount_record_status_at(
+            &path,
+            "T:",
+            "replaced-instance",
+            MountRecordStatus::Mounted,
+            Some("local_ready"),
+        )
+        .expect_err("replaced instance should stop publication");
+
+        assert!(matches!(
+            error,
+            MountRecordUpdateError::InstanceChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn mount_record_status_update_reports_removed_record() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let error = update_mount_record_status_at(
+            &tmp.path().join("missing.json"),
+            "T:",
+            "current-instance",
+            MountRecordStatus::Mounted,
+            Some("local_ready"),
+        )
+        .expect_err("removed mount record should stop publication");
+
+        assert!(matches!(error, MountRecordUpdateError::NotFound { .. }));
     }
 
     #[test]

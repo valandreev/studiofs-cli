@@ -865,63 +865,26 @@ impl FsKitSession {
         // dispatching during startup or mount and receive wait on each other.
         let mut mounted = false;
         let mut mount_ready_callback = mount_ready_callback;
+        let mut mount_ready_thread = None;
         let mut shutdown_deadline = None;
-        loop {
-            match self.mount_result.try_recv() {
-                Ok(Ok(())) => {
-                    mounted = true;
-                    if let Some(callback) = mount_ready_callback.take() {
-                        callback();
-                    }
-                }
-                Ok(Err(result)) => return Err(mount_result_error(result)),
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) if !mounted => {
-                    return Err(io::Error::other(
-                        "FSKit mount worker exited without a result",
-                    ));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {}
-            }
-            if self.control.is_stopping() {
-                let deadline = shutdown_deadline
-                    .get_or_insert_with(|| Instant::now() + FS_KIT_SHUTDOWN_TIMEOUT);
-                if mounted {
-                    self.start_unmount()?;
-                }
-                if Instant::now() >= *deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "FSKit shutdown did not receive DESTROY before the deadline",
-                    ));
-                }
-            }
-            let Some(channel) = self.control.retained_channel() else {
-                return Ok(());
-            };
-            // Keep a bounded fallback in case an older or damaged transport
-            // ignores MFChannelInterrupt().
-            // SAFETY: the retained channel stays alive for this synchronous
-            // wait, and the timeout bounds the call before the reference is
-            // released.
-            let ready =
-                unsafe { MFChannelWaitForNextMessage(channel.as_ptr(), FS_KIT_RECEIVE_POLL_MS) };
-            if ready == 0 {
-                continue;
-            }
-            if ready < 0 {
-                let errno = last_errno();
-                if self.control.is_stopping() {
-                    continue;
-                }
-                if matches!(errno, libc::EINTR | libc::ENODEV) {
-                    return Ok(());
-                }
-                return Err(errno_error(errno));
-            }
-            let Some(message) = FsKitMessage::receive(&channel) else {
+        let loop_result = (|| -> io::Result<()> {
+            loop {
                 match self.mount_result.try_recv() {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        mounted = true;
+                        if let Some(callback) = mount_ready_callback.take() {
+                            mount_ready_thread = Some(
+                                std::thread::Builder::new()
+                                    .name("studiofs-mount-ready".into())
+                                    .spawn(callback)
+                                    .map_err(|error| {
+                                        io::Error::other(format!(
+                                            "failed to start mount-ready callback: {error}"
+                                        ))
+                                    })?,
+                            );
+                        }
+                    }
                     Ok(Err(result)) => return Err(mount_result_error(result)),
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) if !mounted => {
@@ -931,17 +894,76 @@ impl FsKitSession {
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {}
                 }
-                let errno = last_errno();
                 if self.control.is_stopping() {
+                    let deadline = shutdown_deadline
+                        .get_or_insert_with(|| Instant::now() + FS_KIT_SHUTDOWN_TIMEOUT);
+                    if mounted {
+                        self.start_unmount()?;
+                    }
+                    if Instant::now() >= *deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "FSKit shutdown did not receive DESTROY before the deadline",
+                        ));
+                    }
+                }
+                let Some(channel) = self.control.retained_channel() else {
+                    return Ok(());
+                };
+                // Keep a bounded fallback in case an older or damaged transport
+                // ignores MFChannelInterrupt().
+                // SAFETY: the retained channel stays alive for this synchronous
+                // wait, and the timeout bounds the call before the reference is
+                // released.
+                let ready = unsafe {
+                    MFChannelWaitForNextMessage(channel.as_ptr(), FS_KIT_RECEIVE_POLL_MS)
+                };
+                if ready == 0 {
                     continue;
                 }
-                if matches!(errno, libc::EINTR | libc::ENODEV) {
-                    return Ok(());
+                if ready < 0 {
+                    let errno = last_errno();
+                    if self.control.is_stopping() {
+                        continue;
+                    }
+                    if matches!(errno, libc::EINTR | libc::ENODEV) {
+                        return Ok(());
+                    }
+                    return Err(errno_error(errno));
                 }
-                return Err(errno_error(errno));
-            };
-            dispatcher.dispatch(message);
-        }
+                let Some(message) = FsKitMessage::receive(&channel) else {
+                    match self.mount_result.try_recv() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(result)) => return Err(mount_result_error(result)),
+                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Disconnected) if !mounted => {
+                            return Err(io::Error::other(
+                                "FSKit mount worker exited without a result",
+                            ));
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {}
+                    }
+                    let errno = last_errno();
+                    if self.control.is_stopping() {
+                        continue;
+                    }
+                    if matches!(errno, libc::EINTR | libc::ENODEV) {
+                        return Ok(());
+                    }
+                    return Err(errno_error(errno));
+                };
+                dispatcher.dispatch(message);
+            }
+        })();
+
+        let callback_result = mount_ready_thread
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| io::Error::other("mount-ready callback panicked"))
+            })
+            .unwrap_or(Ok(()));
+        loop_result.or(callback_result)
     }
 }
 

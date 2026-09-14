@@ -92,8 +92,11 @@ pub struct WinfspMountRequest {
 
 impl WinfspMountRequest {
     /// Set a callback invoked after the native mount point is attached.
-    pub fn with_mount_ready_callback(mut self, callback: Box<dyn FnOnce() + Send>) -> Self {
-        self.mount_ready_callback = Some(callback);
+    pub fn with_mount_ready_callback<F>(mut self, callback: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.mount_ready_callback = Some(Box::new(callback));
         self
     }
 }
@@ -805,16 +808,6 @@ fn winfsp_async_callback_drain_timeout() -> std::time::Duration {
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
 /// external process (`studiofs umount`) can signal a graceful shutdown.
 pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
-    mount_and_serve_inner(request)
-}
-
-/// Start WinFSP and invoke `mount_ready_callback` after the mount point is
-/// attached, before the serving loop starts.
-pub fn mount_and_serve_with_ready_callback(
-    mut request: WinfspMountRequest,
-    mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
-) -> std::io::Result<()> {
-    request.mount_ready_callback = mount_ready_callback;
     mount_and_serve_inner(request)
 }
 
