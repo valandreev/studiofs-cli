@@ -764,6 +764,25 @@ struct FsKitSession {
     unmount_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+fn handle_mount_ready(
+    mounted: &mut bool,
+    mount_ready_callback: &mut Option<Box<dyn FnOnce() + Send>>,
+    mount_ready_thread: &mut Option<std::thread::JoinHandle<()>>,
+) -> io::Result<()> {
+    *mounted = true;
+    if let Some(callback) = mount_ready_callback.take() {
+        *mount_ready_thread = Some(
+            std::thread::Builder::new()
+                .name("studiofs-mount-ready".into())
+                .spawn(callback)
+                .map_err(|error| {
+                    io::Error::other(format!("failed to start mount-ready callback: {error}"))
+                })?,
+        );
+    }
+    Ok(())
+}
+
 impl FsKitSession {
     fn mount(mount_point: &Path, volume_name: &str) -> io::Result<Self> {
         if !mount_point.starts_with(Path::new("/Volumes")) {
@@ -881,21 +900,11 @@ impl FsKitSession {
                         .map_err(|_| io::Error::other("mount-ready callback panicked"))?;
                 }
                 match self.mount_result.try_recv() {
-                    Ok(Ok(())) => {
-                        mounted = true;
-                        if let Some(callback) = mount_ready_callback.take() {
-                            mount_ready_thread = Some(
-                                std::thread::Builder::new()
-                                    .name("studiofs-mount-ready".into())
-                                    .spawn(callback)
-                                    .map_err(|error| {
-                                        io::Error::other(format!(
-                                            "failed to start mount-ready callback: {error}"
-                                        ))
-                                    })?,
-                            );
-                        }
-                    }
+                    Ok(Ok(())) => handle_mount_ready(
+                        &mut mounted,
+                        &mut mount_ready_callback,
+                        &mut mount_ready_thread,
+                    )?,
                     Ok(Err(result)) => return Err(mount_result_error(result)),
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) if !mounted => {
@@ -944,7 +953,14 @@ impl FsKitSession {
                 }
                 let Some(message) = FsKitMessage::receive(&channel) else {
                     match self.mount_result.try_recv() {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            handle_mount_ready(
+                                &mut mounted,
+                                &mut mount_ready_callback,
+                                &mut mount_ready_thread,
+                            )?;
+                            continue;
+                        }
                         Ok(Err(result)) => return Err(mount_result_error(result)),
                         Err(mpsc::TryRecvError::Empty) => {}
                         Err(mpsc::TryRecvError::Disconnected) if !mounted => {

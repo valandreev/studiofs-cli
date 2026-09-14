@@ -150,7 +150,7 @@ impl std::fmt::Display for MountRecordStatus {
 }
 
 /// JSON state shared by a foreground mount child and detached parent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MountRecordInfo {
     #[serde(default = "default_mount_record_version")]
     pub record_version: u32,
@@ -169,6 +169,29 @@ pub(crate) struct MountRecordInfo {
     /// PostgreSQL synchronization lifecycle, when known.
     #[serde(default)]
     pub sync_lifecycle: Option<String>,
+    /// Local diagnostics endpoint and authentication material, when published.
+    #[serde(default)]
+    pub diagnostics: Option<crate::diagnostics::LocalDiagnosticsDiscovery>,
+}
+
+impl std::fmt::Debug for MountRecordInfo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountRecordInfo")
+            .field("record_version", &self.record_version)
+            .field("pid", &self.pid)
+            .field("mount_point", &self.mount_point)
+            .field("volume", &self.volume)
+            .field("cache_path", &self.cache_path)
+            .field("instance_id", &self.instance_id)
+            .field("status", &self.status)
+            .field("sync_lifecycle", &self.sync_lifecycle)
+            .field(
+                "diagnostics",
+                &self.diagnostics.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -286,6 +309,7 @@ fn write_mount_record_with_cache_and_instance(
         instance_id: instance_id.map(str::to_string),
         status,
         sync_lifecycle: sync_lifecycle.map(str::to_string),
+        diagnostics: None,
     };
     write_mount_record_file(&path, &record)
 }
@@ -543,6 +567,7 @@ pub fn write_pid_file_in(
         instance_id: None,
         status: MountRecordStatus::Starting,
         sync_lifecycle: None,
+        diagnostics: None,
     };
     write_mount_record_file(&path, &record)
 }
@@ -813,6 +838,76 @@ mod tests {
 
         assert_eq!(record.status, MountRecordStatus::Starting);
         assert_eq!(record.sync_lifecycle, None);
+        assert_eq!(record.diagnostics, None);
+    }
+
+    #[test]
+    fn mount_record_status_update_preserves_diagnostics_discovery() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = tmp.path().join("mount.json");
+        let endpoint = {
+            #[cfg(windows)]
+            {
+                crate::diagnostics::LocalDiagnosticsEndpoint::WindowsNamedPipe {
+                    name: r"\\.\pipe\studiofs-demo-diagnostics".to_string(),
+                }
+            }
+            #[cfg(unix)]
+            {
+                crate::diagnostics::LocalDiagnosticsEndpoint::UnixSocket {
+                    path: "/tmp/studiofs-demo-diagnostics.sock".to_string(),
+                }
+            }
+        };
+        let diagnostics = crate::diagnostics::LocalDiagnosticsDiscovery {
+            protocol_version: 1,
+            session_id: "session-id".to_string(),
+            volume: "demo".to_string(),
+            volume_uuid: "demo-uuid".to_string(),
+            bridge: "test".to_string(),
+            mount_point: "T:".to_string(),
+            pid: 123,
+            cache_path: "cache/demo".to_string(),
+            read_only: false,
+            started_unix_ms: 456,
+            endpoint,
+            auth_token: "test-auth-token".to_string(),
+        };
+
+        write_mount_record_file(
+            &path,
+            &MountRecordInfo {
+                record_version: MOUNT_RECORD_VERSION,
+                pid: 123,
+                mount_point: "T:".to_string(),
+                volume: "demo".to_string(),
+                cache_path: None,
+                instance_id: Some("current-instance".to_string()),
+                status: MountRecordStatus::Starting,
+                sync_lifecycle: None,
+                diagnostics: Some(diagnostics.clone()),
+            },
+        )
+        .expect("write mount record");
+
+        update_mount_record_status_at(
+            &path,
+            "T:",
+            "current-instance",
+            MountRecordStatus::Mounted,
+            Some("local_ready"),
+        )
+        .expect("update mount record status");
+
+        let updated: MountRecordInfo =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read mount record"))
+                .expect("parse updated mount record");
+        assert_eq!(updated.status, MountRecordStatus::Mounted);
+        assert_eq!(updated.sync_lifecycle.as_deref(), Some("local_ready"));
+        assert_eq!(updated.diagnostics, Some(diagnostics));
+        let debug = format!("{updated:?}");
+        assert!(!debug.contains("test-auth-token"));
+        assert!(!debug.contains("studiofs-demo-diagnostics"));
     }
 
     #[test]
@@ -830,6 +925,7 @@ mod tests {
                 instance_id: Some("current-instance".to_string()),
                 status: MountRecordStatus::Starting,
                 sync_lifecycle: None,
+                diagnostics: None,
             },
         )
         .expect("write mount record");
@@ -875,6 +971,7 @@ mod tests {
             instance_id: None,
             status: MountRecordStatus::Starting,
             sync_lifecycle: None,
+            diagnostics: None,
         };
 
         assert!(mount_record_is_active_candidate(&record));

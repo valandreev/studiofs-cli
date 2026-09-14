@@ -1164,26 +1164,40 @@ impl MountPlan {
         }
 
         let mount_lock = acquire_mount_lock(&self.actual_mount_path)?;
-        fn publish_failed_preparation(
+        fn cleanup_failed_preparation(
             mount_lock: &utils::MountLockGuard,
             mount_point: &str,
             volume: &str,
+            retain_record: bool,
         ) {
-            if let Err(error) = mount_lock.persist_record_state(
-                mount_point,
-                volume,
-                std::process::id(),
-                None,
-                utils::MountRecordStatus::Failed,
-                None,
-            ) {
+            if retain_record {
+                if let Err(error) = mount_lock.persist_record_state(
+                    mount_point,
+                    volume,
+                    std::process::id(),
+                    None,
+                    utils::MountRecordStatus::Failed,
+                    None,
+                ) {
+                    warn!(
+                        error = ?error,
+                        mount_point = %mount_point,
+                        "failed to publish failed preparation mount record"
+                    );
+                }
+            } else if let Err(error) = utils::remove_pid_file(mount_point) {
                 warn!(
                     error = ?error,
                     mount_point = %mount_point,
-                    "failed to publish failed preparation mount record"
+                    "failed to remove foreground preparation mount record"
                 );
             }
         }
+
+        let retain_failed_record = should_retain_failed_mount_record(
+            self.command.detach,
+            std::env::var_os(daemon_mount_point_env_key()).is_some(),
+        );
 
         mount_lock
             .persist_record_state(
@@ -1214,10 +1228,11 @@ impl MountPlan {
         ) {
             Ok(session) => session,
             Err(error) => {
-                publish_failed_preparation(
+                cleanup_failed_preparation(
                     &mount_lock,
                     &self.actual_mount_path,
                     &self.command.name,
+                    retain_failed_record,
                 );
                 return Err(error);
             }
@@ -1429,10 +1444,11 @@ impl MountPlan {
                 mount_lock: Some(mount_lock),
             }),
             Err(error) => {
-                publish_failed_preparation(
+                cleanup_failed_preparation(
                     &mount_lock,
                     &self.actual_mount_path,
                     &self.command.name,
+                    retain_failed_record,
                 );
                 Err(error)
             }
@@ -3427,6 +3443,40 @@ mod tests {
     }
 
     #[test]
+    fn foreground_preparation_failure_removes_mount_record() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let missing_meta_dir = temp.path().join("missing-meta");
+        let mount_point = startup_mount_point(&temp);
+        let plan = MountPlan::resolve(MountRequest {
+            command: mount_command(
+                "demo",
+                &missing_meta_dir,
+                Some(mount_point.to_string()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved");
+        let actual_mount_path = plan.actual_mount_path.clone();
+
+        let result = plan.prepare(|| {
+            Box::new(FakeBackend {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+                inspect: None,
+            })
+        });
+
+        assert!(result.is_err(), "missing metadata should fail preparation");
+        assert!(
+            utils::read_mount_record(&actual_mount_path).is_err(),
+            "foreground preparation failure should remove the mount record"
+        );
+        assert!(!utils::mount_is_active(&actual_mount_path).expect("check mount lock"));
+    }
+
+    #[test]
     fn default_mount_backend_matches_platform() {
         let backend = default_mount_backend();
         #[cfg(target_os = "linux")]
@@ -3500,6 +3550,7 @@ mod tests {
                                 utils::MountRecordStatus::Live
                             },
                             sync_lifecycle: Some("catching_up".to_string()),
+                            diagnostics: None,
                         })
                     } else {
                         Err(anyhow::anyhow!("record not ready"))
@@ -3528,6 +3579,7 @@ mod tests {
                     instance_id: Some("test-instance".to_string()),
                     status: utils::MountRecordStatus::Starting,
                     sync_lifecycle: None,
+                    diagnostics: None,
                 })
             },
             || Ok(false),
@@ -3576,6 +3628,7 @@ mod tests {
                     instance_id: Some("test-instance".to_string()),
                     status: utils::MountRecordStatus::Failed,
                     sync_lifecycle: None,
+                    diagnostics: None,
                 })
             },
             || Ok(false),
