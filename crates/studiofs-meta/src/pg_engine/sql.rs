@@ -313,7 +313,7 @@ pub(super) const SELECT_FOREIGN_EVENT_ROWS: &str = r#"
     "#;
 
 pub(super) const SELECT_EVENT_LOG_PRUNE_STATE: &str = r#"
-    SELECT checkpoint_version, event_log_prune_floor, event_log_pruned_rows
+    SELECT checkpoint_version, event_log_prune_floor
     FROM metadata_state
     WHERE vol = $1
       AND checkpoint_publication_state = 'published'

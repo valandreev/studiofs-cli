@@ -110,16 +110,6 @@ impl PgMetaEngine {
                             })?,
                             "event-log prune floor",
                         )?;
-                        let current_total = nonnegative(
-                            state.try_get(2).map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres event-log pruned-row counter parse failed",
-                                    error,
-                                )
-                            })?,
-                            "event-log pruned-row counter",
-                        )?;
-
                         let source_floor = tx
                             .query_one(sql::SELECT_EVENT_LOG_SOURCE_PRUNE_FLOOR, &[&volume_id])
                             .await
@@ -234,7 +224,7 @@ impl PgMetaEngine {
                             safe_floor,
                             durable_floor,
                             pruned_rows,
-                            total_pruned_rows: current_total.max(total_pruned_rows),
+                            total_pruned_rows,
                         }))
                     })
                 },
