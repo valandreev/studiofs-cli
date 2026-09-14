@@ -11,9 +11,10 @@ use crate::diagnostics::{
 };
 use anyhow::Context;
 use chrono::Utc;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::{Mutex as StdMutex, OnceLock, Weak};
 use std::thread::JoinHandle;
@@ -1163,6 +1164,28 @@ impl MountPlan {
         }
 
         let mount_lock = acquire_mount_lock(&self.actual_mount_path)?;
+        fn cleanup_failed_preparation(
+            mount_lock: &utils::MountLockGuard,
+            mount_point: &str,
+            volume: &str,
+        ) {
+            let _ = mount_lock.persist_record_state(
+                mount_point,
+                volume,
+                std::process::id(),
+                None,
+                utils::MountRecordStatus::Failed,
+                None,
+            );
+            if let Err(cleanup_error) = utils::remove_pid_file(mount_point) {
+                warn!(
+                    error = ?cleanup_error,
+                    mount_point = %mount_point,
+                    "failed to remove failed preparation mount record"
+                );
+            }
+        }
+
         mount_lock
             .persist_record_state(
                 &self.actual_mount_path,
@@ -1192,15 +1215,11 @@ impl MountPlan {
         ) {
             Ok(session) => session,
             Err(error) => {
-                let _ = mount_lock.persist_record_state(
+                cleanup_failed_preparation(
+                    &mount_lock,
                     &self.actual_mount_path,
                     &self.command.name,
-                    std::process::id(),
-                    None,
-                    utils::MountRecordStatus::Failed,
-                    None,
                 );
-                let _ = utils::remove_pid_file(&self.actual_mount_path);
                 return Err(error);
             }
         };
@@ -1411,21 +1430,11 @@ impl MountPlan {
                 mount_lock: Some(mount_lock),
             }),
             Err(error) => {
-                let _ = mount_lock.persist_record_state(
+                cleanup_failed_preparation(
+                    &mount_lock,
                     &self.actual_mount_path,
                     &self.command.name,
-                    std::process::id(),
-                    None,
-                    utils::MountRecordStatus::Failed,
-                    None,
                 );
-                if let Err(cleanup_error) = utils::remove_pid_file(&self.actual_mount_path) {
-                    warn!(
-                        error = ?cleanup_error,
-                        mount_point = %self.actual_mount_path,
-                        "failed to remove starting mount record after preparation failure"
-                    );
-                }
                 Err(error)
             }
         }
@@ -1514,6 +1523,7 @@ struct MountStatusMonitorState {
 
 struct MountStatusMonitor {
     state: Arc<Mutex<MountStatusMonitorState>>,
+    publication_lock: Arc<Mutex<()>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -1534,49 +1544,56 @@ impl MountStatusMonitor {
         }))
     }
 
-    fn mark_attached(state: &Arc<Mutex<MountStatusMonitorState>>) {
-        if let Ok(mut state) = state.lock() {
-            state.attached = true;
-        }
-        Self::publish_state(state);
+    fn mark_attached(
+        state: &Arc<Mutex<MountStatusMonitorState>>,
+        publication_lock: &Arc<Mutex<()>>,
+    ) -> bool {
+        state.lock().attached = true;
+        Self::publish_state(state, publication_lock)
     }
 
     fn mark_failed(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.failed = true;
+        self.state.lock().failed = true;
+        if !Self::publish_state(&self.state, &self.publication_lock) {
+            self.stop.store(true, Ordering::Release);
         }
-        self.publish_current();
     }
 
-    fn publish_current(&self) {
-        Self::publish_state(&self.state);
-    }
-
-    fn publish_state(state: &Arc<Mutex<MountStatusMonitorState>>) {
-        let Ok(mut state) = state.lock() else {
-            warn!("mount status publisher mutex was poisoned");
-            return;
+    fn publish_state(
+        state: &Arc<Mutex<MountStatusMonitorState>>,
+        publication_lock: &Arc<Mutex<()>>,
+    ) -> bool {
+        let _publication_guard = publication_lock.lock();
+        let (mount_point, instance_id, next) = {
+            let state = state.lock();
+            let sync_status = state.vfs.sync_status();
+            let (record_status, sync_lifecycle) =
+                mount_record_state(state.attached, state.failed, sync_status);
+            let next = (record_status, sync_lifecycle);
+            if state.last_published == Some(next) {
+                return true;
+            }
+            (state.mount_point.clone(), state.instance_id.clone(), next)
         };
-        let sync_status = state.vfs.sync_status();
-        let (record_status, sync_lifecycle) =
-            mount_record_state(state.attached, state.failed, sync_status);
-        let next = (record_status, sync_lifecycle);
-        if state.last_published == Some(next) {
-            return;
-        }
 
-        match utils::update_mount_record_status(
-            &state.mount_point,
-            &state.instance_id,
-            record_status,
-            sync_lifecycle,
-        ) {
-            Ok(()) => state.last_published = Some(next),
-            Err(error) => warn!(
-                error = ?error,
-                mount_point = %state.mount_point,
-                "failed to publish mount lifecycle status"
-            ),
+        match utils::update_mount_record_status(&mount_point, &instance_id, next.0, next.1) {
+            Ok(()) => {
+                let mut state = state.lock();
+                let current =
+                    mount_record_state(state.attached, state.failed, state.vfs.sync_status());
+                if current == next {
+                    state.last_published = Some(next);
+                }
+                true
+            }
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    mount_point = %mount_point,
+                    "failed to publish mount lifecycle status"
+                );
+                false
+            }
         }
     }
 
@@ -1586,20 +1603,26 @@ impl MountStatusMonitor {
         instance_id: String,
     ) -> anyhow::Result<Self> {
         let state = Self::new_state(vfs, mount_point, instance_id);
+        let publication_lock = Arc::new(Mutex::new(()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread_state = state.clone();
+        let thread_publication_lock = publication_lock.clone();
         let thread = std::thread::Builder::new()
             .name("studiofs-mount-status".to_string())
             .spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
-                    Self::publish_state(&thread_state);
-                    std::thread::sleep(MOUNT_STATUS_POLL_INTERVAL);
+                    if !Self::publish_state(&thread_state, &thread_publication_lock) {
+                        thread_stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::park_timeout(MOUNT_STATUS_POLL_INTERVAL);
                 }
             })
             .map_err(|error| anyhow::anyhow!("failed to start mount status monitor: {error}"))?;
         Ok(Self {
             state,
+            publication_lock,
             stop,
             thread: Some(thread),
         })
@@ -1607,16 +1630,23 @@ impl MountStatusMonitor {
 
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            warn!("mount status monitor panicked during shutdown");
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            if thread.join().is_err() {
+                warn!("mount status monitor panicked during shutdown");
+            }
         }
     }
 
-    fn ready_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+    fn ready_callback(&self) -> Box<dyn FnOnce() + Send> {
         let state = self.state.clone();
-        Arc::new(move || Self::mark_attached(&state))
+        let publication_lock = self.publication_lock.clone();
+        let stop = self.stop.clone();
+        Box::new(move || {
+            if !Self::mark_attached(&state, &publication_lock) {
+                stop.store(true, Ordering::Release);
+            }
+        })
     }
 }
 
@@ -2364,23 +2394,28 @@ where
 {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Ok(record) = read_pid_file(mount_point)
-            && record.pid == expected_pid
-        {
-            if record.status == utils::MountRecordStatus::Failed {
-                anyhow::bail!(
-                    "background mount process reported failed mount state for '{}'",
-                    mount_point
-                );
-            }
-            return Ok(());
-        }
-
         if !is_child_alive()? {
             anyhow::bail!(
                 "background mount process exited before publishing mount state for '{}'",
                 mount_point
             );
+        }
+
+        if let Ok(record) = read_pid_file(mount_point)
+            && record.pid == expected_pid
+        {
+            match record.status {
+                utils::MountRecordStatus::Mounted
+                | utils::MountRecordStatus::Live
+                | utils::MountRecordStatus::Degraded => return Ok(()),
+                utils::MountRecordStatus::Failed => {
+                    anyhow::bail!(
+                        "background mount process reported failed mount state for '{}'",
+                        mount_point
+                    );
+                }
+                utils::MountRecordStatus::Starting => {}
+            }
         }
 
         if std::time::Instant::now() >= deadline {
@@ -3373,7 +3408,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_daemon_mount_record_accepts_child_record_once_published() {
+    fn wait_for_daemon_mount_record_accepts_child_record_once_mounted() {
         let attempts = Arc::new(Mutex::new(0usize));
         wait_for_daemon_mount_record_with(
             "/tmp/demo",
@@ -3385,7 +3420,7 @@ mod tests {
                 move |_| {
                     let mut attempts = attempts.lock().expect("lock attempts");
                     *attempts += 1;
-                    if *attempts >= 2 {
+                    if *attempts >= 3 {
                         Ok(utils::MountRecordInfo {
                             record_version: 2,
                             pid: 4242,
@@ -3393,8 +3428,12 @@ mod tests {
                             volume: "demo".to_string(),
                             cache_path: None,
                             instance_id: Some("test-instance".to_string()),
-                            status: utils::MountRecordStatus::Starting,
-                            sync_lifecycle: None,
+                            status: if *attempts == 3 {
+                                utils::MountRecordStatus::Mounted
+                            } else {
+                                utils::MountRecordStatus::Live
+                            },
+                            sync_lifecycle: Some("catching_up".to_string()),
                         })
                     } else {
                         Err(anyhow::anyhow!("record not ready"))
@@ -3404,6 +3443,35 @@ mod tests {
             || Ok(true),
         )
         .expect("daemon record should eventually appear");
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_rejects_dead_child_with_starting_record() {
+        let err = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| {
+                Ok(utils::MountRecordInfo {
+                    record_version: 2,
+                    pid: 4242,
+                    mount_point: "/tmp/demo".to_string(),
+                    volume: "demo".to_string(),
+                    cache_path: None,
+                    instance_id: Some("test-instance".to_string()),
+                    status: utils::MountRecordStatus::Starting,
+                    sync_lifecycle: None,
+                })
+            },
+            || Ok(false),
+        )
+        .expect_err("dead child should fail even with a starting record");
+
+        assert!(
+            err.to_string()
+                .contains("exited before publishing mount state")
+        );
     }
 
     #[test]

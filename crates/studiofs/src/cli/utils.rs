@@ -3,6 +3,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -254,7 +255,21 @@ fn write_mount_record_with_cache_and_instance(
         status,
         sync_lifecycle: sync_lifecycle.map(str::to_string),
     };
-    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+    write_mount_record_file(&path, &record)
+}
+
+fn write_mount_record_file(path: &Path, record: &MountRecordInfo) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("mount record path has no parent directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary mount record near '{}'", path.display()))?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), record)?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| anyhow!("replace mount record '{}': {}", path.display(), error.error))?;
     Ok(())
 }
 
@@ -270,9 +285,8 @@ pub(crate) fn update_mount_record_status(
     }
     record.status = status;
     record.sync_lifecycle = sync_lifecycle.map(str::to_string);
-    let path = pid_file_path(&normalize_mount_point(mount_point))?;
-    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
-    Ok(())
+    let path = pid_file_path(mount_point)?;
+    write_mount_record_file(&path, &record)
 }
 
 pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<MountRecordInfo>> {
@@ -293,7 +307,11 @@ pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<Moun
             Ok(record) if record.volume == volume => record,
             _ => continue,
         };
-        if mount_is_active(&record.mount_point)? {
+        if matches!(
+            record.status,
+            MountRecordStatus::Mounted | MountRecordStatus::Live | MountRecordStatus::Degraded
+        ) && mount_is_active(&record.mount_point)?
+        {
             return Ok(Some(record));
         }
     }
@@ -414,8 +432,7 @@ pub fn write_pid_file_in(
         status: MountRecordStatus::Starting,
         sync_lifecycle: None,
     };
-    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
-    Ok(())
+    write_mount_record_file(&path, &record)
 }
 
 /// Read a PID file from the given directory.

@@ -61,7 +61,7 @@ pub struct LinuxFuseMountRequest {
     volume_name: String,
     read_only: bool,
     connection_config: LinuxFuseConnectionConfig,
-    mount_ready_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl LinuxFuseMountRequest {
@@ -85,7 +85,7 @@ impl LinuxFuseMountRequest {
     }
 
     /// Set a callback invoked after libfuse has attached the mount point.
-    pub fn with_mount_ready_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+    pub fn with_mount_ready_callback(mut self, callback: Box<dyn FnOnce() + Send>) -> Self {
         self.mount_ready_callback = Some(callback);
         self
     }
@@ -115,10 +115,10 @@ pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
         mount_point,
         volume_name,
     )?;
+    session.install_signal_handlers()?;
     if let Some(callback) = mount_ready_callback {
         callback();
     }
-    session.install_signal_handlers()?;
     session.run()
 }
 

@@ -802,7 +802,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
 /// attached, before the serving loop starts.
 pub fn mount_and_serve_with_ready_callback(
     request: WinfspMountRequest,
-    mount_ready_callback: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
 ) -> std::io::Result<()> {
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
@@ -893,10 +893,6 @@ pub fn mount_and_serve_with_ready_callback(
 this usually means Administrator privileges are required, or WinFSP must be configured with MountUseMountmgrFromFSD=1"
         ))
     })?;
-    if let Some(callback) = mount_ready_callback {
-        callback();
-    }
-
     // Register the kernel cache invalidator with the VFS so metadata updates
     // can proactively enqueue inodes for WinFSP notification.
     let invalidator = std::sync::Arc::new(WinfspKernelInvalidator::new(invalidation_queue.clone()));
@@ -905,6 +901,9 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
     host.start_with_threads(options.dispatcher_threads)
         .map_err(|err| std::io::Error::other(format!("failed to start WinFSP host: {err}")))?;
+    if let Some(callback) = mount_ready_callback {
+        callback();
+    }
 
     // Block until Ctrl+C or external shutdown event
     let (tx, rx) = std::sync::mpsc::channel::<()>();

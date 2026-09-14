@@ -859,7 +859,7 @@ impl FsKitSession {
     fn run(
         &mut self,
         dispatcher: &FsKitDispatcher,
-        mount_ready_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+        mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
     ) -> io::Result<()> {
         // macFUSE 5.3.3 local mounts send INIT before MFMount returns. Keep
         // dispatching during startup or mount and receive wait on each other.
