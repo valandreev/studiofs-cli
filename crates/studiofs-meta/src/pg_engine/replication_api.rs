@@ -158,9 +158,11 @@ impl MetaReplication for PgMetaEngine {
     fn pg_sync_diagnostics(&self) -> PgSyncDiagnostics {
         let status = self.pg_sync_status();
         let progress = self.pg_sync_progress_snapshot();
-        let local_applied_version = u64::try_from(self.local_version.load(Ordering::Acquire)).ok();
-        let startup_target_version =
-            u64::try_from(self.metadata_startup_target_version.load(Ordering::Acquire)).ok();
+        let raw_local_version = self.local_version.load(Ordering::Acquire);
+        let raw_startup_target_version =
+            self.metadata_startup_target_version.load(Ordering::Acquire);
+        let local_applied_version = u64::try_from(raw_local_version).ok();
+        let startup_target_version = u64::try_from(raw_startup_target_version).ok();
         let observed_remote_head_version =
             u64::try_from(self.metadata_remote_head_version.load(Ordering::Acquire)).ok();
         let checkpoint = self.metadata_checkpoint_freshness_diagnostics();
@@ -168,9 +170,14 @@ impl MetaReplication for PgMetaEngine {
             (Some(observed), Some(checkpoint)) => Some(observed.max(checkpoint)),
             (observed, checkpoint) => observed.or(checkpoint),
         };
-        let remaining_version_distance = startup_target_version
-            .zip(local_applied_version)
-            .map(|(target, local)| target.saturating_sub(local));
+        let remaining_version_distance = (raw_startup_target_version >= 0).then(|| {
+            u64::try_from(
+                raw_startup_target_version
+                    .saturating_sub(raw_local_version)
+                    .max(0),
+            )
+            .unwrap_or_default()
+        });
         let last_successful_sync_unix_ms = self
             .metadata_last_successful_sync_unix_ms
             .load(Ordering::Acquire);

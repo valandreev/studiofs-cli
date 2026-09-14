@@ -11,7 +11,7 @@ use studiofs_cache::runtime::{
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
-use studiofs_meta::{PgSyncDiagnostics, PgSyncLifecycle, PgSyncPageDiagnostics};
+use studiofs_meta::{PgSyncDiagnostics, PgSyncPageDiagnostics};
 use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
 #[cfg(test)]
 use uuid::Uuid;
@@ -113,9 +113,19 @@ fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
     };
     let first = format_version(page.first_batch_version);
     let last = format_version(page.last_batch_version);
+    let batch_unit = if page.batch_count == 1 {
+        "batch"
+    } else {
+        "batches"
+    };
+    let event_unit = if page.event_count == 1 {
+        "event"
+    } else {
+        "events"
+    };
     let oversized = if page.oversized { ", oversized" } else { "" };
     format!(
-        "{first}..{last} ({} batches, {} events, {}, more={}{oversized})",
+        "{first}..{last} ({} {batch_unit}, {} {event_unit}, {}, more={}{oversized})",
         page.batch_count,
         page.event_count,
         format_bytes(page.response_bytes),
@@ -135,27 +145,36 @@ fn format_last_successful_sync(timestamp: Option<i64>, now_ms: u64) -> String {
     let Some(timestamp) = timestamp.and_then(|timestamp| u64::try_from(timestamp).ok()) else {
         return "unknown".to_string();
     };
-    format!("{}ms ago", now_ms.saturating_sub(timestamp))
+    let age_ms = now_ms.saturating_sub(timestamp);
+    if age_ms < 1_000 {
+        format!("{age_ms}ms ago")
+    } else if age_ms < 60_000 {
+        format!("{:.1}s ago", age_ms as f64 / 1_000.0)
+    } else if age_ms < 3_600_000 {
+        format!("{:.1}m ago", age_ms as f64 / 60_000.0)
+    } else {
+        format!("{:.1}h ago", age_ms as f64 / 3_600_000.0)
+    }
 }
 
 fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
     println!("\nPostgreSQL Sync");
     println!("────────────────");
     println!("  Lifecycle:              {:?}", diagnostics.lifecycle);
-    if diagnostics.lifecycle == PgSyncLifecycle::Live {
-        println!(
-            "  Local applied version:  {}",
-            format_version(diagnostics.local_applied_version)
-        );
-    } else {
+    if let Some(target) = diagnostics.startup_target_version {
         println!(
             "  Local applied/target:   {}/{}",
             format_version(diagnostics.local_applied_version),
-            format_version(diagnostics.startup_target_version)
+            target
         );
         println!(
             "  Target remaining:       {}",
             format_version(diagnostics.remaining_version_distance)
+        );
+    } else {
+        println!(
+            "  Local applied version:  {}",
+            format_version(diagnostics.local_applied_version)
         );
     }
     println!(
@@ -172,7 +191,7 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
         "not needed"
     };
     if let Some(reason) = diagnostics.checkpoint.refresh_reason {
-        println!("  Checkpoint refresh:     {refresh_state} ({reason:?})");
+        println!("  Checkpoint refresh:     {refresh_state} ({reason})");
     } else {
         println!("  Checkpoint refresh:     {refresh_state}");
     }
@@ -193,7 +212,7 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
         }
     );
     if let Some(reason) = diagnostics.write_authority_reason {
-        println!("  Authority reason:       {reason:?}");
+        println!("  Authority reason:       {reason}");
     }
     println!(
         "  Source connected:       {}",
@@ -213,7 +232,7 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
         diagnostics
             .last_sync_error
             .as_ref()
-            .map(|error| format!("{error:?}"))
+            .map(ToString::to_string)
             .unwrap_or_else(|| "none".to_string())
     );
     println!(
@@ -1334,8 +1353,31 @@ mod tests {
     }
 
     #[test]
+    fn pg_sync_page_format_pluralizes_single_counts() {
+        let page = PgSyncPageDiagnostics {
+            first_batch_version: Some(1),
+            last_batch_version: Some(1),
+            batch_count: 1,
+            event_count: 1,
+            response_bytes: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            format_page(Some(&page)),
+            "1..1 (1 batch, 1 event, 1B, more=false)"
+        );
+    }
+
+    #[test]
     fn pg_sync_last_successful_sync_format_reports_age() {
         assert_eq!(format_last_successful_sync(Some(1_234), 2_000), "766ms ago");
+        assert_eq!(format_last_successful_sync(Some(1_000), 2_500), "1.5s ago");
+        assert_eq!(format_last_successful_sync(Some(1_000), 61_000), "1.0m ago");
+        assert_eq!(
+            format_last_successful_sync(Some(1_000), 3_601_000),
+            "1.0h ago"
+        );
         assert_eq!(format_last_successful_sync(None, 2_000), "unknown");
     }
 

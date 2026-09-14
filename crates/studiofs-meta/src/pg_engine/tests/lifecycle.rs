@@ -97,6 +97,27 @@ fn pg_sync_diagnostics_reports_frozen_target_and_remaining_distance() {
 }
 
 #[test]
+fn pg_sync_diagnostics_reports_distance_from_uninitialized_cursor() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local_version
+        .store(-1, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(100, std::sync::atomic::Ordering::Release);
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let diagnostics = engine.pg_sync_diagnostics();
+
+    assert_eq!(diagnostics.local_applied_version, None);
+    assert_eq!(diagnostics.startup_target_version, Some(100));
+    assert_eq!(diagnostics.remaining_version_distance, Some(101));
+}
+
+#[test]
 fn pg_sync_diagnostics_prefers_newer_checkpoint_head_observation() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
@@ -194,12 +215,35 @@ fn pg_sync_success_clears_rebootstrap_requirement() {
 }
 
 #[test]
+fn idle_degraded_sync_success_keeps_rebootstrap_requirement() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: 1,
+        first_available_version: 2,
+        target_version: 3,
+    });
+
+    engine.record_pg_sync_success();
+
+    assert!(engine.pg_sync_diagnostics().rebootstrap_required);
+}
+
+#[test]
 fn pg_sync_failure_classifies_nested_and_oversized_errors() {
     assert_eq!(
         PgSyncFailure::from_error(&MetaError::EventTooLarge {
             estimated: 10,
             limit: 5,
         }),
+        PgSyncFailure::Storage
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::RepairRequired("repair".into())),
+        PgSyncFailure::Storage
+    );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::Serialization("decode".into())),
         PgSyncFailure::Storage
     );
     assert_eq!(
@@ -1646,6 +1690,11 @@ fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
     engine
         .metadata_startup_target_version
         .store(7, std::sync::atomic::Ordering::Release);
+    engine.record_pg_sync_failure(&MetaError::ReplayGap {
+        local_version: 5,
+        first_available_version: 6,
+        target_version: 7,
+    });
     engine
         .try_complete_catchup_sync()
         .expect("complete degraded fresh-client sync");
@@ -1662,6 +1711,7 @@ fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
             .expect("read fresh-client marker"),
         0
     );
+    assert!(!engine.pg_sync_diagnostics().rebootstrap_required);
 }
 
 #[test]

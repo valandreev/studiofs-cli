@@ -494,7 +494,7 @@ struct PgSyncProgressState {
     last_progress_log_at: Option<Instant>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct PgSyncProgressSnapshot {
     pub(super) current_page: Option<PgSyncPageDiagnostics>,
     pub(super) last_page: Option<PgSyncPageDiagnostics>,
@@ -558,7 +558,9 @@ impl PgMetaEngine {
     pub(super) fn record_pg_sync_success(&self) {
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
             progress.last_sync_error = None;
-            progress.rebootstrap_required = false;
+            if self.current_pg_sync_lifecycle() != PgSyncLifecycle::Degraded {
+                progress.rebootstrap_required = false;
+            }
         }
     }
 
@@ -708,6 +710,9 @@ impl PgMetaEngine {
             self.bootstrap_allocator_state();
         } else {
             self.refresh_pg_sync_lifecycle_for_allocator();
+        }
+        if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
+            progress.rebootstrap_required = false;
         }
         // A later recovery cycle must capture its own startup target.
         self.metadata_startup_target_version

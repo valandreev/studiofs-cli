@@ -463,6 +463,16 @@ pub enum MetadataCheckpointRefreshReason {
     Age,
 }
 
+impl std::fmt::Display for MetadataCheckpointRefreshReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::VersionLag => "version lag",
+            Self::EventPayloadBytes => "event payload bytes",
+            Self::Age => "age",
+        })
+    }
+}
+
 /// Best-effort measurements and request state for bootstrap checkpoint freshness.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataCheckpointFreshnessDiagnostics {
@@ -753,13 +763,67 @@ impl PgSyncFailure {
             },
             MetaError::UuidMismatch { .. } => Self::UuidMismatch,
             MetaError::LifecycleFatal => Self::LifecycleFatal,
-            MetaError::EventTooLarge { .. } => Self::Storage,
-            MetaError::Storage(_) => Self::Storage,
+            MetaError::EventTooLarge { .. }
+            | MetaError::RepairRequired(_)
+            | MetaError::Serialization(_)
+            | MetaError::Storage(_) => Self::Storage,
             MetaError::NamespaceBatchOperation { source, .. }
             | MetaError::RegularFileOverlayBatchOperation { source, .. } => {
                 Self::from_error(source)
             }
             _ => Self::Other,
+        }
+    }
+}
+
+fn format_pg_sync_version(version: Option<u64>) -> String {
+    version.map_or_else(|| "unknown".to_string(), |version| version.to_string())
+}
+
+impl std::fmt::Display for PgSyncFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteUnavailable => formatter.write_str("remote unavailable"),
+            Self::Timeout => formatter.write_str("synchronization timed out"),
+            Self::ReplayGap {
+                local_version,
+                first_available_version,
+                target_version,
+            } => write!(
+                formatter,
+                "replay gap (local cursor {}, first available {}, target {})",
+                format_pg_sync_version(*local_version),
+                format_pg_sync_version(*first_available_version),
+                format_pg_sync_version(*target_version),
+            ),
+            Self::CatchUpStalled {
+                local_version,
+                target_version,
+            } => write!(
+                formatter,
+                "catch-up stalled (local cursor {}, target {})",
+                format_pg_sync_version(*local_version),
+                format_pg_sync_version(*target_version),
+            ),
+            Self::CatchUpBudgetExceeded {
+                local_version,
+                target_version,
+                pages,
+            } => write!(
+                formatter,
+                "catch-up page budget exhausted (local cursor {}, target {}, {pages} pages)",
+                format_pg_sync_version(*local_version),
+                format_pg_sync_version(*target_version),
+            ),
+            Self::InvalidCheckpoint => formatter.write_str("invalid checkpoint"),
+            Self::UnsupportedFormat { found, expected } => write!(
+                formatter,
+                "unsupported format (found {found}, expected {expected})"
+            ),
+            Self::UuidMismatch => formatter.write_str("volume UUID mismatch"),
+            Self::LifecycleFatal => formatter.write_str("fatal synchronization lifecycle"),
+            Self::Storage => formatter.write_str("metadata storage error"),
+            Self::Other => formatter.write_str("other synchronization error"),
         }
     }
 }
@@ -778,6 +842,18 @@ pub enum PgSyncWriteAuthorityReason {
     BothAllocatorsHeadroomUnavailable,
     /// The metadata engine is wrapped by an explicitly read-only mount.
     ReadOnlyMount,
+}
+
+impl std::fmt::Display for PgSyncWriteAuthorityReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::LifecycleNotLive => "synchronization lifecycle is not live",
+            Self::InodeIdHeadroomUnavailable => "inode allocator headroom unavailable",
+            Self::ObjectIdHeadroomUnavailable => "object-id allocator headroom unavailable",
+            Self::BothAllocatorsHeadroomUnavailable => "both allocator headrooms unavailable",
+            Self::ReadOnlyMount => "mount is read-only",
+        })
+    }
 }
 
 /// Structured, low-cost PostgreSQL synchronization diagnostics.
@@ -825,9 +901,7 @@ impl PgSyncDiagnostics {
             None
         } else if !matches!(
             status.lifecycle,
-            PgSyncLifecycle::TargetReached
-                | PgSyncLifecycle::AllocatorPending
-                | PgSyncLifecycle::Live
+            PgSyncLifecycle::AllocatorPending | PgSyncLifecycle::Live
         ) {
             Some(PgSyncWriteAuthorityReason::LifecycleNotLive)
         } else {
@@ -1813,6 +1887,40 @@ mod tests {
         assert_eq!(
             diagnostics.write_authority_reason,
             Some(PgSyncWriteAuthorityReason::ObjectIdHeadroomUnavailable)
+        );
+    }
+
+    #[test]
+    fn target_reached_diagnostics_explain_lifecycle_authority() {
+        let diagnostics = PgSyncDiagnostics::from_status(PgSyncStatus::new(
+            PgSyncLifecycle::TargetReached,
+            MetadataAuthorityStatus::writable(),
+        ));
+
+        assert_eq!(
+            diagnostics.write_authority_reason,
+            Some(PgSyncWriteAuthorityReason::LifecycleNotLive)
+        );
+    }
+
+    #[test]
+    fn pg_sync_diagnostic_reasons_have_human_text() {
+        assert_eq!(
+            PgSyncFailure::ReplayGap {
+                local_version: None,
+                first_available_version: Some(4),
+                target_version: Some(8),
+            }
+            .to_string(),
+            "replay gap (local cursor unknown, first available 4, target 8)"
+        );
+        assert_eq!(
+            PgSyncWriteAuthorityReason::BothAllocatorsHeadroomUnavailable.to_string(),
+            "both allocator headrooms unavailable"
+        );
+        assert_eq!(
+            MetadataCheckpointRefreshReason::EventPayloadBytes.to_string(),
+            "event payload bytes"
         );
     }
 }
