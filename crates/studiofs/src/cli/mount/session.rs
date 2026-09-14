@@ -1484,11 +1484,13 @@ impl PreparedMount {
         )?;
         if let Some(mount_lock) = self.mount_lock.as_ref() {
             mount_lock
-                .persist_record(
+                .persist_record_state(
                     &self.plan.actual_mount_path,
                     &self.plan.command.name,
                     std::process::id(),
                     Some(&prepared.cache_path),
+                    utils::MountRecordStatus::Starting,
+                    None,
                 )
                 .with_context(|| {
                     format!(
@@ -1501,12 +1503,7 @@ impl PreparedMount {
     }
 }
 
-#[derive(Clone)]
-struct MountStatusPublisher {
-    state: Arc<Mutex<MountStatusPublisherState>>,
-}
-
-struct MountStatusPublisherState {
+struct MountStatusMonitorState {
     vfs: Arc<StudioVfs>,
     mount_point: String,
     instance_id: String,
@@ -1515,25 +1512,33 @@ struct MountStatusPublisherState {
     last_published: Option<(utils::MountRecordStatus, Option<&'static str>)>,
 }
 
-impl MountStatusPublisher {
-    fn new(vfs: Arc<StudioVfs>, mount_point: String, instance_id: String) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(MountStatusPublisherState {
-                vfs,
-                mount_point,
-                instance_id,
-                attached: false,
-                failed: false,
-                last_published: None,
-            })),
-        }
+struct MountStatusMonitor {
+    state: Arc<Mutex<MountStatusMonitorState>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl MountStatusMonitor {
+    fn new_state(
+        vfs: Arc<StudioVfs>,
+        mount_point: String,
+        instance_id: String,
+    ) -> Arc<Mutex<MountStatusMonitorState>> {
+        Arc::new(Mutex::new(MountStatusMonitorState {
+            vfs,
+            mount_point,
+            instance_id,
+            attached: false,
+            failed: false,
+            last_published: None,
+        }))
     }
 
-    fn mark_attached(&self) {
-        if let Ok(mut state) = self.state.lock() {
+    fn mark_attached(state: &Arc<Mutex<MountStatusMonitorState>>) {
+        if let Ok(mut state) = state.lock() {
             state.attached = true;
         }
-        self.publish_current();
+        Self::publish_state(state);
     }
 
     fn mark_failed(&self) {
@@ -1544,15 +1549,17 @@ impl MountStatusPublisher {
     }
 
     fn publish_current(&self) {
-        let Ok(mut state) = self.state.lock() else {
+        Self::publish_state(&self.state);
+    }
+
+    fn publish_state(state: &Arc<Mutex<MountStatusMonitorState>>) {
+        let Ok(mut state) = state.lock() else {
             warn!("mount status publisher mutex was poisoned");
             return;
         };
         let sync_status = state.vfs.sync_status();
-        let record_status = mount_record_status(state.attached, state.failed, sync_status);
-        let sync_lifecycle = state
-            .attached
-            .then(|| pg_sync_lifecycle_name(sync_status.lifecycle));
+        let (record_status, sync_lifecycle) =
+            mount_record_state(state.attached, state.failed, sync_status);
         let next = (record_status, sync_lifecycle);
         if state.last_published == Some(next) {
             return;
@@ -1572,27 +1579,27 @@ impl MountStatusPublisher {
             ),
         }
     }
-}
 
-struct MountStatusMonitor {
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl MountStatusMonitor {
-    fn start(publisher: MountStatusPublisher) -> anyhow::Result<Self> {
+    fn start(
+        vfs: Arc<StudioVfs>,
+        mount_point: String,
+        instance_id: String,
+    ) -> anyhow::Result<Self> {
+        let state = Self::new_state(vfs, mount_point, instance_id);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let thread_state = state.clone();
         let thread = std::thread::Builder::new()
             .name("studiofs-mount-status".to_string())
             .spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
-                    publisher.publish_current();
+                    Self::publish_state(&thread_state);
                     std::thread::sleep(MOUNT_STATUS_POLL_INTERVAL);
                 }
             })
             .map_err(|error| anyhow::anyhow!("failed to start mount status monitor: {error}"))?;
         Ok(Self {
+            state,
             stop,
             thread: Some(thread),
         })
@@ -1606,46 +1613,53 @@ impl MountStatusMonitor {
             warn!("mount status monitor panicked during shutdown");
         }
     }
+
+    fn ready_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let state = self.state.clone();
+        Arc::new(move || Self::mark_attached(&state))
+    }
 }
 
-fn mount_record_status(
+fn mount_record_state(
     attached: bool,
     failed: bool,
     sync_status: PgSyncStatus,
-) -> utils::MountRecordStatus {
-    if failed {
-        return utils::MountRecordStatus::Failed;
-    }
+) -> (utils::MountRecordStatus, Option<&'static str>) {
     if !attached {
-        return utils::MountRecordStatus::Starting;
+        return (
+            if failed {
+                utils::MountRecordStatus::Failed
+            } else {
+                utils::MountRecordStatus::Starting
+            },
+            None,
+        );
     }
-    match sync_status.lifecycle {
-        PgSyncLifecycle::Live => utils::MountRecordStatus::Live,
-        PgSyncLifecycle::Degraded => utils::MountRecordStatus::Degraded,
-        PgSyncLifecycle::Fatal => utils::MountRecordStatus::Failed,
-        PgSyncLifecycle::LocalReady
-        | PgSyncLifecycle::CatchingUp
-        | PgSyncLifecycle::TargetReached
-        | PgSyncLifecycle::AllocatorPending => utils::MountRecordStatus::Mounted,
-    }
-}
 
-fn pg_sync_lifecycle_name(lifecycle: PgSyncLifecycle) -> &'static str {
-    match lifecycle {
-        PgSyncLifecycle::LocalReady => "local_ready",
-        PgSyncLifecycle::CatchingUp => "catching_up",
-        PgSyncLifecycle::TargetReached => "target_reached",
-        PgSyncLifecycle::AllocatorPending => "allocator_pending",
-        PgSyncLifecycle::Live => "live",
-        PgSyncLifecycle::Degraded => "degraded",
-        PgSyncLifecycle::Fatal => "fatal",
-    }
+    let (status, lifecycle) = match sync_status.lifecycle {
+        PgSyncLifecycle::LocalReady => (utils::MountRecordStatus::Mounted, "local_ready"),
+        PgSyncLifecycle::CatchingUp => (utils::MountRecordStatus::Mounted, "catching_up"),
+        PgSyncLifecycle::TargetReached => (utils::MountRecordStatus::Mounted, "target_reached"),
+        PgSyncLifecycle::AllocatorPending => {
+            (utils::MountRecordStatus::Mounted, "allocator_pending")
+        }
+        PgSyncLifecycle::Live => (utils::MountRecordStatus::Live, "live"),
+        PgSyncLifecycle::Degraded => (utils::MountRecordStatus::Degraded, "degraded"),
+        PgSyncLifecycle::Fatal => (utils::MountRecordStatus::Failed, "fatal"),
+    };
+    (
+        if failed {
+            utils::MountRecordStatus::Failed
+        } else {
+            status
+        },
+        Some(lifecycle),
+    )
 }
 
 struct MountRuntimeGuard {
     prepared: PreparedMount,
     diagnostics_host: Option<LocalDiagnosticsHost>,
-    mount_status_publisher: Option<MountStatusPublisher>,
     mount_status_monitor: Option<MountStatusMonitor>,
     cleanup_completed: bool,
 }
@@ -1655,7 +1669,6 @@ impl MountRuntimeGuard {
         Self {
             prepared,
             diagnostics_host: None,
-            mount_status_publisher: None,
             mount_status_monitor: None,
             cleanup_completed: false,
         }
@@ -1673,9 +1686,9 @@ impl MountRuntimeGuard {
         self.prepared.print_ready()?;
         let result = self.serve_foreground();
         if result.is_err()
-            && let Some(publisher) = self.mount_status_publisher.as_ref()
+            && let Some(monitor) = self.mount_status_monitor.as_ref()
         {
-            publisher.mark_failed();
+            monitor.mark_failed();
         }
         result
     }
@@ -1691,13 +1704,11 @@ impl MountRuntimeGuard {
             .context("foreground mount session is missing lifecycle lock")?
             .instance_id()
             .to_string();
-        let publisher = MountStatusPublisher::new(
+        let monitor = MountStatusMonitor::start(
             foreground.vfs.clone(),
             self.prepared.plan.actual_mount_path.clone(),
             instance_id,
-        );
-        let monitor = MountStatusMonitor::start(publisher.clone())?;
-        self.mount_status_publisher = Some(publisher);
+        )?;
         self.mount_status_monitor = Some(monitor);
         Ok(())
     }
@@ -1706,7 +1717,6 @@ impl MountRuntimeGuard {
         if let Some(mut monitor) = self.mount_status_monitor.take() {
             monitor.stop_and_join();
         }
-        self.mount_status_publisher.take();
     }
 
     fn serve_foreground(&mut self) -> anyhow::Result<()> {
@@ -1759,14 +1769,11 @@ impl MountRuntimeGuard {
                 mount_point: actual_mount_path,
                 volume_name: format_info_name,
                 read_only: read_only_mount,
-                mount_ready_callback: Arc::new({
-                    let publisher = self
-                        .mount_status_publisher
-                        .as_ref()
-                        .expect("mount status publisher started before backend")
-                        .clone();
-                    move || publisher.mark_attached()
-                }),
+                mount_ready_callback: self
+                    .mount_status_monitor
+                    .as_ref()
+                    .expect("mount status monitor started before backend")
+                    .ready_callback(),
                 #[cfg(all(unix, not(target_os = "linux")))]
                 run_in_foreground,
             });
@@ -3445,8 +3452,8 @@ mod tests {
     }
 
     #[test]
-    fn mount_record_status_maps_pg_catch_up_without_claiming_live() {
-        let status = mount_record_status(
+    fn mount_record_state_maps_pg_catch_up_without_claiming_live() {
+        let (status, lifecycle) = mount_record_state(
             true,
             false,
             PgSyncStatus::new(
@@ -3456,10 +3463,7 @@ mod tests {
         );
 
         assert_eq!(status, utils::MountRecordStatus::Mounted);
-        assert_eq!(
-            pg_sync_lifecycle_name(PgSyncLifecycle::CatchingUp),
-            "catching_up"
-        );
+        assert_eq!(lifecycle, Some("catching_up"));
     }
 
     #[test]

@@ -158,24 +158,6 @@ impl MountLockGuard {
         &self.instance_id
     }
 
-    pub(crate) fn persist_record(
-        &self,
-        mount_point: &str,
-        volume: &str,
-        pid: u32,
-        cache_path: Option<&Path>,
-    ) -> Result<()> {
-        write_mount_record_with_cache_and_instance(
-            mount_point,
-            volume,
-            pid,
-            cache_path,
-            Some(self.instance_id()),
-            MountRecordStatus::Starting,
-            None,
-        )
-    }
-
     pub(crate) fn persist_record_state(
         &self,
         mount_point: &str,
