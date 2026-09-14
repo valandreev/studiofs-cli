@@ -762,6 +762,29 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    fn validate_empty_foreign_event_page(
+        cursor_batch_version: i64,
+        target_batch_version: i64,
+        prune_floor: i64,
+    ) -> MetaResult<()> {
+        if prune_floor < 0 {
+            return Err(MetaError::Storage(
+                "postgres event-log prune floor must be nonnegative".to_string(),
+            ));
+        }
+        if cursor_batch_version >= prune_floor {
+            return Ok(());
+        }
+        let first_available_version = prune_floor.checked_add(1).ok_or_else(|| {
+            MetaError::Storage("postgres event-log prune floor exceeds BIGINT".to_string())
+        })?;
+        Err(MetaError::ReplayGap {
+            local_version: cursor_batch_version,
+            first_available_version,
+            target_version: target_batch_version,
+        })
+    }
+
     pub(super) async fn query_foreign_event_page<C>(
         client: &C,
         volume_id: i64,
@@ -793,6 +816,23 @@ impl PgMetaEngine {
             .map_err(|e| Self::classify_pg_error("postgres event_log page select failed", e))?;
 
         let Some(first_row) = rows.first() else {
+            let Some(prune_floor_row) = client
+                .query_opt(sql::SELECT_EVENT_LOG_PRUNE_FLOOR, &[&volume_id])
+                .await
+                .map_err(|e| {
+                    Self::classify_pg_error("postgres event-log prune floor select failed", e)
+                })?
+            else {
+                return Ok(ForeignEventPage::empty(rows));
+            };
+            let prune_floor = prune_floor_row.try_get::<_, i64>(0).map_err(|e| {
+                Self::classify_pg_error("postgres event-log prune floor decode failed", e)
+            })?;
+            Self::validate_empty_foreign_event_page(
+                cursor_batch_version,
+                target_batch_version,
+                prune_floor,
+            )?;
             return Ok(ForeignEventPage::empty(rows));
         };
 

@@ -253,11 +253,14 @@ amount removed without exposing credentials or connection details. Pruning is
 not part of foreground writes, flushes, or startup.
 
 If a replay cursor is below the persisted floor, the client must use the finite
+remote checkpoint import flow to rebootstrap before resuming event replay.
 The bounded event-page query also rejects any non-empty page whose first batch
 is not exactly the next version after the local cursor, returning a typed
 `MetaError::ReplayGap` instead of silently skipping the missing range. The
-checkpoint import/rebootstrap recovery that consumes this signal remains owned
-by SFS-711; automatic client rebase is owned by SFS-712.
+same result is returned for an empty page when the persisted prune floor proves
+that the cursor is too old. Checkpoint import/rebootstrap recovery that consumes
+this signal remains owned by SFS-711; automatic client rebase is owned by
+SFS-712.
 
 ## Finite Remote History and Recovery
 

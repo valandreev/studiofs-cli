@@ -44,7 +44,8 @@ range intact.
 - [x] (2026-09-14) Re-verified the attached review: added replay-gap fencing,
       removed idle metadata writes, aggregated DELETE results, made the janitor
       lock non-blocking, documented the prune limit, skipped pruning after
-      failed sync, and tested source-guard release.
+      failed sync, fixed the normative contract sentence, and tested both
+      source-guard release and an entirely pruned replay window.
 
 ## Surprises & Discoveries
 
@@ -65,8 +66,9 @@ range intact.
   `snapshot_control.rs`.
 - Observation: SFS-711 owns checkpoint import/rebootstrap recovery and
   automatic rebootstrap is SFS-712. SFS-709 now rejects a non-contiguous page
-  with `MetaError::ReplayGap` so it cannot silently skip pruned history, but it
-  does not add the recovery flow.
+  with `MetaError::ReplayGap` so it cannot silently skip pruned history; an
+  empty page also reports that result when the persisted floor is ahead of the
+  cursor. It does not add the recovery flow.
   Evidence: the current Linear relation graph for SFS-709, SFS-711, and
   SFS-712.
 
@@ -119,10 +121,10 @@ range intact.
 
 The repository now has a durable per-volume pruning floor, bounded
 complete-batch event deletion, retryable background execution, a defensive
-non-contiguous-page guard, and focused evidence that retained Snapshot v2
-replay rows survive and later release pruning. The later SFS-711 checkpoint
-recovery can consume `MetaError::ReplayGap`; automatic rebootstrap remains
-outside this task.
+non-contiguous-page guard for both populated and empty windows, and focused
+evidence that retained Snapshot v2 replay rows survive and later release
+pruning. The later SFS-711 checkpoint recovery can consume
+`MetaError::ReplayGap`; automatic rebootstrap remains outside this task.
 
 ## Context and Orientation
 
@@ -149,9 +151,10 @@ version 7 onward through its cut, so pruning may advance only through version
 6 while that source remains retained.
 
 The current local replay page query in `sql.rs` still returns ordered complete
-batch groups and does not reinterpret an empty page as a replay gap. It now
-rejects a non-empty page whose first batch is not exactly the next version
-after the local cursor, before the rows reach foreign apply.
+batch groups. It rejects a non-empty page whose first batch is not exactly the
+next version after the local cursor, and rejects an empty page when the
+persisted prune floor proves that the cursor is too old, before rows reach
+foreign apply.
 
 ## Plan of Work
 
