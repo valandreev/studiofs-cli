@@ -2,7 +2,8 @@ use super::{MetadataSyncSource, PgMetaEngine, sql};
 use crate::engine::{
     MetaError, MetaReplication, MetaResult, MetadataAuthorityStatus,
     MetadataCheckpointFreshnessDiagnostics, MetadataCoherenceProgress,
-    MetadataInvalidationDiagnostics, MetadataReplicationBacklog, PgSyncDiagnostics, PgSyncStatus,
+    MetadataInvalidationDiagnostics, MetadataReplicationBacklog, PgSyncDiagnostics,
+    PgSyncLifecycle, PgSyncStatus,
 };
 use crate::types::Ino;
 use std::sync::Arc;
@@ -43,7 +44,21 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
-        let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+        let shutdown = self.background_workers.poll_shutdown();
+        if matches!(
+            self.current_pg_sync_lifecycle(),
+            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+        ) {
+            self.run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)?;
+        } else {
+            match self.sync_metadata_with_source(MetadataSyncSource::Manual) {
+                Ok(_) => {}
+                Err(MetaError::RebootstrapRequired { .. } | MetaError::ReplayGap { .. }) => {
+                    self.run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if let Err(error) = self.backfill_current_reference_ledger_if_needed() {
             warn!(
                 error = %error,

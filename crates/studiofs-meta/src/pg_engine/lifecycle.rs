@@ -3,6 +3,7 @@ use super::{
     PgMetaEngine,
 };
 use crate::engine::{MetaError, MetaResult, PgSyncLifecycle};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -60,6 +61,51 @@ pub(super) fn drain_startup_catch_up_pages(
         current = next;
     }
     Ok(changed)
+}
+
+/// Require a serving snapshot to be imported before refreshing the catch-up target.
+pub(super) fn rebootstrap_startup_target(
+    rebootstrap_error: MetaError,
+    import_snapshot: impl FnOnce() -> MetaResult<bool>,
+    frozen_target: impl FnOnce() -> MetaResult<i64>,
+) -> MetaResult<i64> {
+    if !import_snapshot()? {
+        match &rebootstrap_error {
+            MetaError::RebootstrapRequired {
+                local_version,
+                retained_floor,
+                checkpoint_version,
+                target_version,
+            } => {
+                tracing::warn!(
+                    local_version = *local_version,
+                    retained_floor = *retained_floor,
+                    checkpoint_version = *checkpoint_version,
+                    target_version = *target_version,
+                    "serving snapshot import returned false during rebootstrap; checkpoint may not be newer than local cursor"
+                );
+            }
+            MetaError::ReplayGap {
+                local_version,
+                first_available_version,
+                target_version,
+            } => {
+                tracing::warn!(
+                    local_version = *local_version,
+                    first_available_version = *first_available_version,
+                    target_version = *target_version,
+                    "serving snapshot import returned false during replay-gap recovery"
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    "serving snapshot import returned false during unexpected metadata recovery"
+                );
+            }
+        }
+        return Err(rebootstrap_error);
+    }
+    frozen_target()
 }
 
 impl PgBackgroundWorkers {
@@ -327,8 +373,12 @@ impl PgMetaEngine {
     }
 
     /// Run one interruptible startup catch-up session to the frozen target.
-    pub(super) fn run_startup_catch_up_session(&self, shutdown: &AtomicBool) -> MetaResult<bool> {
-        let mut remote_operation_recorded = false;
+    pub(super) fn run_startup_catch_up_session(
+        &self,
+        source: MetadataSyncSource,
+        shutdown: &AtomicBool,
+    ) -> MetaResult<bool> {
+        let remote_operation_recorded = Cell::new(false);
         let result = (|| {
             self.ensure_remote_format_validated()?;
             let _guard = self
@@ -344,33 +394,65 @@ impl PgMetaEngine {
                 return Ok(false);
             }
 
-            // Keep target capture and every page pull under one lock so a
-            // concurrent NOTIFY sync cannot clear the target mid-session.
+            // Keep target capture, snapshot transfer, and every page pull under
+            // one lock so a concurrent NOTIFY sync cannot clear the target
+            // mid-session. Each PostgreSQL command is bounded by
+            // `command_timeout`, and page draining is bounded by the startup
+            // catch-up page budget.
             let target_version = match self.frozen_sync_target_version() {
                 Ok(target_version) => target_version,
                 Err(error) => {
-                    remote_operation_recorded = true;
+                    remote_operation_recorded.set(true);
                     return Err(error);
                 }
             };
-            drain_startup_catch_up_pages(
-                target_version,
-                || self.local_version.load(Ordering::Acquire),
-                || {
-                    !shutdown.load(Ordering::Acquire)
-                        && matches!(
-                            self.current_pg_sync_lifecycle(),
-                            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
-                        )
-                },
-                || {
-                    let result = self.pull_foreign_events_locked_to_target(None, target_version);
+            let pull_page = |target_version| {
+                let result = self.pull_foreign_events_locked_to_target(None, target_version);
+                if result.is_err() {
+                    remote_operation_recorded.set(true);
+                }
+                result
+            };
+            let drain_to_target = |target_version| {
+                drain_startup_catch_up_pages(
+                    target_version,
+                    || self.local_version.load(Ordering::Acquire),
+                    || {
+                        !shutdown.load(Ordering::Acquire)
+                            && matches!(
+                                self.current_pg_sync_lifecycle(),
+                                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+                            )
+                    },
+                    || pull_page(target_version),
+                )
+            };
+            let changed = match drain_to_target(target_version) {
+                Ok(changed) => changed,
+                Err(
+                    rebootstrap_error @ (MetaError::RebootstrapRequired { .. }
+                    | MetaError::ReplayGap { .. }),
+                ) => {
+                    let result = rebootstrap_startup_target(
+                        rebootstrap_error,
+                        || {
+                            self.pull_snapshot_locked(
+                                super::StartupSnapshotImportMode::PreserveLocalState,
+                            )
+                        },
+                        || self.frozen_sync_target_version(),
+                    );
                     if result.is_err() {
-                        remote_operation_recorded = true;
+                        remote_operation_recorded.set(true);
                     }
-                    result
-                },
-            )
+                    let target_version = result?;
+                    remote_operation_recorded.set(false);
+                    drain_to_target(target_version)?;
+                    true
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(changed)
         })();
         let result = if result.is_ok() && self.current_pg_sync_lifecycle() == PgSyncLifecycle::Fatal
         {
@@ -383,11 +465,7 @@ impl PgMetaEngine {
         }
         // Fresh-client completion reacquires replication_lock, so record the
         // aggregate session result only after the page-drain lock is released.
-        self.record_metadata_sync_result(
-            MetadataSyncSource::FallbackPoll,
-            &result,
-            remote_operation_recorded,
-        );
+        self.record_metadata_sync_result(source, &result, remote_operation_recorded.get());
         result
     }
 
@@ -446,7 +524,10 @@ impl PgMetaEngine {
                         engine.current_pg_sync_lifecycle(),
                         PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
                     ) {
-                        engine.run_startup_catch_up_session(&shutdown)
+                        engine.run_startup_catch_up_session(
+                            MetadataSyncSource::FallbackPoll,
+                            &shutdown,
+                        )
                     } else {
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
                     };

@@ -236,6 +236,8 @@ pub struct PgMetaEngine {
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
     active_open_inodes: Mutex<HashMap<Ino, u32>>,
+    #[cfg(test)]
+    snapshot_import_after_active_open_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     self_weak: OnceLock<Weak<Self>>,
     lock_workers_enabled: bool,
     lock_worker_start_lock: Mutex<()>,
@@ -1267,6 +1269,8 @@ impl PgMetaEngine {
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
             active_open_inodes: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            snapshot_import_after_active_open_capture_hook: Mutex::new(None),
             self_weak: OnceLock::new(),
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
@@ -1337,7 +1341,23 @@ impl PgMetaEngine {
                         .metadata_remote_head_version
                         .store(remote_head, Ordering::Release);
                     if engine.local_version.load(Ordering::Acquire) < remote_head {
-                        engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                        // Identity validation may leave AllocatorPending before
+                        // this head check; allocator authority is independent
+                        // from convergence, so it can enter CatchingUp directly.
+                        match engine.current_pg_sync_lifecycle() {
+                            PgSyncLifecycle::CatchingUp => {}
+                            PgSyncLifecycle::LocalReady
+                            | PgSyncLifecycle::Degraded
+                            | PgSyncLifecycle::AllocatorPending => {
+                                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                            }
+                            PgSyncLifecycle::Live | PgSyncLifecycle::TargetReached => {
+                                // Record loss of convergence before retrying from a healthy state.
+                                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+                                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                            }
+                            PgSyncLifecycle::Fatal => {}
+                        }
                     }
                     true
                 }

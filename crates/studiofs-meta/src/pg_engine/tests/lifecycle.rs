@@ -384,6 +384,70 @@ fn startup_catch_up_drain_replays_pages_until_frozen_target() {
 }
 
 #[test]
+fn startup_rebootstrap_requires_snapshot_import_before_refreshing_target() {
+    let rebootstrap_error = MetaError::RebootstrapRequired {
+        local_version: 5,
+        retained_floor: 8,
+        checkpoint_version: 8,
+        target_version: 12,
+    };
+    let target_calls = std::cell::Cell::new(0_usize);
+
+    let error = rebootstrap_startup_target(
+        rebootstrap_error.clone(),
+        || Ok(false),
+        || {
+            target_calls.set(target_calls.get() + 1);
+            Ok(15)
+        },
+    )
+    .expect_err("a missing snapshot must keep recovery failed");
+
+    assert!(matches!(error, MetaError::RebootstrapRequired { .. }));
+    assert_eq!(target_calls.get(), 0);
+
+    let target = rebootstrap_startup_target(
+        rebootstrap_error,
+        || Ok(true),
+        || {
+            target_calls.set(target_calls.get() + 1);
+            Ok(15)
+        },
+    )
+    .expect("an imported snapshot should allow a fresh target");
+
+    assert_eq!(target, 15);
+    assert_eq!(target_calls.get(), 1);
+}
+
+#[test]
+fn startup_rebootstrap_propagates_snapshot_import_error_without_refreshing_target() {
+    let rebootstrap_error = MetaError::RebootstrapRequired {
+        local_version: 5,
+        retained_floor: 8,
+        checkpoint_version: 8,
+        target_version: 12,
+    };
+    let target_calls = std::cell::Cell::new(0_usize);
+
+    let error = rebootstrap_startup_target(
+        rebootstrap_error,
+        || Err(MetaError::Storage("io failure".to_string())),
+        || {
+            target_calls.set(target_calls.get() + 1);
+            Ok(15)
+        },
+    )
+    .expect_err("snapshot import errors must be returned unchanged");
+
+    assert!(matches!(
+        error,
+        MetaError::Storage(message) if message == "io failure"
+    ));
+    assert_eq!(target_calls.get(), 0);
+}
+
+#[test]
 fn startup_catch_up_drain_yields_at_page_budget_and_resumes_from_cursor() {
     let local_version = std::cell::Cell::new(0_i64);
     let pulls = std::cell::Cell::new(0_usize);
@@ -602,10 +666,64 @@ fn startup_catch_up_session_rejects_fatal_lifecycle_as_success() {
     );
 
     let error = engine
-        .run_startup_catch_up_session(&std::sync::atomic::AtomicBool::new(false))
+        .run_startup_catch_up_session(
+            MetadataSyncSource::Manual,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
         .expect_err("fatal lifecycle must not be reported as a successful sync");
 
     assert!(matches!(error, MetaError::LifecycleFatal));
+}
+
+#[test]
+fn startup_catch_up_session_honors_shutdown_signal() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    let shutdown = std::sync::atomic::AtomicBool::new(true);
+
+    let changed = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+        .expect("shutdown should stop startup catch-up cleanly");
+
+    assert!(!changed);
+}
+
+#[test]
+fn startup_catch_up_drain_honors_shutdown_after_a_page() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .metadata_startup_target_version
+        .store(2, std::sync::atomic::Ordering::Release);
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || local_version.get(),
+        || !shutdown.load(std::sync::atomic::Ordering::Acquire),
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(1);
+            shutdown.store(true, std::sync::atomic::Ordering::Release);
+            Ok(true)
+        },
+    )
+    .expect("shutdown after a committed page should stop catch-up cleanly");
+
+    assert!(changed);
+    assert_eq!(pulls.get(), 1);
+    engine
+        .local_version
+        .store(local_version.get(), std::sync::atomic::Ordering::Release);
+    engine
+        .try_complete_catchup_sync()
+        .expect("incomplete shutdown catch-up should remain recoverable");
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
 }
 
 struct EventLogLockGuard {
@@ -809,6 +927,180 @@ fn startup_catch_up_reports_rebootstrap_below_retained_event_log_floor() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_overlay() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-checkpoint");
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+    for name in [b"checkpoint-1".as_slice(), b"checkpoint-2"] {
+        publisher
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create checkpoint event");
+        publisher
+            .flush_metadata()
+            .expect("publish checkpoint event");
+    }
+    let (checkpoint_bytes, checkpoint_sha256) = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
+        }
+    }))
+    .expect("read checkpoint at retained floor");
+    publisher
+        .create_dir(ROOT_INO, b"replayed-after-checkpoint", 0, 0, 0o755)
+        .expect("create replay tail event");
+    publisher
+        .flush_metadata()
+        .expect("publish replay tail event");
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            client
+                .execute(
+                    "DELETE FROM event_log WHERE vol = $1 AND batch_version = 2",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 0 WHERE vol = $3",
+                    &[&checkpoint_bytes, &checkpoint_sha256, &volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("restore checkpoint descriptor at retained floor");
+
+    let stale_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_db = stale_dir.path().join("stale.redb");
+    seed_local(&stale_db, &volume.format_info());
+    let local = RedbMetaEngine::open(&stale_db).expect("open stale local metadata");
+    local
+        .create_dir(ROOT_INO, b"pending-local", 0, 0, 0o755)
+        .expect("create pending local overlay");
+    PgMetaEngine::persist_client_slot(&local, 0).expect("persist stale client slot");
+    local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 1)
+        .expect("persist stale replay cursor");
+    drop(local);
+
+    let stale = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open stale metadata client");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 1);
+    assert_eq!(
+        stale
+            .remote_metadata_head_version()
+            .expect("read remote head after stale client open"),
+        3
+    );
+    stale
+        .sync_metadata()
+        .expect("manual sync should rebase a stale replay cursor");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 3);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(
+        stale
+            .metadata_invalidation_diagnostics()
+            .fallback_poll_discoveries,
+        0
+    );
+    publisher
+        .create_dir(ROOT_INO, b"advanced-after-rebootstrap", 0, 0, 0o755)
+        .expect("create event after rebootstrap detection");
+    publisher
+        .flush_metadata()
+        .expect("publish event after rebootstrap detection");
+    drop(publisher);
+
+    stale
+        .sync_metadata()
+        .expect("manual sync should replay the post-rebase event");
+
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 4);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    for name in [
+        b"checkpoint-1".as_slice(),
+        b"checkpoint-2",
+        b"replayed-after-checkpoint",
+        b"advanced-after-rebootstrap",
+        b"pending-local",
+    ] {
+        stale
+            .lookup(ROOT_INO, name)
+            .expect("checkpoint, replay, and pending entries must survive rebase");
+    }
+
+    stale
+        .flush_metadata()
+        .expect("flush preserved overlay after rebase");
+    let (remote_version, remote_events) = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let state = client
+                .query_one(
+                    "SELECT version FROM metadata_state WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let rows = client
+                .query(
+                    "SELECT event_type, event_payload FROM event_log WHERE vol = $1 AND batch_version = 5 ORDER BY seq_id",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let events = rows
+                .into_iter()
+                .map(|row| {
+                    crate::events::decode_event_with_type(
+                        row.get(0),
+                        row.get(1),
+                    )
+                })
+                .collect::<MetaResult<Vec<_>>>()?;
+            Ok::<(i64, Vec<MetaEvent>), MetaError>((state.get(0), events))
+        }
+    }))
+    .expect("read flushed overlay event from postgres");
+    assert_eq!(remote_version, 5);
+    assert!(remote_events.iter().any(|event| matches!(
+        event,
+        MetaEvent::AddEntry { name, .. } if name.as_slice() == b"pending-local"
+    )));
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     let Some(dsn) = pg_dsn() else {
         return;
@@ -872,7 +1164,7 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     let shutdown = std::sync::atomic::AtomicBool::new(false);
     assert!(
         stale
-            .run_startup_catch_up_session(&shutdown)
+            .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
             .expect("drain frozen startup target")
     );
     assert_eq!(stale.local_version.load(Ordering::Acquire), startup_target);
@@ -2942,7 +3234,7 @@ fn snapshot_reconcile_resets_stale_regular_file_serving_attr() {
         "base-only import can leave a stale serving attr until reconciliation"
     );
 
-    pg.reconcile_imported_snapshot_regular_files()
+    pg.reconcile_imported_snapshot_regular_files_with_active_open_inodes(None)
         .expect("reconcile imported snapshot");
 
     assert_eq!(
@@ -2950,6 +3242,149 @@ fn snapshot_reconcile_resets_stale_regular_file_serving_attr() {
         remote_attr.size,
         "snapshot reconciliation must reset stale regular-file serving attrs from base"
     );
+}
+
+#[test]
+fn snapshot_rebootstrap_holds_active_open_lock_through_import() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.note_active_open_inode(ROOT_INO);
+
+    let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+    let hook_release_rx = std::sync::Arc::clone(&release_rx);
+    pg.set_snapshot_import_after_active_open_capture_hook(std::sync::Arc::new(move || {
+        captured_tx.send(()).expect("signal active-open capture");
+        hook_release_rx
+            .lock()
+            .expect("snapshot import hook release lock")
+            .recv()
+            .expect("release snapshot import hook");
+    }));
+
+    let pg = std::sync::Arc::new(pg);
+    let worker_pg = std::sync::Arc::clone(&pg);
+    let worker = std::thread::spawn(move || {
+        worker_pg.import_serving_checkpoint_locked(
+            StartupSnapshotImportMode::PreserveLocalState,
+            &crate::snapshot::ServingCheckpoint::default(),
+            0,
+        )
+    });
+
+    captured_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("snapshot import should capture active opens");
+    let note_pg = std::sync::Arc::clone(&pg);
+    let (noted_tx, noted_rx) = std::sync::mpsc::channel();
+    let note_worker = std::thread::spawn(move || {
+        note_pg.note_active_open_inode(ROOT_INO);
+        noted_tx.send(()).expect("signal active-open registration");
+    });
+    let note_completed_during_import = noted_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_ok();
+
+    release_tx.send(()).expect("release snapshot import");
+    worker
+        .join()
+        .expect("join snapshot import worker")
+        .expect("snapshot import");
+    note_worker.join().expect("join active-open registration");
+
+    assert!(
+        !note_completed_during_import,
+        "active-open registration must wait for snapshot replacement"
+    );
+}
+
+#[test]
+fn snapshot_rebootstrap_preserves_active_open_inode_binding() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"snapshot-open.txt", 0, 0, 0o644)
+        .expect("create file");
+    let entry = pg
+        .lookup(ROOT_INO, b"snapshot-open.txt")
+        .expect("lookup file");
+    pg.local
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr: file.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"snapshot-open.txt".to_vec(),
+                entry,
+            },
+        ])
+        .expect("publish file metadata to base");
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack published setup");
+    pg.note_active_open_inode(file.ino);
+    assert!(
+        !pg.local
+            .local_overlay_attr_inodes()
+            .expect("local attr overlays")
+            .contains(&file.ino)
+    );
+    assert!(
+        !pg.local
+            .local_overlay_inodes()
+            .expect("local overlays")
+            .contains(&file.ino)
+    );
+
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::PreserveLocalState,
+        &crate::snapshot::ServingCheckpoint::default(),
+        0,
+    )
+    .expect("import serving checkpoint");
+
+    assert!(
+        pg.get_attr(file.ino).is_ok(),
+        "snapshot rebootstrap must retain metadata for active open handles"
+    );
+}
+
+#[test]
+fn snapshot_rebootstrap_waits_for_pending_mutation_lock() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let pg = std::sync::Arc::new(pg);
+    let pending_guard = pg.pending_state.lock().expect("pending state");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_pg = std::sync::Arc::clone(&pg);
+
+    let worker = std::thread::spawn(move || {
+        started_tx
+            .send(())
+            .expect("signal checkpoint import worker");
+        result_tx
+            .send(worker_pg.import_serving_checkpoint_locked(
+                StartupSnapshotImportMode::PreserveLocalState,
+                &crate::snapshot::ServingCheckpoint::default(),
+                0,
+            ))
+            .expect("send checkpoint import result");
+    });
+
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("checkpoint import worker should start");
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "checkpoint import must wait for the pending mutation lock"
+    );
+
+    drop(pending_guard);
+    result_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("checkpoint import should finish after the lock is released")
+        .expect("checkpoint import");
+    worker.join().expect("join checkpoint import worker");
 }
 
 #[test]

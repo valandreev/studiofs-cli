@@ -2,7 +2,7 @@ use super::*;
 use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, COUNTER_LIMIT};
 use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::inode_allocator::AllocatorRuntime;
-use crate::pg_engine::lifecycle::drain_startup_catch_up_pages;
+use crate::pg_engine::lifecycle::{drain_startup_catch_up_pages, rebootstrap_startup_target};
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -474,6 +474,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         file_lock_cache: Mutex::new(HashMap::new()),
         held_file_locks: Mutex::new(HashMap::new()),
         active_open_inodes: Mutex::new(HashMap::new()),
+        snapshot_import_after_active_open_capture_hook: Mutex::new(None),
         self_weak: OnceLock::new(),
         lock_workers_enabled: false,
         lock_worker_start_lock: Mutex::new(()),

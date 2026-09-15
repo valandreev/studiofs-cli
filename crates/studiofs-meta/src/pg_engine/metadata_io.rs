@@ -10,6 +10,7 @@ use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -457,22 +458,79 @@ impl PgMetaEngine {
             descriptor.checkpoint_version,
             descriptor.remote_head_version,
         );
+        self.import_serving_checkpoint_locked(import_mode, &checkpoint, replay_start_version)?;
+        Ok(true)
+    }
+
+    pub(super) fn import_serving_checkpoint_locked(
+        &self,
+        import_mode: StartupSnapshotImportMode,
+        checkpoint: &ServingCheckpoint,
+        replay_start_version: i64,
+    ) -> MetaResult<()> {
+        let _pending_state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let _active_open_inodes_guard =
+            if import_mode == StartupSnapshotImportMode::PreserveLocalState {
+                Some(self.active_open_inodes.lock().map_err(|_| {
+                    MetaError::Storage("pg active open inode lock poisoned".to_string())
+                })?)
+            } else {
+                None
+            };
+        let active_open_inodes = _active_open_inodes_guard
+            .as_ref()
+            .map(|active| active.keys().copied().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        #[cfg(test)]
+        self.run_snapshot_import_after_active_open_capture_hook();
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
-                self.local.import_serving_checkpoint(&checkpoint)?;
+                self.local.import_serving_checkpoint(checkpoint)?;
             }
             StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog => {
                 self.local
-                    .import_serving_checkpoint_preserving_local_event_log(&checkpoint)?;
+                    .import_serving_checkpoint_preserving_local_event_log(checkpoint)?;
             }
             StartupSnapshotImportMode::PreserveLocalState => {
                 self.local
-                    .import_serving_checkpoint_preserving_local_state(&checkpoint)?;
+                    .import_serving_checkpoint_preserving_local_state(
+                        checkpoint,
+                        &active_open_inodes,
+                    )?;
             }
         }
-        self.reconcile_imported_snapshot_regular_files()?;
+        self.reconcile_imported_snapshot_regular_files_with_active_open_inodes(
+            (import_mode == StartupSnapshotImportMode::PreserveLocalState)
+                .then_some(&active_open_inodes),
+        )?;
         self.persist_local_version(replay_start_version)?;
-        Ok(true)
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_snapshot_import_after_active_open_capture_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .snapshot_import_after_active_open_capture_hook
+            .lock()
+            .expect("snapshot import hook lock") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_snapshot_import_after_active_open_capture_hook(&self) {
+        let hook = self
+            .snapshot_import_after_active_open_capture_hook
+            .lock()
+            .expect("snapshot import hook lock")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn read_remote_metadata_head_version_unrecorded(&self) -> MetaResult<i64> {

@@ -650,7 +650,10 @@ impl PgSyncLifecycle {
                     Self::AllocatorPending | Self::Live | Self::Degraded | Self::Fatal
                 )
             }
-            Self::AllocatorPending => matches!(next, Self::Live | Self::Degraded | Self::Fatal),
+            Self::AllocatorPending => matches!(
+                next,
+                Self::CatchingUp | Self::Live | Self::Degraded | Self::Fatal
+            ),
             Self::Live => matches!(next, Self::AllocatorPending | Self::Degraded | Self::Fatal),
             Self::Degraded => matches!(next, Self::LocalReady | Self::CatchingUp | Self::Fatal),
             Self::Fatal => false,
@@ -1896,6 +1899,7 @@ mod tests {
         assert!(
             PgSyncLifecycle::TargetReached.can_transition_to(PgSyncLifecycle::AllocatorPending)
         );
+        assert!(PgSyncLifecycle::AllocatorPending.can_transition_to(PgSyncLifecycle::CatchingUp));
         assert!(PgSyncLifecycle::AllocatorPending.can_transition_to(PgSyncLifecycle::Live));
         assert!(PgSyncLifecycle::Live.can_transition_to(PgSyncLifecycle::Degraded));
         assert!(PgSyncLifecycle::Degraded.can_transition_to(PgSyncLifecycle::CatchingUp));
