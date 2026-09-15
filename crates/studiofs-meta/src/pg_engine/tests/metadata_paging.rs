@@ -37,9 +37,14 @@ fn foreign_event_page_query_is_bounded_and_exposes_page_metadata() {
         sql::SELECT_FOREIGN_EVENT_ROWS
             .contains("COALESCE(BOOL_OR(response_bytes > $5::BIGINT), false)")
     );
+}
+
+#[test]
+fn metadata_replay_state_query_uses_shared_replay_lock() {
     assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("event_log_prune_floor"));
     assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("checkpoint_version"));
-    assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("FOR SHARE"));
+    assert!(!sql::SELECT_METADATA_REPLAY_STATE.contains("FOR SHARE"));
+    assert!(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK.contains("pg_advisory_xact_lock_shared"));
 }
 
 #[test]

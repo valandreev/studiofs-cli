@@ -1,7 +1,8 @@
 //! Owns foreign metadata catch-up orchestration and local replay application.
 
 use super::{
-    MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator, sql,
+    MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
+    janitor::pg_janitor_lock_key, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
 use crate::types::FileType;
@@ -211,6 +212,15 @@ impl PgMetaEngine {
                         let tx = client.transaction().await.map_err(|e| {
                             Self::classify_pg_error("postgres begin pull transaction failed", e)
                         })?;
+                        let lock_key = pg_janitor_lock_key(volume_id);
+                        tx.query_one(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK, &[&lock_key])
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres metadata replay advisory lock failed",
+                                    e,
+                                )
+                            })?;
                         let replay_state = tx
                             .query_opt(sql::SELECT_METADATA_REPLAY_STATE, &[&volume_id])
                             .await
@@ -220,15 +230,20 @@ impl PgMetaEngine {
                                     e,
                                 )
                             })?;
-                        let found = replay_state
-                            .as_ref()
-                            .and_then(|row| row.get::<_, Option<i16>>(0));
-                        crate::ensure_supported_pg_sync_format_version(found)?;
                         let replay_state = replay_state.ok_or_else(|| {
                             MetaError::Storage(
                                 "postgres metadata replay state row missing".to_string(),
                             )
                         })?;
+                        let format_version = replay_state
+                            .try_get::<_, Option<i16>>("metadata_format_version")
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres metadata format version read failed",
+                                    e,
+                                )
+                            })?;
+                        crate::ensure_supported_pg_sync_format_version(format_version)?;
                         let checkpoint_version = replay_state
                             .try_get::<_, i64>("checkpoint_version")
                             .map_err(|e| {

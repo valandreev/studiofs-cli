@@ -280,7 +280,9 @@ pub enum MetaError {
     RebootstrapRequired {
         /// Last local replay cursor observed before the retained history.
         local_version: i64,
-        /// Highest complete event-log batch durably removed from PostgreSQL.
+        /// Inclusive upper bound of complete event-log batches durably removed
+        /// from PostgreSQL (`event_log_prune_floor`); the next replayable batch
+        /// is `retained_floor + 1`.
         retained_floor: i64,
         /// Checkpoint version that identifies the descriptor for recovery.
         checkpoint_version: i64,
@@ -710,7 +712,9 @@ pub enum PgSyncFailure {
     RebootstrapRequired {
         /// Last local replay cursor before the retained history.
         local_version: Option<u64>,
-        /// Highest complete event-log batch durably removed remotely.
+        /// Inclusive upper bound of complete event-log batches durably removed
+        /// remotely (`event_log_prune_floor`); the next replayable batch is
+        /// `retained_floor + 1`.
         retained_floor: Option<u64>,
         /// Checkpoint version identifying the recovery descriptor.
         checkpoint_version: Option<u64>,

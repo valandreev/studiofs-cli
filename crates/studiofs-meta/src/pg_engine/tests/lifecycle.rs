@@ -345,6 +345,20 @@ fn pg_sync_failure_preserves_uninitialized_versions() {
             pages: 0,
         }
     );
+    assert_eq!(
+        PgSyncFailure::from_error(&MetaError::RebootstrapRequired {
+            local_version: -1,
+            retained_floor: -1,
+            checkpoint_version: -1,
+            target_version: -1,
+        }),
+        PgSyncFailure::RebootstrapRequired {
+            local_version: None,
+            retained_floor: None,
+            checkpoint_version: None,
+            target_version: None,
+        }
+    );
 }
 
 #[test]

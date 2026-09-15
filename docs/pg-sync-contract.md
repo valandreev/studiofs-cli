@@ -252,13 +252,16 @@ groups per transaction, and advances the persisted
 amount removed without exposing credentials or connection details. Pruning is
 not part of foreground writes, flushes, or startup.
 
-Before each bounded replay page, the client reads `checkpoint_version` and the
-inclusive `event_log_prune_floor` from `metadata_state` under `FOR SHARE` in
-the same transaction as the event-page query. A cursor below that floor returns
-typed `MetaError::RebootstrapRequired` with the local cursor, retained floor,
-checkpoint version, and frozen target. The PostgreSQL pruner takes the same row
-lock before deleting history or advancing the floor, so pruning cannot turn a
-page that passed the check into a false successful convergence.
+Before each bounded replay page, the client takes a shared transaction-level
+advisory lock keyed by volume, then reads `checkpoint_version` and the
+inclusive `event_log_prune_floor` from `metadata_state` in the same transaction
+as the event-page query. A cursor below that floor returns typed
+`MetaError::RebootstrapRequired` with the local cursor, retained floor,
+checkpoint version, and frozen target. The PostgreSQL pruner takes the matching
+exclusive advisory lock before deleting history or advancing the floor, so
+pruning cannot turn a page that passed the check into a false successful
+convergence; ordinary metadata version updates do not contend on this replay
+lock.
 
 A cursor equal to or above the floor continues normal paged replay. The bounded
 event-page query still rejects any non-empty page whose first batch is not

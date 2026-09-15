@@ -121,9 +121,11 @@ The bounded, frozen pull behavior above is implemented by
 `batch_version` groups through the supplied target. The per-client defaults are
 64 batches and 8 MiB of estimated PostgreSQL row response bytes; an environment
 override may tune either limit without changing the volume schema.
-Before returning a page, the query reads the retained event-log floor and
-checkpoint version under the same `metadata_state FOR SHARE` lock used by the
-page transaction. A cursor below the floor returns
+Before returning a page, the transaction takes a shared per-volume advisory
+lock and reads the retained event-log floor and checkpoint version from
+`metadata_state`. The pruner takes the matching exclusive advisory lock, while
+ordinary metadata version updates do not contend on the replay lock. A cursor
+below the floor returns
 `MetaError::RebootstrapRequired` with the checkpoint coordinates and is not
 passed to foreign apply. A cursor at or above the floor continues normal
 replay; structural missing or non-contiguous batches remain
