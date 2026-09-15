@@ -39,6 +39,15 @@ pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
 pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =
     "SELECT metadata_format_version FROM metadata_state WHERE vol = $1";
 
+pub(super) const SELECT_METADATA_REPLAY_STATE: &str = r#"
+    SELECT metadata_format_version, checkpoint_version, event_log_prune_floor
+    FROM metadata_state
+    WHERE vol = $1
+    "#;
+
+pub(super) const ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK: &str =
+    "SELECT pg_advisory_xact_lock_shared($1::BIGINT)";
+
 pub(super) const BUMP_METADATA_VERSION: &str = r#"
     UPDATE metadata_state
     SET version = version + 1,

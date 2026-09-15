@@ -243,8 +243,9 @@ source's first required event version minus one. Source rows belonging to
 `creating`, `ready`, or `deleting` snapshots remain retention guards until the
 source row is removed; a source with no event rows does not lower the floor.
 
-The maintenance transaction takes the per-volume janitor advisory lock and the
-published `metadata_state` row lock before calculating the floor. It removes
+The maintenance transaction takes the dedicated per-volume event-log
+prune/replay advisory lock and the published `metadata_state` row lock before
+calculating the floor. It removes
 only complete `batch_version` groups, limited by the configured number of
 groups per transaction, and advances the persisted
 `metadata_state.event_log_prune_floor` only after no lower rows remain. The
@@ -252,19 +253,29 @@ groups per transaction, and advances the persisted
 amount removed without exposing credentials or connection details. Pruning is
 not part of foreground writes, flushes, or startup.
 
-If a replay cursor is below the persisted floor, the client must use the finite
-remote checkpoint import flow to rebootstrap before resuming event replay.
-The bounded event-page query also rejects any non-empty page whose first batch
-is not exactly the next version after the local cursor, and the decoded sync
-path rejects gaps between adjacent batches in one page. Both paths return a
-typed `MetaError::ReplayGap` instead of silently skipping the missing range.
-The same result is returned for any empty page while the cursor is below the
-requested target. For an empty page, `first_available_version` is set to the
-cursor plus one as an empty-window marker; it does not claim that this batch
-exists remotely. Checkpoint import/rebootstrap recovery that consumes this
-signal remains owned by SFS-711; until that recovery is available, the runtime
-records `Degraded` and blocks new mutations while retaining the local serving
-view. Automatic client rebase is owned by SFS-712.
+Before each bounded replay page, the client takes a shared transaction-level
+advisory lock in the event-log prune/replay domain keyed by volume, then reads
+`checkpoint_version` and the inclusive `event_log_prune_floor` from
+`metadata_state` in the same transaction as the event-page query. A cursor
+below that floor returns typed
+`MetaError::RebootstrapRequired` with the local cursor, retained floor,
+checkpoint version, and frozen target. The PostgreSQL pruner takes the matching
+exclusive event-log prune/replay advisory lock before deleting history or
+advancing the floor, so
+pruning cannot turn a page that passed the check into a false successful
+convergence; ordinary metadata version updates do not contend on this replay
+lock.
+
+A cursor equal to or above the floor continues normal paged replay. The bounded
+event-page query still rejects any non-empty page whose first batch is not
+exactly the next version after the local cursor, and the decoded sync path
+rejects gaps between adjacent batches in one page. Those structural or
+corruption cases return typed `MetaError::ReplayGap`; an empty page while the
+cursor is below the requested target uses the same error with
+`first_available_version = local_version + 1` as an empty-window marker. Both
+errors record `Degraded` and block new mutations. SFS-711 owns the explicit
+rebootstrap signal; automatic checkpoint import and local rebase are owned by
+SFS-712.
 
 ## Finite Remote History and Recovery
 

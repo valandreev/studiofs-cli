@@ -328,6 +328,7 @@ impl PgMetaEngine {
 
     /// Run one interruptible startup catch-up session to the frozen target.
     pub(super) fn run_startup_catch_up_session(&self, shutdown: &AtomicBool) -> MetaResult<bool> {
+        let mut remote_operation_recorded = false;
         let result = (|| {
             self.ensure_remote_format_validated()?;
             let _guard = self
@@ -345,7 +346,13 @@ impl PgMetaEngine {
 
             // Keep target capture and every page pull under one lock so a
             // concurrent NOTIFY sync cannot clear the target mid-session.
-            let target_version = self.frozen_sync_target_version()?;
+            let target_version = match self.frozen_sync_target_version() {
+                Ok(target_version) => target_version,
+                Err(error) => {
+                    remote_operation_recorded = true;
+                    return Err(error);
+                }
+            };
             drain_startup_catch_up_pages(
                 target_version,
                 || self.local_version.load(Ordering::Acquire),
@@ -356,7 +363,13 @@ impl PgMetaEngine {
                             PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
                         )
                 },
-                || self.pull_foreign_events_locked_to_target(None, target_version),
+                || {
+                    let result = self.pull_foreign_events_locked_to_target(None, target_version);
+                    if result.is_err() {
+                        remote_operation_recorded = true;
+                    }
+                    result
+                },
             )
         })();
         let result = if result.is_ok() && self.current_pg_sync_lifecycle() == PgSyncLifecycle::Fatal
@@ -370,7 +383,11 @@ impl PgMetaEngine {
         }
         // Fresh-client completion reacquires replication_lock, so record the
         // aggregate session result only after the page-drain lock is released.
-        self.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result);
+        self.record_metadata_sync_result(
+            MetadataSyncSource::FallbackPoll,
+            &result,
+            remote_operation_recorded,
+        );
         result
     }
 

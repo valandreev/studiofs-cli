@@ -2,6 +2,7 @@
 
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
+    janitor::pg_event_log_prune_lock_key, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
 use crate::types::FileType;
@@ -74,10 +75,15 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    /// Record aggregate sync state after a metadata operation.
+    ///
+    /// Replay helpers record their remote failure before returning, so callers
+    /// pass `true` to avoid repeating those remote failure transitions.
     pub(super) fn record_metadata_sync_result(
         &self,
         source: MetadataSyncSource,
         result: &MetaResult<bool>,
+        remote_operation_recorded: bool,
     ) {
         match result {
             Ok(changed) => {
@@ -101,28 +107,37 @@ impl PgMetaEngine {
                 }
             }
             Err(error) => {
-                self.record_pg_sync_failure(error);
-                self.invalidate_remote_validation();
-                self.record_metadata_source_result(result);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
-                if matches!(error, MetaError::ReplayGap { .. }) {
-                    self.mark_replay_gap_recovery_required();
+                if !remote_operation_recorded {
+                    self.record_pg_sync_failure(error);
+                    self.invalidate_remote_validation();
+                    self.record_metadata_source_result(result);
+                    if matches!(
+                        error,
+                        MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
+                    ) {
+                        self.mark_rebootstrap_required();
+                    }
                 }
             }
         }
     }
 
     pub(super) fn sync_metadata_with_source(&self, source: MetadataSyncSource) -> MetaResult<bool> {
+        let mut remote_operation_recorded = false;
         let result = (|| {
             self.ensure_remote_format_validated()?;
             let _guard = self
                 .replication_lock
                 .lock()
                 .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+            // `pull_foreign_events_locked` records every error after this
+            // boundary through `record_remote_operation_result`.
+            remote_operation_recorded = true;
             let changed = self.pull_foreign_events_locked(None)?;
             Ok(changed)
         })();
-        self.record_metadata_sync_result(source, &result);
+        self.record_metadata_sync_result(source, &result, remote_operation_recorded);
         result
     }
 
@@ -161,7 +176,6 @@ impl PgMetaEngine {
         &self,
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
-        self.ensure_remote_format_validated()?;
         let target_version = self.frozen_sync_target_version()?;
         self.pull_foreign_events_locked_to_target(recent_flush, target_version)
     }
@@ -176,8 +190,10 @@ impl PgMetaEngine {
         recent_flush: Option<&RecentFlush>,
         target_version: i64,
     ) -> MetaResult<bool> {
-        self.ensure_remote_format_validated()?;
-        let result = self.pull_foreign_events_locked_inner(recent_flush, target_version);
+        let result = (|| {
+            self.ensure_remote_format_validated()?;
+            self.pull_foreign_events_locked_inner(recent_flush, target_version)
+        })();
         self.record_remote_operation_result(result)
     }
 
@@ -208,22 +224,60 @@ impl PgMetaEngine {
                         let tx = client.transaction().await.map_err(|e| {
                             Self::classify_pg_error("postgres begin pull transaction failed", e)
                         })?;
-                        let format_row = tx
-                            .query_opt(
-                                "SELECT metadata_format_version FROM metadata_state WHERE vol = $1 FOR SHARE",
-                                &[&volume_id],
-                            )
+                        let lock_key = pg_event_log_prune_lock_key(volume_id);
+                        tx.query_one(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK, &[&lock_key])
                             .await
                             .map_err(|e| {
                                 Self::classify_pg_error(
-                                    "postgres metadata format revalidation failed",
+                                    "postgres metadata replay advisory lock failed",
                                     e,
                                 )
                             })?;
-                        let found = format_row
-                            .as_ref()
-                            .and_then(|row| row.get::<_, Option<i16>>(0));
-                        crate::ensure_supported_pg_sync_format_version(found)?;
+                        let replay_state = tx
+                            .query_opt(sql::SELECT_METADATA_REPLAY_STATE, &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres metadata replay state revalidation failed",
+                                    e,
+                                )
+                            })?;
+                        let replay_state = replay_state.ok_or_else(|| {
+                            MetaError::Storage(
+                                "postgres metadata replay state row missing".to_string(),
+                            )
+                        })?;
+                        let format_version = replay_state
+                            .try_get::<_, Option<i16>>("metadata_format_version")
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres metadata format version read failed",
+                                    e,
+                                )
+                            })?;
+                        crate::ensure_supported_pg_sync_format_version(format_version)?;
+                        let checkpoint_version = replay_state
+                            .try_get::<_, i64>("checkpoint_version")
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres checkpoint version read failed",
+                                    e,
+                                )
+                            })?;
+                        let retained_floor = replay_state
+                            .try_get::<_, i64>("event_log_prune_floor")
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres event-log retention floor read failed",
+                                    e,
+                                )
+                            })?;
+                        Self::validate_replay_cursor_against_floor(
+                            last_batch_version,
+                            retained_floor,
+                            checkpoint_version,
+                            target_version,
+                        )?;
 
                         let page = Self::query_foreign_event_page(
                             &tx,

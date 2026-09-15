@@ -5,6 +5,7 @@ use super::{
 };
 use crate::events::{MetaEvent, encode_event};
 use crate::pg_engine::PgMetaEngine;
+use crate::pg_engine::janitor::{pg_event_log_prune_lock_key, pg_janitor_lock_key};
 use crate::pg_engine::sql;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
@@ -36,6 +37,24 @@ fn foreign_event_page_query_is_bounded_and_exposes_page_metadata() {
     assert!(
         sql::SELECT_FOREIGN_EVENT_ROWS
             .contains("COALESCE(BOOL_OR(response_bytes > $5::BIGINT), false)")
+    );
+}
+
+#[test]
+fn metadata_replay_state_query_uses_shared_replay_lock() {
+    assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("event_log_prune_floor"));
+    assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("checkpoint_version"));
+    assert!(!sql::SELECT_METADATA_REPLAY_STATE.contains("FOR SHARE"));
+    assert!(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK.contains("pg_advisory_xact_lock_shared"));
+    assert!(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK.contains("$1::BIGINT"));
+}
+
+#[test]
+fn metadata_replay_lock_key_is_isolated_from_janitor_lock() {
+    assert_ne!(
+        pg_event_log_prune_lock_key(1),
+        pg_janitor_lock_key(1),
+        "event-log replay/prune must not contend with object janitor work"
     );
 }
 

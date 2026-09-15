@@ -1,4 +1,4 @@
-use super::{PgMetaEngine, janitor::pg_janitor_lock_key, sql};
+use super::{PgMetaEngine, janitor::pg_event_log_prune_lock_key, sql};
 use crate::engine::{MetaError, MetaResult};
 use std::sync::Arc;
 use tracing::debug;
@@ -69,7 +69,7 @@ impl PgMetaEngine {
         let command_pool = Arc::clone(&self.command_pool);
         let command_timeout = self.command_timeout;
         let volume_id = self.volume_id;
-        let lock_key = pg_janitor_lock_key(volume_id);
+        let lock_key = pg_event_log_prune_lock_key(volume_id);
         let batch_limit = self.event_log_prune_batches;
         let result = self.run_async(async move {
             Self::with_postgres_client_timeout(

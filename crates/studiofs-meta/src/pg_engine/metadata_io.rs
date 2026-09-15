@@ -372,6 +372,33 @@ impl ForeignEventPage {
 }
 
 impl PgMetaEngine {
+    pub(super) fn validate_replay_cursor_against_floor(
+        local_version: i64,
+        retained_floor: i64,
+        checkpoint_version: i64,
+        target_version: i64,
+    ) -> MetaResult<()> {
+        if local_version < 0
+            || retained_floor < 0
+            || checkpoint_version < 0
+            || target_version < 0
+            || retained_floor > checkpoint_version
+        {
+            return Err(MetaError::Storage(format!(
+                "postgres replay state has invalid cursor ({local_version}), retention floor ({retained_floor}), checkpoint ({checkpoint_version}), or target ({target_version})"
+            )));
+        }
+        if local_version < retained_floor {
+            return Err(MetaError::RebootstrapRequired {
+                local_version,
+                retained_floor,
+                checkpoint_version,
+                target_version,
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn read_remote_checkpoint_freshness(
         &self,
     ) -> MetaResult<CheckpointFreshnessObservation> {
@@ -467,8 +494,10 @@ impl PgMetaEngine {
     }
 
     pub(super) fn remote_metadata_head_version(&self) -> MetaResult<i64> {
-        self.ensure_remote_format_validated()?;
-        let result = self.read_remote_metadata_head_version_unrecorded();
+        let result = (|| {
+            self.ensure_remote_format_validated()?;
+            self.read_remote_metadata_head_version_unrecorded()
+        })();
         self.record_remote_operation_result(result)
     }
 
@@ -922,5 +951,70 @@ mod tests {
                 && first == i64::MAX
                 && target == i64::MAX
         ));
+    }
+
+    #[test]
+    fn replay_cursor_below_retained_floor_requires_rebootstrap() {
+        let error = PgMetaEngine::validate_replay_cursor_against_floor(5, 8, 8, 12)
+            .expect_err("a cursor below retained history must require rebootstrap");
+
+        assert!(matches!(
+            error,
+            MetaError::RebootstrapRequired {
+                local_version: 5,
+                retained_floor: 8,
+                checkpoint_version: 8,
+                target_version: 12,
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_cursor_at_retained_floor_continues_normal_replay() {
+        assert!(PgMetaEngine::validate_replay_cursor_against_floor(8, 8, 8, 12).is_ok());
+    }
+
+    #[test]
+    fn negative_replay_cursor_is_invalid_state() {
+        assert!(matches!(
+            PgMetaEngine::validate_replay_cursor_against_floor(-1, 0, 0, 12),
+            Err(MetaError::Storage(message))
+                if message == "postgres replay state has invalid cursor (-1), retention floor (0), checkpoint (0), or target (12)"
+        ));
+    }
+
+    #[test]
+    fn negative_replay_target_is_invalid_state() {
+        assert!(matches!(
+            PgMetaEngine::validate_replay_cursor_against_floor(0, 0, 0, -1),
+            Err(MetaError::Storage(message))
+                if message == "postgres replay state has invalid cursor (0), retention floor (0), checkpoint (0), or target (-1)"
+        ));
+    }
+
+    #[test]
+    fn invalid_replay_state_reports_version_coordinates() {
+        assert!(matches!(
+            PgMetaEngine::validate_replay_cursor_against_floor(5, 10, 8, 12),
+            Err(MetaError::Storage(message))
+                if message == "postgres replay state has invalid cursor (5), retention floor (10), checkpoint (8), or target (12)"
+        ));
+    }
+
+    #[test]
+    fn invalid_replay_history_boundaries_are_rejected() {
+        for (local_version, retained_floor, checkpoint_version) in
+            [(5, 10, 8), (5, -1, 8), (5, 0, -1)]
+        {
+            assert!(matches!(
+                PgMetaEngine::validate_replay_cursor_against_floor(
+                    local_version,
+                    retained_floor,
+                    checkpoint_version,
+                    12,
+                ),
+                Err(MetaError::Storage(_))
+            ));
+        }
     }
 }

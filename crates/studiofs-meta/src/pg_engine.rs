@@ -133,8 +133,6 @@ const PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_AGE
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
-const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StartupSnapshotImportMode {
     ReplaceLocalState,
@@ -567,7 +565,10 @@ impl PgMetaEngine {
     pub(super) fn record_pg_sync_failure(&self, error: &MetaError) {
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
             progress.current_page = None;
-            if matches!(error, MetaError::ReplayGap { .. }) {
+            if matches!(
+                error,
+                MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
+            ) {
                 progress.rebootstrap_required = true;
             }
             progress.last_sync_error = Some(PgSyncFailure::from_error(error));
@@ -616,7 +617,7 @@ impl PgMetaEngine {
         }
     }
 
-    fn mark_replay_gap_recovery_required(&self) {
+    fn mark_rebootstrap_required(&self) {
         self.metadata_startup_target_version
             .store(-1, Ordering::Release);
         self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
@@ -1072,8 +1073,11 @@ impl PgMetaEngine {
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
                 self.record_pg_sync_failure(error);
-                if matches!(error, MetaError::ReplayGap { .. }) {
-                    self.mark_replay_gap_recovery_required();
+                if matches!(
+                    error,
+                    MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
+                ) {
+                    self.mark_rebootstrap_required();
                 }
             }
         }

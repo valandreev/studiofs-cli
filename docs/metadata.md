@@ -121,11 +121,17 @@ The bounded, frozen pull behavior above is implemented by
 `batch_version` groups through the supplied target. The per-client defaults are
 64 batches and 8 MiB of estimated PostgreSQL row response bytes; an environment
 override may tune either limit without changing the volume schema.
-Before returning a non-empty page, the query requires its first batch to be
-exactly the next version after the local cursor. A missing range returns a
-typed `MetaError::ReplayGap` and is not passed to foreign apply. The runtime
-records the client as `Degraded` and read-only until the later checkpoint
-import/rebootstrap recovery owned by SFS-711 is available.
+Before returning a page, the transaction takes a shared per-volume event-log
+prune/replay advisory lock and reads the retained event-log floor and checkpoint
+version from `metadata_state`. The pruner takes the matching exclusive
+event-log prune/replay advisory lock, while
+ordinary metadata version updates do not contend on the replay lock. A cursor
+below the floor returns
+`MetaError::RebootstrapRequired` with the checkpoint coordinates and is not
+passed to foreign apply. A cursor at or above the floor continues normal
+replay; structural missing or non-contiguous batches remain
+`MetaError::ReplayGap`. Either condition records the client as `Degraded` and
+read-only until checkpoint import/rebase recovery owned by SFS-712 is available.
 
 ### Backend Selection on Open
 
@@ -372,7 +378,8 @@ removed; empty sources do not pin event history. Each transaction removes a boun
 number of batch groups and advances `event_log_prune_floor` only when all lower
 rows are gone. This work is outside foreground writes, flushes, and startup;
 SFS-711 owns explicit replay-gap/rebootstrap-required reporting for cursors
-below the persisted floor.
+below the persisted floor; checkpoint import/rebase recovery consumes this
+signal in SFS-712.
 
 `snapshot_catalog` stores thin lifecycle/control rows. The immutable source
 row stores only the captured serving-checkpoint bytes, checksum, checkpoint
