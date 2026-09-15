@@ -1337,7 +1337,23 @@ impl PgMetaEngine {
                         .metadata_remote_head_version
                         .store(remote_head, Ordering::Release);
                     if engine.local_version.load(Ordering::Acquire) < remote_head {
-                        engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                        // Identity validation may leave AllocatorPending before
+                        // this head check; only LocalReady can enter CatchingUp
+                        // directly.
+                        match engine.current_pg_sync_lifecycle() {
+                            PgSyncLifecycle::CatchingUp => {}
+                            PgSyncLifecycle::LocalReady => {
+                                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                            }
+                            PgSyncLifecycle::Degraded => {}
+                            PgSyncLifecycle::Live
+                            | PgSyncLifecycle::TargetReached
+                            | PgSyncLifecycle::AllocatorPending => {
+                                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+                                engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+                            }
+                            PgSyncLifecycle::Fatal => {}
+                        }
                     }
                     true
                 }

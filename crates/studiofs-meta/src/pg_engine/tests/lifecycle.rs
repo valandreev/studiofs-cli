@@ -384,6 +384,43 @@ fn startup_catch_up_drain_replays_pages_until_frozen_target() {
 }
 
 #[test]
+fn startup_rebootstrap_requires_snapshot_import_before_refreshing_target() {
+    let rebootstrap_error = MetaError::RebootstrapRequired {
+        local_version: 5,
+        retained_floor: 8,
+        checkpoint_version: 8,
+        target_version: 12,
+    };
+    let target_calls = std::cell::Cell::new(0_usize);
+
+    let error = rebootstrap_startup_target(
+        rebootstrap_error.clone(),
+        || Ok(false),
+        || {
+            target_calls.set(target_calls.get() + 1);
+            Ok(15)
+        },
+    )
+    .expect_err("a missing snapshot must keep recovery failed");
+
+    assert!(matches!(error, MetaError::RebootstrapRequired { .. }));
+    assert_eq!(target_calls.get(), 0);
+
+    let target = rebootstrap_startup_target(
+        rebootstrap_error,
+        || Ok(true),
+        || {
+            target_calls.set(target_calls.get() + 1);
+            Ok(15)
+        },
+    )
+    .expect("an imported snapshot should allow a fresh target");
+
+    assert_eq!(target, 15);
+    assert_eq!(target_calls.get(), 1);
+}
+
+#[test]
 fn startup_catch_up_drain_yields_at_page_budget_and_resumes_from_cursor() {
     let local_version = std::cell::Cell::new(0_i64);
     let pulls = std::cell::Cell::new(0_usize);
@@ -805,6 +842,128 @@ fn startup_catch_up_reports_rebootstrap_below_retained_event_log_floor() {
     );
     assert_eq!(diagnostics.lifecycle, PgSyncLifecycle::Degraded);
     assert!(!engine.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_rebases_stale_client_from_checkpoint_preserving_pending_overlay() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-checkpoint");
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+    for name in [b"checkpoint-1".as_slice(), b"checkpoint-2"] {
+        publisher
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create checkpoint event");
+        publisher
+            .flush_metadata()
+            .expect("publish checkpoint event");
+    }
+    let (checkpoint_bytes, checkpoint_sha256) = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
+        }
+    }))
+    .expect("read checkpoint at retained floor");
+    publisher
+        .create_dir(ROOT_INO, b"replayed-after-checkpoint", 0, 0, 0o755)
+        .expect("create replay tail event");
+    publisher
+        .flush_metadata()
+        .expect("publish replay tail event");
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 2 WHERE vol = $3",
+                    &[&checkpoint_bytes, &checkpoint_sha256, &volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("restore checkpoint descriptor at retained floor");
+
+    let stale_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_db = stale_dir.path().join("stale.redb");
+    seed_local(&stale_db, &volume.format_info());
+    let local = RedbMetaEngine::open(&stale_db).expect("open stale local metadata");
+    local
+        .create_dir(ROOT_INO, b"pending-local", 0, 0, 0o755)
+        .expect("create pending local overlay");
+    PgMetaEngine::persist_client_slot(&local, 0).expect("persist stale client slot");
+    local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 1)
+        .expect("persist stale replay cursor");
+    drop(local);
+
+    let stale = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open stale metadata client");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 1);
+    assert_eq!(
+        stale
+            .remote_metadata_head_version()
+            .expect("read remote head after stale client open"),
+        3
+    );
+    let error = stale
+        .sync_metadata()
+        .expect_err("stale replay cursor should require checkpoint rebase");
+    assert!(matches!(error, MetaError::RebootstrapRequired { .. }));
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    publisher
+        .create_dir(ROOT_INO, b"advanced-after-rebootstrap", 0, 0, 0o755)
+        .expect("create event after rebootstrap detection");
+    publisher
+        .flush_metadata()
+        .expect("publish event after rebootstrap detection");
+    drop(publisher);
+
+    stale
+        .run_startup_catch_up_session(&std::sync::atomic::AtomicBool::new(false))
+        .expect("stale client should rebase and resume catch-up");
+
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 4);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    for name in [
+        b"checkpoint-1".as_slice(),
+        b"checkpoint-2",
+        b"replayed-after-checkpoint",
+        b"advanced-after-rebootstrap",
+        b"pending-local",
+    ] {
+        stale
+            .lookup(ROOT_INO, name)
+            .expect("checkpoint, replay, and pending entries must survive rebase");
+    }
 }
 
 #[test]

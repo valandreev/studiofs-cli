@@ -3,6 +3,7 @@ use super::{
     PgMetaEngine,
 };
 use crate::engine::{MetaError, MetaResult, PgSyncLifecycle};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -60,6 +61,18 @@ pub(super) fn drain_startup_catch_up_pages(
         current = next;
     }
     Ok(changed)
+}
+
+/// Require a serving snapshot to be imported before refreshing the catch-up target.
+pub(super) fn rebootstrap_startup_target(
+    rebootstrap_error: MetaError,
+    import_snapshot: impl FnOnce() -> MetaResult<bool>,
+    frozen_target: impl FnOnce() -> MetaResult<i64>,
+) -> MetaResult<i64> {
+    if !import_snapshot()? {
+        return Err(rebootstrap_error);
+    }
+    frozen_target()
 }
 
 impl PgBackgroundWorkers {
@@ -328,7 +341,7 @@ impl PgMetaEngine {
 
     /// Run one interruptible startup catch-up session to the frozen target.
     pub(super) fn run_startup_catch_up_session(&self, shutdown: &AtomicBool) -> MetaResult<bool> {
-        let mut remote_operation_recorded = false;
+        let remote_operation_recorded = Cell::new(false);
         let result = (|| {
             self.ensure_remote_format_validated()?;
             let _guard = self
@@ -349,28 +362,54 @@ impl PgMetaEngine {
             let target_version = match self.frozen_sync_target_version() {
                 Ok(target_version) => target_version,
                 Err(error) => {
-                    remote_operation_recorded = true;
+                    remote_operation_recorded.set(true);
                     return Err(error);
                 }
             };
-            drain_startup_catch_up_pages(
-                target_version,
-                || self.local_version.load(Ordering::Acquire),
-                || {
-                    !shutdown.load(Ordering::Acquire)
-                        && matches!(
-                            self.current_pg_sync_lifecycle(),
-                            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
-                        )
-                },
-                || {
-                    let result = self.pull_foreign_events_locked_to_target(None, target_version);
+            let pull_page = |target_version| {
+                let result = self.pull_foreign_events_locked_to_target(None, target_version);
+                if result.is_err() {
+                    remote_operation_recorded.set(true);
+                }
+                result
+            };
+            let drain_to_target = |target_version| {
+                drain_startup_catch_up_pages(
+                    target_version,
+                    || self.local_version.load(Ordering::Acquire),
+                    || {
+                        !shutdown.load(Ordering::Acquire)
+                            && matches!(
+                                self.current_pg_sync_lifecycle(),
+                                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+                            )
+                    },
+                    || pull_page(target_version),
+                )
+            };
+            let changed = match drain_to_target(target_version) {
+                Ok(changed) => changed,
+                Err(rebootstrap_error @ MetaError::RebootstrapRequired { .. }) => {
+                    let result = rebootstrap_startup_target(
+                        rebootstrap_error,
+                        || {
+                            self.pull_snapshot_locked(
+                                super::StartupSnapshotImportMode::PreserveLocalState,
+                            )
+                        },
+                        || self.frozen_sync_target_version(),
+                    );
                     if result.is_err() {
-                        remote_operation_recorded = true;
+                        remote_operation_recorded.set(true);
                     }
-                    result
-                },
-            )
+                    let target_version = result?;
+                    remote_operation_recorded.set(false);
+                    drain_to_target(target_version)?;
+                    true
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(changed)
         })();
         let result = if result.is_ok() && self.current_pg_sync_lifecycle() == PgSyncLifecycle::Fatal
         {
@@ -386,7 +425,7 @@ impl PgMetaEngine {
         self.record_metadata_sync_result(
             MetadataSyncSource::FallbackPoll,
             &result,
-            remote_operation_recorded,
+            remote_operation_recorded.get(),
         );
         result
     }

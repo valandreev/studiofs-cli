@@ -2,7 +2,7 @@ use super::*;
 use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, COUNTER_LIMIT};
 use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::inode_allocator::AllocatorRuntime;
-use crate::pg_engine::lifecycle::drain_startup_catch_up_pages;
+use crate::pg_engine::lifecycle::{drain_startup_catch_up_pages, rebootstrap_startup_target};
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
