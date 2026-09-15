@@ -357,10 +357,13 @@ impl RedbMetaEngine {
     pub(crate) fn import_serving_checkpoint_preserving_local_state(
         &self,
         checkpoint: &crate::snapshot::ServingCheckpoint,
+        preserved_inodes: &HashSet<Ino>,
     ) -> MetaResult<()> {
-        self.import_snapshot_with_mode(
-            &self.redb_snapshot_from_serving_checkpoint(checkpoint)?,
+        let snapshot = self.redb_snapshot_from_serving_checkpoint(checkpoint)?;
+        self.import_snapshot_with_mode_and_preserved_inodes(
+            &snapshot,
             SnapshotImportMode::RemotePreserveLocalState,
+            Some(preserved_inodes),
         )
     }
 
@@ -418,6 +421,15 @@ impl RedbMetaEngine {
         snapshot: &RedbSnapshot,
         mode: SnapshotImportMode,
     ) -> MetaResult<()> {
+        self.import_snapshot_with_mode_and_preserved_inodes(snapshot, mode, None)
+    }
+
+    fn import_snapshot_with_mode_and_preserved_inodes(
+        &self,
+        snapshot: &RedbSnapshot,
+        mode: SnapshotImportMode,
+        extra_preserved_inodes: Option<&HashSet<Ino>>,
+    ) -> MetaResult<()> {
         let enable_remote_namespace_filter = mode != SnapshotImportMode::Local;
         let preserve_local_state = mode == SnapshotImportMode::RemotePreserveLocalState;
         let preserve_event_log =
@@ -426,6 +438,9 @@ impl RedbMetaEngine {
             let txn = self.begin_read_txn()?;
             let mut overlay_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
             overlay_inodes.extend(Self::local_overlay_attr_inodes_from_txn(&txn)?);
+            if let Some(extra_preserved_inodes) = extra_preserved_inodes {
+                overlay_inodes.extend(extra_preserved_inodes.iter().copied());
+            }
 
             let inodes = txn
                 .open_table(INODES_TABLE)

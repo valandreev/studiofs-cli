@@ -691,6 +691,41 @@ fn startup_catch_up_session_honors_shutdown_signal() {
     assert!(!changed);
 }
 
+#[test]
+fn startup_catch_up_drain_honors_shutdown_after_a_page() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .metadata_startup_target_version
+        .store(2, std::sync::atomic::Ordering::Release);
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    let local_version = std::cell::Cell::new(0_i64);
+    let pulls = std::cell::Cell::new(0_usize);
+
+    let changed = drain_startup_catch_up_pages(
+        2,
+        || local_version.get(),
+        || !shutdown.load(std::sync::atomic::Ordering::Acquire),
+        || {
+            pulls.set(pulls.get() + 1);
+            local_version.set(1);
+            shutdown.store(true, std::sync::atomic::Ordering::Release);
+            Ok(true)
+        },
+    )
+    .expect("shutdown after a committed page should stop catch-up cleanly");
+
+    assert!(changed);
+    assert_eq!(pulls.get(), 1);
+    engine
+        .local_version
+        .store(local_version.get(), std::sync::atomic::Ordering::Release);
+    engine
+        .try_complete_catchup_sync()
+        .expect("incomplete shutdown catch-up should remain recoverable");
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+}
+
 struct EventLogLockGuard {
     release_tx: Option<tokio::sync::oneshot::Sender<()>>,
     lock_thread: Option<std::thread::JoinHandle<()>>,
@@ -3207,6 +3242,95 @@ fn snapshot_reconcile_resets_stale_regular_file_serving_attr() {
         remote_attr.size,
         "snapshot reconciliation must reset stale regular-file serving attrs from base"
     );
+}
+
+#[test]
+fn snapshot_rebootstrap_preserves_active_open_inode_binding() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"snapshot-open.txt", 0, 0, 0o644)
+        .expect("create file");
+    let entry = pg
+        .lookup(ROOT_INO, b"snapshot-open.txt")
+        .expect("lookup file");
+    pg.local
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr: file.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"snapshot-open.txt".to_vec(),
+                entry,
+            },
+        ])
+        .expect("publish file metadata to base");
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack published setup");
+    pg.note_active_open_inode(file.ino);
+    assert!(
+        !pg.local
+            .local_overlay_attr_inodes()
+            .expect("local attr overlays")
+            .contains(&file.ino)
+    );
+    assert!(
+        !pg.local
+            .local_overlay_inodes()
+            .expect("local overlays")
+            .contains(&file.ino)
+    );
+
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::PreserveLocalState,
+        &crate::snapshot::ServingCheckpoint::default(),
+        0,
+    )
+    .expect("import serving checkpoint");
+
+    assert!(
+        pg.get_attr(file.ino).is_ok(),
+        "snapshot rebootstrap must retain metadata for active open handles"
+    );
+}
+
+#[test]
+fn snapshot_rebootstrap_waits_for_pending_mutation_lock() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let pg = std::sync::Arc::new(pg);
+    let pending_guard = pg.pending_state.lock().expect("pending state");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_pg = std::sync::Arc::clone(&pg);
+
+    let worker = std::thread::spawn(move || {
+        started_tx
+            .send(())
+            .expect("signal checkpoint import worker");
+        result_tx
+            .send(worker_pg.import_serving_checkpoint_locked(
+                StartupSnapshotImportMode::PreserveLocalState,
+                &crate::snapshot::ServingCheckpoint::default(),
+                0,
+            ))
+            .expect("send checkpoint import result");
+    });
+
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("checkpoint import worker should start");
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "checkpoint import must wait for the pending mutation lock"
+    );
+
+    drop(pending_guard);
+    result_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("checkpoint import should finish after the lock is released")
+        .expect("checkpoint import");
+    worker.join().expect("join checkpoint import worker");
 }
 
 #[test]

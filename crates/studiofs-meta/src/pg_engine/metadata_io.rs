@@ -10,6 +10,7 @@ use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -457,22 +458,49 @@ impl PgMetaEngine {
             descriptor.checkpoint_version,
             descriptor.remote_head_version,
         );
+        self.import_serving_checkpoint_locked(import_mode, &checkpoint, replay_start_version)?;
+        Ok(true)
+    }
+
+    pub(super) fn import_serving_checkpoint_locked(
+        &self,
+        import_mode: StartupSnapshotImportMode,
+        checkpoint: &ServingCheckpoint,
+        replay_start_version: i64,
+    ) -> MetaResult<()> {
+        let _pending_state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let active_open_inodes = if import_mode == StartupSnapshotImportMode::PreserveLocalState {
+            self.active_open_inodes
+                .lock()
+                .map_err(|_| MetaError::Storage("pg active open inode lock poisoned".to_string()))?
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
-                self.local.import_serving_checkpoint(&checkpoint)?;
+                self.local.import_serving_checkpoint(checkpoint)?;
             }
             StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog => {
                 self.local
-                    .import_serving_checkpoint_preserving_local_event_log(&checkpoint)?;
+                    .import_serving_checkpoint_preserving_local_event_log(checkpoint)?;
             }
             StartupSnapshotImportMode::PreserveLocalState => {
                 self.local
-                    .import_serving_checkpoint_preserving_local_state(&checkpoint)?;
+                    .import_serving_checkpoint_preserving_local_state(
+                        checkpoint,
+                        &active_open_inodes,
+                    )?;
             }
         }
         self.reconcile_imported_snapshot_regular_files()?;
         self.persist_local_version(replay_start_version)?;
-        Ok(true)
+        Ok(())
     }
 
     fn read_remote_metadata_head_version_unrecorded(&self) -> MetaResult<i64> {

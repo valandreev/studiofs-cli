@@ -1748,7 +1748,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
         let mut ready_inodes = HashSet::new();
         for ino in inodes {
-            if overlay.attr_inodes.contains(ino) || overlay.block_inodes.contains(ino) {
+            if overlay.attr_inodes.contains(ino)
+                || overlay.block_inodes.contains(ino)
+                || overlay.remove_attr_inodes.contains(ino)
+            {
                 continue;
             }
             if self.local_regular_file_state_needs_foreign_protection(*ino)? {
@@ -1776,7 +1779,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         RedbMetaEngine::record_regular_file_serving_reconcile_call_for_test();
         let mut ready_inodes = HashSet::new();
         for ino in inodes {
-            if overlay.attr_inodes.contains(ino) || overlay.block_inodes.contains(ino) {
+            if overlay.attr_inodes.contains(ino)
+                || overlay.block_inodes.contains(ino)
+                || overlay.remove_attr_inodes.contains(ino)
+            {
                 continue;
             }
             if self.local_regular_file_state_needs_foreign_protection_in_txn(txn, *ino)? {
