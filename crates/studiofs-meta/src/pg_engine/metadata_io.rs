@@ -372,6 +372,28 @@ impl ForeignEventPage {
 }
 
 impl PgMetaEngine {
+    pub(super) fn validate_replay_cursor_against_floor(
+        local_version: i64,
+        retained_floor: i64,
+        checkpoint_version: i64,
+        target_version: i64,
+    ) -> MetaResult<()> {
+        if retained_floor < 0 || checkpoint_version < 0 || retained_floor > checkpoint_version {
+            return Err(MetaError::Storage(
+                "postgres replay state has invalid checkpoint or retention versions".to_string(),
+            ));
+        }
+        if local_version < retained_floor {
+            return Err(MetaError::RebootstrapRequired {
+                local_version,
+                retained_floor,
+                checkpoint_version,
+                target_version,
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn read_remote_checkpoint_freshness(
         &self,
     ) -> MetaResult<CheckpointFreshnessObservation> {
@@ -922,5 +944,26 @@ mod tests {
                 && first == i64::MAX
                 && target == i64::MAX
         ));
+    }
+
+    #[test]
+    fn replay_cursor_below_retained_floor_requires_rebootstrap() {
+        let error = PgMetaEngine::validate_replay_cursor_against_floor(5, 8, 8, 12)
+            .expect_err("a cursor below retained history must require rebootstrap");
+
+        assert!(matches!(
+            error,
+            MetaError::RebootstrapRequired {
+                local_version: 5,
+                retained_floor: 8,
+                checkpoint_version: 8,
+                target_version: 12,
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_cursor_at_retained_floor_continues_normal_replay() {
+        assert!(PgMetaEngine::validate_replay_cursor_against_floor(8, 8, 8, 12).is_ok());
     }
 }

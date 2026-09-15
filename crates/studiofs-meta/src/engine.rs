@@ -272,6 +272,22 @@ pub enum MetaError {
         target_version: i64,
     },
 
+    /// The local cursor is older than the complete event history retained by
+    /// PostgreSQL and must be replaced from a bootstrap checkpoint.
+    #[error(
+        "postgres metadata replay requires checkpoint rebootstrap after local version {local_version}: retained floor is {retained_floor}, checkpoint version is {checkpoint_version}, target is {target_version}"
+    )]
+    RebootstrapRequired {
+        /// Last local replay cursor observed before the retained history.
+        local_version: i64,
+        /// Highest complete event-log batch durably removed from PostgreSQL.
+        retained_floor: i64,
+        /// Checkpoint version that identifies the descriptor for recovery.
+        checkpoint_version: i64,
+        /// Frozen remote target being caught up to.
+        target_version: i64,
+    },
+
     /// A startup catch-up session yielded after exhausting its page budget.
     #[error(
         "postgres metadata startup catch-up page budget exhausted at local version {local_version} after {pages} pages while startup target is {target_version}"
@@ -689,6 +705,18 @@ pub enum PgSyncFailure {
         /// Frozen target for the catch-up session.
         target_version: Option<u64>,
     },
+    /// The local cursor is below the retained event history and needs a
+    /// bootstrap checkpoint re-import.
+    RebootstrapRequired {
+        /// Last local replay cursor before the retained history.
+        local_version: Option<u64>,
+        /// Highest complete event-log batch durably removed remotely.
+        retained_floor: Option<u64>,
+        /// Checkpoint version identifying the recovery descriptor.
+        checkpoint_version: Option<u64>,
+        /// Frozen target for the catch-up session.
+        target_version: Option<u64>,
+    },
     /// A catch-up page did not advance the local cursor.
     CatchUpStalled {
         /// Last local replay cursor observed by the stalled session.
@@ -737,6 +765,17 @@ impl PgSyncFailure {
             } => Self::ReplayGap {
                 local_version: (*local_version).try_into().ok(),
                 first_available_version: (*first_available_version).try_into().ok(),
+                target_version: (*target_version).try_into().ok(),
+            },
+            MetaError::RebootstrapRequired {
+                local_version,
+                retained_floor,
+                checkpoint_version,
+                target_version,
+            } => Self::RebootstrapRequired {
+                local_version: (*local_version).try_into().ok(),
+                retained_floor: (*retained_floor).try_into().ok(),
+                checkpoint_version: (*checkpoint_version).try_into().ok(),
                 target_version: (*target_version).try_into().ok(),
             },
             MetaError::CatchUpStalled {
@@ -794,6 +833,19 @@ impl std::fmt::Display for PgSyncFailure {
                 "replay gap (local cursor {}, first available {}, target {})",
                 format_pg_sync_version(*local_version),
                 format_pg_sync_version(*first_available_version),
+                format_pg_sync_version(*target_version),
+            ),
+            Self::RebootstrapRequired {
+                local_version,
+                retained_floor,
+                checkpoint_version,
+                target_version,
+            } => write!(
+                formatter,
+                "checkpoint rebootstrap required (local cursor {}, retained floor {}, checkpoint {}, target {})",
+                format_pg_sync_version(*local_version),
+                format_pg_sync_version(*retained_floor),
+                format_pg_sync_version(*checkpoint_version),
                 format_pg_sync_version(*target_version),
             ),
             Self::CatchUpStalled {
@@ -883,7 +935,7 @@ pub struct PgSyncDiagnostics {
     pub last_sync_error: Option<PgSyncFailure>,
     /// Existing checkpoint freshness and refresh-request state.
     pub checkpoint: MetadataCheckpointFreshnessDiagnostics,
-    /// Whether a replay gap requires the existing rebootstrap recovery path.
+    /// Whether replay history requires checkpoint rebootstrap recovery.
     pub rebootstrap_required: bool,
     /// Whether the metadata source was reachable for the most recent command.
     pub source_connected: bool,

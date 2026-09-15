@@ -567,7 +567,10 @@ impl PgMetaEngine {
     pub(super) fn record_pg_sync_failure(&self, error: &MetaError) {
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
             progress.current_page = None;
-            if matches!(error, MetaError::ReplayGap { .. }) {
+            if matches!(
+                error,
+                MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
+            ) {
                 progress.rebootstrap_required = true;
             }
             progress.last_sync_error = Some(PgSyncFailure::from_error(error));
@@ -616,7 +619,7 @@ impl PgMetaEngine {
         }
     }
 
-    fn mark_replay_gap_recovery_required(&self) {
+    fn mark_rebootstrap_required(&self) {
         self.metadata_startup_target_version
             .store(-1, Ordering::Release);
         self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
@@ -1072,8 +1075,11 @@ impl PgMetaEngine {
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
                 self.record_pg_sync_failure(error);
-                if matches!(error, MetaError::ReplayGap { .. }) {
-                    self.mark_replay_gap_recovery_required();
+                if matches!(
+                    error,
+                    MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
+                ) {
+                    self.mark_rebootstrap_required();
                 }
             }
         }

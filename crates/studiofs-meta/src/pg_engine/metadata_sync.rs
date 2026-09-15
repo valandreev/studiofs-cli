@@ -1,7 +1,7 @@
 //! Owns foreign metadata catch-up orchestration and local replay application.
 
 use super::{
-    MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
+    MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
 use crate::types::FileType;
@@ -105,8 +105,11 @@ impl PgMetaEngine {
                 self.invalidate_remote_validation();
                 self.record_metadata_source_result(result);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
-                if matches!(error, MetaError::ReplayGap { .. }) {
-                    self.mark_replay_gap_recovery_required();
+                if matches!(
+                    error,
+                    MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
+                ) {
+                    self.mark_rebootstrap_required();
                 }
             }
         }
@@ -208,22 +211,46 @@ impl PgMetaEngine {
                         let tx = client.transaction().await.map_err(|e| {
                             Self::classify_pg_error("postgres begin pull transaction failed", e)
                         })?;
-                        let format_row = tx
-                            .query_opt(
-                                "SELECT metadata_format_version FROM metadata_state WHERE vol = $1 FOR SHARE",
-                                &[&volume_id],
-                            )
+                        let replay_state = tx
+                            .query_opt(sql::SELECT_METADATA_REPLAY_STATE, &[&volume_id])
                             .await
                             .map_err(|e| {
                                 Self::classify_pg_error(
-                                    "postgres metadata format revalidation failed",
+                                    "postgres metadata replay state revalidation failed",
                                     e,
                                 )
                             })?;
-                        let found = format_row
+                        let found = replay_state
                             .as_ref()
                             .and_then(|row| row.get::<_, Option<i16>>(0));
                         crate::ensure_supported_pg_sync_format_version(found)?;
+                        let replay_state = replay_state.ok_or_else(|| {
+                            MetaError::Storage(
+                                "postgres metadata replay state row missing".to_string(),
+                            )
+                        })?;
+                        let checkpoint_version = replay_state
+                            .try_get::<_, i64>("checkpoint_version")
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres checkpoint version read failed",
+                                    e,
+                                )
+                            })?;
+                        let retained_floor = replay_state
+                            .try_get::<_, i64>("event_log_prune_floor")
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres event-log retention floor read failed",
+                                    e,
+                                )
+                            })?;
+                        Self::validate_replay_cursor_against_floor(
+                            last_batch_version,
+                            retained_floor,
+                            checkpoint_version,
+                            target_version,
+                        )?;
 
                         let page = Self::query_foreign_event_page(
                             &tx,

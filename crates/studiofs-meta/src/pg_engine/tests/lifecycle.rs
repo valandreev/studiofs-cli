@@ -97,6 +97,60 @@ fn pg_sync_diagnostics_reports_frozen_target_and_remaining_distance() {
 }
 
 #[test]
+fn rebootstrap_required_is_distinct_and_records_checkpoint_coordinates() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Live);
+    let error = MetaError::RebootstrapRequired {
+        local_version: 5,
+        retained_floor: 8,
+        checkpoint_version: 8,
+        target_version: 12,
+    };
+
+    let returned = engine.record_remote_operation_result::<bool>(Err(error.clone()));
+
+    assert!(matches!(
+        returned,
+        Err(MetaError::RebootstrapRequired {
+            local_version: 5,
+            retained_floor: 8,
+            checkpoint_version: 8,
+            target_version: 12,
+        })
+    ));
+    assert_eq!(
+        PgSyncFailure::from_error(&error),
+        PgSyncFailure::RebootstrapRequired {
+            local_version: Some(5),
+            retained_floor: Some(8),
+            checkpoint_version: Some(8),
+            target_version: Some(12),
+        }
+    );
+    let diagnostics = engine.pg_sync_diagnostics();
+    assert!(diagnostics.rebootstrap_required);
+    assert_eq!(
+        diagnostics.last_sync_error,
+        Some(PgSyncFailure::RebootstrapRequired {
+            local_version: Some(5),
+            retained_floor: Some(8),
+            checkpoint_version: Some(8),
+            target_version: Some(12),
+        })
+    );
+    assert_eq!(
+        diagnostics
+            .last_sync_error
+            .expect("rebootstrap diagnostic")
+            .to_string(),
+        "checkpoint rebootstrap required (local cursor 5, retained floor 8, checkpoint 8, target 12)"
+    );
+    assert!(diagnostics.source_connected);
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
 fn pg_sync_diagnostics_reports_distance_from_uninitialized_cursor() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
@@ -671,6 +725,72 @@ fn stale_local_open_does_not_replay_remote_event_tail() {
         .expect("catch up after event-log unlock");
     assert_eq!(opened.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
     assert!(opened.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_reports_rebootstrap_below_retained_event_log_floor() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-floor");
+    let volume_id = volume.volume_id;
+    run_async(with_pg_test_client(&dsn, move |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 12, checkpoint_version = 8, event_log_prune_floor = 8 WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("seed retained replay floor");
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("stale.redb");
+    seed_local(&db, &volume.format_info());
+    let local = RedbMetaEngine::open(&db).expect("open seeded local metadata");
+    PgMetaEngine::persist_client_slot(&local, 0).expect("persist client slot");
+    local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 5)
+        .expect("persist cursor below retained floor");
+    drop(local);
+
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open stale metadata client");
+    let error = engine
+        .sync_metadata()
+        .expect_err("a cursor below retained history must require rebootstrap");
+
+    assert!(matches!(
+        error,
+        MetaError::RebootstrapRequired {
+            local_version: 5,
+            retained_floor: 8,
+            checkpoint_version: 8,
+            target_version: 12,
+        }
+    ));
+    let diagnostics = engine.pg_sync_diagnostics();
+    assert!(diagnostics.rebootstrap_required);
+    assert_eq!(
+        diagnostics.last_sync_error,
+        Some(PgSyncFailure::RebootstrapRequired {
+            local_version: Some(5),
+            retained_floor: Some(8),
+            checkpoint_version: Some(8),
+            target_version: Some(12),
+        })
+    );
+    assert_eq!(diagnostics.lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!engine.pg_sync_status().allows_new_mutations());
 }
 
 #[test]

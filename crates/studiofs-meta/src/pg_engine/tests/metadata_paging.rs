@@ -37,6 +37,9 @@ fn foreign_event_page_query_is_bounded_and_exposes_page_metadata() {
         sql::SELECT_FOREIGN_EVENT_ROWS
             .contains("COALESCE(BOOL_OR(response_bytes > $5::BIGINT), false)")
     );
+    assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("event_log_prune_floor"));
+    assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("checkpoint_version"));
+    assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("FOR SHARE"));
 }
 
 #[test]
