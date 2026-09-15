@@ -3234,13 +3234,67 @@ fn snapshot_reconcile_resets_stale_regular_file_serving_attr() {
         "base-only import can leave a stale serving attr until reconciliation"
     );
 
-    pg.reconcile_imported_snapshot_regular_files()
+    pg.reconcile_imported_snapshot_regular_files_with_active_open_inodes(None)
         .expect("reconcile imported snapshot");
 
     assert_eq!(
         pg.get_attr(file.ino).expect("load reconciled attr").size,
         remote_attr.size,
         "snapshot reconciliation must reset stale regular-file serving attrs from base"
+    );
+}
+
+#[test]
+fn snapshot_rebootstrap_holds_active_open_lock_through_import() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.note_active_open_inode(ROOT_INO);
+
+    let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+    let hook_release_rx = std::sync::Arc::clone(&release_rx);
+    pg.set_snapshot_import_after_active_open_capture_hook(std::sync::Arc::new(move || {
+        captured_tx.send(()).expect("signal active-open capture");
+        hook_release_rx
+            .lock()
+            .expect("snapshot import hook release lock")
+            .recv()
+            .expect("release snapshot import hook");
+    }));
+
+    let pg = std::sync::Arc::new(pg);
+    let worker_pg = std::sync::Arc::clone(&pg);
+    let worker = std::thread::spawn(move || {
+        worker_pg.import_serving_checkpoint_locked(
+            StartupSnapshotImportMode::PreserveLocalState,
+            &crate::snapshot::ServingCheckpoint::default(),
+            0,
+        )
+    });
+
+    captured_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("snapshot import should capture active opens");
+    let note_pg = std::sync::Arc::clone(&pg);
+    let (noted_tx, noted_rx) = std::sync::mpsc::channel();
+    let note_worker = std::thread::spawn(move || {
+        note_pg.note_active_open_inode(ROOT_INO);
+        noted_tx.send(()).expect("signal active-open registration");
+    });
+    let note_completed_during_import = noted_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_ok();
+
+    release_tx.send(()).expect("release snapshot import");
+    worker
+        .join()
+        .expect("join snapshot import worker")
+        .expect("snapshot import");
+    note_worker.join().expect("join active-open registration");
+
+    assert!(
+        !note_completed_during_import,
+        "active-open registration must wait for snapshot replacement"
     );
 }
 

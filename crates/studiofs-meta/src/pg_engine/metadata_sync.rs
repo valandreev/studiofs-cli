@@ -5,7 +5,7 @@ use super::{
     janitor::pg_event_log_prune_lock_key, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
-use crate::types::FileType;
+use crate::types::{FileType, Ino};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use tracing::warn;
@@ -38,17 +38,30 @@ impl PgMetaEngine {
         Ok(observed_target)
     }
 
-    fn active_open_inode_overlay(&self) -> OverlayConflictSets {
+    fn active_open_inode_overlay(
+        &self,
+        active_open_inodes: Option<&HashSet<Ino>>,
+    ) -> OverlayConflictSets {
         let mut overlay = OverlayConflictSets::default();
-        let Ok(active) = self.active_open_inodes.lock() else {
-            return overlay;
-        };
-        overlay.remove_attr_inodes.extend(active.keys().copied());
+        if let Some(active_open_inodes) = active_open_inodes {
+            overlay
+                .remove_attr_inodes
+                .extend(active_open_inodes.iter().copied());
+        } else if let Ok(active) = self.active_open_inodes.lock() {
+            overlay.remove_attr_inodes.extend(active.keys().copied());
+        }
         overlay
     }
 
     pub(super) fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
-        let active_open_overlay = self.active_open_inode_overlay();
+        self.local_overlay_conflicts_with_active_open_inodes(None)
+    }
+
+    fn local_overlay_conflicts_with_active_open_inodes(
+        &self,
+        active_open_inodes: Option<&HashSet<Ino>>,
+    ) -> MetaResult<OverlayConflictSets> {
+        let active_open_overlay = self.active_open_inode_overlay(active_open_inodes);
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
         if end <= start {
@@ -61,7 +74,10 @@ impl PgMetaEngine {
         ))
     }
 
-    pub(super) fn reconcile_imported_snapshot_regular_files(&self) -> MetaResult<()> {
+    pub(super) fn reconcile_imported_snapshot_regular_files_with_active_open_inodes(
+        &self,
+        active_open_inodes: Option<&HashSet<Ino>>,
+    ) -> MetaResult<()> {
         let reconcile_inodes = self
             .local
             .list_inode_attrs()?
@@ -69,7 +85,7 @@ impl PgMetaEngine {
             .filter(|attr| attr.kind == FileType::RegularFile)
             .map(|attr| attr.ino)
             .collect::<HashSet<_>>();
-        let overlay = self.local_overlay_conflicts()?;
+        let overlay = self.local_overlay_conflicts_with_active_open_inodes(active_open_inodes)?;
         RemoteApplyCoordinator::new(&self.local)
             .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
         Ok(())

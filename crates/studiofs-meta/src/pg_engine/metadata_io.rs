@@ -472,16 +472,20 @@ impl PgMetaEngine {
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
-        let active_open_inodes = if import_mode == StartupSnapshotImportMode::PreserveLocalState {
-            self.active_open_inodes
-                .lock()
-                .map_err(|_| MetaError::Storage("pg active open inode lock poisoned".to_string()))?
-                .keys()
-                .copied()
-                .collect::<HashSet<_>>()
-        } else {
-            HashSet::new()
-        };
+        let _active_open_inodes_guard =
+            if import_mode == StartupSnapshotImportMode::PreserveLocalState {
+                Some(self.active_open_inodes.lock().map_err(|_| {
+                    MetaError::Storage("pg active open inode lock poisoned".to_string())
+                })?)
+            } else {
+                None
+            };
+        let active_open_inodes = _active_open_inodes_guard
+            .as_ref()
+            .map(|active| active.keys().copied().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        #[cfg(test)]
+        self.run_snapshot_import_after_active_open_capture_hook();
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
                 self.local.import_serving_checkpoint(checkpoint)?;
@@ -498,9 +502,35 @@ impl PgMetaEngine {
                     )?;
             }
         }
-        self.reconcile_imported_snapshot_regular_files()?;
+        self.reconcile_imported_snapshot_regular_files_with_active_open_inodes(
+            (import_mode == StartupSnapshotImportMode::PreserveLocalState)
+                .then_some(&active_open_inodes),
+        )?;
         self.persist_local_version(replay_start_version)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_snapshot_import_after_active_open_capture_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .snapshot_import_after_active_open_capture_hook
+            .lock()
+            .expect("snapshot import hook lock") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_snapshot_import_after_active_open_capture_hook(&self) {
+        let hook = self
+            .snapshot_import_after_active_open_capture_hook
+            .lock()
+            .expect("snapshot import hook lock")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn read_remote_metadata_head_version_unrecorded(&self) -> MetaResult<i64> {

@@ -474,6 +474,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         file_lock_cache: Mutex::new(HashMap::new()),
         held_file_locks: Mutex::new(HashMap::new()),
         active_open_inodes: Mutex::new(HashMap::new()),
+        snapshot_import_after_active_open_capture_hook: Mutex::new(None),
         self_weak: OnceLock::new(),
         lock_workers_enabled: false,
         lock_worker_start_lock: Mutex::new(()),
