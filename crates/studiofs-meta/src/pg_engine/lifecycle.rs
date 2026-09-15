@@ -70,9 +70,39 @@ pub(super) fn rebootstrap_startup_target(
     frozen_target: impl FnOnce() -> MetaResult<i64>,
 ) -> MetaResult<i64> {
     if !import_snapshot()? {
-        tracing::warn!(
-            "serving snapshot import returned false during rebootstrap; checkpoint may not be newer than local cursor"
-        );
+        match &rebootstrap_error {
+            MetaError::RebootstrapRequired {
+                local_version,
+                retained_floor,
+                checkpoint_version,
+                target_version,
+            } => {
+                tracing::warn!(
+                    local_version = *local_version,
+                    retained_floor = *retained_floor,
+                    checkpoint_version = *checkpoint_version,
+                    target_version = *target_version,
+                    "serving snapshot import returned false during rebootstrap; checkpoint may not be newer than local cursor"
+                );
+            }
+            MetaError::ReplayGap {
+                local_version,
+                first_available_version,
+                target_version,
+            } => {
+                tracing::warn!(
+                    local_version = *local_version,
+                    first_available_version = *first_available_version,
+                    target_version = *target_version,
+                    "serving snapshot import returned false during replay-gap recovery"
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    "serving snapshot import returned false during unexpected metadata recovery"
+                );
+            }
+        }
         return Err(rebootstrap_error);
     }
     frozen_target()
@@ -343,7 +373,11 @@ impl PgMetaEngine {
     }
 
     /// Run one interruptible startup catch-up session to the frozen target.
-    pub(super) fn run_startup_catch_up_session(&self, shutdown: &AtomicBool) -> MetaResult<bool> {
+    pub(super) fn run_startup_catch_up_session(
+        &self,
+        source: MetadataSyncSource,
+        shutdown: &AtomicBool,
+    ) -> MetaResult<bool> {
         let remote_operation_recorded = Cell::new(false);
         let result = (|| {
             self.ensure_remote_format_validated()?;
@@ -395,7 +429,10 @@ impl PgMetaEngine {
             };
             let changed = match drain_to_target(target_version) {
                 Ok(changed) => changed,
-                Err(rebootstrap_error @ MetaError::RebootstrapRequired { .. }) => {
+                Err(
+                    rebootstrap_error @ (MetaError::RebootstrapRequired { .. }
+                    | MetaError::ReplayGap { .. }),
+                ) => {
                     let result = rebootstrap_startup_target(
                         rebootstrap_error,
                         || {
@@ -428,11 +465,7 @@ impl PgMetaEngine {
         }
         // Fresh-client completion reacquires replication_lock, so record the
         // aggregate session result only after the page-drain lock is released.
-        self.record_metadata_sync_result(
-            MetadataSyncSource::FallbackPoll,
-            &result,
-            remote_operation_recorded.get(),
-        );
+        self.record_metadata_sync_result(source, &result, remote_operation_recorded.get());
         result
     }
 
@@ -491,7 +524,10 @@ impl PgMetaEngine {
                         engine.current_pg_sync_lifecycle(),
                         PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
                     ) {
-                        engine.run_startup_catch_up_session(&shutdown)
+                        engine.run_startup_catch_up_session(
+                            MetadataSyncSource::FallbackPoll,
+                            &shutdown,
+                        )
                     } else {
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
                     };

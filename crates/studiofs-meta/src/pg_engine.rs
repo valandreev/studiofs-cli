@@ -1348,6 +1348,7 @@ impl PgMetaEngine {
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                             }
                             PgSyncLifecycle::Live | PgSyncLifecycle::TargetReached => {
+                                // Record loss of convergence before retrying from a healthy state.
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                             }

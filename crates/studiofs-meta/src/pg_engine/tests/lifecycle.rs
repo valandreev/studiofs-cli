@@ -421,6 +421,33 @@ fn startup_rebootstrap_requires_snapshot_import_before_refreshing_target() {
 }
 
 #[test]
+fn startup_rebootstrap_propagates_snapshot_import_error_without_refreshing_target() {
+    let rebootstrap_error = MetaError::RebootstrapRequired {
+        local_version: 5,
+        retained_floor: 8,
+        checkpoint_version: 8,
+        target_version: 12,
+    };
+    let target_calls = std::cell::Cell::new(0_usize);
+
+    let error = rebootstrap_startup_target(
+        rebootstrap_error,
+        || Err(MetaError::Storage("io failure".to_string())),
+        || {
+            target_calls.set(target_calls.get() + 1);
+            Ok(15)
+        },
+    )
+    .expect_err("snapshot import errors must be returned unchanged");
+
+    assert!(matches!(
+        error,
+        MetaError::Storage(message) if message == "io failure"
+    ));
+    assert_eq!(target_calls.get(), 0);
+}
+
+#[test]
 fn startup_catch_up_drain_yields_at_page_budget_and_resumes_from_cursor() {
     let local_version = std::cell::Cell::new(0_i64);
     let pulls = std::cell::Cell::new(0_usize);
@@ -639,10 +666,29 @@ fn startup_catch_up_session_rejects_fatal_lifecycle_as_success() {
     );
 
     let error = engine
-        .run_startup_catch_up_session(&std::sync::atomic::AtomicBool::new(false))
+        .run_startup_catch_up_session(
+            MetadataSyncSource::Manual,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
         .expect_err("fatal lifecycle must not be reported as a successful sync");
 
     assert!(matches!(error, MetaError::LifecycleFatal));
+}
+
+#[test]
+fn startup_catch_up_session_honors_shutdown_signal() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    let shutdown = std::sync::atomic::AtomicBool::new(true);
+
+    let changed = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+        .expect("shutdown should stop startup catch-up cleanly");
+
+    assert!(!changed);
 }
 
 struct EventLogLockGuard {
@@ -846,7 +892,7 @@ fn startup_catch_up_reports_rebootstrap_below_retained_event_log_floor() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn startup_catch_up_rebases_stale_client_from_checkpoint_preserving_pending_overlay() {
+fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_overlay() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
@@ -896,7 +942,14 @@ fn startup_catch_up_rebases_stale_client_from_checkpoint_preserving_pending_over
         move |client| async move {
             client
                 .execute(
-                    "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 2 WHERE vol = $3",
+                    "DELETE FROM event_log WHERE vol = $1 AND batch_version = 2",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 0 WHERE vol = $3",
                     &[&checkpoint_bytes, &checkpoint_sha256, &volume_id],
                 )
                 .await
@@ -939,6 +992,12 @@ fn startup_catch_up_rebases_stale_client_from_checkpoint_preserving_pending_over
         .expect("manual sync should rebase a stale replay cursor");
     assert_eq!(stale.local_version.load(Ordering::Acquire), 3);
     assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(
+        stale
+            .metadata_invalidation_diagnostics()
+            .fallback_poll_discoveries,
+        0
+    );
     publisher
         .create_dir(ROOT_INO, b"advanced-after-rebootstrap", 0, 0, 0o755)
         .expect("create event after rebootstrap detection");
@@ -1070,7 +1129,7 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     let shutdown = std::sync::atomic::AtomicBool::new(false);
     assert!(
         stale
-            .run_startup_catch_up_session(&shutdown)
+            .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
             .expect("drain frozen startup target")
     );
     assert_eq!(stale.local_version.load(Ordering::Acquire), startup_target);
