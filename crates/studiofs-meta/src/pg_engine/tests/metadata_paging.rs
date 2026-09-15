@@ -46,6 +46,7 @@ fn metadata_replay_state_query_uses_shared_replay_lock() {
     assert!(sql::SELECT_METADATA_REPLAY_STATE.contains("checkpoint_version"));
     assert!(!sql::SELECT_METADATA_REPLAY_STATE.contains("FOR SHARE"));
     assert!(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK.contains("pg_advisory_xact_lock_shared"));
+    assert!(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK.contains("$1::BIGINT"));
 }
 
 #[test]

@@ -819,6 +819,7 @@ impl PgSyncFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 struct PgSyncVersionDisplay(Option<u64>);
 
 impl std::fmt::Display for PgSyncVersionDisplay {

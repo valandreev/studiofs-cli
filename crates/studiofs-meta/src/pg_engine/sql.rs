@@ -46,7 +46,7 @@ pub(super) const SELECT_METADATA_REPLAY_STATE: &str = r#"
     "#;
 
 pub(super) const ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK: &str =
-    "SELECT pg_advisory_xact_lock_shared($1)";
+    "SELECT pg_advisory_xact_lock_shared($1::BIGINT)";
 
 pub(super) const BUMP_METADATA_VERSION: &str = r#"
     UPDATE metadata_state

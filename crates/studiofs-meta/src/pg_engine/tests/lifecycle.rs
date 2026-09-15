@@ -1745,6 +1745,28 @@ fn metadata_sync_replay_gap_records_degraded_lifecycle() {
 }
 
 #[test]
+fn metadata_sync_result_does_not_repeat_recorded_remote_failure() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let result = Err(MetaError::RemoteUnavailable(
+        "remote unavailable".to_string(),
+    ));
+
+    let _ = engine.record_remote_operation_result::<bool>(result.clone());
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, true);
+
+    assert!(
+        engine
+            .remote_format_validated
+            .load(std::sync::atomic::Ordering::Acquire),
+        "aggregate recording must not invalidate a failure already recorded by the remote operation"
+    );
+    assert_eq!(engine.pg_sync_diagnostics().sync_errors, 1);
+}
+
+#[test]
 fn established_zero_version_startup_failure_is_degraded() {
     let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
     let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");

@@ -124,19 +124,19 @@ impl PgMetaEngine {
     }
 
     pub(super) fn sync_metadata_with_source(&self, source: MetadataSyncSource) -> MetaResult<bool> {
+        let mut remote_operation_recorded = false;
         let result = (|| {
             self.ensure_remote_format_validated()?;
             let _guard = self
                 .replication_lock
                 .lock()
                 .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+            // `pull_foreign_events_locked` records every error after this
+            // boundary through `record_remote_operation_result`.
+            remote_operation_recorded = true;
             let changed = self.pull_foreign_events_locked(None)?;
             Ok(changed)
         })();
-        let remote_operation_recorded = matches!(
-            &result,
-            Err(MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. })
-        );
         self.record_metadata_sync_result(source, &result, remote_operation_recorded);
         result
     }
@@ -176,7 +176,6 @@ impl PgMetaEngine {
         &self,
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
-        self.ensure_remote_format_validated()?;
         let target_version = self.frozen_sync_target_version()?;
         self.pull_foreign_events_locked_to_target(recent_flush, target_version)
     }
@@ -191,8 +190,10 @@ impl PgMetaEngine {
         recent_flush: Option<&RecentFlush>,
         target_version: i64,
     ) -> MetaResult<bool> {
-        self.ensure_remote_format_validated()?;
-        let result = self.pull_foreign_events_locked_inner(recent_flush, target_version);
+        let result = (|| {
+            self.ensure_remote_format_validated()?;
+            self.pull_foreign_events_locked_inner(recent_flush, target_version)
+        })();
         self.record_remote_operation_result(result)
     }
 

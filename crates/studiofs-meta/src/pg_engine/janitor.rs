@@ -1,7 +1,9 @@
-use super::{PG_JANITOR_LOCK_SALT, PgMetaEngine, PgTimeoutContext};
+use super::{PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
 use std::collections::HashSet;
+
+const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 
 pub(super) struct PgJanitorLock {
     pub(super) _runtime: tokio::runtime::Runtime,

@@ -133,8 +133,6 @@ const PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_AGE
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
-const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StartupSnapshotImportMode {
     ReplaceLocalState,
