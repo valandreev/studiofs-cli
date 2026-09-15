@@ -934,11 +934,11 @@ fn startup_catch_up_rebases_stale_client_from_checkpoint_preserving_pending_over
             .expect("read remote head after stale client open"),
         3
     );
-    let error = stale
+    stale
         .sync_metadata()
-        .expect_err("stale replay cursor should require checkpoint rebase");
-    assert!(matches!(error, MetaError::RebootstrapRequired { .. }));
-    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+        .expect("manual sync should rebase a stale replay cursor");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 3);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
     publisher
         .create_dir(ROOT_INO, b"advanced-after-rebootstrap", 0, 0, 0o755)
         .expect("create event after rebootstrap detection");
@@ -948,8 +948,8 @@ fn startup_catch_up_rebases_stale_client_from_checkpoint_preserving_pending_over
     drop(publisher);
 
     stale
-        .run_startup_catch_up_session(&std::sync::atomic::AtomicBool::new(false))
-        .expect("stale client should rebase and resume catch-up");
+        .sync_metadata()
+        .expect("manual sync should replay the post-rebase event");
 
     assert_eq!(stale.local_version.load(Ordering::Acquire), 4);
     assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
@@ -964,6 +964,45 @@ fn startup_catch_up_rebases_stale_client_from_checkpoint_preserving_pending_over
             .lookup(ROOT_INO, name)
             .expect("checkpoint, replay, and pending entries must survive rebase");
     }
+
+    stale
+        .flush_metadata()
+        .expect("flush preserved overlay after rebase");
+    let (remote_version, remote_events) = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let state = client
+                .query_one(
+                    "SELECT version FROM metadata_state WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let rows = client
+                .query(
+                    "SELECT event_type, event_payload FROM event_log WHERE vol = $1 AND batch_version = 5 ORDER BY seq_id",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let events = rows
+                .into_iter()
+                .map(|row| {
+                    crate::events::decode_event_with_type(
+                        row.get(0),
+                        row.get(1),
+                    )
+                })
+                .collect::<MetaResult<Vec<_>>>()?;
+            Ok::<(i64, Vec<MetaEvent>), MetaError>((state.get(0), events))
+        }
+    }))
+    .expect("read flushed overlay event from postgres");
+    assert_eq!(remote_version, 5);
+    assert!(remote_events.iter().any(|event| matches!(
+        event,
+        MetaEvent::AddEntry { name, .. } if name.as_slice() == b"pending-local"
+    )));
 }
 
 #[test]

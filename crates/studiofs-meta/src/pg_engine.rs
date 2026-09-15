@@ -1338,17 +1338,16 @@ impl PgMetaEngine {
                         .store(remote_head, Ordering::Release);
                     if engine.local_version.load(Ordering::Acquire) < remote_head {
                         // Identity validation may leave AllocatorPending before
-                        // this head check; only LocalReady can enter CatchingUp
-                        // directly.
+                        // this head check; allocator authority is independent
+                        // from convergence, so it can enter CatchingUp directly.
                         match engine.current_pg_sync_lifecycle() {
                             PgSyncLifecycle::CatchingUp => {}
-                            PgSyncLifecycle::LocalReady => {
+                            PgSyncLifecycle::LocalReady
+                            | PgSyncLifecycle::Degraded
+                            | PgSyncLifecycle::AllocatorPending => {
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                             }
-                            PgSyncLifecycle::Degraded => {}
-                            PgSyncLifecycle::Live
-                            | PgSyncLifecycle::TargetReached
-                            | PgSyncLifecycle::AllocatorPending => {
+                            PgSyncLifecycle::Live | PgSyncLifecycle::TargetReached => {
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                             }

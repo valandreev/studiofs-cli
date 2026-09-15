@@ -6,7 +6,7 @@ use crate::engine::{
 };
 use crate::types::Ino;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
 impl MetaReplication for PgMetaEngine {
@@ -43,7 +43,13 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
-        let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+        match self.sync_metadata_with_source(MetadataSyncSource::Manual) {
+            Ok(_) => {}
+            Err(MetaError::RebootstrapRequired { .. }) => {
+                self.run_startup_catch_up_session(&AtomicBool::new(false))?;
+            }
+            Err(error) => return Err(error),
+        }
         if let Err(error) = self.backfill_current_reference_ledger_if_needed() {
             warn!(
                 error = %error,

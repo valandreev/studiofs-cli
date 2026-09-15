@@ -70,6 +70,9 @@ pub(super) fn rebootstrap_startup_target(
     frozen_target: impl FnOnce() -> MetaResult<i64>,
 ) -> MetaResult<i64> {
     if !import_snapshot()? {
+        tracing::warn!(
+            "serving snapshot import returned false during rebootstrap; checkpoint may not be newer than local cursor"
+        );
         return Err(rebootstrap_error);
     }
     frozen_target()
@@ -357,8 +360,11 @@ impl PgMetaEngine {
                 return Ok(false);
             }
 
-            // Keep target capture and every page pull under one lock so a
-            // concurrent NOTIFY sync cannot clear the target mid-session.
+            // Keep target capture, snapshot transfer, and every page pull under
+            // one lock so a concurrent NOTIFY sync cannot clear the target
+            // mid-session. Each PostgreSQL command is bounded by
+            // `command_timeout`, and page draining is bounded by the startup
+            // catch-up page budget.
             let target_version = match self.frozen_sync_target_version() {
                 Ok(target_version) => target_version,
                 Err(error) => {
