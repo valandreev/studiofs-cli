@@ -819,8 +819,15 @@ impl PgSyncFailure {
     }
 }
 
-fn format_pg_sync_version(version: Option<u64>) -> String {
-    version.map_or_else(|| "unknown".to_string(), |version| version.to_string())
+struct PgSyncVersionDisplay(Option<u64>);
+
+impl std::fmt::Display for PgSyncVersionDisplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(version) => write!(formatter, "{version}"),
+            None => formatter.write_str("unknown"),
+        }
+    }
 }
 
 impl std::fmt::Display for PgSyncFailure {
@@ -835,9 +842,9 @@ impl std::fmt::Display for PgSyncFailure {
             } => write!(
                 formatter,
                 "replay gap (local cursor {}, first available {}, target {})",
-                format_pg_sync_version(*local_version),
-                format_pg_sync_version(*first_available_version),
-                format_pg_sync_version(*target_version),
+                PgSyncVersionDisplay(*local_version),
+                PgSyncVersionDisplay(*first_available_version),
+                PgSyncVersionDisplay(*target_version),
             ),
             Self::RebootstrapRequired {
                 local_version,
@@ -847,10 +854,10 @@ impl std::fmt::Display for PgSyncFailure {
             } => write!(
                 formatter,
                 "checkpoint rebootstrap required (local cursor {}, retained floor {}, checkpoint {}, target {})",
-                format_pg_sync_version(*local_version),
-                format_pg_sync_version(*retained_floor),
-                format_pg_sync_version(*checkpoint_version),
-                format_pg_sync_version(*target_version),
+                PgSyncVersionDisplay(*local_version),
+                PgSyncVersionDisplay(*retained_floor),
+                PgSyncVersionDisplay(*checkpoint_version),
+                PgSyncVersionDisplay(*target_version),
             ),
             Self::CatchUpStalled {
                 local_version,
@@ -858,8 +865,8 @@ impl std::fmt::Display for PgSyncFailure {
             } => write!(
                 formatter,
                 "catch-up stalled (local cursor {}, target {})",
-                format_pg_sync_version(*local_version),
-                format_pg_sync_version(*target_version),
+                PgSyncVersionDisplay(*local_version),
+                PgSyncVersionDisplay(*target_version),
             ),
             Self::CatchUpBudgetExceeded {
                 local_version,
@@ -868,8 +875,8 @@ impl std::fmt::Display for PgSyncFailure {
             } => write!(
                 formatter,
                 "catch-up page budget exhausted (local cursor {}, target {}, {pages} pages)",
-                format_pg_sync_version(*local_version),
-                format_pg_sync_version(*target_version),
+                PgSyncVersionDisplay(*local_version),
+                PgSyncVersionDisplay(*target_version),
             ),
             Self::InvalidCheckpoint => formatter.write_str("invalid checkpoint"),
             Self::UnsupportedFormat { found, expected } => write!(

@@ -6,7 +6,7 @@ use crate::pg_engine::PgMetaEngine;
 use crate::pg_engine::event_log_pruning::{
     calculate_safe_prune_floor, should_skip_event_log_prune,
 };
-use crate::pg_engine::janitor::pg_janitor_lock_key;
+use crate::pg_engine::janitor::pg_event_log_prune_lock_key;
 use crate::pg_engine::sql;
 use crate::snapshot::ServingCheckpoint;
 use sha2::{Digest, Sha256};
@@ -178,7 +178,7 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn pg_event_log_prune_defers_when_the_janitor_lock_is_contended() {
+fn pg_event_log_prune_defers_when_its_lock_is_contended() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let volume = PgTestVolume::new(&dsn, "pg-event-log-prune-contended");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
@@ -205,7 +205,7 @@ fn pg_event_log_prune_defers_when_the_janitor_lock_is_contended() {
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         tx.execute(
             "SELECT pg_advisory_xact_lock($1)",
-            &[&pg_janitor_lock_key(volume.volume_id)],
+            &[&pg_event_log_prune_lock_key(volume.volume_id)],
         )
         .await
         .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;

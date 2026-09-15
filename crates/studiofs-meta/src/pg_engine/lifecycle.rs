@@ -370,7 +370,15 @@ impl PgMetaEngine {
         }
         // Fresh-client completion reacquires replication_lock, so record the
         // aggregate session result only after the page-drain lock is released.
-        self.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result);
+        let remote_operation_recorded = matches!(
+            &result,
+            Err(MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. })
+        );
+        self.record_metadata_sync_result(
+            MetadataSyncSource::FallbackPoll,
+            &result,
+            remote_operation_recorded,
+        );
         result
     }
 

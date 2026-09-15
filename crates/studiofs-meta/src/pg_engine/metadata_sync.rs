@@ -2,7 +2,7 @@
 
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
-    janitor::pg_janitor_lock_key, sql,
+    janitor::pg_event_log_prune_lock_key, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
 use crate::types::FileType;
@@ -75,10 +75,15 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    /// Record aggregate sync state after a metadata operation.
+    ///
+    /// Replay helpers record their remote failure before returning, so callers
+    /// pass `true` to avoid repeating those remote failure transitions.
     pub(super) fn record_metadata_sync_result(
         &self,
         source: MetadataSyncSource,
         result: &MetaResult<bool>,
+        remote_operation_recorded: bool,
     ) {
         match result {
             Ok(changed) => {
@@ -102,15 +107,17 @@ impl PgMetaEngine {
                 }
             }
             Err(error) => {
-                self.record_pg_sync_failure(error);
-                self.invalidate_remote_validation();
-                self.record_metadata_source_result(result);
                 self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
-                if matches!(
-                    error,
-                    MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
-                ) {
-                    self.mark_rebootstrap_required();
+                if !remote_operation_recorded {
+                    self.record_pg_sync_failure(error);
+                    self.invalidate_remote_validation();
+                    self.record_metadata_source_result(result);
+                    if matches!(
+                        error,
+                        MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. }
+                    ) {
+                        self.mark_rebootstrap_required();
+                    }
                 }
             }
         }
@@ -126,7 +133,11 @@ impl PgMetaEngine {
             let changed = self.pull_foreign_events_locked(None)?;
             Ok(changed)
         })();
-        self.record_metadata_sync_result(source, &result);
+        let remote_operation_recorded = matches!(
+            &result,
+            Err(MetaError::ReplayGap { .. } | MetaError::RebootstrapRequired { .. })
+        );
+        self.record_metadata_sync_result(source, &result, remote_operation_recorded);
         result
     }
 
@@ -212,7 +223,7 @@ impl PgMetaEngine {
                         let tx = client.transaction().await.map_err(|e| {
                             Self::classify_pg_error("postgres begin pull transaction failed", e)
                         })?;
-                        let lock_key = pg_janitor_lock_key(volume_id);
+                        let lock_key = pg_event_log_prune_lock_key(volume_id);
                         tx.query_one(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK, &[&lock_key])
                             .await
                             .map_err(|e| {

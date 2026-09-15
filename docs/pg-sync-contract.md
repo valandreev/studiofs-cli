@@ -243,8 +243,9 @@ source's first required event version minus one. Source rows belonging to
 `creating`, `ready`, or `deleting` snapshots remain retention guards until the
 source row is removed; a source with no event rows does not lower the floor.
 
-The maintenance transaction takes the per-volume janitor advisory lock and the
-published `metadata_state` row lock before calculating the floor. It removes
+The maintenance transaction takes the dedicated per-volume event-log
+prune/replay advisory lock and the published `metadata_state` row lock before
+calculating the floor. It removes
 only complete `batch_version` groups, limited by the configured number of
 groups per transaction, and advances the persisted
 `metadata_state.event_log_prune_floor` only after no lower rows remain. The
@@ -253,12 +254,14 @@ amount removed without exposing credentials or connection details. Pruning is
 not part of foreground writes, flushes, or startup.
 
 Before each bounded replay page, the client takes a shared transaction-level
-advisory lock keyed by volume, then reads `checkpoint_version` and the
-inclusive `event_log_prune_floor` from `metadata_state` in the same transaction
-as the event-page query. A cursor below that floor returns typed
+advisory lock in the event-log prune/replay domain keyed by volume, then reads
+`checkpoint_version` and the inclusive `event_log_prune_floor` from
+`metadata_state` in the same transaction as the event-page query. A cursor
+below that floor returns typed
 `MetaError::RebootstrapRequired` with the local cursor, retained floor,
 checkpoint version, and frozen target. The PostgreSQL pruner takes the matching
-exclusive advisory lock before deleting history or advancing the floor, so
+exclusive event-log prune/replay advisory lock before deleting history or
+advancing the floor, so
 pruning cannot turn a page that passed the check into a false successful
 convergence; ordinary metadata version updates do not contend on this replay
 lock.

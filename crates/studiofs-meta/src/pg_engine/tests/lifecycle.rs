@@ -1733,7 +1733,7 @@ fn metadata_sync_replay_gap_records_degraded_lifecycle() {
         target_version: 60,
     });
 
-    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result);
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, false);
 
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
     assert!(!engine.pg_sync_status().allows_new_mutations());

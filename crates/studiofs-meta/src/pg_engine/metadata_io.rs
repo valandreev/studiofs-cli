@@ -381,6 +381,7 @@ impl PgMetaEngine {
         if local_version < 0
             || retained_floor < 0
             || checkpoint_version < 0
+            || target_version < 0
             || retained_floor > checkpoint_version
         {
             return Err(MetaError::Storage(
@@ -976,6 +977,15 @@ mod tests {
     fn negative_replay_cursor_is_invalid_state() {
         assert!(matches!(
             PgMetaEngine::validate_replay_cursor_against_floor(-1, 0, 0, 12),
+            Err(MetaError::Storage(message))
+                if message == "postgres replay state has invalid cursor, checkpoint, or retention versions"
+        ));
+    }
+
+    #[test]
+    fn negative_replay_target_is_invalid_state() {
+        assert!(matches!(
+            PgMetaEngine::validate_replay_cursor_against_floor(0, 0, 0, -1),
             Err(MetaError::Storage(message))
                 if message == "postgres replay state has invalid cursor, checkpoint, or retention versions"
         ));

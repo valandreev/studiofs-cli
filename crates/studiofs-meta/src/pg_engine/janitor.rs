@@ -168,3 +168,9 @@ impl PgMetaEngine {
 pub(super) fn pg_janitor_lock_key(volume_id: i64) -> i64 {
     volume_id.wrapping_mul(1_000_003) ^ PG_JANITOR_LOCK_SALT
 }
+
+const PG_EVENT_LOG_PRUNE_LOCK_SALT: i64 = 0x5f53_4653_5f50_5255;
+
+pub(super) fn pg_event_log_prune_lock_key(volume_id: i64) -> i64 {
+    volume_id.wrapping_mul(1_000_003) ^ PG_EVENT_LOG_PRUNE_LOCK_SALT
+}
