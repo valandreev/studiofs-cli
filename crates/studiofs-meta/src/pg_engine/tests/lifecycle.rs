@@ -1592,9 +1592,11 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
             let name = format!("moving-head-{cursor}");
             active_writer
                 .create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
-                .map_err(|_| MetaError::Storage("moving-head publisher failed".to_string()))?;
-            active_writer.flush_metadata().map_err(|_| {
-                MetaError::Storage("moving-head publisher flush failed".to_string())
+                .map_err(|error| {
+                    MetaError::Storage(format!("moving-head publisher failed: {error}"))
+                })?;
+            active_writer.flush_metadata().map_err(|error| {
+                MetaError::Storage(format!("moving-head publisher flush failed: {error}"))
             })?;
         }
         Ok(())
@@ -1618,7 +1620,11 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     let remote_head = stale
         .remote_metadata_head_version()
         .expect("read remote head after moving-head catch-up");
-    assert!(remote_head > startup_target);
+    let cursor_count = observed_cursors
+        .lock()
+        .expect("count moving-head catch-up cursors")
+        .len();
+    assert_eq!(remote_head, startup_target + cursor_count as i64);
 
     stale.set_catch_up_fault_hook(std::sync::Arc::new(|_| Ok(())));
     let post_target_event_count = remote_head.saturating_sub(startup_target);
@@ -1628,11 +1634,16 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
             .expect("replicate moving-head runtime event");
     }
     assert_eq!(stale.local_version.load(Ordering::Acquire), remote_head);
-    for cursor in 0..3 {
+    for cursor in 0..cursor_count {
         let name = format!("moving-head-{cursor}");
         stale
             .lookup(ROOT_INO, name.as_bytes())
             .expect("runtime replication should apply moving-head events");
+    }
+    for name in [b"backlog-1".as_slice(), b"backlog-2", b"backlog-3"] {
+        stale
+            .lookup(ROOT_INO, name)
+            .expect("startup catch-up should apply backlog events");
     }
 }
 
@@ -1732,6 +1743,10 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
     }
     assert_eq!(engine.local_version.load(Ordering::Acquire), 1);
     assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::CatchingUp
+    );
+    assert_eq!(
         engine.pg_sync_diagnostics().startup_target_version,
         Some(startup_target as u64)
     );
@@ -1749,6 +1764,7 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
     );
     assert_eq!(engine.local_version.load(Ordering::Acquire), startup_target);
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(engine.pg_sync_diagnostics().startup_target_version, None);
     assert_eq!(
         observed_cursors
             .lock()
@@ -1760,7 +1776,8 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
     let remote_head = engine
         .remote_metadata_head_version()
         .expect("read remote head after retry");
-    assert!(remote_head > startup_target);
+    let published_count = (next_write.load(std::sync::atomic::Ordering::Acquire) - 1) as i64;
+    assert_eq!(remote_head, startup_target + published_count);
     engine.set_catch_up_fault_hook(std::sync::Arc::new(|_| Ok(())));
     let post_target_event_count = remote_head.saturating_sub(startup_target);
     for _ in 0..post_target_event_count {
@@ -1774,6 +1791,16 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
         engine
             .lookup(ROOT_INO, name.as_bytes())
             .expect("runtime replication should apply every post-target event");
+    }
+    for name in [
+        b"backlog-1".as_slice(),
+        b"backlog-2",
+        b"backlog-3",
+        b"backlog-4",
+    ] {
+        engine
+            .lookup(ROOT_INO, name)
+            .expect("startup catch-up retry should apply backlog events");
     }
 }
 
