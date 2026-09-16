@@ -230,6 +230,11 @@ impl PgMetaEngine {
         let sync_max_batches_per_page = self.sync_max_batches_per_page;
         let sync_max_response_bytes_per_page = self.sync_max_response_bytes_per_page;
 
+        #[cfg(test)]
+        self.run_catch_up_fault_hook(super::CatchUpFaultPoint::BeforePageFetch {
+            cursor: last_batch_version,
+        })?;
+
         let page = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
@@ -313,6 +318,15 @@ impl PgMetaEngine {
             )
             .await
         })?;
+
+        #[cfg(test)]
+        if !page.rows.is_empty() {
+            self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterPageFetch {
+                cursor: last_batch_version,
+                first_batch_version: page.first_batch_version,
+                last_batch_version: page.last_batch_version,
+            })?;
+        }
 
         if page.rows.is_empty() {
             return Ok(false);
@@ -440,8 +454,28 @@ impl PgMetaEngine {
             }
             return Err(error);
         }
+
+        #[cfg(test)]
+        if let Err(error) =
+            self.run_catch_up_fault_hook(super::CatchUpFaultPoint::BeforeLocalCommit {
+                last_batch_version: outcome.max_version,
+            })
+        {
+            if let Err(abort_error) = txn.abort() {
+                tracing::warn!(
+                    error = %abort_error,
+                    "failed to abort redb write transaction during injected catch-up rollback"
+                );
+            }
+            return Err(error);
+        }
         txn.commit()
             .map_err(|error| MetaError::Storage(error.to_string()))?;
+
+        #[cfg(test)]
+        self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterLocalCommit {
+            last_batch_version: outcome.max_version,
+        })?;
         self.publish_replay_position(&outcome);
         Ok(outcome)
     }

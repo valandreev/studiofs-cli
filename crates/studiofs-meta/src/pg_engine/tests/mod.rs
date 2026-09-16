@@ -1,5 +1,6 @@
 use super::*;
 use crate::allocator_state::{AllocatorRecord, AllocatorStateV1, COUNTER_LIMIT};
+use crate::events::encode_event;
 use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::inode_allocator::AllocatorRuntime;
 use crate::pg_engine::lifecycle::{drain_startup_catch_up_pages, rebootstrap_startup_target};
@@ -372,6 +373,33 @@ fn seed_local(path: &std::path::Path, info: &FormatInfo) {
         .expect("seed flushed event seq");
 }
 
+async fn insert_encoded_event_batch(
+    client: &tokio_postgres::Client,
+    volume_id: i64,
+    batch_version: i64,
+    client_id: &str,
+    events: &[MetaEvent],
+) -> MetaResult<()> {
+    for event in events {
+        let payload = encode_event(event)?;
+        client
+            .execute(
+                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &volume_id,
+                    &batch_version,
+                    &event.kind(),
+                    &payload,
+                    &client_id,
+                ],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
     let mut attr = engine.get_attr(ino).expect("get file attr");
     attr.size = size;
@@ -475,6 +503,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         held_file_locks: Mutex::new(HashMap::new()),
         active_open_inodes: Mutex::new(HashMap::new()),
         snapshot_import_after_active_open_capture_hook: Mutex::new(None),
+        catch_up_fault_hook: Mutex::new(None),
         self_weak: OnceLock::new(),
         lock_workers_enabled: false,
         lock_worker_start_lock: Mutex::new(()),

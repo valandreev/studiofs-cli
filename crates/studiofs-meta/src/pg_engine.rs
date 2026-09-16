@@ -238,6 +238,8 @@ pub struct PgMetaEngine {
     active_open_inodes: Mutex<HashMap<Ino, u32>>,
     #[cfg(test)]
     snapshot_import_after_active_open_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    catch_up_fault_hook: Mutex<Option<CatchUpFaultHook>>,
     self_weak: OnceLock<Weak<Self>>,
     lock_workers_enabled: bool,
     lock_worker_start_lock: Mutex<()>,
@@ -466,6 +468,50 @@ enum MetadataSyncSource {
     Manual,
     Notify,
     FallbackPoll,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CatchUpFaultPoint {
+    BeforePageFetch {
+        cursor: i64,
+    },
+    AfterPageFetch {
+        cursor: i64,
+        first_batch_version: Option<i64>,
+        last_batch_version: Option<i64>,
+    },
+    BeforeLocalCommit {
+        last_batch_version: i64,
+    },
+    AfterLocalCommit {
+        last_batch_version: i64,
+    },
+}
+
+#[cfg(test)]
+type CatchUpFaultHook = Arc<dyn Fn(CatchUpFaultPoint) -> MetaResult<()> + Send + Sync>;
+
+#[cfg(test)]
+impl PgMetaEngine {
+    pub(super) fn set_catch_up_fault_hook(&self, hook: CatchUpFaultHook) {
+        *self
+            .catch_up_fault_hook
+            .lock()
+            .expect("catch-up fault hook lock") = Some(hook);
+    }
+
+    pub(super) fn run_catch_up_fault_hook(&self, point: CatchUpFaultPoint) -> MetaResult<()> {
+        let hook = self
+            .catch_up_fault_hook
+            .lock()
+            .map_err(|_| MetaError::Storage("catch-up fault hook lock poisoned".to_string()))?
+            .clone();
+        if let Some(hook) = hook {
+            hook(point)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1271,6 +1317,8 @@ impl PgMetaEngine {
             active_open_inodes: Mutex::new(HashMap::new()),
             #[cfg(test)]
             snapshot_import_after_active_open_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            catch_up_fault_hook: Mutex::new(None),
             self_weak: OnceLock::new(),
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
