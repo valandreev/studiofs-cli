@@ -49,7 +49,7 @@ where
     result
 }
 
-fn open_pg_publisher(volume: &PgTestVolume) -> (tempfile::TempDir, std::sync::Arc<PgMetaEngine>) {
+fn open_pg_publisher(volume: &PgTestVolume) -> (tempfile::TempDir, Arc<PgMetaEngine>) {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("publisher.redb");
     seed_local(&db, &volume.format_info());
@@ -64,6 +64,7 @@ fn open_pg_publisher(volume: &PgTestVolume) -> (tempfile::TempDir, std::sync::Ar
     (dir, publisher)
 }
 
+#[derive(Debug, Clone)]
 struct PgCheckpointData {
     snapshot: Vec<u8>,
     sha256: Vec<u8>,
@@ -78,10 +79,13 @@ fn read_pg_checkpoint(dsn: &str, volume_id: i64) -> PgCheckpointData {
             )
             .await
             .map_err(|error| MetaError::Storage(error.to_string()))?;
-        Ok::<PgCheckpointData, MetaError>(PgCheckpointData {
-            snapshot: row.get(0),
-            sha256: row.get(1),
-        })
+        let snapshot = row
+            .try_get(0)
+            .map_err(|error| MetaError::Storage(format!("invalid snapshot column: {error}")))?;
+        let sha256 = row.try_get(1).map_err(|error| {
+            MetaError::Storage(format!("invalid checkpoint checksum column: {error}"))
+        })?;
+        Ok::<PgCheckpointData, MetaError>(PgCheckpointData { snapshot, sha256 })
     }))
     .expect("read checkpoint")
 }
@@ -1681,7 +1685,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
         .expect("persist stale replay cursor");
     drop(local);
 
-    let invalid_checksum = vec![0_u8; valid_checkpoint.sha256.len()];
+    let invalid_checksum = [0_u8; 32];
     run_async(with_pg_test_client(&dsn, {
         let volume_id = volume.volume_id;
         let checkpoint = valid_checkpoint.snapshot.clone();
@@ -1700,7 +1704,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
             tx
                 .execute(
                     "UPDATE metadata_state SET version = 2, checkpoint_version = 1, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 1 WHERE vol = $3",
-                    &[&checkpoint, &invalid_checksum, &volume_id],
+                    &[&checkpoint, &&invalid_checksum[..], &volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
@@ -1769,7 +1773,10 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
     let error = stale
         .sync_metadata()
         .expect_err("malformed inode must abort checkpoint replacement");
-    assert!(matches!(error, MetaError::Serialization(_)));
+    assert!(
+        matches!(&error, MetaError::Serialization(_)),
+        "malformed checkpoint must be reported as a serialization failure; got: {error:?}"
+    );
     assert!(stale.lookup(ROOT_INO, b"old-complete-base").is_ok());
     assert!(stale.lookup(ROOT_INO, b"unflushed-pending.bin").is_ok());
     assert!(matches!(
@@ -1796,6 +1803,11 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
         reopened.lookup(ROOT_INO, b"new-complete-base"),
         Err(MetaError::EntryNotFound { .. })
     ));
+    assert_eq!(
+        reopened.local_version.load(Ordering::Acquire),
+        0,
+        "aborted rebootstrap attempts must not advance the local replay cursor"
+    );
 
     run_async(with_pg_test_client(&dsn, {
         let volume_id = volume.volume_id;
@@ -1830,6 +1842,14 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
             .lookup(ROOT_INO, name)
             .expect("recovered checkpoint and replay tail must be complete");
     }
+    reopened
+        .flush_metadata()
+        .expect("recovered client must publish its preserved local overlay");
+    assert_eq!(
+        reopened.local_version.load(Ordering::Acquire),
+        3,
+        "publishing the preserved local overlay must advance the local replay cursor"
+    );
 }
 
 #[test]
@@ -2610,8 +2630,8 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
         panic!("startup must reject an unreadable pending local event");
     };
     assert!(
-        matches!(error, MetaError::Serialization(_)),
-        "unsafe pending local state must be reported as a typed decode failure"
+        matches!(&error, MetaError::Serialization(_)),
+        "unsafe pending local state must be reported as a typed decode failure; got: {error:?}"
     );
 
     let local = RedbMetaEngine::open(&path).expect("reopen local metadata after rejection");
