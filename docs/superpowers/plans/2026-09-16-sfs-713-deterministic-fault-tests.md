@@ -19,6 +19,7 @@ The tests will run against the existing ignored `studiofs-meta` PostgreSQL fixtu
 - [x] (2026-09-16) Ran focused nonzero validation, reviewed the final worktree, and committed the five intended files as `695b967e` before the living-plan update.
 - [x] (2026-09-16) Amended the commit with this final plan status update; the final commit hash is recorded by the post-commit verification.
 - [x] (2026-09-16) Processed the attached review: strengthened resumed-fetch and persisted-cursor assertions, made manual batch setup transactional, and documented post-commit recovery semantics; retained inline per-case assertions, `std::sync::Mutex`, and timeout-only injection as codebase-appropriate.
+- [x] (2026-09-16) Processed the deep review: centralized fault-page names and target derivation, documented thread-local test overrides and hook error propagation, and retained the explicit crash-reopen boundary and test-only synchronization after verification.
 
 ## Surprises & Discoveries
 
@@ -47,6 +48,8 @@ The four fault regressions publish four remote batches with one batch per page, 
 Fresh validation passed: `cargo test -p studiofs-meta startup_catch_up_fault --lib -- --ignored --nocapture --test-threads=1` reported 4 passed; `cargo test -p studiofs-meta startup_catch_up_single_oversized_batch_is_applied_atomically --lib -- --ignored --nocapture --test-threads=1` reported 1 passed; `cargo test -p studiofs-meta metadata_paging --lib -- --nocapture` reported 7 passed and 8 explicitly ignored infrastructure tests; `cargo test -p studiofs-meta pg_sync --lib -- --nocapture` reported 19 passed and 1 explicitly ignored test; `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. The full workspace and unrelated ignored suites were not run by repository policy. The final amended commit is the delivery artifact.
 
 The attached review follow-up preserves the four fault tests as self-contained stories while moving the shared resume invariants into their existing resume helper. The manual oversized-batch fixture now commits its event rows transactionally, and `AfterLocalCommit` documents the required drop-and-reopen recovery boundary. The suggested `parking_lot` migration and generalized error factory remain out of scope because the former would add a test-only direct dependency despite adjacent `std::sync::Mutex` hooks, while the latter has no current caller.
+
+The deep review follow-up also derives the replay target from the shared page-name list, documents the thread-local environment seam and normal lifecycle error propagation, and keeps the invalid same-engine retry scenario out of the acceptance tests because post-commit recovery requires reopening the engine.
 
 ## Context and Orientation
 

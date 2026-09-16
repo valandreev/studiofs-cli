@@ -69,6 +69,8 @@ impl Drop for TestEnvGuard {
 }
 
 #[cfg(test)]
+/// Installs a thread-local override read by code on the current test thread;
+/// engine options capture it when `PgMetaEngine::open_with_options` runs.
 fn set_test_env(key: &'static str, value: &str) -> TestEnvGuard {
     set_test_env_value(key, Some(value))
 }
@@ -492,6 +494,7 @@ pub(super) enum CatchUpFaultPoint {
 }
 
 #[cfg(test)]
+/// Hook failures follow normal catch-up error handling and may update lifecycle state.
 type CatchUpFaultHook = Arc<dyn Fn(CatchUpFaultPoint) -> MetaResult<()> + Send + Sync>;
 
 #[cfg(test)]

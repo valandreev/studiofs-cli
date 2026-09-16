@@ -736,6 +736,13 @@ struct StartupCatchUpFaultFixture {
 
 type StartupCatchUpFaultObservations = std::sync::Arc<std::sync::Mutex<Vec<CatchUpFaultPoint>>>;
 
+const STARTUP_CATCH_UP_FAULT_PAGES: &[&[u8]] = &[
+    b"fault-page-1",
+    b"fault-page-2",
+    b"fault-page-3",
+    b"fault-page-4",
+];
+
 fn startup_catch_up_fault_fixture() -> StartupCatchUpFaultFixture {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let volume = PgTestVolume::new(&dsn, "pg-startup-catch-up-faults");
@@ -764,12 +771,7 @@ fn startup_catch_up_fault_fixture() -> StartupCatchUpFaultFixture {
         },
     )
     .expect("open publisher metadata client");
-    for name in [
-        b"fault-page-1".as_slice(),
-        b"fault-page-2",
-        b"fault-page-3",
-        b"fault-page-4",
-    ] {
+    for &name in STARTUP_CATCH_UP_FAULT_PAGES {
         publisher
             .create_dir(ROOT_INO, name, 0, 0, 0o755)
             .expect("create catch-up event");
@@ -800,7 +802,7 @@ fn startup_catch_up_fault_fixture() -> StartupCatchUpFaultFixture {
         _volume: volume,
         _dir: dir,
         db,
-        target_version: 4,
+        target_version: STARTUP_CATCH_UP_FAULT_PAGES.len() as i64,
         stale: Some(stale),
     }
 }
@@ -841,6 +843,7 @@ fn startup_catch_up_fault_hook(
             .lock()
             .expect("catch-up fault observation lock")
             .push(point);
+        // Inject the fault once so recovery can continue after the first failure.
         if should_fail(point) && !fired_hook.swap(true, std::sync::atomic::Ordering::AcqRel) {
             Err(MetaError::Timeout("injected catch-up fault".to_string()))
         } else {
@@ -873,12 +876,7 @@ fn startup_catch_up_fault_resume(fixture: &mut StartupCatchUpFaultFixture, expec
         engine.local_version.load(Ordering::Acquire),
         fixture.target_version
     );
-    for name in [
-        b"fault-page-1".as_slice(),
-        b"fault-page-2",
-        b"fault-page-3",
-        b"fault-page-4",
-    ] {
+    for &name in STARTUP_CATCH_UP_FAULT_PAGES {
         engine
             .lookup(ROOT_INO, name)
             .expect("resumed catch-up should expose every page");
