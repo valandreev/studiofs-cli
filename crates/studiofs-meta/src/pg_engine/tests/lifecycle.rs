@@ -1359,6 +1359,115 @@ fn startup_catch_up_reports_rebootstrap_below_retained_event_log_floor() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tail() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-clean-client");
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+    for name in [b"checkpoint-clean-1".as_slice(), b"checkpoint-clean-2"] {
+        publisher
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create checkpoint event");
+        publisher
+            .flush_metadata()
+            .expect("publish checkpoint event");
+    }
+    let (checkpoint_bytes, checkpoint_sha256) = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
+        }
+    }))
+    .expect("read checkpoint at retained floor");
+    publisher
+        .create_dir(ROOT_INO, b"replayed-after-clean-rebootstrap", 0, 0, 0o755)
+        .expect("create replay tail event");
+    publisher
+        .flush_metadata()
+        .expect("publish replay tail event");
+    drop(publisher);
+
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            client
+                .execute(
+                    "DELETE FROM event_log WHERE vol = $1 AND batch_version < 2",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 2 WHERE vol = $3",
+                    &[&checkpoint_bytes, &checkpoint_sha256, &volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("set retained replay floor");
+
+    let stale_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_db = stale_dir.path().join("stale.redb");
+    seed_local(&stale_db, &volume.format_info());
+    let local = RedbMetaEngine::open(&stale_db).expect("open stale local metadata");
+    PgMetaEngine::persist_client_slot(&local, 0).expect("persist stale client slot");
+    local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 1)
+        .expect("persist cursor below retained floor");
+    drop(local);
+
+    let stale = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open clean stale metadata client");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 1);
+
+    stale
+        .sync_metadata()
+        .expect("clean stale client should rebootstrap from the checkpoint");
+
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 3);
+    assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(stale.pg_sync_status().allows_new_mutations());
+    for name in [
+        b"checkpoint-clean-1".as_slice(),
+        b"checkpoint-clean-2",
+        b"replayed-after-clean-rebootstrap",
+    ] {
+        stale
+            .lookup(ROOT_INO, name)
+            .expect("checkpoint and replay tail entries must be visible");
+    }
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_overlay() {
     let Some(dsn) = pg_dsn() else {
         return;
@@ -1529,6 +1638,190 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
         event,
         MetaEvent::AddEntry { name, .. } if name.as_slice() == b"pending-local"
     )));
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is_available() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-atomicity");
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+    publisher
+        .create_dir(ROOT_INO, b"old-complete-base", 0, 0, 0o755)
+        .expect("create old base event");
+    publisher.flush_metadata().expect("publish old base event");
+    let (valid_checkpoint, valid_checkpoint_sha256) = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
+        }
+    }))
+    .expect("read old complete checkpoint");
+    publisher
+        .create_dir(ROOT_INO, b"new-complete-base", 0, 0, 0o755)
+        .expect("create new base event");
+    publisher.flush_metadata().expect("publish new base event");
+    drop(publisher);
+
+    let stale_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_db = stale_dir.path().join("stale.redb");
+    seed_local(&stale_db, &volume.format_info());
+    let local = RedbMetaEngine::open(&stale_db).expect("open stale local metadata");
+    local
+        .import_serving_checkpoint_bytes(&valid_checkpoint)
+        .expect("seed stale client with old complete base");
+    PgMetaEngine::persist_client_slot(&local, 0).expect("persist stale client slot");
+    local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 0)
+        .expect("persist stale replay cursor");
+    drop(local);
+
+    let invalid_checksum = vec![0_u8; valid_checkpoint_sha256.len()];
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        let checkpoint = valid_checkpoint.clone();
+        move |client| async move {
+            client
+                .execute(
+                    "DELETE FROM event_log WHERE vol = $1 AND batch_version < 2",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = 2, checkpoint_version = 1, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 1 WHERE vol = $3",
+                    &[&checkpoint, &invalid_checksum, &volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("publish invalid checkpoint checksum");
+
+    let stale = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("invalid checkpoint must not prevent local serving");
+    assert!(stale.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(matches!(
+        stale.lookup(ROOT_INO, b"new-complete-base"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    let error = stale
+        .sync_metadata()
+        .expect_err("checksum failure must stop before base replacement");
+    assert!(matches!(
+        error,
+        MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::Checksum
+        }
+    ));
+    assert!(stale.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(matches!(
+        stale.lookup(ROOT_INO, b"new-complete-base"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 0);
+
+    let mut malformed_checkpoint: crate::snapshot::ServingCheckpoint =
+        postcard::from_bytes(&valid_checkpoint).expect("decode valid checkpoint");
+    malformed_checkpoint
+        .inodes
+        .push((u64::MAX - 1, b"invalid-inode-encoding".to_vec()));
+    let malformed_checkpoint =
+        postcard::to_stdvec(&malformed_checkpoint).expect("encode malformed checkpoint");
+    let malformed_checkpoint_sha256 = Sha256::digest(&malformed_checkpoint).to_vec();
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            client
+                .execute(
+                    "UPDATE metadata_state SET snapshot = $1, checkpoint_sha256 = $2 WHERE vol = $3",
+                    &[&malformed_checkpoint, &malformed_checkpoint_sha256, &volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("publish checkpoint that fails during replacement");
+
+    let error = stale
+        .sync_metadata()
+        .expect_err("malformed inode must abort checkpoint replacement");
+    assert!(matches!(error, MetaError::Serialization(_)));
+    assert!(stale.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(matches!(
+        stale.lookup(ROOT_INO, b"new-complete-base"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    drop(stale);
+
+    let reopened = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("restart must retain the old complete base");
+    assert!(reopened.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(matches!(
+        reopened.lookup(ROOT_INO, b"new-complete-base"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            client
+                .execute(
+                    "UPDATE metadata_state SET snapshot = $1, checkpoint_sha256 = $2 WHERE vol = $3",
+                    &[&valid_checkpoint, &valid_checkpoint_sha256, &volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("restore valid checkpoint");
+
+    reopened
+        .sync_metadata()
+        .expect("restart should rebootstrap after checkpoint recovery");
+    assert_eq!(reopened.local_version.load(Ordering::Acquire), 2);
+    assert_eq!(reopened.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    for name in [b"old-complete-base".as_slice(), b"new-complete-base"] {
+        reopened
+            .lookup(ROOT_INO, name)
+            .expect("recovered checkpoint and replay tail must be complete");
+    }
 }
 
 #[test]
@@ -2305,9 +2598,32 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
         },
     );
 
+    let error = match reopened {
+        Ok(_) => panic!("startup must reject an unreadable pending local event"),
+        Err(error) => error,
+    };
     assert!(
-        reopened.is_err(),
-        "startup must not silently discard an unreadable pending local event"
+        matches!(error, MetaError::Serialization(_)),
+        "unsafe pending local state must be reported as a typed decode failure"
+    );
+
+    let local = RedbMetaEngine::open(&path).expect("reopen local metadata after rejection");
+    local
+        .lookup(ROOT_INO, b"pending-local-file.bin")
+        .expect("unsafe local overlay must remain available for recovery");
+    assert_eq!(
+        local
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .expect("read pending event cursor"),
+        event_seq,
+        "rejected pending state must not advance its durable event cursor"
+    );
+    assert!(
+        local
+            .get_counter("nextEventSeq")
+            .expect("read event-log end")
+            > event_seq,
+        "rejected pending state must retain the local event-log suffix"
     );
 }
 
