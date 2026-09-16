@@ -1653,12 +1653,10 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
     .expect("open moving-head publisher");
     let engine = startup_catch_up_fault_engine(&mut fixture);
     let startup_target = fixture.target_version;
-    let writes_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let next_write = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let observed_cursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let active_writer = std::sync::Arc::clone(&publisher);
-    let writes_enabled_hook = std::sync::Arc::clone(&writes_enabled);
     let next_write_hook = std::sync::Arc::clone(&next_write);
     let observed_cursors_hook = std::sync::Arc::clone(&observed_cursors);
     let injected_hook = std::sync::Arc::clone(&injected);
@@ -1668,17 +1666,14 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
                 .lock()
                 .expect("observe retry catch-up cursors")
                 .push(cursor);
-            if writes_enabled_hook.load(std::sync::atomic::Ordering::Acquire) {
-                let write_number =
-                    next_write_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let name = format!("retry-moving-head-{write_number}");
-                active_writer
-                    .create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
-                    .map_err(|_| MetaError::Storage("moving-head publisher failed".to_string()))?;
-                active_writer.flush_metadata().map_err(|_| {
-                    MetaError::Storage("moving-head publisher flush failed".to_string())
-                })?;
-            }
+            let write_number = next_write_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let name = format!("retry-moving-head-{write_number}");
+            active_writer
+                .create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
+                .map_err(|_| MetaError::Storage("moving-head publisher failed".to_string()))?;
+            active_writer.flush_metadata().map_err(|_| {
+                MetaError::Storage("moving-head publisher flush failed".to_string())
+            })?;
             if cursor == 1 && !injected_hook.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 return Err(MetaError::Timeout(
                     "injected temporary catch-up failure".to_string(),
@@ -1724,7 +1719,6 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
         .remote_metadata_head_version()
         .expect("read remote head after retry");
     assert!(remote_head > startup_target);
-    writes_enabled.store(false, std::sync::atomic::Ordering::Release);
     engine.set_catch_up_fault_hook(std::sync::Arc::new(|_| Ok(())));
     let post_target_event_count = next_write.load(std::sync::atomic::Ordering::Acquire) - 1;
     for _ in 0..post_target_event_count {
