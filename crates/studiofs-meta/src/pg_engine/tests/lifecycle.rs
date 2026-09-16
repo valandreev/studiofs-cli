@@ -49,6 +49,35 @@ where
     result
 }
 
+fn open_pg_publisher(volume: &PgTestVolume) -> (tempfile::TempDir, std::sync::Arc<PgMetaEngine>) {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("publisher.redb");
+    seed_local(&db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+    (dir, publisher)
+}
+
+fn read_pg_checkpoint(dsn: &str, volume_id: i64) -> (Vec<u8>, Vec<u8>) {
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        let row = client
+            .query_one(
+                "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
+    }))
+    .expect("read checkpoint")
+}
+
 #[test]
 fn pg_sync_lifecycle_raw_values_keep_fatal_explicit_and_unknown_fail_closed() {
     let cases = [
@@ -1365,17 +1394,7 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
     };
     let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-clean-client");
 
-    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
-    let publisher_db = publisher_dir.path().join("publisher.redb");
-    seed_local(&publisher_db, &volume.format_info());
-    let publisher = PgMetaEngine::open_with_options(
-        &publisher_db,
-        PgOpenOptions {
-            background_poll: false,
-            ..Default::default()
-        },
-    )
-    .expect("open publisher metadata client");
+    let (_publisher_dir, publisher) = open_pg_publisher(&volume);
     for name in [b"checkpoint-clean-1".as_slice(), b"checkpoint-clean-2"] {
         publisher
             .create_dir(ROOT_INO, name, 0, 0, 0o755)
@@ -1384,20 +1403,7 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
             .flush_metadata()
             .expect("publish checkpoint event");
     }
-    let (checkpoint_bytes, checkpoint_sha256) = run_async(with_pg_test_client(&dsn, {
-        let volume_id = volume.volume_id;
-        move |client| async move {
-            let row = client
-                .query_one(
-                    "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
-        }
-    }))
-    .expect("read checkpoint at retained floor");
+    let (checkpoint_bytes, checkpoint_sha256) = read_pg_checkpoint(&dsn, volume.volume_id);
     publisher
         .create_dir(ROOT_INO, b"replayed-after-clean-rebootstrap", 0, 0, 0o755)
         .expect("create replay tail event");
@@ -1474,17 +1480,7 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
     };
     let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-checkpoint");
 
-    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
-    let publisher_db = publisher_dir.path().join("publisher.redb");
-    seed_local(&publisher_db, &volume.format_info());
-    let publisher = PgMetaEngine::open_with_options(
-        &publisher_db,
-        PgOpenOptions {
-            background_poll: false,
-            ..Default::default()
-        },
-    )
-    .expect("open publisher metadata client");
+    let (_publisher_dir, publisher) = open_pg_publisher(&volume);
     for name in [b"checkpoint-1".as_slice(), b"checkpoint-2"] {
         publisher
             .create_dir(ROOT_INO, name, 0, 0, 0o755)
@@ -1493,20 +1489,7 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
             .flush_metadata()
             .expect("publish checkpoint event");
     }
-    let (checkpoint_bytes, checkpoint_sha256) = run_async(with_pg_test_client(&dsn, {
-        let volume_id = volume.volume_id;
-        move |client| async move {
-            let row = client
-                .query_one(
-                    "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
-        }
-    }))
-    .expect("read checkpoint at retained floor");
+    let (checkpoint_bytes, checkpoint_sha256) = read_pg_checkpoint(&dsn, volume.volume_id);
     publisher
         .create_dir(ROOT_INO, b"replayed-after-checkpoint", 0, 0, 0o755)
         .expect("create replay tail event");
@@ -1648,35 +1631,12 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
     };
     let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-atomicity");
 
-    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
-    let publisher_db = publisher_dir.path().join("publisher.redb");
-    seed_local(&publisher_db, &volume.format_info());
-    let publisher = PgMetaEngine::open_with_options(
-        &publisher_db,
-        PgOpenOptions {
-            background_poll: false,
-            ..Default::default()
-        },
-    )
-    .expect("open publisher metadata client");
+    let (_publisher_dir, publisher) = open_pg_publisher(&volume);
     publisher
         .create_dir(ROOT_INO, b"old-complete-base", 0, 0, 0o755)
         .expect("create old base event");
     publisher.flush_metadata().expect("publish old base event");
-    let (valid_checkpoint, valid_checkpoint_sha256) = run_async(with_pg_test_client(&dsn, {
-        let volume_id = volume.volume_id;
-        move |client| async move {
-            let row = client
-                .query_one(
-                    "SELECT snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
-        }
-    }))
-    .expect("read old complete checkpoint");
+    let (valid_checkpoint, valid_checkpoint_sha256) = read_pg_checkpoint(&dsn, volume.volume_id);
     publisher
         .create_dir(ROOT_INO, b"new-complete-base", 0, 0, 0o755)
         .expect("create new base event");
