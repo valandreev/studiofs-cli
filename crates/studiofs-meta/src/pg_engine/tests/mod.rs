@@ -374,29 +374,35 @@ fn seed_local(path: &std::path::Path, info: &FormatInfo) {
 }
 
 async fn insert_encoded_event_batch(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     volume_id: i64,
     batch_version: i64,
     client_id: &str,
     events: &[MetaEvent],
 ) -> MetaResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|error| MetaError::Storage(error.to_string()))?;
     for event in events {
         let payload = encode_event(event)?;
-        client
-            .execute(
-                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
-                 VALUES ($1, $2, $3, $4, $5)",
-                &[
-                    &volume_id,
-                    &batch_version,
-                    &event.kind(),
-                    &payload,
-                    &client_id,
-                ],
-            )
-            .await
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &volume_id,
+                &batch_version,
+                &event.kind(),
+                &payload,
+                &client_id,
+            ],
+        )
+        .await
+        .map_err(|error| MetaError::Storage(error.to_string()))?;
     }
+    tx.commit()
+        .await
+        .map_err(|error| MetaError::Storage(error.to_string()))?;
     Ok(())
 }
 

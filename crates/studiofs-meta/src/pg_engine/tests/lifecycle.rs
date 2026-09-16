@@ -855,13 +855,7 @@ fn persisted_startup_catch_up_cursor(path: &std::path::Path) -> i64 {
     PgMetaEngine::load_persisted_local_version(&local).expect("read persisted catch-up cursor")
 }
 
-fn startup_catch_up_fault_resume(
-    fixture: &mut StartupCatchUpFaultFixture,
-    expected_cursor: i64,
-) -> (
-    std::sync::Arc<PgMetaEngine>,
-    StartupCatchUpFaultObservations,
-) {
+fn startup_catch_up_fault_resume(fixture: &mut StartupCatchUpFaultFixture, expected_cursor: i64) {
     assert_eq!(
         persisted_startup_catch_up_cursor(&fixture.db),
         expected_cursor
@@ -889,7 +883,25 @@ fn startup_catch_up_fault_resume(
             .lookup(ROOT_INO, name)
             .expect("resumed catch-up should expose every page");
     }
-    (engine, observed)
+    let first_fetch = observed
+        .lock()
+        .expect("read resumed catch-up observations")
+        .iter()
+        .copied()
+        .find(|point| matches!(point, CatchUpFaultPoint::BeforePageFetch { .. }));
+    assert_eq!(
+        first_fetch,
+        Some(CatchUpFaultPoint::BeforePageFetch {
+            cursor: expected_cursor
+        }),
+        "resumed catch-up must begin at the durable cursor"
+    );
+    drop(engine);
+    assert_eq!(
+        persisted_startup_catch_up_cursor(&fixture.db),
+        fixture.target_version,
+        "resumed catch-up must persist the final target version to redb"
+    );
 }
 
 #[test]
@@ -922,15 +934,7 @@ fn startup_catch_up_fault_before_page_fetch_reopens_from_original_cursor() {
         "a pre-fetch fault must not advance the durable cursor"
     );
 
-    let (resumed, observed) = startup_catch_up_fault_resume(&mut fixture, 0);
-    assert!(
-        observed
-            .lock()
-            .expect("read resumed catch-up observations")
-            .iter()
-            .any(|point| matches!(point, CatchUpFaultPoint::BeforePageFetch { cursor: 0 }))
-    );
-    drop(resumed);
+    startup_catch_up_fault_resume(&mut fixture, 0);
 }
 
 #[test]
@@ -978,15 +982,7 @@ fn startup_catch_up_fault_after_later_page_fetch_reopens_from_last_committed_pag
     drop(engine);
     assert_eq!(persisted_startup_catch_up_cursor(&fixture.db), 1);
 
-    let (resumed, observed) = startup_catch_up_fault_resume(&mut fixture, 1);
-    assert!(
-        observed
-            .lock()
-            .expect("read resumed catch-up observations")
-            .iter()
-            .any(|point| matches!(point, CatchUpFaultPoint::BeforePageFetch { cursor: 1 }))
-    );
-    drop(resumed);
+    startup_catch_up_fault_resume(&mut fixture, 1);
 }
 
 #[test]
@@ -1033,15 +1029,7 @@ fn startup_catch_up_fault_before_local_commit_reopens_without_partial_page() {
     drop(engine);
     assert_eq!(persisted_startup_catch_up_cursor(&fixture.db), 1);
 
-    let (resumed, observed) = startup_catch_up_fault_resume(&mut fixture, 1);
-    assert!(
-        observed
-            .lock()
-            .expect("read resumed catch-up observations")
-            .iter()
-            .any(|point| matches!(point, CatchUpFaultPoint::BeforePageFetch { cursor: 1 }))
-    );
-    drop(resumed);
+    startup_catch_up_fault_resume(&mut fixture, 1);
 }
 
 #[test]
@@ -1088,15 +1076,7 @@ fn startup_catch_up_fault_after_local_commit_reopens_from_committed_page() {
     drop(engine);
     assert_eq!(persisted_startup_catch_up_cursor(&fixture.db), 1);
 
-    let (resumed, observed) = startup_catch_up_fault_resume(&mut fixture, 1);
-    assert!(
-        observed
-            .lock()
-            .expect("read resumed catch-up observations")
-            .iter()
-            .any(|point| matches!(point, CatchUpFaultPoint::BeforePageFetch { cursor: 1 }))
-    );
-    drop(resumed);
+    startup_catch_up_fault_resume(&mut fixture, 1);
 }
 
 #[test]
@@ -1130,8 +1110,9 @@ fn startup_catch_up_single_oversized_batch_is_applied_atomically() {
     ];
     run_async(with_pg_test_client(&dsn, {
         let volume_id = volume.volume_id;
-        move |client| async move {
-            insert_encoded_event_batch(&client, volume_id, 1, "remote-oversized", &events).await?;
+        move |mut client| async move {
+            insert_encoded_event_batch(&mut client, volume_id, 1, "remote-oversized", &events)
+                .await?;
             client
                 .execute(
                     "UPDATE metadata_state SET version = 1 WHERE vol = $1",

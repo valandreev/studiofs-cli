@@ -484,6 +484,8 @@ pub(super) enum CatchUpFaultPoint {
     BeforeLocalCommit {
         last_batch_version: i64,
     },
+    /// Models a process interruption after the redb commit but before the
+    /// in-memory cursor publication; drop and reopen the engine before retrying.
     AfterLocalCommit {
         last_batch_version: i64,
     },
