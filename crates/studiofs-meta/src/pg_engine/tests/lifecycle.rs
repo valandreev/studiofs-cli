@@ -1580,18 +1580,25 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
         .expect("capture frozen startup target");
     assert_eq!(startup_target, 3);
 
-    publisher
-        .create_dir(ROOT_INO, b"post-target", 0, 0, 0o755)
-        .expect("create post-target event");
-    publisher
-        .flush_metadata()
-        .expect("publish post-target event");
-    assert_eq!(
-        stale
-            .remote_metadata_head_version()
-            .expect("read advanced remote head"),
-        4
-    );
+    let active_writer = std::sync::Arc::clone(&publisher);
+    let observed_cursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_cursors_hook = std::sync::Arc::clone(&observed_cursors);
+    stale.set_catch_up_fault_hook(std::sync::Arc::new(move |point| {
+        if let CatchUpFaultPoint::BeforePageFetch { cursor } = point {
+            observed_cursors_hook
+                .lock()
+                .expect("observe moving-head catch-up cursors")
+                .push(cursor);
+            let name = format!("moving-head-{cursor}");
+            active_writer
+                .create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
+                .map_err(|_| MetaError::Storage("moving-head publisher failed".to_string()))?;
+            active_writer.flush_metadata().map_err(|_| {
+                MetaError::Storage("moving-head publisher flush failed".to_string())
+            })?;
+        }
+        Ok(())
+    }));
 
     let shutdown = std::sync::atomic::AtomicBool::new(false);
     assert!(
@@ -1601,14 +1608,137 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     );
     assert_eq!(stale.local_version.load(Ordering::Acquire), startup_target);
     assert_eq!(stale.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(
+        observed_cursors
+            .lock()
+            .expect("read moving-head catch-up cursors")
+            .as_slice(),
+        &[0, 1, 2]
+    );
+    let remote_head = stale
+        .remote_metadata_head_version()
+        .expect("read remote head after moving-head catch-up");
+    assert!(remote_head > startup_target);
 
-    stale
-        .sync_metadata()
-        .expect("replicate post-target runtime event");
-    assert_eq!(stale.local_version.load(Ordering::Acquire), 4);
-    stale
-        .lookup(ROOT_INO, b"post-target")
-        .expect("post-target event should become visible during runtime sync");
+    stale.set_catch_up_fault_hook(std::sync::Arc::new(|_| Ok(())));
+    for _ in 0..3 {
+        stale
+            .sync_metadata()
+            .expect("replicate moving-head runtime event");
+    }
+    assert_eq!(stale.local_version.load(Ordering::Acquire), remote_head);
+    for cursor in 0..3 {
+        let name = format!("moving-head-{cursor}");
+        stale
+            .lookup(ROOT_INO, name.as_bytes())
+            .expect("runtime replication should apply moving-head events");
+    }
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let mut fixture = startup_catch_up_fault_fixture();
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &fixture._volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open moving-head publisher");
+    let engine = startup_catch_up_fault_engine(&mut fixture);
+    let startup_target = fixture.target_version;
+    let writes_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let next_write = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let observed_cursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_writer = std::sync::Arc::clone(&publisher);
+    let writes_enabled_hook = std::sync::Arc::clone(&writes_enabled);
+    let next_write_hook = std::sync::Arc::clone(&next_write);
+    let observed_cursors_hook = std::sync::Arc::clone(&observed_cursors);
+    let injected_hook = std::sync::Arc::clone(&injected);
+    engine.set_catch_up_fault_hook(std::sync::Arc::new(move |point| {
+        if let CatchUpFaultPoint::BeforePageFetch { cursor } = point {
+            observed_cursors_hook
+                .lock()
+                .expect("observe retry catch-up cursors")
+                .push(cursor);
+            if writes_enabled_hook.load(std::sync::atomic::Ordering::Acquire) {
+                let write_number =
+                    next_write_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let name = format!("retry-moving-head-{write_number}");
+                active_writer
+                    .create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
+                    .map_err(|_| MetaError::Storage("moving-head publisher failed".to_string()))?;
+                active_writer.flush_metadata().map_err(|_| {
+                    MetaError::Storage("moving-head publisher flush failed".to_string())
+                })?;
+            }
+            if cursor == 1 && !injected_hook.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return Err(MetaError::Timeout(
+                    "injected temporary catch-up failure".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }));
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+    let error = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+        .expect_err("temporary catch-up failure must interrupt the first session");
+    assert!(matches!(error, MetaError::Timeout(_)));
+    assert_eq!(engine.local_version.load(Ordering::Acquire), 1);
+    assert_eq!(
+        engine.pg_sync_diagnostics().startup_target_version,
+        Some(startup_target as u64)
+    );
+    assert!(
+        engine
+            .remote_metadata_head_version()
+            .expect("read moving remote head after failure")
+            > startup_target
+    );
+
+    assert!(
+        engine
+            .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+            .expect("retry frozen-target catch-up")
+    );
+    assert_eq!(engine.local_version.load(Ordering::Acquire), startup_target);
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(
+        observed_cursors
+            .lock()
+            .expect("read retry catch-up cursors")
+            .as_slice(),
+        &[0, 1, 1, 2, 3]
+    );
+
+    let remote_head = engine
+        .remote_metadata_head_version()
+        .expect("read remote head after retry");
+    assert!(remote_head > startup_target);
+    writes_enabled.store(false, std::sync::atomic::Ordering::Release);
+    engine.set_catch_up_fault_hook(std::sync::Arc::new(|_| Ok(())));
+    let post_target_event_count = next_write.load(std::sync::atomic::Ordering::Acquire) - 1;
+    for _ in 0..post_target_event_count {
+        engine
+            .sync_metadata()
+            .expect("runtime replication should consume post-target event");
+    }
+    assert_eq!(engine.local_version.load(Ordering::Acquire), remote_head);
+    for write_number in 1..next_write.load(std::sync::atomic::Ordering::Acquire) {
+        let name = format!("retry-moving-head-{write_number}");
+        engine
+            .lookup(ROOT_INO, name.as_bytes())
+            .expect("runtime replication should apply every post-target event");
+    }
 }
 
 #[test]
