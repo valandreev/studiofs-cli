@@ -726,6 +726,438 @@ fn startup_catch_up_drain_honors_shutdown_after_a_page() {
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
 }
 
+struct StartupCatchUpFaultFixture {
+    _volume: PgTestVolume,
+    _dir: tempfile::TempDir,
+    db: std::path::PathBuf,
+    target_version: i64,
+    stale: Option<std::sync::Arc<PgMetaEngine>>,
+}
+
+type StartupCatchUpFaultObservations = std::sync::Arc<std::sync::Mutex<Vec<CatchUpFaultPoint>>>;
+
+const STARTUP_CATCH_UP_FAULT_PAGES: &[&[u8]] = &[
+    b"fault-page-1",
+    b"fault-page-2",
+    b"fault-page-3",
+    b"fault-page-4",
+];
+
+fn startup_catch_up_fault_fixture() -> StartupCatchUpFaultFixture {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-startup-catch-up-faults");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("stale.redb");
+    seed_local(&db, &volume.format_info());
+
+    let stale = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open stale metadata client");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 0);
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher metadata client");
+    for &name in STARTUP_CATCH_UP_FAULT_PAGES {
+        publisher
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create catch-up event");
+        publisher.flush_metadata().expect("publish catch-up event");
+    }
+    drop(publisher);
+    drop(publisher_dir);
+
+    let empty_checkpoint = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())
+        .expect("encode empty replay-tail checkpoint");
+    let empty_checkpoint_sha256 = Sha256::digest(&empty_checkpoint).to_vec();
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            client
+                .execute(
+                    "UPDATE metadata_state SET checkpoint_version = 0, snapshot = $1, checkpoint_sha256 = $2 WHERE vol = $3",
+                    &[&empty_checkpoint, &empty_checkpoint_sha256, &volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("pin replay-tail checkpoint at version zero");
+
+    StartupCatchUpFaultFixture {
+        _volume: volume,
+        _dir: dir,
+        db,
+        target_version: STARTUP_CATCH_UP_FAULT_PAGES.len() as i64,
+        stale: Some(stale),
+    }
+}
+
+fn startup_catch_up_fault_engine(
+    fixture: &mut StartupCatchUpFaultFixture,
+) -> std::sync::Arc<PgMetaEngine> {
+    let engine = fixture.stale.take().unwrap_or_else(|| {
+        PgMetaEngine::open_with_options(
+            &fixture.db,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open catch-up metadata client")
+    });
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+    assert_eq!(
+        engine
+            .frozen_sync_target_version()
+            .expect("freeze catch-up target"),
+        fixture.target_version
+    );
+    engine
+}
+
+fn startup_catch_up_fault_hook(
+    should_fail: impl Fn(CatchUpFaultPoint) -> bool + Send + Sync + 'static,
+) -> (StartupCatchUpFaultObservations, CatchUpFaultHook) {
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_hook = std::sync::Arc::clone(&observed);
+    let fired_hook = std::sync::Arc::clone(&fired);
+    let hook = std::sync::Arc::new(move |point: CatchUpFaultPoint| {
+        observed_hook
+            .lock()
+            .expect("catch-up fault observation lock")
+            .push(point);
+        // Inject the fault once so recovery can continue after the first failure.
+        if should_fail(point) && !fired_hook.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            Err(MetaError::Timeout("injected catch-up fault".to_string()))
+        } else {
+            Ok(())
+        }
+    });
+    (observed, hook)
+}
+
+fn persisted_startup_catch_up_cursor(path: &std::path::Path) -> i64 {
+    let local = RedbMetaEngine::open(path).expect("open local metadata for cursor check");
+    PgMetaEngine::load_persisted_local_version(&local).expect("read persisted catch-up cursor")
+}
+
+fn startup_catch_up_fault_resume(fixture: &mut StartupCatchUpFaultFixture, expected_cursor: i64) {
+    assert_eq!(
+        persisted_startup_catch_up_cursor(&fixture.db),
+        expected_cursor
+    );
+    let engine = startup_catch_up_fault_engine(fixture);
+    let (observed, hook) = startup_catch_up_fault_hook(|_| false);
+    engine.set_catch_up_fault_hook(hook);
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        engine
+            .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+            .expect("resumed catch-up session")
+    );
+    assert_eq!(
+        engine.local_version.load(Ordering::Acquire),
+        fixture.target_version
+    );
+    for &name in STARTUP_CATCH_UP_FAULT_PAGES {
+        engine
+            .lookup(ROOT_INO, name)
+            .expect("resumed catch-up should expose every page");
+    }
+    let first_fetch = observed
+        .lock()
+        .expect("read resumed catch-up observations")
+        .iter()
+        .copied()
+        .find(|point| matches!(point, CatchUpFaultPoint::BeforePageFetch { .. }));
+    assert_eq!(
+        first_fetch,
+        Some(CatchUpFaultPoint::BeforePageFetch {
+            cursor: expected_cursor
+        }),
+        "resumed catch-up must begin at the durable cursor"
+    );
+    drop(engine);
+    assert_eq!(
+        persisted_startup_catch_up_cursor(&fixture.db),
+        fixture.target_version,
+        "resumed catch-up must persist the final target version to redb"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_fault_before_page_fetch_reopens_from_original_cursor() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let mut fixture = startup_catch_up_fault_fixture();
+    let engine = startup_catch_up_fault_engine(&mut fixture);
+    let (observed, hook) = startup_catch_up_fault_hook(|point| {
+        matches!(point, CatchUpFaultPoint::BeforePageFetch { cursor: 0 })
+    });
+    engine.set_catch_up_fault_hook(hook);
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+    let error = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+        .expect_err("a pre-fetch fault must stop the session");
+    assert!(matches!(error, MetaError::Timeout(_)));
+    assert!(
+        observed
+            .lock()
+            .expect("read catch-up fault observations")
+            .iter()
+            .any(|point| matches!(point, CatchUpFaultPoint::BeforePageFetch { cursor: 0 }))
+    );
+    drop(engine);
+    assert_eq!(
+        persisted_startup_catch_up_cursor(&fixture.db),
+        0,
+        "a pre-fetch fault must not advance the durable cursor"
+    );
+
+    startup_catch_up_fault_resume(&mut fixture, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_fault_after_later_page_fetch_reopens_from_last_committed_page() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let mut fixture = startup_catch_up_fault_fixture();
+    let engine = startup_catch_up_fault_engine(&mut fixture);
+    let (observed, hook) = startup_catch_up_fault_hook(|point| {
+        matches!(
+            point,
+            CatchUpFaultPoint::AfterPageFetch {
+                cursor: 1,
+                first_batch_version: Some(2),
+                last_batch_version: Some(2),
+            }
+        )
+    });
+    engine.set_catch_up_fault_hook(hook);
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+    let error = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+        .expect_err("a later page fetch fault must stop the session");
+    assert!(matches!(error, MetaError::Timeout(_)));
+    assert_eq!(
+        engine.local_version.load(Ordering::Acquire),
+        1,
+        "the first page should remain applied in memory"
+    );
+    engine
+        .lookup(ROOT_INO, b"fault-page-1")
+        .expect("the first page should remain visible");
+    assert!(matches!(
+        engine.lookup(ROOT_INO, b"fault-page-2"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert!(
+        observed
+            .lock()
+            .expect("read catch-up fault observations")
+            .iter()
+            .any(|point| matches!(point, CatchUpFaultPoint::AfterPageFetch { cursor: 1, .. }))
+    );
+    drop(engine);
+    assert_eq!(persisted_startup_catch_up_cursor(&fixture.db), 1);
+
+    startup_catch_up_fault_resume(&mut fixture, 1);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_fault_before_local_commit_reopens_without_partial_page() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let mut fixture = startup_catch_up_fault_fixture();
+    let engine = startup_catch_up_fault_engine(&mut fixture);
+    let (observed, hook) = startup_catch_up_fault_hook(|point| {
+        matches!(
+            point,
+            CatchUpFaultPoint::BeforeLocalCommit {
+                last_batch_version: 2
+            }
+        )
+    });
+    engine.set_catch_up_fault_hook(hook);
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+    let error = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+        .expect_err("a pre-commit fault must stop the session");
+    assert!(matches!(error, MetaError::Timeout(_)));
+    assert_eq!(engine.local_version.load(Ordering::Acquire), 1);
+    engine
+        .lookup(ROOT_INO, b"fault-page-1")
+        .expect("the first page should remain visible");
+    assert!(matches!(
+        engine.lookup(ROOT_INO, b"fault-page-2"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert!(
+        observed
+            .lock()
+            .expect("read catch-up fault observations")
+            .iter()
+            .any(|point| matches!(
+                point,
+                CatchUpFaultPoint::BeforeLocalCommit {
+                    last_batch_version: 2
+                }
+            ))
+    );
+    drop(engine);
+    assert_eq!(persisted_startup_catch_up_cursor(&fixture.db), 1);
+
+    startup_catch_up_fault_resume(&mut fixture, 1);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_fault_after_local_commit_reopens_from_committed_page() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let mut fixture = startup_catch_up_fault_fixture();
+    let engine = startup_catch_up_fault_engine(&mut fixture);
+    let (observed, hook) = startup_catch_up_fault_hook(|point| {
+        matches!(
+            point,
+            CatchUpFaultPoint::AfterLocalCommit {
+                last_batch_version: 1
+            }
+        )
+    });
+    engine.set_catch_up_fault_hook(hook);
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+    let error = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+        .expect_err("an after-commit interruption must stop the session");
+    assert!(matches!(error, MetaError::Timeout(_)));
+    assert_eq!(
+        engine.local_version.load(Ordering::Acquire),
+        0,
+        "the interrupted engine must not publish its post-commit cursor"
+    );
+    engine
+        .lookup(ROOT_INO, b"fault-page-1")
+        .expect("the committed page should remain visible after interruption");
+    assert!(
+        observed
+            .lock()
+            .expect("read catch-up fault observations")
+            .iter()
+            .any(|point| matches!(
+                point,
+                CatchUpFaultPoint::AfterLocalCommit {
+                    last_batch_version: 1
+                }
+            ))
+    );
+    drop(engine);
+    assert_eq!(persisted_startup_catch_up_cursor(&fixture.db), 1);
+
+    startup_catch_up_fault_resume(&mut fixture, 1);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_catch_up_single_oversized_batch_is_applied_atomically() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let _byte_limit = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "1");
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-startup-catch-up-oversized-batch");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+
+    let events = vec![
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"oversized-page-1".to_vec(),
+            entry: DirEntryValue {
+                ino: 11,
+                kind: FileType::Directory,
+            },
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"oversized-page-2".to_vec(),
+            entry: DirEntryValue {
+                ino: 12,
+                kind: FileType::Directory,
+            },
+        },
+    ];
+    run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |mut client| async move {
+            insert_encoded_event_batch(&mut client, volume_id, 1, "remote-oversized", &events)
+                .await?;
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = 1 WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }
+    }))
+    .expect("insert oversized foreign batch");
+
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open oversized-batch catch-up client");
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+    assert_eq!(
+        engine
+            .frozen_sync_target_version()
+            .expect("freeze oversized-batch target"),
+        1
+    );
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        engine
+            .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
+            .expect("apply oversized foreign batch")
+    );
+
+    assert_eq!(engine.local_version.load(Ordering::Acquire), 1);
+    for name in [b"oversized-page-1".as_slice(), b"oversized-page-2"] {
+        engine
+            .lookup(ROOT_INO, name)
+            .expect("all rows in one oversized batch must be visible");
+    }
+    let diagnostics = engine.pg_sync_diagnostics();
+    assert_eq!(diagnostics.last_page.map(|page| page.batch_count), Some(1));
+    assert_eq!(diagnostics.last_page.map(|page| page.event_count), Some(2));
+    assert!(diagnostics.last_page.is_some_and(|page| page.oversized));
+}
+
 struct EventLogLockGuard {
     release_tx: Option<tokio::sync::oneshot::Sender<()>>,
     lock_thread: Option<std::thread::JoinHandle<()>>,

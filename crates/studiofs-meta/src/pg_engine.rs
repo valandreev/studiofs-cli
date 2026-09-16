@@ -69,6 +69,8 @@ impl Drop for TestEnvGuard {
 }
 
 #[cfg(test)]
+/// Installs a thread-local override read by code on the current test thread;
+/// engine options capture it when `PgMetaEngine::open_with_options` runs.
 fn set_test_env(key: &'static str, value: &str) -> TestEnvGuard {
     set_test_env_value(key, Some(value))
 }
@@ -238,6 +240,8 @@ pub struct PgMetaEngine {
     active_open_inodes: Mutex<HashMap<Ino, u32>>,
     #[cfg(test)]
     snapshot_import_after_active_open_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    catch_up_fault_hook: Mutex<Option<CatchUpFaultHook>>,
     self_weak: OnceLock<Weak<Self>>,
     lock_workers_enabled: bool,
     lock_worker_start_lock: Mutex<()>,
@@ -466,6 +470,53 @@ enum MetadataSyncSource {
     Manual,
     Notify,
     FallbackPoll,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CatchUpFaultPoint {
+    BeforePageFetch {
+        cursor: i64,
+    },
+    AfterPageFetch {
+        cursor: i64,
+        first_batch_version: Option<i64>,
+        last_batch_version: Option<i64>,
+    },
+    BeforeLocalCommit {
+        last_batch_version: i64,
+    },
+    /// Models a process interruption after the redb commit but before the
+    /// in-memory cursor publication; drop and reopen the engine before retrying.
+    AfterLocalCommit {
+        last_batch_version: i64,
+    },
+}
+
+#[cfg(test)]
+/// Hook failures follow normal catch-up error handling and may update lifecycle state.
+type CatchUpFaultHook = Arc<dyn Fn(CatchUpFaultPoint) -> MetaResult<()> + Send + Sync>;
+
+#[cfg(test)]
+impl PgMetaEngine {
+    pub(super) fn set_catch_up_fault_hook(&self, hook: CatchUpFaultHook) {
+        *self
+            .catch_up_fault_hook
+            .lock()
+            .expect("catch-up fault hook lock") = Some(hook);
+    }
+
+    pub(super) fn run_catch_up_fault_hook(&self, point: CatchUpFaultPoint) -> MetaResult<()> {
+        let hook = self
+            .catch_up_fault_hook
+            .lock()
+            .map_err(|_| MetaError::Storage("catch-up fault hook lock poisoned".to_string()))?
+            .clone();
+        if let Some(hook) = hook {
+            hook(point)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1271,6 +1322,8 @@ impl PgMetaEngine {
             active_open_inodes: Mutex::new(HashMap::new()),
             #[cfg(test)]
             snapshot_import_after_active_open_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            catch_up_fault_hook: Mutex::new(None),
             self_weak: OnceLock::new(),
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
