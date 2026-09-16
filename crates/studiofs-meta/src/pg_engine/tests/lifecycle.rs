@@ -1621,7 +1621,8 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     assert!(remote_head > startup_target);
 
     stale.set_catch_up_fault_hook(std::sync::Arc::new(|_| Ok(())));
-    for _ in 0..3 {
+    let post_target_event_count = remote_head.saturating_sub(startup_target);
+    for _ in 0..post_target_event_count {
         stale
             .sync_metadata()
             .expect("replicate moving-head runtime event");
@@ -1638,11 +1639,29 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
     let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
-    let mut fixture = startup_catch_up_fault_fixture();
+    let volume = PgTestVolume::new(&dsn, "pg-frozen-startup-retry-target");
+
+    let stale_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let stale_db = stale_dir.path().join("stale.redb");
+    seed_local(&stale_db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &stale_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open stale metadata client");
+    assert_eq!(engine.local_version.load(Ordering::Acquire), 0);
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+
     let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
     let publisher_db = publisher_dir.path().join("publisher.redb");
-    seed_local(&publisher_db, &fixture._volume.format_info());
+    seed_local(&publisher_db, &volume.format_info());
     let publisher = PgMetaEngine::open_with_options(
         &publisher_db,
         PgOpenOptions {
@@ -1651,8 +1670,26 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
         },
     )
     .expect("open moving-head publisher");
-    let engine = startup_catch_up_fault_engine(&mut fixture);
-    let startup_target = fixture.target_version;
+
+    for name in [
+        b"backlog-1".as_slice(),
+        b"backlog-2",
+        b"backlog-3",
+        b"backlog-4",
+    ] {
+        publisher
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create backlog event");
+        publisher.flush_metadata().expect("publish backlog event");
+    }
+
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
+    let startup_target = engine
+        .frozen_sync_target_version()
+        .expect("capture frozen startup target");
+    assert_eq!(startup_target, 4);
+
     let next_write = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let observed_cursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1670,9 +1707,11 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
             let name = format!("retry-moving-head-{write_number}");
             active_writer
                 .create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
-                .map_err(|_| MetaError::Storage("moving-head publisher failed".to_string()))?;
-            active_writer.flush_metadata().map_err(|_| {
-                MetaError::Storage("moving-head publisher flush failed".to_string())
+                .map_err(|error| {
+                    MetaError::Storage(format!("moving-head publisher failed: {error}"))
+                })?;
+            active_writer.flush_metadata().map_err(|error| {
+                MetaError::Storage(format!("moving-head publisher flush failed: {error}"))
             })?;
             if cursor == 1 && !injected_hook.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 return Err(MetaError::Timeout(
@@ -1687,7 +1726,10 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
     let error = engine
         .run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)
         .expect_err("temporary catch-up failure must interrupt the first session");
-    assert!(matches!(error, MetaError::Timeout(_)));
+    match error {
+        MetaError::Timeout(_) => {}
+        unexpected => panic!("expected temporary catch-up timeout, got {unexpected:?}"),
+    }
     assert_eq!(engine.local_version.load(Ordering::Acquire), 1);
     assert_eq!(
         engine.pg_sync_diagnostics().startup_target_version,
@@ -1720,7 +1762,7 @@ fn startup_catch_up_retry_keeps_frozen_target_while_remote_head_advances() {
         .expect("read remote head after retry");
     assert!(remote_head > startup_target);
     engine.set_catch_up_fault_hook(std::sync::Arc::new(|_| Ok(())));
-    let post_target_event_count = next_write.load(std::sync::atomic::Ordering::Acquire) - 1;
+    let post_target_event_count = remote_head.saturating_sub(startup_target);
     for _ in 0..post_target_event_count {
         engine
             .sync_metadata()
