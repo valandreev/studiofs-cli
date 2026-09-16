@@ -1464,7 +1464,7 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
             tx
                 .execute(
-                    "DELETE FROM event_log WHERE vol = $1 AND batch_version < 2",
+                    "DELETE FROM event_log WHERE vol = $1 AND batch_version <= 2",
                     &[&volume_id],
                 )
                 .await
@@ -2656,6 +2656,16 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
     local
         .lookup(ROOT_INO, b"pending-local-file.bin")
         .expect("unsafe local overlay must remain available for recovery");
+    let snapshot = local
+        .export_snapshot()
+        .expect("export rejected local metadata for recovery");
+    assert!(
+        snapshot
+            .event_log
+            .iter()
+            .any(|(seq, payload)| *seq == event_seq && payload.as_slice() == b"invalid-event"),
+        "rejected pending state must retain the corrupt event-log row for recovery"
+    );
     assert_eq!(
         local
             .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
