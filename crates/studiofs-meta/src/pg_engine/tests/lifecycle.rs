@@ -67,7 +67,7 @@ fn open_pg_publisher(volume: &PgTestVolume) -> (tempfile::TempDir, Arc<PgMetaEng
 #[derive(Debug, Clone)]
 struct PgCheckpointData {
     snapshot: Vec<u8>,
-    sha256: Vec<u8>,
+    sha256: [u8; 32],
 }
 
 fn read_pg_checkpoint(dsn: &str, volume_id: i64) -> PgCheckpointData {
@@ -79,15 +79,46 @@ fn read_pg_checkpoint(dsn: &str, volume_id: i64) -> PgCheckpointData {
             )
             .await
             .map_err(|error| MetaError::Storage(error.to_string()))?;
-        let snapshot = row
-            .try_get(0)
+        let snapshot: Vec<u8> = row
+            .try_get("snapshot")
             .map_err(|error| MetaError::Storage(format!("invalid snapshot column: {error}")))?;
-        let sha256 = row.try_get(1).map_err(|error| {
+        let sha256: Vec<u8> = row.try_get("checkpoint_sha256").map_err(|error| {
             MetaError::Storage(format!("invalid checkpoint checksum column: {error}"))
+        })?;
+        let sha256: [u8; 32] = sha256.try_into().map_err(|bytes: Vec<u8>| {
+            MetaError::Storage(format!(
+                "invalid checkpoint checksum length: expected 32, got {}",
+                bytes.len()
+            ))
         })?;
         Ok::<PgCheckpointData, MetaError>(PgCheckpointData { snapshot, sha256 })
     }))
     .expect("read checkpoint")
+}
+
+fn read_pg_event_batch(dsn: &str, volume_id: i64, batch_version: i64) -> (i64, Vec<MetaEvent>) {
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        let state = client
+            .query_one(
+                "SELECT version FROM metadata_state WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT event_type, event_payload FROM event_log WHERE vol = $1 AND batch_version = $2 ORDER BY seq_id",
+                &[&volume_id, &batch_version],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let events = rows
+            .into_iter()
+            .map(|row| crate::events::decode_event_with_type(row.get(0), row.get(1)))
+            .collect::<MetaResult<Vec<_>>>()?;
+        Ok::<(i64, Vec<MetaEvent>), MetaError>((state.get(0), events))
+    }))
+    .expect("read event batch from postgres")
 }
 
 #[test]
@@ -1441,7 +1472,7 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
             tx
                 .execute(
                     "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 2 WHERE vol = $3",
-                    &[&checkpoint.snapshot, &checkpoint.sha256, &volume_id],
+                    &[&checkpoint.snapshot, &checkpoint.sha256.as_slice(), &volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
@@ -1472,6 +1503,14 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
     )
     .expect("open clean stale metadata client");
     assert_eq!(stale.local_version.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        stale.lookup(ROOT_INO, b"checkpoint-clean-2"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert!(matches!(
+        stale.lookup(ROOT_INO, b"replayed-after-clean-rebootstrap"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
 
     stale
         .sync_metadata()
@@ -1489,6 +1528,13 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
             .lookup(ROOT_INO, name)
             .expect("checkpoint and replay tail entries must be visible");
     }
+    stale
+        .create_dir(ROOT_INO, b"post-rebootstrap", 0, 0, 0o755)
+        .expect("create entry after clean rebootstrap");
+    stale
+        .flush_metadata()
+        .expect("flush entry after clean rebootstrap");
+    assert_eq!(stale.local_version.load(Ordering::Acquire), 4);
 }
 
 #[test]
@@ -1532,7 +1578,7 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
             tx
                 .execute(
                     "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 0 WHERE vol = $3",
-                    &[&checkpoint.snapshot, &checkpoint.sha256, &volume_id],
+                    &[&checkpoint.snapshot, &checkpoint.sha256.as_slice(), &volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
@@ -1612,36 +1658,7 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
     stale
         .flush_metadata()
         .expect("flush preserved overlay after rebase");
-    let (remote_version, remote_events) = run_async(with_pg_test_client(&dsn, {
-        let volume_id = volume.volume_id;
-        move |client| async move {
-            let state = client
-                .query_one(
-                    "SELECT version FROM metadata_state WHERE vol = $1",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            let rows = client
-                .query(
-                    "SELECT event_type, event_payload FROM event_log WHERE vol = $1 AND batch_version = 5 ORDER BY seq_id",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            let events = rows
-                .into_iter()
-                .map(|row| {
-                    crate::events::decode_event_with_type(
-                        row.get(0),
-                        row.get(1),
-                    )
-                })
-                .collect::<MetaResult<Vec<_>>>()?;
-            Ok::<(i64, Vec<MetaEvent>), MetaError>((state.get(0), events))
-        }
-    }))
-    .expect("read flushed overlay event from postgres");
+    let (remote_version, remote_events) = read_pg_event_batch(&dsn, volume.volume_id, 5);
     assert_eq!(remote_version, 5);
     assert!(remote_events.iter().any(|event| matches!(
         event,
@@ -1704,7 +1721,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
             tx
                 .execute(
                     "UPDATE metadata_state SET version = 2, checkpoint_version = 1, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 1 WHERE vol = $3",
-                    &[&checkpoint, &&invalid_checksum[..], &volume_id],
+                    &[&checkpoint, &invalid_checksum.as_slice(), &volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
@@ -1817,7 +1834,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
                     "UPDATE metadata_state SET snapshot = $1, checkpoint_sha256 = $2 WHERE vol = $3",
                     &[
                         &valid_checkpoint.snapshot,
-                        &valid_checkpoint.sha256,
+                        &valid_checkpoint.sha256.as_slice(),
                         &volume_id,
                     ],
                 )
@@ -1844,11 +1861,12 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
     }
     reopened
         .flush_metadata()
-        .expect("recovered client must publish its preserved local overlay");
-    assert_eq!(
-        reopened.local_version.load(Ordering::Acquire),
-        3,
-        "publishing the preserved local overlay must advance the local replay cursor"
+        .expect("recovered client must flush with its preserved local overlay");
+    let (remote_version, remote_events) = read_pg_event_batch(&dsn, volume.volume_id, 3);
+    assert_eq!(remote_version, 2);
+    assert!(
+        remote_events.is_empty(),
+        "an uncommitted regular-file overlay must remain local-only"
     );
 }
 
