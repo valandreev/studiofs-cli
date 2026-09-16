@@ -735,8 +735,6 @@ struct StartupCatchUpFaultFixture {
 }
 
 type StartupCatchUpFaultObservations = std::sync::Arc<std::sync::Mutex<Vec<CatchUpFaultPoint>>>;
-type StartupCatchUpFaultHook =
-    std::sync::Arc<dyn Fn(CatchUpFaultPoint) -> MetaResult<()> + Send + Sync>;
 
 fn startup_catch_up_fault_fixture() -> StartupCatchUpFaultFixture {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
@@ -833,7 +831,7 @@ fn startup_catch_up_fault_engine(
 
 fn startup_catch_up_fault_hook(
     should_fail: impl Fn(CatchUpFaultPoint) -> bool + Send + Sync + 'static,
-) -> (StartupCatchUpFaultObservations, StartupCatchUpFaultHook) {
+) -> (StartupCatchUpFaultObservations, CatchUpFaultHook) {
     let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_hook = std::sync::Arc::clone(&observed);
