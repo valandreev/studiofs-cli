@@ -64,7 +64,12 @@ fn open_pg_publisher(volume: &PgTestVolume) -> (tempfile::TempDir, std::sync::Ar
     (dir, publisher)
 }
 
-fn read_pg_checkpoint(dsn: &str, volume_id: i64) -> (Vec<u8>, Vec<u8>) {
+struct PgCheckpointData {
+    snapshot: Vec<u8>,
+    sha256: Vec<u8>,
+}
+
+fn read_pg_checkpoint(dsn: &str, volume_id: i64) -> PgCheckpointData {
     run_async(with_pg_test_client(dsn, move |client| async move {
         let row = client
             .query_one(
@@ -73,7 +78,10 @@ fn read_pg_checkpoint(dsn: &str, volume_id: i64) -> (Vec<u8>, Vec<u8>) {
             )
             .await
             .map_err(|error| MetaError::Storage(error.to_string()))?;
-        Ok::<(Vec<u8>, Vec<u8>), MetaError>((row.get(0), row.get(1)))
+        Ok::<PgCheckpointData, MetaError>(PgCheckpointData {
+            snapshot: row.get(0),
+            sha256: row.get(1),
+        })
     }))
     .expect("read checkpoint")
 }
@@ -1403,7 +1411,7 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
             .flush_metadata()
             .expect("publish checkpoint event");
     }
-    let (checkpoint_bytes, checkpoint_sha256) = read_pg_checkpoint(&dsn, volume.volume_id);
+    let checkpoint = read_pg_checkpoint(&dsn, volume.volume_id);
     publisher
         .create_dir(ROOT_INO, b"replayed-after-clean-rebootstrap", 0, 0, 0o755)
         .expect("create replay tail event");
@@ -1414,19 +1422,26 @@ fn stale_client_rebootstrap_without_pending_overlay_reaches_live_and_replays_tai
 
     run_async(with_pg_test_client(&dsn, {
         let volume_id = volume.volume_id;
-        move |client| async move {
-            client
+        move |mut client| async move {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx
                 .execute(
                     "DELETE FROM event_log WHERE vol = $1 AND batch_version < 2",
                     &[&volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
-            client
+            tx
                 .execute(
                     "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 2 WHERE vol = $3",
-                    &[&checkpoint_bytes, &checkpoint_sha256, &volume_id],
+                    &[&checkpoint.snapshot, &checkpoint.sha256, &volume_id],
                 )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx.commit()
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
             Ok::<(), MetaError>(())
@@ -1489,7 +1504,7 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
             .flush_metadata()
             .expect("publish checkpoint event");
     }
-    let (checkpoint_bytes, checkpoint_sha256) = read_pg_checkpoint(&dsn, volume.volume_id);
+    let checkpoint = read_pg_checkpoint(&dsn, volume.volume_id);
     publisher
         .create_dir(ROOT_INO, b"replayed-after-checkpoint", 0, 0, 0o755)
         .expect("create replay tail event");
@@ -1498,19 +1513,26 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
         .expect("publish replay tail event");
     run_async(with_pg_test_client(&dsn, {
         let volume_id = volume.volume_id;
-        move |client| async move {
-            client
+        move |mut client| async move {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx
                 .execute(
                     "DELETE FROM event_log WHERE vol = $1 AND batch_version = 2",
                     &[&volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
-            client
+            tx
                 .execute(
                     "UPDATE metadata_state SET version = 3, checkpoint_version = 2, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 0 WHERE vol = $3",
-                    &[&checkpoint_bytes, &checkpoint_sha256, &volume_id],
+                    &[&checkpoint.snapshot, &checkpoint.sha256, &volume_id],
                 )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx.commit()
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
             Ok::<(), MetaError>(())
@@ -1636,7 +1658,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
         .create_dir(ROOT_INO, b"old-complete-base", 0, 0, 0o755)
         .expect("create old base event");
     publisher.flush_metadata().expect("publish old base event");
-    let (valid_checkpoint, valid_checkpoint_sha256) = read_pg_checkpoint(&dsn, volume.volume_id);
+    let valid_checkpoint = read_pg_checkpoint(&dsn, volume.volume_id);
     publisher
         .create_dir(ROOT_INO, b"new-complete-base", 0, 0, 0o755)
         .expect("create new base event");
@@ -1648,31 +1670,41 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
     seed_local(&stale_db, &volume.format_info());
     let local = RedbMetaEngine::open(&stale_db).expect("open stale local metadata");
     local
-        .import_serving_checkpoint_bytes(&valid_checkpoint)
+        .import_serving_checkpoint_bytes(&valid_checkpoint.snapshot)
         .expect("seed stale client with old complete base");
+    local
+        .create_file(ROOT_INO, b"unflushed-pending.bin", 0, 0, 0o644)
+        .expect("create unflushed pending overlay");
     PgMetaEngine::persist_client_slot(&local, 0).expect("persist stale client slot");
     local
         .set_counter(LOCAL_PG_VERSION_COUNTER, 0)
         .expect("persist stale replay cursor");
     drop(local);
 
-    let invalid_checksum = vec![0_u8; valid_checkpoint_sha256.len()];
+    let invalid_checksum = vec![0_u8; valid_checkpoint.sha256.len()];
     run_async(with_pg_test_client(&dsn, {
         let volume_id = volume.volume_id;
-        let checkpoint = valid_checkpoint.clone();
-        move |client| async move {
-            client
+        let checkpoint = valid_checkpoint.snapshot.clone();
+        move |mut client| async move {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx
                 .execute(
                     "DELETE FROM event_log WHERE vol = $1 AND batch_version < 2",
                     &[&volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
-            client
+            tx
                 .execute(
                     "UPDATE metadata_state SET version = 2, checkpoint_version = 1, snapshot = $1, checkpoint_sha256 = $2, event_log_prune_floor = 1 WHERE vol = $3",
                     &[&checkpoint, &invalid_checksum, &volume_id],
                 )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx.commit()
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
             Ok::<(), MetaError>(())
@@ -1689,6 +1721,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
     )
     .expect("invalid checkpoint must not prevent local serving");
     assert!(stale.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(stale.lookup(ROOT_INO, b"unflushed-pending.bin").is_ok());
     assert!(matches!(
         stale.lookup(ROOT_INO, b"new-complete-base"),
         Err(MetaError::EntryNotFound { .. })
@@ -1703,6 +1736,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
         }
     ));
     assert!(stale.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(stale.lookup(ROOT_INO, b"unflushed-pending.bin").is_ok());
     assert!(matches!(
         stale.lookup(ROOT_INO, b"new-complete-base"),
         Err(MetaError::EntryNotFound { .. })
@@ -1710,7 +1744,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
     assert_eq!(stale.local_version.load(Ordering::Acquire), 0);
 
     let mut malformed_checkpoint: crate::snapshot::ServingCheckpoint =
-        postcard::from_bytes(&valid_checkpoint).expect("decode valid checkpoint");
+        postcard::from_bytes(&valid_checkpoint.snapshot).expect("decode valid checkpoint");
     malformed_checkpoint
         .inodes
         .push((u64::MAX - 1, b"invalid-inode-encoding".to_vec()));
@@ -1737,6 +1771,7 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
         .expect_err("malformed inode must abort checkpoint replacement");
     assert!(matches!(error, MetaError::Serialization(_)));
     assert!(stale.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(stale.lookup(ROOT_INO, b"unflushed-pending.bin").is_ok());
     assert!(matches!(
         stale.lookup(ROOT_INO, b"new-complete-base"),
         Err(MetaError::EntryNotFound { .. })
@@ -1752,6 +1787,11 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
     )
     .expect("restart must retain the old complete base");
     assert!(reopened.lookup(ROOT_INO, b"old-complete-base").is_ok());
+    assert!(reopened.lookup(ROOT_INO, b"unflushed-pending.bin").is_ok());
+    assert!(
+        reopened.list_inode_attrs().is_ok(),
+        "local metadata database must remain structurally valid when rebootstrap aborts"
+    );
     assert!(matches!(
         reopened.lookup(ROOT_INO, b"new-complete-base"),
         Err(MetaError::EntryNotFound { .. })
@@ -1763,7 +1803,11 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
             client
                 .execute(
                     "UPDATE metadata_state SET snapshot = $1, checkpoint_sha256 = $2 WHERE vol = $3",
-                    &[&valid_checkpoint, &valid_checkpoint_sha256, &volume_id],
+                    &[
+                        &valid_checkpoint.snapshot,
+                        &valid_checkpoint.sha256,
+                        &volume_id,
+                    ],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
@@ -1777,7 +1821,11 @@ fn stale_client_rebootstrap_failure_preserves_old_base_until_valid_checkpoint_is
         .expect("restart should rebootstrap after checkpoint recovery");
     assert_eq!(reopened.local_version.load(Ordering::Acquire), 2);
     assert_eq!(reopened.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
-    for name in [b"old-complete-base".as_slice(), b"new-complete-base"] {
+    for name in [
+        b"old-complete-base".as_slice(),
+        b"new-complete-base",
+        b"unflushed-pending.bin",
+    ] {
         reopened
             .lookup(ROOT_INO, name)
             .expect("recovered checkpoint and replay tail must be complete");
@@ -2558,9 +2606,8 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
         },
     );
 
-    let error = match reopened {
-        Ok(_) => panic!("startup must reject an unreadable pending local event"),
-        Err(error) => error,
+    let Err(error) = reopened else {
+        panic!("startup must reject an unreadable pending local event");
     };
     assert!(
         matches!(error, MetaError::Serialization(_)),
