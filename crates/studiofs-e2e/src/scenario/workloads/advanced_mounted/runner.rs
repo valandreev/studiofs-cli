@@ -128,7 +128,7 @@ pub(in crate::scenario) fn run_advanced_mounted_body(
             catchup: execution.catchup,
             invalidation_dropout: execution.invalidation_dropout,
             symlink_attributes: execution.symlink_attributes,
-            large_history: execution.large_history,
+            large_history: None,
         },
     )?;
     Ok(summary)
@@ -240,7 +240,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
-            large_history: None,
         }),
         AdvancedMountedKind::MountedChaos => Ok(AdvancedMountedExecution {
             operations: run_mounted_chaos_operations(
@@ -257,7 +256,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
-            large_history: None,
         }),
         AdvancedMountedKind::HotspotChurn => Ok(AdvancedMountedExecution {
             operations: run_hotspot_churn_operations(
@@ -274,7 +272,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
-            large_history: None,
         }),
         AdvancedMountedKind::FaultChaos => Ok(AdvancedMountedExecution {
             operations: run_fault_chaos_operations(context, controller, clients, isolation)?,
@@ -285,7 +282,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
-            large_history: None,
         }),
         AdvancedMountedKind::LwwReconnectChaos => {
             let (operations, oracle) =
@@ -299,7 +295,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: None,
                 symlink_attributes: None,
-                large_history: None,
             })
         }
         AdvancedMountedKind::OpenHandle => Ok(AdvancedMountedExecution {
@@ -317,7 +312,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
-            large_history: None,
         }),
         AdvancedMountedKind::SparseRange => {
             let (operations, summary) = run_sparse_range_operations(
@@ -336,7 +330,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: None,
                 symlink_attributes: None,
-                large_history: None,
             })
         }
         AdvancedMountedKind::InvalidationDropoutFallback => {
@@ -356,7 +349,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: Some(summary),
                 symlink_attributes: None,
-                large_history: None,
             })
         }
         AdvancedMountedKind::SymlinkAttribute => {
@@ -376,7 +368,6 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: None,
                 symlink_attributes: Some(summary),
-                large_history: None,
             })
         }
         AdvancedMountedKind::ColdObserverLongHistory => unreachable!(
@@ -840,12 +831,12 @@ fn update_large_history_page_totals(
     pages: &mut Vec<LargeHistoryPageSample>,
     sample: &LargeHistoryStatusSample,
 ) {
-    for page in [sample.current_page.clone(), sample.last_page.clone()]
+    for page in [&sample.current_page, &sample.last_page]
         .into_iter()
         .flatten()
     {
-        if !pages.contains(&page) {
-            pages.push(page);
+        if !pages.contains(page) {
+            pages.push(page.clone());
         }
     }
 }
@@ -971,7 +962,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let mut moving_head_observed = false;
     let mut moving_writer = None;
     let monitor_result = (|| {
-        let reached_live = loop {
+        loop {
             let sample =
                 parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
             append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &sample)?;
@@ -1021,7 +1012,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             }
 
             if sample.lifecycle == "Live" {
-                break true;
+                break;
             }
             if Instant::now() >= deadline {
                 return Err(ScenarioError::Io(io::Error::new(
@@ -1030,8 +1021,8 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                 )));
             }
             thread::sleep(LARGE_HISTORY_POLL_INTERVAL);
-        };
-        Ok::<bool, ScenarioError>(reached_live)
+        }
+        Ok::<(), ScenarioError>(())
     })();
     let writer_result =
         if let Some(writer) = moving_writer.take() {
@@ -1041,7 +1032,8 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         } else {
             None
         };
-    let reached_live = monitor_result?;
+    monitor_result?;
+    let reached_live = true;
     if let Some(writer_result) = writer_result {
         writer_result?;
         let after_writer_status =

@@ -580,7 +580,6 @@ pub(in crate::scenario) struct AdvancedMountedExecution {
     pub(in crate::scenario) catchup: Option<CatchupSummary>,
     pub(in crate::scenario) invalidation_dropout: Option<InvalidationDropoutSummary>,
     pub(in crate::scenario) symlink_attributes: Option<SymlinkAttributeSummary>,
-    pub(in crate::scenario) large_history: Option<LargeHistorySummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
