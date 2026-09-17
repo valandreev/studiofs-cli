@@ -647,6 +647,7 @@ fn advanced_mounted_validate_rejects_failed_long_history_oracle() {
         catchup: Some(planned_catchup_summary()),
         invalidation_dropout: None,
         symlink_attributes: None,
+        large_history: None,
     };
     std::fs::write(
         scenario_dir.join("stale-remount-cold-discover-summary.json"),

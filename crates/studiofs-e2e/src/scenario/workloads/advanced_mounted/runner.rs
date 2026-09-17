@@ -75,6 +75,9 @@ pub(in crate::scenario) fn run_advanced_mounted_body(
     if kind == AdvancedMountedKind::StaleRemountColdDiscoverCatchup {
         return run_stale_remount_cold_discover_body(context, controller);
     }
+    if kind == AdvancedMountedKind::LargeHistoryColdBootstrap {
+        return run_large_history_cold_bootstrap_body(context, controller);
+    }
 
     let bootstrap = controller.bootstrap_volume(VolumeBootstrapOptions {
         client_names: kind
@@ -125,6 +128,7 @@ pub(in crate::scenario) fn run_advanced_mounted_body(
             catchup: execution.catchup,
             invalidation_dropout: execution.invalidation_dropout,
             symlink_attributes: execution.symlink_attributes,
+            large_history: execution.large_history,
         },
     )?;
     Ok(summary)
@@ -156,6 +160,9 @@ pub(in crate::scenario) fn write_advanced_mounted_plan_artifacts(
     }
     if kind == AdvancedMountedKind::StaleRemountColdDiscoverCatchup {
         write_planned_catchup_diagnostics(context)?;
+    }
+    if kind == AdvancedMountedKind::LargeHistoryColdBootstrap {
+        write_planned_large_history_diagnostics(context)?;
     }
     if kind == AdvancedMountedKind::InvalidationDropoutFallback {
         write_planned_invalidation_dropout_diagnostics(
@@ -201,6 +208,8 @@ pub(in crate::scenario) fn write_advanced_mounted_plan_artifacts(
         },
         catchup: (kind == AdvancedMountedKind::StaleRemountColdDiscoverCatchup)
             .then(planned_catchup_summary),
+        large_history: (kind == AdvancedMountedKind::LargeHistoryColdBootstrap)
+            .then(planned_large_history_summary),
         invalidation_dropout: (kind == AdvancedMountedKind::InvalidationDropoutFallback)
             .then(planned_invalidation_dropout_summary),
         symlink_attributes: (kind == AdvancedMountedKind::SymlinkAttribute)
@@ -231,6 +240,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
+            large_history: None,
         }),
         AdvancedMountedKind::MountedChaos => Ok(AdvancedMountedExecution {
             operations: run_mounted_chaos_operations(
@@ -247,6 +257,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
+            large_history: None,
         }),
         AdvancedMountedKind::HotspotChurn => Ok(AdvancedMountedExecution {
             operations: run_hotspot_churn_operations(
@@ -263,6 +274,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
+            large_history: None,
         }),
         AdvancedMountedKind::FaultChaos => Ok(AdvancedMountedExecution {
             operations: run_fault_chaos_operations(context, controller, clients, isolation)?,
@@ -273,6 +285,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
+            large_history: None,
         }),
         AdvancedMountedKind::LwwReconnectChaos => {
             let (operations, oracle) =
@@ -286,6 +299,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: None,
                 symlink_attributes: None,
+                large_history: None,
             })
         }
         AdvancedMountedKind::OpenHandle => Ok(AdvancedMountedExecution {
@@ -303,6 +317,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
+            large_history: None,
         }),
         AdvancedMountedKind::SparseRange => {
             let (operations, summary) = run_sparse_range_operations(
@@ -321,6 +336,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: None,
                 symlink_attributes: None,
+                large_history: None,
             })
         }
         AdvancedMountedKind::InvalidationDropoutFallback => {
@@ -340,6 +356,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: Some(summary),
                 symlink_attributes: None,
+                large_history: None,
             })
         }
         AdvancedMountedKind::SymlinkAttribute => {
@@ -359,6 +376,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
                 catchup: None,
                 invalidation_dropout: None,
                 symlink_attributes: Some(summary),
+                large_history: None,
             })
         }
         AdvancedMountedKind::ColdObserverLongHistory => unreachable!(
@@ -366,6 +384,9 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
         ),
         AdvancedMountedKind::StaleRemountColdDiscoverCatchup => unreachable!(
             "stale-remount cold-discover catch-up uses delayed remount/discovery and is handled before common bootstrap"
+        ),
+        AdvancedMountedKind::LargeHistoryColdBootstrap => unreachable!(
+            "large-history cold-bootstrap uses delayed discovery and is handled before common bootstrap"
         ),
     }
 }
@@ -475,6 +496,7 @@ pub(in crate::scenario) fn run_cold_observer_long_history_body(
             catchup: None,
             invalidation_dropout: None,
             symlink_attributes: None,
+            large_history: None,
         },
     )
 }
@@ -640,6 +662,471 @@ pub(in crate::scenario) fn run_stale_remount_cold_discover_body(
             catchup: Some(catchup),
             invalidation_dropout: None,
             symlink_attributes: None,
+            large_history: None,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LargeHistoryPageSample {
+    first_batch_version: Option<u64>,
+    last_batch_version: Option<u64>,
+    batch_count: u64,
+    event_count: u64,
+    response_bytes: u64,
+    has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LargeHistoryStatusSample {
+    lifecycle: String,
+    local_applied_version: Option<u64>,
+    startup_target_version: Option<u64>,
+    remote_head_version: Option<u64>,
+    checkpoint_version: Option<u64>,
+    source_connected: bool,
+    current_page: Option<LargeHistoryPageSample>,
+    last_page: Option<LargeHistoryPageSample>,
+}
+
+fn parse_status_version(value: &str) -> Option<u64> {
+    let value = value.trim();
+    (!value.is_empty() && value != "unknown").then(|| value.parse().ok())?
+}
+
+fn parse_status_bytes(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let amount = parts.next()?.parse::<f64>().ok()?;
+    let multiplier = match parts.next().unwrap_or("B") {
+        "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((amount * multiplier) as u64)
+}
+
+fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, ScenarioError> {
+    let value = value.trim();
+    if value == "none" {
+        return Ok(None);
+    }
+    let (range, details) = value.split_once(" (").ok_or_else(|| {
+        ScenarioError::Io(io::Error::other(format!("invalid status page: {value}")))
+    })?;
+    let details = details.strip_suffix(')').ok_or_else(|| {
+        ScenarioError::Io(io::Error::other(format!(
+            "invalid status page details: {value}"
+        )))
+    })?;
+    let (first, last) = range.split_once("..").ok_or_else(|| {
+        ScenarioError::Io(io::Error::other(format!(
+            "invalid status page range: {value}"
+        )))
+    })?;
+    let mut batch_count = None;
+    let mut event_count = None;
+    let mut response_bytes = None;
+    let mut has_more = None;
+    for detail in details.split(", ") {
+        if detail.ends_with("batch") || detail.ends_with("batches") {
+            batch_count = detail
+                .split_whitespace()
+                .next()
+                .and_then(parse_status_version);
+        } else if detail.ends_with("event") || detail.ends_with("events") {
+            event_count = detail
+                .split_whitespace()
+                .next()
+                .and_then(parse_status_version);
+        } else if let Some(value) = detail.strip_prefix("more=") {
+            has_more = Some(value == "true");
+        } else {
+            response_bytes = parse_status_bytes(detail);
+        }
+    }
+    Ok(Some(LargeHistoryPageSample {
+        first_batch_version: parse_status_version(first),
+        last_batch_version: parse_status_version(last),
+        batch_count: batch_count.ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(format!(
+                "missing status page batch count: {value}"
+            )))
+        })?,
+        event_count: event_count.ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(format!(
+                "missing status page event count: {value}"
+            )))
+        })?,
+        response_bytes: response_bytes.ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(format!(
+                "missing status page byte count: {value}"
+            )))
+        })?,
+        has_more: has_more.ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(format!(
+                "missing status page more flag: {value}"
+            )))
+        })?,
+    }))
+}
+
+fn parse_large_history_status(output: &str) -> Result<LargeHistoryStatusSample, ScenarioError> {
+    let mut lifecycle = None;
+    let mut local_applied_version = None;
+    let mut startup_target_version = None;
+    let mut remote_head_version = None;
+    let mut checkpoint_version = None;
+    let mut source_connected = false;
+    let mut current_page = None;
+    let mut last_page = None;
+    for line in output.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("Lifecycle:") {
+            lifecycle = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Local applied/target:") {
+            let (applied, target) = value.trim().split_once('/').ok_or_else(|| {
+                ScenarioError::Io(io::Error::other(format!(
+                    "invalid status versions: {value}"
+                )))
+            })?;
+            local_applied_version = parse_status_version(applied);
+            startup_target_version = parse_status_version(target);
+        } else if let Some(value) = line.strip_prefix("Local applied version:") {
+            local_applied_version = parse_status_version(value);
+        } else if let Some(value) = line.strip_prefix("Remote head:") {
+            remote_head_version = parse_status_version(value);
+        } else if let Some(value) = line.strip_prefix("Checkpoint version:") {
+            checkpoint_version = parse_status_version(value);
+        } else if let Some(value) = line.strip_prefix("Source connected:") {
+            source_connected = value.trim() == "yes";
+        } else if let Some(value) = line.strip_prefix("Current page:") {
+            current_page = parse_status_page(value)?;
+        } else if let Some(value) = line.strip_prefix("Last page:") {
+            last_page = parse_status_page(value)?;
+        }
+    }
+    let lifecycle = lifecycle.ok_or_else(|| {
+        ScenarioError::Io(io::Error::other("status output did not contain lifecycle"))
+    })?;
+    Ok(LargeHistoryStatusSample {
+        lifecycle,
+        local_applied_version,
+        startup_target_version,
+        remote_head_version,
+        checkpoint_version,
+        source_connected,
+        current_page,
+        last_page,
+    })
+}
+
+fn append_large_history_status(
+    path: &Path,
+    client: &str,
+    sample: &LargeHistoryStatusSample,
+) -> Result<(), ScenarioError> {
+    let mut line = serde_json::to_vec(&json!({
+        "client": client,
+        "sample": sample,
+    }))?;
+    line.push(b'\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&line)?;
+    Ok(())
+}
+
+fn update_large_history_page_totals(
+    pages: &mut Vec<LargeHistoryPageSample>,
+    sample: &LargeHistoryStatusSample,
+) {
+    for page in [sample.current_page.clone(), sample.last_page.clone()]
+        .into_iter()
+        .flatten()
+    {
+        if !pages.contains(&page) {
+            pages.push(page);
+        }
+    }
+}
+
+fn large_history_remote_head_moved(before: Option<u64>, after: Option<u64>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => after > before,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
+    context: &ScenarioContext,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+) -> Result<AdvancedMountedSummary, ScenarioError> {
+    controller.create_clients(COLD_OBSERVER_CLIENT_NAMES.iter().copied())?;
+    controller.init_first_client()?;
+    for client in &COLD_OBSERVER_WARM_CLIENT_NAMES[1..] {
+        controller.discover(client)?;
+    }
+    for client in COLD_OBSERVER_WARM_CLIENT_NAMES {
+        controller.mount(client)?;
+    }
+    let warm_clients = controller
+        .clients()
+        .into_iter()
+        .filter(|client| COLD_OBSERVER_WARM_CLIENT_NAMES.contains(&client.name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let bootstrap = VolumeBootstrapSummary {
+        volume_name: warm_clients
+            .first()
+            .map(|client| client.volume_name.clone())
+            .unwrap_or_else(|| "projectfs".to_string()),
+        init_client: "client-a".to_string(),
+        discovered_clients: vec!["client-b".to_string(), "client-c".to_string()],
+        clients: warm_clients
+            .iter()
+            .map(|client| crate::client::ClientBootstrapRecord {
+                name: client.name.clone(),
+                local_metadata_db: client.local_metadata_db.clone(),
+                state: client.state,
+            })
+            .collect(),
+    };
+    write_bootstrap_summary(context, &bootstrap)?;
+
+    let isolation = ScenarioIsolation::for_advanced(
+        context,
+        AdvancedMountedKind::LargeHistoryColdBootstrap,
+        &bootstrap.volume_name,
+    );
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    let status_path = context.scenario_dir.join("large-history-status.ndjson");
+    fs::write(&status_path, [])?;
+    let initial_warm_status = parse_large_history_status(&controller.status("client-a")?.stdout)?;
+    append_large_history_status(&status_path, "client-a", &initial_warm_status)?;
+    let initial_remote_head = initial_warm_status.remote_head_version;
+    let initial_operation = format!("bulk-create-delete:{LARGE_HISTORY_INITIAL_BATCH_PAIRS}");
+    operations.push(timed_hotspot_helper_fs_op(
+        context,
+        started,
+        1,
+        &warm_clients[0],
+        &initial_operation,
+        &isolation.root,
+        LARGE_HISTORY_CONVERGENCE_TIMEOUT,
+        None,
+        None,
+    )?);
+    let after_initial_status = parse_large_history_status(&controller.status("client-a")?.stdout)?;
+    append_large_history_status(&status_path, "client-a", &after_initial_status)?;
+
+    controller.set_client_env_overrides(
+        LARGE_HISTORY_COLD_CLIENT,
+        [
+            (
+                "STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE",
+                LARGE_HISTORY_CATCHUP_BATCHES_PER_PAGE,
+            ),
+            (
+                "STUDIOFS_PG_SYNC_POLL_SECS",
+                LARGE_HISTORY_CATCHUP_POLL_SECS,
+            ),
+        ],
+    )?;
+    let cold_client = controller
+        .clients()
+        .into_iter()
+        .find(|client| client.name == LARGE_HISTORY_COLD_CLIENT)
+        .cloned()
+        .ok_or_else(|| ScenarioError::Io(io::Error::other("missing large-history client-d")))?;
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &cold_client,
+        "cold_discover_after_large_history",
+        LARGE_HISTORY_COLD_CLIENT,
+        controller
+            .discover(LARGE_HISTORY_COLD_CLIENT)
+            .map_err(ScenarioError::from),
+    )?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &cold_client,
+        "cold_mount_after_large_history",
+        LARGE_HISTORY_COLD_CLIENT,
+        controller
+            .mount(LARGE_HISTORY_COLD_CLIENT)
+            .map_err(ScenarioError::from),
+    )?);
+
+    let deadline = Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT;
+    let mut pages = Vec::new();
+    let mut applied_version_progression = Vec::new();
+    let mut checkpoint_version = after_initial_status.checkpoint_version;
+    let mut startup_target_version = None;
+    let mut saw_catching_up = false;
+    let mut restarted_during_catchup = false;
+    let mut moving_head_observed = false;
+    let mut moving_writer = None;
+    let monitor_result = (|| {
+        let reached_live = loop {
+            let sample =
+                parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
+            append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &sample)?;
+            checkpoint_version = checkpoint_version.or(sample.checkpoint_version);
+            startup_target_version = startup_target_version.or(sample.startup_target_version);
+            if let Some(applied) = sample.local_applied_version {
+                applied_version_progression.push(applied);
+            }
+            update_large_history_page_totals(&mut pages, &sample);
+            saw_catching_up |= sample.lifecycle == "CatchingUp";
+
+            if saw_catching_up && moving_writer.is_none() {
+                let writer_context = context.clone();
+                let writer_client = warm_clients[0].clone();
+                let writer_operation =
+                    format!("bulk-create-delete:{LARGE_HISTORY_MOVING_HEAD_BATCH_PAIRS}");
+                let writer_path = isolation.root.clone();
+                moving_writer = Some(std::thread::spawn(move || {
+                    run_hotspot_helper_process(
+                        &writer_context,
+                        LARGE_HISTORY_CONVERGENCE_TIMEOUT,
+                        &writer_client,
+                        &writer_operation,
+                        &writer_path,
+                        None,
+                        None,
+                        format!(
+                            "{} {} {}",
+                            writer_client.name, writer_operation, writer_path
+                        ),
+                    )
+                }));
+            }
+
+            if saw_catching_up && !restarted_during_catchup {
+                controller.restart(LARGE_HISTORY_COLD_CLIENT)?;
+                restarted_during_catchup = true;
+                operations.push(record_advanced_operation(
+                    started,
+                    operations.len() + 1,
+                    &cold_client,
+                    "cold_restart_during_catchup",
+                    LARGE_HISTORY_COLD_CLIENT,
+                    Ok(()),
+                ));
+                continue;
+            }
+
+            if sample.lifecycle == "Live" {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                return Err(ScenarioError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "large-history cold-bootstrap client did not reach Live",
+                )));
+            }
+            thread::sleep(LARGE_HISTORY_POLL_INTERVAL);
+        };
+        Ok::<bool, ScenarioError>(reached_live)
+    })();
+    let writer_result =
+        if let Some(writer) = moving_writer.take() {
+            Some(writer.join().map_err(|_| {
+                ScenarioError::Io(io::Error::other("large-history writer panicked"))
+            })?)
+        } else {
+            None
+        };
+    let reached_live = monitor_result?;
+    if let Some(writer_result) = writer_result {
+        writer_result?;
+        let after_writer_status =
+            parse_large_history_status(&controller.status("client-a")?.stdout)?;
+        append_large_history_status(&status_path, "client-a", &after_writer_status)?;
+        moving_head_observed = large_history_remote_head_moved(
+            after_initial_status
+                .remote_head_version
+                .or(initial_remote_head),
+            after_writer_status.remote_head_version,
+        );
+    }
+    let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
+    let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
+    let final_marker_path = isolation.path("final-read-write-marker.txt");
+    let final_marker_payload = isolation.payload(
+        "final_read_write",
+        &final_marker_path,
+        "large-history final read-write convergence",
+    );
+    let clients = controller
+        .clients()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    operations.push(timed_hotspot_helper_fs_op(
+        context,
+        started,
+        operations.len() + 1,
+        &clients[0],
+        "final_read_write_marker_create",
+        &final_marker_path,
+        LARGE_HISTORY_CONVERGENCE_TIMEOUT,
+        Some(&final_marker_payload),
+        None,
+    )?);
+    wait_for_mounted_initial_payloads_until(
+        &clients,
+        &[(&final_marker_path, final_marker_payload.as_slice())],
+        deadline,
+        LARGE_HISTORY_POLL_INTERVAL,
+        "large-history final read-write convergence",
+    )?;
+    let final_read_write_converged = true;
+    write_namespace_collision_operations(context, &operations)?;
+    let large_history = LargeHistorySummary {
+        mutation_count,
+        remote_visible_mutations: if moving_head_observed {
+            mutation_count
+        } else {
+            0
+        },
+        initial_mutation_count: LARGE_HISTORY_INITIAL_MUTATION_COUNT,
+        moving_head_mutation_count,
+        cold_client: LARGE_HISTORY_COLD_CLIENT.to_string(),
+        checkpoint_version,
+        startup_target_version,
+        applied_version_progression,
+        observed_page_count: pages.len(),
+        observed_event_rows: pages.iter().map(|page| page.event_count).sum(),
+        observed_event_bytes: pages.iter().map(|page| page.response_bytes).sum(),
+        saw_catching_up,
+        restarted_during_catchup,
+        moving_head_observed,
+        reached_live,
+        final_read_write_converged,
+        final_marker_path,
+        wall_duration_ms: elapsed_millis_u64(started),
+    };
+    finish_advanced_mounted(
+        context,
+        AdvancedMountedKind::LargeHistoryColdBootstrap,
+        Some(&isolation),
+        &clients,
+        AdvancedMountedFinishInput {
+            bootstrap: Some(bootstrap),
+            operations,
+            lww_oracle: None,
+            sparse_ranges: None,
+            cold_observer: None,
+            long_history: None,
+            catchup: None,
+            invalidation_dropout: None,
+            symlink_attributes: None,
+            large_history: Some(large_history),
         },
     )
 }
@@ -1300,4 +1787,32 @@ pub(in crate::scenario) fn write_mounted_initial_file_sync_only(
         file.write_all(&write_payload)?;
         file.sync_all()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_large_history_status_page_and_versions() {
+        let sample = parse_large_history_status(
+            "  Lifecycle:              CatchingUp\n\
+             Local applied/target:   123/456\n\
+             Remote head:            789\n\
+             Checkpoint version:     100\n\
+             Current page:           123..154 (32 batches, 512 events, 64 KiB, more=true)\n\
+             Last page:              91..122 (32 batches, 480 events, 60 KiB, more=true)\n\
+             Source connected:       yes\n",
+        )
+        .unwrap();
+
+        assert_eq!(sample.lifecycle, "CatchingUp");
+        assert_eq!(sample.local_applied_version, Some(123));
+        assert_eq!(sample.startup_target_version, Some(456));
+        assert_eq!(sample.remote_head_version, Some(789));
+        assert_eq!(sample.checkpoint_version, Some(100));
+        assert!(sample.source_connected);
+        assert_eq!(sample.current_page.unwrap().event_count, 512);
+        assert_eq!(sample.last_page.unwrap().response_bytes, 60 * 1024);
+    }
 }

@@ -593,6 +593,36 @@ pub fn run_hotspot_op_helper(
 ) -> Result<(), anyhow::Error> {
     let path = mount_point.join(path);
     record_hotspot_helper_progress(progress, "started", operation, &path, target, None)?;
+    if let Some(pair_count) = operation.strip_prefix("bulk-create-delete:") {
+        let pair_count = pair_count
+            .parse::<usize>()
+            .map_err(|error| anyhow::anyhow!("invalid bulk pair count {pair_count}: {error}"))?;
+        fs::create_dir_all(&path)?;
+        for index in 0..pair_count {
+            let entry = path.join(format!("bulk-entry-{index:06}.txt"));
+            fs::write(&entry, b"x")?;
+            fs::remove_file(&entry)?;
+            if index % 1024 == 0 || index + 1 == pair_count {
+                record_hotspot_helper_progress(
+                    progress,
+                    "bulk_pair_complete",
+                    operation,
+                    &entry,
+                    target,
+                    Some(index + 1),
+                )?;
+            }
+        }
+        record_hotspot_helper_progress(
+            progress,
+            "bulk_complete",
+            operation,
+            &path,
+            target,
+            Some(pair_count * 2),
+        )?;
+        return Ok(());
+    }
     match operation {
         "mkdir" => {
             record_hotspot_helper_progress(

@@ -978,6 +978,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.mount_index(index)
     }
 
+    /// Runs `studiofs status` for a named client and returns its diagnostics output.
+    pub fn status(&self, client: &str) -> Result<ClientCommandOutput, ClientControllerError> {
+        let index = self.client_index(client)?;
+        let command = self.status_command(index)?;
+        let output = self.executor.run(&command)?;
+        ensure_success(&command, output.clone())?;
+        Ok(output)
+    }
+
     /// Restarts (unmount then mount) a named client.
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
@@ -1399,6 +1408,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             args.extend(overrides.iter().cloned());
         }
         self.command(index, "mount", args)
+    }
+
+    fn status_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {
+        let client = self.client(index)?;
+        let args = vec![
+            "status".to_string(),
+            client.volume_name.clone(),
+            "--cache-dir".to_string(),
+            client.cache_dir.display().to_string(),
+        ];
+        self.command(index, "status", args)
     }
 
     fn unmount_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {

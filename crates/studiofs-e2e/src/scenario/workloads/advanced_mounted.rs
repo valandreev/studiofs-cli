@@ -129,6 +129,7 @@ pub(in crate::scenario) enum AdvancedMountedKind {
     StaleRemountColdDiscoverCatchup,
     InvalidationDropoutFallback,
     SymlinkAttribute,
+    LargeHistoryColdBootstrap,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,6 +249,14 @@ impl AdvancedMountedKind {
                 client_names: SYMLINK_ATTRIBUTE_CLIENT_NAMES,
                 convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
             },
+            Self::LargeHistoryColdBootstrap => AdvancedMountedProperties {
+                name: MOUNTED_LARGE_HISTORY_COLD_BOOTSTRAP_CONVERGENCE,
+                description: "opt-in mounted large-history cold-bootstrap catch-up convergence",
+                path_root: "large-history-cold-bootstrap",
+                summary_file: "large-history-cold-bootstrap-summary.json",
+                client_names: COLD_OBSERVER_CLIENT_NAMES,
+                convergence_timeout: LARGE_HISTORY_CONVERGENCE_TIMEOUT,
+            },
         }
     }
 
@@ -331,6 +340,11 @@ impl Scenario for AdvancedMountedScenario {
             .as_ref()
             .map(|validation| validation.matched)
             .unwrap_or_else(|| summary.long_history.is_none());
+        let large_history_matches = summary
+            .large_history
+            .as_ref()
+            .map(LargeHistorySummary::matched)
+            .unwrap_or_else(|| self.kind != AdvancedMountedKind::LargeHistoryColdBootstrap);
         let invalidation_dropout_matches = summary
             .invalidation_dropout
             .as_ref()
@@ -340,6 +354,7 @@ impl Scenario for AdvancedMountedScenario {
             && summary.namespace_violations.is_empty()
             && lww_oracle_matches
             && long_history_matches
+            && large_history_matches
             && invalidation_dropout_matches
             && sparse_ranges_match(self.kind, summary.sparse_ranges.as_ref());
         let validation = json!({
@@ -356,6 +371,7 @@ impl Scenario for AdvancedMountedScenario {
             "long_history": summary.long_history,
             "long_history_validation": summary.long_history_validation,
             "catchup": summary.catchup,
+            "large_history": summary.large_history,
             "invalidation_dropout": summary.invalidation_dropout,
         });
         fs::write(
@@ -385,6 +401,12 @@ impl Scenario for AdvancedMountedScenario {
         if self.kind == AdvancedMountedKind::StaleRemountColdDiscoverCatchup {
             artifacts.push(format!(
                 "artifacts/scenarios/{}/catchup-diagnostics.json",
+                self.kind.name()
+            ));
+        }
+        if self.kind == AdvancedMountedKind::LargeHistoryColdBootstrap {
+            artifacts.push(format!(
+                "artifacts/scenarios/{}/large-history-status.ndjson",
                 self.kind.name()
             ));
         }
@@ -545,6 +567,8 @@ pub(in crate::scenario) struct AdvancedMountedSummary {
     pub(in crate::scenario) invalidation_dropout: Option<InvalidationDropoutSummary>,
     #[serde(default)]
     pub(in crate::scenario) symlink_attributes: Option<SymlinkAttributeSummary>,
+    #[serde(default)]
+    pub(in crate::scenario) large_history: Option<LargeHistorySummary>,
 }
 
 pub(in crate::scenario) struct AdvancedMountedExecution {
@@ -556,6 +580,51 @@ pub(in crate::scenario) struct AdvancedMountedExecution {
     pub(in crate::scenario) catchup: Option<CatchupSummary>,
     pub(in crate::scenario) invalidation_dropout: Option<InvalidationDropoutSummary>,
     pub(in crate::scenario) symlink_attributes: Option<SymlinkAttributeSummary>,
+    pub(in crate::scenario) large_history: Option<LargeHistorySummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::scenario) struct LargeHistorySummary {
+    pub(in crate::scenario) mutation_count: usize,
+    pub(in crate::scenario) remote_visible_mutations: usize,
+    pub(in crate::scenario) initial_mutation_count: usize,
+    pub(in crate::scenario) moving_head_mutation_count: usize,
+    pub(in crate::scenario) cold_client: String,
+    pub(in crate::scenario) checkpoint_version: Option<u64>,
+    pub(in crate::scenario) startup_target_version: Option<u64>,
+    pub(in crate::scenario) applied_version_progression: Vec<u64>,
+    pub(in crate::scenario) observed_page_count: usize,
+    pub(in crate::scenario) observed_event_rows: u64,
+    pub(in crate::scenario) observed_event_bytes: u64,
+    pub(in crate::scenario) saw_catching_up: bool,
+    pub(in crate::scenario) restarted_during_catchup: bool,
+    pub(in crate::scenario) moving_head_observed: bool,
+    pub(in crate::scenario) reached_live: bool,
+    pub(in crate::scenario) final_read_write_converged: bool,
+    pub(in crate::scenario) final_marker_path: String,
+    pub(in crate::scenario) wall_duration_ms: u64,
+}
+
+impl LargeHistorySummary {
+    fn matched(&self) -> bool {
+        self.mutation_count >= LARGE_HISTORY_MUTATION_COUNT
+            && self.remote_visible_mutations >= LARGE_HISTORY_MUTATION_COUNT
+            && self.cold_client == LARGE_HISTORY_COLD_CLIENT
+            && self.checkpoint_version.is_some()
+            && self.startup_target_version.is_some()
+            && self
+                .applied_version_progression
+                .windows(2)
+                .all(|versions| versions[0] <= versions[1])
+            && self.observed_page_count > 1
+            && self.observed_event_rows > 0
+            && self.observed_event_bytes > 0
+            && self.saw_catching_up
+            && self.restarted_during_catchup
+            && self.moving_head_observed
+            && self.reached_live
+            && self.final_read_write_converged
+    }
 }
 
 impl LongHistoryValidation {

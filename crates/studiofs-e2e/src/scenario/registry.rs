@@ -41,6 +41,8 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             AdvancedMountedScenario::new(AdvancedMountedKind::InvalidationDropoutFallback)
                 .definition(),
             AdvancedMountedScenario::new(AdvancedMountedKind::SymlinkAttribute).definition(),
+            AdvancedMountedScenario::new(AdvancedMountedKind::LargeHistoryColdBootstrap)
+                .definition(),
             SnapshotV2Scenario::new(SnapshotV2Kind::ManualRecovery).definition(),
             SnapshotV2Scenario::new(SnapshotV2Kind::MaterializerTakeover).definition(),
         ]
@@ -134,6 +136,11 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
                 AdvancedMountedKind::SymlinkAttribute,
             )))
         }
+        MOUNTED_LARGE_HISTORY_COLD_BOOTSTRAP_CONVERGENCE
+        | "large-history-cold-bootstrap"
+        | "large-history-catchup" => Some(Box::new(AdvancedMountedScenario::new(
+            AdvancedMountedKind::LargeHistoryColdBootstrap,
+        ))),
         SNAPSHOT_MANUAL_RECOVERY => Some(Box::new(SnapshotV2Scenario::new(
             SnapshotV2Kind::ManualRecovery,
         ))),

@@ -416,6 +416,37 @@ fn hotspot_helper_ops_cover_metadata_attribute_and_symlink_ops() {
 }
 
 #[test]
+fn hotspot_helper_bulk_create_delete_leaves_only_namespace_root() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let mount = temp.path().join("mount");
+    std::fs::create_dir_all(&mount).unwrap();
+    let progress = temp.path().join("hotspot-progress.jsonl");
+
+    run_hotspot_op_helper(
+        "bulk-create-delete:3",
+        mount.clone(),
+        "large-history",
+        None,
+        None,
+        Some(&progress),
+    )
+    .unwrap();
+
+    assert!(mount.join("large-history").is_dir());
+    assert_eq!(
+        std::fs::read_dir(mount.join("large-history"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(progress)
+            .unwrap()
+            .contains("bulk_complete")
+    );
+}
+
+#[test]
 fn symlink_helper_skip_accepts_windows_error_gen_failure() {
     let error = ScenarioError::Io(io::Error::other(
         "hotspot helper failed for client-a symlink create: status=exit code: 1; stderr=A device attached to the system is not functioning. (os error 31)",

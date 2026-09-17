@@ -380,6 +380,7 @@ cargo run -p studiofs-e2e -- run mounted-cold-observer-long-history-convergence 
 cargo run -p studiofs-e2e -- run mounted-stale-remount-cold-discover-catchup-convergence --seed 418 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-invalidation-dropout-fallback-convergence --seed 379 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-symlink-attribute-convergence --seed 380 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-large-history-cold-bootstrap-convergence --seed 716 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe

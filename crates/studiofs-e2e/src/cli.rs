@@ -135,7 +135,7 @@ pub struct RunOneArgs {
 #[derive(Args, Debug)]
 /// Hidden helper arguments for one mounted hotspot filesystem operation.
 pub struct HotspotOpArgs {
-    /// Operation name: mkdir, write, append, rename, or readdir.
+    /// Operation name: mkdir, write, append, rename, readdir, or bulk-create-delete:<pairs>.
     #[arg(long)]
     pub operation: String,
 

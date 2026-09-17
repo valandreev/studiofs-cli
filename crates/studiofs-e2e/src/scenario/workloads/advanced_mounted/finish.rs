@@ -12,6 +12,7 @@ pub(in crate::scenario) struct AdvancedMountedFinishInput {
     pub(in crate::scenario) catchup: Option<CatchupSummary>,
     pub(in crate::scenario) invalidation_dropout: Option<InvalidationDropoutSummary>,
     pub(in crate::scenario) symlink_attributes: Option<SymlinkAttributeSummary>,
+    pub(in crate::scenario) large_history: Option<LargeHistorySummary>,
 }
 
 pub(in crate::scenario) fn finish_advanced_mounted(
@@ -31,6 +32,7 @@ pub(in crate::scenario) fn finish_advanced_mounted(
         catchup,
         invalidation_dropout,
         symlink_attributes,
+        large_history,
     } = input;
     let mounts = clients
         .iter()
@@ -77,6 +79,7 @@ pub(in crate::scenario) fn finish_advanced_mounted(
         catchup,
         invalidation_dropout,
         symlink_attributes,
+        large_history,
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -391,6 +394,20 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
                 "client-a",
                 "near_symlink_write",
                 "symlink-attribute/near-symlink-write.txt",
+            ),
+        ],
+        AdvancedMountedKind::LargeHistoryColdBootstrap => &[
+            (
+                "client-a",
+                "large_history_initial_batch",
+                "large-history-cold-bootstrap/bulk-create-delete:45000",
+            ),
+            ("client-d", "cold_discover_after_history", "client-d"),
+            ("client-d", "cold_restart_during_catchup", "client-d"),
+            (
+                "client-a",
+                "large_history_moving_head_batch",
+                "large-history-cold-bootstrap/bulk-create-delete:5000",
             ),
         ],
     };
