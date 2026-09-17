@@ -1,6 +1,6 @@
 //! Native macOS FSKit mount sanity tests.
 
-#![cfg(all(target_os = "macos", studiofs_fskit))]
+#![cfg(all(target_os = "macos", studiofs_fskit, feature = "fskit-mount-sanity"))]
 
 use std::io;
 use std::os::unix::fs::MetadataExt;

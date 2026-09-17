@@ -69,13 +69,15 @@ run as tracked blocking reply tasks instead of occupying the FSKit dispatcher
 loop. The zero-copy negotiation and the remaining full semantic parity matrix
 remain separate follow-up work.
 
-Native FSKit mount sanity is kept out of the default library gate as an ignored
-integration test. Run it only with an approved provider and an internal volume
-mount root, for example:
+Native FSKit mount sanity is kept out of the default library gate as an
+ignored, opt-in integration test. Run it only with the `fskit-mount-sanity`
+Cargo feature, an approved provider, and an internal volume mount root, for
+example:
 
 ```bash
 STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation \
-cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- \
+cargo test -p studiofs-macfuse --features fskit-mount-sanity \
+  --test fskit_mount_sanity fskit_ -- \
   --ignored --nocapture --test-threads=1
 ```
 
