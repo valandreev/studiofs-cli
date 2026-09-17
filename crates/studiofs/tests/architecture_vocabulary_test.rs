@@ -643,15 +643,15 @@ fn related_docs_link_to_canonical_pg_sync_contract() {
 }
 
 #[test]
-fn configuration_docs_label_pg_sync_target_behavior() {
+fn configuration_docs_describe_pg_sync_checkpoint_bootstrap() {
     let configuration = read_workspace_file("docs/configuration.md");
     let normalized_configuration = normalize_doc_whitespace(&configuration);
     let required_terms = [
-        "Target behavior (SFS-695",
-        "runtime follow-ups SFS-696 through SFS-698",
-        "Current transitional behavior",
-        "does not yet return checkpoint/head versions",
-        "fresh-client authority state",
+        "Current behavior (SFS-695 through SFS-705)",
+        "reads one consistent latest remote-visible checkpoint and frozen startup target from PostgreSQL",
+        "keeps the fresh client read-only until the startup target and write authority are both available",
+        "installs the completed local redb database atomically after a durability barrier",
+        "returns before constructing `PgMetaEngine` or replaying the PostgreSQL event log",
     ];
     let missing: Vec<_> = required_terms
         .into_iter()
@@ -660,7 +660,7 @@ fn configuration_docs_label_pg_sync_target_behavior() {
 
     assert!(
         missing.is_empty(),
-        "configuration docs must label SFS-695 behavior as transitional until runtime follow-ups land:\n{}",
+        "configuration docs must describe the implemented SFS-695 checkpoint bootstrap:\n{}",
         missing.join("\n")
     );
 }
