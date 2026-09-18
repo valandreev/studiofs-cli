@@ -585,7 +585,8 @@ pub(in crate::scenario) struct AdvancedMountedExecution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::scenario) struct LargeHistorySummary {
     pub(in crate::scenario) mutation_count: usize,
-    /// Expected workload count confirmed by remote-head progress; status does not expose an exact per-operation counter.
+    /// Expected workload count reported only after the post-writer marker and
+    /// stable remote-head catch-up; status does not expose an exact operation counter.
     pub(in crate::scenario) remote_visible_mutations: usize,
     pub(in crate::scenario) initial_mutation_count: usize,
     pub(in crate::scenario) moving_head_mutation_count: usize,

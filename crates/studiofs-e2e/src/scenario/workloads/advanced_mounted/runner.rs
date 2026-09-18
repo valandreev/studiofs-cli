@@ -816,6 +816,13 @@ fn parse_large_history_status(output: &str) -> Result<LargeHistoryStatusSample, 
     })
 }
 
+fn update_cold_checkpoint_version(
+    checkpoint_version: &mut Option<u64>,
+    sample: &LargeHistoryStatusSample,
+) {
+    *checkpoint_version = (*checkpoint_version).or(sample.checkpoint_version);
+}
+
 fn append_large_history_status(
     path: &Path,
     client: &str,
@@ -857,10 +864,12 @@ fn large_history_remote_head_moved(before: Option<u64>, after: Option<u64>) -> b
 
 fn large_history_remote_head_caught_up(
     before: Option<u64>,
+    previous_remote_head: Option<u64>,
     remote_head: Option<u64>,
     local_applied: Option<u64>,
 ) -> bool {
     large_history_remote_head_moved(before, remote_head)
+        && previous_remote_head == remote_head
         && remote_head
             .zip(local_applied)
             .is_some_and(|(remote_head, local_applied)| local_applied >= remote_head)
@@ -973,7 +982,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let mut pages = Vec::new();
     let mut seen_pages = HashSet::new();
     let mut applied_version_progression = Vec::new();
-    let mut checkpoint_version = after_initial_status.checkpoint_version;
+    let mut checkpoint_version = None;
     let mut startup_target_version = None;
     let mut applied_version_restart_index = None;
     let mut saw_catching_up = false;
@@ -985,7 +994,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             let sample =
                 parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
             append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &sample)?;
-            checkpoint_version = checkpoint_version.or(sample.checkpoint_version);
+            update_cold_checkpoint_version(&mut checkpoint_version, &sample);
             startup_target_version = startup_target_version.or(sample.startup_target_version);
             if let Some(applied) = sample.local_applied_version {
                 applied_version_progression.push(applied);
@@ -1054,38 +1063,9 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         };
     monitor_result?;
     let reached_live = true;
+    let moving_writer_completed = writer_result.is_some();
     if let Some(writer_result) = writer_result {
         writer_result?;
-        let moving_head_baseline = after_initial_status
-            .remote_head_version
-            .or(initial_remote_head);
-        while Instant::now() < deadline {
-            let warm_status = parse_large_history_status(&controller.status("client-a")?.stdout)?;
-            append_large_history_status(&status_path, "client-a", &warm_status)?;
-            let cold_status =
-                parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
-            append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &cold_status)?;
-            checkpoint_version = checkpoint_version.or(cold_status.checkpoint_version);
-            if let Some(applied) = cold_status.local_applied_version {
-                applied_version_progression.push(applied);
-            }
-            update_large_history_page_totals(&mut pages, &mut seen_pages, &cold_status);
-            moving_head_observed = large_history_remote_head_caught_up(
-                moving_head_baseline,
-                warm_status.remote_head_version,
-                cold_status.local_applied_version,
-            );
-            if moving_head_observed {
-                break;
-            }
-            thread::sleep(LARGE_HISTORY_POLL_INTERVAL);
-        }
-        if !moving_head_observed {
-            return Err(ScenarioError::Io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "large-history cold-bootstrap client did not catch up to moving remote head",
-            )));
-        }
     }
     let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
     let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
@@ -1100,6 +1080,8 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
+    // This marker is written after the moving writer completes. Its visibility on the
+    // cold client is the ordered publication barrier for the preceding workload.
     operations.push(timed_hotspot_helper_fs_op_with_helper(
         context,
         started,
@@ -1120,11 +1102,46 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         "large-history final read-write convergence",
     )?;
     let final_read_write_converged = true;
+    if moving_writer_completed {
+        let moving_head_baseline = after_initial_status
+            .remote_head_version
+            .or(initial_remote_head);
+        let mut previous_remote_head = None;
+        while Instant::now() < deadline {
+            let warm_status = parse_large_history_status(&controller.status("client-a")?.stdout)?;
+            append_large_history_status(&status_path, "client-a", &warm_status)?;
+            let cold_status =
+                parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
+            append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &cold_status)?;
+            update_cold_checkpoint_version(&mut checkpoint_version, &cold_status);
+            if let Some(applied) = cold_status.local_applied_version {
+                applied_version_progression.push(applied);
+            }
+            update_large_history_page_totals(&mut pages, &mut seen_pages, &cold_status);
+            moving_head_observed = large_history_remote_head_caught_up(
+                moving_head_baseline,
+                previous_remote_head,
+                warm_status.remote_head_version,
+                cold_status.local_applied_version,
+            );
+            previous_remote_head = warm_status.remote_head_version;
+            if moving_head_observed {
+                break;
+            }
+            thread::sleep(LARGE_HISTORY_POLL_INTERVAL);
+        }
+        if !moving_head_observed {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "large-history cold-bootstrap client did not catch up to moving remote head",
+            )));
+        }
+    }
     write_namespace_collision_operations(context, &operations)?;
     let large_history = LargeHistorySummary {
         mutation_count,
-        // The mounted status boundary proves remote-head advancement and cold-client catch-up,
-        // not an exact per-operation PostgreSQL counter.
+        // The post-writer marker barrier plus stable-head catch-up confirms the expected
+        // workload is remotely visible; status does not expose an exact operation counter.
         remote_visible_mutations: if moving_head_observed {
             mutation_count
         } else {
@@ -1902,7 +1919,40 @@ mod tests {
         assert!(!large_history_remote_head_caught_up(
             Some(10),
             Some(20),
+            Some(20),
             Some(19),
         ));
+    }
+
+    #[test]
+    fn moving_head_requires_a_stable_final_remote_head() {
+        assert!(!large_history_remote_head_caught_up(
+            Some(10),
+            None,
+            Some(20),
+            Some(20)
+        ));
+        assert!(!large_history_remote_head_caught_up(
+            Some(10),
+            Some(20),
+            Some(21),
+            Some(21),
+        ));
+        assert!(large_history_remote_head_caught_up(
+            Some(10),
+            Some(20),
+            Some(20),
+            Some(20),
+        ));
+    }
+
+    #[test]
+    fn checkpoint_evidence_comes_only_from_cold_samples() {
+        let sample = parse_large_history_status("Lifecycle: Live\n").unwrap();
+        let mut checkpoint_version = None;
+
+        update_cold_checkpoint_version(&mut checkpoint_version, &sample);
+
+        assert_eq!(checkpoint_version, None);
     }
 }
