@@ -686,16 +686,19 @@ fn parse_status_version(value: &str) -> Option<u64> {
 }
 
 fn parse_status_bytes(value: &str) -> Option<u64> {
-    let mut parts = value.split_whitespace();
-    let amount = parts.next()?.parse::<f64>().ok()?;
-    let multiplier = match parts.next().unwrap_or("B") {
+    let value = value.trim();
+    let unit_start = value
+        .find(|character: char| character.is_ascii_alphabetic())
+        .unwrap_or(value.len());
+    let (amount, unit) = value.split_at(unit_start);
+    let multiplier = match unit.trim() {
         "B" => 1.0,
         "KiB" => 1024.0,
         "MiB" => 1024.0 * 1024.0,
         "GiB" => 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
-    Some((amount * multiplier) as u64)
+    Some((amount.trim().parse::<f64>().ok()? * multiplier) as u64)
 }
 
 fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, ScenarioError> {
@@ -1059,12 +1062,13 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    operations.push(timed_hotspot_helper_fs_op(
+    operations.push(timed_hotspot_helper_fs_op_with_helper(
         context,
         started,
         operations.len() + 1,
         &clients[0],
         "final_read_write_marker_create",
+        "write",
         &final_marker_path,
         LARGE_HISTORY_CONVERGENCE_TIMEOUT,
         Some(&final_marker_payload),
@@ -1806,5 +1810,14 @@ mod tests {
         assert!(sample.source_connected);
         assert_eq!(sample.current_page.unwrap().event_count, 512);
         assert_eq!(sample.last_page.unwrap().response_bytes, 60 * 1024);
+    }
+
+    #[test]
+    fn parses_compact_status_page_byte_units() {
+        let page = parse_status_page("52..52 (1 batch, 872 events, 75.8KiB, more=false)")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(page.response_bytes, 77_619);
     }
 }

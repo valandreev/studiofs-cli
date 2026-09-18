@@ -610,11 +610,12 @@ impl LargeHistorySummary {
             && self.remote_visible_mutations >= LARGE_HISTORY_MUTATION_COUNT
             && self.cold_client == LARGE_HISTORY_COLD_CLIENT
             && self.checkpoint_version.is_some()
-            && self.startup_target_version.is_some()
-            && self
-                .applied_version_progression
-                .windows(2)
-                .all(|versions| versions[0] <= versions[1])
+            && self.startup_target_version.is_some_and(|target| {
+                self.applied_version_progression
+                    .last()
+                    .copied()
+                    .is_some_and(|applied| applied >= target)
+            })
             && self.observed_page_count > 1
             && self.observed_event_rows > 0
             && self.observed_event_bytes > 0
@@ -634,6 +635,20 @@ impl LongHistoryValidation {
             unexpected_present_paths: Vec::new(),
             checksum_mismatches: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_history_match_accepts_restart_reset_and_moving_head() {
+        let mut summary = planned_large_history_summary();
+        summary.applied_version_progression = vec![30, 29, 50, 54];
+        summary.startup_target_version = Some(53);
+
+        assert!(summary.matched());
     }
 }
 

@@ -598,21 +598,47 @@ pub fn run_hotspot_op_helper(
             .parse::<usize>()
             .map_err(|error| anyhow::anyhow!("invalid bulk pair count {pair_count}: {error}"))?;
         fs::create_dir_all(&path)?;
-        for index in 0..pair_count {
-            let entry = path.join(format!("bulk-entry-{index:06}.txt"));
-            fs::write(&entry, b"x")?;
-            fs::remove_file(&entry)?;
-            if index % 1024 == 0 || index + 1 == pair_count {
-                record_hotspot_helper_progress(
-                    progress,
-                    "bulk_pair_complete",
-                    operation,
-                    &entry,
-                    target,
-                    Some(index + 1),
-                )?;
+        let worker_count = pair_count.clamp(1, 4);
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        let progress_lock = std::sync::Mutex::new(());
+        let root = &path;
+        std::thread::scope(|scope| -> Result<(), anyhow::Error> {
+            let mut workers = Vec::with_capacity(worker_count);
+            for worker in 0..worker_count {
+                let completed = &completed;
+                let progress_lock = &progress_lock;
+                workers.push(scope.spawn(move || -> Result<(), anyhow::Error> {
+                    let mut index = worker;
+                    while index < pair_count {
+                        let entry = root.join(format!("bulk-entry-{index:06}.txt"));
+                        fs::File::create(&entry)?;
+                        fs::remove_file(&entry)?;
+                        let finished = completed.fetch_add(1, Ordering::AcqRel) + 1;
+                        if finished.is_multiple_of(1024) || finished == pair_count {
+                            let _progress_guard = progress_lock
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("bulk progress lock poisoned"))?;
+                            record_hotspot_helper_progress(
+                                progress,
+                                "bulk_pair_complete",
+                                operation,
+                                &entry,
+                                target,
+                                Some(finished),
+                            )?;
+                        }
+                        index += worker_count;
+                    }
+                    Ok(())
+                }));
             }
-        }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("bulk helper worker panicked"))??;
+            }
+            Ok(())
+        })?;
         record_hotspot_helper_progress(
             progress,
             "bulk_complete",
