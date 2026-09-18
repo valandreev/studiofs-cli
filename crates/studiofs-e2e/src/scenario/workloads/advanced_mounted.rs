@@ -610,12 +610,10 @@ impl LargeHistorySummary {
             && self.remote_visible_mutations >= LARGE_HISTORY_MUTATION_COUNT
             && self.cold_client == LARGE_HISTORY_COLD_CLIENT
             && self.checkpoint_version.is_some()
-            && self.startup_target_version.is_some_and(|target| {
-                self.applied_version_progression
-                    .last()
-                    .copied()
-                    .is_some_and(|applied| applied >= target)
-            })
+            && self
+                .startup_target_version
+                .zip(self.applied_version_progression.last().copied())
+                .is_some_and(|(target, applied)| applied >= target)
             && self.observed_page_count > 1
             && self.observed_event_rows > 0
             && self.observed_event_bytes > 0
