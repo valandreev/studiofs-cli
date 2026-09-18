@@ -447,6 +447,21 @@ fn scenario_list_appends_symlink_attribute_after_invalidation_dropout() {
 }
 
 #[test]
+fn scenario_list_appends_large_history_cold_bootstrap_after_symlink_attribute() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(names[22], "mounted-symlink-attribute-convergence");
+    assert_eq!(
+        names[23],
+        "mounted-large-history-cold-bootstrap-convergence"
+    );
+}
+
+#[test]
 fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let request = RunRequest {
@@ -755,6 +770,62 @@ fn cold_observer_long_history_disabled_run_writes_reproducible_artifacts() {
             "expected cold-observer operation {expected}"
         );
     }
+}
+
+#[test]
+fn large_history_cold_bootstrap_disabled_run_writes_reproducible_artifacts() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("large-history-cold-bootstrap-contract-run".to_string()),
+        scenarios: vec!["mounted-large-history-cold-bootstrap-convergence".to_string()],
+        seed: 716,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(
+        outcome.scenarios[0].name,
+        "mounted-large-history-cold-bootstrap-convergence"
+    );
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("large-history-cold-bootstrap-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-large-history-cold-bootstrap-convergence/large-history-cold-bootstrap-summary.json",
+    ));
+
+    assert_eq!(
+        summary["scenario"],
+        "mounted-large-history-cold-bootstrap-convergence"
+    );
+    assert_eq!(summary["clients"], 4);
+    assert!(
+        summary["large_history"]["mutation_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 100_000)
+    );
+    assert_eq!(summary["large_history"]["cold_client"], "client-d");
+    assert_eq!(summary["large_history"]["restarted_during_catchup"], true);
+    assert_eq!(summary["large_history"]["moving_head_observed"], true);
+    assert!(summary["large_history"]["applied_version_progression"].is_array());
+    assert!(summary["large_history"]["observed_page_count"].is_number());
+    assert!(summary["large_history"]["observed_event_rows"].is_number());
+    assert!(summary["large_history"]["observed_event_bytes"].is_number());
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-large-history-cold-bootstrap-convergence/large-history-status.ndjson"
+            .to_string()
+    ));
 }
 
 #[test]

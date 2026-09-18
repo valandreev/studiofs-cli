@@ -607,6 +607,7 @@ mod tests {
             run_in_foreground: true,
             signal_handling: super::SignalHandling::Disabled,
             unmount_signal: Some(unmount_signal.clone()),
+            mount_ready_callback: None,
         };
         let mount = std::thread::spawn(move || super::mount_with_request(request));
         let ready_target = mount_point.join(std::str::from_utf8(ready_name).unwrap());

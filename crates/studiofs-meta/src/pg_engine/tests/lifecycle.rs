@@ -1402,7 +1402,7 @@ fn startup_catch_up_reports_rebootstrap_below_retained_event_log_floor() {
     )
     .expect("open stale metadata client");
     let error = engine
-        .sync_metadata()
+        .sync_metadata_with_source(MetadataSyncSource::Manual)
         .expect_err("a cursor below retained history must require rebootstrap");
 
     assert!(matches!(

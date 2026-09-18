@@ -93,6 +93,9 @@ pub const MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE: &str =
     "mounted-invalidation-dropout-fallback-convergence";
 /// Symlink attribute convergence scenario.
 pub const MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE: &str = "mounted-symlink-attribute-convergence";
+/// Opt-in large-history cold-bootstrap catch-up scenario.
+pub const MOUNTED_LARGE_HISTORY_COLD_BOOTSTRAP_CONVERGENCE: &str =
+    "mounted-large-history-cold-bootstrap-convergence";
 /// Manual Snapshot v2 recovery scenario.
 pub const SNAPSHOT_MANUAL_RECOVERY: &str = "snapshot-manual-recovery";
 /// Snapshot v2 materializer claimant takeover scenario.
@@ -111,6 +114,16 @@ const INVALIDATION_DROPOUT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "cl
 const INVALIDATION_DROPOUT_WRITER_CLIENTS: &[&str] = &["client-a", "client-b"];
 const INVALIDATION_DROPOUT_OBSERVER_CLIENT: &str = "client-c";
 const SYMLINK_ATTRIBUTE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const LARGE_HISTORY_MUTATION_COUNT: usize = 100_000;
+const LARGE_HISTORY_INITIAL_MUTATION_COUNT: usize = 90_000;
+const LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT: usize = 10_000;
+const LARGE_HISTORY_COLD_CLIENT: &str = "client-d";
+const LARGE_HISTORY_INITIAL_BATCH_PAIRS: usize = LARGE_HISTORY_INITIAL_MUTATION_COUNT / 2;
+const LARGE_HISTORY_MOVING_HEAD_BATCH_PAIRS: usize = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT / 2;
+const LARGE_HISTORY_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(600);
+const LARGE_HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LARGE_HISTORY_CATCHUP_BATCHES_PER_PAGE: &str = "1";
+const LARGE_HISTORY_CATCHUP_POLL_SECS: &str = "1";
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];

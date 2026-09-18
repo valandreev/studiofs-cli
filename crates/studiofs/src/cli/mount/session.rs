@@ -1567,7 +1567,9 @@ impl MountStatusMonitor {
             state: Mutex::new(MountStatusMonitorState {
                 attached: false,
                 failed: false,
-                last_published: None,
+                // `write_pid_file` already persisted this state. Do not let
+                // the first monitor poll overwrite a newer diagnostics record.
+                last_published: Some((utils::MountRecordStatus::Starting, None)),
             }),
             publication_lock: Mutex::new(()),
         })

@@ -807,7 +807,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         let command = self.init_command(0)?;
         let output = self.executor.run(&command)?;
-        ensure_success(&command, output)?;
+        ensure_success(&command, &output)?;
         self.clients[0].spec.state = ClientLifecycleState::Initialized;
         Ok(())
     }
@@ -820,7 +820,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         for index in 1..self.clients.len() {
             let command = self.discover_command(index)?;
             let output = self.executor.run(&command)?;
-            ensure_success(&command, output)?;
+            ensure_success(&command, &output)?;
             self.clients[index].spec.state = ClientLifecycleState::Discovered;
         }
         Ok(())
@@ -831,7 +831,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let index = self.client_index(client)?;
         let command = self.discover_command(index)?;
         let output = self.executor.run(&command)?;
-        ensure_success(&command, output)?;
+        ensure_success(&command, &output)?;
         self.clients[index].spec.state = ClientLifecycleState::Discovered;
         Ok(())
     }
@@ -894,7 +894,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         for (owner_index, volume_name) in volume_names.iter().enumerate() {
             let init_command = self.init_command_for_volume(owner_index, volume_name)?;
             let output = self.executor.run(&init_command)?;
-            ensure_success(&init_command, output)?;
+            ensure_success(&init_command, &output)?;
             self.clients[owner_index].spec.state = ClientLifecycleState::Initialized;
 
             let mut discovered_clients = Vec::new();
@@ -904,7 +904,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 }
                 let discover_command = self.discover_command_for_volume(index, volume_name)?;
                 let output = self.executor.run(&discover_command)?;
-                ensure_success(&discover_command, output)?;
+                ensure_success(&discover_command, &output)?;
                 self.clients[index].spec.state = ClientLifecycleState::Discovered;
                 discovered_clients.push(self.clients[index].spec.name.clone());
             }
@@ -976,6 +976,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn mount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.mount_index(index)
+    }
+
+    /// Runs `studiofs status` for a named client and returns its diagnostics output.
+    pub fn status(&self, client: &str) -> Result<ClientCommandOutput, ClientControllerError> {
+        let index = self.client_index(client)?;
+        let command = self.status_command(index)?;
+        let output = self.executor.run(&command)?;
+        ensure_success(&command, &output)?;
+        Ok(output)
     }
 
     /// Restarts (unmount then mount) a named client.
@@ -1237,7 +1246,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         let command = self.unmount_command(index)?;
         let output = self.executor.run(&command)?;
-        ensure_success(&command, output)?;
+        ensure_success(&command, &output)?;
         if let Some(process) = self.clients[index].process.as_mut()
             && let Err(primary) = wait_for_process_exit(
                 process.as_mut(),
@@ -1401,6 +1410,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.command(index, "mount", args)
     }
 
+    fn status_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {
+        let client = self.client(index)?;
+        let args = vec![
+            "status".to_string(),
+            client.volume_name.clone(),
+            "--cache-dir".to_string(),
+            client.cache_dir.display().to_string(),
+        ];
+        self.command(index, "status", args)
+    }
+
     fn unmount_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {
         let client = self.client(index)?;
         let args = vec![
@@ -1508,7 +1528,7 @@ struct ClientRuntime {
 
 fn ensure_success(
     command: &ClientCommand,
-    output: ClientCommandOutput,
+    output: &ClientCommandOutput,
 ) -> Result<(), ClientControllerError> {
     if output.status == 0 {
         Ok(())

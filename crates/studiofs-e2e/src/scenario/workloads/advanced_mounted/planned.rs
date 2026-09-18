@@ -72,6 +72,47 @@ pub(in crate::scenario) fn write_planned_catchup_diagnostics(
     write_catchup_diagnostics(context, &planned_catchup_summary())
 }
 
+pub(in crate::scenario) fn planned_large_history_summary() -> LargeHistorySummary {
+    LargeHistorySummary {
+        mutation_count: LARGE_HISTORY_MUTATION_COUNT + 1,
+        remote_visible_mutations: LARGE_HISTORY_MUTATION_COUNT + 1,
+        initial_mutation_count: LARGE_HISTORY_INITIAL_MUTATION_COUNT,
+        moving_head_mutation_count: LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT,
+        cold_client: LARGE_HISTORY_COLD_CLIENT.to_string(),
+        checkpoint_version: Some(0),
+        startup_target_version: Some((LARGE_HISTORY_MUTATION_COUNT + 1) as u64),
+        applied_version_progression: vec![0, (LARGE_HISTORY_MUTATION_COUNT + 1) as u64],
+        applied_version_restart_index: Some(1),
+        observed_page_count: 2,
+        observed_event_rows: (LARGE_HISTORY_MUTATION_COUNT + 1) as u64,
+        observed_event_bytes: (LARGE_HISTORY_MUTATION_COUNT + 1) as u64,
+        saw_catching_up: true,
+        restarted_during_catchup: true,
+        moving_head_observed: true,
+        reached_live: true,
+        final_read_write_converged: true,
+        final_marker_path: format!(
+            "{}/final-marker.txt",
+            AdvancedMountedKind::LargeHistoryColdBootstrap.path_root()
+        ),
+        wall_duration_ms: 0,
+    }
+}
+
+pub(in crate::scenario) fn write_planned_large_history_diagnostics(
+    context: &ScenarioContext,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context.scenario_dir.join("large-history-status.ndjson"),
+        serde_json::to_vec_pretty(&json!({
+            "mode": "planned",
+            "client": LARGE_HISTORY_COLD_CLIENT,
+            "mutation_count": LARGE_HISTORY_MUTATION_COUNT + 1,
+        }))?,
+    )?;
+    Ok(())
+}
+
 pub(in crate::scenario) fn write_planned_invalidation_dropout_diagnostics(
     context: &ScenarioContext,
     summary: &InvalidationDropoutSummary,

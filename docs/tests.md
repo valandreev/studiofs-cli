@@ -275,7 +275,7 @@ subscriber and requires an explicitly selected unused WinFSP drive.
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
 | Linux libfuse3 mount | `cargo test -p studiofs-linux-fuse mounted_ -- --ignored --nocapture --test-threads=1` |
 | macFUSE read/cache report fields | `cargo test -p studiofs-macfuse repeated_read_report_records_callback_distribution_and_cache_interpretation -- --nocapture` |
-| macFUSE FSKit native mount sanity | `STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- --ignored --nocapture --test-threads=1` |
+| macFUSE FSKit native mount sanity | `STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation cargo test -p studiofs-macfuse --features fskit-mount-sanity --test fskit_mount_sanity fskit_ -- --ignored --nocapture --test-threads=1` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
 ### Local-first VFS fast checks (no S3)
@@ -319,15 +319,20 @@ complete smoke-test strategy, CI integration, and self-hosted runner contract.
 
 The native FSKit scenarios live in
 `crates/studiofs-macfuse/tests/fskit_mount_sanity.rs`. They are compiled only
-when macOS and `MFMount.framework` are available and are marked `#[ignore]`
-because they require a real host mount. Run them explicitly with a mount root
-on an internal volume:
+when macOS, `MFMount.framework`, and the explicit `fskit-mount-sanity` Cargo
+feature are available. They are marked `#[ignore]` because they require a real
+host mount. Run them explicitly with a mount root on an internal volume:
 
 ```bash
 STUDIOFS_FSKIT_MOUNT_ROOT=/Volumes/studiofs/target/sfs-670-validation \
-cargo test -p studiofs-macfuse --test fskit_mount_sanity fskit_ -- \
+cargo test -p studiofs-macfuse --features fskit-mount-sanity \
+  --test fskit_mount_sanity fskit_ -- \
   --ignored --nocapture --test-threads=1
 ```
+
+The feature is intentionally opt-in while the macFUSE/FSKit lifecycle issue
+is being resolved, so the workspace-wide ignored test command does not start
+these native scenarios.
 
 The three scenarios cover FSKit read/unmount, pre-cancelled mount cleanup, and
 local hardlink unlink semantics. Each test uses a PID-scoped mountpoint and
@@ -380,6 +385,7 @@ cargo run -p studiofs-e2e -- run mounted-cold-observer-long-history-convergence 
 cargo run -p studiofs-e2e -- run mounted-stale-remount-cold-discover-catchup-convergence --seed 418 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-invalidation-dropout-fallback-convergence --seed 379 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-symlink-attribute-convergence --seed 380 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-large-history-cold-bootstrap-convergence --seed 716 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
