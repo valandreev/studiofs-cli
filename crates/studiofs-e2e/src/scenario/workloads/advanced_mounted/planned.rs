@@ -82,6 +82,7 @@ pub(in crate::scenario) fn planned_large_history_summary() -> LargeHistorySummar
         checkpoint_version: Some(0),
         startup_target_version: Some((LARGE_HISTORY_MUTATION_COUNT + 1) as u64),
         applied_version_progression: vec![0, (LARGE_HISTORY_MUTATION_COUNT + 1) as u64],
+        applied_version_restart_index: Some(1),
         observed_page_count: 2,
         observed_event_rows: (LARGE_HISTORY_MUTATION_COUNT + 1) as u64,
         observed_event_bytes: (LARGE_HISTORY_MUTATION_COUNT + 1) as u64,

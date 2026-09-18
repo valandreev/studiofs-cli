@@ -600,32 +600,41 @@ pub fn run_hotspot_op_helper(
         fs::create_dir_all(&path)?;
         let worker_count = pair_count.clamp(1, 4);
         let completed = std::sync::atomic::AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let progress_lock = std::sync::Mutex::new(());
         let root = &path;
         std::thread::scope(|scope| -> Result<(), anyhow::Error> {
             let mut workers = Vec::with_capacity(worker_count);
             for worker in 0..worker_count {
                 let completed = &completed;
+                let failed = &failed;
                 let progress_lock = &progress_lock;
                 workers.push(scope.spawn(move || -> Result<(), anyhow::Error> {
                     let mut index = worker;
-                    while index < pair_count {
+                    while index < pair_count && !failed.load(Ordering::Relaxed) {
                         let entry = root.join(format!("bulk-entry-{index:06}.txt"));
-                        fs::File::create(&entry)?;
-                        fs::remove_file(&entry)?;
-                        let finished = completed.fetch_add(1, Ordering::AcqRel) + 1;
-                        if finished.is_multiple_of(1024) || finished == pair_count {
-                            let _progress_guard = progress_lock
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("bulk progress lock poisoned"))?;
-                            record_hotspot_helper_progress(
-                                progress,
-                                "bulk_pair_complete",
-                                operation,
-                                &entry,
-                                target,
-                                Some(finished),
-                            )?;
+                        let result = (|| -> Result<(), anyhow::Error> {
+                            fs::File::create(&entry)?;
+                            fs::remove_file(&entry)?;
+                            let finished = completed.fetch_add(1, Ordering::AcqRel) + 1;
+                            if finished.is_multiple_of(1024) || finished == pair_count {
+                                let _progress_guard = progress_lock
+                                    .lock()
+                                    .map_err(|_| anyhow::anyhow!("bulk progress lock poisoned"))?;
+                                record_hotspot_helper_progress(
+                                    progress,
+                                    "bulk_pair_complete",
+                                    operation,
+                                    &entry,
+                                    target,
+                                    Some(finished),
+                                )?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = result {
+                            failed.store(true, Ordering::Relaxed);
+                            return Err(error);
                         }
                         index += worker_count;
                     }

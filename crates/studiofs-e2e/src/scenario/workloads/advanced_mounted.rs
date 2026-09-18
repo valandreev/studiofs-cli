@@ -585,6 +585,7 @@ pub(in crate::scenario) struct AdvancedMountedExecution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::scenario) struct LargeHistorySummary {
     pub(in crate::scenario) mutation_count: usize,
+    /// Expected workload count confirmed by remote-head progress; status does not expose an exact per-operation counter.
     pub(in crate::scenario) remote_visible_mutations: usize,
     pub(in crate::scenario) initial_mutation_count: usize,
     pub(in crate::scenario) moving_head_mutation_count: usize,
@@ -592,6 +593,8 @@ pub(in crate::scenario) struct LargeHistorySummary {
     pub(in crate::scenario) checkpoint_version: Option<u64>,
     pub(in crate::scenario) startup_target_version: Option<u64>,
     pub(in crate::scenario) applied_version_progression: Vec<u64>,
+    #[serde(default)]
+    pub(in crate::scenario) applied_version_restart_index: Option<usize>,
     pub(in crate::scenario) observed_page_count: usize,
     pub(in crate::scenario) observed_event_rows: u64,
     pub(in crate::scenario) observed_event_bytes: u64,
@@ -605,6 +608,26 @@ pub(in crate::scenario) struct LargeHistorySummary {
 }
 
 impl LargeHistorySummary {
+    fn applied_version_progression_is_monotonic(&self) -> bool {
+        let Some(restart_index) = self.applied_version_restart_index else {
+            return self
+                .applied_version_progression
+                .windows(2)
+                .all(|versions| versions[0] <= versions[1]);
+        };
+        self.applied_version_progression
+            .get(..restart_index)
+            .zip(self.applied_version_progression.get(restart_index..))
+            .is_some_and(|(before_restart, after_restart)| {
+                before_restart
+                    .windows(2)
+                    .all(|versions| versions[0] <= versions[1])
+                    && after_restart
+                        .windows(2)
+                        .all(|versions| versions[0] <= versions[1])
+            })
+    }
+
     fn matched(&self) -> bool {
         self.mutation_count >= LARGE_HISTORY_MUTATION_COUNT
             && self.remote_visible_mutations >= LARGE_HISTORY_MUTATION_COUNT
@@ -614,6 +637,7 @@ impl LargeHistorySummary {
                 .startup_target_version
                 .zip(self.applied_version_progression.last().copied())
                 .is_some_and(|(target, applied)| applied >= target)
+            && self.applied_version_progression_is_monotonic()
             && self.observed_page_count > 1
             && self.observed_event_rows > 0
             && self.observed_event_bytes > 0
@@ -641,9 +665,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_history_match_accepts_restart_reset_and_moving_head() {
+    fn large_history_match_rejects_intra_session_regression() {
+        let mut summary = planned_large_history_summary();
+        summary.applied_version_progression = vec![30, 31, 29, 54];
+        summary.applied_version_restart_index = Some(1);
+        summary.startup_target_version = Some(53);
+
+        assert!(!summary.matched());
+    }
+
+    #[test]
+    fn large_history_match_accepts_restart_reset_between_monotonic_sessions() {
         let mut summary = planned_large_history_summary();
         summary.applied_version_progression = vec![30, 29, 50, 54];
+        summary.applied_version_restart_index = Some(1);
         summary.startup_target_version = Some(53);
 
         assert!(summary.matched());

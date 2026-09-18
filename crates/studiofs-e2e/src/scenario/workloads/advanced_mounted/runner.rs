@@ -1,6 +1,7 @@
 //! Split from advanced mounted workload implementation.
 
 use super::*;
+use std::collections::HashSet;
 
 const EXPECT_ACTION_PAYLOAD_MSG: &str =
     "create and overwrite operations must have an action payload";
@@ -698,7 +699,7 @@ fn parse_status_bytes(value: &str) -> Option<u64> {
         "GiB" => 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
-    Some((amount.trim().parse::<f64>().ok()? * multiplier) as u64)
+    Some((amount.trim().parse::<f64>().ok()? * multiplier).round() as u64)
 }
 
 fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, ScenarioError> {
@@ -736,7 +737,7 @@ fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, Scen
                 .and_then(parse_status_version);
         } else if let Some(value) = detail.strip_prefix("more=") {
             has_more = Some(value == "true");
-        } else {
+        } else if detail != "oversized" {
             response_bytes = parse_status_bytes(detail);
         }
     }
@@ -832,13 +833,15 @@ fn append_large_history_status(
 
 fn update_large_history_page_totals(
     pages: &mut Vec<LargeHistoryPageSample>,
+    seen_pages: &mut HashSet<(Option<u64>, Option<u64>)>,
     sample: &LargeHistoryStatusSample,
 ) {
     for page in [&sample.current_page, &sample.last_page]
         .into_iter()
         .flatten()
     {
-        if !pages.contains(page) {
+        let key = (page.first_batch_version, page.last_batch_version);
+        if seen_pages.insert(key) {
             pages.push(page.clone());
         }
     }
@@ -850,6 +853,17 @@ fn large_history_remote_head_moved(before: Option<u64>, after: Option<u64>) -> b
         (None, Some(_)) => true,
         _ => false,
     }
+}
+
+fn large_history_remote_head_caught_up(
+    before: Option<u64>,
+    remote_head: Option<u64>,
+    local_applied: Option<u64>,
+) -> bool {
+    large_history_remote_head_moved(before, remote_head)
+        && remote_head
+            .zip(local_applied)
+            .is_some_and(|(remote_head, local_applied)| local_applied >= remote_head)
 }
 
 pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
@@ -957,9 +971,11 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
 
     let deadline = Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT;
     let mut pages = Vec::new();
+    let mut seen_pages = HashSet::new();
     let mut applied_version_progression = Vec::new();
     let mut checkpoint_version = after_initial_status.checkpoint_version;
     let mut startup_target_version = None;
+    let mut applied_version_restart_index = None;
     let mut saw_catching_up = false;
     let mut restarted_during_catchup = false;
     let mut moving_head_observed = false;
@@ -974,7 +990,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             if let Some(applied) = sample.local_applied_version {
                 applied_version_progression.push(applied);
             }
-            update_large_history_page_totals(&mut pages, &sample);
+            update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
             saw_catching_up |= sample.lifecycle == "CatchingUp";
 
             if saw_catching_up && moving_writer.is_none() {
@@ -1001,6 +1017,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             }
 
             if saw_catching_up && !restarted_during_catchup {
+                applied_version_restart_index = Some(applied_version_progression.len());
                 controller.restart(LARGE_HISTORY_COLD_CLIENT)?;
                 restarted_during_catchup = true;
                 operations.push(record_advanced_operation(
@@ -1039,15 +1056,36 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let reached_live = true;
     if let Some(writer_result) = writer_result {
         writer_result?;
-        let after_writer_status =
-            parse_large_history_status(&controller.status("client-a")?.stdout)?;
-        append_large_history_status(&status_path, "client-a", &after_writer_status)?;
-        moving_head_observed = large_history_remote_head_moved(
-            after_initial_status
-                .remote_head_version
-                .or(initial_remote_head),
-            after_writer_status.remote_head_version,
-        );
+        let moving_head_baseline = after_initial_status
+            .remote_head_version
+            .or(initial_remote_head);
+        while Instant::now() < deadline {
+            let warm_status = parse_large_history_status(&controller.status("client-a")?.stdout)?;
+            append_large_history_status(&status_path, "client-a", &warm_status)?;
+            let cold_status =
+                parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
+            append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &cold_status)?;
+            checkpoint_version = checkpoint_version.or(cold_status.checkpoint_version);
+            if let Some(applied) = cold_status.local_applied_version {
+                applied_version_progression.push(applied);
+            }
+            update_large_history_page_totals(&mut pages, &mut seen_pages, &cold_status);
+            moving_head_observed = large_history_remote_head_caught_up(
+                moving_head_baseline,
+                warm_status.remote_head_version,
+                cold_status.local_applied_version,
+            );
+            if moving_head_observed {
+                break;
+            }
+            thread::sleep(LARGE_HISTORY_POLL_INTERVAL);
+        }
+        if !moving_head_observed {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "large-history cold-bootstrap client did not catch up to moving remote head",
+            )));
+        }
     }
     let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
     let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
@@ -1085,6 +1123,8 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     write_namespace_collision_operations(context, &operations)?;
     let large_history = LargeHistorySummary {
         mutation_count,
+        // The mounted status boundary proves remote-head advancement and cold-client catch-up,
+        // not an exact per-operation PostgreSQL counter.
         remote_visible_mutations: if moving_head_observed {
             mutation_count
         } else {
@@ -1096,6 +1136,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         checkpoint_version,
         startup_target_version,
         applied_version_progression,
+        applied_version_restart_index,
         observed_page_count: pages.len(),
         observed_event_rows: pages.iter().map(|page| page.event_count).sum(),
         observed_event_bytes: pages.iter().map(|page| page.response_bytes).sum(),
@@ -1819,5 +1860,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(page.response_bytes, 77_619);
+    }
+
+    #[test]
+    fn parses_oversized_status_page_without_losing_byte_count() {
+        let page =
+            parse_status_page("52..52 (1 batch, 872 events, 75.8 KiB, more=false, oversized)")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(page.response_bytes, 77_619);
+    }
+
+    #[test]
+    fn rounds_fractional_status_page_byte_units() {
+        let page = parse_status_page("52..52 (1 batch, 872 events, 1.9KiB, more=false)")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(page.response_bytes, 1_946);
+    }
+
+    #[test]
+    fn page_totals_deduplicate_repeated_page_ranges() {
+        let sample = parse_large_history_status(
+            "Lifecycle: CatchingUp\n\
+             Current page: 52..52 (1 batch, 1 event, 1 KiB, more=false)\n\
+             Last page: 52..52 (1 batch, 1 event, 1 KiB, more=false)\n",
+        )
+        .unwrap();
+        let mut pages = Vec::new();
+        let mut seen_pages = std::collections::HashSet::new();
+
+        update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
+
+        assert_eq!(pages.len(), 1);
+    }
+
+    #[test]
+    fn moving_head_requires_cold_client_to_reach_observed_head() {
+        assert!(!large_history_remote_head_caught_up(
+            Some(10),
+            Some(20),
+            Some(19),
+        ));
     }
 }
