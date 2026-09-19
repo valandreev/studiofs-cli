@@ -2359,24 +2359,38 @@ fn windows_mount_io_is_ready(mount_point: &Path, write_capable: bool) -> io::Res
         ".studiofs-e2e-readiness-{}.tmp",
         uuid::Uuid::new_v4().simple()
     ));
-    windows_mount_io_is_ready_with(|| {
+    windows_mount_io_is_ready_with(write_capable, || {
         let mut options = OpenOptions::new();
         options.read(!write_capable).write(write_capable);
-        options.open(&probe_path).map(|_| ())
+        if !write_capable {
+            return options.open(&probe_path).map(|_| ());
+        }
+
+        options.create_new(true);
+        let mut file = options.open(&probe_path)?;
+        let result = file
+            .write_all(b"studiofs-e2e-readiness")
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if result.is_ok() {
+            fs::remove_file(&probe_path)?;
+        } else {
+            let _ = fs::remove_file(&probe_path);
+        }
+        result
     })
 }
 
 #[cfg(windows)]
-fn windows_mount_io_is_ready_with<F>(probe: F) -> io::Result<bool>
+fn windows_mount_io_is_ready_with<F>(write_capable: bool, probe: F) -> io::Result<bool>
 where
     F: FnOnce() -> io::Result<()>,
 {
     match probe() {
         Ok(()) => Ok(true),
-        // The probe name is unique and is expected not to exist. A native
-        // not-found response proves that the mount accepted the open request
-        // and reached the filesystem callback.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        // Read-only probes intentionally target a nonexistent path, while a
+        // write-capable probe must create its unique path successfully.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(!write_capable),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
         Err(error) => Err(error),
     }
@@ -3280,16 +3294,24 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
     #[cfg(windows)]
     #[test]
     fn windows_mount_io_readiness_treats_driver_access_errors_as_transient() {
-        assert!(windows_mount_io_is_ready_with(|| Ok(())).unwrap());
+        assert!(windows_mount_io_is_ready_with(false, || Ok(())).unwrap());
         assert!(
-            !windows_mount_io_is_ready_with(|| {
+            !windows_mount_io_is_ready_with(true, || {
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             })
             .unwrap()
         );
         assert!(
-            windows_mount_io_is_ready_with(|| { Err(io::Error::from(io::ErrorKind::NotFound)) })
-                .unwrap()
+            !windows_mount_io_is_ready_with(true, || {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap()
+        );
+        assert!(
+            windows_mount_io_is_ready_with(false, || {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap()
         );
     }
 
