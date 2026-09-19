@@ -2362,10 +2362,7 @@ fn windows_mount_io_is_ready(mount_point: &Path, write_capable: bool) -> io::Res
     windows_mount_io_is_ready_with(|| {
         let mut options = OpenOptions::new();
         options.read(!write_capable).write(write_capable);
-        match options.open(&probe_path) {
-            Ok(_) => Ok(()),
-            Err(error) => Err(error),
-        }
+        options.open(&probe_path).map(|_| ())
     })
 }
 
@@ -2648,10 +2645,10 @@ fn force_unmount_stale_windows_mount(
         }
     }
 
-    if let Err(error) = wait_for_windows_mount_detached(
-        &root,
+    if let Err(error) = wait_for_windows_mount_detached_with(
         WINDOWS_STALE_UNMOUNT_TIMEOUT,
         WINDOWS_STALE_UNMOUNT_POLL_INTERVAL,
+        || mount_point_is_active(&root),
     ) {
         let readiness = readiness_error
             .map(|err| format!("; readiness probe error: {err}"))
@@ -2666,15 +2663,6 @@ fn force_unmount_stale_windows_mount(
     }
 
     Ok(())
-}
-
-#[cfg(windows)]
-fn wait_for_windows_mount_detached(
-    root: &Path,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> io::Result<()> {
-    wait_for_windows_mount_detached_with(timeout, poll_interval, || mount_point_is_active(root))
 }
 
 #[cfg(windows)]
