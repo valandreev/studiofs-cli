@@ -4766,6 +4766,54 @@ fn pg_background_checkpoint_coordinator_coalesces_two_clients_and_publishes_exac
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_coordinator_rechecks_authoritative_freshness_after_coordination_miss() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-coordination-miss");
+    let (_dir, engine) = open_pg_publisher(&volume);
+
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 10000, total_event_payload_bytes = 10000 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("advance remote head for checkpoint freshness");
+    engine.local_version.store(10_000, Ordering::Release);
+    engine.observe_checkpoint_freshness();
+    assert!(
+        engine.checkpoint_freshness_diagnostics().refresh_needed,
+        "the initial remote head must require a checkpoint refresh"
+    );
+
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET checkpoint_version = 10000, checkpoint_total_event_bytes = 10000, checkpoint_updated_at = now() WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("publish authoritative checkpoint state");
+
+    assert!(
+        engine.refresh_checkpoint_freshness_after_coordination_miss(),
+        "a coordination miss must report fresh state after the peer publishes"
+    );
+    assert!(!engine.checkpoint_freshness_diagnostics().refresh_needed);
+    engine.prepare_for_close().expect("close pg engine");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_checkpoint_coordinator_skips_unflushed_local_batch() {
     let Some(dsn) = pg_dsn() else {
         return;

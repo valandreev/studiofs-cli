@@ -195,7 +195,7 @@ impl PgMetaEngine {
                 owner = %owner,
                 "checkpoint lease is currently held by another node; backing off"
             );
-            return Ok(false);
+            return Ok(self.refresh_checkpoint_freshness_after_coordination_miss());
         };
 
         let result = self.build_and_publish_checkpoint(&owner, lease, cut);
@@ -207,6 +207,11 @@ impl PgMetaEngine {
             );
         }
         result
+    }
+
+    pub(super) fn refresh_checkpoint_freshness_after_coordination_miss(&self) -> bool {
+        self.observe_checkpoint_freshness();
+        !self.checkpoint_freshness_diagnostics().refresh_needed
     }
 
     pub(super) fn write_checkpoint_with_lease(&self) -> MetaResult<()> {
@@ -241,7 +246,7 @@ impl PgMetaEngine {
         let Some(observation) =
             self.publish_checkpoint_if_source_cut_is_current(owner, lease, cut, checkpoint)?
         else {
-            return Ok(false);
+            return Ok(self.refresh_checkpoint_freshness_after_coordination_miss());
         };
 
         self.record_checkpoint_freshness_observation(observation);
