@@ -698,6 +698,15 @@ impl StudioVfs {
                         break;
                     }
                     Err(error) => {
+                        if Self::is_namespace_entry_conflict(&error) {
+                            self.abandon_failed_deferred_namespace_batch(&batch, &error);
+                            warn!(
+                                error = %error,
+                                operations = batch.len(),
+                                "deferred namespace metadata batch lost a concurrent namespace conflict; abandoning batch without degrading mount"
+                            );
+                            break;
+                        }
                         attempts += 1;
                         if attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
                             self.state
@@ -730,6 +739,14 @@ impl StudioVfs {
                 }
             }
         }
+    }
+
+    fn is_namespace_entry_conflict(error: &VfsError) -> bool {
+        matches!(
+            error,
+            VfsError::Meta(MetaError::NamespaceBatchOperation { source, .. })
+                if matches!(source.as_ref(), MetaError::EntryExists { .. })
+        )
     }
 
     fn deferred_namespace_mutation(op: &DeferredNamespaceOp) -> NamespaceMutation {

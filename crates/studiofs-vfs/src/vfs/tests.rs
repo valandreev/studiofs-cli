@@ -14121,6 +14121,56 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
 }
 
 #[test]
+fn deferred_namespace_entry_conflict_does_not_degrade_mount() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-entry-conflict");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let deferred = InodeAttr::new_file(9_100_002, ROOT_INO, 0, 0, 0o644);
+        vfs.enqueue_deferred_namespace_op(
+            Some(super::namespace::DeferredNamespaceKey::new(
+                ROOT_INO,
+                b"conflict.txt",
+            )),
+            deferred.clone(),
+            super::namespace::DeferredNamespaceOp::CreateFile {
+                attr: deferred.clone(),
+                parent: ROOT_INO,
+                name: b"conflict.txt".to_vec(),
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            },
+        )
+        .expect("admit deferred create");
+
+        meta.create_file_with_ino(9_100_003, ROOT_INO, b"conflict.txt", 0, 0, 0o644)
+            .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.wait_for_deferred_namespace_metadata(deferred.ino),
+        )
+        .await
+        .expect("deferred conflict should settle")
+        .expect_err("the losing deferred create should report the namespace conflict");
+        assert!(
+            error.to_string().contains("entry already exists"),
+            "unexpected deferred conflict error: {error}"
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "a concurrent namespace conflict must not degrade the mount"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_degradation_does_not_fail_read_only_flush() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) =
