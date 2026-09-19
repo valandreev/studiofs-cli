@@ -37,6 +37,12 @@ const MACOS_DISKUTIL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 const MACOS_MOUNT_TABLE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const WINDOWS_STALE_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(windows)]
+const WINDOWS_STALE_UNMOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const WINDOWS_STALE_UNMOUNT_STABLE_PROBES: usize = 3;
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
 const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
@@ -390,6 +396,17 @@ pub trait ClientProcessExecutor {
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
     /// Probe if a client mount point is already active.
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool>;
+    /// Probe if a spawned client has completed native mount readiness.
+    ///
+    /// The default keeps test and non-native executors compatible: their
+    /// mount probe already represents the complete readiness contract.
+    fn is_mount_ready_for_process(
+        &self,
+        command: &ClientCommand,
+        _process_id: u32,
+    ) -> io::Result<bool> {
+        self.is_mount_ready(command)
+    }
     /// Remove stale mounts that may remain from previous runs.
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
         Ok(())
@@ -443,6 +460,37 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
         #[cfg(not(target_os = "macos"))]
         let active = mount_point_is_active(&command.mount_point)?;
         Ok(active)
+    }
+
+    fn is_mount_ready_for_process(
+        &self,
+        command: &ClientCommand,
+        process_id: u32,
+    ) -> io::Result<bool> {
+        #[cfg(windows)]
+        {
+            if !mount_point_is_active(&command.mount_point)? {
+                return Ok(false);
+            }
+            if !windows_mount_lifecycle_is_ready(
+                &command.client_root,
+                &command.mount_point,
+                process_id,
+            )? {
+                return Ok(false);
+            }
+            let write_capable = !command
+                .args
+                .iter()
+                .any(|argument| argument == "--read-only");
+            windows_mount_io_is_ready(&command.mount_point, write_capable)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = process_id;
+            self.is_mount_ready(command)
+        }
     }
 
     fn cleanup_stale_mount_before_remount(&self, command: &ClientCommand) -> io::Result<()> {
@@ -1485,7 +1533,10 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     ),
                 });
             }
-            if self.executor.is_mount_ready(command)? {
+            if self
+                .executor
+                .is_mount_ready_for_process(command, process.id())?
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -2263,6 +2314,78 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Deserialize)]
+struct WindowsMountLifecycleRecord {
+    pid: u32,
+    status: String,
+}
+
+#[cfg(windows)]
+fn windows_mount_lifecycle_is_ready(
+    client_root: &Path,
+    mount_point: &Path,
+    process_id: u32,
+) -> io::Result<bool> {
+    let mount_name = mount_point
+        .to_string_lossy()
+        .replace(['\\', '/', ':'], "_")
+        .trim_matches('_')
+        .to_lowercase();
+    let mount_name = if mount_name.is_empty() {
+        "root"
+    } else {
+        mount_name.as_str()
+    };
+    let record_path = client_root
+        .join("mounts")
+        .join(format!("{mount_name}.json"));
+    let data = match fs::read_to_string(record_path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let record = match serde_json::from_str::<WindowsMountLifecycleRecord>(&data) {
+        Ok(record) => record,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(record.pid == process_id
+        && matches!(record.status.as_str(), "mounted" | "live" | "degraded"))
+}
+
+#[cfg(windows)]
+fn windows_mount_io_is_ready(mount_point: &Path, write_capable: bool) -> io::Result<bool> {
+    let probe_path = mount_point.join(format!(
+        ".studiofs-e2e-readiness-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    windows_mount_io_is_ready_with(|| {
+        let mut options = OpenOptions::new();
+        options.read(!write_capable).write(write_capable);
+        match options.open(&probe_path) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+#[cfg(windows)]
+fn windows_mount_io_is_ready_with<F>(probe: F) -> io::Result<bool>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    match probe() {
+        Ok(()) => Ok(true),
+        // The probe name is unique and is expected not to exist. A native
+        // not-found response proves that the mount accepted the open request
+        // and reached the filesystem callback.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
 fn is_windows_drive_mount_point(path: &Path) -> bool {
     windows_drive_root(path).is_some()
 }
@@ -2283,11 +2406,11 @@ pub(crate) fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> 
 
 #[cfg(windows)]
 pub(crate) fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
-    match mount_point_is_active(path) {
-        Ok(false) => Ok(()),
-        Ok(true) => force_unmount_stale_windows_mount(path, None),
-        Err(err) => force_unmount_stale_windows_mount(path, Some(err)),
-    }
+    // A force-killed WinFSP process can make the drive root disappear before
+    // the kernel and Mount Manager have finished detaching it. The inactive
+    // result therefore still needs a bounded stability wait.
+    let readiness_error = mount_point_is_active(path).err();
+    force_unmount_stale_windows_mount(path, readiness_error)
 }
 
 #[cfg(target_os = "macos")]
@@ -2496,51 +2619,97 @@ fn force_unmount_stale_windows_mount(
     ];
 
     let mut diagnostics = Vec::new();
-    for (program, args) in attempts {
-        match Command::new(program).args(*args).output() {
-            Ok(output) if output.status.success() => {
-                if !mount_point_is_active(&root)? {
-                    return Ok(());
-                }
-                diagnostics.push(format!(
-                    "{} {} exited successfully but {} is still active",
+    if mount_point_is_active(&root).unwrap_or(true) {
+        for (program, args) in attempts {
+            match Command::new(program).args(*args).output() {
+                Ok(output) if output.status.success() => diagnostics.push(format!(
+                    "{} {} exited successfully; waiting for {} to detach",
                     program,
                     args.join(" "),
                     root.display()
-                ));
+                )),
+                Ok(output) => diagnostics.push(format!(
+                    "{} {} exited with {}; stderr: {}; stdout: {}",
+                    program,
+                    args.join(" "),
+                    output.status.code().unwrap_or(-1),
+                    diagnostic_excerpt(&String::from_utf8_lossy(&output.stderr)),
+                    diagnostic_excerpt(&String::from_utf8_lossy(&output.stdout))
+                )),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => diagnostics.push(format!(
+                    "{program} was not found while cleaning stale Windows mount {}",
+                    root.display()
+                )),
+                Err(err) => diagnostics.push(format!(
+                    "{program} failed while cleaning stale Windows mount {}: {err}",
+                    root.display()
+                )),
             }
-            Ok(output) => diagnostics.push(format!(
-                "{} {} exited with {}; stderr: {}; stdout: {}",
-                program,
-                args.join(" "),
-                output.status.code().unwrap_or(-1),
-                diagnostic_excerpt(&String::from_utf8_lossy(&output.stderr)),
-                diagnostic_excerpt(&String::from_utf8_lossy(&output.stdout))
-            )),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => diagnostics.push(format!(
-                "{program} was not found while cleaning stale Windows mount {}",
-                root.display()
-            )),
-            Err(err) => diagnostics.push(format!(
-                "{program} failed while cleaning stale Windows mount {}: {err}",
-                root.display()
-            )),
         }
     }
 
-    if !mount_point_is_active(&root)? {
-        return Ok(());
+    if let Err(error) = wait_for_windows_mount_detached(
+        &root,
+        WINDOWS_STALE_UNMOUNT_TIMEOUT,
+        WINDOWS_STALE_UNMOUNT_POLL_INTERVAL,
+    ) {
+        let readiness = readiness_error
+            .map(|err| format!("; readiness probe error: {err}"))
+            .unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "failed to force-unmount stale Windows mount {}{}; {}; attempts: {}",
+            root.display(),
+            readiness,
+            error,
+            diagnostics.join(" | ")
+        )));
     }
 
-    let readiness = readiness_error
-        .map(|err| format!("; readiness probe error: {err}"))
-        .unwrap_or_default();
-    Err(io::Error::other(format!(
-        "failed to force-unmount stale Windows mount {}{}; attempts: {}",
-        root.display(),
-        readiness,
-        diagnostics.join(" | ")
-    )))
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_windows_mount_detached(
+    root: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> io::Result<()> {
+    wait_for_windows_mount_detached_with(timeout, poll_interval, || mount_point_is_active(root))
+}
+
+#[cfg(windows)]
+fn wait_for_windows_mount_detached_with<F>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut is_active: F,
+) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<bool>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut inactive_probes = 0;
+    loop {
+        if is_active()? {
+            inactive_probes = 0;
+        } else {
+            inactive_probes += 1;
+            if inactive_probes >= WINDOWS_STALE_UNMOUNT_STABLE_PROBES {
+                return Ok(());
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "Windows mount did not remain detached for {} consecutive probes within {} ms",
+                    WINDOWS_STALE_UNMOUNT_STABLE_PROBES,
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        std::thread::sleep(poll_interval.max(Duration::from_millis(1)));
+    }
 }
 
 #[cfg(windows)]
@@ -3094,5 +3263,63 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
     #[test]
     fn windows_drive_arg_strips_root_backslash_for_net_use() {
         assert_eq!(windows_drive_arg(Path::new("Z:\\")).unwrap(), "Z:");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mount_readiness_requires_current_process_lifecycle_record() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let mount_point = PathBuf::from("Z:\\");
+        let record_path = temp.path().join("mounts").join("z.json");
+        fs::create_dir_all(record_path.parent().expect("record parent")).unwrap();
+        fs::write(
+            &record_path,
+            serde_json::json!({"pid": 42, "status": "starting"}).to_string(),
+        )
+        .unwrap();
+
+        assert!(!windows_mount_lifecycle_is_ready(temp.path(), &mount_point, 42).unwrap());
+
+        fs::write(
+            &record_path,
+            serde_json::json!({"pid": 42, "status": "mounted"}).to_string(),
+        )
+        .unwrap();
+        assert!(windows_mount_lifecycle_is_ready(temp.path(), &mount_point, 42).unwrap());
+        assert!(!windows_mount_lifecycle_is_ready(temp.path(), &mount_point, 43).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mount_io_readiness_treats_driver_access_errors_as_transient() {
+        assert!(windows_mount_io_is_ready_with(|| Ok(())).unwrap());
+        assert!(
+            !windows_mount_io_is_ready_with(|| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .unwrap()
+        );
+        assert!(
+            windows_mount_io_is_ready_with(|| { Err(io::Error::from(io::ErrorKind::NotFound)) })
+                .unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stale_mount_detach_requires_stable_inactive_observations() {
+        let mut observations = [false, true, false, false, false].into_iter();
+        let mut probes = 0;
+
+        wait_for_windows_mount_detached_with(Duration::from_secs(1), Duration::ZERO, || {
+            probes += 1;
+            Ok(observations.next().unwrap_or(false))
+        })
+        .expect("mount should become stably inactive");
+
+        assert_eq!(
+            probes, 5,
+            "a transient inactive probe must not finish detach"
+        );
     }
 }
