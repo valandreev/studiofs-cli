@@ -14127,22 +14127,7 @@ fn deferred_namespace_entry_conflict_does_not_degrade_mount() {
     let _guard = rt.enter();
     rt.block_on(async {
         let deferred = InodeAttr::new_file(9_100_002, ROOT_INO, 0, 0, 0o644);
-        vfs.enqueue_deferred_namespace_op(
-            Some(super::namespace::DeferredNamespaceKey::new(
-                ROOT_INO,
-                b"conflict.txt",
-            )),
-            deferred.clone(),
-            super::namespace::DeferredNamespaceOp::CreateFile {
-                attr: deferred.clone(),
-                parent: ROOT_INO,
-                name: b"conflict.txt".to_vec(),
-                uid: 0,
-                gid: 0,
-                mode: 0o644,
-            },
-        )
-        .expect("admit deferred create");
+        enqueue_deferred_namespace_create(&vfs, &deferred, b"conflict.txt");
 
         meta.create_file_with_ino(9_100_003, ROOT_INO, b"conflict.txt", 0, 0, 0o644)
             .expect("persist competing namespace entry");
