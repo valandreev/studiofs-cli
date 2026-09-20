@@ -1087,6 +1087,16 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.mount_index(index, true)
     }
 
+    /// Restarts a client while accepting native lifecycle readiness before I/O is writable.
+    pub fn restart_until_lifecycle_ready(
+        &mut self,
+        client: &str,
+    ) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.unmount_index(index)?;
+        self.mount_index(index, false)
+    }
+
     /// Force-kills a named client process and marks it as killed.
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
@@ -2885,6 +2895,74 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    struct TestClientProcess {
+        id: u32,
+        exited: bool,
+    }
+
+    #[cfg(windows)]
+    impl ClientProcess for TestClientProcess {
+        fn id(&self) -> u32 {
+            self.id
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(self.exited.then_some(0))
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.exited = true;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    struct ReadinessProbeExecutor {
+        probes: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(windows)]
+    impl ClientProcessExecutor for ReadinessProbeExecutor {
+        fn run(&self, _command: &ClientCommand) -> io::Result<ClientCommandOutput> {
+            Ok(ClientCommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        fn spawn(&self, _command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>> {
+            Ok(Box::new(TestClientProcess {
+                id: 2,
+                exited: false,
+            }))
+        }
+
+        fn is_mount_ready(&self, _command: &ClientCommand) -> io::Result<bool> {
+            self.probes.lock().unwrap().push("preflight");
+            Ok(false)
+        }
+
+        fn is_mount_ready_for_process(
+            &self,
+            _command: &ClientCommand,
+            _process_id: u32,
+        ) -> io::Result<bool> {
+            self.probes.lock().unwrap().push("io");
+            Ok(false)
+        }
+
+        fn is_mount_lifecycle_ready_for_process(
+            &self,
+            _command: &ClientCommand,
+            _process_id: u32,
+        ) -> io::Result<bool> {
+            self.probes.lock().unwrap().push("lifecycle");
+            Ok(true)
+        }
+    }
+
     #[test]
     fn mount_metadata_persists_the_external_mount_root() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
@@ -2906,6 +2984,55 @@ mod tests {
             metadata["mount_root"],
             serde_json::Value::String("/Volumes/studiofs-review".to_string())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_until_lifecycle_ready_does_not_require_mount_io() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let probes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = ClientControllerConfig {
+            studiofs_bin: PathBuf::from("studiofs"),
+            sandbox: temp.path().to_path_buf(),
+            volume_name: "projectfs".to_string(),
+            meta_dsn: "postgres://127.0.0.1:1/studiofs".to_string(),
+            s3: S3Config {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "bucket".to_string(),
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            mount_ready_timeout: Duration::from_millis(100),
+            mount_exit_timeout: Duration::ZERO,
+            poll_interval: Duration::ZERO,
+            mount_points: vec![temp.path().join("mount")],
+            client_env_overrides: BTreeMap::new(),
+            mount_arg_overrides: BTreeMap::new(),
+        };
+        let mut controller = MultiClientController::new(
+            config,
+            ReadinessProbeExecutor {
+                probes: std::sync::Arc::clone(&probes),
+            },
+        );
+        controller
+            .create_clients(["client-a"])
+            .expect("create test client");
+        controller.clients[0].process = Some(Box::new(TestClientProcess {
+            id: 1,
+            exited: true,
+        }));
+        controller.clients[0].spec.process_id = Some(1);
+        controller.clients[0].spec.state = ClientLifecycleState::Mounted;
+
+        controller
+            .restart_until_lifecycle_ready("client-a")
+            .expect("lifecycle-only restart should succeed");
+
+        let probes = probes.lock().unwrap();
+        assert!(probes.contains(&"lifecycle"));
+        assert!(!probes.contains(&"io"));
     }
 
     #[test]

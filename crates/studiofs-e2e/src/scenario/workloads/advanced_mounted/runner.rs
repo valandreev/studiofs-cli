@@ -1036,7 +1036,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                     &isolation.root,
                     Ok(()),
                 ));
-                controller.restart(LARGE_HISTORY_COLD_CLIENT)?;
+                controller.restart_until_lifecycle_ready(LARGE_HISTORY_COLD_CLIENT)?;
                 restarted_during_catchup = true;
                 operations.push(record_advanced_operation(
                     started,

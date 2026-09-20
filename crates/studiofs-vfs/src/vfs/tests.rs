@@ -14193,6 +14193,52 @@ fn deferred_namespace_entry_conflict_does_not_degrade_mount() {
 }
 
 #[test]
+fn deferred_namespace_entry_conflict_retries_nonconflicting_operations() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "deferred-namespace-entry-conflict-retries-remainder");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let survivor = InodeAttr::new_file(9_100_004, ROOT_INO, 0, 0, 0o644);
+        let deferred_conflict = InodeAttr::new_file(9_100_005, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &survivor, b"survivor.txt");
+        enqueue_deferred_namespace_create(&vfs, &deferred_conflict, b"conflict.txt");
+
+        meta.create_file_with_ino(9_100_006, ROOT_INO, b"conflict.txt", 0, 0, 0o644)
+            .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        vfs.wait_for_deferred_namespace_metadata(survivor.ino)
+            .await
+            .expect("the nonconflicting deferred create should be retried and committed");
+        let persisted = meta
+            .lookup(ROOT_INO, b"survivor.txt")
+            .expect("the nonconflicting deferred create should remain persisted");
+        assert_eq!(persisted.ino, survivor.ino);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.wait_for_deferred_namespace_metadata(deferred_conflict.ino),
+        )
+        .await
+        .expect("deferred conflict should settle")
+        .expect_err("the losing deferred create should report the namespace conflict");
+        assert!(
+            error.to_string().contains("entry already exists"),
+            "unexpected deferred conflict error: {error}"
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "a concurrent namespace conflict must not degrade the mount"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_degradation_does_not_fail_read_only_flush() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) =

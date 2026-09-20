@@ -244,6 +244,38 @@ fn removing_regular_file_graph_does_not_create_remote_backlog() {
 }
 
 #[test]
+fn removing_published_regular_file_graph_does_not_remain_local_only() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"published-graph-remove.txt", 77_006);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge published setup");
+    {
+        let mut state = pg.pending_state.lock().expect("pending_state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+
+    pg.remove_regular_file_graph(file.ino)
+        .expect("remove published file graph");
+
+    let graph_end = pg.local.get_counter("nextEventSeq").expect("graph end");
+    let state = pg.pending_state.lock().expect("pending_state");
+    assert_eq!(
+        state.ops, 0,
+        "graph cleanup itself is not a remote-visible operation"
+    );
+    assert!(
+        state.event_start.is_none(),
+        "published graph cleanup must not be retained as a local-only pending range"
+    );
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        graph_end,
+        "published graph cleanup must advance the local projection cursor"
+    );
+}
+
+#[test]
 fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.local.get_counter("nextEventSeq").expect("baseline seq");

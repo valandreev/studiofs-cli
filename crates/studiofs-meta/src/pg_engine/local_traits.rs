@@ -256,10 +256,12 @@ impl MetaPayloadObjects for PgMetaEngine {
     }
 
     fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        self.mutate_with_hint(
-            |local| local.remove_regular_file_graph(ino),
-            |_| PendingMutationHint::LocalOnly,
-        )
+        let hint = if self.current_inode_is_unpublished_regular(ino)? {
+            PendingMutationHint::LocalOnly
+        } else {
+            PendingMutationHint::Unknown
+        };
+        self.mutate_with_hint(|local| local.remove_regular_file_graph(ino), |_| hint)
     }
 
     fn next_object_id(&self) -> MetaResult<u64> {

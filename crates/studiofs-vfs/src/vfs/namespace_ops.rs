@@ -698,14 +698,24 @@ impl StudioVfs {
                         break;
                     }
                     Err(error) => {
-                        if Self::is_namespace_entry_conflict(&error) {
-                            self.abandon_failed_deferred_namespace_batch(&batch, &error);
+                        if let Some(conflict_index) = Self::namespace_entry_conflict_index(&error)
+                            .filter(|index| *index < batch.len())
+                        {
+                            let conflicting_operation = batch.remove(conflict_index);
+                            self.abandon_failed_deferred_namespace_batch(
+                                std::slice::from_ref(&conflicting_operation),
+                                &error,
+                            );
                             warn!(
                                 error = %error,
-                                operations = batch.len(),
-                                "deferred namespace metadata batch lost a concurrent namespace conflict; abandoning batch without degrading mount"
+                                conflict_index,
+                                remaining_operations = batch.len(),
+                                "deferred namespace metadata operation lost a concurrent namespace conflict; retrying the remaining batch without degrading mount"
                             );
-                            break;
+                            if batch.is_empty() {
+                                break;
+                            }
+                            continue;
                         }
                         attempts += 1;
                         if attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
@@ -741,12 +751,15 @@ impl StudioVfs {
         }
     }
 
-    fn is_namespace_entry_conflict(error: &VfsError) -> bool {
-        matches!(
-            error,
-            VfsError::Meta(MetaError::NamespaceBatchOperation { source, .. })
-                if matches!(source.as_ref(), MetaError::EntryExists { .. })
-        )
+    fn namespace_entry_conflict_index(error: &VfsError) -> Option<usize> {
+        match error {
+            VfsError::Meta(MetaError::NamespaceBatchOperation { index, source })
+                if matches!(source.as_ref(), MetaError::EntryExists { .. }) =>
+            {
+                Some(*index)
+            }
+            _ => None,
+        }
     }
 
     fn deferred_namespace_mutation(op: &DeferredNamespaceOp) -> NamespaceMutation {
