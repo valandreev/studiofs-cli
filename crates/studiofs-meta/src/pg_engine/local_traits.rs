@@ -65,12 +65,10 @@ impl MetaInodes for PgMetaEngine {
     }
 
     fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
-        let hint = if self.current_inode_is_unpublished_regular(ino)? {
-            PendingMutationHint::LocalOnly
-        } else {
-            PendingMutationHint::Unknown
-        };
-        self.mutate_with_hint(|local| local.remove_attr(ino), |_| hint)
+        self.mutate_with_hint(
+            |local| local.remove_attr(ino),
+            |_| PendingMutationHint::Unknown,
+        )
     }
 
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
@@ -256,12 +254,10 @@ impl MetaPayloadObjects for PgMetaEngine {
     }
 
     fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        let hint = if self.current_inode_is_unpublished_regular(ino)? {
-            PendingMutationHint::LocalOnly
-        } else {
-            PendingMutationHint::Unknown
-        };
-        self.mutate_with_hint(|local| local.remove_regular_file_graph(ino), |_| hint)
+        self.mutate_with_hint(
+            |local| local.remove_regular_file_graph(ino),
+            |_| PendingMutationHint::Unknown,
+        )
     }
 
     fn next_object_id(&self) -> MetaResult<u64> {

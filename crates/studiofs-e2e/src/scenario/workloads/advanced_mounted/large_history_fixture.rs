@@ -486,7 +486,7 @@ async fn seed_large_history_fixture_async(
             "large-history PostgreSQL fixture payload counter overflow",
         ))
     })?;
-    let checkpoint_payload_bytes = i64::try_from(checkpoint_payload_bytes).map_err(|_| {
+    let checkpoint_payload_bytes_i64 = i64::try_from(checkpoint_payload_bytes).map_err(|_| {
         ScenarioError::Io(io::Error::other(
             "large-history PostgreSQL fixture checkpoint payload counter overflow",
         ))
@@ -510,7 +510,7 @@ async fn seed_large_history_fixture_async(
                 &remote_head_version,
                 &FIXTURE_CHECKPOINT_VERSION,
                 &total_payload_bytes,
-                &checkpoint_payload_bytes,
+                &checkpoint_payload_bytes_i64,
                 &checkpoint_bytes,
                 &sha256(&checkpoint_bytes),
             ],
@@ -538,10 +538,22 @@ async fn seed_large_history_fixture_async(
         checkpoint_event_count: checkpoint_events.len(),
         event_count: events.len(),
         total_event_count: checkpoint_events.len().saturating_add(events.len()),
-        checkpoint_version: FIXTURE_CHECKPOINT_VERSION as u64,
-        batch_count: remote_head_version as u64,
-        remote_head_version: remote_head_version as u64,
-        checkpoint_payload_bytes: checkpoint_payload_bytes as u64,
+        checkpoint_version: u64::try_from(FIXTURE_CHECKPOINT_VERSION).map_err(|_| {
+            ScenarioError::Io(io::Error::other(
+                "large-history PostgreSQL fixture checkpoint version was negative",
+            ))
+        })?,
+        batch_count: u64::try_from(remote_head_version).map_err(|_| {
+            ScenarioError::Io(io::Error::other(
+                "large-history PostgreSQL fixture produced a negative batch count",
+            ))
+        })?,
+        remote_head_version: u64::try_from(remote_head_version).map_err(|_| {
+            ScenarioError::Io(io::Error::other(
+                "large-history PostgreSQL fixture produced a negative remote head version",
+            ))
+        })?,
+        checkpoint_payload_bytes,
         event_payload_bytes,
         elapsed_ms: 0,
     })

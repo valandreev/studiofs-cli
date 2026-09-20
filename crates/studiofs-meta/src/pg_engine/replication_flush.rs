@@ -91,6 +91,29 @@ fn push_repaired_overlay_events(
 }
 
 impl PgMetaEngine {
+    fn acknowledge_pending_state_if_unchanged(
+        &self,
+        expected_state: PendingReplicationState,
+        event_end: u64,
+    ) -> MetaResult<()> {
+        // `metadata_sync` takes local_position_lock before pending_state. Do
+        // the same here so persisting the cursor cannot deadlock with replay.
+        let _position_guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        let mut state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        if *state != expected_state {
+            return Ok(());
+        }
+        self.persist_flushed_event_seq_locked(event_end)?;
+        Self::clear_pending_state(&mut state);
+        Ok(())
+    }
+
     pub(super) fn current_inode_is_unpublished_regular(&self, ino: Ino) -> MetaResult<bool> {
         if let Some(lifecycle) = self.local.get_inode_lifecycle(ino)? {
             return Ok(!lifecycle.has_published_base);
@@ -307,8 +330,8 @@ impl PgMetaEngine {
                 state.last_mutation_at = Some(now);
                 return Ok(());
             }
-            Self::clear_pending_state(state);
             self.persist_flushed_event_seq(event_end)?;
+            Self::clear_pending_state(state);
             return Ok(());
         }
 
@@ -450,9 +473,9 @@ impl PgMetaEngine {
                 let events = self.local.read_events_range(event_start, after_seq)?;
                 let projected = RemoteApplyCoordinator::project_local_batch(&events);
                 if projected.visible_ops == 0 && !projected.needs_local_replay {
-                    Self::clear_pending_state(&mut state);
+                    let expected_state = *state;
                     drop(state);
-                    self.persist_flushed_event_seq(after_seq)?;
+                    self.acknowledge_pending_state_if_unchanged(expected_state, after_seq)?;
                     return Ok(false);
                 }
             }
@@ -508,9 +531,9 @@ impl PgMetaEngine {
                 if self.inflight_replication_ops.load(Ordering::SeqCst) > 0 {
                     return Ok(false);
                 }
-                Self::clear_pending_state(&mut state);
+                let expected_state = *state;
                 drop(state);
-                self.persist_flushed_event_seq(after_seq)?;
+                self.acknowledge_pending_state_if_unchanged(expected_state, after_seq)?;
             } else {
                 if state.event_start.is_none() {
                     state.event_start = Some(before_seq);

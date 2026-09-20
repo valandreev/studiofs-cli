@@ -105,7 +105,6 @@ impl StudioVfs {
         } else {
             meta.remove_regular_file_graph(ino)?
         };
-        let removed_ids_were_empty = removed_ids.is_empty();
         let cleanup_ids = if !removed_ids.is_empty() {
             removed_ids
         } else if !graph_usage.object_ids.is_empty() {
@@ -113,7 +112,7 @@ impl StudioVfs {
         } else {
             fallback_object_ids
         };
-        if metadata_already_removed || !removed_ids_were_empty {
+        if !cleanup_ids.is_empty() {
             self.queue_pending_deletions_for_object_ids(meta, &cleanup_ids, gc_reason)?;
         }
 

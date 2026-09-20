@@ -31,6 +31,16 @@ fn checkpoint_lease_sql_is_fenced_and_short_lived() {
     assert!(publish.contains("RETURNING"));
 }
 
+#[test]
+fn checkpoint_coordination_miss_fails_closed_when_freshness_observation_fails() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+
+    assert!(
+        !engine.refresh_checkpoint_freshness_after_coordination_miss(),
+        "a failed freshness observation must not report a fresh checkpoint"
+    );
+}
+
 async fn with_pg_test_client<T, F, Fut>(dsn: &str, f: F) -> Result<T, MetaError>
 where
     F: FnOnce(tokio_postgres::Client) -> Fut,

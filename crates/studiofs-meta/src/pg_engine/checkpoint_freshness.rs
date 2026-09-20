@@ -152,14 +152,14 @@ impl From<super::metadata_io::CheckpointFreshnessObservation> for CheckpointFres
 }
 
 impl super::PgMetaEngine {
-    pub(super) fn observe_checkpoint_freshness(&self) {
+    pub(super) fn observe_checkpoint_freshness(&self) -> bool {
         if let Err(error) = self.ensure_remote_format_validated() {
             warn!(
                 error = %error,
                 volume_id = self.volume_id,
                 "checkpoint freshness observation could not validate postgres format"
             );
-            return;
+            return false;
         }
 
         let observation = match self.read_remote_checkpoint_freshness() {
@@ -170,10 +170,11 @@ impl super::PgMetaEngine {
                     volume_id = self.volume_id,
                     "checkpoint freshness observation failed"
                 );
-                return;
+                return false;
             }
         };
         self.record_checkpoint_freshness_observation(observation);
+        true
     }
 
     pub(super) fn record_checkpoint_freshness_observation(

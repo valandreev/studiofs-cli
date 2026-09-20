@@ -540,15 +540,29 @@ fn scan_dir(
             continue;
         }
         if directory_only_children {
+            let file_type = child
+                .file_type()
+                .map_err(|source| io_error(&path, source))?;
+            let entry_type = if file_type.is_dir() {
+                TreeEntryKind::Directory
+            } else if file_type.is_file() {
+                TreeEntryKind::File
+            } else if file_type.is_symlink() {
+                TreeEntryKind::Symlink
+            } else {
+                TreeEntryKind::Other
+            };
             entries.push(TreeEntry {
                 path: relative_path,
-                entry_type: TreeEntryKind::Directory,
+                entry_type,
                 size: None,
                 modified_unix_ms: None,
                 checksum_sha256: None,
                 symlink_target: None,
             });
-            scan_dir(root, &path, options, entries)?;
+            if file_type.is_dir() {
+                scan_dir(root, &path, options, entries)?;
+            }
             continue;
         }
         if options.is_metadata_only(&relative_path) {
@@ -911,6 +925,28 @@ mod tests {
         let marker = entries["fixture-root/control/marker.txt"];
         assert_eq!(marker.size, Some(6));
         assert!(marker.checksum_sha256.is_some());
+    }
+
+    #[test]
+    fn directory_only_option_does_not_recurse_into_non_directories() {
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-tree-directory-only-");
+        let root = temp.path();
+        let fixture_dir = root.join("fixture-root/fixture-files");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        fs::write(fixture_dir.join("marker.txt"), b"marker").unwrap();
+
+        let snapshot = snapshot_client_tree_with_options(
+            "client-a",
+            root,
+            &MountedTreeSnapshotOptions::default()
+                .with_directory_only_directory("fixture-root/fixture-files"),
+        )
+        .unwrap();
+        let entries = entries_by_path(&snapshot);
+        let marker = entries["fixture-root/fixture-files/marker.txt"];
+        assert_eq!(marker.entry_type, TreeEntryKind::File);
+        assert_eq!(marker.size, None);
+        assert_eq!(marker.checksum_sha256, None);
     }
 
     #[test]

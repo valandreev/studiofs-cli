@@ -210,8 +210,8 @@ impl PgMetaEngine {
     }
 
     pub(super) fn refresh_checkpoint_freshness_after_coordination_miss(&self) -> bool {
-        self.observe_checkpoint_freshness();
-        !self.checkpoint_freshness_diagnostics().refresh_needed
+        self.observe_checkpoint_freshness()
+            && !self.checkpoint_freshness_diagnostics().refresh_needed
     }
 
     pub(super) fn write_checkpoint_with_lease(&self) -> MetaResult<()> {

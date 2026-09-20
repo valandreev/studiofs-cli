@@ -227,6 +227,74 @@ fn removing_unpublished_regular_attr_does_not_create_remote_backlog() {
 }
 
 #[test]
+fn pending_state_survives_flushed_cursor_persist_failure() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"persist-failure-draft.txt", 0, 0, 0o644)
+        .expect("create unpublished file");
+    let before_seq = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read before seq");
+    pg.local
+        .remove_attr(file.ino)
+        .expect("remove unpublished file attributes");
+    let after_seq = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read after seq");
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = pg.local_position_lock.lock().expect("local position lock");
+        panic!("poison local position lock for persistence failure test");
+    }));
+
+    assert!(
+        pg.mark_pending_after_mutation(before_seq, after_seq, PendingMutationHint::Unknown)
+            .is_err(),
+        "the poisoned cursor lock must make the acknowledgement fail"
+    );
+    let state = pg.pending_state.lock().expect("pending state");
+    assert!(
+        state.event_start.is_some(),
+        "pending range must remain available after cursor persistence fails"
+    );
+}
+
+#[test]
+fn restore_pending_state_survives_flushed_cursor_persist_failure() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"restore-persist-failure.bin", 77_007);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge published setup");
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        PgMetaEngine::clear_pending_state(&mut state);
+        pg.local
+            .remove_regular_file_graph(file.ino)
+            .expect("remove published file graph");
+        state.event_start = Some(setup_end);
+    }
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = pg.local_position_lock.lock().expect("local position lock");
+        panic!("poison local position lock for restore persistence failure test");
+    }));
+
+    assert!(
+        pg.restore_pending_state_from_local_log().is_err(),
+        "the poisoned cursor lock must make restore fail"
+    );
+    let state = pg.pending_state.lock().expect("pending state");
+    assert_eq!(
+        state.event_start,
+        Some(setup_end),
+        "restore must not clear pending state before cursor persistence succeeds"
+    );
+}
+
+#[test]
 fn removing_regular_file_graph_does_not_create_remote_backlog() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg

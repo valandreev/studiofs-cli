@@ -392,7 +392,7 @@ pub(super) enum PendingMutationHint {
     LocalOnlyDeletion,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct PendingReplicationState {
     ops: u32,
     started_at: Option<Instant>,

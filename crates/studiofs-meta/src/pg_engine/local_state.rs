@@ -61,6 +61,10 @@ impl PgMetaEngine {
             .local_position_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        self.persist_flushed_event_seq_locked(seq)
+    }
+
+    pub(super) fn persist_flushed_event_seq_locked(&self, seq: u64) -> MetaResult<()> {
         if seq <= self.flushed_event_seq.load(Ordering::SeqCst) {
             return Ok(());
         }

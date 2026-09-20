@@ -340,7 +340,6 @@ impl StudioVfs {
             } else {
                 inner.pending_inodes.insert(ino, pending_count - 1);
             }
-            inner.errors.remove(&ino);
             inner.settled_operations += 1;
             inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
             inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
