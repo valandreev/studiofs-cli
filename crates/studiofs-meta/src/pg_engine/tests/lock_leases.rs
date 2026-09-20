@@ -1,6 +1,102 @@
 use super::*;
 
 #[test]
+fn pg_file_lock_operations_require_remote_identity_validation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let reset_validation = || {
+        engine
+            .remote_format_validated
+            .store(true, std::sync::atomic::Ordering::Release);
+        engine
+            .remote_identity_validated
+            .store(false, std::sync::atomic::Ordering::Release);
+        engine
+            .remote_transport_unavailable
+            .store(false, std::sync::atomic::Ordering::Release);
+    };
+
+    reset_validation();
+    let acquire_error = engine
+        .acquire_file_lock_lease(ROOT_INO, HardLockKind::Exclusive, Duration::from_secs(1))
+        .expect_err("acquire must validate remote identity first");
+    assert!(acquire_error.is_reachability_error());
+    assert!(
+        engine
+            .remote_transport_unavailable
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    reset_validation();
+    let release_error = engine
+        .release_file_lock_lease(ROOT_INO)
+        .expect_err("release must validate remote identity first");
+    assert!(release_error.is_reachability_error());
+    assert!(
+        engine
+            .remote_transport_unavailable
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    reset_validation();
+    let renew_error = engine
+        .renew_file_lock_lease(ROOT_INO, Duration::from_secs(1))
+        .expect_err("renew must validate remote identity first");
+    assert!(renew_error.is_reachability_error());
+    assert!(
+        engine
+            .remote_transport_unavailable
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    reset_validation();
+    let current_error = engine
+        .current_file_lock_lease(ROOT_INO)
+        .expect_err("current lease reads must validate remote identity first");
+    assert!(current_error.is_reachability_error());
+    assert!(
+        engine
+            .remote_transport_unavailable
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_file_lock_lease_rejects_remote_identity_mismatch() {
+    let _guard = file_lock_test_guard();
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-file-lock-uuid-mismatch");
+    let info = volume.format_info();
+    seed_local(&db, &info);
+
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open engine");
+    volume.update_uuid("recreated-file-lock-uuid");
+
+    assert!(matches!(
+        engine.check_consistency(),
+        Err(MetaError::UuidMismatch { local, remote })
+            if local == info.uuid && remote == "recreated-file-lock-uuid"
+    ));
+    assert!(matches!(
+        engine.acquire_file_lock_lease(ROOT_INO, HardLockKind::Exclusive, Duration::from_secs(1)),
+        Err(MetaError::UuidMismatch { local, remote })
+            if local == info.uuid && remote == "recreated-file-lock-uuid"
+    ));
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_file_lock_lease_blocks_peer_until_release() {
     let _guard = file_lock_test_guard();

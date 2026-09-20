@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn pg_lock_monitoring_waits_for_remote_identity_validation() {
+    let (_dir, mut engine) = temp_pg_engine_for_unit();
+    engine.lock_workers_enabled = true;
+    engine
+        .remote_identity_validated
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    engine
+        .ensure_known_file_lock_monitoring()
+        .expect("monitoring should remain local until identity validation succeeds");
+    assert!(
+        !engine
+            .background_workers
+            .has_handle(PgBackgroundWorker::LockNotify)
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worker() {
     let _guard = file_lock_test_guard();

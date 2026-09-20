@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 impl PgMetaEngine {
     pub(super) fn ensure_lock_notify_listener_started(&self) -> MetaResult<()> {
-        if !self.lock_workers_enabled {
+        if !self.lock_workers_enabled || !self.remote_identity_validated.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -24,9 +24,10 @@ impl PgMetaEngine {
             .lock_worker_start_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg lock worker start state poisoned".to_string()))?;
-        if self
-            .background_workers
-            .has_handle(PgBackgroundWorker::LockNotify)
+        if !self.remote_identity_validated.load(Ordering::Acquire)
+            || self
+                .background_workers
+                .has_handle(PgBackgroundWorker::LockNotify)
         {
             return Ok(());
         }
