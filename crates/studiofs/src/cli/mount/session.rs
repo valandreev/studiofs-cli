@@ -25,11 +25,10 @@ use studiofs_cache::{
     DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalPayloadRuntime, prepare_local_payload_runtime,
 };
 use studiofs_data::{DataStoreConfig, normalize_s3_endpoint_transport};
-use studiofs_meta::engine::{MetaError, PgSyncLifecycle, PgSyncStatus};
-use studiofs_meta::schema::MetadataBackend;
+use studiofs_meta::engine::{PgSyncLifecycle, PgSyncStatus};
 use studiofs_meta::snapshot::SnapshotId;
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetaFormat, MetaOpenOptions, MetaReplication, open_meta_engine,
+    FormatInfo, MetaEngine, MetaFormat, MetaOpenOptions, open_meta_engine,
     open_meta_engine_with_options,
 };
 #[cfg(test)]
@@ -119,9 +118,6 @@ struct PreparedForegroundRuntime {
     write_path_observability_publisher: WritePathObservabilityPublisher,
     snapshot_mount: Option<PreparedSnapshotMount>,
 }
-
-trait MountOpenMeta: Send + Sync + MetaFormat + MetaReplication {}
-impl<T> MountOpenMeta for T where T: ?Sized + Send + Sync + MetaFormat + MetaReplication {}
 
 trait MountRuntimeMeta: Send + Sync + VfsMeta {}
 impl<T> MountRuntimeMeta for T where T: ?Sized + Send + Sync + VfsMeta {}
@@ -2223,48 +2219,13 @@ fn acquire_mount_lock(actual_mount_path: &str) -> anyhow::Result<utils::MountLoc
     Ok(mount_lock)
 }
 
-fn read_live_mount_format_info<M: ?Sized + MountOpenMeta>(
+fn read_live_mount_format_info<M: ?Sized + MetaFormat>(
     name: &str,
     live_meta: &M,
 ) -> anyhow::Result<FormatInfo> {
-    let format_info = live_meta.get_format_info()?;
-    admit_live_mount_format_info(
-        name,
-        format_info,
-        live_meta.check_consistency_for_mount_admission(),
-    )
-}
-
-fn admit_live_mount_format_info(
-    name: &str,
-    format_info: FormatInfo,
-    consistency: studiofs_meta::engine::MetaResult<()>,
-) -> anyhow::Result<FormatInfo> {
-    if let Err(error) = consistency {
-        match (&error, format_info.metadata.backend) {
-            (MetaError::UuidMismatch { local, remote }, _) => {
-                anyhow::bail!(
-                    "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
-                    name,
-                    local,
-                    remote,
-                    utils::format_cleanup_command(name)
-                );
-            }
-            (error, MetadataBackend::Postgres) if error.is_reachability_error() => {
-                warn!(
-                    volume = %name,
-                    error = %error,
-                    "remote PostgreSQL identity check unavailable; continuing with local metadata"
-                );
-            }
-            _ => {
-                return Err(anyhow::Error::new(error).context("metadata consistency check failed"));
-            }
-        }
-    }
-
-    Ok(format_info)
+    live_meta.get_format_info().with_context(|| {
+        format!("failed to read format information from local metadata for volume '{name}'")
+    })
 }
 
 fn open_live_mount_meta(name: &str, meta_dir: &Path) -> anyhow::Result<OpenedLiveMountMeta> {
@@ -2274,6 +2235,7 @@ fn open_live_mount_meta(name: &str, meta_dir: &Path) -> anyhow::Result<OpenedLiv
         &db_path,
         MetaOpenOptions {
             background_poll: metadata_background_poll_enabled(),
+            defer_remote_startup_probes: true,
             ..Default::default()
         },
     )?;
@@ -2670,103 +2632,61 @@ mod tests {
         format_info
     }
 
-    #[test]
-    fn admit_live_mount_format_info_allows_postgres_transport_failures() {
-        for consistency_error in [
-            studiofs_meta::engine::MetaError::RemoteUnavailable(
-                "test-postgres-unavailable".to_string(),
-            ),
-            studiofs_meta::engine::MetaError::Timeout("test-postgres-timeout".to_string()),
-        ] {
-            let expected = postgres_format_info("demo");
-            let actual =
-                admit_live_mount_format_info("demo", expected.clone(), Err(consistency_error))
-                    .expect("local PostgreSQL metadata should admit the mount");
+    struct LocalFormatMeta {
+        format_info: FormatInfo,
+    }
 
-            assert_eq!(actual.uuid, expected.uuid);
-            assert_eq!(actual.metadata.backend, expected.metadata.backend);
+    impl MetaFormat for LocalFormatMeta {
+        fn set_format_info(&self, _info: &FormatInfo) -> studiofs_meta::engine::MetaResult<()> {
+            Ok(())
+        }
+
+        fn get_format_info(&self) -> studiofs_meta::engine::MetaResult<FormatInfo> {
+            Ok(self.format_info.clone())
         }
     }
 
     #[test]
-    fn admit_live_mount_format_info_accepts_consistent_metadata() {
+    fn read_live_mount_format_info_uses_local_format_without_remote_validation() {
         let expected = postgres_format_info("demo");
-        let actual = admit_live_mount_format_info("demo", expected.clone(), Ok(()))
-            .expect("consistent metadata must be admitted");
+        let meta = LocalFormatMeta {
+            format_info: expected.clone(),
+        };
+
+        let actual = read_live_mount_format_info("demo", &meta)
+            .expect("local format metadata should admit the mount without PostgreSQL");
 
         assert_eq!(actual.uuid, expected.uuid);
         assert_eq!(actual.metadata.backend, expected.metadata.backend);
     }
 
-    #[test]
-    fn admit_live_mount_format_info_rejects_postgres_identity_mismatch() {
-        let error = admit_live_mount_format_info(
-            "demo",
-            postgres_format_info("demo"),
-            Err(studiofs_meta::engine::MetaError::UuidMismatch {
-                local: "local-uuid".to_string(),
-                remote: "remote-uuid".to_string(),
-            }),
-        )
-        .expect_err("identity mismatch must reject the mount")
-        .to_string();
+    struct FailingFormatMeta;
 
-        assert!(error.contains("has been recreated"));
-        assert!(error.contains("local-uuid"));
-        assert!(error.contains("remote-uuid"));
+    impl MetaFormat for FailingFormatMeta {
+        fn set_format_info(&self, _info: &FormatInfo) -> studiofs_meta::engine::MetaResult<()> {
+            Ok(())
+        }
+
+        fn get_format_info(&self) -> studiofs_meta::engine::MetaResult<FormatInfo> {
+            Err(studiofs_meta::engine::MetaError::NotFormatted)
+        }
     }
 
     #[test]
-    fn admit_live_mount_format_info_rejects_postgres_storage_failures() {
-        let error = admit_live_mount_format_info(
-            "demo",
-            postgres_format_info("demo"),
-            Err(studiofs_meta::engine::MetaError::Storage(
-                "test-postgres-storage-failure".to_string(),
-            )),
-        )
-        .expect_err("storage failure must reject the mount");
+    fn read_live_mount_format_info_adds_local_format_error_context() {
+        let error = read_live_mount_format_info("demo", &FailingFormatMeta)
+            .expect_err("local format metadata errors must reject mount preparation");
 
         assert!(
-            error
-                .downcast_ref::<studiofs_meta::engine::MetaError>()
-                .is_some()
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("metadata consistency check failed")
-        );
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string().contains("test-postgres-storage-failure"))
-        );
-    }
-
-    #[test]
-    fn admit_live_mount_format_info_rejects_non_postgres_transport_failures() {
-        let mut format_info = postgres_format_info("demo");
-        format_info.metadata.backend = MetadataBackend::RedbLocal;
-        let error = admit_live_mount_format_info(
-            "demo",
-            format_info,
-            Err(MetaError::RemoteUnavailable(
-                "test-unexpected-transport-failure".to_string(),
-            )),
-        )
-        .expect_err("non-Postgres transport failure must reject the mount");
-
-        assert!(error.downcast_ref::<MetaError>().is_some());
-        assert!(
-            error
-                .to_string()
-                .contains("metadata consistency check failed")
+            error.to_string().contains(
+                "failed to read format information from local metadata for volume 'demo'"
+            )
         );
         assert!(error.chain().any(|cause| {
-            cause
-                .to_string()
-                .contains("test-unexpected-transport-failure")
+            matches!(
+                cause.downcast_ref::<studiofs_meta::engine::MetaError>(),
+                Some(studiofs_meta::engine::MetaError::NotFormatted)
+            )
         }));
     }
 
@@ -3363,6 +3283,36 @@ mod tests {
         assert_eq!(
             session.meta.get_format_info().expect("meta info").uuid,
             format_info.uuid
+        );
+    }
+
+    #[test]
+    fn mount_meta_session_resolves_postgres_backend_from_local_redb_without_network() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-mount-meta-pg-");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let db_path = meta_dir.join("demo-pg.db");
+
+        let engine = RedbMetaEngine::open(&db_path).expect("open redb");
+        let mut format_info = postgres_format_info("demo-pg");
+        format_info.endpoint = "http://127.0.0.1:9000".to_string();
+        format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
+            url: "test-postgres-dsn".to_string(),
+            volume_id: 1,
+        });
+        engine
+            .set_format_info(&format_info)
+            .expect("persist pg format info");
+        engine.init_root(0, 0).expect("init root");
+        drop(engine);
+
+        let session = resolve_mount_meta_session("demo-pg", &meta_dir, None, false)
+            .expect("local Postgres format info must resolve from local redb");
+
+        assert_eq!(session.format_info.uuid, format_info.uuid);
+        assert_eq!(
+            session.format_info.metadata.backend,
+            studiofs_meta::schema::MetadataBackend::Postgres
         );
     }
 

@@ -1682,12 +1682,6 @@ pub trait MetaReplication: Send + Sync {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).
     fn check_consistency(&self) -> MetaResult<()>;
 
-    /// Verify metadata for mount admission, allowing a known-unreachable
-    /// PostgreSQL source to be handled by local-first startup policy.
-    fn check_consistency_for_mount_admission(&self) -> MetaResult<()> {
-        self.check_consistency()
-    }
-
     /// Flush pending metadata mutations to remote store (if any).
     fn flush_metadata(&self) -> MetaResult<()>;
 

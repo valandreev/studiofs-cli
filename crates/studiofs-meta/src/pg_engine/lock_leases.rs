@@ -1,6 +1,7 @@
 use super::{HeldFileLockLease, PgMetaEngine, sql};
 use crate::engine::{MetaError, MetaResult};
 use crate::types::*;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 impl PgMetaEngine {
@@ -136,6 +137,11 @@ impl PgMetaEngine {
     where
         C: tokio_postgres::GenericClient + Sync,
     {
+        if !self.remote_identity_validated.load(Ordering::Acquire) {
+            return Err(MetaError::RemoteUnavailable(
+                "remote identity is not validated".to_string(),
+            ));
+        }
         let snapshot =
             Self::current_file_lock_lease_with_client(client, self.volume_id, ino).await?;
         self.upsert_cached_file_lock_lease(snapshot.clone(), ino);

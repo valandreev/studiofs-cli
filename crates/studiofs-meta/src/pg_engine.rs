@@ -373,6 +373,8 @@ pub struct PgOpenOptions {
     /// Values above the runtime semaphore capacity are rejected.
     /// `STUDIOFS_PG_POOL_SIZE` overrides this value when set.
     pub pg_pool_size: usize,
+    /// Whether to defer synchronous remote startup probes until replication runs.
+    pub defer_remote_startup_probes: bool,
 }
 
 impl Default for PgOpenOptions {
@@ -381,6 +383,7 @@ impl Default for PgOpenOptions {
             background_poll: true,
             fresh_client: false,
             pg_pool_size: DEFAULT_PG_POOL_SIZE,
+            defer_remote_startup_probes: false,
         }
     }
 }
@@ -1184,6 +1187,9 @@ impl PgMetaEngine {
             local.set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
         }
         let fresh_client_pending = local.get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)? != 0;
+        let defer_remote_startup_probes = options.defer_remote_startup_probes
+            && !repair_local_graph_recovery_pending
+            && !fresh_client_pending;
         let pool_size = resolve_pg_pool_size(options.pg_pool_size)?;
 
         let poll_secs = pg_env_var("STUDIOFS_PG_SYNC_POLL_SECS")
@@ -1234,29 +1240,34 @@ impl PgMetaEngine {
                 checkpoint_freshness::DEFAULT_MAX_CHECKPOINT_AGE_SECS,
             )),
         );
-        let remote_transport_unavailable = match Self::validate_postgres_schema(
-            &pg.url,
-            pg.volume_id,
-            connect_timeout,
-            command_timeout,
-        ) {
-            Ok(StartupSchemaValidation::Available) => false,
-            Ok(StartupSchemaValidation::Fallback(error)) => {
-                warn!(
-                    error = %error,
-                    "postgres schema validation unavailable; continuing with local-first startup"
-                );
-                true
+        let remote_transport_unavailable = if defer_remote_startup_probes {
+            false
+        } else {
+            match Self::validate_postgres_schema(
+                &pg.url,
+                pg.volume_id,
+                connect_timeout,
+                command_timeout,
+            ) {
+                Ok(StartupSchemaValidation::Available) => false,
+                Ok(StartupSchemaValidation::Fallback(error)) => {
+                    warn!(
+                        error = %error,
+                        "postgres schema validation unavailable; continuing with local-first startup"
+                    );
+                    true
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
-        let remote_format_validated = !remote_transport_unavailable;
+        let remote_format_validated = !defer_remote_startup_probes && !remote_transport_unavailable;
         let remote_identity_validated = false;
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
         let client_slot = match persisted_client_slot {
             Some(slot) => Some(slot),
             None if fresh_client_pending => None,
+            None if defer_remote_startup_probes => None,
             None => Some(Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?),
         };
         let restored_local_version = Self::load_persisted_local_version(&local)?;
@@ -1268,11 +1279,12 @@ impl PgMetaEngine {
             } else {
                 restored_flushed_event_seq
             };
-        let startup_snapshot_import_mode = if repair_local_graph_recovery_pending {
-            None
-        } else {
-            Self::startup_snapshot_import_mode(&local, restored_local_version)?
-        };
+        let startup_snapshot_import_mode =
+            if repair_local_graph_recovery_pending || defer_remote_startup_probes {
+                None
+            } else {
+                Self::startup_snapshot_import_mode(&local, restored_local_version)?
+            };
         let metadata_invalidation_notify = Arc::clone(&local.invalidation_notify);
         let engine = Arc::new(Self {
             local,
@@ -1391,7 +1403,8 @@ impl PgMetaEngine {
             engine.restore_pending_state_from_local_log()?;
             bootstrap_succeeded
         };
-        let startup_target_observed = if engine.remote_transport_unavailable.load(Ordering::Acquire)
+        let startup_target_observed = if defer_remote_startup_probes
+            || engine.remote_transport_unavailable.load(Ordering::Acquire)
         {
             false
         } else {
@@ -1441,7 +1454,13 @@ impl PgMetaEngine {
             engine.cache_client_slot(client_slot)?;
         }
         if !fresh_client_pending {
-            engine.bootstrap_allocator_state();
+            if defer_remote_startup_probes {
+                if client_slot.is_some() {
+                    engine.bootstrap_allocator_state_local_only();
+                }
+            } else {
+                engine.bootstrap_allocator_state();
+            }
         }
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;

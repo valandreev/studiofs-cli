@@ -161,22 +161,38 @@ impl PgMetaEngine {
     }
 
     pub(super) fn bootstrap_allocator_state(&self) {
+        self.bootstrap_allocator_state_with_remote_recovery(true);
+    }
+
+    pub(super) fn bootstrap_allocator_state_local_only(&self) {
+        self.bootstrap_allocator_state_with_remote_recovery(false);
+    }
+
+    fn bootstrap_allocator_state_with_remote_recovery(&self, allow_remote_recovery: bool) {
         let (allocator_state, loaded_state_result) = match self.local.read_allocator_state() {
             Ok(Some(state)) => ("trusted", Ok(state)),
-            Ok(None) => (
+            Ok(None) if allow_remote_recovery => (
                 "new",
                 self.mint_allocator_state().and_then(|state| {
                     self.local.replace_allocator_state(state)?;
                     Ok(state)
                 }),
             ),
-            Err(_) => (
+            Ok(None) => (
+                "missing",
+                Err(MetaError::Storage(
+                    "local allocator state is unavailable while remote bootstrap is deferred"
+                        .to_string(),
+                )),
+            ),
+            Err(_error) if allow_remote_recovery => (
                 "untrustworthy",
                 self.mint_allocator_state().and_then(|state| {
                     self.local.replace_allocator_state(state)?;
                     Ok(state)
                 }),
             ),
+            Err(error) => ("untrustworthy", Err(error)),
         };
         match loaded_state_result {
             Ok(state) => {

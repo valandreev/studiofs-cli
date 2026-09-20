@@ -151,6 +151,8 @@ pub struct MetaOpenOptions {
     /// Values above the runtime semaphore capacity are rejected.
     /// `STUDIOFS_PG_POOL_SIZE` overrides this value when set.
     pub pg_pool_size: usize,
+    /// Whether to defer synchronous remote startup probes until replication runs.
+    pub defer_remote_startup_probes: bool,
 }
 
 impl Default for MetaOpenOptions {
@@ -159,6 +161,7 @@ impl Default for MetaOpenOptions {
             background_poll: true,
             fresh_client: false,
             pg_pool_size: DEFAULT_PG_POOL_SIZE,
+            defer_remote_startup_probes: false,
         }
     }
 }
@@ -213,6 +216,7 @@ pub fn open_meta_engine_with_options(
                     background_poll: options.background_poll,
                     fresh_client: options.fresh_client,
                     pg_pool_size: options.pg_pool_size,
+                    defer_remote_startup_probes: options.defer_remote_startup_probes,
                 },
             )?;
             let pg_info = pg.get_format_info()?;
@@ -269,6 +273,7 @@ pub fn open_meta_engine_with_options(
                         background_poll: options.background_poll,
                         fresh_client: options.fresh_client,
                         pg_pool_size: options.pg_pool_size,
+                        defer_remote_startup_probes: options.defer_remote_startup_probes,
                     },
                 )?;
                 Ok(pg)
