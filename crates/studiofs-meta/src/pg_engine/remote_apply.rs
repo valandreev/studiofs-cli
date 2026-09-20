@@ -383,6 +383,27 @@ impl<'a> RemoteApplyCoordinator<'a> {
         candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
     }
 
+    // Foreign replay can transiently protect a regular file while repair-restored
+    // local serving state is present. Once the matching self batch is acknowledged,
+    // only a newer local suffix may keep that protection alive.
+    fn clear_resolved_self_regular_file_protection(
+        replay_protected_overlay: &mut OverlayConflictSets,
+        current_overlay: &OverlayConflictSets,
+        batch_events: &[MetaEvent],
+    ) {
+        for ino in Self::regular_file_serving_reconcile_inodes(batch_events) {
+            if current_overlay.attr_inodes.contains(&ino)
+                || current_overlay.block_inodes.contains(&ino)
+                || current_overlay.remove_attr_inodes.contains(&ino)
+            {
+                continue;
+            }
+            replay_protected_overlay.attr_inodes.remove(&ino);
+            replay_protected_overlay.block_inodes.remove(&ino);
+            replay_protected_overlay.remove_attr_inodes.remove(&ino);
+        }
+    }
+
     pub(super) fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
         match event {
             MetaEvent::RemoveAttr { .. }
@@ -1915,6 +1936,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     context.flushed_event_seq,
                     context.next_event_seq,
                 )?;
+                if batch.is_self_batch {
+                    Self::clear_resolved_self_regular_file_protection(
+                        &mut replay_protected_overlay,
+                        &overlay,
+                        &batch.events,
+                    );
+                }
                 overlay_is_dirty = false;
             }
         }
