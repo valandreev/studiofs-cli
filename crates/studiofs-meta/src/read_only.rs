@@ -486,10 +486,6 @@ where
         self.inner.check_consistency()
     }
 
-    fn check_consistency_for_mount_admission(&self) -> MetaResult<()> {
-        self.inner.check_consistency_for_mount_admission()
-    }
-
     fn flush_metadata(&self) -> MetaResult<()> {
         Ok(())
     }

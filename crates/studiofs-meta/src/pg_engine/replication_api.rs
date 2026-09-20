@@ -220,15 +220,6 @@ impl MetaReplication for PgMetaEngine {
         self.check_remote_identity()
     }
 
-    fn check_consistency_for_mount_admission(&self) -> MetaResult<()> {
-        if self.remote_transport_unavailable.load(Ordering::Acquire) {
-            return Err(MetaError::RemoteUnavailable(
-                "remote PostgreSQL transport is currently unavailable".to_string(),
-            ));
-        }
-        self.check_consistency()
-    }
-
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;

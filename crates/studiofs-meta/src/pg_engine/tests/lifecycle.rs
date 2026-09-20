@@ -2845,32 +2845,6 @@ fn fresh_client_startup_failure_is_degraded_and_marker_survives_reopen() {
 }
 
 #[test]
-fn mount_admission_consistency_check_short_circuits_after_startup_remote_transport_failure() {
-    let (_dir, mut engine) = temp_pg_engine_for_unit();
-    engine
-        .remote_transport_unavailable
-        .store(true, std::sync::atomic::Ordering::Release);
-    engine.command_pool = Arc::new(
-        PgConnectionPool::new(
-            "test-postgres-dsn".to_string(),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-            1,
-        )
-        .expect("non-zero command pool size"),
-    );
-
-    let error = engine
-        .check_consistency_for_mount_admission()
-        .expect_err("known startup transport failure should defer identity probing");
-    assert!(matches!(
-        error,
-        MetaError::RemoteUnavailable(message)
-            if message == "remote PostgreSQL transport is currently unavailable"
-    ));
-}
-
-#[test]
 fn regular_consistency_check_retries_after_startup_remote_transport_failure() {
     let (_dir, mut engine) = temp_pg_engine_for_unit();
     engine
@@ -3094,6 +3068,55 @@ fn established_zero_version_startup_failure_is_degraded() {
 
     assert_eq!(opened.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
     assert!(!opened.pg_sync_status().allows_new_mutations());
+}
+
+#[test]
+fn deferred_mount_startup_uses_trusted_local_state_without_remote_probe() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let local = RedbMetaEngine::open(&db).expect("open local metadata");
+    local.init_root(0, 0).expect("init root");
+    local
+        .set_format_info(&format_info(
+            "deferred-mount-startup",
+            "deferred-mount-startup-uuid",
+            "test-postgres-dsn",
+            1,
+        ))
+        .expect("set format info");
+    PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+    local
+        .replace_allocator_state(
+            AllocatorStateV1::new(
+                AllocatorRecord::new(1, 0).expect("inode namespace"),
+                AllocatorRecord::new(2, 0).expect("payload namespace"),
+            )
+            .expect("allocator state"),
+        )
+        .expect("persist allocator state");
+    local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 1)
+        .expect("persist local version");
+    drop(local);
+
+    let opened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("trusted local metadata should open without PostgreSQL");
+
+    assert_eq!(opened.command_pool.stats().checkouts, 0);
+    assert!(!opened.remote_format_validated.load(Ordering::Acquire));
+    assert_eq!(
+        opened.metadata_remote_head_version.load(Ordering::Acquire),
+        -1
+    );
+    assert!(opened.allocator_runtime_available_for_test());
+    assert!(opened.next_inode().is_ok());
 }
 
 #[test]
@@ -5300,6 +5323,7 @@ fn command_pool_capacity_is_bounded_by_configured_pool_size() {
             background_poll: false,
             fresh_client: false,
             pg_pool_size: 1,
+            defer_remote_startup_probes: false,
         },
     )
     .expect("open pg engine with one command-pool slot");
@@ -5398,6 +5422,7 @@ fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
             background_poll: false,
             fresh_client: false,
             pg_pool_size: 2,
+            defer_remote_startup_probes: false,
         },
     )
     .expect("open pg engine");

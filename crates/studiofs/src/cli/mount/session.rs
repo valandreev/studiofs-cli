@@ -2220,9 +2220,12 @@ fn acquire_mount_lock(actual_mount_path: &str) -> anyhow::Result<utils::MountLoc
 }
 
 fn read_live_mount_format_info<M: ?Sized + MetaFormat>(
+    name: &str,
     live_meta: &M,
 ) -> anyhow::Result<FormatInfo> {
-    Ok(live_meta.get_format_info()?)
+    live_meta.get_format_info().with_context(|| {
+        format!("failed to read format information from local metadata for volume '{name}'")
+    })
 }
 
 fn open_live_mount_meta(name: &str, meta_dir: &Path) -> anyhow::Result<OpenedLiveMountMeta> {
@@ -2232,10 +2235,11 @@ fn open_live_mount_meta(name: &str, meta_dir: &Path) -> anyhow::Result<OpenedLiv
         &db_path,
         MetaOpenOptions {
             background_poll: metadata_background_poll_enabled(),
+            defer_remote_startup_probes: true,
             ..Default::default()
         },
     )?;
-    let format_info = read_live_mount_format_info(source_meta.as_ref())?;
+    let format_info = read_live_mount_format_info(name, source_meta.as_ref())?;
     let runtime_meta = into_vfs_meta(source_meta.clone());
     Ok(OpenedLiveMountMeta {
         source_meta,
@@ -2649,11 +2653,41 @@ mod tests {
             format_info: expected.clone(),
         };
 
-        let actual = read_live_mount_format_info(&meta)
+        let actual = read_live_mount_format_info("demo", &meta)
             .expect("local format metadata should admit the mount without PostgreSQL");
 
         assert_eq!(actual.uuid, expected.uuid);
         assert_eq!(actual.metadata.backend, expected.metadata.backend);
+    }
+
+    struct FailingFormatMeta;
+
+    impl MetaFormat for FailingFormatMeta {
+        fn set_format_info(&self, _info: &FormatInfo) -> studiofs_meta::engine::MetaResult<()> {
+            Ok(())
+        }
+
+        fn get_format_info(&self) -> studiofs_meta::engine::MetaResult<FormatInfo> {
+            Err(studiofs_meta::engine::MetaError::NotFormatted)
+        }
+    }
+
+    #[test]
+    fn read_live_mount_format_info_adds_local_format_error_context() {
+        let error = read_live_mount_format_info("demo", &FailingFormatMeta)
+            .expect_err("local format metadata errors must reject mount preparation");
+
+        assert!(
+            error.to_string().contains(
+                "failed to read format information from local metadata for volume 'demo'"
+            )
+        );
+        assert!(error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<studiofs_meta::engine::MetaError>(),
+                Some(studiofs_meta::engine::MetaError::NotFormatted)
+            )
+        }));
     }
 
     fn seed_mount_meta_db(
@@ -3249,6 +3283,36 @@ mod tests {
         assert_eq!(
             session.meta.get_format_info().expect("meta info").uuid,
             format_info.uuid
+        );
+    }
+
+    #[test]
+    fn mount_meta_session_resolves_postgres_backend_from_local_redb_without_network() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-mount-meta-pg-");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let db_path = meta_dir.join("demo-pg.db");
+
+        let engine = RedbMetaEngine::open(&db_path).expect("open redb");
+        let mut format_info = postgres_format_info("demo-pg");
+        format_info.endpoint = "http://127.0.0.1:9000".to_string();
+        format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
+            url: "test-postgres-dsn".to_string(),
+            volume_id: 1,
+        });
+        engine
+            .set_format_info(&format_info)
+            .expect("persist pg format info");
+        engine.init_root(0, 0).expect("init root");
+        drop(engine);
+
+        let session = resolve_mount_meta_session("demo-pg", &meta_dir, None, false)
+            .expect("local Postgres format info must resolve from local redb");
+
+        assert_eq!(session.format_info.uuid, format_info.uuid);
+        assert_eq!(
+            session.format_info.metadata.backend,
+            studiofs_meta::schema::MetadataBackend::Postgres
         );
     }
 
