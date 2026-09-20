@@ -431,13 +431,33 @@ impl PgMetaEngine {
             // here would only add contention.
             return Ok(false);
         }
-        if hint == PendingMutationHint::LocalOnly {
+        if matches!(
+            hint,
+            PendingMutationHint::LocalOnly | PendingMutationHint::LocalOnlyDeletion
+        ) {
             // The namespace wrapper has already established that this
-            // mutation is a newly created empty regular file, or its local-only
-            // deletion. Keep the event range for local serving-state replay,
-            // but do not read and project it again on every hot-path mutation.
+            // mutation is local-only. Keep the event range for local serving-
+            // state replay, but do not read and project it again on every
+            // hot-path mutation. A local-only deletion is also allowed to
+            // retire a fully canceled range immediately: there is no remote
+            // work and no serving replay left once the unpublished inode has
+            // been removed.
+            let event_start = state.event_start.unwrap_or(before_seq);
+            if hint == PendingMutationHint::LocalOnlyDeletion
+                && state.ops == 0
+                && self.inflight_replication_ops.load(Ordering::SeqCst) == 0
+            {
+                let events = self.local.read_events_range(event_start, after_seq)?;
+                let projected = RemoteApplyCoordinator::project_local_batch(&events);
+                if projected.visible_ops == 0 && !projected.needs_local_replay {
+                    Self::clear_pending_state(&mut state);
+                    drop(state);
+                    self.persist_flushed_event_seq(after_seq)?;
+                    return Ok(false);
+                }
+            }
             if state.event_start.is_none() {
-                state.event_start = Some(before_seq);
+                state.event_start = Some(event_start);
                 if state.started_at.is_none() {
                     state.started_at = Some(now);
                 }

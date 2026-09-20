@@ -175,7 +175,7 @@ impl MetaFsOps for PgMetaEngine {
             |local| local.unlink(parent, name),
             |attr| {
                 if attr.is_unpublished_empty_draft() {
-                    PendingMutationHint::LocalOnly
+                    PendingMutationHint::LocalOnlyDeletion
                 } else {
                     PendingMutationHint::Unknown
                 }
@@ -188,7 +188,7 @@ impl MetaFsOps for PgMetaEngine {
             |local| local.unlink_open_handle(parent, name),
             |attr| {
                 if attr.is_unpublished_empty_draft() {
-                    PendingMutationHint::LocalOnly
+                    PendingMutationHint::LocalOnlyDeletion
                 } else {
                     PendingMutationHint::Unknown
                 }

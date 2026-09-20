@@ -389,6 +389,7 @@ impl Default for PgOpenOptions {
 pub(super) enum PendingMutationHint {
     Unknown,
     LocalOnly,
+    LocalOnlyDeletion,
 }
 
 #[derive(Clone, Copy, Default)]

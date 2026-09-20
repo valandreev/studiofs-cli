@@ -54,6 +54,15 @@ catch-up, restart, moving-head convergence, and final mounted-tree convergence.
 - [x] (2026-09-20) Inspected the final diff and ran focused tests and clippy for
   the affected crates. Temporary diagnostic runs remain under `analysis-s24`
   as retained evidence and are intentionally untracked.
+- [x] (2026-09-20) Reproduced the remaining snapshot timeout with the current
+  binaries, then added directory-only traversal for the fixture's 64 known
+  shard directories so mounted validation does not issue a file-type probe for
+  every shard entry. Corrected the runner contract to expect the two clients
+  that the scenario actually mounts.
+- [x] (2026-09-20) Passed the corrected native scenario with retained runs
+  `20260920T-directory-only-trace`, `20260920T-directory-only-r2`, and
+  `20260920T-directory-only-r3`; all report `Passed`, validate successfully,
+  and summarize two converged clients with 100,001 mutations.
 
 ## Surprises & Discoveries
 
@@ -96,6 +105,12 @@ catch-up, restart, moving-head convergence, and final mounted-tree convergence.
 - Observation: even checksum-free snapshots remain slow when they issue a
   getattr/file-type callback per fixture file. Sharding plus file-only shard
   enumeration validates all 4,096 names while avoiding per-file callbacks.
+- Observation: file-only shard enumeration alone was insufficient because the
+  parent `fixture-files` directory still classified each shard through the
+  mounted `DirEntry::file_type` path. On the affected native WinFSP run that
+  could consume the full 60-second snapshot-attempt bound. Treating the known
+  direct children as directories removes that remaining metadata probe; the
+  trace run showed both clients completing with 4,164 entries.
 
 ## Decision Log
 
@@ -148,12 +163,14 @@ catch-up, restart, moving-head convergence, and final mounted-tree convergence.
 
 ## Outcomes & Retrospective
 
-The fixture-backed scenario is complete and passed twice on native WinFSP. The
-initial 90,000 logical mutations seed in about 1.2 seconds, the deterministic
-gate exposes `CatchingUp`, the cold client restarts, a second PG append moves the
-remote head by 10,000 logical mutations, and a mounted marker proves read/write
-convergence. The retained passing runs finished in roughly 162 and 181 seconds,
-both below the original five-minute timeout, with no namespace differences.
+The fixture-backed scenario is complete and passed in three retained native
+runs after the snapshot traversal correction. The initial 90,000 logical
+mutations seed in about 1.2 seconds, the deterministic gate exposes
+`CatchingUp`, the cold client restarts, a second PG append moves the remote
+head by 10,000 logical mutations, and a mounted marker proves read/write
+convergence. The two ordinary runs finished below the original five-minute
+timeout, with no namespace differences; the trace run also completed both
+mounted snapshots with 4,164 entries.
 
 ## Context and Orientation
 
@@ -204,12 +221,12 @@ operation and artifact, and remove the mounted initial bulk helper. Keep the
 cold discovery, restart, moving writer, final marker, and existing summary
 checks unchanged while the native evidence is investigated.
 
-The planned operation names and fixture-backed runner are updated, and focused
-unit tests cover fixture shape and batch grouping. The next implementation step
-is evidence-driven: inspect the retained final-marker timeout and status
-artifacts, then make the smallest timing/ordering correction needed to expose
-catch-up and allow the final mounted probe to converge. Do not add sleeps or
-retry loops as a substitute for an observable state condition.
+The planned operation names and fixture-backed runner are updated. Focused
+tests cover fixture shape, batch grouping, mounted snapshot options, and the
+runner contract. Native validation now uses the directory-only/file-only
+snapshot path, which preserves namespace validation while avoiding the
+per-entry metadata callback that caused the timeout. No sleep or retry loop was
+added as a substitute for an observable state condition.
 
 ## Concrete Steps
 
@@ -231,20 +248,18 @@ Run all commands from `E:\dev\studiofs-cli`.
     cargo build --target-dir E:\dev\studiofs-cli\analysis-s24\target -p studiofs -p studiofs-e2e
 
 5. Run only scenario 24 with the registered runner and retained artifacts after
-   the remaining runner correction. The run must use the native mounted
-   environment and a fresh run ID; do not run a workspace-wide or full ignored
-   test suite. The exploratory runs are `20260919T-e24-pg-checkpoint-fast`,
-   `20260919T-e24-pg-checkpoint-pages`, and the interrupted
-   `20260919T-e24-pg-checkpoint-tail32`.
+   each mounted-validation correction. The accepted native runs are
+   `20260920T-directory-only-trace`, `20260920T-directory-only-r2`, and
+   `20260920T-directory-only-r3`; all used fresh run IDs and the native mounted
+   environment.
 6. Inspect `large-history-cold-bootstrap-summary.json`,
    `large-history-status.ndjson`, `operations.ndjson`, and the validation
    artifact. Confirm `observed_page_count > 1`, `saw_catching_up`,
    `restarted_during_catchup`, `moving_head_observed`, and
    `final_read_write_converged` are all true.
-7. Remove only the self-created `analysis-s24` scratch directory and temporary
-   inspection example after evidence is no longer needed. It is intentionally
-   retained at this checkpoint so tomorrow's investigation can start from the
-   current artifacts.
+7. Keep the retained `analysis-s24` artifacts as the investigation record.
+   Temporary cargo target directories created outside `target` are disposable
+   scratch and should not be committed.
 
 ## Validation and Acceptance
 
@@ -253,11 +268,12 @@ ignored tests. The focused VFS cleanup regression must pass. The fixture unit
 module currently reports 2 passed and the affected E2E/meta crates compile with
 the fixture module. These are not the native acceptance gate.
 
-The native scenario is accepted only if its registered `run-one` invocation
-returns success, its summary's `matched` validation is true, the final mounted
-trees converge, and the retained status shows more than one PostgreSQL page,
+The native scenario is accepted because the registered runner returned success
+for three fresh runs, each summary's `final_validator.converged` is true, and
+the retained status validates more than one PostgreSQL page,
 `saw_catching_up`, `restarted_during_catchup`, `moving_head_observed`, and
-`final_read_write_converged`. No current run meets all of these conditions.
+`final_read_write_converged`. The native acceptance gate was exercised on
+WinFSP; compile-only results were not used as acceptance evidence.
 A compile-only result or a test command reporting `running 0 tests` is not
 acceptance evidence. If Docker, WinFSP, or the native mount environment is
 unavailable, retain the diagnostic artifact and report that gate separately.

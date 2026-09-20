@@ -44,8 +44,10 @@ pub(in crate::scenario) fn finish_advanced_mounted(
                 "large-history convergence requires scenario isolation",
             ))
         })?;
+        let fixture_files_path = isolation.path(FIXTURE_FILES_DIRECTORY_NAME);
         let mut snapshot_options = MountedTreeSnapshotOptions::default()
-            .with_metadata_only_prefix(isolation.path(FIXTURE_FILES_DIRECTORY_NAME));
+            .with_metadata_only_prefix(fixture_files_path.clone())
+            .with_directory_only_directory(fixture_files_path);
         for shard_index in 0..FIXTURE_SHARD_COUNT {
             snapshot_options = snapshot_options.with_file_only_directory(isolation.path(&format!(
                 "{FIXTURE_FILES_DIRECTORY_NAME}/shard-{shard_index:02}"

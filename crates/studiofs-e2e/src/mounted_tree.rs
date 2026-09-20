@@ -34,6 +34,7 @@ pub struct ClientMount {
 pub struct MountedTreeSnapshotOptions {
     metadata_only_prefixes: Vec<String>,
     file_only_directories: Vec<String>,
+    directory_only_directories: Vec<String>,
 }
 
 impl MountedTreeSnapshotOptions {
@@ -51,6 +52,13 @@ impl MountedTreeSnapshotOptions {
         self
     }
 
+    /// Treats every direct child of `directory` as a directory without metadata calls.
+    #[must_use]
+    pub fn with_directory_only_directory(mut self, directory: impl Into<String>) -> Self {
+        self.directory_only_directories.push(directory.into());
+        self
+    }
+
     fn is_metadata_only(&self, path: &str) -> bool {
         self.metadata_only_prefixes.iter().any(|prefix| {
             path == prefix
@@ -62,6 +70,12 @@ impl MountedTreeSnapshotOptions {
 
     fn is_file_only_directory(&self, path: &str) -> bool {
         self.file_only_directories
+            .iter()
+            .any(|directory| directory == path)
+    }
+
+    fn is_directory_only_directory(&self, path: &str) -> bool {
+        self.directory_only_directories
             .iter()
             .any(|directory| directory == path)
     }
@@ -510,6 +524,7 @@ fn scan_dir(
     children.sort_by_key(|left| left.file_name());
     let current_relative_path = relative_path(root, current)?;
     let file_only_directory = options.is_file_only_directory(&current_relative_path);
+    let directory_only_children = options.is_directory_only_directory(&current_relative_path);
     for child in children {
         let path = child.path();
         let relative_path = relative_path(root, &path)?;
@@ -522,6 +537,18 @@ fn scan_dir(
                 checksum_sha256: None,
                 symlink_target: None,
             });
+            continue;
+        }
+        if directory_only_children {
+            entries.push(TreeEntry {
+                path: relative_path,
+                entry_type: TreeEntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+                checksum_sha256: None,
+                symlink_target: None,
+            });
+            scan_dir(root, &path, options, entries)?;
             continue;
         }
         if options.is_metadata_only(&relative_path) {
@@ -868,10 +895,14 @@ mod tests {
             root,
             &MountedTreeSnapshotOptions::default()
                 .with_metadata_only_prefix("fixture-root/fixture-files")
+                .with_directory_only_directory("fixture-root/fixture-files")
                 .with_file_only_directory("fixture-root/fixture-files/shard-00"),
         )
         .unwrap();
         let entries = entries_by_path(&snapshot);
+        let shard = entries["fixture-root/fixture-files/shard-00"];
+        assert_eq!(shard.entry_type, TreeEntryKind::Directory);
+        assert_eq!(shard.modified_unix_ms, None);
         let fixture = entries["fixture-root/fixture-files/shard-00/history-file-000000.bin"];
         assert_eq!(fixture.entry_type, TreeEntryKind::File);
         assert_eq!(fixture.size, None);
