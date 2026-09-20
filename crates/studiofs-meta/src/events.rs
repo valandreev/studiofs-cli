@@ -253,7 +253,11 @@ impl MetaEvent {
     }
 }
 
-pub(crate) fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
+/// Encode a metadata event using the persisted PostgreSQL/local-journal wire format.
+///
+/// Integration fixtures and storage adapters use this function to create event
+/// rows without duplicating the format's tag and envelope rules.
+pub fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
     let tag = event.wire_tag();
     match event {
         MetaEvent::SetAttr { attr } => encode_event_envelope(tag, attr),

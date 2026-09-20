@@ -2014,6 +2014,43 @@ fn make_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
+#[test]
+fn unlink_without_open_handles_does_not_append_redundant_cleanup_events() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "unlink-cleanup-events");
+    vfs.create(ROOT_INO, b"empty.txt", 0, 0, 0o644)
+        .expect("create empty file");
+
+    let unlink_start = meta
+        .get_counter("nextEventSeq")
+        .expect("read unlink event start");
+    vfs.unlink(ROOT_INO, b"empty.txt")
+        .expect("unlink empty file");
+    let unlink_end = meta
+        .get_counter("nextEventSeq")
+        .expect("read unlink event end");
+    let events = meta
+        .read_events_range(unlink_start, unlink_end)
+        .expect("read unlink events");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind() == "remove_regular_file_graph")
+            .count(),
+        1,
+        "unlink should append one graph-removal event, not one more from cleanup: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind() == "remove_attr")
+            .count(),
+        1,
+        "unlink should append one attr-removal event, not one more from cleanup: {events:?}"
+    );
+}
+
 fn enqueue_deferred_namespace_create(vfs: &Arc<StudioVfs>, attr: &InodeAttr, name: &[u8]) {
     vfs.enqueue_deferred_namespace_op(
         Some(super::namespace::DeferredNamespaceKey::new(ROOT_INO, name)),
@@ -13266,6 +13303,28 @@ fn orphan_deleted_inode_cleanup_batches_pending_deletions_for_multiple_objects()
 }
 
 #[test]
+fn deleted_inode_cleanup_queues_fallback_objects_when_graph_removal_is_empty() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deleted-inode-fallback-cleanup");
+    let attr = vfs
+        .create(1, b"deleted-inode-fallback-cleanup.bin", 0, 0, 0o644)
+        .expect("create test file");
+
+    let cleanup = vfs
+        .collect_deleted_inode_cleanup(&vfs.meta(), attr.ino, 0, "fallback-test", vec![701, 702])
+        .expect("collect fallback deleted inode cleanup");
+
+    assert_eq!(cleanup.removed_ids, vec![701, 702]);
+    let pending_ids: Vec<_> = meta
+        .get_pending_deletions()
+        .expect("read pending deletions")
+        .into_iter()
+        .map(|(object_id, _)| object_id)
+        .collect();
+    assert_eq!(pending_ids, vec![701, 702]);
+}
+
+#[test]
 fn orphan_cleanup_clears_dirty_writer_stack_state_for_deleted_inode() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "orphan-writer-stack-cleanup");
@@ -14116,6 +14175,127 @@ fn deferred_namespace_drain_abandons_permanent_failure() {
         assert!(
             matches!(shutdown_error, VfsError::MetadataPersistenceDegraded),
             "unexpected shutdown error: {shutdown_error:?}"
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_entry_conflict_does_not_degrade_mount() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-entry-conflict");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let deferred = InodeAttr::new_file(9_100_002, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &deferred, b"conflict.txt");
+
+        meta.create_file_with_ino(9_100_003, ROOT_INO, b"conflict.txt", 0, 0, 0o644)
+            .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.wait_for_deferred_namespace_metadata(deferred.ino),
+        )
+        .await
+        .expect("deferred conflict should settle")
+        .expect_err("the losing deferred create should report the namespace conflict");
+        assert!(
+            error.to_string().contains("entry already exists"),
+            "unexpected deferred conflict error: {error}"
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "a concurrent namespace conflict must not degrade the mount"
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_entry_conflict_retries_nonconflicting_operations() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "deferred-namespace-entry-conflict-retries-remainder");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let survivor = InodeAttr::new_file(9_100_004, ROOT_INO, 0, 0, 0o644);
+        let deferred_conflict = InodeAttr::new_file(9_100_005, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &survivor, b"survivor.txt");
+        enqueue_deferred_namespace_create(&vfs, &deferred_conflict, b"conflict.txt");
+
+        meta.create_file_with_ino(9_100_006, ROOT_INO, b"conflict.txt", 0, 0, 0o644)
+            .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        vfs.wait_for_deferred_namespace_metadata(survivor.ino)
+            .await
+            .expect("the nonconflicting deferred create should be retried and committed");
+        let persisted = meta
+            .lookup(ROOT_INO, b"survivor.txt")
+            .expect("the nonconflicting deferred create should remain persisted");
+        assert_eq!(persisted.ino, survivor.ino);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.wait_for_deferred_namespace_metadata(deferred_conflict.ino),
+        )
+        .await
+        .expect("deferred conflict should settle")
+        .expect_err("the losing deferred create should report the namespace conflict");
+        assert!(
+            error.to_string().contains("entry already exists"),
+            "unexpected deferred conflict error: {error}"
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "a concurrent namespace conflict must not degrade the mount"
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_conflict_preserves_same_inode_error_after_other_op_commits() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-same-inode-error");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = InodeAttr::new_file(9_100_007, ROOT_INO, 0, 0, 0o644);
+        meta.create_file_with_ino(attr.ino, ROOT_INO, b"existing-same-inode.txt", 0, 0, 0o644)
+            .expect("persist the inode used by the surviving setattr");
+        enqueue_deferred_namespace_create(&vfs, &attr, b"conflict-same-inode.txt");
+        vfs.enqueue_deferred_namespace_op(
+            None,
+            attr.clone(),
+            super::namespace::DeferredNamespaceOp::SetAttr {
+                attr: attr.clone(),
+                args: SetattrArgs {
+                    mode: Some(0o600),
+                    ..SetattrArgs::default()
+                },
+            },
+        )
+        .expect("admit surviving setattr for the same inode");
+        meta.create_file_with_ino(9_100_008, ROOT_INO, b"conflict-same-inode.txt", 0, 0, 0o644)
+            .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.wait_for_deferred_namespace_metadata(attr.ino),
+        )
+        .await
+        .expect("same-inode deferred operations should settle")
+        .expect_err("the failed create must remain visible after setattr succeeds");
+        assert!(
+            error.to_string().contains("entry already exists"),
+            "unexpected same-inode deferred conflict error: {error}"
         );
     });
 }

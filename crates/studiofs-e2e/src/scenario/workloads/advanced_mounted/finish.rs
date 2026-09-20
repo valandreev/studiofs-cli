@@ -38,12 +38,37 @@ pub(in crate::scenario) fn finish_advanced_mounted(
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
         .collect::<Vec<_>>();
-    let convergence = wait_for_convergence(
-        &mounts,
-        context.scenario_dir.join("validation"),
-        kind.convergence_timeout(),
-        ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
-    )?;
+    let convergence = if kind == AdvancedMountedKind::LargeHistoryColdBootstrap {
+        let isolation = isolation.ok_or_else(|| {
+            ScenarioError::Io(std::io::Error::other(
+                "large-history convergence requires scenario isolation",
+            ))
+        })?;
+        let fixture_files_path = isolation.path(FIXTURE_FILES_DIRECTORY_NAME);
+        let mut snapshot_options = MountedTreeSnapshotOptions::default()
+            .with_metadata_only_prefix(fixture_files_path.clone())
+            .with_directory_only_directory(fixture_files_path);
+        for shard_index in 0..FIXTURE_SHARD_COUNT {
+            snapshot_options = snapshot_options.with_file_only_directory(isolation.path(&format!(
+                "{FIXTURE_FILES_DIRECTORY_NAME}/shard-{shard_index:02}"
+            )));
+        }
+        wait_for_convergence_with_options(
+            &mounts,
+            context.scenario_dir.join("validation"),
+            kind.convergence_timeout(),
+            ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+            LARGE_HISTORY_SNAPSHOT_ATTEMPT_TIMEOUT,
+            &snapshot_options,
+        )?
+    } else {
+        wait_for_convergence(
+            &mounts,
+            context.scenario_dir.join("validation"),
+            kind.convergence_timeout(),
+            ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+        )?
+    };
     let expected_absent_paths = expected_absent_paths_for(kind, isolation);
     let expected_absent_paths = expected_absent_paths
         .iter()
@@ -399,15 +424,15 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
         AdvancedMountedKind::LargeHistoryColdBootstrap => &[
             (
                 "client-a",
-                "large_history_initial_batch",
-                "large-history-cold-bootstrap/bulk-create-delete:45000",
+                "large_history_pg_fixture_seed",
+                "large-history-cold-bootstrap/pg-fixture",
             ),
             ("client-d", "cold_discover_after_history", "client-d"),
             ("client-d", "cold_restart_during_catchup", "client-d"),
             (
                 "client-a",
-                "large_history_moving_head_batch",
-                "large-history-cold-bootstrap/bulk-create-delete:5000",
+                "large_history_pg_moving_head_append",
+                "large-history-cold-bootstrap/pg-fixture",
             ),
         ],
     };

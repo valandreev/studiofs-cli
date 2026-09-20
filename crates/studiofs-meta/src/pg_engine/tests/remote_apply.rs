@@ -927,6 +927,114 @@ fn self_batch_reconcile_uses_overlay_after_ack_for_dentries() {
 }
 
 #[test]
+fn self_replay_ack_clears_stale_foreign_regular_file_protection_after_repair() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"repaired-self-publish.bin", 77_101);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge setup");
+
+    let foreign_attr = pg.get_attr(file.ino).expect("foreign ready attr");
+    let self_start = setup_end;
+    let self_payload = PayloadRef::new_partial(77_102, 270);
+    pg.stage_payload_slice(file.ino, 0, &self_payload)
+        .expect("stage self payload");
+    set_file_state(&pg, file.ino, 270, 7);
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            file.ino,
+            7,
+            self_payload.object_id
+        )
+        .expect("mark self payload uploaded")
+    );
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 7)
+            .expect("publish self payload")
+    );
+    let self_end = pg.local.get_counter("nextEventSeq").expect("self end");
+    let self_events = pg
+        .local
+        .read_events_range(self_start, self_end)
+        .expect("read self events");
+    let self_batch = RemoteApplyCoordinator::project_local_batch(&self_events);
+    let self_attr = pg.get_attr(file.ino).expect("self ready attr");
+    assert_eq!(self_attr.size, 270);
+
+    let repaired_attr = foreign_attr.clone();
+    let repaired_overlay =
+        fixture_payload_slices(0, Some(&self_payload), PayloadRefState::Uploaded)
+            .expect("build repaired overlay");
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr {
+                attr: repaired_attr,
+            },
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: repaired_overlay,
+            },
+        ])
+        .expect("restore repaired local overlay and serving attr");
+    assert!(
+        pg.local
+            .has_local_regular_file_overlay(file.ino)
+            .expect("check repaired overlay"),
+        "repair setup must leave a local overlay for the foreign replay pass"
+    );
+
+    let foreign_events = vec![MetaEvent::SetAttr { attr: foreign_attr }];
+    let initial_overlay = self_batch.overlay.clone();
+    let foreign_conflicts = RemoteApplyCoordinator::new(&pg.local)
+        .current_regular_file_overlay_conflicts_for_batch(&foreign_events)
+        .expect("collect foreign replay protection");
+    assert!(foreign_conflicts.attr_inodes.contains(&file.ino));
+    assert!(foreign_conflicts.block_inodes.contains(&file.ino));
+
+    let outcome = RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![
+                DecodedReplayBatch {
+                    batch_version: 1,
+                    events: foreign_events,
+                    is_self_batch: false,
+                },
+                DecodedReplayBatch {
+                    batch_version: 2,
+                    events: self_batch.events,
+                    is_self_batch: true,
+                },
+            ],
+            Some(&RecentFlush {
+                batch_version: 2,
+                overlay: initial_overlay.clone(),
+            }),
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: self_start,
+                next_event_seq: self_end,
+                initial_overlay,
+            },
+        )
+        .expect("replay foreign and self batches");
+
+    assert!(outcome.changed);
+    assert_eq!(outcome.flushed_event_seq, Some(self_end));
+    let restored = pg.get_attr(file.ino).expect("restored serving attr");
+    assert_eq!(restored.size, self_attr.size);
+    assert_eq!(restored.content_epoch, self_attr.content_epoch);
+    assert_eq!(
+        pg.lookup_regular_file_slices(file.ino, 0, restored.size)
+            .expect("restored serving slices")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<Vec<_>>(),
+        vec![self_payload.object_id]
+    );
+}
+
+#[test]
 fn foreign_unlink_after_local_rename_removes_destination_alias() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

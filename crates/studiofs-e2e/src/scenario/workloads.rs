@@ -32,8 +32,9 @@ use crate::infra::{
     SystemCommandExecutor,
 };
 use crate::mounted_tree::{
-    ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
-    validate_namespace_invariants, wait_for_convergence,
+    ClientMount, ConvergenceOutcome, MountedTreeError, MountedTreeSnapshotOptions,
+    NamespaceInvariantViolation, TreeComparison, validate_namespace_invariants,
+    wait_for_convergence, wait_for_convergence_with_options,
 };
 #[cfg(all(windows, not(test)))]
 use crate::process_diagnostics::capture_process_diagnostics_best_effort;
@@ -118,9 +119,13 @@ const LARGE_HISTORY_MUTATION_COUNT: usize = 100_000;
 const LARGE_HISTORY_INITIAL_MUTATION_COUNT: usize = 90_000;
 const LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT: usize = 10_000;
 const LARGE_HISTORY_COLD_CLIENT: &str = "client-d";
-const LARGE_HISTORY_INITIAL_BATCH_PAIRS: usize = LARGE_HISTORY_INITIAL_MUTATION_COUNT / 2;
-const LARGE_HISTORY_MOVING_HEAD_BATCH_PAIRS: usize = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT / 2;
+const LARGE_HISTORY_CLIENT_NAMES: &[&str] = &["client-a", LARGE_HISTORY_COLD_CLIENT];
+const LARGE_HISTORY_FIXTURE_FILE_COUNT: usize = 4096;
+const LARGE_HISTORY_FIXTURE_EVENTS_PER_BATCH: usize = 256;
+const LARGE_HISTORY_FIXTURE_INSERT_CHUNK_ROWS: usize = 4096;
+const LARGE_HISTORY_MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const LARGE_HISTORY_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(600);
+const LARGE_HISTORY_SNAPSHOT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LARGE_HISTORY_CATCHUP_BATCHES_PER_PAGE: &str = "1";
 const LARGE_HISTORY_CATCHUP_POLL_SECS: &str = "1";

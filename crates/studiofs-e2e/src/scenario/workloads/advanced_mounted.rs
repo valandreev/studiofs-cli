@@ -254,7 +254,7 @@ impl AdvancedMountedKind {
                 description: "opt-in mounted large-history cold-bootstrap catch-up convergence",
                 path_root: "large-history-cold-bootstrap",
                 summary_file: "large-history-cold-bootstrap-summary.json",
-                client_names: COLD_OBSERVER_CLIENT_NAMES,
+                client_names: LARGE_HISTORY_CLIENT_NAMES,
                 convergence_timeout: LARGE_HISTORY_CONVERGENCE_TIMEOUT,
             },
         }
@@ -407,6 +407,10 @@ impl Scenario for AdvancedMountedScenario {
         if self.kind == AdvancedMountedKind::LargeHistoryColdBootstrap {
             artifacts.push(format!(
                 "artifacts/scenarios/{}/large-history-status.ndjson",
+                self.kind.name()
+            ));
+            artifacts.push(format!(
+                "artifacts/scenarios/{}/large-history-fixture.json",
                 self.kind.name()
             ));
         }
@@ -689,6 +693,7 @@ mod tests {
 mod finish;
 mod hotspot;
 mod invalidation_symlink;
+mod large_history_fixture;
 mod open_handle;
 mod planned;
 mod probe;
@@ -699,6 +704,7 @@ mod sparse;
 pub(in crate::scenario) use finish::*;
 pub(in crate::scenario) use hotspot::*;
 pub(in crate::scenario) use invalidation_symlink::*;
+pub(in crate::scenario) use large_history_fixture::*;
 pub(in crate::scenario) use open_handle::*;
 pub(in crate::scenario) use planned::*;
 pub(in crate::scenario) use probe::*;

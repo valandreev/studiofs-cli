@@ -29,6 +29,58 @@ pub struct ClientMount {
     pub mount_point: PathBuf,
 }
 
+/// Controls how mounted tree entries are captured.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MountedTreeSnapshotOptions {
+    metadata_only_prefixes: Vec<String>,
+    file_only_directories: Vec<String>,
+    directory_only_directories: Vec<String>,
+}
+
+impl MountedTreeSnapshotOptions {
+    /// Skips size and checksum reads for regular files at or below `prefix`.
+    #[must_use]
+    pub fn with_metadata_only_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.metadata_only_prefixes.push(prefix.into());
+        self
+    }
+
+    /// Treats every direct child of `directory` as a regular file without getattr calls.
+    #[must_use]
+    pub fn with_file_only_directory(mut self, directory: impl Into<String>) -> Self {
+        self.file_only_directories.push(directory.into());
+        self
+    }
+
+    /// Treats every direct child of `directory` as a directory without metadata calls.
+    #[must_use]
+    pub fn with_directory_only_directory(mut self, directory: impl Into<String>) -> Self {
+        self.directory_only_directories.push(directory.into());
+        self
+    }
+
+    fn is_metadata_only(&self, path: &str) -> bool {
+        self.metadata_only_prefixes.iter().any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+
+    fn is_file_only_directory(&self, path: &str) -> bool {
+        self.file_only_directories
+            .iter()
+            .any(|directory| directory == path)
+    }
+
+    fn is_directory_only_directory(&self, path: &str) -> bool {
+        self.directory_only_directories
+            .iter()
+            .any(|directory| directory == path)
+    }
+}
+
 impl ClientMount {
     /// Creates a new client mount descriptor.
     pub fn new(client: impl Into<String>, mount_point: impl Into<PathBuf>) -> Self {
@@ -209,10 +261,19 @@ pub fn snapshot_client_tree(
     client: impl Into<String>,
     mount_point: impl AsRef<Path>,
 ) -> Result<MountedTreeSnapshot, MountedTreeError> {
+    snapshot_client_tree_with_options(client, mount_point, &MountedTreeSnapshotOptions::default())
+}
+
+/// Captures a sorted snapshot using scenario-specific payload read options.
+pub fn snapshot_client_tree_with_options(
+    client: impl Into<String>,
+    mount_point: impl AsRef<Path>,
+    options: &MountedTreeSnapshotOptions,
+) -> Result<MountedTreeSnapshot, MountedTreeError> {
     let client = client.into();
     let mount_point = mount_point.as_ref();
     let mut entries = Vec::new();
-    scan_dir(mount_point, mount_point, &mut entries)?;
+    scan_dir(mount_point, mount_point, options, &mut entries)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(MountedTreeSnapshot {
@@ -361,6 +422,25 @@ pub fn wait_for_convergence(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, MountedTreeError> {
+    wait_for_convergence_with_options(
+        mounts,
+        artifact_dir,
+        timeout,
+        poll_interval,
+        SNAPSHOT_ATTEMPT_TIMEOUT,
+        &MountedTreeSnapshotOptions::default(),
+    )
+}
+
+/// Polls mounted snapshots with scenario-specific snapshot and attempt bounds.
+pub fn wait_for_convergence_with_options(
+    mounts: &[ClientMount],
+    artifact_dir: impl AsRef<Path>,
+    timeout: Duration,
+    poll_interval: Duration,
+    snapshot_attempt_timeout: Duration,
+    snapshot_options: &MountedTreeSnapshotOptions,
+) -> Result<ConvergenceOutcome, MountedTreeError> {
     let artifact_dir = artifact_dir.as_ref();
     let started = Instant::now();
     let deadline = started + timeout;
@@ -370,7 +450,7 @@ pub fn wait_for_convergence(
 
     loop {
         attempts += 1;
-        match snapshot_mounts_with_timeout(mounts, SNAPSHOT_ATTEMPT_TIMEOUT) {
+        match snapshot_mounts_with_timeout(mounts, snapshot_attempt_timeout, snapshot_options) {
             Ok(snapshots) => {
                 let comparison = compare_snapshots(&snapshots);
                 let elapsed_ms = started.elapsed().as_millis();
@@ -437,14 +517,82 @@ pub fn wait_for_convergence(
 fn scan_dir(
     root: &Path,
     current: &Path,
+    options: &MountedTreeSnapshotOptions,
     entries: &mut Vec<TreeEntry>,
 ) -> Result<(), MountedTreeError> {
     let mut children = read_dir_entries(current)?;
     children.sort_by_key(|left| left.file_name());
+    let current_relative_path = relative_path(root, current)?;
+    let file_only_directory = options.is_file_only_directory(&current_relative_path);
+    let directory_only_children = options.is_directory_only_directory(&current_relative_path);
     for child in children {
         let path = child.path();
-        let metadata = symlink_metadata(&path)?;
         let relative_path = relative_path(root, &path)?;
+        if file_only_directory {
+            entries.push(TreeEntry {
+                path: relative_path,
+                entry_type: TreeEntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+                checksum_sha256: None,
+                symlink_target: None,
+            });
+            continue;
+        }
+        if directory_only_children {
+            let file_type = child
+                .file_type()
+                .map_err(|source| io_error(&path, source))?;
+            let entry_type = if file_type.is_dir() {
+                TreeEntryKind::Directory
+            } else if file_type.is_file() {
+                TreeEntryKind::File
+            } else if file_type.is_symlink() {
+                TreeEntryKind::Symlink
+            } else {
+                TreeEntryKind::Other
+            };
+            entries.push(TreeEntry {
+                path: relative_path,
+                entry_type,
+                size: None,
+                modified_unix_ms: None,
+                checksum_sha256: None,
+                symlink_target: None,
+            });
+            if file_type.is_dir() {
+                scan_dir(root, &path, options, entries)?;
+            }
+            continue;
+        }
+        if options.is_metadata_only(&relative_path) {
+            let file_type = child
+                .file_type()
+                .map_err(|source| io_error(&path, source))?;
+            let entry_type = if file_type.is_dir() {
+                TreeEntryKind::Directory
+            } else if file_type.is_file() {
+                TreeEntryKind::File
+            } else if file_type.is_symlink() {
+                TreeEntryKind::Symlink
+            } else {
+                TreeEntryKind::Other
+            };
+            entries.push(TreeEntry {
+                path: relative_path,
+                entry_type,
+                size: None,
+                modified_unix_ms: None,
+                checksum_sha256: None,
+                symlink_target: None,
+            });
+            if file_type.is_dir() {
+                scan_dir(root, &path, options, entries)?;
+            }
+            continue;
+        }
+
+        let metadata = symlink_metadata(&path)?;
         let file_type = metadata.file_type();
 
         if file_type.is_dir() {
@@ -456,7 +604,7 @@ fn scan_dir(
                 checksum_sha256: None,
                 symlink_target: None,
             });
-            scan_dir(root, &path, entries)?;
+            scan_dir(root, &path, options, entries)?;
         } else if file_type.is_file() {
             entries.push(TreeEntry {
                 path: relative_path,
@@ -572,19 +720,24 @@ fn compare_entry(
 }
 
 /// Captures snapshots for every provided mounted client.
-fn snapshot_mounts(mounts: &[ClientMount]) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
+fn snapshot_mounts(
+    mounts: &[ClientMount],
+    options: &MountedTreeSnapshotOptions,
+) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
     mounts
         .iter()
-        .map(|mount| snapshot_client_tree(&mount.client, &mount.mount_point))
+        .map(|mount| snapshot_client_tree_with_options(&mount.client, &mount.mount_point, options))
         .collect()
 }
 
 fn snapshot_mounts_with_timeout(
     mounts: &[ClientMount],
     timeout: Duration,
+    options: &MountedTreeSnapshotOptions,
 ) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
     let mounts = mounts.to_vec();
-    run_snapshot_attempt_with_timeout(timeout, move || snapshot_mounts(&mounts))
+    let options = options.clone();
+    run_snapshot_attempt_with_timeout(timeout, move || snapshot_mounts(&mounts, &options))
 }
 
 fn run_snapshot_attempt_with_timeout<F>(
@@ -739,6 +892,62 @@ fn io_error(path: &Path, source: io::Error) -> MountedTreeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_only_prefix_skips_file_payload_reads_but_preserves_namespace() {
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-tree-options-");
+        let root = temp.path();
+        let fixture_dir = root.join("fixture-root/fixture-files/shard-00");
+        let control_dir = root.join("fixture-root/control");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        fs::create_dir_all(&control_dir).unwrap();
+        fs::write(fixture_dir.join("history-file-000000.bin"), b"fixture").unwrap();
+        fs::write(control_dir.join("marker.txt"), b"marker").unwrap();
+
+        let snapshot = snapshot_client_tree_with_options(
+            "client-a",
+            root,
+            &MountedTreeSnapshotOptions::default()
+                .with_metadata_only_prefix("fixture-root/fixture-files")
+                .with_directory_only_directory("fixture-root/fixture-files")
+                .with_file_only_directory("fixture-root/fixture-files/shard-00"),
+        )
+        .unwrap();
+        let entries = entries_by_path(&snapshot);
+        let shard = entries["fixture-root/fixture-files/shard-00"];
+        assert_eq!(shard.entry_type, TreeEntryKind::Directory);
+        assert_eq!(shard.modified_unix_ms, None);
+        let fixture = entries["fixture-root/fixture-files/shard-00/history-file-000000.bin"];
+        assert_eq!(fixture.entry_type, TreeEntryKind::File);
+        assert_eq!(fixture.size, None);
+        assert_eq!(fixture.checksum_sha256, None);
+
+        let marker = entries["fixture-root/control/marker.txt"];
+        assert_eq!(marker.size, Some(6));
+        assert!(marker.checksum_sha256.is_some());
+    }
+
+    #[test]
+    fn directory_only_option_does_not_recurse_into_non_directories() {
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-tree-directory-only-");
+        let root = temp.path();
+        let fixture_dir = root.join("fixture-root/fixture-files");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        fs::write(fixture_dir.join("marker.txt"), b"marker").unwrap();
+
+        let snapshot = snapshot_client_tree_with_options(
+            "client-a",
+            root,
+            &MountedTreeSnapshotOptions::default()
+                .with_directory_only_directory("fixture-root/fixture-files"),
+        )
+        .unwrap();
+        let entries = entries_by_path(&snapshot);
+        let marker = entries["fixture-root/fixture-files/marker.txt"];
+        assert_eq!(marker.entry_type, TreeEntryKind::File);
+        assert_eq!(marker.size, None);
+        assert_eq!(marker.checksum_sha256, None);
+    }
 
     #[test]
     fn snapshot_attempt_timeout_returns_without_waiting_for_blocked_probe() {

@@ -809,7 +809,7 @@ fn large_history_cold_bootstrap_disabled_run_writes_reproducible_artifacts() {
         summary["scenario"],
         "mounted-large-history-cold-bootstrap-convergence"
     );
-    assert_eq!(summary["clients"], 4);
+    assert_eq!(summary["clients"], 2);
     assert!(
         summary["large_history"]["mutation_count"]
             .as_u64()

@@ -879,65 +879,22 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     context: &ScenarioContext,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
-    controller.create_clients(COLD_OBSERVER_CLIENT_NAMES.iter().copied())?;
+    controller.create_clients(LARGE_HISTORY_CLIENT_NAMES.iter().copied())?;
     controller.init_first_client()?;
-    for client in &COLD_OBSERVER_WARM_CLIENT_NAMES[1..] {
-        controller.discover(client)?;
-    }
-    for client in COLD_OBSERVER_WARM_CLIENT_NAMES {
-        controller.mount(client)?;
-    }
-    let warm_clients = controller
-        .clients()
-        .into_iter()
-        .filter(|client| COLD_OBSERVER_WARM_CLIENT_NAMES.contains(&client.name.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let bootstrap = VolumeBootstrapSummary {
-        volume_name: warm_clients
-            .first()
-            .map(|client| client.volume_name.clone())
-            .unwrap_or_else(|| "projectfs".to_string()),
-        init_client: "client-a".to_string(),
-        discovered_clients: vec!["client-b".to_string(), "client-c".to_string()],
-        clients: warm_clients
-            .iter()
-            .map(|client| crate::client::ClientBootstrapRecord {
-                name: client.name.clone(),
-                local_metadata_db: client.local_metadata_db.clone(),
-                state: client.state,
-            })
-            .collect(),
-    };
-    write_bootstrap_summary(context, &bootstrap)?;
-
+    let config = context.client_controller_config.as_ref().ok_or_else(|| {
+        ScenarioError::Io(io::Error::other(
+            "large-history PG fixture requires client controller configuration",
+        ))
+    })?;
+    let volume_name = config.volume_name.clone();
     let isolation = ScenarioIsolation::for_advanced(
         context,
         AdvancedMountedKind::LargeHistoryColdBootstrap,
-        &bootstrap.volume_name,
+        &volume_name,
     );
     let started = Instant::now();
-    let mut operations = Vec::new();
-    let status_path = context.scenario_dir.join("large-history-status.ndjson");
-    fs::write(&status_path, [])?;
-    let initial_warm_status = parse_large_history_status(&controller.status("client-a")?.stdout)?;
-    append_large_history_status(&status_path, "client-a", &initial_warm_status)?;
-    let initial_remote_head = initial_warm_status.remote_head_version;
-    let initial_operation = format!("bulk-create-delete:{LARGE_HISTORY_INITIAL_BATCH_PAIRS}");
-    operations.push(timed_hotspot_helper_fs_op(
-        context,
-        started,
-        1,
-        &warm_clients[0],
-        &initial_operation,
-        &isolation.root,
-        LARGE_HISTORY_CONVERGENCE_TIMEOUT,
-        None,
-        None,
-    )?);
-    let after_initial_status = parse_large_history_status(&controller.status("client-a")?.stdout)?;
-    append_large_history_status(&status_path, "client-a", &after_initial_status)?;
-
+    let _fixture =
+        seed_large_history_fixture(config, &volume_name, &isolation.root, &context.scenario_dir)?;
     controller.set_client_env_overrides(
         LARGE_HISTORY_COLD_CLIENT,
         [
@@ -951,6 +908,66 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             ),
         ],
     )?;
+    controller.set_mount_ready_timeout(LARGE_HISTORY_MOUNT_READY_TIMEOUT);
+    controller.mount("client-a")?;
+    let warm_clients = controller
+        .clients()
+        .into_iter()
+        .filter(|client| client.name == "client-a")
+        .cloned()
+        .collect::<Vec<_>>();
+    let warm_writer = warm_clients
+        .first()
+        .cloned()
+        .ok_or_else(|| ScenarioError::Io(io::Error::other("missing large-history client-a")))?;
+    let bootstrap = VolumeBootstrapSummary {
+        volume_name: volume_name.clone(),
+        init_client: "client-a".to_string(),
+        discovered_clients: Vec::new(),
+        clients: warm_clients
+            .iter()
+            .map(|client| crate::client::ClientBootstrapRecord {
+                name: client.name.clone(),
+                local_metadata_db: client.local_metadata_db.clone(),
+                state: client.state,
+            })
+            .collect(),
+    };
+    write_bootstrap_summary(context, &bootstrap)?;
+
+    let mut operations = Vec::new();
+    let status_path = context.scenario_dir.join("large-history-status.ndjson");
+    fs::write(&status_path, [])?;
+    let warm_deadline = Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT;
+    let initial_warm_status = loop {
+        let sample = parse_large_history_status(&controller.status("client-a")?.stdout)?;
+        append_large_history_status(&status_path, "client-a", &sample)?;
+        let caught_up = sample
+            .remote_head_version
+            .zip(sample.local_applied_version)
+            .is_some_and(|(remote_head, local_applied)| local_applied >= remote_head);
+        if sample.lifecycle == "Live" && caught_up {
+            break sample;
+        }
+        if Instant::now() >= warm_deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "large-history warm client did not apply the PostgreSQL fixture",
+            )));
+        }
+        thread::sleep(LARGE_HISTORY_POLL_INTERVAL);
+    };
+    let initial_remote_head = initial_warm_status.remote_head_version;
+    let after_initial_status = initial_warm_status.clone();
+    append_large_history_status(&status_path, "client-a", &after_initial_status)?;
+    operations.push(record_advanced_operation(
+        started,
+        1,
+        &warm_writer,
+        "large_history_pg_fixture_seed",
+        &isolation.root,
+        Ok(()),
+    ));
     let cold_client = controller
         .clients()
         .into_iter()
@@ -967,6 +984,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             .discover(LARGE_HISTORY_COLD_CLIENT)
             .map_err(ScenarioError::from),
     )?);
+    let mut replay_gate = Some(LargeHistoryReplayGate::acquire(&config.meta_dsn)?);
     operations.push(required_op(
         started,
         operations.len() + 1,
@@ -974,7 +992,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         "cold_mount_after_large_history",
         LARGE_HISTORY_COLD_CLIENT,
         controller
-            .mount(LARGE_HISTORY_COLD_CLIENT)
+            .mount_until_lifecycle_ready(LARGE_HISTORY_COLD_CLIENT)
             .map_err(ScenarioError::from),
     )?);
 
@@ -988,7 +1006,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let mut saw_catching_up = false;
     let mut restarted_during_catchup = false;
     let mut moving_head_observed = false;
-    let mut moving_writer = None;
+    let mut moving_head_fixture_appended = false;
     let monitor_result = (|| {
         loop {
             let sample =
@@ -1002,32 +1020,23 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
             saw_catching_up |= sample.lifecycle == "CatchingUp";
 
-            if saw_catching_up && moving_writer.is_none() {
-                let writer_context = context.clone();
-                let writer_client = warm_clients[0].clone();
-                let writer_operation =
-                    format!("bulk-create-delete:{LARGE_HISTORY_MOVING_HEAD_BATCH_PAIRS}");
-                let writer_path = isolation.root.clone();
-                moving_writer = Some(std::thread::spawn(move || {
-                    run_hotspot_helper_process(
-                        &writer_context,
-                        LARGE_HISTORY_CONVERGENCE_TIMEOUT,
-                        &writer_client,
-                        &writer_operation,
-                        &writer_path,
-                        None,
-                        None,
-                        format!(
-                            "{} {} {}",
-                            writer_client.name, writer_operation, writer_path
-                        ),
-                    )
-                }));
-            }
-
             if saw_catching_up && !restarted_during_catchup {
                 applied_version_restart_index = Some(applied_version_progression.len());
-                controller.restart(LARGE_HISTORY_COLD_CLIENT)?;
+                replay_gate
+                    .take()
+                    .expect("large-history replay gate must be held until cold restart")
+                    .release()?;
+                append_large_history_moving_head_fixture(config, &volume_name)?;
+                moving_head_fixture_appended = true;
+                operations.push(record_advanced_operation(
+                    started,
+                    operations.len() + 1,
+                    &warm_writer,
+                    "large_history_pg_moving_head_append",
+                    &isolation.root,
+                    Ok(()),
+                ));
+                controller.restart_until_lifecycle_ready(LARGE_HISTORY_COLD_CLIENT)?;
                 restarted_during_catchup = true;
                 operations.push(record_advanced_operation(
                     started,
@@ -1053,23 +1062,17 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         }
         Ok::<(), ScenarioError>(())
     })();
-    let writer_result =
-        if let Some(writer) = moving_writer.take() {
-            Some(writer.join().map_err(|_| {
-                ScenarioError::Io(io::Error::other("large-history writer panicked"))
-            })?)
-        } else {
-            None
-        };
+    let replay_gate_result = replay_gate
+        .take()
+        .map(LargeHistoryReplayGate::release)
+        .transpose();
     monitor_result?;
+    replay_gate_result?;
     let reached_live = true;
-    let moving_writer_completed = writer_result.is_some();
-    if let Some(writer_result) = writer_result {
-        writer_result?;
-    }
+    let moving_writer_completed = moving_head_fixture_appended;
     let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
     let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
-    let final_marker_path = isolation.path("final-read-write-marker.txt");
+    let final_marker_path = isolation.path("control/final-read-write-marker.txt");
     let final_marker_payload = isolation.payload(
         "final_read_write",
         &final_marker_path,
@@ -1080,8 +1083,8 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    // This marker is written after the moving writer completes. Its visibility on the
-    // cold client is the ordered publication barrier for the preceding workload.
+    // This mounted marker is written after the PG moving-head fixture. Its visibility
+    // on the cold client is the ordered publication barrier for the preceding workload.
     operations.push(timed_hotspot_helper_fs_op_with_helper(
         context,
         started,
@@ -1094,12 +1097,13 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         Some(&final_marker_payload),
         None,
     )?);
-    wait_for_mounted_initial_payloads_until(
+    wait_for_mounted_initial_payloads_until_with_probe_timeout(
         &clients,
         &[(&final_marker_path, final_marker_payload.as_slice())],
         deadline,
         LARGE_HISTORY_POLL_INTERVAL,
         "large-history final read-write convergence",
+        LARGE_HISTORY_SNAPSHOT_ATTEMPT_TIMEOUT,
     )?;
     let final_read_write_converged = true;
     if moving_writer_completed {

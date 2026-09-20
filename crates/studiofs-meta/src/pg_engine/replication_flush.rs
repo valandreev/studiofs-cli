@@ -1,11 +1,12 @@
 //! Owns local event replication backlog claims and flush completion.
 
 use super::{
-    ClaimedPendingBatch, PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
+    ClaimedPendingBatch, PendingMutationHint, PendingReplicationState, PgMetaEngine, RecentFlush,
+    RemoteApplyCoordinator,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
-use crate::schema::{ChunkId, PayloadRefState, SliceRecord, UploadState};
+use crate::schema::{ChunkId, PayloadRefState, ROOT_INO, SliceRecord, UploadState};
 use crate::types::{FileType, Ino, InodeAttr};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
+const LOCAL_ONLY_SUFFIX_CONTEXT_EVENTS: u64 = 16;
 
 #[derive(Default)]
 struct RepairedRegularFileOverlay {
@@ -89,6 +91,123 @@ fn push_repaired_overlay_events(
 }
 
 impl PgMetaEngine {
+    fn acknowledge_pending_state_if_unchanged(
+        &self,
+        expected_state: PendingReplicationState,
+        event_end: u64,
+    ) -> MetaResult<()> {
+        // `metadata_sync` takes local_position_lock before pending_state. Do
+        // the same here so persisting the cursor cannot deadlock with replay.
+        let _position_guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        let mut state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        if *state != expected_state {
+            return Ok(());
+        }
+        self.persist_flushed_event_seq_locked(event_end)?;
+        Self::clear_pending_state(&mut state);
+        Ok(())
+    }
+
+    pub(super) fn current_inode_is_unpublished_regular(&self, ino: Ino) -> MetaResult<bool> {
+        if let Some(lifecycle) = self.local.get_inode_lifecycle(ino)? {
+            return Ok(!lifecycle.has_published_base);
+        }
+        match self.local.get_attr(ino) {
+            Ok(attr) => Ok(attr.kind == FileType::RegularFile && attr.is_unpublished_empty_draft()),
+            Err(MetaError::InodeNotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn source_has_local_only_deleted_inode(source_events: &[MetaEvent], ino: Ino) -> bool {
+        let mut has_graph_removal = false;
+        let mut has_attr_removal = false;
+        for event in source_events {
+            match event {
+                MetaEvent::RemoveRegularFileGraph { ino: event_ino } if *event_ino == ino => {
+                    has_graph_removal = true;
+                }
+                MetaEvent::RemoveAttr { ino: event_ino } if *event_ino == ino => {
+                    has_attr_removal = true;
+                }
+                MetaEvent::RemoveEntry { .. } => return false,
+                _ => {}
+            }
+        }
+        has_graph_removal && has_attr_removal
+    }
+
+    pub(super) fn projected_suffix_is_local_only(
+        &self,
+        source_events: &[MetaEvent],
+        projected_events: &[MetaEvent],
+    ) -> MetaResult<bool> {
+        let mut graph_counts = HashMap::<Ino, usize>::new();
+        let mut attr_counts = HashMap::<Ino, usize>::new();
+        let mut source_is_only_file_deletions = true;
+        for event in source_events {
+            match event {
+                MetaEvent::RemoveRegularFileGraph { ino } => {
+                    *graph_counts.entry(*ino).or_default() += 1;
+                }
+                MetaEvent::RemoveAttr { ino } => {
+                    *attr_counts.entry(*ino).or_default() += 1;
+                }
+                _ => {
+                    source_is_only_file_deletions = false;
+                    break;
+                }
+            }
+        }
+        if source_is_only_file_deletions
+            && !attr_counts.is_empty()
+            && attr_counts.iter().all(|(ino, attr_count)| {
+                graph_counts.get(ino).copied().unwrap_or_default() >= *attr_count
+            })
+            && projected_events.len() == attr_counts.values().sum::<usize>()
+            && projected_events.iter().all(|event| {
+                matches!(event, MetaEvent::RemoveAttr { ino } if attr_counts.contains_key(ino))
+            })
+        {
+            return Ok(true);
+        }
+        if projected_events.is_empty() {
+            return Ok(false);
+        }
+        let unpublished_empty_inodes = source_events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => Some(attr.ino),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for event in projected_events {
+            let local_only = match event {
+                MetaEvent::SetAttr { attr } => attr.is_unpublished_empty_draft(),
+                MetaEvent::AddEntry { entry, .. } => {
+                    entry.kind == FileType::RegularFile
+                        && (unpublished_empty_inodes.contains(&entry.ino)
+                            || self.current_inode_is_unpublished_regular(entry.ino)?
+                            || Self::source_has_local_only_deleted_inode(source_events, entry.ino))
+                }
+                MetaEvent::RemoveAttr { ino } => {
+                    Self::source_has_local_only_deleted_inode(source_events, *ino)
+                }
+                _ => false,
+            };
+            if !local_only {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn clear_pending_state(state: &mut PendingReplicationState) {
         *state = PendingReplicationState::default();
     }
@@ -133,6 +252,25 @@ impl PgMetaEngine {
         Ok(events.len())
     }
 
+    fn initial_root_snapshot_prefix_len(event_start: u64, events: &[MetaEvent]) -> usize {
+        if event_start != 0 {
+            return 0;
+        }
+
+        matches!(
+            events.first(),
+            Some(MetaEvent::SetAttr { attr })
+                if attr.ino == ROOT_INO
+                    && attr.kind == FileType::Directory
+                    && attr.parent == ROOT_INO
+                    && attr.content_epoch == 0
+                    && attr.committed_content_epoch == 0
+                    && attr.upload_state == UploadState::Ready
+        )
+        .then_some(1)
+        .unwrap_or_default()
+    }
+
     pub(super) fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
         let mut state = self
             .pending_state
@@ -153,7 +291,20 @@ impl PgMetaEngine {
         }
 
         let pending_events = self.local.read_events_range(event_start, event_end)?;
-        let stale_setup_prefix_len = self.stale_published_setup_prefix_len(&pending_events)?;
+        // `studiofs init` publishes the initial root in the serving checkpoint,
+        // while the local redb journal still contains the root setup event.
+        // Treat that one event as acknowledged so every later local mutation
+        // does not repeatedly re-project the startup baseline.
+        let initial_root_prefix_len =
+            Self::initial_root_snapshot_prefix_len(event_start, &pending_events);
+        if initial_root_prefix_len > 0 {
+            event_start = event_start
+                .max(1)
+                .saturating_add(initial_root_prefix_len as u64);
+            self.persist_flushed_event_seq(event_start)?;
+        }
+        let pending_events = &pending_events[initial_root_prefix_len..];
+        let stale_setup_prefix_len = self.stale_published_setup_prefix_len(pending_events)?;
         if stale_setup_prefix_len > 0 {
             event_start = event_start
                 .max(1)
@@ -179,8 +330,8 @@ impl PgMetaEngine {
                 state.last_mutation_at = Some(now);
                 return Ok(());
             }
-            Self::clear_pending_state(state);
             self.persist_flushed_event_seq(event_end)?;
+            Self::clear_pending_state(state);
             return Ok(());
         }
 
@@ -286,6 +437,7 @@ impl PgMetaEngine {
         &self,
         before_seq: u64,
         after_seq: u64,
+        hint: PendingMutationHint,
     ) -> MetaResult<bool> {
         if after_seq <= before_seq {
             return Ok(false);
@@ -295,6 +447,71 @@ impl PgMetaEngine {
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        if state.ops > 0 && state.event_start.is_some() && after_seq <= state.event_end {
+            // A later mutation may have published a higher event watermark
+            // before this caller reacquired the pending-state lock. Its range
+            // is already covered by that projection, so replaying the prefix
+            // here would only add contention.
+            return Ok(false);
+        }
+        if matches!(
+            hint,
+            PendingMutationHint::LocalOnly | PendingMutationHint::LocalOnlyDeletion
+        ) {
+            // The namespace wrapper has already established that this
+            // mutation is local-only. Keep the event range for local serving-
+            // state replay, but do not read and project it again on every
+            // hot-path mutation. A local-only deletion is also allowed to
+            // retire a fully canceled range immediately: there is no remote
+            // work and no serving replay left once the unpublished inode has
+            // been removed.
+            let event_start = state.event_start.unwrap_or(before_seq);
+            if hint == PendingMutationHint::LocalOnlyDeletion
+                && state.ops == 0
+                && self.inflight_replication_ops.load(Ordering::SeqCst) == 0
+            {
+                let events = self.local.read_events_range(event_start, after_seq)?;
+                let projected = RemoteApplyCoordinator::project_local_batch(&events);
+                if projected.visible_ops == 0 && !projected.needs_local_replay {
+                    let expected_state = *state;
+                    drop(state);
+                    self.acknowledge_pending_state_if_unchanged(expected_state, after_seq)?;
+                    return Ok(false);
+                }
+            }
+            if state.event_start.is_none() {
+                state.event_start = Some(event_start);
+                if state.started_at.is_none() {
+                    state.started_at = Some(now);
+                }
+            }
+            state.last_mutation_at = Some(now);
+            state.event_end = state.event_end.max(after_seq);
+            return Ok(false);
+        }
+        if state.ops > 0 && state.event_start.is_some() && before_seq >= state.event_end {
+            // A local-only suffix cannot change the already projected remote
+            // operation count. Keep it in the range so a later flush can
+            // restore serving state, but avoid re-projecting the whole older
+            // prefix on every deferred namespace mutation.
+            let context_start = before_seq.saturating_sub(LOCAL_ONLY_SUFFIX_CONTEXT_EVENTS);
+            let events_with_context = self.local.read_events_range(context_start, after_seq)?;
+            let suffix_len =
+                usize::try_from(after_seq.saturating_sub(before_seq)).unwrap_or(usize::MAX);
+            let context_len = events_with_context.len().saturating_sub(suffix_len);
+            let suffix = &events_with_context[context_len..];
+            let suffix_projected = RemoteApplyCoordinator::project_local_batch(suffix);
+            let suffix_is_local_only = suffix_projected.visible_ops == 0
+                || self.projected_suffix_is_local_only(
+                    &events_with_context,
+                    &suffix_projected.events,
+                )?;
+            if suffix_is_local_only {
+                state.last_mutation_at = Some(now);
+                state.event_end = after_seq;
+                return Ok(false);
+            }
+        }
         let event_start = state.event_start.unwrap_or(before_seq);
         let events = self.local.read_events_range(event_start, after_seq)?;
         let projected = RemoteApplyCoordinator::project_local_batch(&events);
@@ -314,9 +531,9 @@ impl PgMetaEngine {
                 if self.inflight_replication_ops.load(Ordering::SeqCst) > 0 {
                     return Ok(false);
                 }
-                Self::clear_pending_state(&mut state);
+                let expected_state = *state;
                 drop(state);
-                self.persist_flushed_event_seq(after_seq)?;
+                self.acknowledge_pending_state_if_unchanged(expected_state, after_seq)?;
             } else {
                 if state.event_start.is_none() {
                     state.event_start = Some(before_seq);

@@ -340,7 +340,6 @@ impl StudioVfs {
             } else {
                 inner.pending_inodes.insert(ino, pending_count - 1);
             }
-            inner.errors.remove(&ino);
             inner.settled_operations += 1;
             inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
             inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
@@ -698,6 +697,25 @@ impl StudioVfs {
                         break;
                     }
                     Err(error) => {
+                        if let Some(conflict_index) = Self::namespace_entry_conflict_index(&error)
+                            .filter(|index| *index < batch.len())
+                        {
+                            let conflicting_operation = batch.remove(conflict_index);
+                            self.abandon_failed_deferred_namespace_batch(
+                                std::slice::from_ref(&conflicting_operation),
+                                &error,
+                            );
+                            warn!(
+                                error = %error,
+                                conflict_index,
+                                remaining_operations = batch.len(),
+                                "deferred namespace metadata operation lost a concurrent namespace conflict; retrying the remaining batch without degrading mount"
+                            );
+                            if batch.is_empty() {
+                                break;
+                            }
+                            continue;
+                        }
                         attempts += 1;
                         if attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
                             self.state
@@ -729,6 +747,17 @@ impl StudioVfs {
                     }
                 }
             }
+        }
+    }
+
+    fn namespace_entry_conflict_index(error: &VfsError) -> Option<usize> {
+        match error {
+            VfsError::Meta(MetaError::NamespaceBatchOperation { index, source })
+                if matches!(source.as_ref(), MetaError::EntryExists { .. }) =>
+            {
+                Some(*index)
+            }
+            _ => None,
         }
     }
 

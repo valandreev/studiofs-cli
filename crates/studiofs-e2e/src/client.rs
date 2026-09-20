@@ -407,6 +407,14 @@ pub trait ClientProcessExecutor {
     ) -> io::Result<bool> {
         self.is_mount_ready(command)
     }
+    /// Probe native mount and lifecycle readiness without requiring mounted I/O.
+    fn is_mount_lifecycle_ready_for_process(
+        &self,
+        command: &ClientCommand,
+        process_id: u32,
+    ) -> io::Result<bool> {
+        self.is_mount_ready_for_process(command, process_id)
+    }
     /// Remove stale mounts that may remain from previous runs.
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
         Ok(())
@@ -484,6 +492,28 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
                 .iter()
                 .any(|argument| argument == "--read-only");
             windows_mount_io_is_ready(&command.mount_point, write_capable)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = process_id;
+            self.is_mount_ready(command)
+        }
+    }
+
+    fn is_mount_lifecycle_ready_for_process(
+        &self,
+        command: &ClientCommand,
+        process_id: u32,
+    ) -> io::Result<bool> {
+        #[cfg(windows)]
+        {
+            Ok(mount_point_is_active(&command.mount_point)?
+                && windows_mount_lifecycle_is_ready(
+                    &command.client_root,
+                    &command.mount_point,
+                    process_id,
+                )?)
         }
 
         #[cfg(not(windows))]
@@ -763,6 +793,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
+    /// Extends the bounded readiness window for scenarios whose mounted
+    /// process must expose a catch-up lifecycle before readiness completes.
+    pub fn set_mount_ready_timeout(&mut self, timeout: Duration) {
+        self.config.mount_ready_timeout = timeout;
+    }
+
     /// Replaces configured clients with names.
     ///
     /// Existing mounted clients are rejected to prevent unsafe mutation.
@@ -1015,7 +1051,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     /// Mounts all configured clients.
     pub fn mount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
-            self.mount_index(index)?;
+            self.mount_index(index, true)?;
         }
         Ok(())
     }
@@ -1023,7 +1059,16 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     /// Mounts a single named client.
     pub fn mount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
-        self.mount_index(index)
+        self.mount_index(index, true)
+    }
+
+    /// Mounts a client while accepting native lifecycle readiness before I/O is writable.
+    pub fn mount_until_lifecycle_ready(
+        &mut self,
+        client: &str,
+    ) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.mount_index(index, false)
     }
 
     /// Runs `studiofs status` for a named client and returns its diagnostics output.
@@ -1039,7 +1084,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.unmount_index(index)?;
-        self.mount_index(index)
+        self.mount_index(index, true)
+    }
+
+    /// Restarts a client while accepting native lifecycle readiness before I/O is writable.
+    pub fn restart_until_lifecycle_ready(
+        &mut self,
+        client: &str,
+    ) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.unmount_index(index)?;
+        self.mount_index(index, false)
     }
 
     /// Force-kills a named client process and marks it as killed.
@@ -1074,14 +1129,14 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .cleanup_stale_mount_before_remount(&self.mount_command(index)?)?;
         #[cfg(not(target_os = "macos"))]
         {
-            self.mount_index(index)
+            self.mount_index(index, true)
         }
         #[cfg(target_os = "macos")]
         {
             let was_killed = self.clients[index].spec.state == ClientLifecycleState::Killed;
             let retry_deadline = Instant::now() + self.config.mount_exit_timeout;
             loop {
-                let result = self.mount_index(index);
+                let result = self.mount_index(index, true);
                 if was_killed
                     && Instant::now() < retry_deadline
                     && matches!(
@@ -1175,7 +1230,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
-    fn mount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
+    fn mount_index(
+        &mut self,
+        index: usize,
+        require_io_ready: bool,
+    ) -> Result<(), ClientControllerError> {
         let command = self.mount_command(index)?;
         let mount_active = self.executor.is_mount_ready(&command)?;
         #[cfg(target_os = "macos")]
@@ -1189,7 +1248,8 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
-        if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
+        if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut(), require_io_ready)
+        {
             if let Err(kill_error) = force_kill_process_and_wait(
                 process.as_mut(),
                 "mount readiness failure",
@@ -1519,6 +1579,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         &self,
         command: &ClientCommand,
         process: &mut dyn ClientProcess,
+        require_io_ready: bool,
     ) -> Result<(), ClientControllerError> {
         let deadline = Instant::now() + self.config.mount_ready_timeout;
         loop {
@@ -1533,10 +1594,14 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     ),
                 });
             }
-            if self
-                .executor
-                .is_mount_ready_for_process(command, process.id())?
-            {
+            let ready = if require_io_ready {
+                self.executor
+                    .is_mount_ready_for_process(command, process.id())?
+            } else {
+                self.executor
+                    .is_mount_lifecycle_ready_for_process(command, process.id())?
+            };
+            if ready {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -2359,24 +2424,38 @@ fn windows_mount_io_is_ready(mount_point: &Path, write_capable: bool) -> io::Res
         ".studiofs-e2e-readiness-{}.tmp",
         uuid::Uuid::new_v4().simple()
     ));
-    windows_mount_io_is_ready_with(|| {
+    windows_mount_io_is_ready_with(write_capable, || {
         let mut options = OpenOptions::new();
         options.read(!write_capable).write(write_capable);
-        options.open(&probe_path).map(|_| ())
+        if !write_capable {
+            return options.open(&probe_path).map(|_| ());
+        }
+
+        options.create_new(true);
+        let mut file = options.open(&probe_path)?;
+        let result = file
+            .write_all(b"studiofs-e2e-readiness")
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if result.is_ok() {
+            fs::remove_file(&probe_path)?;
+        } else {
+            let _ = fs::remove_file(&probe_path);
+        }
+        result
     })
 }
 
 #[cfg(windows)]
-fn windows_mount_io_is_ready_with<F>(probe: F) -> io::Result<bool>
+fn windows_mount_io_is_ready_with<F>(write_capable: bool, probe: F) -> io::Result<bool>
 where
     F: FnOnce() -> io::Result<()>,
 {
     match probe() {
         Ok(()) => Ok(true),
-        // The probe name is unique and is expected not to exist. A native
-        // not-found response proves that the mount accepted the open request
-        // and reached the filesystem callback.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        // Read-only probes intentionally target a nonexistent path, while a
+        // write-capable probe must create its unique path successfully.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(!write_capable),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
         Err(error) => Err(error),
     }
@@ -2816,6 +2895,74 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    struct TestClientProcess {
+        id: u32,
+        exited: bool,
+    }
+
+    #[cfg(windows)]
+    impl ClientProcess for TestClientProcess {
+        fn id(&self) -> u32 {
+            self.id
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(self.exited.then_some(0))
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.exited = true;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    struct ReadinessProbeExecutor {
+        probes: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(windows)]
+    impl ClientProcessExecutor for ReadinessProbeExecutor {
+        fn run(&self, _command: &ClientCommand) -> io::Result<ClientCommandOutput> {
+            Ok(ClientCommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        fn spawn(&self, _command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>> {
+            Ok(Box::new(TestClientProcess {
+                id: 2,
+                exited: false,
+            }))
+        }
+
+        fn is_mount_ready(&self, _command: &ClientCommand) -> io::Result<bool> {
+            self.probes.lock().unwrap().push("preflight");
+            Ok(false)
+        }
+
+        fn is_mount_ready_for_process(
+            &self,
+            _command: &ClientCommand,
+            _process_id: u32,
+        ) -> io::Result<bool> {
+            self.probes.lock().unwrap().push("io");
+            Ok(false)
+        }
+
+        fn is_mount_lifecycle_ready_for_process(
+            &self,
+            _command: &ClientCommand,
+            _process_id: u32,
+        ) -> io::Result<bool> {
+            self.probes.lock().unwrap().push("lifecycle");
+            Ok(true)
+        }
+    }
+
     #[test]
     fn mount_metadata_persists_the_external_mount_root() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
@@ -2837,6 +2984,55 @@ mod tests {
             metadata["mount_root"],
             serde_json::Value::String("/Volumes/studiofs-review".to_string())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_until_lifecycle_ready_does_not_require_mount_io() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let probes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = ClientControllerConfig {
+            studiofs_bin: PathBuf::from("studiofs"),
+            sandbox: temp.path().to_path_buf(),
+            volume_name: "projectfs".to_string(),
+            meta_dsn: "postgres://127.0.0.1:1/studiofs".to_string(),
+            s3: S3Config {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "bucket".to_string(),
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            mount_ready_timeout: Duration::from_millis(100),
+            mount_exit_timeout: Duration::ZERO,
+            poll_interval: Duration::ZERO,
+            mount_points: vec![temp.path().join("mount")],
+            client_env_overrides: BTreeMap::new(),
+            mount_arg_overrides: BTreeMap::new(),
+        };
+        let mut controller = MultiClientController::new(
+            config,
+            ReadinessProbeExecutor {
+                probes: std::sync::Arc::clone(&probes),
+            },
+        );
+        controller
+            .create_clients(["client-a"])
+            .expect("create test client");
+        controller.clients[0].process = Some(Box::new(TestClientProcess {
+            id: 1,
+            exited: true,
+        }));
+        controller.clients[0].spec.process_id = Some(1);
+        controller.clients[0].spec.state = ClientLifecycleState::Mounted;
+
+        controller
+            .restart_until_lifecycle_ready("client-a")
+            .expect("lifecycle-only restart should succeed");
+
+        let probes = probes.lock().unwrap();
+        assert!(probes.contains(&"lifecycle"));
+        assert!(!probes.contains(&"io"));
     }
 
     #[test]
@@ -3280,16 +3476,24 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
     #[cfg(windows)]
     #[test]
     fn windows_mount_io_readiness_treats_driver_access_errors_as_transient() {
-        assert!(windows_mount_io_is_ready_with(|| Ok(())).unwrap());
+        assert!(windows_mount_io_is_ready_with(false, || Ok(())).unwrap());
         assert!(
-            !windows_mount_io_is_ready_with(|| {
+            !windows_mount_io_is_ready_with(true, || {
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             })
             .unwrap()
         );
         assert!(
-            windows_mount_io_is_ready_with(|| { Err(io::Error::from(io::ErrorKind::NotFound)) })
-                .unwrap()
+            !windows_mount_io_is_ready_with(true, || {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap()
+        );
+        assert!(
+            windows_mount_io_is_ready_with(false, || {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+            .unwrap()
         );
     }
 
