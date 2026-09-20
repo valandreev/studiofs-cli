@@ -107,6 +107,143 @@ fn pg_empty_pending_deletion_batch_does_not_acquire_pending_state_lock() {
 }
 
 #[test]
+fn restore_pending_state_acknowledges_initial_root_snapshot_event() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let root_event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read root event end");
+    pg.local
+        .create_dir(ROOT_INO, b"after-root", 0, 0, 0o755)
+        .expect("create local directory after root setup");
+    let event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read local event end");
+    pg.local
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 0)
+        .expect("reset the startup cursor");
+    pg.flushed_event_seq.store(0, Ordering::SeqCst);
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore startup pending state");
+
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        root_event_end,
+        "the root event is already represented by the initial serving checkpoint"
+    );
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .expect("read persisted startup cursor"),
+        root_event_end
+    );
+    let pending_events = pg
+        .local
+        .read_events_range(root_event_end, event_end)
+        .expect("read local events after root setup");
+    let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
+    let state = pg.pending_state.lock().expect("pending_state");
+    assert_eq!(state.ops, projected.visible_ops);
+    assert_eq!(state.event_start, Some(root_event_end));
+    assert_eq!(state.event_end, event_end);
+}
+
+#[test]
+fn unpublished_file_deletion_suffix_is_not_remote_visible() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"visible-prefix", 0, 0, 0o755)
+        .expect("create visible pending prefix");
+    let create_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read create start");
+    pg.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+        .expect("create unpublished file");
+    let create_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read create end");
+    pg.create_file(ROOT_INO, b"draft-2.txt", 0, 0, 0o644)
+        .expect("create second unpublished file");
+    let create_events = pg
+        .local
+        .read_events_range(create_start, create_end)
+        .expect("read unpublished create events");
+    let add_entry_only = [create_events
+        .last()
+        .cloned()
+        .expect("unpublished create must append an AddEntry")];
+    let add_entry_projected = RemoteApplyCoordinator::project_local_batch(&add_entry_only);
+    assert!(
+        pg.projected_suffix_is_local_only(&add_entry_only, &add_entry_projected.events)
+            .expect("classify unpublished AddEntry suffix"),
+        "an AddEntry suffix for a new empty regular file must stay local-only"
+    );
+    let deletion_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read deletion start");
+
+    pg.unlink(ROOT_INO, b"draft.txt")
+        .expect("unlink unpublished file");
+    pg.unlink(ROOT_INO, b"draft-2.txt")
+        .expect("unlink second unpublished file");
+
+    let deletion_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read deletion end");
+    let deletion_events = pg
+        .local
+        .read_events_range(deletion_start, deletion_end)
+        .expect("read unpublished deletion events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&deletion_events);
+
+    assert!(
+        pg.projected_suffix_is_local_only(&deletion_events, &projected.events)
+            .expect("classify unpublished deletion suffix"),
+        "deleting a regular file with no published base must not re-project the pending prefix: deletion_events={deletion_events:?} projected={:?}",
+        projected.events,
+    );
+}
+
+#[test]
+fn removing_unpublished_regular_attr_does_not_create_remote_backlog() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"draft-to-remove.txt", 0, 0, 0o644)
+        .expect("create unpublished file");
+
+    pg.remove_attr(file.ino)
+        .expect("remove unpublished file attributes");
+
+    let state = pg.pending_state.lock().expect("pending_state");
+    assert_eq!(
+        state.ops, 0,
+        "removing a never-published regular file must not create remote-visible work"
+    );
+}
+
+#[test]
+fn removing_regular_file_graph_does_not_create_remote_backlog() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"draft-graph-remove.txt", 0, 0, 0o644)
+        .expect("create unpublished file");
+
+    pg.remove_regular_file_graph(file.ino)
+        .expect("remove unpublished file graph");
+
+    let state = pg.pending_state.lock().expect("pending_state");
+    assert_eq!(
+        state.ops, 0,
+        "regular-file graph cleanup is local-only and must not create remote-visible work"
+    );
+}
+
+#[test]
 fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.local.get_counter("nextEventSeq").expect("baseline seq");

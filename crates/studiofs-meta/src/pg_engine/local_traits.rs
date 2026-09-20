@@ -1,4 +1,4 @@
-use super::PgMetaEngine;
+use super::{PendingMutationHint, PgMetaEngine};
 use crate::engine::{
     DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaFormat, MetaFsOps,
     MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication,
@@ -65,7 +65,12 @@ impl MetaInodes for PgMetaEngine {
     }
 
     fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
-        self.mutate(|local| local.remove_attr(ino))
+        let hint = if self.current_inode_is_unpublished_regular(ino)? {
+            PendingMutationHint::LocalOnly
+        } else {
+            PendingMutationHint::Unknown
+        };
+        self.mutate_with_hint(|local| local.remove_attr(ino), |_| hint)
     }
 
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
@@ -96,7 +101,19 @@ impl MetaFsOps for PgMetaEngine {
         &self,
         mutations: &[NamespaceMutation],
     ) -> MetaResult<Vec<InodeAttr>> {
-        self.mutate(|local| local.apply_namespace_mutations(mutations))
+        let hint = if !mutations.is_empty()
+            && mutations
+                .iter()
+                .all(|mutation| matches!(mutation, NamespaceMutation::CreateFile { .. }))
+        {
+            PendingMutationHint::LocalOnly
+        } else {
+            PendingMutationHint::Unknown
+        };
+        self.mutate_with_hint(
+            |local| local.apply_namespace_mutations(mutations),
+            move |_| hint,
+        )
     }
 
     fn create_file(
@@ -108,7 +125,10 @@ impl MetaFsOps for PgMetaEngine {
         mode: u16,
     ) -> MetaResult<InodeAttr> {
         let ino = self.next_inode()?;
-        self.mutate(|local| local.create_file_with_ino(ino, parent, name, uid, gid, mode))
+        self.mutate_with_hint(
+            |local| local.create_file_with_ino(ino, parent, name, uid, gid, mode),
+            |_| PendingMutationHint::LocalOnly,
+        )
     }
 
     fn create_file_with_ino(
@@ -120,7 +140,10 @@ impl MetaFsOps for PgMetaEngine {
         gid: u32,
         mode: u16,
     ) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.create_file_with_ino(ino, parent, name, uid, gid, mode))
+        self.mutate_with_hint(
+            |local| local.create_file_with_ino(ino, parent, name, uid, gid, mode),
+            |_| PendingMutationHint::LocalOnly,
+        )
     }
 
     fn create_dir(
@@ -148,11 +171,29 @@ impl MetaFsOps for PgMetaEngine {
     }
 
     fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.unlink(parent, name))
+        self.mutate_with_hint(
+            |local| local.unlink(parent, name),
+            |attr| {
+                if attr.is_unpublished_empty_draft() {
+                    PendingMutationHint::LocalOnly
+                } else {
+                    PendingMutationHint::Unknown
+                }
+            },
+        )
     }
 
     fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        self.mutate(|local| local.unlink_open_handle(parent, name))
+        self.mutate_with_hint(
+            |local| local.unlink_open_handle(parent, name),
+            |attr| {
+                if attr.is_unpublished_empty_draft() {
+                    PendingMutationHint::LocalOnly
+                } else {
+                    PendingMutationHint::Unknown
+                }
+            },
+        )
     }
 
     fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
@@ -215,7 +256,10 @@ impl MetaPayloadObjects for PgMetaEngine {
     }
 
     fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.remove_regular_file_graph(ino))
+        self.mutate_with_hint(
+            |local| local.remove_regular_file_graph(ino),
+            |_| PendingMutationHint::LocalOnly,
+        )
     }
 
     fn next_object_id(&self) -> MetaResult<u64> {

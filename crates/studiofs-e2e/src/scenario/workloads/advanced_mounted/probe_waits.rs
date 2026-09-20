@@ -20,10 +20,33 @@ pub(in crate::scenario) fn wait_for_mounted_initial_payloads_until(
     poll_interval: Duration,
     label: &str,
 ) -> Result<(), ScenarioError> {
+    wait_for_mounted_initial_payloads_until_with_probe_timeout(
+        clients,
+        required_payloads,
+        deadline,
+        poll_interval,
+        label,
+        MOUNTED_VALIDATION_PROBE_TIMEOUT,
+    )
+}
+
+pub(in crate::scenario) fn wait_for_mounted_initial_payloads_until_with_probe_timeout(
+    clients: &[ClientSpec],
+    required_payloads: &[(&str, &[u8])],
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+    probe_timeout: Duration,
+) -> Result<(), ScenarioError> {
     let probe_limiter = MountedProbeLimiter::new(MOUNTED_VALIDATION_MAX_ACTIVE_PROBES);
     loop {
-        let last_missing =
-            missing_mounted_initial_payloads(clients, required_payloads, &probe_limiter);
+        let last_missing = missing_mounted_initial_payloads_with_probe(
+            clients,
+            required_payloads,
+            &probe_limiter,
+            probe_timeout,
+            mounted_initial_payload_probe,
+        );
         if last_missing.is_empty() {
             return Ok(());
         }
@@ -129,20 +152,6 @@ pub(in crate::scenario) fn present_mounted_path_probe(
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => Some(format!("{}:{relative_path} ({error})", client.name)),
     }
-}
-
-pub(in crate::scenario) fn missing_mounted_initial_payloads(
-    clients: &[ClientSpec],
-    required_payloads: &[(&str, &[u8])],
-    probe_limiter: &MountedProbeLimiter,
-) -> Vec<String> {
-    missing_mounted_initial_payloads_with_probe(
-        clients,
-        required_payloads,
-        probe_limiter,
-        MOUNTED_VALIDATION_PROBE_TIMEOUT,
-        mounted_initial_payload_probe,
-    )
 }
 
 pub(in crate::scenario) fn missing_mounted_initial_payloads_with_probe<F>(

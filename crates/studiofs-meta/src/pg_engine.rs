@@ -385,6 +385,12 @@ impl Default for PgOpenOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PendingMutationHint {
+    Unknown,
+    LocalOnly,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PendingReplicationState {
     ops: u32,
@@ -1520,6 +1526,14 @@ impl PgMetaEngine {
     where
         F: FnOnce(&RedbMetaEngine) -> MetaResult<T>,
     {
+        self.mutate_with_hint(f, |_| PendingMutationHint::Unknown)
+    }
+
+    pub(super) fn mutate_with_hint<T, F, H>(&self, f: F, hint: H) -> MetaResult<T>
+    where
+        F: FnOnce(&RedbMetaEngine) -> MetaResult<T>,
+        H: FnOnce(&T) -> PendingMutationHint,
+    {
         // Serving-state replay reads a local event prefix and writes it back to
         // redb. Keep the local mutation outside that read/apply window so the
         // replay cannot overwrite a mutation it did not observe.
@@ -1532,9 +1546,10 @@ impl PgMetaEngine {
         // This wrapper only tracks local event-seq growth for replication.
         let before_seq = self.local.get_counter("nextEventSeq")?;
         let result = f(&self.local)?;
+        let hint = hint(&result);
         let after_seq = self.local.get_counter("nextEventSeq")?;
         drop(pending_guard);
-        if self.mark_pending_after_mutation(before_seq, after_seq)? {
+        if self.mark_pending_after_mutation(before_seq, after_seq, hint)? {
             self.signal_poll_wakeup();
         }
         Ok(result)

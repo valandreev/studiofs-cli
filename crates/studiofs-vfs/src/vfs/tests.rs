@@ -2014,6 +2014,43 @@ fn make_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
+#[test]
+fn unlink_without_open_handles_does_not_append_redundant_cleanup_events() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "unlink-cleanup-events");
+    vfs.create(ROOT_INO, b"empty.txt", 0, 0, 0o644)
+        .expect("create empty file");
+
+    let unlink_start = meta
+        .get_counter("nextEventSeq")
+        .expect("read unlink event start");
+    vfs.unlink(ROOT_INO, b"empty.txt")
+        .expect("unlink empty file");
+    let unlink_end = meta
+        .get_counter("nextEventSeq")
+        .expect("read unlink event end");
+    let events = meta
+        .read_events_range(unlink_start, unlink_end)
+        .expect("read unlink events");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind() == "remove_regular_file_graph")
+            .count(),
+        1,
+        "unlink should append one graph-removal event, not one more from cleanup: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind() == "remove_attr")
+            .count(),
+        1,
+        "unlink should append one attr-removal event, not one more from cleanup: {events:?}"
+    );
+}
+
 fn enqueue_deferred_namespace_create(vfs: &Arc<StudioVfs>, attr: &InodeAttr, name: &[u8]) {
     vfs.enqueue_deferred_namespace_op(
         Some(super::namespace::DeferredNamespaceKey::new(ROOT_INO, name)),

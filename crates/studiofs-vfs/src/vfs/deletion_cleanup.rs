@@ -60,11 +60,52 @@ impl StudioVfs {
         gc_reason: &str,
         fallback_object_ids: Vec<u64>,
     ) -> VfsResult<DeletedInodeCleanup> {
+        self.collect_deleted_inode_cleanup_impl(
+            meta,
+            ino,
+            used_space_bytes,
+            gc_reason,
+            fallback_object_ids,
+            false,
+        )
+    }
+
+    pub(super) fn collect_deleted_inode_cleanup_after_unlink(
+        &self,
+        meta: &Arc<dyn VfsMeta>,
+        ino: Ino,
+        used_space_bytes: u64,
+        gc_reason: &str,
+        fallback_object_ids: Vec<u64>,
+    ) -> VfsResult<DeletedInodeCleanup> {
+        self.collect_deleted_inode_cleanup_impl(
+            meta,
+            ino,
+            used_space_bytes,
+            gc_reason,
+            fallback_object_ids,
+            true,
+        )
+    }
+
+    fn collect_deleted_inode_cleanup_impl(
+        &self,
+        meta: &Arc<dyn VfsMeta>,
+        ino: Ino,
+        used_space_bytes: u64,
+        gc_reason: &str,
+        fallback_object_ids: Vec<u64>,
+        metadata_already_removed: bool,
+    ) -> VfsResult<DeletedInodeCleanup> {
         self.mark_inode_deleted_for_uploads(ino);
 
         let graph_usage = self.regular_file_graph_usage(meta, ino)?;
-        let removed_ids = meta.remove_regular_file_graph(ino)?;
-        self.queue_pending_deletions_for_object_ids(meta, &removed_ids, gc_reason)?;
+        let removed_ids = if metadata_already_removed {
+            Vec::new()
+        } else {
+            meta.remove_regular_file_graph(ino)?
+        };
+        let removed_ids_were_empty = removed_ids.is_empty();
         let cleanup_ids = if !removed_ids.is_empty() {
             removed_ids
         } else if !graph_usage.object_ids.is_empty() {
@@ -72,6 +113,9 @@ impl StudioVfs {
         } else {
             fallback_object_ids
         };
+        if metadata_already_removed || !removed_ids_were_empty {
+            self.queue_pending_deletions_for_object_ids(meta, &cleanup_ids, gc_reason)?;
+        }
 
         let freed_bytes = if graph_usage.total_bytes > 0 {
             graph_usage.total_bytes
@@ -281,7 +325,7 @@ impl StudioVfs {
         gc_reason: &str,
         fallback_object_ids: Vec<u64>,
     ) -> VfsResult<()> {
-        let cleanup = self.collect_deleted_inode_cleanup(
+        let cleanup = self.collect_deleted_inode_cleanup_after_unlink(
             meta,
             ino,
             used_space_bytes,

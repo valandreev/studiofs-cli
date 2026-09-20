@@ -407,6 +407,14 @@ pub trait ClientProcessExecutor {
     ) -> io::Result<bool> {
         self.is_mount_ready(command)
     }
+    /// Probe native mount and lifecycle readiness without requiring mounted I/O.
+    fn is_mount_lifecycle_ready_for_process(
+        &self,
+        command: &ClientCommand,
+        process_id: u32,
+    ) -> io::Result<bool> {
+        self.is_mount_ready_for_process(command, process_id)
+    }
     /// Remove stale mounts that may remain from previous runs.
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
         Ok(())
@@ -484,6 +492,28 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
                 .iter()
                 .any(|argument| argument == "--read-only");
             windows_mount_io_is_ready(&command.mount_point, write_capable)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = process_id;
+            self.is_mount_ready(command)
+        }
+    }
+
+    fn is_mount_lifecycle_ready_for_process(
+        &self,
+        command: &ClientCommand,
+        process_id: u32,
+    ) -> io::Result<bool> {
+        #[cfg(windows)]
+        {
+            Ok(mount_point_is_active(&command.mount_point)?
+                && windows_mount_lifecycle_is_ready(
+                    &command.client_root,
+                    &command.mount_point,
+                    process_id,
+                )?)
         }
 
         #[cfg(not(windows))]
@@ -763,6 +793,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
+    /// Extends the bounded readiness window for scenarios whose mounted
+    /// process must expose a catch-up lifecycle before readiness completes.
+    pub fn set_mount_ready_timeout(&mut self, timeout: Duration) {
+        self.config.mount_ready_timeout = timeout;
+    }
+
     /// Replaces configured clients with names.
     ///
     /// Existing mounted clients are rejected to prevent unsafe mutation.
@@ -1015,7 +1051,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     /// Mounts all configured clients.
     pub fn mount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
-            self.mount_index(index)?;
+            self.mount_index(index, true)?;
         }
         Ok(())
     }
@@ -1023,7 +1059,16 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     /// Mounts a single named client.
     pub fn mount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
-        self.mount_index(index)
+        self.mount_index(index, true)
+    }
+
+    /// Mounts a client while accepting native lifecycle readiness before I/O is writable.
+    pub fn mount_until_lifecycle_ready(
+        &mut self,
+        client: &str,
+    ) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.mount_index(index, false)
     }
 
     /// Runs `studiofs status` for a named client and returns its diagnostics output.
@@ -1039,7 +1084,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.unmount_index(index)?;
-        self.mount_index(index)
+        self.mount_index(index, true)
     }
 
     /// Force-kills a named client process and marks it as killed.
@@ -1074,14 +1119,14 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .cleanup_stale_mount_before_remount(&self.mount_command(index)?)?;
         #[cfg(not(target_os = "macos"))]
         {
-            self.mount_index(index)
+            self.mount_index(index, true)
         }
         #[cfg(target_os = "macos")]
         {
             let was_killed = self.clients[index].spec.state == ClientLifecycleState::Killed;
             let retry_deadline = Instant::now() + self.config.mount_exit_timeout;
             loop {
-                let result = self.mount_index(index);
+                let result = self.mount_index(index, true);
                 if was_killed
                     && Instant::now() < retry_deadline
                     && matches!(
@@ -1175,7 +1220,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
-    fn mount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
+    fn mount_index(
+        &mut self,
+        index: usize,
+        require_io_ready: bool,
+    ) -> Result<(), ClientControllerError> {
         let command = self.mount_command(index)?;
         let mount_active = self.executor.is_mount_ready(&command)?;
         #[cfg(target_os = "macos")]
@@ -1189,7 +1238,8 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
-        if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
+        if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut(), require_io_ready)
+        {
             if let Err(kill_error) = force_kill_process_and_wait(
                 process.as_mut(),
                 "mount readiness failure",
@@ -1519,6 +1569,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         &self,
         command: &ClientCommand,
         process: &mut dyn ClientProcess,
+        require_io_ready: bool,
     ) -> Result<(), ClientControllerError> {
         let deadline = Instant::now() + self.config.mount_ready_timeout;
         loop {
@@ -1533,10 +1584,14 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     ),
                 });
             }
-            if self
-                .executor
-                .is_mount_ready_for_process(command, process.id())?
-            {
+            let ready = if require_io_ready {
+                self.executor
+                    .is_mount_ready_for_process(command, process.id())?
+            } else {
+                self.executor
+                    .is_mount_lifecycle_ready_for_process(command, process.id())?
+            };
+            if ready {
                 return Ok(());
             }
             if Instant::now() >= deadline {

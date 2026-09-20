@@ -4916,6 +4916,7 @@ dependencies = [
  "fs2",
  "libc",
  "percent-encoding",
+ "postcard",
  "serde",
  "serde-saphyr",
  "serde_json",
