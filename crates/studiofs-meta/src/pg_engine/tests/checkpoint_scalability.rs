@@ -7,9 +7,9 @@ use std::thread::JoinHandle;
 use studiofs_test_support::workspace_target_tempdir;
 
 struct Sfs720CheckpointFixture {
-    _dir: tempfile::TempDir,
     source: RedbMetaEngine,
     checkpoint_bytes: Vec<u8>,
+    _dir: tempfile::TempDir,
 }
 
 struct RssSampler {
@@ -28,10 +28,8 @@ impl RssSampler {
         let initial_pids = [pid];
         let _ =
             initial_system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&initial_pids), true);
-        if let Some(process) = initial_system.process(pid) {
-            peak.store(process.memory(), Ordering::Relaxed);
-        }
-        let baseline = peak.load(Ordering::Relaxed);
+        let baseline = initial_system.process(pid)?.memory();
+        peak.store(baseline, Ordering::Relaxed);
         let thread_stop = std::sync::Arc::clone(&stop);
         let thread_peak = std::sync::Arc::clone(&peak);
         let join = std::thread::spawn(move || {
@@ -185,7 +183,7 @@ fn publish_sfs720_checkpoint(
     run_async(async {
         let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
-            .map_err(|error| MetaError::Storage(format!("postgres connect failed: {error}")))?;
+            .map_err(|error| MetaError::Storage(format!("postgres connect failed: {}", pg_err(error))))?;
         let connection_task = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -195,13 +193,16 @@ fn publish_sfs720_checkpoint(
                 &[
                     &checkpoint_version,
                     &checkpoint_bytes,
-                    &&checkpoint_sha256[..],
+                    &checkpoint_sha256.as_slice(),
                     &volume_id,
                 ],
             )
             .await
-            .map_err(|error| MetaError::Storage(format!("postgres checkpoint seed failed: {error}")));
+            .map_err(|error| {
+                MetaError::Storage(format!("postgres checkpoint seed failed: {}", pg_err(error)))
+            });
         connection_task.abort();
+        let _ = connection_task.await;
         let rows_affected = rows_affected?;
         if rows_affected != 1 {
             return Err(MetaError::Storage(format!(
@@ -275,8 +276,17 @@ fn sfs720_checkpoint_scalability() {
     let dsn = pg_dsn().expect("SFS-720 benchmark requires STUDIOFS_TEST_PG_DSN");
     let sizes = sfs720_namespace_sizes();
     let samples = sfs720_samples();
-    let output_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/perf/sfs-720/checkpoint-scalability.jsonl");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if path.is_relative() {
+                studiofs_test_support::workspace_root().join(path)
+            } else {
+                path
+            }
+        })
+        .unwrap_or_else(|| studiofs_test_support::workspace_root().join("target"));
+    let output_path = target_dir.join("perf/sfs-720/checkpoint-scalability.jsonl");
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).expect("create SFS-720 output directory");
     }
@@ -305,9 +315,11 @@ fn sfs720_checkpoint_scalability() {
                 .export_serving_checkpoint_bytes()
                 .expect("export SFS-720 serving checkpoint");
             export_millis.push(started.elapsed().as_secs_f64() * 1_000.0);
-            assert_eq!(
-                checkpoint_bytes, fixture.checkpoint_bytes,
-                "source checkpoint must remain stable between benchmark samples"
+            assert!(
+                checkpoint_bytes.as_slice() == fixture.checkpoint_bytes.as_slice(),
+                "source checkpoint changed between benchmark samples: expected {} bytes, got {} bytes",
+                fixture.checkpoint_bytes.len(),
+                checkpoint_bytes.len()
             );
 
             let started = Instant::now();
@@ -315,7 +327,12 @@ fn sfs720_checkpoint_scalability() {
                 .read_bootstrap_checkpoint()
                 .expect("read SFS-720 PostgreSQL bootstrap checkpoint");
             postgres_millis.push(started.elapsed().as_secs_f64() * 1_000.0);
-            assert_eq!(descriptor.checkpoint_bytes, fixture.checkpoint_bytes);
+            assert!(
+                descriptor.checkpoint_bytes.as_slice() == fixture.checkpoint_bytes.as_slice(),
+                "PostgreSQL checkpoint differs from fixture: expected {} bytes, got {} bytes",
+                fixture.checkpoint_bytes.len(),
+                descriptor.checkpoint_bytes.len()
+            );
 
             let import_dir = workspace_target_tempdir("sfs720-import-");
             let target = RedbMetaEngine::open(import_dir.path().join("meta.redb"))
