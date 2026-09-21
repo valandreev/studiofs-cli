@@ -452,24 +452,14 @@ impl PgMetaEngine {
             return Ok(());
         }
 
-        self.backfill_current_reference_ledger()?;
-        self.snapshot_reachability_bootstrapped
-            .store(true, Ordering::Release);
-        Ok(())
-    }
-
-    /// Run one bounded reachability-bootstrap transaction.
-    ///
-    /// A concurrent metadata-version change is reported to the caller so the
-    /// next bounded replication poll can retry it. Reachability bootstrap must
-    /// not perform its own catch-up loop.
-    pub(super) fn backfill_current_reference_ledger(&self) -> MetaResult<()> {
         if self.backfill_current_reference_ledger_once()? {
             return Err(MetaError::Storage(
                 "snapshot reachability bootstrap could not capture a consistent local metadata version"
                     .to_owned(),
             ));
         }
+        self.snapshot_reachability_bootstrapped
+            .store(true, Ordering::Release);
         Ok(())
     }
 
