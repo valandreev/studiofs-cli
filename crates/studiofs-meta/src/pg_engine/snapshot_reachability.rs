@@ -28,12 +28,14 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
+const SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReachabilityBootstrapOutcome {
     Completed,
     AlreadyInitialized,
     VersionMismatch,
+    SnapshotCreationInProgress,
 }
 
 type FragmentUploadColumns = (Vec<i64>, Vec<i32>, Vec<String>, Vec<i64>, Vec<Vec<u8>>);
@@ -441,9 +443,10 @@ impl PgMetaEngine {
 
     /// Attempt one bounded reachability-bootstrap transaction when needed.
     ///
-    /// A version mismatch is a normal deferral: the bootstrap flag remains
-    /// clear and the next eligible replication cycle may retry it. PostgreSQL
-    /// and local-storage failures remain typed metadata errors.
+    /// A version mismatch or active snapshot creation is a normal deferral:
+    /// the bootstrap flag remains clear and the next eligible replication
+    /// cycle may retry it. PostgreSQL and local-storage failures remain typed
+    /// metadata errors.
     pub(super) fn backfill_current_reference_ledger_if_needed(&self) -> MetaResult<()> {
         if self
             .snapshot_reachability_bootstrapped
@@ -475,6 +478,12 @@ impl PgMetaEngine {
                 debug!(
                     volume_id = self.volume_id,
                     "snapshot reachability bootstrap deferred until metadata catches up"
+                );
+            }
+            ReachabilityBootstrapOutcome::SnapshotCreationInProgress => {
+                debug!(
+                    volume_id = self.volume_id,
+                    "snapshot reachability bootstrap deferred until snapshot creation completes"
                 );
             }
         }
@@ -565,16 +574,29 @@ impl PgMetaEngine {
                                 )
                             })?;
                         if creating_snapshot.is_some() {
-                            return Err(MetaError::Storage(
-                                "snapshot reachability bootstrap deferred while snapshot creation is in progress"
-                                    .to_owned(),
-                            ));
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap snapshot-deferred rollback failed",
+                                    error,
+                                )
+                            })?;
+                            return Ok(ReachabilityBootstrapOutcome::SnapshotCreationInProgress);
                         }
 
                         let local_version_before = checked_i64(
                             local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
                             "local metadata version",
                         )?;
+                        if local_version_before != version {
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap version-mismatch rollback failed",
+                                    error,
+                                )
+                            })?;
+                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
+                        }
+
                         let references = local.list_published_object_references()?;
                         let local_version_after = checked_i64(
                             local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
@@ -583,13 +605,26 @@ impl PgMetaEngine {
                         if local_version_before != local_version_after
                             || local_version_before != version
                         {
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap version-mismatch rollback failed",
+                                    error,
+                                )
+                            })?;
                             return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
                         }
 
-                        let objects = references
-                            .iter()
-                            .map(|(_, object_id)| *object_id)
-                            .collect::<BTreeSet<_>>();
+                        let mut reference_inodes = Vec::with_capacity(references.len());
+                        let mut reference_object_ids = Vec::with_capacity(references.len());
+                        let mut object_id_values = BTreeSet::new();
+                        for (inode, object_id) in &references {
+                            let inode = checked_i64(*inode, "inode")?;
+                            let object_id = checked_i64(*object_id, "object id")?;
+                            reference_inodes.push(inode);
+                            reference_object_ids.push(object_id);
+                            object_id_values.insert(object_id);
+                        }
+
                         let inserted = tx
                             .execute(
                                 "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -604,13 +639,10 @@ impl PgMetaEngine {
                             })?;
                         debug_assert_eq!(inserted, 1);
 
-                        let mut reference_inodes = Vec::with_capacity(references.len());
-                        let mut reference_object_ids = Vec::with_capacity(references.len());
-                        for (inode, object_id) in &references {
-                            reference_inodes.push(checked_i64(*inode, "inode")?);
-                            reference_object_ids.push(checked_i64(*object_id, "object id")?);
-                        }
-                        if !reference_inodes.is_empty() {
+                        for (reference_inodes, reference_object_ids) in reference_inodes
+                            .chunks(SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE)
+                            .zip(reference_object_ids.chunks(SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE))
+                        {
                             tx.execute(
                                 "INSERT INTO snapshot_current_references (vol, ino, object_id) SELECT $1, refs.ino, refs.object_id FROM UNNEST($2::BIGINT[], $3::BIGINT[]) AS refs(ino, object_id) ON CONFLICT DO NOTHING",
                                 &[&volume_id, &reference_inodes, &reference_object_ids],
@@ -623,22 +655,24 @@ impl PgMetaEngine {
                                 )
                             })?;
                         }
-                        let object_id_values = objects
-                            .into_iter()
-                            .map(|object_id| checked_i64(object_id, "object id"))
-                            .collect::<MetaResult<Vec<_>>>()?;
+
+                        let object_id_values = object_id_values.into_iter().collect::<Vec<_>>();
                         if !object_id_values.is_empty() {
-                            tx.execute(
-                                "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) SELECT $1, objects.object_id, $3 FROM UNNEST($2::BIGINT[]) AS objects(object_id) ON CONFLICT DO NOTHING",
-                                &[&volume_id, &object_id_values, &version],
-                            )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot reachability bootstrap interval insert failed",
-                                    error,
+                            for object_id_values in
+                                object_id_values.chunks(SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE)
+                            {
+                                tx.execute(
+                                    "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) SELECT $1, objects.object_id, $3 FROM UNNEST($2::BIGINT[]) AS objects(object_id) ON CONFLICT DO NOTHING",
+                                    &[&volume_id, &object_id_values, &version],
                                 )
-                            })?;
+                                .await
+                                .map_err(|error| {
+                                    Self::classify_pg_error(
+                                        "postgres snapshot reachability bootstrap interval insert failed",
+                                        error,
+                                    )
+                                })?;
+                            }
                         }
                         tx.execute(
                             "INSERT INTO snapshot_object_reachability (vol, object_id, start_version, end_version)
