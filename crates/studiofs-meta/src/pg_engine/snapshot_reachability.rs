@@ -504,19 +504,33 @@ impl PgMetaEngine {
                 move |client| {
                     let local = local.clone();
                     Box::pin(async move {
-                        let initialized = client
+                        let fast_path = client
                             .query_opt(
-                                "SELECT 1 FROM snapshot_reachability_bootstrap WHERE vol = $1",
+                                "SELECT metadata.version,
+                                        EXISTS (
+                                            SELECT 1
+                                            FROM snapshot_reachability_bootstrap AS bootstrap
+                                            WHERE bootstrap.vol = $1
+                                        )
+                                 FROM metadata_state AS metadata
+                                 WHERE metadata.vol = $1",
                                 &[&volume_id],
                             )
                             .await
                             .map_err(|error| {
                                 Self::classify_pg_error(
-                                    "postgres snapshot reachability bootstrap marker fast-path query failed",
+                                    "postgres snapshot reachability bootstrap marker/version fast-path query failed",
                                     error,
                                 )
                             })?;
-                        if initialized.is_some() {
+                        let Some(fast_path) = fast_path else {
+                            return Err(MetaError::Storage(
+                                "postgres snapshot reachability bootstrap metadata state row missing"
+                                    .to_owned(),
+                            ));
+                        };
+                        let remote_version: i64 = fast_path.get(0);
+                        if fast_path.get::<_, bool>(1) {
                             return Ok(ReachabilityBootstrapOutcome::AlreadyInitialized);
                         }
 
@@ -524,14 +538,34 @@ impl PgMetaEngine {
                             local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
                             "local metadata version",
                         )?;
+                        // This non-locking version read is only an early cutoff;
+                        // the transaction below rechecks the authoritative row.
+                        if local_version_before_scan != remote_version {
+                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
+                        }
+
                         let references = local.list_published_object_references()?;
                         let local_version_after_scan = checked_i64(
                             local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
                             "local metadata version",
                         )?;
+                        // The references must belong to one stable local version.
                         if local_version_before_scan != local_version_after_scan {
                             return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
                         }
+
+                        let mut reference_inodes = Vec::with_capacity(references.len());
+                        let mut reference_object_ids = Vec::with_capacity(references.len());
+                        let mut unique_object_ids = Vec::with_capacity(references.len());
+                        for (inode, object_id) in references {
+                            let inode = checked_i64(inode, "inode")?;
+                            let object_id = checked_i64(object_id, "object id")?;
+                            reference_inodes.push(inode);
+                            reference_object_ids.push(object_id);
+                            unique_object_ids.push(object_id);
+                        }
+                        unique_object_ids.sort_unstable();
+                        unique_object_ids.dedup();
 
                         let tx = client.transaction().await.map_err(|error| {
                             Self::classify_pg_error(
@@ -596,6 +630,8 @@ impl PgMetaEngine {
                             return Ok(ReachabilityBootstrapOutcome::SnapshotCreationInProgress);
                         }
 
+                        // Only this row-locked version can authorize the
+                        // prepared local references for publication.
                         let local_version_after_lock = checked_i64(
                             local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
                             "local metadata version",
@@ -611,18 +647,6 @@ impl PgMetaEngine {
                             })?;
                             return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
                         }
-
-                        let mut reference_inodes = Vec::with_capacity(references.len());
-                        let mut reference_object_ids = Vec::with_capacity(references.len());
-                        for (inode, object_id) in &references {
-                            let inode = checked_i64(*inode, "inode")?;
-                            let object_id = checked_i64(*object_id, "object id")?;
-                            reference_inodes.push(inode);
-                            reference_object_ids.push(object_id);
-                        }
-                        let mut unique_object_ids = reference_object_ids.clone();
-                        unique_object_ids.sort_unstable();
-                        unique_object_ids.dedup();
 
                         let inserted = tx
                             .execute(
