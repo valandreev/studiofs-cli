@@ -561,7 +561,7 @@ async fn seed_large_history_fixture_async(
     })
 }
 
-fn configured_replay_batch_count() -> Result<usize, ScenarioError> {
+fn configured_replay_event_count() -> Result<usize, ScenarioError> {
     let value = std::env::var(LARGE_HISTORY_REPLAY_BATCHES_ENV)
         .unwrap_or_else(|_| FIXTURE_REPLAY_BATCH_COUNT.to_string());
     let replay_batch_count = value.parse::<usize>().map_err(|_| {
@@ -589,21 +589,14 @@ fn configured_replay_batch_count() -> Result<usize, ScenarioError> {
             format!("{LARGE_HISTORY_REPLAY_BATCHES_ENV} exceeds the initial mutation budget"),
         )));
     }
-    Ok(replay_batch_count)
+    Ok(replay_event_count)
 }
 
 fn build_fixture_events(
     fixture_root: &str,
 ) -> Result<(Vec<MetaEvent>, Vec<FixtureEvent>, usize), ScenarioError> {
     let file_count = LARGE_HISTORY_FIXTURE_FILE_COUNT;
-    let replay_batch_count = configured_replay_batch_count()?;
-    let replay_event_count = LARGE_HISTORY_FIXTURE_EVENTS_PER_BATCH
-        .checked_mul(replay_batch_count)
-        .ok_or_else(|| {
-            ScenarioError::Io(io::Error::other(
-                "large-history fixture replay event count overflow",
-            ))
-        })?;
+    let replay_event_count = configured_replay_event_count()?;
     let checkpoint_event_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT
         .checked_sub(replay_event_count)
         .ok_or_else(|| {

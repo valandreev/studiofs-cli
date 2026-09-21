@@ -167,18 +167,6 @@ function Quote-ProcessArgument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
-function Get-ScenarioSummaryPath {
-    param([string]$RunId)
-
-    return Join-Path $e2eRoot "$RunId\artifacts\scenarios\$scenario\large-history-cold-bootstrap-summary.json"
-}
-
-function Get-ScenarioStatusPath {
-    param([string]$RunId)
-
-    return Join-Path $e2eRoot "$RunId\artifacts\scenarios\$scenario\large-history-status.ndjson"
-}
-
 function Get-UniquePages {
     param([object[]]$Entries)
 
@@ -208,8 +196,8 @@ function Get-CellMetrics {
         [string]$ScenarioReportPath
     )
 
-    $summaryPath = Get-ScenarioSummaryPath -RunId $RunId
-    $statusPath = Get-ScenarioStatusPath -RunId $RunId
+    $summaryPath = Join-Path $e2eRoot "$RunId\artifacts\scenarios\$scenario\large-history-cold-bootstrap-summary.json"
+    $statusPath = Join-Path $e2eRoot "$RunId\artifacts\scenarios\$scenario\large-history-status.ndjson"
     $summary = $null
     $pages = @()
     if (Test-Path -LiteralPath $summaryPath) {
@@ -281,13 +269,7 @@ if (-not [string]::IsNullOrWhiteSpace($SelectedCase)) {
     if ($unknownCases.Count -gt 0) {
         throw "Unknown SFS-718 case(s): $($unknownCases -join ', ')"
     }
-    $requestedCases = [System.Collections.Generic.HashSet[string]]::new(
-        [StringComparer]::OrdinalIgnoreCase
-    )
-    foreach ($caseName in $selectedCaseNames) {
-        [void]$requestedCases.Add($caseName)
-    }
-    $cases = @($cases.Where({ $requestedCases.Contains($_.name) }))
+    $cases = @($cases | Where-Object { $selectedCaseNames -contains $_.name })
 }
 
 $matrix = [ordered]@{
