@@ -225,6 +225,8 @@ impl PgMetaEngine {
         lease: CheckpointLease,
         cut: CheckpointSourceCut,
     ) -> MetaResult<bool> {
+        let total_started = Instant::now();
+        let build_started = Instant::now();
         // The local export is a consistent redb transaction. It intentionally
         // runs without replication_lock so ordinary replication can continue.
         let payload = self.local.export_serving_checkpoint_bytes()?;
@@ -243,13 +245,24 @@ impl PgMetaEngine {
             checkpoint_sha256,
             format_info,
         };
+        let payload_bytes = u64::try_from(checkpoint.payload.len()).unwrap_or(u64::MAX);
+        let build_duration_us = elapsed_micros(build_started);
+        let publish_started = Instant::now();
         let Some(observation) =
             self.publish_checkpoint_if_source_cut_is_current(owner, lease, cut, checkpoint)?
         else {
             return Ok(self.refresh_checkpoint_freshness_after_coordination_miss());
         };
+        let publish_duration_us = elapsed_micros(publish_started);
+        let total_duration_us = elapsed_micros(total_started);
 
         self.record_checkpoint_freshness_observation(observation);
+        self.record_checkpoint_performance(
+            payload_bytes,
+            build_duration_us,
+            publish_duration_us,
+            total_duration_us,
+        );
         Ok(true)
     }
 
@@ -488,6 +501,10 @@ impl PgMetaEngine {
 
 fn checkpoint_source_version_if_stable(observed: i64, current: i64) -> Option<i64> {
     (observed == current).then_some(current)
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn next_checkpoint_retry_delay(current: Duration, base: Duration) -> Duration {

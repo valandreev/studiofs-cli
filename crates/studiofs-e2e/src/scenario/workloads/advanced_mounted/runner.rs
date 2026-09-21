@@ -54,6 +54,45 @@ fn cleanup_advanced_mounted_after_run(
     }
 }
 
+fn large_history_positive_env_override(
+    name: &str,
+    fallback: &str,
+) -> Result<String, ScenarioError> {
+    let value = std::env::var(name).unwrap_or_else(|_| fallback.to_string());
+    if value.parse::<u64>().ok().is_none_or(|value| value == 0) {
+        return Err(ScenarioError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be a positive integer"),
+        )));
+    }
+    Ok(value)
+}
+
+fn large_history_catchup_overrides() -> Result<Vec<(String, String)>, ScenarioError> {
+    let page_batches = large_history_positive_env_override(
+        LARGE_HISTORY_PAGE_BATCHES_ENV,
+        LARGE_HISTORY_CATCHUP_BATCHES_PER_PAGE,
+    )?;
+    let mut overrides = vec![
+        (
+            "STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE".to_string(),
+            page_batches,
+        ),
+        (
+            "STUDIOFS_PG_SYNC_POLL_SECS".to_string(),
+            LARGE_HISTORY_CATCHUP_POLL_SECS.to_string(),
+        ),
+    ];
+    if std::env::var(LARGE_HISTORY_PAGE_BYTES_ENV).is_ok() {
+        let page_bytes = large_history_positive_env_override(LARGE_HISTORY_PAGE_BYTES_ENV, "1")?;
+        overrides.push((
+            "STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE".to_string(),
+            page_bytes,
+        ));
+    }
+    Ok(overrides)
+}
+
 pub(in crate::scenario) fn release_completed_hotspot_helpers_for_advanced_kind(
     context: &ScenarioContext,
     kind: AdvancedMountedKind,
@@ -667,6 +706,9 @@ struct LargeHistoryPageSample {
     event_count: u64,
     response_bytes: u64,
     has_more: bool,
+    query_duration_us: Option<u64>,
+    apply_duration_us: Option<u64>,
+    total_duration_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -677,6 +719,10 @@ struct LargeHistoryStatusSample {
     remote_head_version: Option<u64>,
     checkpoint_version: Option<u64>,
     source_connected: bool,
+    checkpoint_payload_bytes: Option<u64>,
+    checkpoint_build_duration_us: Option<u64>,
+    checkpoint_publish_duration_us: Option<u64>,
+    checkpoint_total_duration_us: Option<u64>,
     current_page: Option<LargeHistoryPageSample>,
     last_page: Option<LargeHistoryPageSample>,
 }
@@ -702,6 +748,11 @@ fn parse_status_bytes(value: &str) -> Option<u64> {
     Some((amount.trim().parse::<f64>().ok()? * multiplier).round() as u64)
 }
 
+fn parse_status_duration_us(value: &str) -> Option<u64> {
+    let value = value.trim().strip_suffix("ms")?.trim();
+    Some((value.parse::<f64>().ok()? * 1_000.0).round() as u64)
+}
+
 fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, ScenarioError> {
     let value = value.trim();
     if value == "none" {
@@ -724,6 +775,9 @@ fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, Scen
     let mut event_count = None;
     let mut response_bytes = None;
     let mut has_more = None;
+    let mut query_duration_us = None;
+    let mut apply_duration_us = None;
+    let mut total_duration_us = None;
     for detail in details.split(", ") {
         if detail.ends_with("batch") || detail.ends_with("batches") {
             batch_count = detail
@@ -737,6 +791,12 @@ fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, Scen
                 .and_then(parse_status_version);
         } else if let Some(value) = detail.strip_prefix("more=") {
             has_more = Some(value == "true");
+        } else if let Some(value) = detail.strip_prefix("query=") {
+            query_duration_us = parse_status_duration_us(value);
+        } else if let Some(value) = detail.strip_prefix("apply=") {
+            apply_duration_us = parse_status_duration_us(value);
+        } else if let Some(value) = detail.strip_prefix("total=") {
+            total_duration_us = parse_status_duration_us(value);
         } else if detail != "oversized" {
             response_bytes = parse_status_bytes(detail);
         }
@@ -764,6 +824,9 @@ fn parse_status_page(value: &str) -> Result<Option<LargeHistoryPageSample>, Scen
                 "missing status page more flag: {value}"
             )))
         })?,
+        query_duration_us,
+        apply_duration_us,
+        total_duration_us,
     }))
 }
 
@@ -774,6 +837,10 @@ fn parse_large_history_status(output: &str) -> Result<LargeHistoryStatusSample, 
     let mut remote_head_version = None;
     let mut checkpoint_version = None;
     let mut source_connected = false;
+    let mut checkpoint_payload_bytes = None;
+    let mut checkpoint_build_duration_us = None;
+    let mut checkpoint_publish_duration_us = None;
+    let mut checkpoint_total_duration_us = None;
     let mut current_page = None;
     let mut last_page = None;
     for line in output.lines().map(str::trim) {
@@ -795,6 +862,18 @@ fn parse_large_history_status(output: &str) -> Result<LargeHistoryStatusSample, 
             checkpoint_version = parse_status_version(value);
         } else if let Some(value) = line.strip_prefix("Source connected:") {
             source_connected = value.trim() == "yes";
+        } else if let Some(value) = line.strip_prefix("Checkpoint payload:") {
+            checkpoint_payload_bytes = parse_status_bytes(value);
+        } else if let Some(value) = line.strip_prefix("Checkpoint timings:") {
+            for detail in value.trim().split(", ") {
+                if let Some(value) = detail.strip_prefix("build=") {
+                    checkpoint_build_duration_us = parse_status_duration_us(value);
+                } else if let Some(value) = detail.strip_prefix("publish=") {
+                    checkpoint_publish_duration_us = parse_status_duration_us(value);
+                } else if let Some(value) = detail.strip_prefix("total=") {
+                    checkpoint_total_duration_us = parse_status_duration_us(value);
+                }
+            }
         } else if let Some(value) = line.strip_prefix("Current page:") {
             current_page = parse_status_page(value)?;
         } else if let Some(value) = line.strip_prefix("Last page:") {
@@ -811,6 +890,10 @@ fn parse_large_history_status(output: &str) -> Result<LargeHistoryStatusSample, 
         remote_head_version,
         checkpoint_version,
         source_connected,
+        checkpoint_payload_bytes,
+        checkpoint_build_duration_us,
+        checkpoint_publish_duration_us,
+        checkpoint_total_duration_us,
         current_page,
         last_page,
     })
@@ -821,6 +904,19 @@ fn update_cold_checkpoint_version(
     sample: &LargeHistoryStatusSample,
 ) {
     *checkpoint_version = (*checkpoint_version).or(sample.checkpoint_version);
+}
+
+fn update_checkpoint_performance(
+    payload_bytes: &mut Option<u64>,
+    build_duration_us: &mut Option<u64>,
+    publish_duration_us: &mut Option<u64>,
+    total_duration_us: &mut Option<u64>,
+    sample: &LargeHistoryStatusSample,
+) {
+    *payload_bytes = (*payload_bytes).or(sample.checkpoint_payload_bytes);
+    *build_duration_us = (*build_duration_us).or(sample.checkpoint_build_duration_us);
+    *publish_duration_us = (*publish_duration_us).or(sample.checkpoint_publish_duration_us);
+    *total_duration_us = (*total_duration_us).or(sample.checkpoint_total_duration_us);
 }
 
 fn append_large_history_status(
@@ -850,6 +946,13 @@ fn update_large_history_page_totals(
         let key = (page.first_batch_version, page.last_batch_version);
         if seen_pages.insert(key) {
             pages.push(page.clone());
+        } else if let Some(existing) = pages
+            .iter_mut()
+            .find(|existing| (existing.first_batch_version, existing.last_batch_version) == key)
+            && existing.total_duration_us.unwrap_or_default() == 0
+            && page.total_duration_us.unwrap_or_default() > 0
+        {
+            *existing = page.clone();
         }
     }
 }
@@ -895,19 +998,13 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let started = Instant::now();
     let _fixture =
         seed_large_history_fixture(config, &volume_name, &isolation.root, &context.scenario_dir)?;
-    controller.set_client_env_overrides(
-        LARGE_HISTORY_COLD_CLIENT,
-        [
-            (
-                "STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE",
-                LARGE_HISTORY_CATCHUP_BATCHES_PER_PAGE,
-            ),
-            (
-                "STUDIOFS_PG_SYNC_POLL_SECS",
-                LARGE_HISTORY_CATCHUP_POLL_SECS,
-            ),
-        ],
-    )?;
+    let catchup_overrides = large_history_catchup_overrides()?;
+    if std::env::var_os(LARGE_HISTORY_PAGE_BATCHES_ENV).is_some()
+        || std::env::var_os(LARGE_HISTORY_PAGE_BYTES_ENV).is_some()
+    {
+        controller.set_client_env_overrides("client-a", catchup_overrides.clone())?;
+    }
+    controller.set_client_env_overrides(LARGE_HISTORY_COLD_CLIENT, catchup_overrides)?;
     controller.set_mount_ready_timeout(LARGE_HISTORY_MOUNT_READY_TIMEOUT);
     controller.mount("client-a")?;
     let warm_clients = controller
@@ -938,10 +1035,13 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let mut operations = Vec::new();
     let status_path = context.scenario_dir.join("large-history-status.ndjson");
     fs::write(&status_path, [])?;
+    let mut pages = Vec::new();
+    let mut seen_pages = HashSet::new();
     let warm_deadline = Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT;
     let initial_warm_status = loop {
         let sample = parse_large_history_status(&controller.status("client-a")?.stdout)?;
         append_large_history_status(&status_path, "client-a", &sample)?;
+        update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
         let caught_up = sample
             .remote_head_version
             .zip(sample.local_applied_version)
@@ -997,10 +1097,19 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     )?);
 
     let deadline = Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT;
-    let mut pages = Vec::new();
-    let mut seen_pages = HashSet::new();
     let mut applied_version_progression = Vec::new();
     let mut checkpoint_version = None;
+    let mut checkpoint_payload_bytes = None;
+    let mut checkpoint_build_duration_us = None;
+    let mut checkpoint_publish_duration_us = None;
+    let mut checkpoint_total_duration_us = None;
+    update_checkpoint_performance(
+        &mut checkpoint_payload_bytes,
+        &mut checkpoint_build_duration_us,
+        &mut checkpoint_publish_duration_us,
+        &mut checkpoint_total_duration_us,
+        &after_initial_status,
+    );
     let mut startup_target_version = None;
     let mut applied_version_restart_index = None;
     let mut saw_catching_up = false;
@@ -1013,6 +1122,13 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                 parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
             append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &sample)?;
             update_cold_checkpoint_version(&mut checkpoint_version, &sample);
+            update_checkpoint_performance(
+                &mut checkpoint_payload_bytes,
+                &mut checkpoint_build_duration_us,
+                &mut checkpoint_publish_duration_us,
+                &mut checkpoint_total_duration_us,
+                &sample,
+            );
             startup_target_version = startup_target_version.or(sample.startup_target_version);
             if let Some(applied) = sample.local_applied_version {
                 applied_version_progression.push(applied);
@@ -1118,6 +1234,20 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                 parse_large_history_status(&controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout)?;
             append_large_history_status(&status_path, LARGE_HISTORY_COLD_CLIENT, &cold_status)?;
             update_cold_checkpoint_version(&mut checkpoint_version, &cold_status);
+            update_checkpoint_performance(
+                &mut checkpoint_payload_bytes,
+                &mut checkpoint_build_duration_us,
+                &mut checkpoint_publish_duration_us,
+                &mut checkpoint_total_duration_us,
+                &warm_status,
+            );
+            update_checkpoint_performance(
+                &mut checkpoint_payload_bytes,
+                &mut checkpoint_build_duration_us,
+                &mut checkpoint_publish_duration_us,
+                &mut checkpoint_total_duration_us,
+                &cold_status,
+            );
             if let Some(applied) = cold_status.local_applied_version {
                 applied_version_progression.push(applied);
             }
@@ -1161,6 +1291,22 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         observed_page_count: pages.len(),
         observed_event_rows: pages.iter().map(|page| page.event_count).sum(),
         observed_event_bytes: pages.iter().map(|page| page.response_bytes).sum(),
+        observed_page_query_duration_us: pages
+            .iter()
+            .filter_map(|page| page.query_duration_us)
+            .sum(),
+        observed_page_apply_duration_us: pages
+            .iter()
+            .filter_map(|page| page.apply_duration_us)
+            .sum(),
+        observed_page_total_duration_us: pages
+            .iter()
+            .filter_map(|page| page.total_duration_us)
+            .sum(),
+        checkpoint_payload_bytes,
+        checkpoint_build_duration_us,
+        checkpoint_publish_duration_us,
+        checkpoint_total_duration_us,
         saw_catching_up,
         restarted_during_catchup,
         moving_head_observed,
@@ -1858,8 +2004,10 @@ mod tests {
              Local applied/target:   123/456\n\
              Remote head:            789\n\
              Checkpoint version:     100\n\
-             Current page:           123..154 (32 batches, 512 events, 64 KiB, more=true)\n\
-             Last page:              91..122 (32 batches, 480 events, 60 KiB, more=true)\n\
+             Checkpoint payload:     1.0MiB\n\
+             Checkpoint timings:     build=12.345ms, publish=6.789ms, total=19.134ms\n\
+             Current page:           123..154 (32 batches, 512 events, 64 KiB, more=true, query=1.250ms, apply=2.500ms, total=3.750ms)\n\
+             Last page:              91..122 (32 batches, 480 events, 60 KiB, more=true, query=1.000ms, apply=2.000ms, total=3.000ms)\n\
              Source connected:       yes\n",
         )
         .unwrap();
@@ -1869,8 +2017,16 @@ mod tests {
         assert_eq!(sample.startup_target_version, Some(456));
         assert_eq!(sample.remote_head_version, Some(789));
         assert_eq!(sample.checkpoint_version, Some(100));
+        assert_eq!(sample.checkpoint_payload_bytes, Some(1024 * 1024));
+        assert_eq!(sample.checkpoint_build_duration_us, Some(12_345));
+        assert_eq!(sample.checkpoint_publish_duration_us, Some(6_789));
+        assert_eq!(sample.checkpoint_total_duration_us, Some(19_134));
         assert!(sample.source_connected);
-        assert_eq!(sample.current_page.unwrap().event_count, 512);
+        let current_page = sample.current_page.unwrap();
+        assert_eq!(current_page.event_count, 512);
+        assert_eq!(current_page.query_duration_us, Some(1_250));
+        assert_eq!(current_page.apply_duration_us, Some(2_500));
+        assert_eq!(current_page.total_duration_us, Some(3_750));
         assert_eq!(sample.last_page.unwrap().response_bytes, 60 * 1024);
     }
 
@@ -1906,8 +2062,8 @@ mod tests {
     fn page_totals_deduplicate_repeated_page_ranges() {
         let sample = parse_large_history_status(
             "Lifecycle: CatchingUp\n\
-             Current page: 52..52 (1 batch, 1 event, 1 KiB, more=false)\n\
-             Last page: 52..52 (1 batch, 1 event, 1 KiB, more=false)\n",
+             Current page: 52..52 (1 batch, 1 event, 1 KiB, more=false, query=0.000ms, apply=0.000ms, total=0.000ms)\n\
+             Last page: 52..52 (1 batch, 1 event, 1 KiB, more=false, query=1.000ms, apply=2.000ms, total=3.000ms)\n",
         )
         .unwrap();
         let mut pages = Vec::new();
@@ -1916,6 +2072,9 @@ mod tests {
         update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
 
         assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].query_duration_us, Some(1_000));
+        assert_eq!(pages[0].apply_duration_us, Some(2_000));
+        assert_eq!(pages[0].total_duration_us, Some(3_000));
     }
 
     #[test]

@@ -603,6 +603,20 @@ pub(in crate::scenario) struct LargeHistorySummary {
     pub(in crate::scenario) observed_page_count: usize,
     pub(in crate::scenario) observed_event_rows: u64,
     pub(in crate::scenario) observed_event_bytes: u64,
+    #[serde(default)]
+    pub(in crate::scenario) observed_page_query_duration_us: u64,
+    #[serde(default)]
+    pub(in crate::scenario) observed_page_apply_duration_us: u64,
+    #[serde(default)]
+    pub(in crate::scenario) observed_page_total_duration_us: u64,
+    #[serde(default)]
+    pub(in crate::scenario) checkpoint_payload_bytes: Option<u64>,
+    #[serde(default)]
+    pub(in crate::scenario) checkpoint_build_duration_us: Option<u64>,
+    #[serde(default)]
+    pub(in crate::scenario) checkpoint_publish_duration_us: Option<u64>,
+    #[serde(default)]
+    pub(in crate::scenario) checkpoint_total_duration_us: Option<u64>,
     pub(in crate::scenario) saw_catching_up: bool,
     pub(in crate::scenario) restarted_during_catchup: bool,
     pub(in crate::scenario) moving_head_observed: bool,

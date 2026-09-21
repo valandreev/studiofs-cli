@@ -945,6 +945,9 @@ impl PgMetaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{
+        ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
 
     #[test]
     fn encoded_payload_byte_accounting_matches_event_payloads() {
@@ -964,6 +967,38 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].payload_bytes, expected);
+    }
+
+    #[test]
+    fn large_regular_file_publication_fits_the_default_replay_byte_cap() {
+        let slices = (0..200_000_u64)
+            .map(|index| SliceRecord {
+                slice_id: SliceId(index),
+                order: SliceOrder(index),
+                range: SliceRange::new(index as u32, index as u32 + 1)
+                    .expect("fixture slice range"),
+                payload: Some(PayloadRef::new_full(index, 1)),
+                payload_state: PayloadRefState::Published,
+            })
+            .collect();
+        let event = MetaEvent::PublishRegularFileBaseSlices {
+            ino: 42,
+            chunk_slices: vec![(ChunkId(0), slices)],
+        };
+        let payload = encode_event(&event).expect("publication event should encode");
+        let response_bytes =
+            encoded_event_response_bytes(event.kind(), payload.len(), "client-slot:1")
+                .expect("publication response size should fit BIGINT");
+        assert!(response_bytes > 2 * 1024 * 1024);
+        assert!(response_bytes <= 8 * 1024 * 1024);
+
+        let batches = PgMetaEngine::split_projected_event_batches(
+            vec![event],
+            "client-slot:1",
+            super::super::DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
+        )
+        .expect("a valid publication event must fit the default replay cap");
+        assert_eq!(batches.len(), 1);
     }
 
     #[test]

@@ -101,6 +101,16 @@ fn format_ms(value: f64) -> String {
     format!("{value:.3}ms")
 }
 
+fn format_duration_us(value: u64) -> String {
+    format_ms(value as f64 / 1_000.0)
+}
+
+fn format_optional_duration_us(value: Option<u64>) -> String {
+    value
+        .map(format_duration_us)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn format_version(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
@@ -140,11 +150,14 @@ fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
     };
     let oversized = if page.oversized { ", oversized" } else { "" };
     format!(
-        "{first}..{last} ({} {batch_unit}, {} {event_unit}, {}, more={}{oversized})",
+        "{first}..{last} ({} {batch_unit}, {} {event_unit}, {}, more={}, query={}, apply={}, total={}{oversized})",
         page.batch_count,
         page.event_count,
         format_bytes(page.response_bytes),
-        page.has_more
+        page.has_more,
+        format_duration_us(page.query_duration_us),
+        format_duration_us(page.apply_duration_us),
+        format_duration_us(page.total_duration_us),
     )
 }
 
@@ -210,6 +223,20 @@ fn print_pg_sync_diagnostics(diagnostics: &PgSyncDiagnostics) {
     } else {
         println!("  Checkpoint refresh:     {refresh_state}");
     }
+    println!(
+        "  Checkpoint payload:     {}",
+        diagnostics
+            .checkpoint
+            .last_checkpoint_payload_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "  Checkpoint timings:     build={}, publish={}, total={}",
+        format_optional_duration_us(diagnostics.checkpoint.last_checkpoint_build_duration_us),
+        format_optional_duration_us(diagnostics.checkpoint.last_checkpoint_publish_duration_us),
+        format_optional_duration_us(diagnostics.checkpoint.last_checkpoint_total_duration_us),
+    );
     println!(
         "  Current page:           {}",
         format_page(diagnostics.current_page.as_ref())
@@ -1396,11 +1423,12 @@ mod tests {
             response_bytes: 128,
             has_more: true,
             oversized: true,
+            ..Default::default()
         };
 
         assert_eq!(
             format_page(Some(&page)),
-            "4..9 (3 batches, 7 events, 128B, more=true, oversized)"
+            "4..9 (3 batches, 7 events, 128B, more=true, query=0.000ms, apply=0.000ms, total=0.000ms, oversized)"
         );
     }
 
@@ -1417,7 +1445,7 @@ mod tests {
 
         assert_eq!(
             format_page(Some(&page)),
-            "1..1 (1 batch, 1 event, 1B, more=false)"
+            "1..1 (1 batch, 1 event, 1B, more=false, query=0.000ms, apply=0.000ms, total=0.000ms)"
         );
     }
 

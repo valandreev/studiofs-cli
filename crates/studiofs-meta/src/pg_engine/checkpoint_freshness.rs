@@ -116,6 +116,11 @@ impl CheckpointFreshnessState {
             .diagnostics
             .refresh_requests
             .saturating_add(u64::from(!was_needed && refresh_needed));
+        let last_checkpoint_payload_bytes = self.diagnostics.last_checkpoint_payload_bytes;
+        let last_checkpoint_build_duration_us = self.diagnostics.last_checkpoint_build_duration_us;
+        let last_checkpoint_publish_duration_us =
+            self.diagnostics.last_checkpoint_publish_duration_us;
+        let last_checkpoint_total_duration_us = self.diagnostics.last_checkpoint_total_duration_us;
         self.diagnostics = MetadataCheckpointFreshnessDiagnostics {
             head_version: Some(decision.head_version),
             checkpoint_version: Some(decision.checkpoint_version),
@@ -132,7 +137,24 @@ impl CheckpointFreshnessState {
             refresh_needed,
             refresh_reason: decision.reason,
             refresh_requests,
+            last_checkpoint_payload_bytes,
+            last_checkpoint_build_duration_us,
+            last_checkpoint_publish_duration_us,
+            last_checkpoint_total_duration_us,
         };
+    }
+
+    pub(super) fn record_checkpoint_performance(
+        &mut self,
+        payload_bytes: u64,
+        build_duration_us: u64,
+        publish_duration_us: u64,
+        total_duration_us: u64,
+    ) {
+        self.diagnostics.last_checkpoint_payload_bytes = Some(payload_bytes);
+        self.diagnostics.last_checkpoint_build_duration_us = Some(build_duration_us);
+        self.diagnostics.last_checkpoint_publish_duration_us = Some(publish_duration_us);
+        self.diagnostics.last_checkpoint_total_duration_us = Some(total_duration_us);
     }
 
     pub(super) fn diagnostics(&self) -> MetadataCheckpointFreshnessDiagnostics {
@@ -209,6 +231,25 @@ impl super::PgMetaEngine {
         } else {
             self.checkpoint_coordinator_state.clear();
         }
+    }
+
+    pub(super) fn record_checkpoint_performance(
+        &self,
+        payload_bytes: u64,
+        build_duration_us: u64,
+        publish_duration_us: u64,
+        total_duration_us: u64,
+    ) {
+        let mut state = self
+            .checkpoint_freshness_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_checkpoint_performance(
+            payload_bytes,
+            build_duration_us,
+            publish_duration_us,
+            total_duration_us,
+        );
     }
 
     pub(super) fn checkpoint_freshness_diagnostics(
@@ -328,5 +369,19 @@ mod tests {
 
         tracker.observe(&policy(), input(16, 5, 0, Duration::ZERO));
         assert_eq!(tracker.diagnostics().refresh_requests, 2);
+    }
+
+    #[test]
+    fn checkpoint_performance_survives_later_freshness_observation() {
+        let mut tracker = CheckpointFreshnessState::default();
+        tracker.record_checkpoint_performance(4096, 12, 34, 56);
+
+        tracker.observe(&policy(), input(15, 5, 0, Duration::ZERO));
+
+        let diagnostics = tracker.diagnostics();
+        assert_eq!(diagnostics.last_checkpoint_payload_bytes, Some(4096));
+        assert_eq!(diagnostics.last_checkpoint_build_duration_us, Some(12));
+        assert_eq!(diagnostics.last_checkpoint_publish_duration_us, Some(34));
+        assert_eq!(diagnostics.last_checkpoint_total_duration_us, Some(56));
     }
 }

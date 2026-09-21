@@ -57,6 +57,22 @@ current-main/direct, feature/direct, feature/adaptive, and JuiceFS paths. It
 defaults to five repetitions, computes median/p95/p99 wall time, applies the
 release thresholds, and writes all artifacts under `target/perf`.
 
+For SFS-718 PostgreSQL catch-up and checkpoint threshold evidence, use
+`sfs-718-pg-sync.ps1` with freshly built release binaries. It runs the
+retained mounted large-history scenario, samples the client process tree and
+labeled PostgreSQL container, and writes per-cell page/checkpoint telemetry
+under a non-overwriting `target/perf/sfs-718-pg-sync-*` directory.
+
+Example low-resource matrix run:
+
+    & 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -File .\tools\perf\sfs-718-pg-sync.ps1 -StudiofsBin .\target\release\studiofs.exe -E2eBin .\target\release\studiofs-e2e.exe -Runs 2 -ConstrainPostgres
+
+Use `-SelectedCase page-batches-32,page-batches-64,page-bytes-2m` for a
+comma-separated subset, and `-PreviewOnly` to inspect the matrix without
+starting services. See
+[`docs/perf/sfs-718-pg-sync-thresholds.md`](../../docs/perf/sfs-718-pg-sync-thresholds.md)
+for the SFS-718 decision and retained evidence.
+
 ## Scope
 
 For this pass we care about two focused scenarios:
