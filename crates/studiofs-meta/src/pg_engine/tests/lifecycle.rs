@@ -310,6 +310,7 @@ fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
         response_bytes: 64,
         has_more: true,
         oversized: false,
+        ..Default::default()
     };
     let next_page = PgSyncPageDiagnostics {
         first_batch_version: Some(5),

@@ -8,6 +8,7 @@ use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPa
 use crate::types::{FileType, Ino};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use tracing::warn;
 
 impl PgMetaEngine {
@@ -204,6 +205,7 @@ impl PgMetaEngine {
             cursor: last_batch_version,
         })?;
 
+        let page_started = Instant::now();
         let page = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
@@ -287,6 +289,7 @@ impl PgMetaEngine {
             )
             .await
         })?;
+        let query_duration_us = elapsed_micros(page_started);
 
         #[cfg(test)]
         if !page.rows.is_empty() {
@@ -313,6 +316,8 @@ impl PgMetaEngine {
             response_bytes: page.response_bytes.try_into().unwrap_or_default(),
             has_more: page.has_more,
             oversized: page.oversized,
+            query_duration_us,
+            ..PgSyncPageDiagnostics::default()
         };
         let should_log = self.record_pg_sync_page_selected(page_diagnostics);
         // Keep the local event position, serving-state reconcile, and pending
@@ -345,6 +350,7 @@ impl PgMetaEngine {
                 "postgres foreign event page contains an oversized atomic batch"
             );
         }
+        let apply_started = Instant::now();
         let mut pending_state = self
             .pending_state
             .lock()
@@ -373,7 +379,11 @@ impl PgMetaEngine {
             self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
         }
         drop(pending_state);
-        self.record_pg_sync_page_applied(page_diagnostics);
+        self.record_pg_sync_page_applied(PgSyncPageDiagnostics {
+            apply_duration_us: elapsed_micros(apply_started),
+            total_duration_us: elapsed_micros(page_started),
+            ..page_diagnostics
+        });
         Ok(outcome.changed)
     }
 
@@ -466,4 +476,8 @@ impl PgMetaEngine {
         )?;
         Ok(changed)
     }
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }

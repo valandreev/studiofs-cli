@@ -645,7 +645,7 @@ PostgreSQL metadata invalidation uses push-plus-poll behavior:
   metadata listener reconnect and sync attempts.
 - `STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE` and
   `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE` bound each foreign event-log
-  page. They default to `64` complete batches and `8388608` estimated response
+  page. They default to `64` complete batches and `2097152` estimated response
   bytes; the first oversized batch is returned atomically and marked for
   explicit handling.
 - Keep `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE` at or above the encoded

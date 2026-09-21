@@ -516,6 +516,18 @@ pub struct MetadataCheckpointFreshnessDiagnostics {
     pub refresh_reason: Option<MetadataCheckpointRefreshReason>,
     /// Number of transitions from fresh to refresh-needed state.
     pub refresh_requests: u64,
+    /// Serialized serving-checkpoint payload size from the last successful publication.
+    #[serde(default)]
+    pub last_checkpoint_payload_bytes: Option<u64>,
+    /// Local checkpoint export, serialization, and hashing duration in microseconds.
+    #[serde(default)]
+    pub last_checkpoint_build_duration_us: Option<u64>,
+    /// Fenced PostgreSQL checkpoint publication duration in microseconds.
+    #[serde(default)]
+    pub last_checkpoint_publish_duration_us: Option<u64>,
+    /// End-to-end checkpoint build and publication duration in microseconds.
+    #[serde(default)]
+    pub last_checkpoint_total_duration_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1012,6 +1024,15 @@ pub struct PgSyncPageDiagnostics {
     pub has_more: bool,
     /// Whether one atomic batch exceeded the configured page byte budget.
     pub oversized: bool,
+    /// Client-observed PostgreSQL page fetch duration in microseconds.
+    #[serde(default)]
+    pub query_duration_us: u64,
+    /// Local decode and atomic redb apply duration in microseconds.
+    #[serde(default)]
+    pub apply_duration_us: u64,
+    /// End-to-end page fetch and apply duration in microseconds.
+    #[serde(default)]
+    pub total_duration_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

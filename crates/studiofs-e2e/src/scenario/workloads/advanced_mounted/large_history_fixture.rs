@@ -34,10 +34,9 @@ const FIXTURE_TIME_NANOS: i64 = 1_700_000_000_000_000_000;
 const FIXTURE_CLIENT_ID: &str = "studiofs-e2e-pg-fixture";
 const FIXTURE_CHECKPOINT_VERSION: i64 = 8;
 const FIXTURE_REPLAY_BATCH_COUNT: usize = 32;
+#[cfg(test)]
 const FIXTURE_REPLAY_EVENT_COUNT: usize =
     LARGE_HISTORY_FIXTURE_EVENTS_PER_BATCH * FIXTURE_REPLAY_BATCH_COUNT;
-const FIXTURE_CHECKPOINT_EVENT_COUNT: usize =
-    LARGE_HISTORY_INITIAL_MUTATION_COUNT - FIXTURE_REPLAY_EVENT_COUNT;
 const REPLAY_GATE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const INSERT_FIXTURE_EVENTS: &str = r#"
@@ -67,6 +66,8 @@ pub(in crate::scenario) struct LargeHistoryFixtureSummary {
     pub(in crate::scenario) checkpoint_event_count: usize,
     pub(in crate::scenario) event_count: usize,
     pub(in crate::scenario) total_event_count: usize,
+    #[serde(default)]
+    pub(in crate::scenario) replay_batch_count: usize,
     pub(in crate::scenario) checkpoint_version: u64,
     pub(in crate::scenario) batch_count: u64,
     pub(in crate::scenario) remote_head_version: u64,
@@ -538,6 +539,7 @@ async fn seed_large_history_fixture_async(
         checkpoint_event_count: checkpoint_events.len(),
         event_count: events.len(),
         total_event_count: checkpoint_events.len().saturating_add(events.len()),
+        replay_batch_count: events.len() / LARGE_HISTORY_FIXTURE_EVENTS_PER_BATCH,
         checkpoint_version: u64::try_from(FIXTURE_CHECKPOINT_VERSION).map_err(|_| {
             ScenarioError::Io(io::Error::other(
                 "large-history PostgreSQL fixture checkpoint version was negative",
@@ -559,12 +561,58 @@ async fn seed_large_history_fixture_async(
     })
 }
 
+fn configured_replay_batch_count() -> Result<usize, ScenarioError> {
+    let value = std::env::var(LARGE_HISTORY_REPLAY_BATCHES_ENV)
+        .unwrap_or_else(|_| FIXTURE_REPLAY_BATCH_COUNT.to_string());
+    let replay_batch_count = value.parse::<usize>().map_err(|_| {
+        ScenarioError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{LARGE_HISTORY_REPLAY_BATCHES_ENV} must be a positive integer"),
+        ))
+    })?;
+    if replay_batch_count == 0 {
+        return Err(ScenarioError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{LARGE_HISTORY_REPLAY_BATCHES_ENV} must be a positive integer"),
+        )));
+    }
+    let replay_event_count = LARGE_HISTORY_FIXTURE_EVENTS_PER_BATCH
+        .checked_mul(replay_batch_count)
+        .ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "large-history fixture replay event count overflow",
+            ))
+        })?;
+    if replay_event_count > LARGE_HISTORY_INITIAL_MUTATION_COUNT {
+        return Err(ScenarioError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{LARGE_HISTORY_REPLAY_BATCHES_ENV} exceeds the initial mutation budget"),
+        )));
+    }
+    Ok(replay_batch_count)
+}
+
 fn build_fixture_events(
     fixture_root: &str,
 ) -> Result<(Vec<MetaEvent>, Vec<FixtureEvent>, usize), ScenarioError> {
     let file_count = LARGE_HISTORY_FIXTURE_FILE_COUNT;
-    let mut checkpoint_events = Vec::with_capacity(FIXTURE_CHECKPOINT_EVENT_COUNT);
-    let mut replay_events = Vec::with_capacity(FIXTURE_REPLAY_EVENT_COUNT);
+    let replay_batch_count = configured_replay_batch_count()?;
+    let replay_event_count = LARGE_HISTORY_FIXTURE_EVENTS_PER_BATCH
+        .checked_mul(replay_batch_count)
+        .ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "large-history fixture replay event count overflow",
+            ))
+        })?;
+    let checkpoint_event_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT
+        .checked_sub(replay_event_count)
+        .ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "large-history fixture checkpoint history underflow",
+            ))
+        })?;
+    let mut checkpoint_events = Vec::with_capacity(checkpoint_event_count);
+    let mut replay_events = Vec::with_capacity(replay_event_count);
     let mut root_attr = InodeAttr::new_dir(
         ROOT_INO,
         0,
@@ -663,7 +711,7 @@ fn build_fixture_events(
         file_attrs.push(attr);
     }
 
-    let checkpoint_filler_count = FIXTURE_CHECKPOINT_EVENT_COUNT
+    let checkpoint_filler_count = checkpoint_event_count
         .checked_sub(checkpoint_events.len())
         .ok_or_else(|| {
             ScenarioError::Io(io::Error::other(
@@ -680,7 +728,7 @@ fn build_fixture_events(
         checkpoint_events.push(MetaEvent::SetAttr { attr });
     }
 
-    for filler_index in 0..FIXTURE_REPLAY_EVENT_COUNT {
+    for filler_index in 0..replay_event_count {
         let file_index = filler_index % file_attrs.len();
         let mut attr = file_attrs[file_index].clone();
         let delta = i64::try_from(
