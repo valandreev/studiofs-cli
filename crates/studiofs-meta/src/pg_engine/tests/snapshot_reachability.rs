@@ -246,6 +246,128 @@ fn bootstrap_defers_while_a_snapshot_is_creating() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn bootstrap_defers_until_local_metadata_catches_up() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-bootstrap-lag");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open lagging postgres engine");
+
+    let publisher_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let publisher_db = publisher_dir.path().join("publisher.redb");
+    seed_local(&publisher_db, &volume.format_info());
+    let publisher = PgMetaEngine::open_with_options(
+        &publisher_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open publisher postgres engine");
+    publisher
+        .create_dir(ROOT_INO, b"bootstrap-lag", 0, 0, 0o755)
+        .expect("create remote event");
+    publisher.flush_metadata().expect("publish remote event");
+    drop(publisher);
+    drop(publisher_dir);
+
+    engine
+        .backfill_current_reference_ledger_if_needed()
+        .expect("version mismatch should defer bootstrap without failing");
+    assert!(
+        !engine
+            .snapshot_reachability_bootstrapped
+            .load(std::sync::atomic::Ordering::Acquire),
+        "bootstrap must stay pending while local metadata trails PostgreSQL"
+    );
+
+    engine
+        .sync_metadata()
+        .expect("metadata sync should catch up the local engine");
+    assert!(
+        engine
+            .snapshot_reachability_bootstrapped
+            .load(std::sync::atomic::Ordering::Acquire),
+        "bootstrap must complete after local metadata catches up"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn bootstrap_batches_large_reference_ledger() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-bootstrap-batches");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open postgres engine");
+
+    for object_index in 0..1_025_u64 {
+        let name = format!("bootstrap-batch-{object_index}");
+        create_published_small_file(&engine, ROOT_INO, name.as_bytes(), 100_000 + object_index);
+    }
+
+    engine
+        .backfill_current_reference_ledger_if_needed()
+        .expect("large reachability bootstrap should complete in batches");
+    assert!(
+        engine
+            .snapshot_reachability_bootstrapped
+            .load(std::sync::atomic::Ordering::Acquire),
+        "large reachability bootstrap must publish its completion marker"
+    );
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let current_reference_count = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM snapshot_current_references WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("count bootstrapped current references")
+            .get::<_, i64>(0);
+        let reachability_count = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM snapshot_object_reachability WHERE vol = $1 AND start_version = 0",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("count bootstrapped reachability rows")
+            .get::<_, i64>(0);
+        connection_task.abort();
+        let _ = connection_task.await;
+        assert_eq!(current_reference_count, 1_025);
+        assert_eq!(reachability_count, 1_025);
+        Ok::<(), MetaError>(())
+    })
+    .expect("verify batched reachability bootstrap");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn snapshot_cut_and_mount_lease_control_object_protection() {
     let Some(dsn) = pg_dsn() else {
         return;

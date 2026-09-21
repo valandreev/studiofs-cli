@@ -19,6 +19,7 @@ use crate::snapshot_ports::{
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tokio_postgres::GenericClient;
+use tracing::debug;
 
 /// Maximum number of uploaded fragment rows one reconciliation cycle may claim.
 pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
@@ -26,8 +27,16 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 /// Lease duration used by uploaded-fragment reconciliation.
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
-const SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES: usize = 3;
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
+const SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE: usize = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReachabilityBootstrapOutcome {
+    Completed,
+    AlreadyInitialized,
+    VersionMismatch,
+    SnapshotCreationInProgress,
+}
 
 type FragmentUploadColumns = (Vec<i64>, Vec<i32>, Vec<String>, Vec<i64>, Vec<Vec<u8>>);
 
@@ -432,6 +441,12 @@ impl PgMetaEngine {
             .collect()
     }
 
+    /// Attempt one bounded reachability-bootstrap transaction when needed.
+    ///
+    /// A version mismatch or active snapshot creation is a normal deferral:
+    /// the bootstrap flag remains clear and the next eligible replication
+    /// cycle may retry it. PostgreSQL and local-storage failures remain typed
+    /// metadata errors.
     pub(super) fn backfill_current_reference_ledger_if_needed(&self) -> MetaResult<()> {
         if self
             .snapshot_reachability_bootstrapped
@@ -453,29 +468,29 @@ impl PgMetaEngine {
             return Ok(());
         }
 
-        self.backfill_current_reference_ledger()?;
-        self.snapshot_reachability_bootstrapped
-            .store(true, Ordering::Release);
+        match self.backfill_current_reference_ledger_once()? {
+            ReachabilityBootstrapOutcome::Completed
+            | ReachabilityBootstrapOutcome::AlreadyInitialized => {
+                self.snapshot_reachability_bootstrapped
+                    .store(true, Ordering::Release);
+            }
+            ReachabilityBootstrapOutcome::VersionMismatch => {
+                debug!(
+                    volume_id = self.volume_id,
+                    "snapshot reachability bootstrap deferred until metadata catches up"
+                );
+            }
+            ReachabilityBootstrapOutcome::SnapshotCreationInProgress => {
+                debug!(
+                    volume_id = self.volume_id,
+                    "snapshot reachability bootstrap deferred until snapshot creation completes"
+                );
+            }
+        }
         Ok(())
     }
 
-    pub(super) fn backfill_current_reference_ledger(&self) -> MetaResult<()> {
-        for attempt in 0..=SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES {
-            if !self.backfill_current_reference_ledger_once()? {
-                return Ok(());
-            }
-            if attempt == SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES {
-                break;
-            }
-            self.sync_metadata_to_current_head()?;
-        }
-        Err(MetaError::Storage(
-            "snapshot reachability bootstrap could not capture a consistent local metadata version"
-                .to_owned(),
-        ))
-    }
-
-    fn backfill_current_reference_ledger_once(&self) -> MetaResult<bool> {
+    fn backfill_current_reference_ledger_once(&self) -> MetaResult<ReachabilityBootstrapOutcome> {
         let local = self.local.clone();
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
@@ -489,6 +504,69 @@ impl PgMetaEngine {
                 move |client| {
                     let local = local.clone();
                     Box::pin(async move {
+                        let fast_path = client
+                            .query_opt(
+                                "SELECT metadata.version,
+                                        EXISTS (
+                                            SELECT 1
+                                            FROM snapshot_reachability_bootstrap AS bootstrap
+                                            WHERE bootstrap.vol = $1
+                                        )
+                                 FROM metadata_state AS metadata
+                                 WHERE metadata.vol = $1",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap marker/version fast-path query failed",
+                                    error,
+                                )
+                            })?;
+                        let Some(fast_path) = fast_path else {
+                            return Err(MetaError::Storage(
+                                "postgres snapshot reachability bootstrap metadata state row missing"
+                                    .to_owned(),
+                            ));
+                        };
+                        let remote_version: i64 = fast_path.get(0);
+                        if fast_path.get::<_, bool>(1) {
+                            return Ok(ReachabilityBootstrapOutcome::AlreadyInitialized);
+                        }
+
+                        let local_version_before_scan = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        // This non-locking version read is only an early cutoff;
+                        // the transaction below rechecks the authoritative row.
+                        if local_version_before_scan != remote_version {
+                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
+                        }
+
+                        let references = local.list_published_object_references()?;
+                        let local_version_after_scan = checked_i64(
+                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
+                            "local metadata version",
+                        )?;
+                        // The references must belong to one stable local version.
+                        if local_version_before_scan != local_version_after_scan {
+                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
+                        }
+
+                        let mut reference_inodes = Vec::with_capacity(references.len());
+                        let mut reference_object_ids = Vec::with_capacity(references.len());
+                        let mut unique_object_ids = Vec::with_capacity(references.len());
+                        for (inode, object_id) in references {
+                            let inode = checked_i64(inode, "inode")?;
+                            let object_id = checked_i64(object_id, "object id")?;
+                            reference_inodes.push(inode);
+                            reference_object_ids.push(object_id);
+                            unique_object_ids.push(object_id);
+                        }
+                        unique_object_ids.sort_unstable();
+                        unique_object_ids.dedup();
+
                         let tx = client.transaction().await.map_err(|error| {
                             Self::classify_pg_error(
                                 "postgres snapshot reachability bootstrap transaction failed",
@@ -527,7 +605,7 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            return Ok(false);
+                            return Ok(ReachabilityBootstrapOutcome::AlreadyInitialized);
                         }
 
                         let creating_snapshot = tx
@@ -543,31 +621,33 @@ impl PgMetaEngine {
                                 )
                             })?;
                         if creating_snapshot.is_some() {
-                            return Err(MetaError::Storage(
-                                "snapshot reachability bootstrap deferred while snapshot creation is in progress"
-                                    .to_owned(),
-                            ));
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap snapshot-deferred rollback failed",
+                                    error,
+                                )
+                            })?;
+                            return Ok(ReachabilityBootstrapOutcome::SnapshotCreationInProgress);
                         }
 
-                        let local_version_before = checked_i64(
+                        // Only this row-locked version can authorize the
+                        // prepared local references for publication.
+                        let local_version_after_lock = checked_i64(
                             local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
                             "local metadata version",
                         )?;
-                        let references = local.list_published_object_references()?;
-                        let local_version_after = checked_i64(
-                            local.get_counter(LOCAL_PG_VERSION_COUNTER)?,
-                            "local metadata version",
-                        )?;
-                        if local_version_before != local_version_after
-                            || local_version_before != version
+                        if local_version_after_scan != local_version_after_lock
+                            || local_version_after_lock != version
                         {
-                            return Ok(true);
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap version-mismatch rollback failed",
+                                    error,
+                                )
+                            })?;
+                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
                         }
 
-                        let objects = references
-                            .iter()
-                            .map(|(_, object_id)| *object_id)
-                            .collect::<BTreeSet<_>>();
                         let inserted = tx
                             .execute(
                                 "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -580,18 +660,26 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                        debug_assert_eq!(inserted, 1);
-
-                        let mut reference_inodes = Vec::with_capacity(references.len());
-                        let mut reference_object_ids = Vec::with_capacity(references.len());
-                        for (inode, object_id) in &references {
-                            reference_inodes.push(checked_i64(*inode, "inode")?);
-                            reference_object_ids.push(checked_i64(*object_id, "object id")?);
+                        if inserted != 1 {
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap marker-conflict rollback failed",
+                                    error,
+                                )
+                            })?;
+                            return Err(MetaError::Storage(
+                                "postgres snapshot reachability bootstrap marker was not inserted"
+                                    .to_owned(),
+                            ));
                         }
-                        if !reference_inodes.is_empty() {
+
+                        for (inode_chunk, object_id_chunk) in reference_inodes
+                            .chunks(SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE)
+                            .zip(reference_object_ids.chunks(SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE))
+                        {
                             tx.execute(
                                 "INSERT INTO snapshot_current_references (vol, ino, object_id) SELECT $1, refs.ino, refs.object_id FROM UNNEST($2::BIGINT[], $3::BIGINT[]) AS refs(ino, object_id) ON CONFLICT DO NOTHING",
-                                &[&volume_id, &reference_inodes, &reference_object_ids],
+                                &[&volume_id, &inode_chunk, &object_id_chunk],
                             )
                             .await
                             .map_err(|error| {
@@ -601,14 +689,13 @@ impl PgMetaEngine {
                                 )
                             })?;
                         }
-                        let object_id_values = objects
-                            .into_iter()
-                            .map(|object_id| checked_i64(object_id, "object id"))
-                            .collect::<MetaResult<Vec<_>>>()?;
-                        if !object_id_values.is_empty() {
+
+                        for object_id_chunk in
+                            unique_object_ids.chunks(SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE)
+                        {
                             tx.execute(
                                 "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) SELECT $1, objects.object_id, $3 FROM UNNEST($2::BIGINT[]) AS objects(object_id) ON CONFLICT DO NOTHING",
-                                &[&volume_id, &object_id_values, &version],
+                                &[&volume_id, &object_id_chunk, &version],
                             )
                             .await
                             .map_err(|error| {
@@ -643,7 +730,7 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        Ok(false)
+                        Ok(ReachabilityBootstrapOutcome::Completed)
                     })
                 },
             )

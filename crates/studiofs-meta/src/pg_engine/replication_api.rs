@@ -59,7 +59,13 @@ impl MetaReplication for PgMetaEngine {
                 Err(error) => return Err(error),
             }
         }
-        if let Err(error) = self.backfill_current_reference_ledger_if_needed() {
+        if matches!(
+            self.current_pg_sync_lifecycle(),
+            PgSyncLifecycle::TargetReached
+                | PgSyncLifecycle::AllocatorPending
+                | PgSyncLifecycle::Live
+        ) && let Err(error) = self.backfill_current_reference_ledger_if_needed()
+        {
             warn!(
                 error = %error,
                 volume_id = self.volume_id,

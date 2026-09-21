@@ -157,37 +157,6 @@ impl PgMetaEngine {
         result
     }
 
-    pub(super) fn sync_metadata_to_current_head(&self) -> MetaResult<()> {
-        // SFS-698: this bounded helper is reserved for explicit background
-        // reachability/bootstrap work; engine construction must not call it.
-        const MAX_STARTUP_CATCHUP_ROUNDS: usize = 16;
-
-        self.ensure_remote_format_validated()?;
-        let target_head = self.remote_metadata_head_version()?;
-        for _ in 0..MAX_STARTUP_CATCHUP_ROUNDS {
-            if self.local_version.load(Ordering::SeqCst) >= target_head {
-                return Ok(());
-            }
-
-            let before = self.local_version.load(Ordering::SeqCst);
-            self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
-            self.local.sync_local_metadata()?;
-            let after = self.local_version.load(Ordering::SeqCst);
-            if after >= target_head {
-                return Ok(());
-            }
-            if after == before {
-                return Err(MetaError::Storage(format!(
-                    "postgres metadata catch-up stalled at local version {after} while remote head is {target_head}"
-                )));
-            }
-        }
-
-        Err(MetaError::Storage(
-            "postgres metadata catch-up did not reach the frozen remote head".to_string(),
-        ))
-    }
-
     pub(super) fn pull_foreign_events_locked(
         &self,
         recent_flush: Option<&RecentFlush>,
