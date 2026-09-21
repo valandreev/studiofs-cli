@@ -532,7 +532,14 @@ impl PgMetaEngine {
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
                     };
                     if let Ok(initial_changed) = sync_result {
-                        if let Err(error) = engine.backfill_current_reference_ledger_if_needed() {
+                        if matches!(
+                            engine.current_pg_sync_lifecycle(),
+                            PgSyncLifecycle::TargetReached
+                                | PgSyncLifecycle::AllocatorPending
+                                | PgSyncLifecycle::Live
+                        ) && let Err(error) =
+                            engine.backfill_current_reference_ledger_if_needed()
+                        {
                             warn!(
                                 error = %error,
                                 volume_id = engine.volume_id,

@@ -19,6 +19,7 @@ use crate::snapshot_ports::{
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tokio_postgres::GenericClient;
+use tracing::debug;
 
 /// Maximum number of uploaded fragment rows one reconciliation cycle may claim.
 pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
@@ -27,6 +28,13 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReachabilityBootstrapOutcome {
+    Completed,
+    AlreadyInitialized,
+    VersionMismatch,
+}
 
 type FragmentUploadColumns = (Vec<i64>, Vec<i32>, Vec<String>, Vec<i64>, Vec<Vec<u8>>);
 
@@ -431,6 +439,11 @@ impl PgMetaEngine {
             .collect()
     }
 
+    /// Attempt one bounded reachability-bootstrap transaction when needed.
+    ///
+    /// A version mismatch is a normal deferral: the bootstrap flag remains
+    /// clear and the next eligible replication cycle may retry it. PostgreSQL
+    /// and local-storage failures remain typed metadata errors.
     pub(super) fn backfill_current_reference_ledger_if_needed(&self) -> MetaResult<()> {
         if self
             .snapshot_reachability_bootstrapped
@@ -452,18 +465,23 @@ impl PgMetaEngine {
             return Ok(());
         }
 
-        if self.backfill_current_reference_ledger_once()? {
-            return Err(MetaError::Storage(
-                "snapshot reachability bootstrap could not capture a consistent local metadata version"
-                    .to_owned(),
-            ));
+        match self.backfill_current_reference_ledger_once()? {
+            ReachabilityBootstrapOutcome::Completed
+            | ReachabilityBootstrapOutcome::AlreadyInitialized => {
+                self.snapshot_reachability_bootstrapped
+                    .store(true, Ordering::Release);
+            }
+            ReachabilityBootstrapOutcome::VersionMismatch => {
+                debug!(
+                    volume_id = self.volume_id,
+                    "snapshot reachability bootstrap deferred until metadata catches up"
+                );
+            }
         }
-        self.snapshot_reachability_bootstrapped
-            .store(true, Ordering::Release);
         Ok(())
     }
 
-    fn backfill_current_reference_ledger_once(&self) -> MetaResult<bool> {
+    fn backfill_current_reference_ledger_once(&self) -> MetaResult<ReachabilityBootstrapOutcome> {
         let local = self.local.clone();
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
@@ -477,6 +495,22 @@ impl PgMetaEngine {
                 move |client| {
                     let local = local.clone();
                     Box::pin(async move {
+                        let initialized = client
+                            .query_opt(
+                                "SELECT 1 FROM snapshot_reachability_bootstrap WHERE vol = $1",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres snapshot reachability bootstrap marker fast-path query failed",
+                                    error,
+                                )
+                            })?;
+                        if initialized.is_some() {
+                            return Ok(ReachabilityBootstrapOutcome::AlreadyInitialized);
+                        }
+
                         let tx = client.transaction().await.map_err(|error| {
                             Self::classify_pg_error(
                                 "postgres snapshot reachability bootstrap transaction failed",
@@ -515,7 +549,7 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            return Ok(false);
+                            return Ok(ReachabilityBootstrapOutcome::AlreadyInitialized);
                         }
 
                         let creating_snapshot = tx
@@ -549,7 +583,7 @@ impl PgMetaEngine {
                         if local_version_before != local_version_after
                             || local_version_before != version
                         {
-                            return Ok(true);
+                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
                         }
 
                         let objects = references
@@ -631,7 +665,7 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        Ok(false)
+                        Ok(ReachabilityBootstrapOutcome::Completed)
                     })
                 },
             )
