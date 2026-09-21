@@ -26,7 +26,6 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 /// Lease duration used by uploaded-fragment reconciliation.
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
-const SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES: usize = 3;
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
 
 type FragmentUploadColumns = (Vec<i64>, Vec<i32>, Vec<String>, Vec<i64>, Vec<Vec<u8>>);
@@ -459,20 +458,19 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    /// Run one bounded reachability-bootstrap transaction.
+    ///
+    /// A concurrent metadata-version change is reported to the caller so the
+    /// next bounded replication poll can retry it. Reachability bootstrap must
+    /// not perform its own catch-up loop.
     pub(super) fn backfill_current_reference_ledger(&self) -> MetaResult<()> {
-        for attempt in 0..=SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES {
-            if !self.backfill_current_reference_ledger_once()? {
-                return Ok(());
-            }
-            if attempt == SNAPSHOT_REACHABILITY_BOOTSTRAP_RETRIES {
-                break;
-            }
-            self.sync_metadata_to_current_head()?;
+        if self.backfill_current_reference_ledger_once()? {
+            return Err(MetaError::Storage(
+                "snapshot reachability bootstrap could not capture a consistent local metadata version"
+                    .to_owned(),
+            ));
         }
-        Err(MetaError::Storage(
-            "snapshot reachability bootstrap could not capture a consistent local metadata version"
-                .to_owned(),
-        ))
+        Ok(())
     }
 
     fn backfill_current_reference_ledger_once(&self) -> MetaResult<bool> {
