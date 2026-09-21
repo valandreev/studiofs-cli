@@ -19,11 +19,17 @@ measurements use the production path:
 4. A fresh `RedbMetaEngine` imports the bytes through
    `import_serving_checkpoint_bytes`.
 
-The PostgreSQL descriptor path validates and decodes its checkpoint, while
-`import_serving_checkpoint_bytes` accepts serialized bytes and decodes them
-again. This is the current production boundary: the two timings are separate
-stage measurements, not additive end-to-end latency, and `local_import`
-includes its own checkpoint decode.
+The benchmark intentionally calls the public PostgreSQL descriptor API and then
+the raw-byte import API. The descriptor path validates and decodes its
+checkpoint, while `import_serving_checkpoint_bytes` accepts serialized bytes
+and decodes them again. The normal snapshot-pull path passes its already
+decoded `ServingCheckpoint` directly to import, so this second decode is a
+benchmark boundary rather than evidence of a duplicate decode in that startup
+path. The two timings are separate stage measurements, not additive
+end-to-end latency, and `local_import` includes its own checkpoint decode.
+It also includes the current `RedbSnapshot` materialization and ownership
+copies for the separate overlay/base tables; reducing that shared import-path
+cost is a separate optimization from the SFS-720 checkpoint-format decision.
 
 The benchmark records checkpoint bytes, export/serialization time, PostgreSQL
 read/decode time, local import time, and process RSS in
@@ -71,7 +77,11 @@ The run produced four complete JSONL records with three samples each:
 | 100,000 | 12.24 MiB | 320.62 ms | 2,167.56 ms | 2,788.55 ms | 432.25 MiB | 558.17 MiB | 125.92 MiB |
 
 The RSS values are process-level observations for the measured size; they are
-not a low-resource host acceptance gate. The configured PostgreSQL service was
+not a low-resource host acceptance gate. Sizes run serially in one test
+process, so allocator and redb retained pages can raise later baselines; these
+are warm same-process measurements, not independent cold-start footprints. To
+compare independent RSS baselines, run the benchmark once per size with a
+single `SFS720_NAMESPACE_SIZES` value. The configured PostgreSQL service was
 available for this run, and all export, descriptor-read/decode, and local
 import samples completed successfully.
 

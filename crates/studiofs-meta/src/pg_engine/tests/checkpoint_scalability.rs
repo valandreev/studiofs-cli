@@ -26,8 +26,11 @@ impl RssSampler {
         let peak = std::sync::Arc::new(AtomicU64::new(0));
         let mut initial_system = sysinfo::System::new();
         let initial_pids = [pid];
-        let _ =
-            initial_system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&initial_pids), true);
+        let _ = initial_system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&initial_pids),
+            false,
+            sysinfo::ProcessRefreshKind::nothing().with_memory(),
+        );
         let baseline = initial_system.process(pid)?.memory();
         peak.store(baseline, Ordering::Relaxed);
         let thread_stop = std::sync::Arc::clone(&stop);
@@ -36,7 +39,11 @@ impl RssSampler {
             let mut system = initial_system;
             while !thread_stop.load(Ordering::Relaxed) {
                 let pids = [pid];
-                let _ = system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+                let _ = system.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&pids),
+                    false,
+                    sysinfo::ProcessRefreshKind::nothing().with_memory(),
+                );
                 if let Some(process) = system.process(pid) {
                     thread_peak.fetch_max(process.memory(), Ordering::Relaxed);
                 }
@@ -342,6 +349,13 @@ fn sfs720_checkpoint_scalability() {
                 .import_serving_checkpoint_bytes(&descriptor.checkpoint_bytes)
                 .expect("import SFS-720 serving checkpoint");
             import_millis.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(
+                target
+                    .get_attr(ROOT_INO)
+                    .expect("read imported root attr")
+                    .kind,
+                FileType::Directory
+            );
         }
 
         let rss_measurement = rss_before.map(RssSampler::finish);
@@ -360,7 +374,6 @@ fn sfs720_checkpoint_scalability() {
                 .map(|(baseline, peak)| peak.saturating_sub(baseline)),
         });
         writeln!(output, "{record}").expect("write SFS-720 result");
-        output.flush().expect("flush SFS-720 result");
         eprintln!("{record}");
     }
 }
