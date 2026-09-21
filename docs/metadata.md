@@ -119,7 +119,7 @@ Runtime behavior:
 The bounded, frozen pull behavior above is implemented by
 `query_foreign_event_page`. Its SQL selects an ordered prefix of complete
 `batch_version` groups through the supplied target. The per-client defaults are
-64 batches and 2 MiB of estimated PostgreSQL row response bytes; an environment
+64 batches and 8 MiB of estimated PostgreSQL row response bytes; an environment
 override may tune either limit without changing the volume schema.
 Before returning a page, the transaction takes a shared per-volume event-log
 prune/replay advisory lock and reads the retained event-log floor and checkpoint
@@ -516,7 +516,7 @@ Not persisted in the volume format:
 - `STUDIOFS_PG_SYNC_POLL_SECS = 2`
 - `STUDIOFS_PG_POOL_SIZE = 4`
 - `STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE = 64`
-- `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE = 2097152`
+- `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE = 8388608`
 
 `STUDIOFS_PG_POOL_SIZE` is a positive-integer per-client runtime override within
 the runtime semaphore capacity. It takes precedence over

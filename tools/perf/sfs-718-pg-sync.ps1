@@ -193,7 +193,8 @@ function Get-CellMetrics {
         [int]$ExitCode,
         [int64]$MaxWorkingSetBytes,
         [int64]$MaxPostgresMemoryBytes,
-        [string]$ScenarioReportPath
+        [string]$ScenarioReportPath,
+        [string]$CaseName
     )
 
     $summaryPath = Join-Path $e2eRoot "$RunId\artifacts\scenarios\$scenario\large-history-cold-bootstrap-summary.json"
@@ -217,6 +218,14 @@ function Get-CellMetrics {
     } else {
         $null
     }
+    $checkpointCase = $CaseName -like "checkpoint-*"
+    $checkpointTelemetryComplete = ($null -ne $checkpoint -and
+        $null -ne $checkpoint.checkpoint_payload_bytes -and
+        $null -ne $checkpoint.checkpoint_build_duration_us -and
+        $null -ne $checkpoint.checkpoint_publish_duration_us -and
+        $null -ne $checkpoint.checkpoint_total_duration_us)
+    $pageTelemetryComplete = ($pages.Count -gt 0 -and $queryValues.Count -eq $pages.Count -and
+        $applyValues.Count -eq $pages.Count -and $totalValues.Count -eq $pages.Count)
     return [ordered]@{
         run_id = $RunId
         exit_code = $ExitCode
@@ -241,8 +250,10 @@ function Get-CellMetrics {
         checkpoint_total_duration_us = if ($null -ne $checkpoint) { $checkpoint.checkpoint_total_duration_us } else { $null }
         client_process_tree_peak_working_set_bytes = $MaxWorkingSetBytes
         postgres_peak_memory_bytes = $MaxPostgresMemoryBytes
-        telemetry_complete = ($pages.Count -gt 0 -and $queryValues.Count -eq $pages.Count -and
-            $applyValues.Count -eq $pages.Count -and $totalValues.Count -eq $pages.Count)
+        checkpoint_telemetry_required = $checkpointCase
+        checkpoint_telemetry_complete = $checkpointTelemetryComplete
+        telemetry_complete = ($pageTelemetryComplete -and
+            (-not $checkpointCase -or $checkpointTelemetryComplete))
         scenario_passed = ($ExitCode -eq 0 -and $null -ne $checkpoint -and $checkpoint.final_read_write_converged -eq $true)
     }
 }
@@ -398,7 +409,8 @@ try {
                 -ExitCode $exitCode `
                 -MaxWorkingSetBytes $maxWorkingSetBytes `
                 -MaxPostgresMemoryBytes $maxPostgresMemoryBytes `
-                -ScenarioReportPath $reportPath
+                -ScenarioReportPath $reportPath `
+                -CaseName $matrixCase.name
             $metrics["case"] = $matrixCase.name
             $metrics["iteration"] = $iteration
             $metrics["page_batches"] = $matrixCase.page_batches
@@ -411,7 +423,7 @@ try {
             $metricsPath = Join-Path $cellDir "metrics.json"
             $metrics | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $metricsPath -Encoding utf8
             $results.Add($metrics)
-            if (-not $metrics.scenario_passed) {
+            if (-not ($metrics.scenario_passed -and $metrics.telemetry_complete)) {
                 Write-Warning "SFS-718 cell failed; retained artifacts: $cellDir"
             }
         }

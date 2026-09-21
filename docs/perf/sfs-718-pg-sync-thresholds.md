@@ -1,6 +1,6 @@
 # SFS-718 PostgreSQL catch-up and checkpoint thresholds
 
-This note records the SFS-718 measurement used to replace the provisional
+This note records the SFS-718 measurement used to evaluate the provisional
 foreign-event response-byte default and to keep the checkpoint freshness
 defaults evidence-backed. The benchmark exercises the existing mounted
 large-history scenario; it is not a new liveness gate or a foreground
@@ -60,9 +60,10 @@ The selected production defaults are therefore:
 - keep `STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE = 64`, because it had the
   shortest repeatable complete catch-up wall time and did not produce a
   pathological response in this realistic fixture;
-- change `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE` from 8 MiB to 2 MiB,
-  which leaves measured headroom above the 1.70 MiB response while making the
-  byte bound explicit; and
+- retain `STUDIOFS_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE = 8 MiB`. The 2 MiB
+  control leaves measured headroom above this fixture's 1.70 MiB response, but
+  it is not a safe production default: the producer uses the same cap and
+  valid fragmented `PublishRegularFileBaseSlices` events can be larger; and
 - retain the complete-batch and oversized-single-batch behavior. A single
   event that exceeds the byte budget must still be returned atomically and
   marked for explicit handling.
