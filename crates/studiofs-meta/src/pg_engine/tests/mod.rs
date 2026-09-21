@@ -8,6 +8,7 @@ use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod checkpoint_scalability;
 mod event_log_pruning;
 mod inode_allocator;
 mod janitor;

@@ -35,3 +35,4 @@ zeroize.workspace = true
 dotenvy.workspace = true
 uuid.workspace = true
 studiofs-test-support.workspace = true
+sysinfo.workspace = true
