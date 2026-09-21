@@ -357,9 +357,9 @@ fn bootstrap_batches_large_reference_ledger() {
             .await
             .expect("count bootstrapped reachability rows")
             .get::<_, i64>(0);
+        connection_task.abort();
         assert_eq!(current_reference_count, 1_025);
         assert_eq!(reachability_count, 1_025);
-        connection_task.abort();
         Ok::<(), MetaError>(())
     })
     .expect("verify batched reachability bootstrap");
