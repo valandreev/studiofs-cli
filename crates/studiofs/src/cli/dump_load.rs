@@ -57,7 +57,7 @@ struct DumpHeader {
 }
 
 /// Typed failures found while validating a metadata dump.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum DumpValidationError {
     #[error(
         "metadata state versions cannot be negative (checkpoint: {checkpoint_version}, head: {head_version})"
@@ -88,7 +88,7 @@ pub enum DumpValidationError {
         batch_version: i64,
     },
     #[error(
-        "event log is missing tail batch {expected_version} before metadata head {head_version}"
+        "event log is missing tail batch {expected_version} to reach metadata head {head_version}"
     )]
     MissingHeadTailBatch {
         expected_version: i64,
@@ -100,11 +100,9 @@ pub enum DumpValidationError {
 pub enum DumpLoadError {
     #[error("input/output error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("postgres operation failed: {0}")]
-    Postgres(#[from] tokio_postgres::Error),
     #[error("postgres operation '{operation}' failed: {source}")]
     PostgresOperation {
-        operation: &'static str,
+        operation: String,
         #[source]
         source: tokio_postgres::Error,
     },
@@ -119,6 +117,16 @@ pub enum DumpLoadError {
 }
 
 type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;
+
+fn postgres_operation(
+    operation: impl Into<String>,
+    source: tokio_postgres::Error,
+) -> DumpLoadError {
+    DumpLoadError::PostgresOperation {
+        operation: operation.into(),
+        source,
+    }
+}
 
 #[derive(Debug, Args)]
 #[command(about = "Dump metadata manifest from PostgreSQL (source of truth)")]
@@ -172,10 +180,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 .read_only(true)
                 .start()
                 .await
-                .map_err(|source| DumpLoadError::PostgresOperation {
-                    operation: "start dump snapshot transaction",
-                    source,
-                })?;
+                .map_err(|source| postgres_operation("start dump snapshot transaction", source))?;
 
             let row = transaction
                 .query_opt(
@@ -200,29 +205,27 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     &[&volume_id],
                 )
                 .await
-                .map_err(|source| DumpLoadError::PostgresOperation {
-                    operation: "query metadata_state",
-                    source,
-                })?;
+                .map_err(|source| postgres_operation("query metadata_state", source))?;
 
             let row = row.ok_or_else(|| {
                 DumpLoadError::Message(format!("volume {volume_id} not found in postgres"))
             })?;
 
+            let decode_state_row = |source| postgres_operation("decode metadata_state row", source);
             let volume = DumpVolume {
-                vol: row.get(0),
-                name: row.get(1),
-                uuid: row.get(2),
-                block_size: row.get(3),
+                vol: row.try_get(0).map_err(decode_state_row)?,
+                name: row.try_get(1).map_err(decode_state_row)?,
+                uuid: row.try_get(2).map_err(decode_state_row)?,
+                block_size: row.try_get(3).map_err(decode_state_row)?,
             };
-            let state_format_version: i16 = row.get(4);
-            let state_version: i64 = row.get(5);
-            let state_checkpoint_version: i64 = row.get(6);
-            let state_snapshot: Vec<u8> = row.get(7);
-            let state_checkpoint_sha256: Vec<u8> = row.get(8);
-            let state_format_info: Vec<u8> = row.get(9);
-            let state_publication_state: String = row.get(10);
-            let state_generation: i64 = row.get(11);
+            let state_format_version: i16 = row.try_get(4).map_err(decode_state_row)?;
+            let state_version: i64 = row.try_get(5).map_err(decode_state_row)?;
+            let state_checkpoint_version: i64 = row.try_get(6).map_err(decode_state_row)?;
+            let state_snapshot: Vec<u8> = row.try_get(7).map_err(decode_state_row)?;
+            let state_checkpoint_sha256: Vec<u8> = row.try_get(8).map_err(decode_state_row)?;
+            let state_format_info: Vec<u8> = row.try_get(9).map_err(decode_state_row)?;
+            let state_publication_state: String = row.try_get(10).map_err(decode_state_row)?;
+            let state_generation: i64 = row.try_get(11).map_err(decode_state_row)?;
 
             let counter_rows = transaction
                 .query(
@@ -230,43 +233,43 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     &[&volume.vol],
                 )
                 .await
-                .map_err(|source| DumpLoadError::PostgresOperation {
-                    operation: "query counters",
-                    source,
-                })?;
+                .map_err(|source| postgres_operation("query counters", source))?;
             let counters = counter_rows
                 .into_iter()
-                .map(|r| DumpCounter {
-                    name: r.get(0),
-                    value: r.get(1),
+                .map(|row| {
+                    Ok(DumpCounter {
+                        name: row.try_get(0)?,
+                        value: row.try_get(1)?,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+                .map_err(|source| postgres_operation("decode counter rows", source))?;
 
             let event_rows = transaction
                 .query(
                     r#"
             SELECT batch_version, event_type, event_payload, client_id, client_timestamp
             FROM event_log
-            WHERE vol = $1
+            WHERE vol = $1 AND batch_version > $2
             ORDER BY seq_id
                     "#,
-                    &[&volume.vol],
+                    &[&volume.vol, &state_checkpoint_version],
                 )
                 .await
-                .map_err(|source| DumpLoadError::PostgresOperation {
-                    operation: "query event_log",
-                    source,
-                })?;
+                .map_err(|source| postgres_operation("query event_log", source))?;
             let event_log = event_rows
                 .into_iter()
-                .map(|r| DumpEvent {
-                    batch_version: r.get(0),
-                    event_type: r.get(1),
-                    event_payload: r.get(2),
-                    client_id: r.get(3),
-                    client_timestamp: r.get(4),
+                .map(|row| {
+                    Ok(DumpEvent {
+                        batch_version: row.try_get(0)?,
+                        event_type: row.try_get(1)?,
+                        event_payload: row.try_get(2)?,
+                        client_id: row.try_get(3)?,
+                        client_timestamp: row.try_get(4)?,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+                .map_err(|source| postgres_operation("decode event_log rows", source))?;
 
             let dump = MetadataDump {
                 dump_version: 4,
@@ -285,10 +288,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             transaction
                 .commit()
                 .await
-                .map_err(|source| DumpLoadError::PostgresOperation {
-                    operation: "commit dump snapshot transaction",
-                    source,
-                })?;
+                .map_err(|source| postgres_operation("commit dump snapshot transaction", source))?;
             Ok(dump)
         }
         .await;
@@ -360,10 +360,10 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             let tx = client
                 .transaction()
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("postgres transaction failed: {e}")))?;
+                .map_err(|source| postgres_operation("start load transaction", source))?;
             tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("postgres advisory lock failed: {e}")))?;
+                .map_err(|source| postgres_operation("acquire load advisory lock", source))?;
 
             let row = tx
                 .query_one(
@@ -378,8 +378,10 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     &[&dump.volume.name, &dump.volume.uuid, &dump.volume.block_size],
                 )
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("upsert volume failed: {e}")))?;
-            let target_vol: i64 = row.get(0);
+                .map_err(|source| postgres_operation("upsert volume", source))?;
+            let target_vol: i64 = row
+                .try_get(0)
+                .map_err(|source| postgres_operation("decode upserted volume row", source))?;
             let format_info_bytes =
                 rebind_postgres_volume_id(&dump.metadata_state_format_info, target_vol)?;
 
@@ -389,10 +391,9 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     &[&target_vol],
                 )
                 .await
-                .map_err(|e| {
-                    DumpLoadError::Message(format!("check snapshot v2 state failed: {e}"))
-                })?
-                .get(0);
+                .map_err(|source| postgres_operation("check snapshot v2 state", source))?
+                .try_get(0)
+                .map_err(|source| postgres_operation("decode snapshot v2 state row", source))?;
             if has_snapshot_v2_state {
                 return Err(DumpLoadError::Message(
                     "cannot load metadata over existing Snapshot v2 state; remove snapshots and policy first"
@@ -402,19 +403,19 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
 
             tx.execute("DELETE FROM snapshot_policies WHERE vol = $1", &[&target_vol])
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("clear snapshot policies failed: {e}")))?;
+                .map_err(|source| postgres_operation("clear snapshot policies", source))?;
             tx.execute("DELETE FROM snapshot_catalog WHERE vol = $1", &[&target_vol])
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("clear snapshot catalog failed: {e}")))?;
+                .map_err(|source| postgres_operation("clear snapshot catalog", source))?;
             tx.execute("DELETE FROM counters WHERE vol = $1", &[&target_vol])
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("clear counters failed: {e}")))?;
+                .map_err(|source| postgres_operation("clear counters", source))?;
             tx.execute("DELETE FROM event_log WHERE vol = $1", &[&target_vol])
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("clear event log failed: {e}")))?;
+                .map_err(|source| postgres_operation("clear event log", source))?;
             tx.execute("DELETE FROM metadata_state WHERE vol = $1", &[&target_vol])
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("clear metadata_state failed: {e}")))?;
+                .map_err(|source| postgres_operation("clear metadata_state", source))?;
             tx.execute(
                 "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
@@ -430,7 +431,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 ],
             )
             .await
-            .map_err(|e| DumpLoadError::Message(format!("insert metadata_state failed: {e}")))?;
+            .map_err(|source| postgres_operation("insert metadata_state", source))?;
 
             for counter in &dump.counters {
                 tx.execute(
@@ -438,8 +439,8 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     &[&target_vol, &counter.name, &counter.value],
                 )
                 .await
-                .map_err(|e| {
-                    DumpLoadError::Message(format!("insert counter '{}' failed: {e}", counter.name))
+                .map_err(|source| {
+                    postgres_operation(format!("insert counter '{}'", counter.name), source)
                 })?;
             }
 
@@ -459,17 +460,20 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     ],
                 )
                 .await
-                .map_err(|e| {
-                    DumpLoadError::Message(format!(
-                        "insert event_log row failed for vol={} batch_version={} event_type={}: {e}",
-                        target_vol, event.batch_version, event.event_type
-                    ))
+                .map_err(|source| {
+                    postgres_operation(
+                        format!(
+                            "insert event_log row for vol={target_vol} batch_version={} event_type={}",
+                            event.batch_version, event.event_type
+                        ),
+                        source,
+                    )
                 })?;
             }
 
             tx.commit()
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("postgres commit failed: {e}")))?;
+                .map_err(|source| postgres_operation("commit load transaction", source))?;
 
             Ok::<i64, DumpLoadError>(target_vol)
         }
@@ -791,6 +795,10 @@ mod tests {
         dump.metadata_state_version = 101;
 
         let err = validate_dump(&dump).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "event log is missing tail batch 101 to reach metadata head 101"
+        );
 
         assert!(matches!(
             err,
@@ -919,13 +927,16 @@ mod tests {
     }
 
     #[test]
-    fn dump_validation_handles_max_version_without_overflow() {
+    fn dump_validation_accepts_max_version_when_tail_is_complete() {
         let mut complete_dump = test_dump();
         complete_dump.metadata_state_checkpoint_version = i64::MAX - 1;
         complete_dump.metadata_state_version = i64::MAX;
         complete_dump.event_log = vec![test_event(i64::MAX)];
         validate_dump(&complete_dump).expect("maximum batch version should validate");
+    }
 
+    #[test]
+    fn dump_validation_rejects_missing_tail_at_max_version() {
         let mut incomplete_dump = test_dump();
         incomplete_dump.metadata_state_checkpoint_version = i64::MAX - 1;
         incomplete_dump.metadata_state_version = i64::MAX;
@@ -957,10 +968,27 @@ mod tests {
         runtime: &'a tokio::runtime::Runtime,
         metadata_dsn: String,
         volume_id: i64,
+        connection_tasks:
+            Vec<tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>>,
+        loader: Option<std::thread::JoinHandle<DumpLoadResult<MetadataDump>>>,
     }
 
     impl Drop for PgTestVolumeCleanup<'_> {
         fn drop(&mut self) {
+            let connection_tasks = std::mem::take(&mut self.connection_tasks);
+            if !connection_tasks.is_empty() {
+                self.runtime.block_on(async move {
+                    for task in &connection_tasks {
+                        task.abort();
+                    }
+                    for task in connection_tasks {
+                        let _ = task.await;
+                    }
+                });
+            }
+            if let Some(loader) = self.loader.take() {
+                let _ = loader.join();
+            }
             self.runtime.block_on(async {
                 let Ok((client, connection)) = connect_studiofs_postgres(&self.metadata_dsn).await
                 else {
@@ -999,7 +1027,7 @@ mod tests {
             name: "sfs723-test-counter".to_string(),
             value: 11,
         });
-        dump.event_log.push(test_event(101));
+        dump.event_log = vec![test_event(99), test_event(101)];
         let mut format_info =
             decode_format_info(&dump.metadata_state_format_info).expect("test format info");
         format_info.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
@@ -1010,22 +1038,26 @@ mod tests {
         dump.metadata_state_format_info =
             serde_json::to_vec(&format_info).expect("serialize test format info");
         let volume_id = apply_dump(&metadata_dsn, &dump).expect("seed PostgreSQL test volume");
-        let _cleanup = PgTestVolumeCleanup {
+        let mut cleanup = PgTestVolumeCleanup {
             runtime: &runtime,
             metadata_dsn: metadata_dsn.clone(),
             volume_id,
+            connection_tasks: Vec::new(),
+            loader: None,
         };
 
-        runtime.block_on(async move {
+        runtime.block_on(async {
             let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
                 .await
                 .expect("connect to PostgreSQL test database");
-            let connection_task = tokio::spawn(connection);
+            cleanup.connection_tasks.push(tokio::spawn(connection));
 
             let (mut lock_client, lock_connection) = connect_studiofs_postgres(&metadata_dsn)
                 .await
                 .expect("connect to PostgreSQL lock session");
-            let lock_task = tokio::spawn(lock_connection);
+            cleanup
+                .connection_tasks
+                .push(tokio::spawn(lock_connection));
             let lock_tx = lock_client
                 .transaction()
                 .await
@@ -1036,7 +1068,9 @@ mod tests {
                 .expect("lock counters for deterministic dump pause");
 
             let loader_dsn = metadata_dsn.clone();
-            let loader = std::thread::spawn(move || load_remote_dump(&loader_dsn, volume_id));
+            cleanup.loader = Some(std::thread::spawn(move || {
+                load_remote_dump(&loader_dsn, volume_id)
+            }));
             let wait_for_counter_query = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let waiting: bool = client
@@ -1046,7 +1080,8 @@ mod tests {
                         )
                         .await
                         .expect("inspect PostgreSQL dump query state")
-                        .get(0);
+                        .try_get(0)
+                        .expect("decode PostgreSQL dump query state");
                     if waiting {
                         break;
                     }
@@ -1080,10 +1115,13 @@ mod tests {
                 .commit()
                 .await
                 .expect("commit checkpoint publication and prune");
-            assert_eq!(pruned, 1);
+            assert_eq!(pruned, 2);
             lock_tx.commit().await.expect("release counters table lock");
 
-            let captured = loader
+            let captured = cleanup
+                .loader
+                .take()
+                .expect("dump loader thread should be running")
                 .join()
                 .expect("dump loader thread panicked")
                 .expect("load remote dump");
@@ -1092,11 +1130,6 @@ mod tests {
             assert_eq!(captured.metadata_state_version, 101);
             assert_eq!(captured.event_log.len(), 1);
             assert_eq!(captured.event_log[0].batch_version, 101);
-
-            connection_task.abort();
-            let _ = connection_task.await;
-            lock_task.abort();
-            let _ = lock_task.await;
         });
     }
 }
