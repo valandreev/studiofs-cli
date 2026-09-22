@@ -1,4 +1,6 @@
 #[cfg(test)]
+use crate::allocator_state::AllocatorStateV1;
+#[cfg(test)]
 use crate::engine::{
     MetaEngineCore, MetaFsOps, MetaGc, MetaNamespace, MetaPayloadObjects, MetaSymlink, MetaXattr,
 };
@@ -135,6 +137,8 @@ const PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR: &str = "STUDIOFS_PG_CHECKPOINT_MAX_AGE
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS: u64 = 1_000;
+const MAX_ALLOCATOR_BOOTSTRAP_RETRY_SECS: u64 = 30;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StartupSnapshotImportMode {
     ReplaceLocalState,
@@ -231,6 +235,7 @@ pub struct PgMetaEngine {
     remote_runtime: runtime::PgRemoteRuntime,
     allocator_runtime: Mutex<inode_allocator::AllocatorRuntime>,
     allocator_refill_lock: Mutex<()>,
+    allocator_bootstrap_retry_state: Mutex<AllocatorBootstrapRetryState>,
     inode_id_headroom_available: AtomicBool,
     object_id_headroom_available: AtomicBool,
     pg_sync_lifecycle: AtomicU8,
@@ -242,6 +247,8 @@ pub struct PgMetaEngine {
     snapshot_import_after_active_open_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     catch_up_fault_hook: Mutex<Option<CatchUpFaultHook>>,
+    #[cfg(test)]
+    allocator_bootstrap_hook: Mutex<Option<AllocatorBootstrapHook>>,
     self_weak: OnceLock<Weak<Self>>,
     lock_workers_enabled: bool,
     lock_worker_start_lock: Mutex<()>,
@@ -508,6 +515,9 @@ pub(super) enum CatchUpFaultPoint {
 type CatchUpFaultHook = Arc<dyn Fn(CatchUpFaultPoint) -> MetaResult<()> + Send + Sync>;
 
 #[cfg(test)]
+type AllocatorBootstrapHook = Arc<dyn Fn() -> MetaResult<AllocatorStateV1> + Send + Sync>;
+
+#[cfg(test)]
 impl PgMetaEngine {
     pub(super) fn set_catch_up_fault_hook(&self, hook: CatchUpFaultHook) {
         *self
@@ -527,6 +537,19 @@ impl PgMetaEngine {
         }
         Ok(())
     }
+
+    pub(super) fn set_allocator_bootstrap_hook(&self, hook: AllocatorBootstrapHook) {
+        *self
+            .allocator_bootstrap_hook
+            .lock()
+            .expect("allocator bootstrap hook lock") = Some(hook);
+    }
+
+    pub(super) fn retry_allocator_bootstrap_now_for_test(&self) {
+        if let Ok(mut retry) = self.allocator_bootstrap_retry_state.lock() {
+            retry.next_attempt_at = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -544,6 +567,20 @@ enum StartupSchemaValidation {
 struct HeldFileLockLease {
     lease_ttl: Duration,
     next_renew_at: Instant,
+}
+
+struct AllocatorBootstrapRetryState {
+    next_attempt_at: Option<Instant>,
+    retry_delay: Duration,
+}
+
+impl Default for AllocatorBootstrapRetryState {
+    fn default() -> Self {
+        Self {
+            next_attempt_at: None,
+            retry_delay: Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -713,13 +750,59 @@ impl PgMetaEngine {
         });
     }
 
+    fn bootstrap_allocator_state_with_retry(&self) -> Option<bool> {
+        if self
+            .try_restore_allocator_state_from_local()
+            .unwrap_or(false)
+        {
+            self.reset_allocator_bootstrap_retry();
+            return Some(true);
+        }
+
+        let mut retry = match self.allocator_bootstrap_retry_state.lock() {
+            Ok(retry) => retry,
+            Err(_) => return Some(self.bootstrap_allocator_state()),
+        };
+        if !self.allocator_runtime_state_missing() {
+            retry.next_attempt_at = None;
+            retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
+            return Some(true);
+        }
+        if retry
+            .next_attempt_at
+            .is_some_and(|next_attempt_at| Instant::now() < next_attempt_at)
+        {
+            return None;
+        }
+
+        let recovered = self.bootstrap_allocator_state();
+        if recovered {
+            retry.next_attempt_at = None;
+            retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
+        } else {
+            let delay = retry.retry_delay;
+            retry.next_attempt_at = Some(Instant::now() + delay);
+            retry.retry_delay = Self::next_allocator_bootstrap_retry_delay(delay);
+        }
+        Some(recovered)
+    }
+
+    fn reset_allocator_bootstrap_retry(&self) {
+        if let Ok(mut retry) = self.allocator_bootstrap_retry_state.lock() {
+            retry.next_attempt_at = None;
+            retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
+        }
+    }
+
     /// Complete local catch-up after a successful sync has reached the frozen
     /// startup target.
     pub(super) fn try_complete_catchup_sync(&self) -> MetaResult<()> {
         let current = self.current_pg_sync_lifecycle();
         if !matches!(
             current,
-            PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+            PgSyncLifecycle::CatchingUp
+                | PgSyncLifecycle::Degraded
+                | PgSyncLifecycle::AllocatorPending
         ) {
             return Ok(());
         }
@@ -748,8 +831,8 @@ impl PgMetaEngine {
             return Err(error);
         }
 
-        let mut reached_target = false;
-        loop {
+        let mut reached_target = current == PgSyncLifecycle::AllocatorPending;
+        while !reached_target {
             if !self.update_pg_sync_lifecycle(|current| match current {
                 PgSyncLifecycle::Degraded => PgSyncLifecycle::CatchingUp,
                 PgSyncLifecycle::CatchingUp => PgSyncLifecycle::TargetReached,
@@ -757,23 +840,28 @@ impl PgMetaEngine {
             }) {
                 break;
             }
-            if self.current_pg_sync_lifecycle() == PgSyncLifecycle::TargetReached {
-                reached_target = true;
-                break;
-            }
+            reached_target = self.current_pg_sync_lifecycle() == PgSyncLifecycle::TargetReached;
         }
         if !reached_target {
             return Ok(());
         }
 
+        let allocator_bootstrapped = if self.allocator_runtime_state_missing() {
+            let Some(recovered) = self.bootstrap_allocator_state_with_retry() else {
+                return Ok(());
+            };
+            recovered
+        } else {
+            self.reset_allocator_bootstrap_retry();
+            self.refresh_pg_sync_lifecycle_for_allocator();
+            true
+        };
+        if !allocator_bootstrapped {
+            return Ok(());
+        }
         if fresh_client_pending {
             self.local
                 .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
-        }
-        if self.allocator_runtime_state_missing() {
-            self.bootstrap_allocator_state();
-        } else {
-            self.refresh_pg_sync_lifecycle_for_allocator();
         }
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
             progress.rebootstrap_required = false;
@@ -782,6 +870,14 @@ impl PgMetaEngine {
         self.metadata_startup_target_version
             .store(-1, Ordering::Release);
         Ok(())
+    }
+
+    fn next_allocator_bootstrap_retry_delay(current: Duration) -> Duration {
+        let max_delay = Duration::from_secs(MAX_ALLOCATOR_BOOTSTRAP_RETRY_SECS);
+        current
+            .max(Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS))
+            .checked_mul(2)
+            .map_or(max_delay, |delay| delay.min(max_delay))
     }
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
@@ -1332,6 +1428,7 @@ impl PgMetaEngine {
             remote_runtime: runtime::PgRemoteRuntime::new("studiofs-pg-remote-runtime")?,
             allocator_runtime: Mutex::new(inode_allocator::AllocatorRuntime::default()),
             allocator_refill_lock: Mutex::new(()),
+            allocator_bootstrap_retry_state: Mutex::new(AllocatorBootstrapRetryState::default()),
             inode_id_headroom_available: AtomicBool::new(false),
             object_id_headroom_available: AtomicBool::new(false),
             pg_sync_lifecycle: AtomicU8::new(PgSyncLifecycle::LocalReady as u8),
@@ -1343,6 +1440,8 @@ impl PgMetaEngine {
             snapshot_import_after_active_open_capture_hook: Mutex::new(None),
             #[cfg(test)]
             catch_up_fault_hook: Mutex::new(None),
+            #[cfg(test)]
+            allocator_bootstrap_hook: Mutex::new(None),
             self_weak: OnceLock::new(),
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
