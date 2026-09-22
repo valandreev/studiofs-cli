@@ -1355,7 +1355,11 @@ impl StudioVfs {
             self.wait_for_deferred_release_inflight(open_file.ino),
             self.wait_for_deferred_namespace_metadata(open_file.ino)
         );
-        metadata_result?;
+        if let Err(error) = metadata_result {
+            self.wait_for_deferred_namespace_cleanup(open_file.ino)
+                .await?;
+            return Err(error);
+        }
         // A materializer may hold the session's per-inode materialize gate.
         // Interrupt it before Flush tries to acquire the write-side gate, or
         // the barrier can wait on a task that it has already blocked.
@@ -1459,7 +1463,10 @@ impl StudioVfs {
             self.wait_for_deferred_release_inflight(ino),
             self.wait_for_deferred_namespace_metadata(ino)
         );
-        metadata_result?;
+        if let Err(error) = metadata_result {
+            self.wait_for_deferred_namespace_cleanup(ino).await?;
+            return Err(error);
+        }
         self.wait_for_deferred_materialization_inflight(ino).await;
         let session = self
             .state

@@ -195,6 +195,31 @@ fn namespace_mutation_batch_setattr_preserves_newer_inode_fields() {
 }
 
 #[test]
+fn namespace_mutation_batch_setattr_rejects_missing_inode() {
+    let engine = temp_engine();
+    let missing = InodeAttr::new_file(42, ROOT_INO, 1000, 1000, 0o644);
+
+    let error = engine
+        .apply_namespace_mutations(&[NamespaceMutation::SetAttr {
+            attr: missing.clone(),
+            args: SetattrArgs {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        }])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MetaError::NamespaceBatchOperation {
+            index: 0,
+            source
+        } if matches!(*source, MetaError::InodeNotFound(ino) if ino == missing.ino)
+    ));
+    assert!(engine.get_attr(missing.ino).is_err());
+}
+
+#[test]
 fn namespace_mutation_batch_propagates_inode_decode_errors() {
     let engine = temp_engine();
     let txn = engine.begin_write_txn().unwrap();

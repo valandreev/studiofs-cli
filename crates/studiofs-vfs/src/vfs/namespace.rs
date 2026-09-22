@@ -94,6 +94,8 @@ pub(super) struct DeferredNamespaceInner {
     pub(super) attrs: HashMap<Ino, InodeAttr>,
     pub(super) pending_inodes: HashMap<Ino, usize>,
     pub(super) errors: HashMap<Ino, Arc<str>>,
+    pub(super) cleanup_pending: HashSet<Ino>,
+    pub(super) cleanup_errors: HashMap<Ino, Arc<str>>,
     pub(super) queue: VecDeque<DeferredNamespaceOp>,
     /// Number of deferred operations admitted since this VFS was created.
     pub(super) admitted_operations: u64,

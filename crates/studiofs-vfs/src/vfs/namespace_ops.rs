@@ -25,7 +25,7 @@ type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 pub(super) const NAMESPACE_INODE_BATCH: u32 = 4096;
 const DEFERRED_NAMESPACE_MAX_RETRIES: u8 = 3;
-const DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS: usize = 256;
+pub(super) const DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS: usize = 256;
 const DEFERRED_NAMESPACE_BATCH_LINGER_DELAY: Duration = Duration::from_millis(10);
 pub(super) const DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS: usize = 4096;
 const DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES: usize = 1024 * 1024;
@@ -185,7 +185,7 @@ impl StudioVfs {
             .cloned()
     }
 
-    fn ensure_no_deferred_namespace_error(&self, ino: Ino) -> VfsResult<()> {
+    pub(super) fn ensure_no_deferred_namespace_error(&self, ino: Ino) -> VfsResult<()> {
         if let Some(error) = self.deferred_namespace_error(ino) {
             return Err(VfsError::Other(format!(
                 "deferred namespace metadata commit failed for inode {ino}: {error}"
@@ -266,6 +266,16 @@ impl StudioVfs {
         let op_bytes = Self::deferred_namespace_op_estimated_bytes(&op);
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
+            let error_ino = match &op {
+                DeferredNamespaceOp::CreateFile { parent, .. }
+                | DeferredNamespaceOp::CreateDir { parent, .. } => *parent,
+                DeferredNamespaceOp::SetAttr { attr, .. } => attr.ino,
+            };
+            if let Some(error) = inner.errors.get(&error_ino) {
+                return Err(VfsError::Other(format!(
+                    "deferred namespace metadata commit failed for inode {error_ino}: {error}"
+                )));
+            }
             if let Some(key) = key.as_ref()
                 && inner.entries.contains_key(key)
             {
@@ -350,49 +360,182 @@ impl StudioVfs {
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
+    fn deferred_namespace_op_depends_on(
+        op: &DeferredNamespaceOp,
+        abandoned_inodes: &HashSet<Ino>,
+    ) -> bool {
+        match op {
+            DeferredNamespaceOp::CreateFile { parent, .. }
+            | DeferredNamespaceOp::CreateDir { parent, .. } => {
+                abandoned_inodes.contains(&op.ino()) || abandoned_inodes.contains(parent)
+            }
+            DeferredNamespaceOp::SetAttr { .. } => abandoned_inodes.contains(&op.ino()),
+        }
+    }
+
+    fn settle_abandoned_deferred_namespace_op(
+        &self,
+        inner: &mut DeferredNamespaceInner,
+        op: &DeferredNamespaceOp,
+        error: &Arc<str>,
+        affected_inodes: &mut HashSet<Ino>,
+        abandoned_file_inodes: &mut HashSet<Ino>,
+        affected_parents: &mut HashSet<Ino>,
+    ) {
+        let ino = op.ino();
+        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
+        affected_inodes.insert(ino);
+        inner.errors.insert(ino, Arc::clone(error));
+        match op {
+            DeferredNamespaceOp::CreateFile { parent, name, .. } => {
+                inner
+                    .entries
+                    .remove(&DeferredNamespaceKey::new(*parent, name));
+                self.dentry_cache_invalidate(*parent, name);
+                affected_parents.insert(*parent);
+                abandoned_file_inodes.insert(ino);
+            }
+            DeferredNamespaceOp::CreateDir { parent, name, .. } => {
+                inner
+                    .entries
+                    .remove(&DeferredNamespaceKey::new(*parent, name));
+                inner.locally_created_dirs.remove(&ino);
+                self.dentry_cache_invalidate(*parent, name);
+                affected_parents.insert(*parent);
+            }
+            DeferredNamespaceOp::SetAttr { .. } => {}
+        }
+        let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
+        if pending_count <= 1 {
+            inner.pending_inodes.remove(&ino);
+            inner.attrs.remove(&ino);
+        } else {
+            inner.pending_inodes.insert(ino, pending_count - 1);
+        }
+        inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
+        inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+        inner.settled_operations += 1;
+    }
+
     fn abandon_failed_deferred_namespace_batch(
         &self,
         ops: &[DeferredNamespaceOp],
         error: &VfsError,
-    ) {
+    ) -> usize {
         let error: Arc<str> = Arc::from(error.to_string());
+        let cleanup_owner = self.state.namespace.deferred.upgrade_owner();
         let mut affected_inodes = HashSet::new();
+        let mut abandoned_file_inodes = HashSet::new();
+        let mut affected_parents = HashSet::new();
+        let mut abandoned_inodes: HashSet<_> =
+            ops.iter()
+                .filter_map(|op| match op {
+                    DeferredNamespaceOp::CreateFile { .. }
+                    | DeferredNamespaceOp::CreateDir { .. } => Some(op.ino()),
+                    DeferredNamespaceOp::SetAttr { .. } => None,
+                })
+                .collect();
+        let mut queued_abandoned = 0;
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
             for op in ops {
-                let ino = op.ino();
-                let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
-                affected_inodes.insert(ino);
-                inner.errors.insert(ino, Arc::clone(&error));
-                match op {
-                    DeferredNamespaceOp::CreateFile { parent, name, .. }
-                    | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
-                        inner
-                            .entries
-                            .remove(&DeferredNamespaceKey::new(*parent, name));
-                    }
-                    DeferredNamespaceOp::SetAttr { .. } => {}
-                }
-                let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
-                if pending_count <= 1 {
-                    inner.pending_inodes.remove(&ino);
-                    inner.attrs.remove(&ino);
-                } else {
-                    inner.pending_inodes.insert(ino, pending_count - 1);
-                }
-                inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
-                inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+                self.settle_abandoned_deferred_namespace_op(
+                    &mut inner,
+                    op,
+                    &error,
+                    &mut affected_inodes,
+                    &mut abandoned_file_inodes,
+                    &mut affected_parents,
+                );
             }
-            inner.settled_operations += ops.len() as u64;
+            let queued_operations = inner.queue.len();
+            for _ in 0..queued_operations {
+                let Some(op) = inner.queue.pop_front() else {
+                    break;
+                };
+                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes) {
+                    abandoned_inodes.insert(op.ino());
+                    self.settle_abandoned_deferred_namespace_op(
+                        &mut inner,
+                        &op,
+                        &error,
+                        &mut affected_inodes,
+                        &mut abandoned_file_inodes,
+                        &mut affected_parents,
+                    );
+                    queued_abandoned += 1;
+                } else {
+                    inner.queue.push_back(op);
+                }
+            }
+            if cleanup_owner.is_some() {
+                inner
+                    .cleanup_pending
+                    .extend(abandoned_file_inodes.iter().copied());
+            } else {
+                for ino in &abandoned_file_inodes {
+                    inner.cleanup_errors.insert(
+                        *ino,
+                        Arc::from("VFS owner unavailable during abandoned inode cleanup"),
+                    );
+                }
+            }
+            self.bump_namespace_for_parents(affected_parents.iter().copied());
         }
         {
             let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
             for ino in &affected_inodes {
-                dirty_attrs.remove(ino);
+                if !abandoned_file_inodes.contains(ino) {
+                    dirty_attrs.remove(ino);
+                }
             }
         }
+        for ino in abandoned_inodes.difference(&abandoned_file_inodes) {
+            self.clear_inode_incarnation(*ino);
+        }
         self.invalidate_attr_read_cache(affected_inodes);
+        if let Some(vfs) = cleanup_owner {
+            let cleanup_inodes: Vec<_> = abandoned_file_inodes.into_iter().collect();
+            let cleanup_vfs = Arc::clone(&vfs);
+            // The drainer can be called from a write barrier that already owns this gate.
+            // Let it return before cleanup waits for Delete, then retire state under that gate.
+            vfs.track_background_task(tokio::spawn(async move {
+                for ino in cleanup_inodes {
+                    let cleanup_result = async {
+                        let _session = cleanup_vfs
+                            .state
+                            .file_session
+                            .enter_op(ino, FileSessionOperation::Delete)
+                            .await;
+                        let cleanup = cleanup_vfs.collect_orphan_deleted_inode_cleanup(ino).await?;
+                        cleanup_vfs
+                            .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
+                            .await;
+                        Ok::<_, VfsError>(())
+                    }
+                    .await;
+                    if let Err(error) = &cleanup_result {
+                        warn!(ino, error = %error, "failed to clean an abandoned deferred file inode");
+                    }
+                    {
+                        let mut inner = cleanup_vfs.state.namespace.deferred.inner.lock();
+                        inner.cleanup_pending.remove(&ino);
+                        if let Err(error) = cleanup_result {
+                            inner.cleanup_errors.insert(ino, Arc::from(error.to_string()));
+                        }
+                    }
+                    cleanup_vfs.state.namespace.deferred.notify.notify_waiters();
+                    cleanup_vfs.state.file_session.gc_if_idle(ino);
+                }
+            }));
+        } else if !abandoned_file_inodes.is_empty() {
+            error!(
+                inodes = ?abandoned_file_inodes,
+                "cannot clean abandoned deferred file inodes because the VFS owner is unavailable"
+            );
+        }
         self.state.namespace.deferred.notify.notify_waiters();
+        queued_abandoned
     }
 
     pub(super) async fn wait_for_deferred_namespace_metadata(&self, ino: Ino) -> VfsResult<()> {
@@ -410,6 +553,31 @@ impl StudioVfs {
                 }
             }
             notified.await;
+        }
+    }
+
+    pub(super) async fn wait_for_deferred_namespace_cleanup(&self, ino: Ino) -> VfsResult<()> {
+        loop {
+            let notified = self.state.namespace.deferred.notify.notified();
+            let cleanup_result = {
+                let inner = self.state.namespace.deferred.inner.lock();
+                if inner.cleanup_pending.contains(&ino) {
+                    None
+                } else if let Some(error) = inner.cleanup_errors.get(&ino) {
+                    Some(Err(Arc::clone(error)))
+                } else {
+                    Some(Ok(()))
+                }
+            };
+            match cleanup_result {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(error)) => {
+                    return Err(VfsError::Other(format!(
+                        "failed to clean abandoned deferred file inode {ino}: {error}"
+                    )));
+                }
+                None => notified.await,
+            }
         }
     }
 
@@ -480,6 +648,10 @@ impl StudioVfs {
         self: &Arc<Self>,
         runtime: &tokio::runtime::Handle,
     ) {
+        self.state
+            .namespace
+            .deferred
+            .set_owner(Arc::downgrade(self));
         if self
             .state
             .namespace
@@ -584,9 +756,15 @@ impl StudioVfs {
         tokio::pin!(sleep);
         loop {
             let notified = self.state.namespace.deferred.notify.notified();
-            let drained = {
+            let (drained, cleanup_error) = {
                 let inner = self.state.namespace.deferred.inner.lock();
-                inner.settled_operations >= cutoff
+                let cleanup_error = inner
+                    .cleanup_errors
+                    .iter()
+                    .next()
+                    .map(|(ino, error)| (*ino, Arc::clone(error)));
+                let drained = inner.settled_operations >= cutoff
+                    && inner.cleanup_pending.is_empty()
                     && !self
                         .state
                         .namespace
@@ -594,9 +772,15 @@ impl StudioVfs {
                         .draining
                         .load(std::sync::atomic::Ordering::Acquire)
                     && inner.queue.is_empty()
-                    && inner.backlog_operations == 0
+                    && inner.backlog_operations == 0;
+                (drained, cleanup_error)
             };
             if drained {
+                if let Some((ino, error)) = cleanup_error {
+                    return Err(VfsError::Other(format!(
+                        "failed to clean abandoned deferred file inode {ino}: {error}"
+                    )));
+                }
                 return self.deferred_namespace_shutdown_error().map_or(Ok(()), Err);
             }
             tokio::select! {
@@ -701,15 +885,28 @@ impl StudioVfs {
                             .filter(|index| *index < batch.len())
                         {
                             let conflicting_operation = batch.remove(conflict_index);
-                            self.abandon_failed_deferred_namespace_batch(
-                                std::slice::from_ref(&conflicting_operation),
+                            let mut abandoned_inodes = HashSet::from([conflicting_operation.ino()]);
+                            let mut abandoned_operations = vec![conflicting_operation];
+                            for op in batch.split_off(conflict_index) {
+                                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes) {
+                                    abandoned_inodes.insert(op.ino());
+                                    abandoned_operations.push(op);
+                                } else {
+                                    batch.push(op);
+                                }
+                            }
+                            let queued_abandoned = self.abandon_failed_deferred_namespace_batch(
+                                &abandoned_operations,
                                 &error,
                             );
                             warn!(
                                 error = %error,
                                 conflict_index,
+                                abandoned_operations = abandoned_operations.len()
+                                    + queued_abandoned,
+                                queued_abandoned_operations = queued_abandoned,
                                 remaining_operations = batch.len(),
-                                "deferred namespace metadata operation lost a concurrent namespace conflict; retrying the remaining batch without degrading mount"
+                                "deferred namespace metadata operations lost a concurrent namespace conflict; retrying independent operations without degrading mount"
                             );
                             if batch.is_empty() {
                                 break;

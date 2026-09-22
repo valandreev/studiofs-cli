@@ -7619,6 +7619,7 @@ impl StudioVfs {
     /// namespace metadata after the handle was opened.
     pub(super) fn enforce_write_access_for_handle(&self, fh: u64, ino: Ino) -> VfsResult<OpenFile> {
         let open_file = self.enforce_mutating_handle_access(fh, ino)?;
+        self.ensure_no_deferred_namespace_error(ino)?;
         match self.enforce_access(ino, AccessLevel::ReadWrite) {
             Ok(()) => Ok(open_file),
             Err(error)
