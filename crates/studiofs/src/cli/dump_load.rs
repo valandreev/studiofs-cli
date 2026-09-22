@@ -116,13 +116,19 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             .await
             .map_err(|e| DumpLoadError::Message(e.to_string()))?
             .metadata_dsn;
-        let (client, connection) = connect_studiofs_postgres(&metadata_dsn)
+        let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
             .await
             .map_err(|e| DumpLoadError::Message(e.to_string()))?;
         let connection_task = tokio::spawn(connection);
 
         let dump = async {
-            let row = client
+            // Keep checkpoint, counters, and event rows on one MVCC snapshot.
+            let transaction = client.transaction().await?;
+            transaction
+                .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .await?;
+
+            let row = transaction
                 .query_opt(
                     r#"
             SELECT
@@ -168,7 +174,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             let state_publication_state: String = row.get(10);
             let state_generation: i64 = row.get(11);
 
-            let counter_rows = client
+            let counter_rows = transaction
                 .query(
                     "SELECT name, value FROM counters WHERE vol = $1 ORDER BY name",
                     &[&volume.vol],
@@ -183,7 +189,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 })
                 .collect();
 
-            let event_rows = client
+            let event_rows = transaction
                 .query(
                     r#"
             SELECT batch_version, event_type, event_payload, client_id, client_timestamp
@@ -206,7 +212,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 })
                 .collect();
 
-            Ok(MetadataDump {
+            let dump = MetadataDump {
                 dump_version: 4,
                 volume,
                 metadata_state_format_version: state_format_version,
@@ -219,7 +225,9 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 metadata_state_generation: state_generation,
                 counters,
                 event_log,
-            })
+            };
+            transaction.commit().await?;
+            Ok(dump)
         }
         .await;
 
@@ -424,6 +432,62 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
         Some(&dump.metadata_state_publication_state),
         Some(dump.metadata_state_generation),
     )?;
+
+    let checkpoint_version = dump.metadata_state_checkpoint_version;
+    let head_version = dump.metadata_state_version;
+    if checkpoint_version < 0 || head_version < 0 {
+        return Err(DumpLoadError::Message(
+            "metadata state versions cannot be negative".to_string(),
+        ));
+    }
+    if checkpoint_version > head_version {
+        return Err(DumpLoadError::Message(format!(
+            "checkpoint version {checkpoint_version} is ahead of metadata head {head_version}"
+        )));
+    }
+
+    let mut last_event_version = None;
+    let mut contiguous_through = checkpoint_version;
+    for event in &dump.event_log {
+        let batch_version = event.batch_version;
+        if batch_version < 0 {
+            return Err(DumpLoadError::Message(
+                "event log contains a negative batch version".to_string(),
+            ));
+        }
+        if last_event_version.is_some_and(|last| batch_version < last) {
+            return Err(DumpLoadError::Message(
+                "event log batches are not ordered by version".to_string(),
+            ));
+        }
+        last_event_version = Some(batch_version);
+
+        if batch_version <= checkpoint_version {
+            continue;
+        }
+        if batch_version > head_version {
+            return Err(DumpLoadError::Message(format!(
+                "event batch {batch_version} is ahead of metadata head {head_version}"
+            )));
+        }
+        if batch_version == contiguous_through {
+            continue;
+        }
+
+        let expected_version = contiguous_through + 1;
+        if batch_version != expected_version {
+            return Err(DumpLoadError::Message(format!(
+                "event log is missing tail batch {expected_version} before batch {batch_version}"
+            )));
+        }
+        contiguous_through = batch_version;
+    }
+    if contiguous_through < head_version {
+        return Err(DumpLoadError::Message(format!(
+            "event log is missing tail batch {} before metadata head {head_version}",
+            contiguous_through + 1
+        )));
+    }
     Ok(())
 }
 
@@ -564,6 +628,16 @@ mod tests {
         }
     }
 
+    fn test_event(batch_version: i64) -> DumpEvent {
+        DumpEvent {
+            batch_version,
+            event_type: "test".to_string(),
+            event_payload: vec![1, 2, 3],
+            client_id: None,
+            client_timestamp: None,
+        }
+    }
+
     #[test]
     fn dump_checkpoint_validation_rejects_checksum_mismatch() {
         let mut dump = test_dump();
@@ -638,5 +712,180 @@ mod tests {
     #[test]
     fn valid_dump_passes_manifest_validation() {
         validate_dump(&test_dump()).expect("valid dump should pass manifest validation");
+    }
+
+    #[test]
+    fn dump_validation_rejects_missing_event_log_tail() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_version = 100;
+        dump.metadata_state_version = 101;
+
+        let err = validate_dump(&dump).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("batch 101")
+        ));
+    }
+
+    #[test]
+    fn dump_validation_rejects_gap_between_event_log_batches() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_version = 100;
+        dump.metadata_state_version = 103;
+        dump.event_log = vec![test_event(101), test_event(103)];
+
+        let err = validate_dump(&dump).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("batch 102")
+        ));
+    }
+
+    #[test]
+    fn dump_validation_accepts_contiguous_event_log_batches() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_version = 1;
+        dump.metadata_state_version = 3;
+        dump.event_log = vec![test_event(1), test_event(2), test_event(2), test_event(3)];
+
+        validate_dump(&dump).expect("complete event batches should pass validation");
+    }
+
+    fn test_pg_dsn() -> Option<String> {
+        if let Ok(dsn) = std::env::var("STUDIOFS_TEST_PG_DSN")
+            && !dsn.trim().is_empty()
+        {
+            return Some(dsn);
+        }
+
+        dotenvy::from_path_iter(studiofs_test_support::workspace_root().join(".env"))
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|(key, value)| (key == "STUDIOFS_TEST_PG_DSN").then_some(value))
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn dump_snapshot_preserves_tail_pruned_after_metadata_read() {
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Runtime::new().expect("build PostgreSQL test runtime");
+
+        let raw_dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let metadata_dsn = runtime
+            .block_on(ensure_studiofs_database(&raw_dsn))
+            .expect("resolve PostgreSQL test database")
+            .metadata_dsn;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut dump = test_dump();
+        dump.volume.name = format!("sfs-723-{id}");
+        dump.volume.uuid = id;
+        dump.metadata_state_checkpoint_version = 100;
+        dump.metadata_state_version = 101;
+        dump.counters.push(DumpCounter {
+            name: "sfs723-test-counter".to_string(),
+            value: 11,
+        });
+        dump.event_log.push(test_event(101));
+        let mut format_info =
+            decode_format_info(&dump.metadata_state_format_info).expect("test format info");
+        format_info.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
+        format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
+            url: "test-postgres-dsn".to_string(),
+            volume_id: 1,
+        });
+        dump.metadata_state_format_info =
+            serde_json::to_vec(&format_info).expect("serialize test format info");
+        let volume_id = apply_dump(&metadata_dsn, &dump).expect("seed PostgreSQL test volume");
+
+        runtime.block_on(async move {
+            let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
+                .await
+                .expect("connect to PostgreSQL test database");
+            let connection_task = tokio::spawn(connection);
+
+            let (mut lock_client, lock_connection) = connect_studiofs_postgres(&metadata_dsn)
+                .await
+                .expect("connect to PostgreSQL lock session");
+            let lock_task = tokio::spawn(lock_connection);
+            let lock_tx = lock_client
+                .transaction()
+                .await
+                .expect("begin PostgreSQL lock transaction");
+            lock_tx
+                .batch_execute("LOCK TABLE counters IN ACCESS EXCLUSIVE MODE")
+                .await
+                .expect("lock counters for deterministic dump pause");
+
+            let loader_dsn = metadata_dsn.clone();
+            let loader = std::thread::spawn(move || load_remote_dump(&loader_dsn, volume_id));
+            let wait_for_counter_query = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let waiting: bool = client
+                        .query_one(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'counters'::regclass AND mode = 'AccessShareLock' AND NOT granted)",
+                            &[],
+                        )
+                        .await
+                        .expect("inspect PostgreSQL dump query state")
+                        .get(0);
+                    if waiting {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            wait_for_counter_query.expect("dump did not reach its counters query");
+
+            let newer_snapshot = vec![4, 5, 6];
+            let newer_checksum = Sha256::digest(&newer_snapshot).to_vec();
+            let prune_tx = client
+                .transaction()
+                .await
+                .expect("begin checkpoint publication and prune transaction");
+            prune_tx
+                .execute(
+                    "UPDATE metadata_state SET checkpoint_version = 101, snapshot = $2, checkpoint_sha256 = $3, checkpoint_generation = 2, event_log_prune_floor = 101 WHERE vol = $1",
+                    &[&volume_id, &newer_snapshot, &newer_checksum],
+                )
+                .await
+                .expect("publish test checkpoint");
+            let pruned = prune_tx
+                .execute(
+                    "DELETE FROM event_log WHERE vol = $1 AND batch_version <= 101",
+                    &[&volume_id],
+                )
+                .await
+                .expect("prune test event tail");
+            prune_tx
+                .commit()
+                .await
+                .expect("commit checkpoint publication and prune");
+            assert_eq!(pruned, 1);
+            lock_tx.commit().await.expect("release counters table lock");
+
+            let captured = loader
+                .join()
+                .expect("dump loader thread panicked")
+                .expect("load remote dump");
+            validate_dump(&captured).expect("captured dump should be valid");
+            assert_eq!(captured.metadata_state_checkpoint_version, 100);
+            assert_eq!(captured.metadata_state_version, 101);
+            assert_eq!(captured.event_log.len(), 1);
+            assert_eq!(captured.event_log[0].batch_version, 101);
+
+            client
+                .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
+                .await
+                .expect("delete PostgreSQL test volume");
+            connection_task.abort();
+            let _ = connection_task.await;
+            lock_task.abort();
+            let _ = lock_task.await;
+        });
     }
 }
