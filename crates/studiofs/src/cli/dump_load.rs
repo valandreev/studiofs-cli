@@ -56,16 +56,64 @@ struct DumpHeader {
     dump_version: u16,
 }
 
+/// Typed failures found while validating a metadata dump.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DumpValidationError {
+    #[error(
+        "metadata state versions cannot be negative (checkpoint: {checkpoint_version}, head: {head_version})"
+    )]
+    NegativeMetadataVersions {
+        checkpoint_version: i64,
+        head_version: i64,
+    },
+    #[error("checkpoint version {checkpoint_version} is ahead of metadata head {head_version}")]
+    CheckpointAheadOfHead {
+        checkpoint_version: i64,
+        head_version: i64,
+    },
+    #[error("event log contains a negative batch version {batch_version}")]
+    NegativeEventBatchVersion { batch_version: i64 },
+    #[error(
+        "event log batches are not ordered by version (previous: {previous}, current: {current})"
+    )]
+    UnorderedEventBatches { previous: i64, current: i64 },
+    #[error("event batch {batch_version} is ahead of metadata head {head_version}")]
+    BatchAheadOfHead {
+        batch_version: i64,
+        head_version: i64,
+    },
+    #[error("event log is missing tail batch {expected_version} before batch {batch_version}")]
+    MissingTailBatch {
+        expected_version: i64,
+        batch_version: i64,
+    },
+    #[error(
+        "event log is missing tail batch {expected_version} before metadata head {head_version}"
+    )]
+    MissingHeadTailBatch {
+        expected_version: i64,
+        head_version: i64,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum DumpLoadError {
     #[error("input/output error: {0}")]
     Io(#[from] std::io::Error),
     #[error("postgres operation failed: {0}")]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("postgres operation '{operation}' failed: {source}")]
+    PostgresOperation {
+        operation: &'static str,
+        #[source]
+        source: tokio_postgres::Error,
+    },
     #[error("metadata operation failed: {0}")]
     Meta(#[from] MetaError),
     #[error("json serialization failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Validation(#[from] DumpValidationError),
     #[error("{0}")]
     Message(String),
 }
@@ -123,7 +171,11 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
                 .read_only(true)
                 .start()
-                .await?;
+                .await
+                .map_err(|source| DumpLoadError::PostgresOperation {
+                    operation: "start dump snapshot transaction",
+                    source,
+                })?;
 
             let row = transaction
                 .query_opt(
@@ -147,7 +199,11 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     "#,
                     &[&volume_id],
                 )
-                .await?;
+                .await
+                .map_err(|source| DumpLoadError::PostgresOperation {
+                    operation: "query metadata_state",
+                    source,
+                })?;
 
             let row = row.ok_or_else(|| {
                 DumpLoadError::Message(format!("volume {volume_id} not found in postgres"))
@@ -173,7 +229,11 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     "SELECT name, value FROM counters WHERE vol = $1 ORDER BY name",
                     &[&volume.vol],
                 )
-                .await?;
+                .await
+                .map_err(|source| DumpLoadError::PostgresOperation {
+                    operation: "query counters",
+                    source,
+                })?;
             let counters = counter_rows
                 .into_iter()
                 .map(|r| DumpCounter {
@@ -192,7 +252,11 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     "#,
                     &[&volume.vol],
                 )
-                .await?;
+                .await
+                .map_err(|source| DumpLoadError::PostgresOperation {
+                    operation: "query event_log",
+                    source,
+                })?;
             let event_log = event_rows
                 .into_iter()
                 .map(|r| DumpEvent {
@@ -218,7 +282,13 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 counters,
                 event_log,
             };
-            transaction.commit().await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| DumpLoadError::PostgresOperation {
+                    operation: "commit dump snapshot transaction",
+                    source,
+                })?;
             Ok(dump)
         }
         .await;
@@ -280,12 +350,9 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
 fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64> {
     crate::runtime_bridge::block_on(async move {
         let metadata_dsn = ensure_studiofs_database(postgres_address)
-            .await
-            .map_err(|e| DumpLoadError::Message(e.to_string()))?
+            .await?
             .metadata_dsn;
-        let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
-            .await
-            .map_err(|e| DumpLoadError::Message(e.to_string()))?;
+        let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn).await?;
         let connection_task = tokio::spawn(connection);
 
         let result = async {
@@ -428,14 +495,18 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
     let checkpoint_version = dump.metadata_state_checkpoint_version;
     let head_version = dump.metadata_state_version;
     if checkpoint_version < 0 || head_version < 0 {
-        return Err(DumpLoadError::Message(
-            "metadata state versions cannot be negative".to_string(),
-        ));
+        return Err(DumpValidationError::NegativeMetadataVersions {
+            checkpoint_version,
+            head_version,
+        }
+        .into());
     }
     if checkpoint_version > head_version {
-        return Err(DumpLoadError::Message(format!(
-            "checkpoint version {checkpoint_version} is ahead of metadata head {head_version}"
-        )));
+        return Err(DumpValidationError::CheckpointAheadOfHead {
+            checkpoint_version,
+            head_version,
+        }
+        .into());
     }
 
     let mut last_event_version = None;
@@ -443,14 +514,16 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
     for event in &dump.event_log {
         let batch_version = event.batch_version;
         if batch_version < 0 {
-            return Err(DumpLoadError::Message(
-                "event log contains a negative batch version".to_string(),
-            ));
+            return Err(DumpValidationError::NegativeEventBatchVersion { batch_version }.into());
         }
-        if last_event_version.is_some_and(|last| batch_version < last) {
-            return Err(DumpLoadError::Message(
-                "event log batches are not ordered by version".to_string(),
-            ));
+        if let Some(previous) = last_event_version
+            && batch_version < previous
+        {
+            return Err(DumpValidationError::UnorderedEventBatches {
+                previous,
+                current: batch_version,
+            }
+            .into());
         }
         last_event_version = Some(batch_version);
 
@@ -458,9 +531,11 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
             continue;
         }
         if batch_version > head_version {
-            return Err(DumpLoadError::Message(format!(
-                "event batch {batch_version} is ahead of metadata head {head_version}"
-            )));
+            return Err(DumpValidationError::BatchAheadOfHead {
+                batch_version,
+                head_version,
+            }
+            .into());
         }
         if batch_version == contiguous_through {
             continue;
@@ -468,17 +543,20 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
 
         let expected_version = contiguous_through + 1;
         if batch_version != expected_version {
-            return Err(DumpLoadError::Message(format!(
-                "event log is missing tail batch {expected_version} before batch {batch_version}"
-            )));
+            return Err(DumpValidationError::MissingTailBatch {
+                expected_version,
+                batch_version,
+            }
+            .into());
         }
         contiguous_through = batch_version;
     }
     if contiguous_through < head_version {
-        return Err(DumpLoadError::Message(format!(
-            "event log is missing tail batch {} before metadata head {head_version}",
-            contiguous_through + 1
-        )));
+        return Err(DumpValidationError::MissingHeadTailBatch {
+            expected_version: contiguous_through + 1,
+            head_version,
+        }
+        .into());
     }
     Ok(())
 }
@@ -716,7 +794,10 @@ mod tests {
 
         assert!(matches!(
             err,
-            DumpLoadError::Message(message) if message.contains("batch 101")
+            DumpLoadError::Validation(DumpValidationError::MissingHeadTailBatch {
+                expected_version: 101,
+                head_version: 101,
+            })
         ));
     }
 
@@ -731,7 +812,10 @@ mod tests {
 
         assert!(matches!(
             err,
-            DumpLoadError::Message(message) if message.contains("batch 102")
+            DumpLoadError::Validation(DumpValidationError::MissingTailBatch {
+                expected_version: 102,
+                batch_version: 103,
+            })
         ));
     }
 
@@ -756,7 +840,10 @@ mod tests {
 
             assert!(matches!(
                 err,
-                DumpLoadError::Message(message) if message.contains("cannot be negative")
+                DumpLoadError::Validation(DumpValidationError::NegativeMetadataVersions {
+                    checkpoint_version: actual_checkpoint,
+                    head_version: actual_head,
+                }) if actual_checkpoint == checkpoint_version && actual_head == head_version
             ));
         }
     }
@@ -771,7 +858,10 @@ mod tests {
 
         assert!(matches!(
             err,
-            DumpLoadError::Message(message) if message.contains("ahead of metadata head")
+            DumpLoadError::Validation(DumpValidationError::CheckpointAheadOfHead {
+                checkpoint_version: 105,
+                head_version: 100,
+            })
         ));
     }
 
@@ -786,7 +876,9 @@ mod tests {
 
         assert!(matches!(
             err,
-            DumpLoadError::Message(message) if message.contains("negative batch version")
+            DumpLoadError::Validation(DumpValidationError::NegativeEventBatchVersion {
+                batch_version: -1,
+            })
         ));
     }
 
@@ -801,7 +893,10 @@ mod tests {
 
         assert!(matches!(
             err,
-            DumpLoadError::Message(message) if message.contains("not ordered by version")
+            DumpLoadError::Validation(DumpValidationError::UnorderedEventBatches {
+                previous: 102,
+                current: 101,
+            })
         ));
     }
 
@@ -816,7 +911,10 @@ mod tests {
 
         assert!(matches!(
             err,
-            DumpLoadError::Message(message) if message.contains("ahead of metadata head")
+            DumpLoadError::Validation(DumpValidationError::BatchAheadOfHead {
+                batch_version: 102,
+                head_version: 101,
+            })
         ));
     }
 
@@ -834,7 +932,10 @@ mod tests {
         let err = validate_dump(&incomplete_dump).unwrap_err();
         assert!(matches!(
             err,
-            DumpLoadError::Message(message) if message.contains(&format!("batch {}", i64::MAX))
+            DumpLoadError::Validation(DumpValidationError::MissingHeadTailBatch {
+                expected_version,
+                head_version,
+            }) if expected_version == i64::MAX && head_version == i64::MAX
         ));
     }
 
@@ -851,6 +952,7 @@ mod tests {
             .find_map(|(key, value)| (key == "STUDIOFS_TEST_PG_DSN").then_some(value))
     }
 
+    // Keep this guard in the synchronous test scope; Drop calls `Runtime::block_on`.
     struct PgTestVolumeCleanup<'a> {
         runtime: &'a tokio::runtime::Runtime,
         metadata_dsn: String,
