@@ -3379,6 +3379,465 @@ fn catching_up_fresh_client_completes_slot_and_allocator_bootstrap() {
 }
 
 #[test]
+fn failed_fresh_allocator_bootstrap_keeps_recovery_marker() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    engine
+        .try_complete_catchup_sync()
+        .expect("transient allocator bootstrap failure stays recoverable");
+
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1,
+        "failed allocator bootstrap must retain the durable recovery marker"
+    );
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+    assert_eq!(
+        engine
+            .metadata_startup_target_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        7,
+        "allocator recovery must retain the frozen target"
+    );
+}
+
+fn fresh_allocator_recovery_fixture() -> (tempfile::TempDir, PgMetaEngine) {
+    let (dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .write_invalid_allocator_state_for_test()
+        .expect("persist invalid allocator state");
+    engine.clear_allocator_runtime_for_test();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
+        .expect("set fresh-client marker");
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::CatchingUp as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    engine
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    (dir, engine)
+}
+
+#[test]
+fn allocator_pending_retries_missing_allocator_authority() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("first allocator bootstrap attempt");
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+
+    engine
+        .local
+        .replace_allocator_state(
+            AllocatorStateV1::new(
+                AllocatorRecord::new(11, 0).expect("inode namespace"),
+                AllocatorRecord::new(12, 0).expect("payload namespace"),
+            )
+            .expect("allocator state"),
+        )
+        .expect("persist recovered allocator state");
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("retry allocator bootstrap");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        0
+    );
+    assert!(engine.next_inode().is_ok());
+}
+
+#[test]
+fn allocator_pending_recovers_without_startup_target() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)
+        .expect("clear fresh-client marker for existing client");
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::AllocatorPending as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    engine
+        .metadata_startup_target_version
+        .store(-1, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(13, 0).expect("inode namespace"),
+        AllocatorRecord::new(14, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || Ok(recovered_state)));
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("allocator-pending client recovers without a startup target");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(engine.next_inode().is_ok());
+}
+
+#[test]
+fn transient_allocator_bootstrap_recovers_on_background_retry() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(21, 0).expect("inode namespace"),
+        AllocatorRecord::new(22, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    let hook_attempts = std::sync::Arc::clone(&attempts);
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        if hook_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+            Err(MetaError::RemoteUnavailable(
+                "transient allocator bootstrap failure".to_string(),
+            ))
+        } else {
+            Ok(recovered_state)
+        }
+    }));
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("first allocator bootstrap attempt");
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+
+    let sync_result = Ok(false);
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &sync_result, false);
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "backoff must suppress an immediate duplicate mint attempt"
+    );
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+    assert_eq!(
+        engine
+            .metadata_startup_target_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        7
+    );
+
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.retry_allocator_bootstrap_now_for_test();
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &sync_result, false);
+
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 2);
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        0
+    );
+    assert!(engine.next_inode().is_ok());
+}
+
+#[test]
+fn permanent_allocator_bootstrap_failure_is_not_retried() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = std::sync::Arc::clone(&attempts);
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        hook_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Err(MetaError::Storage(
+            "postgres allocator namespace exhausted".to_string(),
+        ))
+    }));
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("permanent allocator failure remains read-only");
+    engine.retry_allocator_bootstrap_now_for_test();
+    let sync_result = Ok(false);
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &sync_result, false);
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "permanent allocator failures must not mint another namespace pair"
+    );
+    assert_eq!(
+        engine.pg_sync_diagnostics().last_sync_error,
+        Some(PgSyncFailure::Storage)
+    );
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+}
+
+#[test]
+fn allocator_bootstrap_does_not_hold_retry_lock_during_mint() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let engine = std::sync::Arc::new(engine);
+    let hook_engine = std::sync::Arc::downgrade(&engine);
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        hook_engine
+            .upgrade()
+            .expect("allocator engine still alive")
+            .retry_allocator_bootstrap_now_for_test();
+        Err(MetaError::RemoteUnavailable(
+            "transient allocator bootstrap failure".to_string(),
+        ))
+    }));
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_engine = std::sync::Arc::clone(&engine);
+    let worker = std::thread::spawn(move || {
+        result_tx
+            .send(worker_engine.try_complete_catchup_sync())
+            .expect("send allocator bootstrap result");
+    });
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("allocator bootstrap must not deadlock on its retry lock")
+        .expect("allocator bootstrap retry remains recoverable");
+    worker.join().expect("allocator bootstrap worker panicked");
+}
+
+#[test]
+fn allocator_bootstrap_panic_releases_in_flight_state_and_can_retry() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)
+        .expect("clear fresh-client marker for allocator-only retry");
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = std::sync::Arc::clone(&attempts);
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(23, 0).expect("inode namespace"),
+        AllocatorRecord::new(24, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        if hook_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+            panic!("simulated allocator bootstrap panic");
+        }
+        Ok(recovered_state)
+    }));
+
+    let first_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine
+            .try_complete_catchup_sync()
+            .expect("first attempt reaches allocator bootstrap");
+    }));
+    assert!(first_attempt.is_err());
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("allocator bootstrap can retry after panic");
+
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 2);
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+}
+
+#[test]
+fn fresh_client_marker_clear_failure_keeps_engine_read_only() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(25, 0).expect("inode namespace"),
+        AllocatorRecord::new(26, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || Ok(recovered_state)));
+    engine.set_catch_up_fault_hook(std::sync::Arc::new(|point| {
+        if point == CatchUpFaultPoint::BeforeFreshClientMarkerClear {
+            return Err(MetaError::Storage("marker clear failed".to_string()));
+        }
+        Ok(())
+    }));
+
+    let error = engine
+        .try_complete_catchup_sync()
+        .expect_err("marker clear failure must be surfaced");
+
+    assert!(matches!(error, MetaError::Storage(_)));
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read retained fresh-client marker"),
+        1
+    );
+}
+
+#[test]
+fn poisoned_allocator_retry_state_preserves_backoff() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let engine = std::sync::Arc::new(engine);
+    let poisoned_engine = std::sync::Arc::clone(&engine);
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned_engine
+                .allocator_bootstrap_retry_state
+                .lock()
+                .expect("allocator retry state lock");
+            panic!("poison allocator retry state");
+        }));
+    })
+    .join()
+    .expect("poisoning worker panicked outside catch_unwind");
+
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = std::sync::Arc::clone(&attempts);
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        hook_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Err(MetaError::RemoteUnavailable(
+            "transient allocator bootstrap failure".to_string(),
+        ))
+    }));
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("first allocator bootstrap attempt");
+    let sync_result = Ok(false);
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &sync_result, false);
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "poisoned retry state must retain the backoff gate"
+    );
+}
+
+#[test]
+fn allocator_bootstrap_retry_delay_is_bounded() {
+    let next = PgMetaEngine::next_allocator_bootstrap_retry_delay(Duration::from_secs(1));
+    assert!(next >= Duration::from_secs(2));
+    assert!(next <= Duration::from_millis(2_500));
+    let capped = PgMetaEngine::next_allocator_bootstrap_retry_delay(Duration::from_secs(30));
+    assert!(capped >= Duration::from_millis(22_500));
+    assert!(capped < Duration::from_secs(30));
+}
+
+#[test]
+fn poisoned_allocator_runtime_does_not_restore_write_authority() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let poisoned_engine = std::sync::Arc::clone(&engine);
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned_engine
+                .allocator_runtime
+                .lock()
+                .expect("allocator runtime lock");
+            panic!("poison allocator runtime");
+        }));
+    })
+    .join()
+    .expect("poisoning worker panicked outside catch_unwind");
+
+    assert!(engine.bootstrap_allocator_state().is_err());
+    let status = engine.pg_sync_status();
+    assert_eq!(status.lifecycle, PgSyncLifecycle::AllocatorPending);
+    assert!(!status.allows_new_mutations());
+    assert!(!status.authority.inode_id_headroom);
+    assert!(!status.authority.object_id_headroom);
+}
+
+#[test]
+fn failed_allocator_bootstrap_survives_reopen_and_recovers() {
+    let _connect_timeout = set_test_env("STUDIOFS_PG_CONNECT_TIMEOUT_MS", "50");
+    let _command_timeout = set_test_env("STUDIOFS_PG_COMMAND_TIMEOUT_MS", "50");
+    let (dir, engine) = fresh_allocator_recovery_fixture();
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(|| {
+        Err(MetaError::RemoteUnavailable(
+            "transient allocator bootstrap failure".to_string(),
+        ))
+    }));
+    engine
+        .try_complete_catchup_sync()
+        .expect("failed allocator bootstrap remains recoverable");
+    drop(engine);
+
+    let reopened = PgMetaEngine::open_with_options(
+        dir.path().join("meta.redb"),
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("reopen failed fresh client locally");
+    assert_eq!(
+        reopened
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker after reopen"),
+        1
+    );
+    assert!(!reopened.pg_sync_status().allows_new_mutations());
+
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(31, 0).expect("inode namespace"),
+        AllocatorRecord::new(32, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    reopened.set_allocator_bootstrap_hook(std::sync::Arc::new(move || Ok(recovered_state)));
+    reopened
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    reopened
+        .local_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    reopened
+        .metadata_startup_target_version
+        .store(7, std::sync::atomic::Ordering::Release);
+    reopened
+        .try_complete_catchup_sync()
+        .expect("recover allocator authority after reopen");
+
+    assert_eq!(reopened.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(
+        reopened
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read cleared fresh-client marker"),
+        0
+    );
+    assert!(reopened.next_inode().is_ok());
+}
+
+#[test]
 fn snapshot_reachability_bootstrap_skips_after_success() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
@@ -3490,6 +3949,29 @@ fn catching_up_fresh_client_slot_failure_becomes_degraded() {
 
     assert!(engine.try_complete_catchup_sync().is_err());
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+}
+
+#[test]
+fn allocator_pending_fresh_client_slot_failure_becomes_degraded() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    engine
+        .local
+        .set_counter(LOCAL_PG_CLIENT_SLOT_COUNTER, 0)
+        .expect("clear client slot");
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::AllocatorPending as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    assert!(engine.try_complete_catchup_sync().is_err());
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1
+    );
 }
 
 #[test]

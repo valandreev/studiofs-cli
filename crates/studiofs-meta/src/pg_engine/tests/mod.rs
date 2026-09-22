@@ -502,6 +502,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
             .expect("unit test remote runtime"),
         allocator_runtime: Mutex::new(AllocatorRuntime::default()),
         allocator_refill_lock: Mutex::new(()),
+        allocator_bootstrap_retry_state: Mutex::new(AllocatorBootstrapRetryState::default()),
         inode_id_headroom_available: AtomicBool::new(false),
         object_id_headroom_available: AtomicBool::new(false),
         pg_sync_lifecycle: AtomicU8::new(PgSyncLifecycle::LocalReady as u8),
@@ -511,6 +512,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         active_open_inodes: Mutex::new(HashMap::new()),
         snapshot_import_after_active_open_capture_hook: Mutex::new(None),
         catch_up_fault_hook: Mutex::new(None),
+        allocator_bootstrap_hook: Mutex::new(None),
         self_weak: OnceLock::new(),
         lock_workers_enabled: false,
         lock_worker_start_lock: Mutex::new(()),
@@ -542,7 +544,9 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         .local
         .replace_allocator_state(allocator_state)
         .expect("persist unit test allocator state");
-    engine.bootstrap_allocator_state();
+    engine
+        .bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
 
     (dir, engine)
 }

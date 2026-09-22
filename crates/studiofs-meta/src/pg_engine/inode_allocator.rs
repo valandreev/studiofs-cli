@@ -107,6 +107,17 @@ impl PgMetaEngine {
     }
 
     fn mint_allocator_state(&self) -> MetaResult<AllocatorStateV1> {
+        #[cfg(test)]
+        let hook = self
+            .allocator_bootstrap_hook
+            .lock()
+            .map_err(|_| MetaError::Storage("allocator bootstrap hook lock poisoned".to_string()))?
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            return hook();
+        }
+
         let command_pool = self.command_pool.clone();
         let command_timeout = self.command_timeout;
         let volume_id = self.volume_id;
@@ -160,24 +171,29 @@ impl PgMetaEngine {
         })
     }
 
-    pub(super) fn bootstrap_allocator_state(&self) {
-        self.bootstrap_allocator_state_with_remote_recovery(true);
+    #[cfg(test)]
+    pub(super) fn bootstrap_allocator_state(&self) -> MetaResult<()> {
+        self.bootstrap_allocator_state_with_local_state(self.local.read_allocator_state(), true)
     }
 
-    pub(super) fn bootstrap_allocator_state_local_only(&self) {
-        self.bootstrap_allocator_state_with_remote_recovery(false);
+    pub(super) fn bootstrap_allocator_state_local_only(&self) -> MetaResult<()> {
+        self.bootstrap_allocator_state_with_local_state(self.local.read_allocator_state(), false)
     }
 
-    fn bootstrap_allocator_state_with_remote_recovery(&self, allow_remote_recovery: bool) {
-        let (allocator_state, loaded_state_result) = match self.local.read_allocator_state() {
+    pub(super) fn bootstrap_allocator_state_with_local_state(
+        &self,
+        local_state: MetaResult<Option<AllocatorStateV1>>,
+        allow_remote_recovery: bool,
+    ) -> MetaResult<()> {
+        let mint_and_persist = || {
+            self.mint_allocator_state().and_then(|state| {
+                self.local.replace_allocator_state(state)?;
+                Ok(state)
+            })
+        };
+        let (allocator_state, loaded_state_result) = match local_state {
             Ok(Some(state)) => ("trusted", Ok(state)),
-            Ok(None) if allow_remote_recovery => (
-                "new",
-                self.mint_allocator_state().and_then(|state| {
-                    self.local.replace_allocator_state(state)?;
-                    Ok(state)
-                }),
-            ),
+            Ok(None) if allow_remote_recovery => ("new", mint_and_persist()),
             Ok(None) => (
                 "missing",
                 Err(MetaError::Storage(
@@ -185,43 +201,45 @@ impl PgMetaEngine {
                         .to_string(),
                 )),
             ),
-            Err(_error) if allow_remote_recovery => (
-                "untrustworthy",
-                self.mint_allocator_state().and_then(|state| {
-                    self.local.replace_allocator_state(state)?;
-                    Ok(state)
-                }),
-            ),
+            Err(_error) if allow_remote_recovery => ("untrustworthy", mint_and_persist()),
             Err(error) => ("untrustworthy", Err(error)),
         };
-        match loaded_state_result {
-            Ok(state) => {
-                let inode_id_headroom = state.inode.reserved_through() < COUNTER_LIMIT;
-                let object_id_headroom = state.payload.reserved_through() < COUNTER_LIMIT;
-                if let Ok(mut runtime) = self.allocator_runtime.lock() {
-                    runtime.state = Some(state);
-                    runtime.inode_batch = 0..0;
-                    runtime.payload_batch = 0..0;
-                }
-                self.inode_id_headroom_available
-                    .store(inode_id_headroom, Ordering::Release);
-                self.object_id_headroom_available
-                    .store(object_id_headroom, Ordering::Release);
-            }
-            Err(error) => {
-                self.inode_id_headroom_available
-                    .store(false, Ordering::Release);
-                self.object_id_headroom_available
-                    .store(false, Ordering::Release);
-                warn!(
-                    error = %error,
-                    volume_id = self.volume_id,
-                    allocator_state,
-                    "id_allocator_recovery_required"
-                );
-            }
-        }
+        let result = loaded_state_result.and_then(|state| {
+            self.activate_allocator_state(state)?;
+            Ok(())
+        });
+        if let Err(error) = &result {
+            self.inode_id_headroom_available
+                .store(false, Ordering::Release);
+            self.object_id_headroom_available
+                .store(false, Ordering::Release);
+            warn!(
+                error = %error,
+                volume_id = self.volume_id,
+                allocator_state,
+                "id_allocator_recovery_required"
+            );
+        };
         self.refresh_pg_sync_lifecycle_for_allocator();
+        result
+    }
+
+    fn activate_allocator_state(&self, state: AllocatorStateV1) -> MetaResult<()> {
+        let inode_id_headroom = state.inode.reserved_through() < COUNTER_LIMIT;
+        let object_id_headroom = state.payload.reserved_through() < COUNTER_LIMIT;
+        let mut runtime = self
+            .allocator_runtime
+            .lock()
+            .map_err(|_| MetaError::Storage("allocator runtime lock poisoned".to_string()))?;
+        runtime.state = Some(state);
+        runtime.inode_batch = 0..0;
+        runtime.payload_batch = 0..0;
+        drop(runtime);
+        self.inode_id_headroom_available
+            .store(inode_id_headroom, Ordering::Release);
+        self.object_id_headroom_available
+            .store(object_id_headroom, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn allocator_runtime_state_missing(&self) -> bool {
