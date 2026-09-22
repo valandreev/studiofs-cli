@@ -25,7 +25,7 @@ type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 pub(super) const NAMESPACE_INODE_BATCH: u32 = 4096;
 const DEFERRED_NAMESPACE_MAX_RETRIES: u8 = 3;
-const DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS: usize = 256;
+pub(super) const DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS: usize = 256;
 const DEFERRED_NAMESPACE_BATCH_LINGER_DELAY: Duration = Duration::from_millis(10);
 pub(super) const DEFERRED_NAMESPACE_BACKLOG_MAX_OPERATIONS: usize = 4096;
 const DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES: usize = 1024 * 1024;
@@ -266,6 +266,16 @@ impl StudioVfs {
         let op_bytes = Self::deferred_namespace_op_estimated_bytes(&op);
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
+            let error_ino = match &op {
+                DeferredNamespaceOp::CreateFile { parent, .. }
+                | DeferredNamespaceOp::CreateDir { parent, .. } => *parent,
+                DeferredNamespaceOp::SetAttr { attr, .. } => attr.ino,
+            };
+            if let Some(error) = inner.errors.get(&error_ino) {
+                return Err(VfsError::Other(format!(
+                    "deferred namespace metadata commit failed for inode {error_ino}: {error}"
+                )));
+            }
             if let Some(key) = key.as_ref()
                 && inner.entries.contains_key(key)
             {
@@ -350,40 +360,114 @@ impl StudioVfs {
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
+    fn deferred_namespace_op_depends_on(
+        op: &DeferredNamespaceOp,
+        abandoned_inodes: &HashSet<Ino>,
+    ) -> bool {
+        match op {
+            DeferredNamespaceOp::CreateFile { parent, .. }
+            | DeferredNamespaceOp::CreateDir { parent, .. } => {
+                abandoned_inodes.contains(&op.ino()) || abandoned_inodes.contains(parent)
+            }
+            DeferredNamespaceOp::SetAttr { .. } => abandoned_inodes.contains(&op.ino()),
+        }
+    }
+
+    fn settle_abandoned_deferred_namespace_op(
+        &self,
+        inner: &mut DeferredNamespaceInner,
+        op: &DeferredNamespaceOp,
+        error: &Arc<str>,
+        affected_inodes: &mut HashSet<Ino>,
+        abandoned_file_inodes: &mut HashSet<Ino>,
+        affected_parents: &mut HashSet<Ino>,
+    ) {
+        let ino = op.ino();
+        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
+        affected_inodes.insert(ino);
+        inner.errors.insert(ino, Arc::clone(error));
+        match op {
+            DeferredNamespaceOp::CreateFile { parent, name, .. } => {
+                inner
+                    .entries
+                    .remove(&DeferredNamespaceKey::new(*parent, name));
+                self.dentry_cache_invalidate(*parent, name);
+                affected_parents.insert(*parent);
+                abandoned_file_inodes.insert(ino);
+            }
+            DeferredNamespaceOp::CreateDir { parent, name, .. } => {
+                inner
+                    .entries
+                    .remove(&DeferredNamespaceKey::new(*parent, name));
+                inner.locally_created_dirs.remove(&ino);
+                self.dentry_cache_invalidate(*parent, name);
+                affected_parents.insert(*parent);
+            }
+            DeferredNamespaceOp::SetAttr { .. } => {}
+        }
+        let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
+        if pending_count <= 1 {
+            inner.pending_inodes.remove(&ino);
+            inner.attrs.remove(&ino);
+        } else {
+            inner.pending_inodes.insert(ino, pending_count - 1);
+        }
+        inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
+        inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+        inner.settled_operations += 1;
+    }
+
     fn abandon_failed_deferred_namespace_batch(
         &self,
         ops: &[DeferredNamespaceOp],
         error: &VfsError,
-    ) {
+    ) -> usize {
         let error: Arc<str> = Arc::from(error.to_string());
         let mut affected_inodes = HashSet::new();
+        let mut abandoned_file_inodes = HashSet::new();
+        let mut affected_parents = HashSet::new();
+        let mut abandoned_inodes: HashSet<_> =
+            ops.iter()
+                .filter_map(|op| match op {
+                    DeferredNamespaceOp::CreateFile { .. }
+                    | DeferredNamespaceOp::CreateDir { .. } => Some(op.ino()),
+                    DeferredNamespaceOp::SetAttr { .. } => None,
+                })
+                .collect();
+        let mut queued_abandoned = 0;
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
             for op in ops {
-                let ino = op.ino();
-                let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
-                affected_inodes.insert(ino);
-                inner.errors.insert(ino, Arc::clone(&error));
-                match op {
-                    DeferredNamespaceOp::CreateFile { parent, name, .. }
-                    | DeferredNamespaceOp::CreateDir { parent, name, .. } => {
-                        inner
-                            .entries
-                            .remove(&DeferredNamespaceKey::new(*parent, name));
-                    }
-                    DeferredNamespaceOp::SetAttr { .. } => {}
-                }
-                let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
-                if pending_count <= 1 {
-                    inner.pending_inodes.remove(&ino);
-                    inner.attrs.remove(&ino);
-                } else {
-                    inner.pending_inodes.insert(ino, pending_count - 1);
-                }
-                inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
-                inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+                self.settle_abandoned_deferred_namespace_op(
+                    &mut inner,
+                    op,
+                    &error,
+                    &mut affected_inodes,
+                    &mut abandoned_file_inodes,
+                    &mut affected_parents,
+                );
             }
-            inner.settled_operations += ops.len() as u64;
+            let queued_operations = inner.queue.len();
+            for _ in 0..queued_operations {
+                let Some(op) = inner.queue.pop_front() else {
+                    break;
+                };
+                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes) {
+                    abandoned_inodes.insert(op.ino());
+                    self.settle_abandoned_deferred_namespace_op(
+                        &mut inner,
+                        &op,
+                        &error,
+                        &mut affected_inodes,
+                        &mut abandoned_file_inodes,
+                        &mut affected_parents,
+                    );
+                    queued_abandoned += 1;
+                } else {
+                    inner.queue.push_back(op);
+                }
+            }
+            self.bump_namespace_for_parents(affected_parents.iter().copied());
         }
         {
             let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
@@ -391,8 +475,15 @@ impl StudioVfs {
                 dirty_attrs.remove(ino);
             }
         }
+        for ino in &abandoned_file_inodes {
+            self.clear_pending_payloads_for_inode(*ino);
+        }
+        for ino in abandoned_inodes {
+            self.clear_inode_incarnation(ino);
+        }
         self.invalidate_attr_read_cache(affected_inodes);
         self.state.namespace.deferred.notify.notify_waiters();
+        queued_abandoned
     }
 
     pub(super) async fn wait_for_deferred_namespace_metadata(&self, ino: Ino) -> VfsResult<()> {
@@ -704,31 +795,23 @@ impl StudioVfs {
                             let mut abandoned_inodes = HashSet::from([conflicting_operation.ino()]);
                             let mut abandoned_operations = vec![conflicting_operation];
                             for op in batch.split_off(conflict_index) {
-                                let depends_on_abandoned_inode = match &op {
-                                    DeferredNamespaceOp::CreateFile { parent, .. }
-                                    | DeferredNamespaceOp::CreateDir { parent, .. } => {
-                                        abandoned_inodes.contains(&op.ino())
-                                            || abandoned_inodes.contains(parent)
-                                    }
-                                    DeferredNamespaceOp::SetAttr { .. } => {
-                                        abandoned_inodes.contains(&op.ino())
-                                    }
-                                };
-                                if depends_on_abandoned_inode {
+                                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes) {
                                     abandoned_inodes.insert(op.ino());
                                     abandoned_operations.push(op);
                                 } else {
                                     batch.push(op);
                                 }
                             }
-                            self.abandon_failed_deferred_namespace_batch(
+                            let queued_abandoned = self.abandon_failed_deferred_namespace_batch(
                                 &abandoned_operations,
                                 &error,
                             );
                             warn!(
                                 error = %error,
                                 conflict_index,
-                                abandoned_operations = abandoned_operations.len(),
+                                abandoned_operations = abandoned_operations.len()
+                                    + queued_abandoned,
+                                queued_abandoned_operations = queued_abandoned,
                                 remaining_operations = batch.len(),
                                 "deferred namespace metadata operations lost a concurrent namespace conflict; retrying independent operations without degrading mount"
                             );
