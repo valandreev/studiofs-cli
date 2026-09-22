@@ -185,7 +185,7 @@ impl StudioVfs {
             .cloned()
     }
 
-    fn ensure_no_deferred_namespace_error(&self, ino: Ino) -> VfsResult<()> {
+    pub(super) fn ensure_no_deferred_namespace_error(&self, ino: Ino) -> VfsResult<()> {
         if let Some(error) = self.deferred_namespace_error(ino) {
             return Err(VfsError::Other(format!(
                 "deferred namespace metadata commit failed for inode {ino}: {error}"
@@ -423,6 +423,7 @@ impl StudioVfs {
         error: &VfsError,
     ) -> usize {
         let error: Arc<str> = Arc::from(error.to_string());
+        let cleanup_owner = self.state.namespace.deferred.upgrade_owner();
         let mut affected_inodes = HashSet::new();
         let mut abandoned_file_inodes = HashSet::new();
         let mut affected_parents = HashSet::new();
@@ -467,21 +468,72 @@ impl StudioVfs {
                     inner.queue.push_back(op);
                 }
             }
+            if cleanup_owner.is_some() {
+                inner
+                    .cleanup_pending
+                    .extend(abandoned_file_inodes.iter().copied());
+            } else {
+                for ino in &abandoned_file_inodes {
+                    inner.cleanup_errors.insert(
+                        *ino,
+                        Arc::from("VFS owner unavailable during abandoned inode cleanup"),
+                    );
+                }
+            }
             self.bump_namespace_for_parents(affected_parents.iter().copied());
         }
         {
             let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
             for ino in &affected_inodes {
-                dirty_attrs.remove(ino);
+                if !abandoned_file_inodes.contains(ino) {
+                    dirty_attrs.remove(ino);
+                }
             }
         }
-        for ino in &abandoned_file_inodes {
-            self.clear_pending_payloads_for_inode(*ino);
-        }
-        for ino in abandoned_inodes {
-            self.clear_inode_incarnation(ino);
+        for ino in abandoned_inodes.difference(&abandoned_file_inodes) {
+            self.clear_inode_incarnation(*ino);
         }
         self.invalidate_attr_read_cache(affected_inodes);
+        if let Some(vfs) = cleanup_owner {
+            let cleanup_inodes: Vec<_> = abandoned_file_inodes.into_iter().collect();
+            let cleanup_vfs = Arc::clone(&vfs);
+            // The drainer can be called from a write barrier that already owns this gate.
+            // Let it return before cleanup waits for Delete, then retire state under that gate.
+            vfs.track_background_task(tokio::spawn(async move {
+                for ino in cleanup_inodes {
+                    let cleanup_result = async {
+                        let _session = cleanup_vfs
+                            .state
+                            .file_session
+                            .enter_op(ino, FileSessionOperation::Delete)
+                            .await;
+                        let cleanup = cleanup_vfs.collect_orphan_deleted_inode_cleanup(ino).await?;
+                        cleanup_vfs
+                            .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
+                            .await;
+                        Ok::<_, VfsError>(())
+                    }
+                    .await;
+                    if let Err(error) = &cleanup_result {
+                        warn!(ino, error = %error, "failed to clean an abandoned deferred file inode");
+                    }
+                    {
+                        let mut inner = cleanup_vfs.state.namespace.deferred.inner.lock();
+                        inner.cleanup_pending.remove(&ino);
+                        if let Err(error) = cleanup_result {
+                            inner.cleanup_errors.insert(ino, Arc::from(error.to_string()));
+                        }
+                    }
+                    cleanup_vfs.state.namespace.deferred.notify.notify_waiters();
+                    cleanup_vfs.state.file_session.gc_if_idle(ino);
+                }
+            }));
+        } else if !abandoned_file_inodes.is_empty() {
+            error!(
+                inodes = ?abandoned_file_inodes,
+                "cannot clean abandoned deferred file inodes because the VFS owner is unavailable"
+            );
+        }
         self.state.namespace.deferred.notify.notify_waiters();
         queued_abandoned
     }
@@ -501,6 +553,31 @@ impl StudioVfs {
                 }
             }
             notified.await;
+        }
+    }
+
+    pub(super) async fn wait_for_deferred_namespace_cleanup(&self, ino: Ino) -> VfsResult<()> {
+        loop {
+            let notified = self.state.namespace.deferred.notify.notified();
+            let cleanup_result = {
+                let inner = self.state.namespace.deferred.inner.lock();
+                if inner.cleanup_pending.contains(&ino) {
+                    None
+                } else if let Some(error) = inner.cleanup_errors.get(&ino) {
+                    Some(Err(Arc::clone(error)))
+                } else {
+                    Some(Ok(()))
+                }
+            };
+            match cleanup_result {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(error)) => {
+                    return Err(VfsError::Other(format!(
+                        "failed to clean abandoned deferred file inode {ino}: {error}"
+                    )));
+                }
+                None => notified.await,
+            }
         }
     }
 
@@ -571,6 +648,10 @@ impl StudioVfs {
         self: &Arc<Self>,
         runtime: &tokio::runtime::Handle,
     ) {
+        self.state
+            .namespace
+            .deferred
+            .set_owner(Arc::downgrade(self));
         if self
             .state
             .namespace
@@ -675,9 +756,15 @@ impl StudioVfs {
         tokio::pin!(sleep);
         loop {
             let notified = self.state.namespace.deferred.notify.notified();
-            let drained = {
+            let (drained, cleanup_error) = {
                 let inner = self.state.namespace.deferred.inner.lock();
-                inner.settled_operations >= cutoff
+                let cleanup_error = inner
+                    .cleanup_errors
+                    .iter()
+                    .next()
+                    .map(|(ino, error)| (*ino, Arc::clone(error)));
+                let drained = inner.settled_operations >= cutoff
+                    && inner.cleanup_pending.is_empty()
                     && !self
                         .state
                         .namespace
@@ -685,9 +772,15 @@ impl StudioVfs {
                         .draining
                         .load(std::sync::atomic::Ordering::Acquire)
                     && inner.queue.is_empty()
-                    && inner.backlog_operations == 0
+                    && inner.backlog_operations == 0;
+                (drained, cleanup_error)
             };
             if drained {
+                if let Some((ino, error)) = cleanup_error {
+                    return Err(VfsError::Other(format!(
+                        "failed to clean abandoned deferred file inode {ino}: {error}"
+                    )));
+                }
                 return self.deferred_namespace_shutdown_error().map_or(Ok(()), Err);
             }
             tokio::select! {

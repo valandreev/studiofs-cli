@@ -13751,6 +13751,33 @@ fn deferred_create_conflict_keeps_competing_entry_visible_through_vfs_lookup() {
                 rt.handle(),
             )
             .expect("admit deferred create");
+        let fh = vfs
+            .open_created_file_with_known_attr(&deferred, OpenFlags::RDWR, false)
+            .expect("open deferred create");
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            deferred.ino,
+            0,
+            b"writer-stack orphan",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write through deferred create handle");
+        assert!(
+            meta.get_attr(deferred.ino).is_ok(),
+            "writing an unpublished empty draft must persist its local inode attr"
+        );
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(deferred.ino),
+            "the test must stage bytes in the writer stack before the conflict"
+        );
+        vfs.cached_store()
+            .submit_upload(deferred.ino, 0, 9_900_002, deferred.content_epoch);
+        assert_eq!(
+            vfs.pending_uploads_snapshot_for_inode(deferred.ino).len(),
+            1,
+            "the test must have queued publication state before the conflict"
+        );
         let payload = BytesMut::from(&b"orphan"[..]);
         let payload_bytes = payload.len();
         vfs.state.local_dirty.pending_payloads.lock().insert(
@@ -13782,6 +13809,11 @@ fn deferred_create_conflict_keeps_competing_entry_visible_through_vfs_lookup() {
             0o644,
         )
         .expect("persist competing create");
+        let write_boundary = vfs
+            .state
+            .file_session
+            .enter_op(deferred.ino, FileSessionOperation::Write)
+            .await;
         vfs.state
             .namespace
             .deferred
@@ -13796,6 +13828,29 @@ fn deferred_create_conflict_keeps_competing_entry_visible_through_vfs_lookup() {
         assert!(
             error.to_string().contains("entry already exists"),
             "unexpected deferred conflict error: {error}"
+        );
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(deferred.ino),
+            "cleanup must wait for the inode write boundary"
+        );
+        assert!(
+            meta.get_attr(deferred.ino).is_ok(),
+            "local metadata must remain intact until the write boundary is released"
+        );
+        assert_eq!(
+            vfs.pending_uploads_snapshot_for_inode(deferred.ino).len(),
+            1,
+            "queued publication must remain intact until the write boundary is released"
+        );
+        drop(write_boundary);
+
+        let error = vfs
+            .flush_fh(fh)
+            .await
+            .expect_err("flush should report the deferred namespace conflict");
+        assert!(
+            error.to_string().contains("entry already exists"),
+            "unexpected flush error: {error}"
         );
 
         assert!(
@@ -13823,12 +13878,45 @@ fn deferred_create_conflict_keeps_competing_entry_visible_through_vfs_lookup() {
             "abandoned file payload bytes must be removed from local dirty accounting"
         );
         assert!(
+            !vfs.state.writer_stack.has_dirty_writers(deferred.ino),
+            "abandoned file writer-stack state must be retired"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(deferred.ino),
+            0,
+            "abandoned file bytes must be removed from writer-stack accounting"
+        );
+        assert!(
+            vfs.pending_uploads_snapshot_for_inode(deferred.ino).is_empty(),
+            "abandoned file uploads must be cancelled"
+        );
+        assert!(
+            meta.get_attr(deferred.ino).is_err(),
+            "abandoned file draft attr must be removed from local metadata"
+        );
+        assert!(
             !vfs.state
                 .incarnation
                 .inode_incarnations
                 .lock()
                 .contains_key(&deferred.ino),
             "abandoned file inode incarnation must be retired"
+        );
+        assert!(
+            vfs.write_fh_with_local_sync_policy(
+                fh,
+                deferred.ino,
+                0,
+                b"late write",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .is_err(),
+            "writes through a handle for an abandoned create must keep returning its namespace error"
+        );
+        assert!(
+            meta.get_attr(deferred.ino).is_err(),
+            "a late write must not recreate an abandoned inode attr"
         );
         let winner = vfs
             .lookup(ROOT_INO, b"deferred-create-conflict.txt")
@@ -14522,6 +14610,9 @@ fn deferred_namespace_dir_conflict_abandons_child_and_retries_independent_ops_ac
         vfs.wait_for_deferred_namespace_metadata(independent.ino)
             .await
             .expect("independent operation should still commit");
+        vfs.wait_for_deferred_namespace_cleanup(child.ino)
+            .await
+            .expect("abandoned child file runtime cleanup should finish");
 
         assert!(meta.get_attr(conflicted_dir.ino).is_err());
         assert!(meta.get_attr(child.ino).is_err());
