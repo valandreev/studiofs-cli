@@ -701,15 +701,36 @@ impl StudioVfs {
                             .filter(|index| *index < batch.len())
                         {
                             let conflicting_operation = batch.remove(conflict_index);
+                            let mut abandoned_inodes = HashSet::from([conflicting_operation.ino()]);
+                            let mut abandoned_operations = vec![conflicting_operation];
+                            for op in batch.split_off(conflict_index) {
+                                let depends_on_abandoned_inode = match &op {
+                                    DeferredNamespaceOp::CreateFile { parent, .. }
+                                    | DeferredNamespaceOp::CreateDir { parent, .. } => {
+                                        abandoned_inodes.contains(&op.ino())
+                                            || abandoned_inodes.contains(parent)
+                                    }
+                                    DeferredNamespaceOp::SetAttr { .. } => {
+                                        abandoned_inodes.contains(&op.ino())
+                                    }
+                                };
+                                if depends_on_abandoned_inode {
+                                    abandoned_inodes.insert(op.ino());
+                                    abandoned_operations.push(op);
+                                } else {
+                                    batch.push(op);
+                                }
+                            }
                             self.abandon_failed_deferred_namespace_batch(
-                                std::slice::from_ref(&conflicting_operation),
+                                &abandoned_operations,
                                 &error,
                             );
                             warn!(
                                 error = %error,
                                 conflict_index,
+                                abandoned_operations = abandoned_operations.len(),
                                 remaining_operations = batch.len(),
-                                "deferred namespace metadata operation lost a concurrent namespace conflict; retrying the remaining batch without degrading mount"
+                                "deferred namespace metadata operations lost a concurrent namespace conflict; retrying independent operations without degrading mount"
                             );
                             if batch.is_empty() {
                                 break;

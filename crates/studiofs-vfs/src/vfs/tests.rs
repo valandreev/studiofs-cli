@@ -14261,6 +14261,154 @@ fn deferred_namespace_entry_conflict_retries_nonconflicting_operations() {
 }
 
 #[test]
+fn deferred_namespace_entry_conflict_abandons_setattr_for_created_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-create-setattr-conflict");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let conflicted = InodeAttr::new_file(9_100_007, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &conflicted, b"conflict-setattr.txt");
+
+        let mut updated = conflicted.clone();
+        updated.mode = 0o600;
+        vfs.enqueue_deferred_namespace_op(
+            None,
+            updated.clone(),
+            super::namespace::DeferredNamespaceOp::SetAttr {
+                attr: updated,
+                args: SetattrArgs {
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("admit deferred setattr");
+
+        let independent = InodeAttr::new_file(9_100_008, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &independent, b"independent-after-setattr.txt");
+        meta.create_file_with_ino(9_100_009, ROOT_INO, b"conflict-setattr.txt", 0, 0, 0o644)
+            .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.wait_for_deferred_namespace_metadata(conflicted.ino),
+        )
+        .await
+        .expect("deferred conflict should settle")
+        .expect_err("the create and its setattr must both be abandoned");
+        assert!(
+            error.to_string().contains("entry already exists"),
+            "unexpected deferred conflict error: {error}"
+        );
+        vfs.wait_for_deferred_namespace_metadata(independent.ino)
+            .await
+            .expect("independent operation should still commit");
+
+        assert!(meta.get_attr(conflicted.ino).is_err());
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"independent-after-setattr.txt")
+                .unwrap()
+                .ino,
+            independent.ino
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "dependent operations from a namespace conflict must not degrade the mount"
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_dir_conflict_abandons_child_and_retries_independent_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-dir-child-conflict");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let conflicted_dir = InodeAttr::new_dir(9_100_010, ROOT_INO, 0, 0, 0o755);
+        vfs.enqueue_deferred_namespace_op(
+            Some(super::namespace::DeferredNamespaceKey::new(
+                ROOT_INO,
+                b"conflict-dir",
+            )),
+            conflicted_dir.clone(),
+            super::namespace::DeferredNamespaceOp::CreateDir {
+                attr: conflicted_dir.clone(),
+                parent: ROOT_INO,
+                name: b"conflict-dir".to_vec(),
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+            },
+        )
+        .expect("admit deferred directory create");
+
+        let child = InodeAttr::new_file(9_100_011, conflicted_dir.ino, 0, 0, 0o644);
+        vfs.enqueue_deferred_namespace_op(
+            Some(super::namespace::DeferredNamespaceKey::new(
+                conflicted_dir.ino,
+                b"child.txt",
+            )),
+            child.clone(),
+            super::namespace::DeferredNamespaceOp::CreateFile {
+                attr: child.clone(),
+                parent: conflicted_dir.ino,
+                name: b"child.txt".to_vec(),
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            },
+        )
+        .expect("admit deferred child create");
+
+        let independent = InodeAttr::new_file(9_100_012, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &independent, b"independent-after-dir.txt");
+        meta.create_dir(ROOT_INO, b"conflict-dir", 0, 0, 0o755)
+            .expect("persist competing directory entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        for ino in [conflicted_dir.ino, child.ino] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(3),
+                vfs.wait_for_deferred_namespace_metadata(ino),
+            )
+            .await
+            .expect("dependent operation should settle")
+            .expect_err("a create under an abandoned directory must fail");
+            assert!(
+                error.to_string().contains("entry already exists"),
+                "unexpected dependent operation error: {error}"
+            );
+        }
+        vfs.wait_for_deferred_namespace_metadata(independent.ino)
+            .await
+            .expect("independent operation should still commit");
+
+        assert!(meta.get_attr(conflicted_dir.ino).is_err());
+        assert!(meta.get_attr(child.ino).is_err());
+        assert!(meta.lookup(conflicted_dir.ino, b"child.txt").is_err());
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"independent-after-dir.txt")
+                .unwrap()
+                .ino,
+            independent.ino
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "a dependent child create must not degrade the mount after a directory conflict"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_conflict_preserves_same_inode_error_after_other_op_commits() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-same-inode-error");
