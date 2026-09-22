@@ -544,7 +544,9 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         .local
         .replace_allocator_state(allocator_state)
         .expect("persist unit test allocator state");
-    engine.bootstrap_allocator_state();
+    engine
+        .bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
 
     (dir, engine)
 }

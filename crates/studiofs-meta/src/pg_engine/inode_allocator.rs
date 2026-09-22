@@ -170,11 +170,11 @@ impl PgMetaEngine {
         })
     }
 
-    pub(super) fn bootstrap_allocator_state(&self) -> bool {
+    pub(super) fn bootstrap_allocator_state(&self) -> MetaResult<()> {
         self.bootstrap_allocator_state_with_remote_recovery(true)
     }
 
-    pub(super) fn bootstrap_allocator_state_local_only(&self) -> bool {
+    pub(super) fn bootstrap_allocator_state_local_only(&self) -> MetaResult<()> {
         self.bootstrap_allocator_state_with_remote_recovery(false)
     }
 
@@ -187,7 +187,10 @@ impl PgMetaEngine {
         Ok(true)
     }
 
-    fn bootstrap_allocator_state_with_remote_recovery(&self, allow_remote_recovery: bool) -> bool {
+    fn bootstrap_allocator_state_with_remote_recovery(
+        &self,
+        allow_remote_recovery: bool,
+    ) -> MetaResult<()> {
         let (allocator_state, loaded_state_result) = match self.local.read_allocator_state() {
             Ok(Some(state)) => ("trusted", Ok(state)),
             Ok(None) if allow_remote_recovery => (
@@ -213,27 +216,24 @@ impl PgMetaEngine {
             ),
             Err(error) => ("untrustworthy", Err(error)),
         };
-        let recovered = match loaded_state_result.and_then(|state| {
+        let result = loaded_state_result.and_then(|state| {
             self.activate_allocator_state(state)?;
             Ok(())
-        }) {
-            Ok(()) => true,
-            Err(error) => {
-                self.inode_id_headroom_available
-                    .store(false, Ordering::Release);
-                self.object_id_headroom_available
-                    .store(false, Ordering::Release);
-                warn!(
-                    error = %error,
-                    volume_id = self.volume_id,
-                    allocator_state,
-                    "id_allocator_recovery_required"
-                );
-                false
-            }
+        });
+        if let Err(error) = &result {
+            self.inode_id_headroom_available
+                .store(false, Ordering::Release);
+            self.object_id_headroom_available
+                .store(false, Ordering::Release);
+            warn!(
+                error = %error,
+                volume_id = self.volume_id,
+                allocator_state,
+                "id_allocator_recovery_required"
+            );
         };
         self.refresh_pg_sync_lifecycle_for_allocator();
-        recovered
+        result
     }
 
     fn activate_allocator_state(&self, state: AllocatorStateV1) -> MetaResult<()> {

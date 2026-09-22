@@ -186,7 +186,8 @@ fn sfs623_recovery_exhausted_persisted_record_is_read_only() {
         .replace_allocator_state(state)
         .expect("persist exhausted allocator state");
 
-    pg.bootstrap_allocator_state();
+    pg.bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
 
     let authority = MetaReplication::metadata_authority_status(&pg);
     assert!(!authority.inode_id_headroom);
@@ -204,7 +205,8 @@ fn sfs623_recovery_final_inode_refill_marks_authority_read_only() {
     pg.local
         .replace_allocator_state(state)
         .expect("persist final inode allocator state");
-    pg.bootstrap_allocator_state();
+    pg.bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
 
     pg.next_inode().expect("allocate final inode");
 
@@ -224,7 +226,8 @@ fn sfs623_recovery_final_payload_refill_marks_authority_read_only() {
     pg.local
         .replace_allocator_state(state)
         .expect("persist final payload allocator state");
-    pg.bootstrap_allocator_state();
+    pg.bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
 
     pg.next_object_ids(1).expect("allocate final payload ID");
 
@@ -245,7 +248,8 @@ fn sfs623_recovery_overflow_keeps_authority_read_only_until_reopen() {
     pg.local
         .replace_allocator_state(state)
         .expect("persist partial allocator state");
-    pg.bootstrap_allocator_state();
+    pg.bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
 
     assert!(
         pg.next_inode_ids(8_192).is_err(),

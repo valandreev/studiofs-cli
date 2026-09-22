@@ -6,6 +6,8 @@ This ExecPlan is living documentation for SFS-722. It follows `.agent/PLANS.md`;
 
 A fresh PostgreSQL-backed client that reaches its replay target but temporarily loses PostgreSQL while minting its paired allocator namespaces must remain safely read-only without becoming permanently stuck. After PostgreSQL is reachable again, the existing background synchronization path must retry the allocator bootstrap with bounded exponential backoff, persist the allocator pair to local `redb`, clear the fresh-client recovery marker, promote the lifecycle to `Live`, and allow the normal filesystem mutation path. A trusted but exhausted allocator must remain read-only and must not mint a replacement namespace.
 
+Permanent allocator errors and local persistence/activation errors follow the same read-only boundary: they are retained as typed diagnostics and suppress further remote minting until local recovery succeeds. Only `RemoteUnavailable` and `Timeout` errors schedule another remote attempt.
+
 The behavior is demonstrated by a focused regression that fails before the change when the marker is cleared and the lifecycle cannot recover, then passes after a transient bootstrap failure followed by a successful retry. Reopen coverage must prove that the durable marker survives the failed attempt and drives recovery on the next mount.
 
 ## Progress
@@ -20,6 +22,8 @@ The behavior is demonstrated by a focused regression that fails before the chang
 - [x] (2026-09-22 17:14Z) Passed focused tests, `cargo check -p studiofs-meta`, Clippy with `-D warnings`, formatting, and `git diff --check`.
 - [x] (2026-09-22 17:16Z) Recorded final package-library evidence and the PostgreSQL-gated coverage boundary; no commit, push, or Linear mutation was performed.
 - [x] (2026-09-22 17:45Z) Verified the attached review: released retry-state locking before remote mint, preserved backoff through poisoned mutexes, guarded allocator activation failures, refreshed lifecycle after slot registration, added bounded jitter, and covered the confirmed races with focused tests.
+- [x] (2026-09-22 18:31Z) Verified the follow-up review: allocator bootstrap now returns `MetaResult`, records redacted `PgSyncFailure` diagnostics, retries only reachability errors, and suppresses repeated minting after permanent/local failures.
+- [x] (2026-09-22 18:31Z) Added `permanent_allocator_bootstrap_failure_is_not_retried`; current allocator-bootstrap group passed 7/7 and the full metadata library passed 633/633 non-ignored tests.
 
 ## Surprises & Discoveries
 
@@ -35,6 +39,8 @@ The behavior is demonstrated by a focused regression that fails before the chang
   Evidence: `allocator_pending_retries_missing_allocator_authority` writes a valid local pair after the first failed attempt and must recover without waiting for the remote retry deadline.
 - Observation: the existing fallback poll already reaches `try_complete_catchup_sync()` through `record_metadata_sync_result()`; no second worker is needed for allocator recovery.
   Evidence: the transient retry regression exercises the same completion entry point after a successful fallback-poll result.
+- Observation: the previous retry helper reduced every allocator bootstrap error to `false`, so a permanent PostgreSQL allocator error or local `redb` replacement failure entered the same mint backoff as a reachability outage.
+  Evidence: the new regression injects `MetaError::Storage("postgres allocator namespace exhausted")`, observes one mint attempt, and confirms the typed `PgSyncFailure::Storage` remains visible after the next sync tick.
 
 ## Decision Log
 
@@ -65,18 +71,24 @@ The behavior is demonstrated by a focused regression that fails before the chang
 - Decision: Keep allocator retry defaults internal rather than adding environment configuration.
   Rationale: SFS-722 has no deployment requirement for tuning these values, and the deterministic test-only wakeup already avoids test sleeps without expanding the runtime configuration surface.
   Date/Author: 2026-09-22 / Codex.
+- Decision: Make allocator bootstrap return `MetaResult<()>` and classify retryability with `MetaError::is_reachability_error()`.
+  Rationale: the caller must retain the actual failure category; only `RemoteUnavailable` and `Timeout` represent a safe reason to mint another remote namespace pair. `Storage`, poisoned local state, and activation failures remain read-only and stop remote minting.
+  Date/Author: 2026-09-22 / Codex.
+- Decision: Preserve a permanent allocator diagnostic across a successful metadata-sync tick while retry is suppressed, then clear it only after allocator recovery.
+  Rationale: metadata transport success does not grant allocator mutation authority; clearing the only diagnostic before the suppressed retry runs would hide the reason the lifecycle remains `AllocatorPending`.
+  Date/Author: 2026-09-22 / Codex.
 
 ## Outcomes & Retrospective
 
 Implementation complete. Validation evidence:
 
-- `cargo test -p studiofs-meta --lib allocator -- --nocapture`: 44 passed, 0 failed, 4 ignored; the ignored allocator tests require `STUDIOFS_TEST_PG_DSN`.
+- `cargo test -p studiofs-meta --lib allocator_bootstrap -- --nocapture`: 7 passed, 0 failed.
 - `cargo test -p studiofs-meta --lib catching_up_fresh_client -- --nocapture`: 2 passed, 0 failed.
 - `cargo test -p studiofs-meta --lib degraded_fresh_client -- --nocapture`: 5 passed, 0 failed.
-- `cargo test -p studiofs-meta --lib --quiet`: 632 passed, 0 failed, 137 ignored.
+- `cargo test -p studiofs-meta --lib --quiet`: 633 passed, 0 failed, 137 ignored.
 - `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 
-No live PostgreSQL or mounted native acceptance ran because the service-backed tests were ignored without `STUDIOFS_TEST_PG_DSN`; no commit, push, or external Linear mutation was made.
+No live PostgreSQL or mounted native acceptance ran because the service-backed tests remain environment-gated; no commit, push, or external Linear mutation was made.
 
 ## Context and Orientation
 
@@ -90,7 +102,7 @@ The durable fresh-client marker is `LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER` (`pgF
 
 First add one focused test in the existing `studiofs-meta` lifecycle test module that starts at a reached fresh-client target with no allocator runtime, injects one transient mint failure, and proves the marker remains nonzero, lifecycle remains read-only, and no allocator runtime is installed. The test then makes the next bootstrap succeed and proves local allocator state is durable, the marker is cleared, lifecycle is `Live`, and a normal ID allocation succeeds. Add a pure retry-delay test if the schedule is not already directly covered.
 
-Then make allocator bootstrap report whether it actually loaded and durably installed usable state. Keep the existing warning and closed headroom behavior on failure. In `try_complete_catchup_sync()`, accept the eligible `AllocatorPending` recovery state, retain the fresh marker and frozen target on failure, and perform the final marker/target/progress cleanup only after successful durable allocator installation. The path must continue to leave trusted exhausted state untouched.
+Then make allocator bootstrap return `MetaResult<()>` so it exposes the actual remote, local persistence, or activation error instead of collapsing every failure into `false`. Keep the existing warning and closed headroom behavior on failure. In `try_complete_catchup_sync()`, accept the eligible `AllocatorPending` recovery state, retain the fresh marker and frozen target on failure, and perform the final marker/target/progress cleanup only after successful durable allocator installation. The path must continue to leave trusted exhausted state untouched.
 
 Add the smallest retry-state holder to `PgMetaEngine` and use it only when allocator runtime state is missing/untrustworthy. The first attempt is immediate; later attempts are gated by an in-memory exponential delay capped at a finite maximum. Remote identity must be validated before a retry, shutdown must remain owned by the existing poll worker, and success resets the delay. Do not add a new worker, schema, dependency, or foreground remote call.
 
@@ -106,7 +118,7 @@ Work from `/Volumes/Storage/dev/studiofs`.
 
    The initial run failed as expected (`left: 0`, `right: 1` for the durable marker); after the fix the test passes.
 
-2. Implemented the minimal code change in `pg_engine.rs` and `pg_engine/inode_allocator.rs`; the existing `pg_engine/lifecycle.rs` poll remains the retry owner. The test-only mint hook follows the existing fault-hook pattern.
+2. Implemented the minimal code change in `pg_engine.rs` and `pg_engine/inode_allocator.rs`; the existing `pg_engine/lifecycle.rs` poll remains the retry owner. The test-only mint hook follows the existing fault-hook pattern. The bootstrap methods return `MetaResult<()>`, while retry state stores only scheduling/suppression state and diagnostics use the existing redacted `PgSyncFailure` categories.
 
 3. Ran the focused lifecycle/allocator tests with one filter per command; each reported nonzero tests:
 
@@ -123,9 +135,16 @@ Work from `/Volumes/Storage/dev/studiofs`.
 
 5. [x] Ran the broader metadata library suite, recorded ignored PostgreSQL tests separately, inspected the final diff, and updated this plan. No mounted or live PostgreSQL acceptance is claimed from unit tests.
 
+6. [x] Verified the review regression and retry classification:
+
+       cargo test -p studiofs-meta --lib permanent_allocator_bootstrap_failure_is_not_retried -- --nocapture
+       cargo test -p studiofs-meta --lib allocator_bootstrap -- --nocapture
+
+   The permanent failure test proves exactly one mint attempt, a `Storage` diagnostic, and continued `AllocatorPending`; the transient group proves reachability retry behavior remains intact.
+
 ## Validation and Acceptance
 
-The focused regression is accepted only when it fails before the production change and passes after it. Its observable assertions are: a transient mint failure leaves `pgFreshClientPending == 1`, no allocator authority/headroom, and no `Live` lifecycle; the next due retry durably installs the paired allocator state, changes lifecycle to `Live`, clears the marker, and allocates an ID. A trusted exhausted allocator test must continue to report `AllocatorPending` without invoking the mint path.
+The focused regression is accepted only when it fails before the production change and passes after it. Its observable assertions are: a transient mint failure leaves `pgFreshClientPending == 1`, no allocator authority/headroom, and no `Live` lifecycle; the next due retry durably installs the paired allocator state, changes lifecycle to `Live`, clears the marker, and allocates an ID. A trusted exhausted allocator test must continue to report `AllocatorPending` without invoking the mint path. The permanent-failure regression must retain `PgSyncFailure::Storage` and perform no second mint after a forced retry wake-up.
 
 The reopen test is accepted when a failed fresh bootstrap survives engine close and ordinary reopen with the marker still set and writes still rejected. A service-backed test may additionally prove that once PostgreSQL is restored, a later background retry reaches `Live`; it must use the repository's configured non-secret `STUDIOFS_TEST_PG_DSN` and be reported as ignored when unavailable.
 
@@ -133,7 +152,7 @@ The final report must distinguish focused unit results, package compile/Clippy/f
 
 ## Idempotence and Recovery
 
-The plan is safe to repeat because tests use isolated temporary `redb` directories and the retry schedule is in-memory. If a test or implementation attempt fails, preserve the worktree, inspect the failing assertion, and return to the smallest failing regression; do not reset or discard unrelated changes. A failed remote mint may reserve an unused PostgreSQL namespace before local persistence fails, but the pair is not authoritative until `replace_allocator_state` succeeds, so a later retry may mint another pair without granting premature write authority.
+The plan is safe to repeat because tests use isolated temporary `redb` directories and the retry schedule is in-memory. If a test or implementation attempt fails, preserve the worktree, inspect the failing assertion, and return to the smallest failing regression; do not reset or discard unrelated changes. A failed transient remote mint may reserve an unused PostgreSQL namespace before local persistence succeeds, but the pair is not authoritative until `replace_allocator_state` succeeds; only reachability failures may mint another pair, while permanent/local failures remain suppressed and read-only.
 
 ## Artifacts and Notes
 
@@ -144,9 +163,10 @@ The primary artifacts are the focused test output, the final diff for the three 
 The final implementation keeps these existing interfaces and adds no external dependency:
 
 - `PgMetaEngine::try_complete_catchup_sync()` remains the lifecycle completion entry point used by metadata synchronization.
-- `PgMetaEngine::bootstrap_allocator_state_with_remote_recovery()` remains the single path that mints or loads the paired allocator state and must expose successful durable installation to its caller.
+- `PgMetaEngine::bootstrap_allocator_state()` and `bootstrap_allocator_state_local_only()` return `MetaResult<()>`; their shared `bootstrap_allocator_state_with_remote_recovery()` path remains the single path that mints or loads the paired allocator state and exposes the actual `MetaError` to its caller.
 - `RedbMetaEngine::replace_allocator_state()` remains the local durability boundary.
 - `PgSyncLifecycle::AllocatorPending` remains read-only and transitions to `Live` only after identity validation and paired allocator headroom are true.
 - The existing `PgBackgroundWorkers` poll worker remains responsible for shutdown and retry scheduling.
+- `MetaError::is_reachability_error()` is the retry gate; `PgSyncFailure::from_error()` is the safe diagnostic projection for allocator failures.
 
 Plan created at 2026-09-22 16:56Z; revise all living sections when implementation evidence changes the design.

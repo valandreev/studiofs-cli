@@ -3538,6 +3538,40 @@ fn transient_allocator_bootstrap_recovers_on_background_retry() {
 }
 
 #[test]
+fn permanent_allocator_bootstrap_failure_is_not_retried() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = std::sync::Arc::clone(&attempts);
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        hook_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Err(MetaError::Storage(
+            "postgres allocator namespace exhausted".to_string(),
+        ))
+    }));
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("permanent allocator failure remains read-only");
+    engine.retry_allocator_bootstrap_now_for_test();
+    let sync_result = Ok(false);
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &sync_result, false);
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "permanent allocator failures must not mint another namespace pair"
+    );
+    assert_eq!(
+        engine.pg_sync_diagnostics().last_sync_error,
+        Some(PgSyncFailure::Storage)
+    );
+    assert_eq!(
+        engine.pg_sync_status().lifecycle,
+        PgSyncLifecycle::AllocatorPending
+    );
+}
+
+#[test]
 fn allocator_bootstrap_does_not_hold_retry_lock_during_mint() {
     let (_dir, engine) = fresh_allocator_recovery_fixture();
     let engine = std::sync::Arc::new(engine);
@@ -3632,7 +3666,7 @@ fn poisoned_allocator_runtime_does_not_restore_write_authority() {
     .join()
     .expect("poisoning worker panicked outside catch_unwind");
 
-    assert!(!engine.bootstrap_allocator_state());
+    assert!(engine.bootstrap_allocator_state().is_err());
     let status = engine.pg_sync_status();
     assert_eq!(status.lifecycle, PgSyncLifecycle::AllocatorPending);
     assert!(!status.allows_new_mutations());

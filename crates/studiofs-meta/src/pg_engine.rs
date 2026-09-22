@@ -572,6 +572,7 @@ struct AllocatorBootstrapRetryState {
     next_attempt_at: Option<Instant>,
     retry_delay: Duration,
     attempt_in_flight: bool,
+    retry_suppressed: bool,
 }
 
 impl Default for AllocatorBootstrapRetryState {
@@ -580,6 +581,7 @@ impl Default for AllocatorBootstrapRetryState {
             next_attempt_at: None,
             retry_delay: Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS),
             attempt_in_flight: false,
+            retry_suppressed: false,
         }
     }
 }
@@ -662,8 +664,12 @@ impl PgMetaEngine {
     }
 
     pub(super) fn record_pg_sync_success(&self) {
+        let allocator_retry_suppressed =
+            self.lock_allocator_bootstrap_retry_state().retry_suppressed;
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
-            progress.last_sync_error = None;
+            if !allocator_retry_suppressed {
+                progress.last_sync_error = None;
+            }
             if self.current_pg_sync_lifecycle() != PgSyncLifecycle::Degraded {
                 progress.rebootstrap_required = false;
             }
@@ -764,6 +770,7 @@ impl PgMetaEngine {
             .unwrap_or(false)
         {
             self.reset_allocator_bootstrap_retry();
+            self.record_pg_sync_success();
             return AllocatorBootstrapOutcome::Recovered;
         }
 
@@ -773,7 +780,11 @@ impl PgMetaEngine {
                 retry.next_attempt_at = None;
                 retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
                 retry.attempt_in_flight = false;
+                retry.retry_suppressed = false;
                 return AllocatorBootstrapOutcome::Recovered;
+            }
+            if retry.retry_suppressed {
+                return AllocatorBootstrapOutcome::Failed;
             }
             if retry.attempt_in_flight
                 || retry
@@ -792,20 +803,33 @@ impl PgMetaEngine {
             delay
         };
 
-        let recovered = self.bootstrap_allocator_state();
+        let result = self.bootstrap_allocator_state();
+        self.record_metadata_source_result(&result);
+        if let Err(error) = &result {
+            self.record_pg_sync_failure(error);
+        }
         let mut retry = self.lock_allocator_bootstrap_retry_state();
         retry.attempt_in_flight = false;
-        if recovered {
-            retry.next_attempt_at = None;
-            retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
-        } else {
-            retry.next_attempt_at = Some(Instant::now() + delay);
-            retry.retry_delay = Self::next_allocator_bootstrap_retry_delay(delay);
-        }
-        if recovered {
-            AllocatorBootstrapOutcome::Recovered
-        } else {
-            AllocatorBootstrapOutcome::Failed
+        match result {
+            Ok(()) => {
+                retry.next_attempt_at = None;
+                retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
+                retry.retry_suppressed = false;
+                drop(retry);
+                self.record_pg_sync_success();
+                AllocatorBootstrapOutcome::Recovered
+            }
+            Err(error) if error.is_reachability_error() => {
+                retry.next_attempt_at = Some(Instant::now() + delay);
+                retry.retry_delay = Self::next_allocator_bootstrap_retry_delay(delay);
+                retry.retry_suppressed = false;
+                AllocatorBootstrapOutcome::Failed
+            }
+            Err(_) => {
+                retry.next_attempt_at = None;
+                retry.retry_suppressed = true;
+                AllocatorBootstrapOutcome::Failed
+            }
         }
     }
 
@@ -820,6 +844,7 @@ impl PgMetaEngine {
         retry.next_attempt_at = None;
         retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
         retry.attempt_in_flight = false;
+        retry.retry_suppressed = false;
     }
 
     /// Complete local catch-up after a successful sync has reached the frozen
@@ -1602,10 +1627,10 @@ impl PgMetaEngine {
         if !fresh_client_pending {
             if defer_remote_startup_probes {
                 if client_slot.is_some() {
-                    engine.bootstrap_allocator_state_local_only();
+                    let _ = engine.bootstrap_allocator_state_local_only();
                 }
             } else {
-                engine.bootstrap_allocator_state();
+                let _ = engine.bootstrap_allocator_state_with_retry();
             }
         }
         if options.background_poll {
