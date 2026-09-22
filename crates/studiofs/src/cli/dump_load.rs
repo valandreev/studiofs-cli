@@ -112,20 +112,17 @@ impl LoadArgs {
 
 fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDump> {
     crate::runtime_bridge::block_on(async move {
-        let metadata_dsn = ensure_studiofs_database(meta_dsn)
-            .await
-            .map_err(|e| DumpLoadError::Message(e.to_string()))?
-            .metadata_dsn;
-        let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
-            .await
-            .map_err(|e| DumpLoadError::Message(e.to_string()))?;
+        let metadata_dsn = ensure_studiofs_database(meta_dsn).await?.metadata_dsn;
+        let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn).await?;
         let connection_task = tokio::spawn(connection);
 
         let dump = async {
             // Keep checkpoint, counters, and event rows on one MVCC snapshot.
-            let transaction = client.transaction().await?;
-            transaction
-                .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            let transaction = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
                 .await?;
 
             let row = transaction
@@ -147,13 +144,10 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             FROM volumes v
             JOIN metadata_state ms ON ms.vol = v.vol
             WHERE v.vol = $1
-            "#,
+                    "#,
                     &[&volume_id],
                 )
-                .await
-                .map_err(|e| {
-                    DumpLoadError::Message(format!("failed to query metadata_state: {e}"))
-                })?;
+                .await?;
 
             let row = row.ok_or_else(|| {
                 DumpLoadError::Message(format!("volume {volume_id} not found in postgres"))
@@ -179,8 +173,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     "SELECT name, value FROM counters WHERE vol = $1 ORDER BY name",
                     &[&volume.vol],
                 )
-                .await
-                .map_err(|e| DumpLoadError::Message(format!("failed to query counters: {e}")))?;
+                .await?;
             let counters = counter_rows
                 .into_iter()
                 .map(|r| DumpCounter {
@@ -196,11 +189,10 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             FROM event_log
             WHERE vol = $1
             ORDER BY seq_id
-            "#,
+                    "#,
                     &[&volume.vol],
                 )
-                .await
-                .map_err(|e| DumpLoadError::Message(format!("failed to query event_log: {e}")))?;
+                .await?;
             let event_log = event_rows
                 .into_iter()
                 .map(|r| DumpEvent {
@@ -753,6 +745,99 @@ mod tests {
         validate_dump(&dump).expect("complete event batches should pass validation");
     }
 
+    #[test]
+    fn dump_validation_rejects_negative_metadata_versions() {
+        for (checkpoint_version, head_version) in [(-1, 0), (0, -1)] {
+            let mut dump = test_dump();
+            dump.metadata_state_checkpoint_version = checkpoint_version;
+            dump.metadata_state_version = head_version;
+
+            let err = validate_dump(&dump).unwrap_err();
+
+            assert!(matches!(
+                err,
+                DumpLoadError::Message(message) if message.contains("cannot be negative")
+            ));
+        }
+    }
+
+    #[test]
+    fn dump_validation_rejects_checkpoint_ahead_of_metadata_head() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_version = 105;
+        dump.metadata_state_version = 100;
+
+        let err = validate_dump(&dump).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("ahead of metadata head")
+        ));
+    }
+
+    #[test]
+    fn dump_validation_rejects_negative_event_batch_version() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_version = 0;
+        dump.metadata_state_version = 1;
+        dump.event_log = vec![test_event(-1)];
+
+        let err = validate_dump(&dump).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("negative batch version")
+        ));
+    }
+
+    #[test]
+    fn dump_validation_rejects_unordered_event_batches() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_version = 100;
+        dump.metadata_state_version = 102;
+        dump.event_log = vec![test_event(101), test_event(102), test_event(101)];
+
+        let err = validate_dump(&dump).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("not ordered by version")
+        ));
+    }
+
+    #[test]
+    fn dump_validation_rejects_event_batch_ahead_of_metadata_head() {
+        let mut dump = test_dump();
+        dump.metadata_state_checkpoint_version = 100;
+        dump.metadata_state_version = 101;
+        dump.event_log = vec![test_event(101), test_event(102)];
+
+        let err = validate_dump(&dump).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains("ahead of metadata head")
+        ));
+    }
+
+    #[test]
+    fn dump_validation_handles_max_version_without_overflow() {
+        let mut complete_dump = test_dump();
+        complete_dump.metadata_state_checkpoint_version = i64::MAX - 1;
+        complete_dump.metadata_state_version = i64::MAX;
+        complete_dump.event_log = vec![test_event(i64::MAX)];
+        validate_dump(&complete_dump).expect("maximum batch version should validate");
+
+        let mut incomplete_dump = test_dump();
+        incomplete_dump.metadata_state_checkpoint_version = i64::MAX - 1;
+        incomplete_dump.metadata_state_version = i64::MAX;
+        let err = validate_dump(&incomplete_dump).unwrap_err();
+        assert!(matches!(
+            err,
+            DumpLoadError::Message(message) if message.contains(&format!("batch {}", i64::MAX))
+        ));
+    }
+
     fn test_pg_dsn() -> Option<String> {
         if let Ok(dsn) = std::env::var("STUDIOFS_TEST_PG_DSN")
             && !dsn.trim().is_empty()
@@ -764,6 +849,29 @@ mod tests {
             .ok()?
             .filter_map(Result::ok)
             .find_map(|(key, value)| (key == "STUDIOFS_TEST_PG_DSN").then_some(value))
+    }
+
+    struct PgTestVolumeCleanup<'a> {
+        runtime: &'a tokio::runtime::Runtime,
+        metadata_dsn: String,
+        volume_id: i64,
+    }
+
+    impl Drop for PgTestVolumeCleanup<'_> {
+        fn drop(&mut self) {
+            self.runtime.block_on(async {
+                let Ok((client, connection)) = connect_studiofs_postgres(&self.metadata_dsn).await
+                else {
+                    return;
+                };
+                let connection_task = tokio::spawn(connection);
+                let _ = client
+                    .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
+                    .await;
+                connection_task.abort();
+                let _ = connection_task.await;
+            });
+        }
     }
 
     #[test]
@@ -800,6 +908,11 @@ mod tests {
         dump.metadata_state_format_info =
             serde_json::to_vec(&format_info).expect("serialize test format info");
         let volume_id = apply_dump(&metadata_dsn, &dump).expect("seed PostgreSQL test volume");
+        let _cleanup = PgTestVolumeCleanup {
+            runtime: &runtime,
+            metadata_dsn: metadata_dsn.clone(),
+            volume_id,
+        };
 
         runtime.block_on(async move {
             let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
@@ -878,10 +991,6 @@ mod tests {
             assert_eq!(captured.event_log.len(), 1);
             assert_eq!(captured.event_log[0].batch_version, 101);
 
-            client
-                .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
-                .await
-                .expect("delete PostgreSQL test volume");
             connection_task.abort();
             let _ = connection_task.await;
             lock_task.abort();
