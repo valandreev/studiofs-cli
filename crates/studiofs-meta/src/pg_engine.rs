@@ -503,6 +503,7 @@ pub(super) enum CatchUpFaultPoint {
     BeforeLocalCommit {
         last_batch_version: i64,
     },
+    BeforeFreshClientMarkerClear,
     /// Models a process interruption after the redb commit but before the
     /// in-memory cursor publication; drop and reopen the engine before retrying.
     AfterLocalCommit {
@@ -516,6 +517,20 @@ type CatchUpFaultHook = Arc<dyn Fn(CatchUpFaultPoint) -> MetaResult<()> + Send +
 
 #[cfg(test)]
 type AllocatorBootstrapHook = Arc<dyn Fn() -> MetaResult<AllocatorStateV1> + Send + Sync>;
+
+struct AllocatorBootstrapAttemptGuard<'a>(&'a PgMetaEngine);
+
+impl Drop for AllocatorBootstrapAttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lock_allocator_bootstrap_retry_state()
+            .attempt_in_flight = false;
+        if self.0.current_pg_sync_lifecycle() == PgSyncLifecycle::TargetReached {
+            self.0
+                .transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+        }
+    }
+}
 
 #[cfg(test)]
 impl PgMetaEngine {
@@ -765,10 +780,12 @@ impl PgMetaEngine {
     }
 
     fn bootstrap_allocator_state_with_retry(&self) -> AllocatorBootstrapOutcome {
-        if self
-            .try_restore_allocator_state_from_local()
-            .unwrap_or(false)
-        {
+        let local_state = self.local.read_allocator_state();
+        if matches!(&local_state, Ok(Some(_))) {
+            let result = self.bootstrap_allocator_state_with_local_state(local_state, true);
+            return self.finish_allocator_bootstrap_attempt(result, None);
+        }
+        if !self.allocator_runtime_state_missing() {
             self.reset_allocator_bootstrap_retry();
             self.record_pg_sync_success();
             return AllocatorBootstrapOutcome::Recovered;
@@ -776,13 +793,6 @@ impl PgMetaEngine {
 
         let delay = {
             let mut retry = self.lock_allocator_bootstrap_retry_state();
-            if !self.allocator_runtime_state_missing() {
-                retry.next_attempt_at = None;
-                retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
-                retry.attempt_in_flight = false;
-                retry.retry_suppressed = false;
-                return AllocatorBootstrapOutcome::Recovered;
-            }
             if retry.retry_suppressed {
                 return AllocatorBootstrapOutcome::Failed;
             }
@@ -803,7 +813,16 @@ impl PgMetaEngine {
             delay
         };
 
-        let result = self.bootstrap_allocator_state();
+        let _attempt_guard = AllocatorBootstrapAttemptGuard(self);
+        let result = self.bootstrap_allocator_state_with_local_state(local_state, true);
+        self.finish_allocator_bootstrap_attempt(result, Some(delay))
+    }
+
+    fn finish_allocator_bootstrap_attempt(
+        &self,
+        result: MetaResult<()>,
+        retry_delay: Option<Duration>,
+    ) -> AllocatorBootstrapOutcome {
         self.record_metadata_source_result(&result);
         if let Err(error) = &result {
             self.record_pg_sync_failure(error);
@@ -819,15 +838,16 @@ impl PgMetaEngine {
                 self.record_pg_sync_success();
                 AllocatorBootstrapOutcome::Recovered
             }
-            Err(error) if error.is_reachability_error() => {
-                retry.next_attempt_at = Some(Instant::now() + delay);
-                retry.retry_delay = Self::next_allocator_bootstrap_retry_delay(delay);
-                retry.retry_suppressed = false;
-                AllocatorBootstrapOutcome::Failed
-            }
-            Err(_) => {
+            Err(error) => {
                 retry.next_attempt_at = None;
                 retry.retry_suppressed = true;
+                if error.is_reachability_error()
+                    && let Some(delay) = retry_delay
+                {
+                    retry.next_attempt_at = Some(Instant::now() + delay);
+                    retry.retry_delay = Self::next_allocator_bootstrap_retry_delay(delay);
+                    retry.retry_suppressed = false;
+                }
                 AllocatorBootstrapOutcome::Failed
             }
         }
@@ -866,7 +886,9 @@ impl PgMetaEngine {
 
         let local_version = self.local_version.load(Ordering::Acquire);
         let startup_target = self.metadata_startup_target_version.load(Ordering::Acquire);
-        if startup_target < 0 || local_version < startup_target {
+        if (startup_target < 0 && initial_lifecycle != PgSyncLifecycle::AllocatorPending)
+            || (startup_target >= 0 && local_version < startup_target)
+        {
             return Ok(());
         }
 
@@ -915,8 +937,21 @@ impl PgMetaEngine {
             self.refresh_pg_sync_lifecycle_for_allocator();
         }
         if fresh_client_pending {
-            self.local
-                .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)?;
+            #[cfg(test)]
+            let marker_clear_result = self
+                .run_catch_up_fault_hook(CatchUpFaultPoint::BeforeFreshClientMarkerClear)
+                .and_then(|()| {
+                    self.local
+                        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)
+                });
+            #[cfg(not(test))]
+            let marker_clear_result = self
+                .local
+                .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0);
+            if let Err(error) = marker_clear_result {
+                self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+                return Err(error);
+            }
         }
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
             progress.rebootstrap_required = false;

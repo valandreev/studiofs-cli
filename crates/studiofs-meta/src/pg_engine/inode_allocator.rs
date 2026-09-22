@@ -108,12 +108,13 @@ impl PgMetaEngine {
 
     fn mint_allocator_state(&self) -> MetaResult<AllocatorStateV1> {
         #[cfg(test)]
-        if let Some(hook) = self
+        let hook = self
             .allocator_bootstrap_hook
             .lock()
             .map_err(|_| MetaError::Storage("allocator bootstrap hook lock poisoned".to_string()))?
-            .clone()
-        {
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = hook {
             return hook();
         }
 
@@ -170,36 +171,29 @@ impl PgMetaEngine {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn bootstrap_allocator_state(&self) -> MetaResult<()> {
-        self.bootstrap_allocator_state_with_remote_recovery(true)
+        self.bootstrap_allocator_state_with_local_state(self.local.read_allocator_state(), true)
     }
 
     pub(super) fn bootstrap_allocator_state_local_only(&self) -> MetaResult<()> {
-        self.bootstrap_allocator_state_with_remote_recovery(false)
+        self.bootstrap_allocator_state_with_local_state(self.local.read_allocator_state(), false)
     }
 
-    pub(super) fn try_restore_allocator_state_from_local(&self) -> MetaResult<bool> {
-        let Some(state) = self.local.read_allocator_state()? else {
-            return Ok(false);
-        };
-        self.activate_allocator_state(state)?;
-        self.refresh_pg_sync_lifecycle_for_allocator();
-        Ok(true)
-    }
-
-    fn bootstrap_allocator_state_with_remote_recovery(
+    pub(super) fn bootstrap_allocator_state_with_local_state(
         &self,
+        local_state: MetaResult<Option<AllocatorStateV1>>,
         allow_remote_recovery: bool,
     ) -> MetaResult<()> {
-        let (allocator_state, loaded_state_result) = match self.local.read_allocator_state() {
+        let mint_and_persist = || {
+            self.mint_allocator_state().and_then(|state| {
+                self.local.replace_allocator_state(state)?;
+                Ok(state)
+            })
+        };
+        let (allocator_state, loaded_state_result) = match local_state {
             Ok(Some(state)) => ("trusted", Ok(state)),
-            Ok(None) if allow_remote_recovery => (
-                "new",
-                self.mint_allocator_state().and_then(|state| {
-                    self.local.replace_allocator_state(state)?;
-                    Ok(state)
-                }),
-            ),
+            Ok(None) if allow_remote_recovery => ("new", mint_and_persist()),
             Ok(None) => (
                 "missing",
                 Err(MetaError::Storage(
@@ -207,13 +201,7 @@ impl PgMetaEngine {
                         .to_string(),
                 )),
             ),
-            Err(_error) if allow_remote_recovery => (
-                "untrustworthy",
-                self.mint_allocator_state().and_then(|state| {
-                    self.local.replace_allocator_state(state)?;
-                    Ok(state)
-                }),
-            ),
+            Err(_error) if allow_remote_recovery => ("untrustworthy", mint_and_persist()),
             Err(error) => ("untrustworthy", Err(error)),
         };
         let result = loaded_state_result.and_then(|state| {

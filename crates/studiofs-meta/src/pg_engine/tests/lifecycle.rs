@@ -3469,6 +3469,38 @@ fn allocator_pending_retries_missing_allocator_authority() {
 }
 
 #[test]
+fn allocator_pending_recovers_without_startup_target() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)
+        .expect("clear fresh-client marker for existing client");
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::AllocatorPending as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    engine
+        .metadata_startup_target_version
+        .store(-1, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(13, 0).expect("inode namespace"),
+        AllocatorRecord::new(14, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || Ok(recovered_state)));
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("allocator-pending client recovers without a startup target");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(engine.next_inode().is_ok());
+}
+
+#[test]
 fn transient_allocator_bootstrap_recovers_on_background_retry() {
     let (_dir, engine) = fresh_allocator_recovery_fixture();
 
@@ -3598,6 +3630,75 @@ fn allocator_bootstrap_does_not_hold_retry_lock_during_mint() {
         .expect("allocator bootstrap must not deadlock on its retry lock")
         .expect("allocator bootstrap retry remains recoverable");
     worker.join().expect("allocator bootstrap worker panicked");
+}
+
+#[test]
+fn allocator_bootstrap_panic_releases_in_flight_state_and_can_retry() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    engine
+        .local
+        .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 0)
+        .expect("clear fresh-client marker for allocator-only retry");
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = std::sync::Arc::clone(&attempts);
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(23, 0).expect("inode namespace"),
+        AllocatorRecord::new(24, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        if hook_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+            panic!("simulated allocator bootstrap panic");
+        }
+        Ok(recovered_state)
+    }));
+
+    let first_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine
+            .try_complete_catchup_sync()
+            .expect("first attempt reaches allocator bootstrap");
+    }));
+    assert!(first_attempt.is_err());
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("allocator bootstrap can retry after panic");
+
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 2);
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+}
+
+#[test]
+fn fresh_client_marker_clear_failure_keeps_engine_read_only() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let recovered_state = AllocatorStateV1::new(
+        AllocatorRecord::new(25, 0).expect("inode namespace"),
+        AllocatorRecord::new(26, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || Ok(recovered_state)));
+    engine.set_catch_up_fault_hook(std::sync::Arc::new(|point| {
+        if point == CatchUpFaultPoint::BeforeFreshClientMarkerClear {
+            return Err(MetaError::Storage("marker clear failed".to_string()));
+        }
+        Ok(())
+    }));
+
+    let error = engine
+        .try_complete_catchup_sync()
+        .expect_err("marker clear failure must be surfaced");
+
+    assert!(matches!(error, MetaError::Storage(_)));
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read retained fresh-client marker"),
+        1
+    );
 }
 
 #[test]

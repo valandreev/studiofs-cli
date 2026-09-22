@@ -24,13 +24,16 @@ The behavior is demonstrated by a focused regression that fails before the chang
 - [x] (2026-09-22 17:45Z) Verified the attached review: released retry-state locking before remote mint, preserved backoff through poisoned mutexes, guarded allocator activation failures, refreshed lifecycle after slot registration, added bounded jitter, and covered the confirmed races with focused tests.
 - [x] (2026-09-22 18:31Z) Verified the follow-up review: allocator bootstrap now returns `MetaResult`, records redacted `PgSyncFailure` diagnostics, retries only reachability errors, and suppresses repeated minting after permanent/local failures.
 - [x] (2026-09-22 18:31Z) Added `permanent_allocator_bootstrap_failure_is_not_retried`; current allocator-bootstrap group passed 7/7 and the full metadata library passed 633/633 non-ignored tests.
+- [x] (2026-09-22 18:55Z) Verified the attached review: `AllocatorPending` can recover with no frozen startup target; panic-safe retry cleanup and marker-clear failure handling now have regressions; allocator retry reuses its single local-state read, consolidates mint/persist, and checks runtime state outside the retry mutex.
+- [x] (2026-09-22 18:55Z) Kept the frozen-target assignment in the fresh-client reopen test: that reopened lifecycle is `CatchingUp`, where the target gates replay; added separate coverage for `AllocatorPending` with target `-1`.
+- [x] (2026-09-22 18:55Z) Re-ran metadata library tests excluding the reopen case: 635 passed, 137 ignored, 1 filtered. The reopen case could not run because PostgreSQL was unavailable at its configured local endpoint. `cargo check`, Clippy with `-D warnings`, formatting, and `git diff --check` passed.
 
 ## Surprises & Discoveries
 
-- Observation: `try_complete_catchup_sync()` currently clears `LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER` before allocator bootstrap and unconditionally resets the frozen target at the end.
-  Evidence: `crates/studiofs-meta/src/pg_engine.rs`, current lines 761-784.
-- Observation: `bootstrap_allocator_state_with_remote_recovery()` records a failed mint only through a warning and refreshes lifecycle authority; it does not return success to its caller.
-  Evidence: `crates/studiofs-meta/src/pg_engine/inode_allocator.rs`, current lines 171-225.
+- Initial observation: `try_complete_catchup_sync()` cleared `LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER` before allocator bootstrap and unconditionally reset the frozen target at the end.
+  Evidence: the pre-review implementation in `crates/studiofs-meta/src/pg_engine.rs`.
+- Initial observation: `bootstrap_allocator_state_with_remote_recovery()` recorded a failed mint only through a warning and refreshed lifecycle authority; it did not return success to its caller.
+  Evidence: the pre-review implementation in `crates/studiofs-meta/src/pg_engine/inode_allocator.rs`.
 - Observation: the fallback poll selects normal metadata sync for `AllocatorPending`, while `try_complete_catchup_sync()` only accepts `CatchingUp` or `Degraded`.
   Evidence: `crates/studiofs-meta/src/pg_engine/lifecycle.rs`, current lines 520-535, and `crates/studiofs-meta/src/pg_engine.rs`, current lines 718-724.
 - Observation: the existing allocator contract says trusted exhausted state stays read-only; only missing or untrustworthy runtime state is eligible for remote namespace minting.
@@ -41,6 +44,14 @@ The behavior is demonstrated by a focused regression that fails before the chang
   Evidence: the transient retry regression exercises the same completion entry point after a successful fallback-poll result.
 - Observation: the previous retry helper reduced every allocator bootstrap error to `false`, so a permanent PostgreSQL allocator error or local `redb` replacement failure entered the same mint backoff as a reachability outage.
   Evidence: the new regression injects `MetaError::Storage("postgres allocator namespace exhausted")`, observes one mint attempt, and confirms the typed `PgSyncFailure::Storage` remains visible after the next sync tick.
+- Observation: each retry now passes its already-read `MetaResult<Option<AllocatorStateV1>>` into the shared allocator bootstrap path, avoiding a second `redb` read immediately before a remote mint.
+  Evidence: `bootstrap_allocator_state_with_retry()` reads once in `pg_engine.rs`; `bootstrap_allocator_state_with_local_state()` consumes that result in `pg_engine/inode_allocator.rs`.
+- Observation: panicking during allocator mint leaves catch-up at `TargetReached`; clearing only the retry flag would not make the next catch-up eligible.
+  Evidence: the panic regression fails unless both the in-flight marker is released and `TargetReached` is moved back to `Degraded`; the retry then reaches `Live`.
+- Observation: failure to clear the durable fresh-client marker happens after allocator activation may have promoted the lifecycle to `Live`.
+  Evidence: the injected marker-write failure now returns the typed storage error, retains the marker, and moves the lifecycle back to read-only `Degraded`.
+- Observation: the reopen recovery test enters `CatchingUp`, not `AllocatorPending`, so removing its explicit target would bypass the replay-completion condition rather than test target-less allocator recovery.
+  Evidence: the separate `allocator_pending_recovers_without_startup_target` test proves the only lifecycle allowed to recover without a target, while the reopen test retains its frozen-target setup.
 
 ## Decision Log
 
@@ -77,15 +88,20 @@ The behavior is demonstrated by a focused regression that fails before the chang
 - Decision: Preserve a permanent allocator diagnostic across a successful metadata-sync tick while retry is suppressed, then clear it only after allocator recovery.
   Rationale: metadata transport success does not grant allocator mutation authority; clearing the only diagnostic before the suppressed retry runs would hide the reason the lifecycle remains `AllocatorPending`.
   Date/Author: 2026-09-22 / Codex.
+- Decision: Keep the frozen replay target for the reopened fresh-client test and handle no-target recovery only for `AllocatorPending`.
+  Rationale: a reopened `CatchingUp` client must finish replay before allocator completion; treating target `-1` as reached there would weaken the replay gate.
+  Date/Author: 2026-09-22 / Codex.
+- Decision: Use a drop guard to release allocator retry single-flight state after panic and demote abandoned `TargetReached` to `Degraded`.
+  Rationale: the next sync must be eligible to retry and must not mistake an interrupted bootstrap for a completed catch-up.
+  Date/Author: 2026-09-22 / Codex.
 
 ## Outcomes & Retrospective
 
-Implementation complete. Validation evidence:
+Implementation and attached-review follow-up complete. Latest validation evidence:
 
-- `cargo test -p studiofs-meta --lib allocator_bootstrap -- --nocapture`: 7 passed, 0 failed.
-- `cargo test -p studiofs-meta --lib catching_up_fresh_client -- --nocapture`: 2 passed, 0 failed.
-- `cargo test -p studiofs-meta --lib degraded_fresh_client -- --nocapture`: 5 passed, 0 failed.
-- `cargo test -p studiofs-meta --lib --quiet`: 633 passed, 0 failed, 137 ignored.
+- `cargo test -p studiofs-meta --lib --quiet -- --skip failed_allocator_bootstrap_survives_reopen_and_recovers`: 635 passed, 0 failed, 137 ignored, 1 filtered.
+- `cargo test -p studiofs-meta --lib allocator_bootstrap -- --nocapture`: 7 passed; the reopen test failed before assertions because PostgreSQL was unavailable at its configured local endpoint.
+- The focused target-less allocator recovery, panic retry, marker-clear failure, and retry-lock tests passed.
 - `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 
 No live PostgreSQL or mounted native acceptance ran because the service-backed tests remain environment-gated; no commit, push, or external Linear mutation was made.
@@ -94,7 +110,7 @@ No live PostgreSQL or mounted native acceptance ran because the service-backed t
 
 `PgMetaEngine` in `crates/studiofs-meta/src/pg_engine.rs` owns the local-first PostgreSQL lifecycle. Foreground metadata remains in local `redb`; PostgreSQL is used for identity, replay, client-slot registration, and allocator namespace minting. `PgSyncLifecycle::CatchingUp` and `Degraded` represent unfinished remote convergence. `TargetReached` means the frozen replay target is complete but does not grant mutation authority. `AllocatorPending` means the paired local allocator authority is unavailable. Only `Live` plus both allocator headroom flags permits new mutations.
 
-`try_complete_catchup_sync()` is called after a successful metadata sync by `record_metadata_sync_result()` in `crates/studiofs-meta/src/pg_engine/metadata_sync.rs`. It reserves a fresh client slot, promotes the lifecycle, and bootstraps missing allocator state. `bootstrap_allocator_state_with_remote_recovery()` in `crates/studiofs-meta/src/pg_engine/inode_allocator.rs` mints a paired inode/payload namespace through PostgreSQL and then calls `RedbMetaEngine::replace_allocator_state`; that local write is the durability boundary. `start_background_poll()` in `crates/studiofs-meta/src/pg_engine/lifecycle.rs` owns the periodic fallback sync and its shutdown condition.
+`try_complete_catchup_sync()` is called after a successful metadata sync by `record_metadata_sync_result()` in `crates/studiofs-meta/src/pg_engine/metadata_sync.rs`. It reserves a fresh client slot, promotes the lifecycle, and bootstraps missing allocator state. `bootstrap_allocator_state_with_local_state()` in `crates/studiofs-meta/src/pg_engine/inode_allocator.rs` receives one local `redb` read result, activates a trusted pair, or mints and persists a replacement pair through PostgreSQL and then `RedbMetaEngine::replace_allocator_state`; that local write is the durability boundary. `start_background_poll()` in `crates/studiofs-meta/src/pg_engine/lifecycle.rs` owns the periodic fallback sync and its shutdown condition.
 
 The durable fresh-client marker is `LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER` (`pgFreshClientPending`). A nonzero value means fresh-client authority bootstrap is unfinished. It is copied through checkpoint import and must remain nonzero until the allocator pair is durably stored. The implementation must not move PostgreSQL into the foreground mutation path, clear the marker on failure, retry trusted exhausted namespaces, or use sleeps as test synchronization.
 
@@ -163,7 +179,7 @@ The primary artifacts are the focused test output, the final diff for the three 
 The final implementation keeps these existing interfaces and adds no external dependency:
 
 - `PgMetaEngine::try_complete_catchup_sync()` remains the lifecycle completion entry point used by metadata synchronization.
-- `PgMetaEngine::bootstrap_allocator_state()` and `bootstrap_allocator_state_local_only()` return `MetaResult<()>`; their shared `bootstrap_allocator_state_with_remote_recovery()` path remains the single path that mints or loads the paired allocator state and exposes the actual `MetaError` to its caller.
+- `PgMetaEngine::bootstrap_allocator_state_local_only()` is the production startup restore path. The test-only `bootstrap_allocator_state()` wrapper and production `bootstrap_allocator_state_with_local_state()` share one typed result path; allocator retry passes in its initial local read, and that path either activates the trusted pair or mints and durably persists a new pair.
 - `RedbMetaEngine::replace_allocator_state()` remains the local durability boundary.
 - `PgSyncLifecycle::AllocatorPending` remains read-only and transitions to `Live` only after identity validation and paired allocator headroom are true.
 - The existing `PgBackgroundWorkers` poll worker remains responsible for shutdown and retry scheduling.
