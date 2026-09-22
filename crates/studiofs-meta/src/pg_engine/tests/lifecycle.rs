@@ -3538,15 +3538,106 @@ fn transient_allocator_bootstrap_recovers_on_background_retry() {
 }
 
 #[test]
+fn allocator_bootstrap_does_not_hold_retry_lock_during_mint() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let engine = std::sync::Arc::new(engine);
+    let hook_engine = std::sync::Arc::downgrade(&engine);
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        hook_engine
+            .upgrade()
+            .expect("allocator engine still alive")
+            .retry_allocator_bootstrap_now_for_test();
+        Err(MetaError::RemoteUnavailable(
+            "transient allocator bootstrap failure".to_string(),
+        ))
+    }));
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_engine = std::sync::Arc::clone(&engine);
+    let worker = std::thread::spawn(move || {
+        result_tx
+            .send(worker_engine.try_complete_catchup_sync())
+            .expect("send allocator bootstrap result");
+    });
+    result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("allocator bootstrap must not deadlock on its retry lock")
+        .expect("allocator bootstrap retry remains recoverable");
+    worker.join().expect("allocator bootstrap worker panicked");
+}
+
+#[test]
+fn poisoned_allocator_retry_state_preserves_backoff() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    let engine = std::sync::Arc::new(engine);
+    let poisoned_engine = std::sync::Arc::clone(&engine);
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned_engine
+                .allocator_bootstrap_retry_state
+                .lock()
+                .expect("allocator retry state lock");
+            panic!("poison allocator retry state");
+        }));
+    })
+    .join()
+    .expect("poisoning worker panicked outside catch_unwind");
+
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = std::sync::Arc::clone(&attempts);
+    engine.set_allocator_bootstrap_hook(std::sync::Arc::new(move || {
+        hook_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Err(MetaError::RemoteUnavailable(
+            "transient allocator bootstrap failure".to_string(),
+        ))
+    }));
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("first allocator bootstrap attempt");
+    let sync_result = Ok(false);
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &sync_result, false);
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "poisoned retry state must retain the backoff gate"
+    );
+}
+
+#[test]
 fn allocator_bootstrap_retry_delay_is_bounded() {
-    assert_eq!(
-        PgMetaEngine::next_allocator_bootstrap_retry_delay(Duration::from_secs(1)),
-        Duration::from_secs(2)
-    );
-    assert_eq!(
-        PgMetaEngine::next_allocator_bootstrap_retry_delay(Duration::from_secs(30)),
-        Duration::from_secs(30)
-    );
+    let next = PgMetaEngine::next_allocator_bootstrap_retry_delay(Duration::from_secs(1));
+    assert!(next >= Duration::from_secs(2));
+    assert!(next <= Duration::from_millis(2_500));
+    let capped = PgMetaEngine::next_allocator_bootstrap_retry_delay(Duration::from_secs(30));
+    assert!(capped >= Duration::from_millis(22_500));
+    assert!(capped < Duration::from_secs(30));
+}
+
+#[test]
+fn poisoned_allocator_runtime_does_not_restore_write_authority() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let engine = std::sync::Arc::new(engine);
+    let poisoned_engine = std::sync::Arc::clone(&engine);
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned_engine
+                .allocator_runtime
+                .lock()
+                .expect("allocator runtime lock");
+            panic!("poison allocator runtime");
+        }));
+    })
+    .join()
+    .expect("poisoning worker panicked outside catch_unwind");
+
+    assert!(!engine.bootstrap_allocator_state());
+    let status = engine.pg_sync_status();
+    assert_eq!(status.lifecycle, PgSyncLifecycle::AllocatorPending);
+    assert!(!status.allows_new_mutations());
+    assert!(!status.authority.inode_id_headroom);
+    assert!(!status.authority.object_id_headroom);
 }
 
 #[test]
@@ -3723,6 +3814,29 @@ fn catching_up_fresh_client_slot_failure_becomes_degraded() {
 
     assert!(engine.try_complete_catchup_sync().is_err());
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+}
+
+#[test]
+fn allocator_pending_fresh_client_slot_failure_becomes_degraded() {
+    let (_dir, engine) = fresh_allocator_recovery_fixture();
+    engine
+        .local
+        .set_counter(LOCAL_PG_CLIENT_SLOT_COUNTER, 0)
+        .expect("clear client slot");
+    engine.pg_sync_lifecycle.store(
+        PgSyncLifecycle::AllocatorPending as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    assert!(engine.try_complete_catchup_sync().is_err());
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
+            .expect("read fresh-client marker"),
+        1
+    );
 }
 
 #[test]

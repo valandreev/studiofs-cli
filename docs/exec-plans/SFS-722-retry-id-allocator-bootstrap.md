@@ -19,6 +19,7 @@ The behavior is demonstrated by a focused regression that fails before the chang
 - [x] (2026-09-22 17:14Z) Preserved trusted exhausted-namespace read-only behavior and added reopen recovery coverage.
 - [x] (2026-09-22 17:14Z) Passed focused tests, `cargo check -p studiofs-meta`, Clippy with `-D warnings`, formatting, and `git diff --check`.
 - [x] (2026-09-22 17:16Z) Recorded final package-library evidence and the PostgreSQL-gated coverage boundary; no commit, push, or Linear mutation was performed.
+- [x] (2026-09-22 17:45Z) Verified the attached review: released retry-state locking before remote mint, preserved backoff through poisoned mutexes, guarded allocator activation failures, refreshed lifecycle after slot registration, added bounded jitter, and covered the confirmed races with focused tests.
 
 ## Surprises & Discoveries
 
@@ -52,15 +53,27 @@ The behavior is demonstrated by a focused regression that fails before the chang
 - Decision: Try the local durable allocator state before applying the retry deadline to remote minting.
   Rationale: local redb remains authoritative for foreground recovery, and a pair that became durable must not be delayed by a previous remote failure.
   Date/Author: 2026-09-22 / Codex.
+- Decision: Reserve allocator retry attempts with an in-flight marker, release the retry mutex before PostgreSQL minting, and recover poisoned retry guards with `into_inner()`.
+  Rationale: the existing fallback poll remains single-flight for the retry state without holding an in-memory lock across bounded network I/O; a poisoned mutex must not disable the backoff schedule.
+  Date/Author: 2026-09-22 / Codex.
+- Decision: Treat allocator-runtime activation failure as a failed bootstrap and keep both headroom flags closed.
+  Rationale: lifecycle promotion requires an actually installed paired runtime; a poisoned allocator mutex must never produce a `Live` status from stale atomics.
+  Date/Author: 2026-09-22 / Codex.
+- Decision: Add bounded jitter to allocator retry delay using the existing `rand` dependency and checkpoint retry convention.
+  Rationale: independent clients should not replay allocator mint requests at identical deterministic deadlines after a shared PostgreSQL outage.
+  Date/Author: 2026-09-22 / Codex.
+- Decision: Keep allocator retry defaults internal rather than adding environment configuration.
+  Rationale: SFS-722 has no deployment requirement for tuning these values, and the deterministic test-only wakeup already avoids test sleeps without expanding the runtime configuration surface.
+  Date/Author: 2026-09-22 / Codex.
 
 ## Outcomes & Retrospective
 
 Implementation complete. Validation evidence:
 
-- `cargo test -p studiofs-meta --lib allocator -- --nocapture`: 40 passed, 0 failed, 4 ignored; the ignored allocator tests require `STUDIOFS_TEST_PG_DSN`.
+- `cargo test -p studiofs-meta --lib allocator -- --nocapture`: 44 passed, 0 failed, 4 ignored; the ignored allocator tests require `STUDIOFS_TEST_PG_DSN`.
 - `cargo test -p studiofs-meta --lib catching_up_fresh_client -- --nocapture`: 2 passed, 0 failed.
 - `cargo test -p studiofs-meta --lib degraded_fresh_client -- --nocapture`: 5 passed, 0 failed.
-- `cargo test -p studiofs-meta --lib --quiet`: 628 passed, 0 failed, 137 ignored.
+- `cargo test -p studiofs-meta --lib --quiet`: 632 passed, 0 failed, 137 ignored.
 - `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 
 No live PostgreSQL or mounted native acceptance ran because the service-backed tests were ignored without `STUDIOFS_TEST_PG_DSN`; no commit, push, or external Linear mutation was made.

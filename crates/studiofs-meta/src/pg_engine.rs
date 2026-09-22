@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -546,9 +546,8 @@ impl PgMetaEngine {
     }
 
     pub(super) fn retry_allocator_bootstrap_now_for_test(&self) {
-        if let Ok(mut retry) = self.allocator_bootstrap_retry_state.lock() {
-            retry.next_attempt_at = None;
-        }
+        let mut retry = self.lock_allocator_bootstrap_retry_state();
+        retry.next_attempt_at = None;
     }
 }
 
@@ -572,6 +571,7 @@ struct HeldFileLockLease {
 struct AllocatorBootstrapRetryState {
     next_attempt_at: Option<Instant>,
     retry_delay: Duration,
+    attempt_in_flight: bool,
 }
 
 impl Default for AllocatorBootstrapRetryState {
@@ -579,8 +579,16 @@ impl Default for AllocatorBootstrapRetryState {
         Self {
             next_attempt_at: None,
             retry_delay: Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS),
+            attempt_in_flight: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AllocatorBootstrapOutcome {
+    BackoffDeferred,
+    Failed,
+    Recovered,
 }
 
 #[derive(Default)]
@@ -750,56 +758,76 @@ impl PgMetaEngine {
         });
     }
 
-    fn bootstrap_allocator_state_with_retry(&self) -> Option<bool> {
+    fn bootstrap_allocator_state_with_retry(&self) -> AllocatorBootstrapOutcome {
         if self
             .try_restore_allocator_state_from_local()
             .unwrap_or(false)
         {
             self.reset_allocator_bootstrap_retry();
-            return Some(true);
+            return AllocatorBootstrapOutcome::Recovered;
         }
 
-        let mut retry = match self.allocator_bootstrap_retry_state.lock() {
-            Ok(retry) => retry,
-            Err(_) => return Some(self.bootstrap_allocator_state()),
-        };
-        if !self.allocator_runtime_state_missing() {
+        let delay = {
+            let mut retry = self.lock_allocator_bootstrap_retry_state();
+            if !self.allocator_runtime_state_missing() {
+                retry.next_attempt_at = None;
+                retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
+                retry.attempt_in_flight = false;
+                return AllocatorBootstrapOutcome::Recovered;
+            }
+            if retry.attempt_in_flight
+                || retry
+                    .next_attempt_at
+                    .is_some_and(|next_attempt_at| Instant::now() < next_attempt_at)
+            {
+                return AllocatorBootstrapOutcome::BackoffDeferred;
+            }
+
+            let delay = retry
+                .retry_delay
+                .max(Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS));
+            retry.retry_delay = delay;
+            retry.attempt_in_flight = true;
             retry.next_attempt_at = None;
-            retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
-            return Some(true);
-        }
-        if retry
-            .next_attempt_at
-            .is_some_and(|next_attempt_at| Instant::now() < next_attempt_at)
-        {
-            return None;
-        }
+            delay
+        };
 
         let recovered = self.bootstrap_allocator_state();
+        let mut retry = self.lock_allocator_bootstrap_retry_state();
+        retry.attempt_in_flight = false;
         if recovered {
             retry.next_attempt_at = None;
             retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
         } else {
-            let delay = retry.retry_delay;
             retry.next_attempt_at = Some(Instant::now() + delay);
             retry.retry_delay = Self::next_allocator_bootstrap_retry_delay(delay);
         }
-        Some(recovered)
+        if recovered {
+            AllocatorBootstrapOutcome::Recovered
+        } else {
+            AllocatorBootstrapOutcome::Failed
+        }
+    }
+
+    fn lock_allocator_bootstrap_retry_state(&self) -> MutexGuard<'_, AllocatorBootstrapRetryState> {
+        self.allocator_bootstrap_retry_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn reset_allocator_bootstrap_retry(&self) {
-        if let Ok(mut retry) = self.allocator_bootstrap_retry_state.lock() {
-            retry.next_attempt_at = None;
-            retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
-        }
+        let mut retry = self.lock_allocator_bootstrap_retry_state();
+        retry.next_attempt_at = None;
+        retry.retry_delay = Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS);
+        retry.attempt_in_flight = false;
     }
 
     /// Complete local catch-up after a successful sync has reached the frozen
     /// startup target.
     pub(super) fn try_complete_catchup_sync(&self) -> MetaResult<()> {
-        let current = self.current_pg_sync_lifecycle();
+        let initial_lifecycle = self.current_pg_sync_lifecycle();
         if !matches!(
-            current,
+            initial_lifecycle,
             PgSyncLifecycle::CatchingUp
                 | PgSyncLifecycle::Degraded
                 | PgSyncLifecycle::AllocatorPending
@@ -823,15 +851,19 @@ impl PgMetaEngine {
             != 0;
         if fresh_client_pending && let Err(error) = self.ensure_client_slot_for_fresh_client() {
             self.update_pg_sync_lifecycle(|current| match current {
-                PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded => {
-                    PgSyncLifecycle::Degraded
-                }
+                PgSyncLifecycle::CatchingUp
+                | PgSyncLifecycle::Degraded
+                | PgSyncLifecycle::AllocatorPending => PgSyncLifecycle::Degraded,
                 current => current,
             });
             return Err(error);
         }
 
-        let mut reached_target = current == PgSyncLifecycle::AllocatorPending;
+        let active_lifecycle = self.current_pg_sync_lifecycle();
+        if active_lifecycle == PgSyncLifecycle::Fatal {
+            return Err(MetaError::LifecycleFatal);
+        }
+        let mut reached_target = active_lifecycle == PgSyncLifecycle::AllocatorPending;
         while !reached_target {
             if !self.update_pg_sync_lifecycle(|current| match current {
                 PgSyncLifecycle::Degraded => PgSyncLifecycle::CatchingUp,
@@ -846,18 +878,16 @@ impl PgMetaEngine {
             return Ok(());
         }
 
-        let allocator_bootstrapped = if self.allocator_runtime_state_missing() {
-            let Some(recovered) = self.bootstrap_allocator_state_with_retry() else {
+        if self.allocator_runtime_state_missing() {
+            if !matches!(
+                self.bootstrap_allocator_state_with_retry(),
+                AllocatorBootstrapOutcome::Recovered
+            ) {
                 return Ok(());
-            };
-            recovered
+            }
         } else {
             self.reset_allocator_bootstrap_retry();
             self.refresh_pg_sync_lifecycle_for_allocator();
-            true
-        };
-        if !allocator_bootstrapped {
-            return Ok(());
         }
         if fresh_client_pending {
             self.local
@@ -874,10 +904,27 @@ impl PgMetaEngine {
 
     fn next_allocator_bootstrap_retry_delay(current: Duration) -> Duration {
         let max_delay = Duration::from_secs(MAX_ALLOCATOR_BOOTSTRAP_RETRY_SECS);
-        current
+        let exponential = current
             .max(Duration::from_millis(DEFAULT_ALLOCATOR_BOOTSTRAP_RETRY_MS))
             .checked_mul(2)
-            .map_or(max_delay, |delay| delay.min(max_delay))
+            .map_or(max_delay, |delay| delay.min(max_delay));
+        let jitter_limit_ms =
+            u64::try_from((exponential.as_millis() / 4).min(u128::from(u64::MAX)))
+                .unwrap_or(u64::MAX);
+        if jitter_limit_ms == 0 {
+            return exponential;
+        }
+        let jitter_ms = if exponential == max_delay {
+            rand::random_range(1..=jitter_limit_ms)
+        } else {
+            rand::random_range(0..=jitter_limit_ms)
+        };
+        let jitter = Duration::from_millis(jitter_ms);
+        if exponential == max_delay {
+            exponential.saturating_sub(jitter)
+        } else {
+            exponential.saturating_add(jitter).min(max_delay)
+        }
     }
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {

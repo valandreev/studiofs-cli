@@ -182,7 +182,7 @@ impl PgMetaEngine {
         let Some(state) = self.local.read_allocator_state()? else {
             return Ok(false);
         };
-        self.activate_allocator_state(state);
+        self.activate_allocator_state(state)?;
         self.refresh_pg_sync_lifecycle_for_allocator();
         Ok(true)
     }
@@ -213,11 +213,11 @@ impl PgMetaEngine {
             ),
             Err(error) => ("untrustworthy", Err(error)),
         };
-        let recovered = match loaded_state_result {
-            Ok(state) => {
-                self.activate_allocator_state(state);
-                true
-            }
+        let recovered = match loaded_state_result.and_then(|state| {
+            self.activate_allocator_state(state)?;
+            Ok(())
+        }) {
+            Ok(()) => true,
             Err(error) => {
                 self.inode_id_headroom_available
                     .store(false, Ordering::Release);
@@ -236,18 +236,22 @@ impl PgMetaEngine {
         recovered
     }
 
-    fn activate_allocator_state(&self, state: AllocatorStateV1) {
+    fn activate_allocator_state(&self, state: AllocatorStateV1) -> MetaResult<()> {
         let inode_id_headroom = state.inode.reserved_through() < COUNTER_LIMIT;
         let object_id_headroom = state.payload.reserved_through() < COUNTER_LIMIT;
-        if let Ok(mut runtime) = self.allocator_runtime.lock() {
-            runtime.state = Some(state);
-            runtime.inode_batch = 0..0;
-            runtime.payload_batch = 0..0;
-        }
+        let mut runtime = self
+            .allocator_runtime
+            .lock()
+            .map_err(|_| MetaError::Storage("allocator runtime lock poisoned".to_string()))?;
+        runtime.state = Some(state);
+        runtime.inode_batch = 0..0;
+        runtime.payload_batch = 0..0;
+        drop(runtime);
         self.inode_id_headroom_available
             .store(inode_id_headroom, Ordering::Release);
         self.object_id_headroom_available
             .store(object_id_headroom, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn allocator_runtime_state_missing(&self) -> bool {
