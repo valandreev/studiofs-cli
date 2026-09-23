@@ -100,7 +100,7 @@ impl RedbMetaEngine {
         Self::get_inode_lifecycle_from_read_txn(&txn, ino)
     }
 
-    pub(crate) fn get_inode_lifecycle_from_read_txn(
+    pub(super) fn get_inode_lifecycle_from_read_txn(
         txn: &ReadTransaction,
         ino: Ino,
     ) -> MetaResult<Option<InodeLifecycleRecord>> {

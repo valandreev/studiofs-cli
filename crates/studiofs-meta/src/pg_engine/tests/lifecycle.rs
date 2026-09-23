@@ -5287,10 +5287,11 @@ fn pg_checkpoint_publishes_captured_cut_while_local_writes_continue_and_replays_
     let checkpoint = read_pg_checkpoint(&dsn, volume.volume_id);
     let checkpoint_state: crate::snapshot::ServingCheckpoint =
         postcard::from_bytes(&checkpoint.snapshot).expect("decode published checkpoint");
+    let concurrent_write_prefix = b"checkpoint-cut-write";
     assert!(
         checkpoint_state.dentries.iter().all(|(key, _)| {
-            !key.windows(first_write.len())
-                .any(|window| window == first_write.as_bytes())
+            !key.windows(concurrent_write_prefix.len())
+                .any(|window| window == concurrent_write_prefix)
         }),
         "the checkpoint bytes must remain at the captured cut"
     );

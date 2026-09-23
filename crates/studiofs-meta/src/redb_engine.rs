@@ -51,10 +51,6 @@ pub(crate) struct ServingCheckpointReadSnapshot {
 }
 
 impl ServingCheckpointReadSnapshot {
-    pub(crate) fn read_txn(&self) -> &ReadTransaction {
-        &self.transaction
-    }
-
     pub(crate) fn get_counter(&self, name: &str) -> MetaResult<u64> {
         let table = self
             .transaction
@@ -64,6 +60,18 @@ impl ServingCheckpointReadSnapshot {
             .get(name)
             .map_err(|error| MetaError::Storage(error.to_string()))?
             .map_or(0, |value| value.value()))
+    }
+
+    pub(crate) fn format_info(&self) -> MetaResult<crate::schema::FormatInfo> {
+        RedbMetaEngine::read_format_info_from_read_txn(&self.transaction)
+    }
+
+    pub(crate) fn export_serving_checkpoint_bytes(&self) -> MetaResult<Vec<u8>> {
+        let checkpoint =
+            RedbMetaEngine::export_serving_checkpoint_from_read_txn(&self.transaction)?;
+        postcard::to_stdvec(&checkpoint).map_err(|error| {
+            MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
+        })
     }
 }
 

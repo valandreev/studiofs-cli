@@ -16,13 +16,6 @@ impl RedbMetaEngine {
         crate::decode_format_info(entry.value())
     }
 
-    pub(crate) fn get_format_info_from_checkpoint_snapshot(
-        &self,
-        snapshot: &ServingCheckpointReadSnapshot,
-    ) -> MetaResult<FormatInfo> {
-        Self::read_format_info_from_read_txn(snapshot.read_txn())
-    }
-
     /// Read persisted format metadata from a redb file without opening the full engine.
     pub fn read_format_info_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
         let db = match ReadOnlyDatabase::open(path.as_ref()) {

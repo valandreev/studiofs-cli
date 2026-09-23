@@ -41,6 +41,7 @@ impl CheckpointCoordinatorState {
 
 pub(super) struct CheckpointSourceCut {
     version: i64,
+    // Kept for cut diagnostics; publication no longer gates on the live event sequence.
     event_seq: u64,
     total_event_payload_bytes: i64,
     snapshot: ServingCheckpointReadSnapshot,
@@ -49,7 +50,7 @@ pub(super) struct CheckpointSourceCut {
 struct BuiltCheckpoint {
     metadata_format_version: i16,
     payload: Vec<u8>,
-    checkpoint_sha256: Vec<u8>,
+    checkpoint_sha256: [u8; 32],
     format_info: Vec<u8>,
 }
 
@@ -236,12 +237,8 @@ impl PgMetaEngine {
         } = cut;
         // The redb read transaction was captured with the source cut. Exporting
         // from it keeps the payload at that version while writes continue.
-        let payload = self
-            .local
-            .export_serving_checkpoint_bytes_from_snapshot(&snapshot)?;
-        let format_info = self
-            .local
-            .get_format_info_from_checkpoint_snapshot(&snapshot)?;
+        let payload = snapshot.export_serving_checkpoint_bytes()?;
+        let format_info = snapshot.format_info()?;
         drop(snapshot);
         let metadata_format_version = i16::try_from(format_info.format_version).map_err(|_| {
             MetaError::Storage("metadata format version exceeds PostgreSQL SMALLINT".to_string())
@@ -249,7 +246,7 @@ impl PgMetaEngine {
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
-        let checkpoint_sha256 = Sha256::digest(&payload).to_vec();
+        let checkpoint_sha256: [u8; 32] = Sha256::digest(&payload).into();
 
         let checkpoint = BuiltCheckpoint {
             metadata_format_version,
@@ -258,6 +255,7 @@ impl PgMetaEngine {
             format_info,
         };
         tracing::debug!(
+            volume_id = self.volume_id,
             version,
             event_seq,
             "built checkpoint from captured source cut"
@@ -496,7 +494,7 @@ impl PgMetaEngine {
                                     &version,
                                     &total_event_payload_bytes,
                                     &checkpoint.payload,
-                                    &checkpoint.checkpoint_sha256,
+                                    &&checkpoint.checkpoint_sha256[..],
                                     &checkpoint.format_info,
                                     &owner,
                                     &fencing_token,

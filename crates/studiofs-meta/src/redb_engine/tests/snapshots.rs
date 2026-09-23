@@ -1,4 +1,51 @@
 #[test]
+fn serving_checkpoint_read_snapshot_exports_only_the_captured_state() {
+    let engine = temp_engine();
+    for name in [b"checkpoint-before-a".as_slice(), b"checkpoint-before-b"] {
+        engine
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create entry before snapshot");
+    }
+
+    let snapshot = engine
+        .begin_serving_checkpoint_snapshot()
+        .expect("capture checkpoint snapshot");
+    for name in [b"checkpoint-after-c".as_slice(), b"checkpoint-after-d"] {
+        engine
+            .create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create entry after snapshot");
+    }
+
+    let captured_bytes = snapshot
+        .export_serving_checkpoint_bytes()
+        .expect("export captured checkpoint");
+    let captured: crate::snapshot::ServingCheckpoint =
+        postcard::from_bytes(&captured_bytes).expect("decode captured checkpoint");
+    let contains_name = |checkpoint: &crate::snapshot::ServingCheckpoint, name: &[u8]| {
+        checkpoint.dentries.iter().any(|(key, _)| {
+            key.windows(name.len())
+                .any(|window| window == name)
+        })
+    };
+    for name in [b"checkpoint-before-a".as_slice(), b"checkpoint-before-b"] {
+        assert!(contains_name(&captured, name), "captured state must include {name:?}");
+    }
+    for name in [b"checkpoint-after-c".as_slice(), b"checkpoint-after-d"] {
+        assert!(!contains_name(&captured, name), "captured state must exclude {name:?}");
+    }
+
+    drop(snapshot);
+    let current_bytes = engine
+        .export_serving_checkpoint_bytes()
+        .expect("export current checkpoint");
+    let current: crate::snapshot::ServingCheckpoint =
+        postcard::from_bytes(&current_bytes).expect("decode current checkpoint");
+    for name in [b"checkpoint-after-c".as_slice(), b"checkpoint-after-d"] {
+        assert!(contains_name(&current, name), "current state must include {name:?}");
+    }
+}
+
+#[test]
 fn remote_snapshot_hides_root_empty_regular_file_draft() {
     let engine = temp_engine();
     engine

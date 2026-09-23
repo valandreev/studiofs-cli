@@ -21,13 +21,10 @@ impl RedbMetaEngine {
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;
-        self.export_snapshot_from_read_txn(&txn)
+        Self::export_snapshot_from_read_txn(&txn)
     }
 
-    pub(crate) fn export_snapshot_from_read_txn(
-        &self,
-        txn: &ReadTransaction,
-    ) -> MetaResult<RedbSnapshot> {
+    pub(super) fn export_snapshot_from_read_txn(txn: &ReadTransaction) -> MetaResult<RedbSnapshot> {
         let mut snapshot = RedbSnapshot::default();
 
         {

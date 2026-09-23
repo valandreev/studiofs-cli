@@ -370,14 +370,11 @@ impl RedbMetaEngine {
     /// Export a snapshot projected to the remote-visible published namespace.
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;
-        self.export_remote_snapshot_from_read_txn(&txn)
+        Self::export_remote_snapshot_from_read_txn(&txn)
     }
 
-    pub(crate) fn export_remote_snapshot_from_read_txn(
-        &self,
-        txn: &ReadTransaction,
-    ) -> MetaResult<RedbSnapshot> {
-        let mut snapshot = self.export_snapshot_from_read_txn(txn)?;
+    fn export_remote_snapshot_from_read_txn(txn: &ReadTransaction) -> MetaResult<RedbSnapshot> {
+        let mut snapshot = Self::export_snapshot_from_read_txn(txn)?;
         let mut published_regular_inodes = HashSet::new();
         for (ino, bytes) in &snapshot.regular_file_base {
             let regular: RegularFileBaseState = decode(bytes)?;
@@ -470,14 +467,13 @@ impl RedbMetaEngine {
         &self,
     ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
         let txn = self.begin_read_txn()?;
-        self.export_serving_checkpoint_from_read_txn(&txn)
+        Self::export_serving_checkpoint_from_read_txn(&txn)
     }
 
-    fn export_serving_checkpoint_from_read_txn(
-        &self,
+    pub(super) fn export_serving_checkpoint_from_read_txn(
         txn: &ReadTransaction,
     ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
-        let snapshot = self.export_remote_snapshot_from_read_txn(txn)?;
+        let snapshot = Self::export_remote_snapshot_from_read_txn(txn)?;
         Ok(crate::snapshot::ServingCheckpoint {
             inodes: snapshot.inodes,
             dentries: snapshot.dentries,
@@ -495,16 +491,6 @@ impl RedbMetaEngine {
     /// data stay in the local database or PostgreSQL control-plane tables.
     pub fn export_serving_checkpoint_bytes(&self) -> MetaResult<Vec<u8>> {
         postcard::to_stdvec(&self.export_serving_checkpoint()?).map_err(|error| {
-            MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
-        })
-    }
-
-    pub(crate) fn export_serving_checkpoint_bytes_from_snapshot(
-        &self,
-        snapshot: &ServingCheckpointReadSnapshot,
-    ) -> MetaResult<Vec<u8>> {
-        let checkpoint = self.export_serving_checkpoint_from_read_txn(snapshot.read_txn())?;
-        postcard::to_stdvec(&checkpoint).map_err(|error| {
             MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
         })
     }
