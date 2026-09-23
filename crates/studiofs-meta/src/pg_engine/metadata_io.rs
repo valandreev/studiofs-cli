@@ -472,7 +472,7 @@ impl PgMetaEngine {
         let _active_open_inodes_guard =
             if import_mode == StartupSnapshotImportMode::PreserveLocalState {
                 Some(self.active_open_inodes.lock().map_err(|_| {
-                    MetaError::Storage("pg active open inode lock poisoned".to_string())
+                    MetaError::Storage("pg active open inodes lock poisoned".to_string())
                 })?)
             } else {
                 None

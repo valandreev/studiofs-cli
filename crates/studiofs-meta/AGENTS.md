@@ -19,6 +19,8 @@ replication, snapshot, and lifecycle paths. Read the root `AGENTS.md`,
 - Use focused `studiofs-meta` tests first. Ignored PostgreSQL tests require the
   configured service and `.env`; report skipped infrastructure separately from
   compile or unit evidence.
+- Metadata lock order is `local_position_lock` → `pending_state` →
+  `active_open_inodes` when nested. See [Local Replay Lock Ordering](../../docs/pg-sync-contract.md#local-replay-lock-ordering).
 
 Use `docs/agents-coding-guide.md`, `docs/metadata.md`, and `docs/tests.md` for
 the detailed contract and command matrix.

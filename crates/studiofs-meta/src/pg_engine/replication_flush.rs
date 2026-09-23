@@ -264,7 +264,10 @@ impl PgMetaEngine {
 
     pub(super) fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
         let (_position_guard, mut state) = self.lock_local_position_and_pending_state()?;
-        self.restore_pending_state_from_local_log_with_state(&mut state)
+        self.restore_pending_state_from_local_log_with_state(&mut state)?;
+        #[cfg(test)]
+        self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterPendingStateRestore)?;
+        Ok(())
     }
 
     /// Restore pending state while the caller holds both locks in canonical order.

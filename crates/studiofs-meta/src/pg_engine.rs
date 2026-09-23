@@ -500,6 +500,8 @@ pub(super) enum CatchUpFaultPoint {
         first_batch_version: Option<i64>,
         last_batch_version: Option<i64>,
     },
+    AfterLocalPositionLockAcquired,
+    AfterPendingStateRestore,
     BeforeLocalCommit {
         last_batch_version: i64,
     },

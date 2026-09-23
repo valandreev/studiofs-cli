@@ -22,6 +22,8 @@ impl PgMetaEngine {
             .local_position_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        #[cfg(test)]
+        self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterLocalPositionLockAcquired)?;
         let pending_state = self
             .pending_state
             .lock()
