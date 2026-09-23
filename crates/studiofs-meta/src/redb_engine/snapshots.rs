@@ -21,6 +21,10 @@ impl RedbMetaEngine {
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;
+        Self::export_snapshot_from_read_txn(&txn)
+    }
+
+    pub(super) fn export_snapshot_from_read_txn(txn: &ReadTransaction) -> MetaResult<RedbSnapshot> {
         let mut snapshot = RedbSnapshot::default();
 
         {
@@ -77,14 +81,14 @@ impl RedbMetaEngine {
         }
         {
             snapshot.regular_file_overlay = Self::regular_file_snapshot_rows_from_txn(
-                &txn,
+                txn,
                 REGULAR_FILE_OVERLAY_TABLE,
                 |chunks| RegularFileOverlayState { chunks },
             )?;
         }
         {
             snapshot.regular_file_base = Self::regular_file_snapshot_rows_from_txn(
-                &txn,
+                txn,
                 REGULAR_FILE_BASE_TABLE,
                 |chunks| RegularFileBaseState { chunks },
             )?;

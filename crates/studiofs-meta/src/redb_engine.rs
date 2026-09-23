@@ -46,6 +46,41 @@ pub struct RedbMetaEngine {
     allocator_state_write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
+/// A pinned redb read view for a consistent serving-checkpoint export.
+///
+/// Reads and exports use one MVCC snapshot while foreground writes continue.
+/// Drop it after the checkpoint data is built so redb can reclaim older pages.
+pub(crate) struct ServingCheckpointReadSnapshot {
+    transaction: ReadTransaction,
+}
+
+impl ServingCheckpointReadSnapshot {
+    /// Read a counter from this snapshot's transaction.
+    pub(crate) fn get_counter(&self, name: &str) -> MetaResult<u64> {
+        RedbMetaEngine::read_counter_from_read_txn(&self.transaction, name)
+    }
+
+    /// Read format metadata from this snapshot's transaction.
+    pub(crate) fn format_info(&self) -> MetaResult<crate::schema::FormatInfo> {
+        RedbMetaEngine::read_format_info_from_read_txn(&self.transaction)
+    }
+
+    /// Serialize the serving checkpoint visible in this snapshot.
+    pub(crate) fn export_serving_checkpoint_bytes(&self) -> MetaResult<Vec<u8>> {
+        let checkpoint = self.export_serving_checkpoint()?;
+        postcard::to_stdvec(&checkpoint).map_err(|error| {
+            MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
+        })
+    }
+
+    /// Export the serving checkpoint visible in this snapshot.
+    pub(crate) fn export_serving_checkpoint(
+        &self,
+    ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
+        RedbMetaEngine::export_serving_checkpoint_from_read_txn(&self.transaction)
+    }
+}
+
 struct RelaxedDurabilityState {
     started: Instant,
     interval_ms: u64,
@@ -562,6 +597,14 @@ impl RedbMetaEngine {
             .ok_or_else(|| MetaError::Storage("redb database handle is unavailable".to_string()))?
             .begin_read()
             .map_err(|error| MetaError::Storage(error.to_string()))
+    }
+
+    pub(crate) fn begin_serving_checkpoint_snapshot(
+        &self,
+    ) -> MetaResult<ServingCheckpointReadSnapshot> {
+        Ok(ServingCheckpointReadSnapshot {
+            transaction: self.begin_read_txn()?,
+        })
     }
 
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
