@@ -269,6 +269,23 @@ impl PgMetaEngine {
             .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))
     }
 
+    /// Return published and completed ranges that no longer reserve local
+    /// overlay conflicts. Rejected ranges intentionally remain local authority.
+    pub(super) fn local_event_overlay_exclusions(&self) -> MetaResult<Vec<LocalEventRange>> {
+        let progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        let mut ranges = progress
+            .published
+            .iter()
+            .chain(progress.completed.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        merge_local_event_ranges(&mut ranges);
+        Ok(ranges)
+    }
+
     #[cfg(test)]
     pub(super) fn persist_replay_position(
         &self,

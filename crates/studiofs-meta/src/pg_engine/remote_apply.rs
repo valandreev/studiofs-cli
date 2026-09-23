@@ -1,3 +1,4 @@
+use super::LocalEventRange;
 use crate::engine::{MetaError, MetaResult};
 use crate::events::{MetaEvent, decode_event_with_type};
 use crate::redb_engine::layout::{encode_acl_rule_key, encode_dentry_key, encode_xattr_key};
@@ -60,6 +61,7 @@ pub(super) struct ProjectedRemoteBatch {
 pub(super) struct RemoteApplyCoordinator<'a> {
     pub(super) local: &'a RedbMetaEngine,
     local_event_ack_barrier: Option<u64>,
+    local_event_overlay_exclusions: Vec<LocalEventRange>,
 }
 
 impl<'a> RemoteApplyCoordinator<'a> {
@@ -67,11 +69,20 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Self {
             local,
             local_event_ack_barrier: None,
+            local_event_overlay_exclusions: Vec::new(),
         }
     }
 
     pub(super) fn with_local_event_ack_barrier(mut self, barrier: Option<u64>) -> Self {
         self.local_event_ack_barrier = barrier;
+        self
+    }
+
+    pub(super) fn with_local_event_overlay_exclusions(
+        mut self,
+        ranges: Vec<LocalEventRange>,
+    ) -> Self {
+        self.local_event_overlay_exclusions = ranges;
         self
     }
 
@@ -301,77 +312,109 @@ impl<'a> RemoteApplyCoordinator<'a> {
     pub(super) fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
         let mut overlay = OverlayConflictSets::default();
         for event in events {
-            match event {
-                MetaEvent::SetAttr { attr } => {
-                    overlay.attr_inodes.insert(attr.ino);
-                }
-                MetaEvent::RemoveAttr { ino } => {
-                    overlay.attr_inodes.insert(*ino);
-                    overlay.block_inodes.insert(*ino);
-                    overlay.symlink_inodes.insert(*ino);
-                    overlay.xattr_inodes.insert(*ino);
-                }
-                MetaEvent::AddEntry { parent, name, .. }
-                | MetaEvent::RemoveEntry { parent, name } => {
-                    overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
-                }
-                MetaEvent::RenameEntry {
-                    parent,
-                    name,
-                    new_parent,
-                    new_name,
-                    entry,
-                    displaced_set_attr,
-                    displaced_remove_attr_ino,
-                    moved_dir_attr,
-                    old_parent_attr,
-                    new_parent_attr,
-                } => {
-                    overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
-                    overlay
-                        .dentry_keys
-                        .insert(encode_dentry_key(*new_parent, new_name));
-                    overlay.attr_inodes.insert(entry.ino);
-                    if let Some(attr) = displaced_set_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                    if let Some(ino) = displaced_remove_attr_ino {
-                        overlay.attr_inodes.insert(*ino);
-                    }
-                    if let Some(attr) = moved_dir_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                    if let Some(attr) = old_parent_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                    if let Some(attr) = new_parent_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                }
-                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
-                | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                | MetaEvent::RemoveRegularFileGraph { ino } => {
-                    overlay.block_inodes.insert(*ino);
-                }
-                MetaEvent::SetSymlinkTarget { ino, .. } => {
-                    overlay.symlink_inodes.insert(*ino);
-                    overlay.attr_inodes.insert(*ino);
-                }
-                MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
-                    overlay.xattr_inodes.insert(*ino);
-                    overlay.xattr_keys.insert(encode_xattr_key(*ino, name));
-                }
-                MetaEvent::SetAclRule { ino, principal, .. }
-                | MetaEvent::RemoveAclRule { ino, principal } => {
-                    overlay.attr_inodes.insert(*ino);
-                    overlay
-                        .acl_keys
-                        .insert(encode_acl_rule_key(*ino, principal));
-                }
-                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+            Self::add_event_overlay_conflicts(&mut overlay, event);
+        }
+        overlay
+    }
+
+    fn overlay_conflicts_for_local_events(
+        events: &[MetaEvent],
+        event_start: u64,
+        excluded_ranges: &[LocalEventRange],
+    ) -> OverlayConflictSets {
+        if excluded_ranges.is_empty() {
+            return Self::overlay_conflicts_for_events(events);
+        }
+        let first_seq = event_start.max(1);
+        let mut excluded_index = excluded_ranges.partition_point(|range| range.end <= first_seq);
+        let mut overlay = OverlayConflictSets::default();
+        for (index, event) in events.iter().enumerate() {
+            let seq = first_seq.saturating_add(index as u64);
+            while excluded_ranges
+                .get(excluded_index)
+                .is_some_and(|range| range.end <= seq)
+            {
+                excluded_index += 1;
+            }
+            if !excluded_ranges
+                .get(excluded_index)
+                .is_some_and(|range| range.start <= seq)
+            {
+                Self::add_event_overlay_conflicts(&mut overlay, event);
             }
         }
         overlay
+    }
+
+    fn add_event_overlay_conflicts(overlay: &mut OverlayConflictSets, event: &MetaEvent) {
+        match event {
+            MetaEvent::SetAttr { attr } => {
+                overlay.attr_inodes.insert(attr.ino);
+            }
+            MetaEvent::RemoveAttr { ino } => {
+                overlay.attr_inodes.insert(*ino);
+                overlay.block_inodes.insert(*ino);
+                overlay.symlink_inodes.insert(*ino);
+                overlay.xattr_inodes.insert(*ino);
+            }
+            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+                overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
+            }
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                displaced_set_attr,
+                displaced_remove_attr_ino,
+                moved_dir_attr,
+                old_parent_attr,
+                new_parent_attr,
+            } => {
+                overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
+                overlay
+                    .dentry_keys
+                    .insert(encode_dentry_key(*new_parent, new_name));
+                overlay.attr_inodes.insert(entry.ino);
+                if let Some(attr) = displaced_set_attr.as_ref() {
+                    overlay.attr_inodes.insert(attr.ino);
+                }
+                if let Some(ino) = displaced_remove_attr_ino {
+                    overlay.attr_inodes.insert(*ino);
+                }
+                if let Some(attr) = moved_dir_attr.as_ref() {
+                    overlay.attr_inodes.insert(attr.ino);
+                }
+                if let Some(attr) = old_parent_attr.as_ref() {
+                    overlay.attr_inodes.insert(attr.ino);
+                }
+                if let Some(attr) = new_parent_attr.as_ref() {
+                    overlay.attr_inodes.insert(attr.ino);
+                }
+            }
+            MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+            | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+            | MetaEvent::RemoveRegularFileGraph { ino } => {
+                overlay.block_inodes.insert(*ino);
+            }
+            MetaEvent::SetSymlinkTarget { ino, .. } => {
+                overlay.symlink_inodes.insert(*ino);
+                overlay.attr_inodes.insert(*ino);
+            }
+            MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
+                overlay.xattr_inodes.insert(*ino);
+                overlay.xattr_keys.insert(encode_xattr_key(*ino, name));
+            }
+            MetaEvent::SetAclRule { ino, principal, .. }
+            | MetaEvent::RemoveAclRule { ino, principal } => {
+                overlay.attr_inodes.insert(*ino);
+                overlay
+                    .acl_keys
+                    .insert(encode_acl_rule_key(*ino, principal));
+            }
+            MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+        }
     }
 
     pub(super) fn merge_overlay_conflicts(
@@ -1684,25 +1727,35 @@ impl<'a> RemoteApplyCoordinator<'a> {
         local: &RedbMetaEngine,
         start: u64,
         end: u64,
+        excluded_ranges: &[LocalEventRange],
     ) -> MetaResult<OverlayConflictSets> {
         if end <= start {
             return Ok(OverlayConflictSets::default());
         }
 
         let events = local.read_events_range(start, end)?;
-        Ok(Self::overlay_conflicts_for_events(&events))
+        Ok(Self::overlay_conflicts_for_local_events(
+            &events,
+            start,
+            excluded_ranges,
+        ))
     }
 
     fn overlay_conflicts_for_local_range_in_txn(
         txn: &RedbWriteTransaction<'_>,
         start: u64,
         end: u64,
+        excluded_ranges: &[LocalEventRange],
     ) -> MetaResult<OverlayConflictSets> {
         if end <= start {
             return Ok(OverlayConflictSets::default());
         }
         let events = RedbMetaEngine::read_events_range_in_write_txn(txn, start, end)?;
-        Ok(Self::overlay_conflicts_for_events(&events))
+        Ok(Self::overlay_conflicts_for_local_events(
+            &events,
+            start,
+            excluded_ranges,
+        ))
     }
 
     #[cfg(test)]
@@ -1968,6 +2021,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     txn,
                     context.flushed_event_seq,
                     context.next_event_seq,
+                    &self.local_event_overlay_exclusions,
                 )?;
                 if batch.is_self_batch {
                     Self::clear_resolved_self_regular_file_protection(

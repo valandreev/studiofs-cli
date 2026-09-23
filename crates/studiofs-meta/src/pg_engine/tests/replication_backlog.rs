@@ -1,5 +1,5 @@
 use super::*;
-use crate::redb_engine::layout::encode_xattr_key;
+use crate::redb_engine::layout::{encode_dentry_key, encode_xattr_key};
 use std::sync::Barrier;
 use std::thread;
 
@@ -1488,6 +1488,187 @@ fn local_only_deletion_does_not_advance_cursor_past_rejected_event() {
         pg.flushed_event_seq.load(Ordering::SeqCst),
         cursor_before_rejected_event,
         "retiring later local-only events must not advance past the rejected event"
+    );
+}
+
+#[test]
+fn processed_local_ranges_stop_masking_foreign_dentries_across_rejected_gap() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    let cursor_before_gap = reject_oversized_test_event(&mut pg, b"overlay-gap");
+
+    let completed_name = b"cancelled-after-gap";
+    let completed_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read completed range start");
+    pg.local
+        .create_file(ROOT_INO, completed_name, 0, 0, 0o644)
+        .expect("append completed local create");
+    pg.local
+        .unlink(ROOT_INO, completed_name)
+        .expect("append completed local delete");
+    let completed_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read completed range end");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: completed_start,
+        end: completed_end,
+    }])
+    .expect("record the cancelled local range as completed");
+
+    let published_name = b"published-after-gap";
+    let published_start = completed_end;
+    pg.local
+        .create_dir(ROOT_INO, published_name, 0, 0, 0o755)
+        .expect("append published local range");
+    let event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read published range end");
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: published_start,
+        end: event_end,
+    }])
+    .expect("mark local range as published");
+
+    let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_gap,
+        "the rejected event remains the durable cursor barrier"
+    );
+    assert!(
+        overlay
+            .xattr_keys
+            .contains(&encode_xattr_key(ROOT_INO, b"user.sfs726.overlay-gap")),
+        "the rejected event should retain local authority"
+    );
+    assert!(
+        !overlay
+            .dentry_keys
+            .contains(&encode_dentry_key(ROOT_INO, completed_name)),
+        "a completed create/delete must not reserve its old dentry"
+    );
+    assert!(
+        !overlay
+            .dentry_keys
+            .contains(&encode_dentry_key(ROOT_INO, published_name)),
+        "a published range must not reserve its dentry while the cursor is behind the gap"
+    );
+
+    let remote_ino = ROOT_INO + 8_000;
+    let remote_attr = InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755);
+    apply_foreign_batch(
+        &pg,
+        &[
+            MetaEvent::SetAttr { attr: remote_attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: completed_name.to_vec(),
+                entry: DirEntryValue {
+                    ino: remote_ino,
+                    kind: FileType::Directory,
+                },
+            },
+        ],
+        &overlay,
+        &HashSet::new(),
+    )
+    .expect("apply foreign create for the completed name");
+    assert_eq!(
+        pg.lookup(ROOT_INO, completed_name)
+            .expect("foreign create should become visible")
+            .ino,
+        remote_ino
+    );
+}
+
+#[test]
+fn completed_overlay_conflicts_are_removed_during_self_ack_replay() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let event_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read self event start");
+    pg.local
+        .set_xattr(ROOT_INO, b"user.sfs726.self", b"published", 0)
+        .expect("append self event");
+    let self_event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read self event end");
+    let self_events = pg
+        .local
+        .read_events_range(event_start, self_event_end)
+        .expect("read self events");
+    let self_batch = RemoteApplyCoordinator::project_local_batch(&self_events).events;
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: event_start,
+        end: self_event_end,
+    }])
+    .expect("mark self range as published");
+
+    let completed_name = b"completed-before-foreign-create";
+    pg.local
+        .create_file(ROOT_INO, completed_name, 0, 0, 0o644)
+        .expect("append local create to be completed");
+    pg.local
+        .unlink(ROOT_INO, completed_name)
+        .expect("append local delete to be completed");
+    let next_event_seq = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read completed local suffix end");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: self_event_end,
+        end: next_event_seq,
+    }])
+    .expect("record local create/delete as completed");
+
+    let remote_ino = ROOT_INO + 8_001;
+    let remote_attr = InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755);
+    let outcome = pg
+        .apply_replay_page_atomically(
+            vec![
+                DecodedReplayBatch {
+                    batch_version: 1,
+                    events: self_batch,
+                    is_self_batch: true,
+                },
+                DecodedReplayBatch {
+                    batch_version: 2,
+                    events: vec![
+                        MetaEvent::SetAttr { attr: remote_attr },
+                        MetaEvent::AddEntry {
+                            parent: ROOT_INO,
+                            name: completed_name.to_vec(),
+                            entry: DirEntryValue {
+                                ino: remote_ino,
+                                kind: FileType::Directory,
+                            },
+                        },
+                    ],
+                    is_self_batch: false,
+                },
+            ],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+                flushed_event_seq: event_start,
+                next_event_seq,
+                initial_overlay: pg.local_overlay_conflicts().expect("local overlays"),
+            },
+        )
+        .expect("apply self and foreign batches");
+
+    assert_eq!(outcome.flushed_event_seq, Some(next_event_seq));
+    assert_eq!(
+        pg.lookup(ROOT_INO, completed_name)
+            .expect("foreign create should be visible after completed local range")
+            .ino,
+        remote_ino
     );
 }
 

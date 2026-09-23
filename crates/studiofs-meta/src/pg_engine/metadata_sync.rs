@@ -69,8 +69,14 @@ impl PgMetaEngine {
             return Ok(active_open_overlay);
         }
 
+        let overlay_exclusions = self.local_event_overlay_exclusions()?;
         Ok(RemoteApplyCoordinator::merge_overlay_conflicts(
-            &RemoteApplyCoordinator::overlay_conflicts_for_local_range(&self.local, start, end)?,
+            &RemoteApplyCoordinator::overlay_conflicts_for_local_range(
+                &self.local,
+                start,
+                end,
+                &overlay_exclusions,
+            )?,
             &active_open_overlay,
         ))
     }
@@ -420,9 +426,11 @@ impl PgMetaEngine {
             .rejected
             .first()
             .map(|range| range.start);
+        let local_event_overlay_exclusions = self.local_event_overlay_exclusions()?;
         let txn = self.local.begin_write_txn()?;
         let result = RemoteApplyCoordinator::new(&self.local)
             .with_local_event_ack_barrier(local_event_ack_barrier)
+            .with_local_event_overlay_exclusions(local_event_overlay_exclusions)
             .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context);
         let mut outcome = match result {
             Ok(outcome) => outcome,

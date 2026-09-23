@@ -190,6 +190,9 @@ is at-least-once for event-log publication, not exactly-once row insertion.
 When a self-ack advances the cursor to a locally completed range, the cursor
 must continue through adjacent completed ranges before pending replay is
 restored, stopping at any rejected range.
+Journal-derived overlay conflicts include unprocessed and rejected local
+events; published and completed ranges no longer reserve their old keys.
+Rejected ranges remain local authority until replay can resume past the gap.
 
 The catch-up worker checks the operation deadline and cancellation boundary
 before each batch and rolls back without advancing the cursor when either is
