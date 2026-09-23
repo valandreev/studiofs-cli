@@ -598,8 +598,12 @@ pub(in crate::scenario) struct LargeHistorySummary {
     pub(in crate::scenario) checkpoint_version: Option<u64>,
     pub(in crate::scenario) startup_target_version: Option<u64>,
     pub(in crate::scenario) applied_version_progression: Vec<u64>,
+    /// Index of the first recorded applied-version sample after restart.
     #[serde(default)]
     pub(in crate::scenario) applied_version_restart_index: Option<usize>,
+    /// Whether the pre-restart partial cursor crossed a mounted-file sync barrier.
+    #[serde(default)]
+    pub(in crate::scenario) restart_cursor_durable: bool,
     pub(in crate::scenario) observed_page_count: usize,
     pub(in crate::scenario) observed_event_rows: u64,
     pub(in crate::scenario) observed_event_bytes: u64,
@@ -622,29 +626,51 @@ pub(in crate::scenario) struct LargeHistorySummary {
     pub(in crate::scenario) moving_head_observed: bool,
     pub(in crate::scenario) reached_live: bool,
     pub(in crate::scenario) final_read_write_converged: bool,
+    #[serde(default)]
+    pub(in crate::scenario) cold_client_write_converged: bool,
     pub(in crate::scenario) final_marker_path: String,
     pub(in crate::scenario) wall_duration_ms: u64,
 }
 
+fn large_history_partial_replay_version(
+    checkpoint_version: Option<u64>,
+    applied_version: Option<u64>,
+    target_version: Option<u64>,
+) -> Option<u64> {
+    let ((checkpoint_version, applied_version), target_version) = checkpoint_version
+        .zip(applied_version)
+        .zip(target_version)?;
+    (checkpoint_version < applied_version && applied_version < target_version)
+        .then_some(applied_version)
+}
+
 impl LargeHistorySummary {
     fn applied_version_progression_is_monotonic(&self) -> bool {
-        let Some(restart_index) = self.applied_version_restart_index else {
-            return self
-                .applied_version_progression
-                .windows(2)
-                .all(|versions| versions[0] <= versions[1]);
-        };
         self.applied_version_progression
-            .get(..restart_index)
-            .zip(self.applied_version_progression.get(restart_index..))
-            .is_some_and(|(before_restart, after_restart)| {
-                before_restart
-                    .windows(2)
-                    .all(|versions| versions[0] <= versions[1])
-                    && after_restart
-                        .windows(2)
-                        .all(|versions| versions[0] <= versions[1])
-            })
+            .windows(2)
+            .all(|versions| versions[0] <= versions[1])
+    }
+
+    fn restart_resumes_partial_replay(&self) -> bool {
+        let Some(restart_index) = self.applied_version_restart_index else {
+            return false;
+        };
+        let Some(applied_before_restart) = restart_index
+            .checked_sub(1)
+            .and_then(|index| self.applied_version_progression.get(index))
+        else {
+            return false;
+        };
+        let Some(applied_after_restart) = self.applied_version_progression.get(restart_index)
+        else {
+            return false;
+        };
+        large_history_partial_replay_version(
+            self.checkpoint_version,
+            Some(*applied_before_restart),
+            self.startup_target_version,
+        )
+        .is_some_and(|durable_version| *applied_after_restart >= durable_version)
     }
 
     fn matched(&self) -> bool {
@@ -657,6 +683,8 @@ impl LargeHistorySummary {
                 .zip(self.applied_version_progression.last().copied())
                 .is_some_and(|(target, applied)| applied >= target)
             && self.applied_version_progression_is_monotonic()
+            && self.restart_resumes_partial_replay()
+            && self.restart_cursor_durable
             && self.observed_page_count > 1
             && self.observed_event_rows > 0
             && self.observed_event_bytes > 0
@@ -665,6 +693,7 @@ impl LargeHistorySummary {
             && self.moving_head_observed
             && self.reached_live
             && self.final_read_write_converged
+            && self.cold_client_write_converged
     }
 }
 
@@ -694,13 +723,52 @@ mod tests {
     }
 
     #[test]
-    fn large_history_match_accepts_restart_reset_between_monotonic_sessions() {
+    fn large_history_match_rejects_restart_resume_below_durable_cursor() {
         let mut summary = planned_large_history_summary();
-        summary.applied_version_progression = vec![30, 29, 50, 54];
-        summary.applied_version_restart_index = Some(1);
+        summary.checkpoint_version = Some(10);
         summary.startup_target_version = Some(53);
+        summary.applied_version_progression = vec![10, 30, 29, 54];
+        summary.applied_version_restart_index = Some(2);
+
+        assert!(!summary.matched());
+    }
+
+    #[test]
+    fn large_history_match_rejects_restart_at_checkpoint_cursor() {
+        let mut summary = planned_large_history_summary();
+        summary.checkpoint_version = Some(30);
+        summary.startup_target_version = Some(53);
+        summary.applied_version_progression = vec![30, 30, 53];
+        summary.applied_version_restart_index = Some(2);
+
+        assert!(!summary.matched());
+    }
+
+    #[test]
+    fn large_history_match_accepts_resume_from_partial_durable_cursor() {
+        let mut summary = planned_large_history_summary();
+        summary.checkpoint_version = Some(10);
+        summary.startup_target_version = Some(53);
+        summary.applied_version_progression = vec![10, 30, 30, 54];
+        summary.applied_version_restart_index = Some(2);
 
         assert!(summary.matched());
+    }
+
+    #[test]
+    fn large_history_match_rejects_missing_cold_writer_replication() {
+        let mut summary = planned_large_history_summary();
+        summary.cold_client_write_converged = false;
+
+        assert!(!summary.matched());
+    }
+
+    #[test]
+    fn large_history_match_rejects_restart_without_durable_cursor_barrier() {
+        let mut summary = planned_large_history_summary();
+        summary.restart_cursor_durable = false;
+
+        assert!(!summary.matched());
     }
 }
 

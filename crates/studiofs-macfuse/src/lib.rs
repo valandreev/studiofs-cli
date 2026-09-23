@@ -101,7 +101,10 @@ pub enum SignalHandling {
     /// Do not install SIGINT/SIGTERM handlers.
     #[default]
     Disabled,
-    /// Install temporary SIGINT/SIGTERM handlers for the StudioFS CLI.
+    /// Install SIGINT/SIGTERM handlers for the StudioFS CLI process.
+    ///
+    /// The handlers stay installed through post-session runtime cleanup so a
+    /// signal sent after kernel detach cannot interrupt local shutdown.
     InstallForCli,
 }
 
@@ -139,6 +142,8 @@ struct CliSignalHandlers {
     previous_sigint: libc::sighandler_t,
     previous_sigterm: libc::sighandler_t,
 }
+
+static CLI_SIGNAL_HANDLERS_FOR_PROCESS: Mutex<Option<CliSignalHandlers>> = Mutex::new(None);
 
 impl CliSignalHandlers {
     fn install() -> io::Result<Self> {
@@ -194,13 +199,19 @@ fn signal_handlers_for_policy(
 ) -> io::Result<Option<CliSignalHandlers>> {
     match signal_handling {
         SignalHandling::Disabled => Ok(None),
-        SignalHandling::InstallForCli => CliSignalHandlers::install().map(Some),
+        SignalHandling::InstallForCli => {
+            if CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
+                Ok(None)
+            } else {
+                CliSignalHandlers::install().map(Some)
+            }
+        }
     }
 }
 
 struct SignalWatcher {
     stop: Arc<AtomicBool>,
-    handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
+    handlers: Option<CliSignalHandlers>,
     wake: std::thread::Thread,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -208,12 +219,17 @@ struct SignalWatcher {
 impl Drop for SignalWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Ok(mut handlers) = self.handlers.lock() {
-            let _ = handlers.take();
-        }
         self.wake.unpark();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+        if let Some(handlers) = self.handlers.take() {
+            let mut retained = CLI_SIGNAL_HANDLERS_FOR_PROCESS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retained.is_none() {
+                *retained = Some(handlers);
+            }
         }
     }
 }
@@ -224,9 +240,8 @@ fn spawn_signal_watcher(
     unmount_signal: Option<MacFuseUnmountSignal>,
 ) -> io::Result<SignalWatcher> {
     let stop = Arc::new(AtomicBool::new(false));
-    let handlers = Arc::new(Mutex::new(signal_handlers_for_policy(signal_handling)?));
+    let handlers = signal_handlers_for_policy(signal_handling)?;
     let watcher_stop = Arc::clone(&stop);
-    let watcher_handlers = Arc::clone(&handlers);
     let thread = std::thread::Builder::new()
         .name("macfuse-signal-watcher".into())
         .spawn(move || {
@@ -240,11 +255,6 @@ fn spawn_signal_watcher(
             }
             if watcher_stop.load(Ordering::Acquire) {
                 return;
-            }
-            if SHUTDOWN_REQUESTED.load(Ordering::Acquire)
-                && let Ok(mut handlers) = watcher_handlers.lock()
-            {
-                let _ = handlers.take();
             }
             request_exit();
         })?;
@@ -527,6 +537,42 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<super::low_level::Session>();
+    }
+
+    #[test]
+    fn cli_signal_handler_remains_installed_after_session_watcher_drops() {
+        super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
+        assert!(!super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));
+
+        let watcher =
+            super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None)
+                .expect("install CLI signal handlers");
+        drop(watcher);
+
+        let (still_installed, retained_for_process, term_handler_is_active) = {
+            let mut handlers = super::CLI_SIGNAL_HANDLERS_FOR_PROCESS
+                .lock()
+                .expect("process signal handler lock");
+            let still_installed =
+                super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire);
+            let retained_for_process = handlers.is_some();
+            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+            // SAFETY: a null new-action pointer queries the current SIGTERM action.
+            let query_succeeded = unsafe {
+                libc::sigaction(libc::SIGTERM, std::ptr::null(), action.as_mut_ptr()) == 0
+            };
+            let term_handler_is_active = query_succeeded
+                && unsafe { action.assume_init() }.sa_sigaction
+                    == super::shutdown_signal_handler as *const () as libc::sighandler_t;
+            drop(handlers.take());
+            (
+                still_installed,
+                retained_for_process,
+                term_handler_is_active,
+            )
+        };
+
+        assert!(still_installed && retained_for_process && term_handler_is_active);
     }
 
     #[test]

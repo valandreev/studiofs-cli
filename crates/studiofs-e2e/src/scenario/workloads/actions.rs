@@ -734,6 +734,42 @@ pub fn run_hotspot_op_helper(
                 BarrierWriteMode::CreateNew,
             )?;
         }
+        "sync-existing" => {
+            record_hotspot_helper_progress(
+                progress,
+                "before_open_existing",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let file = fs::File::open(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_open_existing",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_sync_all",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            file.sync_all()?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_sync_all",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+        }
         "overwrite-barrier" => {
             let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
             record_hotspot_helper_progress(

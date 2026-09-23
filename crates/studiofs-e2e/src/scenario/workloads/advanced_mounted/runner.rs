@@ -1112,10 +1112,36 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     );
     let mut startup_target_version = None;
     let mut applied_version_restart_index = None;
+    let mut restart_cursor_durable = false;
     let mut saw_catching_up = false;
     let mut restarted_during_catchup = false;
     let mut moving_head_observed = false;
     let mut moving_head_fixture_appended = false;
+    let clients = controller
+        .clients()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let cold_client_cursor_sync_path = isolation.path(&format!(
+        "{}/shard-00/file-00000.bin",
+        super::large_history_fixture::FIXTURE_FILES_DIRECTORY_NAME
+    ));
+    let cold_client_writer_marker_path = isolation.path("control/cold-client-writer-marker.txt");
+    let cold_client_writer_marker_payload = isolation.payload(
+        "cold_client_writer",
+        &cold_client_writer_marker_path,
+        "large-history cold-client allocator write proof",
+    );
+    let peer_clients = clients
+        .iter()
+        .filter(|client| client.name != LARGE_HISTORY_COLD_CLIENT)
+        .cloned()
+        .collect::<Vec<_>>();
+    if peer_clients.is_empty() {
+        return Err(ScenarioError::Io(io::Error::other(
+            "large-history cold writer has no peer mounts to validate replication",
+        )));
+    }
     let monitor_result = (|| {
         loop {
             let sample =
@@ -1136,11 +1162,10 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
             saw_catching_up |= sample.lifecycle == "CatchingUp";
 
-            if saw_catching_up && !restarted_during_catchup {
-                applied_version_restart_index = Some(applied_version_progression.len());
+            if saw_catching_up && !moving_head_fixture_appended {
                 replay_gate
                     .take()
-                    .expect("large-history replay gate must be held until cold restart")
+                    .expect("large-history replay gate must be held until catch-up starts")
                     .release()?;
                 append_large_history_moving_head_fixture(config, &volume_name)?;
                 moving_head_fixture_appended = true;
@@ -1152,6 +1177,41 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                     &isolation.root,
                     Ok(()),
                 ));
+            }
+
+            if moving_head_fixture_appended
+                && !restarted_during_catchup
+                && super::large_history_partial_replay_version(
+                    checkpoint_version,
+                    sample.local_applied_version,
+                    startup_target_version,
+                )
+                .is_some()
+            {
+                // Sync a writable checkpoint file to durably record this replay cursor.
+                let cursor_sync = timed_hotspot_helper_fs_op_with_helper(
+                    context,
+                    started,
+                    operations.len() + 1,
+                    &cold_client,
+                    "cold_client_cursor_sync_barrier",
+                    "sync-existing",
+                    &cold_client_cursor_sync_path,
+                    LARGE_HISTORY_CONVERGENCE_TIMEOUT,
+                    None,
+                    None,
+                )?;
+                let cursor_sync_accepted = cursor_sync.result == "accepted";
+                operations.push(cursor_sync);
+                if !cursor_sync_accepted {
+                    write_namespace_collision_operations(context, &operations)?;
+                    return Err(ScenarioError::Io(io::Error::other(
+                        "large-history cold-client cursor sync barrier was rejected",
+                    )));
+                }
+                restart_cursor_durable = true;
+                // The index points at the first recorded sample after restart.
+                applied_version_restart_index = Some(applied_version_progression.len());
                 controller.restart_until_lifecycle_ready(LARGE_HISTORY_COLD_CLIENT)?;
                 restarted_during_catchup = true;
                 operations.push(record_advanced_operation(
@@ -1166,6 +1226,12 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             }
 
             if sample.lifecycle == "Live" {
+                if !restarted_during_catchup {
+                    return Err(ScenarioError::Io(io::Error::other(format!(
+                        "large-history cold client reached Live before a partial replay restart (checkpoint={checkpoint_version:?}, applied={:?}, target={startup_target_version:?})",
+                        sample.local_applied_version,
+                    ))));
+                }
                 break;
             }
             if Instant::now() >= deadline {
@@ -1188,17 +1254,37 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let moving_writer_completed = moving_head_fixture_appended;
     let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
     let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
+    operations.push(timed_hotspot_helper_fs_op_with_helper(
+        context,
+        started,
+        operations.len() + 1,
+        &cold_client,
+        "cold_client_writer_marker",
+        "create-barrier-sync",
+        &cold_client_writer_marker_path,
+        LARGE_HISTORY_CONVERGENCE_TIMEOUT,
+        Some(&cold_client_writer_marker_payload),
+        None,
+    )?);
+    wait_for_mounted_initial_payloads_until_with_probe_timeout(
+        &peer_clients,
+        &[(
+            &cold_client_writer_marker_path,
+            cold_client_writer_marker_payload.as_slice(),
+        )],
+        Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT,
+        LARGE_HISTORY_POLL_INTERVAL,
+        "large-history cold-client writer marker convergence",
+        LARGE_HISTORY_SNAPSHOT_ATTEMPT_TIMEOUT,
+    )?;
+    let cold_client_write_converged = true;
+
     let final_marker_path = isolation.path("control/final-read-write-marker.txt");
     let final_marker_payload = isolation.payload(
         "final_read_write",
         &final_marker_path,
         "large-history final read-write convergence",
     );
-    let clients = controller
-        .clients()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
     // This mounted marker is written after the PG moving-head fixture. Its visibility
     // on the cold client is the ordered publication barrier for the preceding workload.
     operations.push(timed_hotspot_helper_fs_op_with_helper(
@@ -1271,6 +1357,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             )));
         }
     }
+
     write_namespace_collision_operations(context, &operations)?;
     let large_history = LargeHistorySummary {
         mutation_count,
@@ -1288,6 +1375,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         startup_target_version,
         applied_version_progression,
         applied_version_restart_index,
+        restart_cursor_durable,
         observed_page_count: pages.len(),
         observed_event_rows: pages.iter().map(|page| page.event_count).sum(),
         observed_event_bytes: pages.iter().map(|page| page.response_bytes).sum(),
@@ -1312,6 +1400,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         moving_head_observed,
         reached_live,
         final_read_write_converged,
+        cold_client_write_converged,
         final_marker_path,
         wall_duration_ms: elapsed_millis_u64(started),
     };
