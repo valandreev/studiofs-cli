@@ -213,6 +213,7 @@ pub struct PgMetaEngine {
     local_version: AtomicI64,
     namespace_version: AtomicI64,
     flushed_event_seq: AtomicU64,
+    local_event_progress: Mutex<LocalEventProgress>,
     local_position_lock: Mutex<()>,
     replication_lock: Mutex<()>,
     poll_interval: Duration,
@@ -410,6 +411,29 @@ struct PendingReplicationState {
     force_flush: bool,
     event_start: Option<u64>,
     event_end: u64,
+}
+
+/// Half-open local journal sequence range: `start` is included and `end` is excluded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalEventRange {
+    start: u64,
+    end: u64,
+}
+
+/// In-memory dispositions for local journal ranges not covered by the cursor.
+///
+/// These markers let a live engine skip work already rejected, locally retired,
+/// or published while the contiguous durable cursor remains behind a gap.
+/// They are discarded on restart; replay reloads the durable cursor and
+/// reevaluates the remaining local journal under the current limits.
+#[derive(Clone, Default)]
+struct LocalEventProgress {
+    /// Ranges whose current publication failed because an event was too large.
+    rejected: Vec<LocalEventRange>,
+    /// Ranges that need no remote publication and no further serving replay.
+    completed: Vec<LocalEventRange>,
+    /// Ranges committed to PostgreSQL and awaiting local self-acknowledgment.
+    published: Vec<LocalEventRange>,
 }
 
 #[derive(Clone, Copy)]
@@ -1508,6 +1532,7 @@ impl PgMetaEngine {
             local_version: AtomicI64::new(restored_local_version),
             namespace_version: AtomicI64::new(restored_namespace_version),
             flushed_event_seq: AtomicU64::new(restored_flushed_event_seq),
+            local_event_progress: Mutex::new(LocalEventProgress::default()),
             local_position_lock: Mutex::new(()),
             replication_lock: Mutex::new(()),
             poll_interval: Duration::from_secs(poll_secs),

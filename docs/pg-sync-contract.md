@@ -172,11 +172,27 @@ event error or use a durable chunking representation; it must never exempt that
 event or batch from the replay bounds.
 
 `EventTooLarge` is a permanent configuration error for the current client
-configuration, not a transient PostgreSQL failure. The flush path surfaces it
-once and completes the claim without restoring it, so later local events are
-not held behind the rejected range. The rejected event remains in the local
-event log with the local replay cursor unchanged; after increasing the byte
-limit, restart the client to reconstruct and retry the pending range.
+configuration, not a transient PostgreSQL failure. The flush path identifies
+the local journal sequence for the oversized projected event, marks only that
+event rejected, completes the claim, and restores the remaining unprocessed
+events so independent work stays schedulable. The rejected event remains in the
+local event log with the durable replay cursor unchanged; after increasing the
+byte limit, restart the client to reconstruct and retry the pending range.
+While that engine remains open, local-only retirements and self-acknowledgments
+for later ranges must not move the durable cursor across the rejected gap.
+Independent later batches may still publish, but restoration must not put the
+already rejected range back into the active flush queue. These in-memory
+rejection/publication markers reset on restart; the unchanged durable cursor
+then reconstructs the local journal from the gap under the current limits.
+Because the cursor is one contiguous watermark, that reconstructed suffix can
+include later ranges already published by the previous process; this recovery
+is at-least-once for event-log publication, not exactly-once row insertion.
+When a self-ack advances the cursor to a locally completed range, the cursor
+must continue through adjacent completed ranges before pending replay is
+restored, stopping at any rejected range.
+Journal-derived overlay conflicts include unprocessed and rejected local
+events; published and completed ranges no longer reserve their old keys.
+Rejected ranges remain local authority until replay can resume past the gap.
 
 The catch-up worker checks the operation deadline and cancellation boundary
 before each batch and rolls back without advancing the cursor when either is

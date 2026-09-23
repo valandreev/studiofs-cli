@@ -1,13 +1,14 @@
 //! Owns local event replication backlog claims and flush completion.
 
 use super::{
-    ClaimedPendingBatch, PendingMutationHint, PendingReplicationState, PgMetaEngine, RecentFlush,
-    RemoteApplyCoordinator,
+    ClaimedPendingBatch, LocalEventRange, PendingMutationHint, PendingReplicationState,
+    PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
 use crate::schema::{ChunkId, PayloadRefState, ROOT_INO, SliceRecord, UploadState};
 use crate::types::{FileType, Ino, InodeAttr};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -15,6 +16,16 @@ use tracing::warn;
 
 const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
 const LOCAL_ONLY_SUFFIX_CONTEXT_EVENTS: u64 = 16;
+
+struct SelectedLocalEvents<'a> {
+    events: Cow<'a, [MetaEvent]>,
+    ranges: Vec<LocalEventRange>,
+}
+
+fn local_event_range_contains(ranges: &[LocalEventRange], seq: u64) -> bool {
+    let index = ranges.partition_point(|range| range.start <= seq);
+    index > 0 && seq < ranges[index - 1].end
+}
 
 #[derive(Default)]
 struct RepairedRegularFileOverlay {
@@ -91,16 +102,94 @@ fn push_repaired_overlay_events(
 }
 
 impl PgMetaEngine {
+    fn select_unprocessed_local_events<'a>(
+        &self,
+        event_start: u64,
+        events: &'a [MetaEvent],
+    ) -> MetaResult<SelectedLocalEvents<'a>> {
+        let progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        let first_seq = event_start.max(1);
+        let event_end = first_seq.saturating_add(events.len() as u64);
+        let has_processed_ranges = progress
+            .rejected
+            .iter()
+            .chain(progress.completed.iter())
+            .chain(progress.published.iter())
+            .any(|range| range.start < event_end && first_seq < range.end);
+        if !has_processed_ranges {
+            let ranges = (first_seq < event_end)
+                .then_some(LocalEventRange {
+                    start: first_seq,
+                    end: event_end,
+                })
+                .into_iter()
+                .collect();
+            return Ok(SelectedLocalEvents {
+                events: Cow::Borrowed(events),
+                ranges,
+            });
+        }
+
+        let mut selected_events = Vec::with_capacity(events.len());
+        let mut ranges: Vec<LocalEventRange> = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            let seq = first_seq.saturating_add(index as u64);
+            let already_processed = local_event_range_contains(&progress.rejected, seq)
+                || local_event_range_contains(&progress.completed, seq)
+                || local_event_range_contains(&progress.published, seq);
+            if already_processed {
+                continue;
+            }
+            selected_events.push(event.clone());
+            let event_end = seq.saturating_add(1);
+            if let Some(previous) = ranges.last_mut()
+                && previous.end == seq
+            {
+                previous.end = event_end;
+            } else {
+                ranges.push(LocalEventRange {
+                    start: seq,
+                    end: event_end,
+                });
+            }
+        }
+        Ok(SelectedLocalEvents {
+            events: Cow::Owned(selected_events),
+            ranges,
+        })
+    }
+
+    fn selected_local_event_seq(
+        ranges: &[LocalEventRange],
+        mut selected_index: usize,
+    ) -> Option<u64> {
+        for range in ranges {
+            let range_len = usize::try_from(range.end.saturating_sub(range.start)).ok()?;
+            if selected_index < range_len {
+                return range.start.checked_add(u64::try_from(selected_index).ok()?);
+            }
+            selected_index -= range_len;
+        }
+        None
+    }
+
     pub(super) fn acknowledge_pending_state_if_unchanged(
         &self,
         expected_state: PendingReplicationState,
+        event_start: u64,
         event_end: u64,
     ) -> MetaResult<()> {
         let (_position_guard, mut state) = self.lock_local_position_and_pending_state()?;
         if *state != expected_state {
             return Ok(());
         }
-        self.persist_flushed_event_seq_locked(event_end)?;
+        self.complete_local_event_ranges_locked(&[LocalEventRange {
+            start: event_start,
+            end: event_end,
+        }])?;
         Self::clear_pending_state(&mut state);
         Ok(())
     }
@@ -290,18 +379,26 @@ impl PgMetaEngine {
         let initial_root_prefix_len =
             Self::initial_root_snapshot_prefix_len(event_start, &pending_events);
         if initial_root_prefix_len > 0 {
+            let prefix_start = event_start.max(1);
             event_start = event_start
                 .max(1)
                 .saturating_add(initial_root_prefix_len as u64);
-            self.persist_flushed_event_seq_locked(event_start)?;
+            self.complete_local_event_ranges_locked(&[LocalEventRange {
+                start: prefix_start,
+                end: event_start,
+            }])?;
         }
         let pending_events = &pending_events[initial_root_prefix_len..];
         let stale_setup_prefix_len = self.stale_published_setup_prefix_len(pending_events)?;
         if stale_setup_prefix_len > 0 {
+            let prefix_start = event_start.max(1);
             event_start = event_start
                 .max(1)
                 .saturating_add(stale_setup_prefix_len as u64);
-            self.persist_flushed_event_seq_locked(event_start)?;
+            self.complete_local_event_ranges_locked(&[LocalEventRange {
+                start: prefix_start,
+                end: event_start,
+            }])?;
         }
         let pending_events = &pending_events[stale_setup_prefix_len..];
         if pending_events.is_empty() {
@@ -310,19 +407,24 @@ impl PgMetaEngine {
         }
         self.local
             .apply_replica_serving_state_for_pending_replay(pending_events)?;
-        let projected = RemoteApplyCoordinator::project_local_batch(pending_events);
+        let selected = self.select_unprocessed_local_events(event_start, pending_events)?;
+        if selected.events.is_empty() {
+            Self::clear_pending_state(state);
+            return Ok(());
+        }
+        let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
         if projected.visible_ops == 0 {
             if projected.needs_local_replay {
                 let now = Instant::now();
                 state.ops = 0;
                 state.force_flush = false;
-                state.event_start = Some(event_start);
+                state.event_start = selected.ranges.first().map(|range| range.start);
                 state.event_end = event_end;
                 state.started_at.get_or_insert(now);
                 state.last_mutation_at = Some(now);
                 return Ok(());
             }
-            self.persist_flushed_event_seq_locked(event_end)?;
+            self.complete_local_event_ranges_locked(&selected.ranges)?;
             Self::clear_pending_state(state);
             return Ok(());
         }
@@ -330,7 +432,7 @@ impl PgMetaEngine {
         let now = Instant::now();
         state.ops = projected.visible_ops;
         state.force_flush = true;
-        state.event_start = Some(event_start);
+        state.event_start = selected.ranges.first().map(|range| range.start);
         state.event_end = event_end;
         state.started_at = Some(now);
         state.last_mutation_at = Some(now);
@@ -467,7 +569,11 @@ impl PgMetaEngine {
                 if projected.visible_ops == 0 && !projected.needs_local_replay {
                     let expected_state = *state;
                     drop(state);
-                    self.acknowledge_pending_state_if_unchanged(expected_state, after_seq)?;
+                    self.acknowledge_pending_state_if_unchanged(
+                        expected_state,
+                        event_start,
+                        after_seq,
+                    )?;
                     return Ok(false);
                 }
             }
@@ -525,7 +631,11 @@ impl PgMetaEngine {
                 }
                 let expected_state = *state;
                 drop(state);
-                self.acknowledge_pending_state_if_unchanged(expected_state, after_seq)?;
+                self.acknowledge_pending_state_if_unchanged(
+                    expected_state,
+                    event_start,
+                    after_seq,
+                )?;
             } else {
                 if state.event_start.is_none() {
                     state.event_start = Some(before_seq);
@@ -649,15 +759,60 @@ impl PgMetaEngine {
         if events.is_empty() {
             return Ok(None);
         }
-        let projected = RemoteApplyCoordinator::project_local_batch(&events);
+        let selected = self.select_unprocessed_local_events(batch.event_start, &events)?;
+        if selected.events.is_empty() {
+            self.restore_pending_state_from_local_log()?;
+            return Ok(None);
+        }
+        let mut projected_source_event_indices = Vec::with_capacity(selected.events.len());
+        let projected = RemoteApplyCoordinator::project_local_batch_with_event_sources(
+            selected.events.as_ref(),
+            &mut projected_source_event_indices,
+        );
         if projected.events.is_empty() {
             if !projected.needs_local_replay {
-                self.persist_flushed_event_seq(batch.event_end)?;
+                self.complete_local_event_ranges(&selected.ranges)?;
             }
             self.restore_pending_state_from_local_log()?;
             return Ok(None);
         }
-        let batch_version = self.push_projected_event_log_batch_locked(projected.events)?;
+        let mut oversized_projected_event_index = None;
+        let batch_version = match self.push_projected_event_log_batch_locked(
+            projected.events,
+            &mut oversized_projected_event_index,
+        ) {
+            Ok(batch_version) => batch_version,
+            Err(error @ MetaError::EventTooLarge { .. }) => {
+                let projected_index = oversized_projected_event_index.ok_or_else(|| {
+                    MetaError::Storage(
+                        "oversized event error did not identify its projected index".to_string(),
+                    )
+                })?;
+                let selected_index = *projected_source_event_indices
+                    .get(projected_index)
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "oversized projected event has no local source index".to_string(),
+                        )
+                    })?;
+                let event_start = Self::selected_local_event_seq(&selected.ranges, selected_index)
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "oversized projected event has no local journal sequence".to_string(),
+                        )
+                    })?;
+                let event_end = event_start.checked_add(1).ok_or_else(|| {
+                    MetaError::Storage("local event sequence exceeds u64".to_string())
+                })?;
+                self.reject_local_event_ranges(&[LocalEventRange {
+                    start: event_start,
+                    end: event_end,
+                }])?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.mark_local_event_ranges_published(&selected.ranges)?;
         // The replay pass acknowledges only the local prefix represented by the
         // projected batch. The remaining local-only suffix must stay replayable.
         self.restore_pending_state_from_local_log()?;
@@ -678,12 +833,13 @@ impl PgMetaEngine {
             }
             Err(err @ MetaError::EventTooLarge { .. }) => {
                 self.finish_claimed_batch(batch);
+                self.restore_pending_state_from_local_log()?;
                 warn!(
                     error = %err,
                     volume_id = self.volume_id,
-                    event_start = batch.event_start,
-                    event_end = batch.event_end,
-                    "postgres flush rejected an oversized event; pending claim was not restored"
+                    attempted_event_start = batch.event_start,
+                    attempted_event_end = batch.event_end,
+                    "postgres flush rejected one oversized event and restored remaining local work"
                 );
                 Err(err)
             }

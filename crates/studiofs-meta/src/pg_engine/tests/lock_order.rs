@@ -10,19 +10,32 @@ enum LockOrderHookEvent {
     PendingStateRestored,
 }
 
+fn pending_cancelled_local_file_ack(
+    pg: &PgMetaEngine,
+    name: &[u8],
+) -> (u64, u64, PendingReplicationState) {
+    let event_start = pg.local.get_counter("nextEventSeq").expect("event start");
+    pg.local
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create local-only file");
+    pg.local
+        .unlink(ROOT_INO, name)
+        .expect("delete local-only file");
+    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let state = PendingReplicationState {
+        event_start: Some(event_start),
+        event_end,
+        ..PendingReplicationState::default()
+    };
+    *pg.pending_state.lock().expect("pending state") = state;
+    (event_start, event_end, state)
+}
+
 #[test]
 fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    pg.create_file(ROOT_INO, b"cancelled-local-file", 0, 0, 0o644)
-        .expect("create local file");
-    pg.unlink(ROOT_INO, b"cancelled-local-file")
-        .expect("unlink unpublished local file");
-
-    let event_end = pg
-        .local
-        .get_counter("nextEventSeq")
-        .expect("read local event end");
-    let expected_state = *pg.pending_state.lock().expect("pending state");
+    let (event_start, event_end, expected_state) =
+        pending_cancelled_local_file_ack(&pg, b"cancelled-local-file");
     let context = RemoteReplayApplyContext {
         last_seq: 0,
         current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
@@ -125,7 +138,8 @@ fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
         ack_ready_tx
             .send(contending)
             .expect("signal acknowledgement lock state");
-        let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+        let result =
+            ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_start, event_end);
         ack_tx.send(result).expect("send acknowledgement result");
     });
     ack_start.wait();
@@ -175,15 +189,8 @@ fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
 #[test]
 fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    pg.create_file(ROOT_INO, b"checkpoint-local-file", 0, 0, 0o644)
-        .expect("create local file");
-    pg.unlink(ROOT_INO, b"checkpoint-local-file")
-        .expect("unlink unpublished local file");
-    let event_end = pg
-        .local
-        .get_counter("nextEventSeq")
-        .expect("read local event end");
-    let expected_state = *pg.pending_state.lock().expect("pending state");
+    let (event_start, event_end, expected_state) =
+        pending_cancelled_local_file_ack(&pg, b"checkpoint-local-file");
 
     let pg = Arc::new(pg);
     let (position_tx, position_rx) = mpsc::channel();
@@ -274,7 +281,8 @@ fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
         ack_ready_tx
             .send(contending)
             .expect("signal acknowledgement lock state");
-        let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+        let result =
+            ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_start, event_end);
         ack_tx.send(result).expect("send acknowledgement result");
     });
     ack_start.wait();
@@ -327,6 +335,7 @@ fn restore_pending_state_and_local_ack_share_the_canonical_lock_order() {
         .local
         .get_counter("nextEventSeq")
         .expect("read local event end");
+    let event_start = expected_state.event_start.expect("pending event start");
 
     let pg = Arc::new(pg);
     let restore_barrier = Arc::new(Barrier::new(2));
@@ -410,7 +419,8 @@ fn restore_pending_state_and_local_ack_share_the_canonical_lock_order() {
         ack_ready_tx
             .send(contending)
             .expect("signal acknowledgement lock state");
-        let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+        let result =
+            ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_start, event_end);
         ack_tx.send(result).expect("send acknowledgement result");
     });
     ack_start.wait();

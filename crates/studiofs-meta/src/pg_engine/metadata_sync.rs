@@ -69,8 +69,14 @@ impl PgMetaEngine {
             return Ok(active_open_overlay);
         }
 
+        let overlay_exclusions = self.local_event_overlay_exclusions()?;
         Ok(RemoteApplyCoordinator::merge_overlay_conflicts(
-            &RemoteApplyCoordinator::overlay_conflicts_for_local_range(&self.local, start, end)?,
+            &RemoteApplyCoordinator::overlay_conflicts_for_local_range(
+                &self.local,
+                start,
+                end,
+                &overlay_exclusions,
+            )?,
             &active_open_overlay,
         ))
     }
@@ -413,14 +419,20 @@ impl PgMetaEngine {
                 flushed_event_seq: None,
             });
         }
+        let local_event_ack_barrier = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?
+            .rejected
+            .first()
+            .map(|range| range.start);
+        let local_event_overlay_exclusions = self.local_event_overlay_exclusions()?;
         let txn = self.local.begin_write_txn()?;
-        let result = RemoteApplyCoordinator::new(&self.local).apply_decoded_batches_in_txn(
-            &txn,
-            batches,
-            recent_flush,
-            context,
-        );
-        let outcome = match result {
+        let result = RemoteApplyCoordinator::new(&self.local)
+            .with_local_event_ack_barrier(local_event_ack_barrier)
+            .with_local_event_overlay_exclusions(local_event_overlay_exclusions)
+            .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context);
+        let mut outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Err(abort_error) = txn.abort() {
@@ -432,6 +444,10 @@ impl PgMetaEngine {
                 return Err(error);
             }
         };
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            outcome.flushed_event_seq =
+                Some(self.flushed_event_seq_after_completed_ranges_locked(flushed_event_seq)?);
+        }
         if let Err(error) = Self::write_replay_position_in_txn(&txn, &outcome) {
             if let Err(abort_error) = txn.abort() {
                 tracing::warn!(
@@ -464,6 +480,9 @@ impl PgMetaEngine {
             last_batch_version: outcome.max_version,
         })?;
         self.publish_replay_position(&outcome);
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            self.trim_local_event_progress_before_locked(flushed_event_seq)?;
+        }
         Ok(outcome)
     }
 
