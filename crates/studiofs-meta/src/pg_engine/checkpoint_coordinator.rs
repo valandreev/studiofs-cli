@@ -1,5 +1,6 @@
 use super::{PendingReplicationState, PgMetaEngine, sql};
-use crate::engine::{MetaError, MetaFormat, MetaInodes, MetaResult};
+use crate::engine::{MetaError, MetaResult};
+use crate::redb_engine::ServingCheckpointReadSnapshot;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -38,11 +39,11 @@ impl CheckpointCoordinatorState {
     }
 }
 
-#[derive(Clone, Copy)]
-struct CheckpointSourceCut {
+pub(super) struct CheckpointSourceCut {
     version: i64,
     event_seq: u64,
     total_event_payload_bytes: i64,
+    snapshot: ServingCheckpointReadSnapshot,
 }
 
 struct BuiltCheckpoint {
@@ -219,7 +220,7 @@ impl PgMetaEngine {
             .map(|_| ())
     }
 
-    fn build_and_publish_checkpoint(
+    pub(super) fn build_and_publish_checkpoint(
         &self,
         owner: &str,
         lease: CheckpointLease,
@@ -227,10 +228,21 @@ impl PgMetaEngine {
     ) -> MetaResult<bool> {
         let total_started = Instant::now();
         let build_started = Instant::now();
-        // The local export is a consistent redb transaction. It intentionally
-        // runs without replication_lock so ordinary replication can continue.
-        let payload = self.local.export_serving_checkpoint_bytes()?;
-        let format_info = self.local.get_format_info()?;
+        let CheckpointSourceCut {
+            version,
+            event_seq,
+            total_event_payload_bytes,
+            snapshot,
+        } = cut;
+        // The redb read transaction was captured with the source cut. Exporting
+        // from it keeps the payload at that version while writes continue.
+        let payload = self
+            .local
+            .export_serving_checkpoint_bytes_from_snapshot(&snapshot)?;
+        let format_info = self
+            .local
+            .get_format_info_from_checkpoint_snapshot(&snapshot)?;
+        drop(snapshot);
         let metadata_format_version = i16::try_from(format_info.format_version).map_err(|_| {
             MetaError::Storage("metadata format version exceeds PostgreSQL SMALLINT".to_string())
         })?;
@@ -245,11 +257,21 @@ impl PgMetaEngine {
             checkpoint_sha256,
             format_info,
         };
+        tracing::debug!(
+            version,
+            event_seq,
+            "built checkpoint from captured source cut"
+        );
         let payload_bytes = u64::try_from(checkpoint.payload.len()).unwrap_or(u64::MAX);
         let build_duration_us = elapsed_micros(build_started);
         let publish_started = Instant::now();
-        let Some(observation) =
-            self.publish_checkpoint_if_source_cut_is_current(owner, lease, cut, checkpoint)?
+        let Some(observation) = self.publish_checkpoint_for_cut(
+            owner,
+            lease,
+            version,
+            total_event_payload_bytes,
+            checkpoint,
+        )?
         else {
             return Ok(self.refresh_checkpoint_freshness_after_coordination_miss());
         };
@@ -266,7 +288,7 @@ impl PgMetaEngine {
         Ok(true)
     }
 
-    fn capture_checkpoint_source_cut(&self) -> MetaResult<Option<CheckpointSourceCut>> {
+    pub(super) fn capture_checkpoint_source_cut(&self) -> MetaResult<Option<CheckpointSourceCut>> {
         let local_version_before = self.local_version.load(Ordering::Acquire);
         let freshness = self.read_remote_checkpoint_freshness()?;
         let _guard = self
@@ -277,10 +299,6 @@ impl PgMetaEngine {
         let Some(local_version) =
             checkpoint_source_version_if_stable(local_version_before, local_version)
         else {
-            self.record_checkpoint_freshness_observation(freshness);
-            return Ok(None);
-        };
-        let Some(event_seq) = self.checkpoint_source_event_seq()? else {
             self.record_checkpoint_freshness_observation(freshness);
             return Ok(None);
         };
@@ -296,7 +314,11 @@ impl PgMetaEngine {
             self.record_checkpoint_freshness_observation(freshness);
             return Ok(None);
         }
-
+        let snapshot = self.local.begin_serving_checkpoint_snapshot()?;
+        let Some(event_seq) = self.checkpoint_source_event_seq(&snapshot)? else {
+            self.record_checkpoint_freshness_observation(freshness);
+            return Ok(None);
+        };
         let total_event_payload_bytes = i64::try_from(freshness.total_event_payload_bytes)
             .map_err(|_| {
                 MetaError::Storage(
@@ -307,21 +329,26 @@ impl PgMetaEngine {
             version: local_version,
             event_seq,
             total_event_payload_bytes,
+            snapshot,
         }))
     }
 
-    /// Return the local event position only when the serving snapshot has no
-    /// local replication work that has not reached PostgreSQL yet.
+    /// Return the local event position only when the captured serving snapshot
+    /// has no local replication work that has not reached PostgreSQL yet.
     ///
     /// The in-memory pending state is updated after the redb mutation commits,
     /// so the durable event cursor closes the bookkeeping window between those
-    /// operations. Callers must hold `replication_lock`.
-    fn checkpoint_source_event_seq(&self) -> MetaResult<Option<u64>> {
+    /// operations. Read it from the same redb transaction that will be
+    /// exported. Callers must hold `replication_lock`.
+    fn checkpoint_source_event_seq(
+        &self,
+        snapshot: &ServingCheckpointReadSnapshot,
+    ) -> MetaResult<Option<u64>> {
         let pending_state = self
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
-        let next_event_seq = self.local.get_counter("nextEventSeq")?;
+        let next_event_seq = snapshot.get_counter("nextEventSeq")?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::Acquire);
         Ok(checkpoint_source_event_seq_if_clean(
             *pending_state,
@@ -435,23 +462,18 @@ impl PgMetaEngine {
         self.record_remote_operation_result(result)
     }
 
-    fn publish_checkpoint_if_source_cut_is_current(
+    fn publish_checkpoint_for_cut(
         &self,
         owner: &str,
         lease: CheckpointLease,
-        cut: CheckpointSourceCut,
+        version: i64,
+        total_event_payload_bytes: i64,
         checkpoint: BuiltCheckpoint,
     ) -> MetaResult<Option<super::metadata_io::CheckpointFreshnessObservation>> {
         let _guard = self
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        if self.local_version.load(Ordering::Acquire) != cut.version
-            || self.checkpoint_source_event_seq()? != Some(cut.event_seq)
-        {
-            return Ok(None);
-        }
-
         let command_pool = Arc::clone(&self.command_pool);
         let command_timeout = self.command_timeout;
         let volume_id = self.volume_id;
@@ -470,9 +492,9 @@ impl PgMetaEngine {
                                 &[
                                     &volume_id,
                                     &checkpoint.metadata_format_version,
-                                    &cut.version,
-                                    &cut.version,
-                                    &cut.total_event_payload_bytes,
+                                    &version,
+                                    &version,
+                                    &total_event_payload_bytes,
                                     &checkpoint.payload,
                                     &checkpoint.checkpoint_sha256,
                                     &checkpoint.format_info,

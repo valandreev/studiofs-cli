@@ -97,6 +97,13 @@ impl RedbMetaEngine {
     /// from the same read snapshot used by the foreground metadata.
     pub fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
         let txn = self.begin_read_txn()?;
+        Self::get_inode_lifecycle_from_read_txn(&txn, ino)
+    }
+
+    pub(crate) fn get_inode_lifecycle_from_read_txn(
+        txn: &ReadTransaction,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeLifecycleRecord>> {
         let stored_lifecycle = txn
             .open_table(INODE_LIFECYCLE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -111,9 +118,9 @@ impl RedbMetaEngine {
             return Ok(Some(stored_lifecycle));
         }
 
-        let prefer_current = Self::prefer_current_attr_for_inode_from_txn(&txn, ino)?;
+        let prefer_current = Self::prefer_current_attr_for_inode_from_txn(txn, ino)?;
         let attr =
-            match Self::resolve_attr_with_preference_in_read_snapshot(&txn, ino, prefer_current) {
+            match Self::resolve_attr_with_preference_in_read_snapshot(txn, ino, prefer_current) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => return Ok(Some(stored_lifecycle)),
                 Err(error) => return Err(error),
@@ -123,7 +130,7 @@ impl RedbMetaEngine {
         }
 
         let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(
-            &txn,
+            txn,
             REGULAR_FILE_OVERLAY_TABLE,
             ino,
         )?;
@@ -131,7 +138,7 @@ impl RedbMetaEngine {
             return Ok(Some(stored_lifecycle));
         }
         let has_published_base =
-            Self::has_regular_file_chunk_rows_in_read_txn(&txn, REGULAR_FILE_BASE_TABLE, ino)?
+            Self::has_regular_file_chunk_rows_in_read_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?
                 || attr.committed_size > 0
                 || attr.committed_content_epoch > 0;
 

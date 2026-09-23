@@ -369,7 +369,15 @@ impl RedbMetaEngine {
 
     /// Export a snapshot projected to the remote-visible published namespace.
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
-        let mut snapshot = self.export_snapshot()?;
+        let txn = self.begin_read_txn()?;
+        self.export_remote_snapshot_from_read_txn(&txn)
+    }
+
+    pub(crate) fn export_remote_snapshot_from_read_txn(
+        &self,
+        txn: &ReadTransaction,
+    ) -> MetaResult<RedbSnapshot> {
+        let mut snapshot = self.export_snapshot_from_read_txn(txn)?;
         let mut published_regular_inodes = HashSet::new();
         for (ino, bytes) in &snapshot.regular_file_base {
             let regular: RegularFileBaseState = decode(bytes)?;
@@ -387,7 +395,7 @@ impl RedbMetaEngine {
         for (ino, bytes) in snapshot.inodes.drain(..) {
             let mut attr: InodeAttr = decode(&bytes)?;
             if attr.kind == FileType::RegularFile {
-                let lifecycle = self.get_inode_lifecycle(ino)?;
+                let lifecycle = Self::get_inode_lifecycle_from_read_txn(txn, ino)?;
                 let visible_in_remote_namespace = published_regular_inodes.contains(&ino)
                     || (lifecycle
                         .as_ref()
@@ -461,7 +469,15 @@ impl RedbMetaEngine {
     pub(crate) fn export_serving_checkpoint(
         &self,
     ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
-        let snapshot = self.export_remote_snapshot()?;
+        let txn = self.begin_read_txn()?;
+        self.export_serving_checkpoint_from_read_txn(&txn)
+    }
+
+    fn export_serving_checkpoint_from_read_txn(
+        &self,
+        txn: &ReadTransaction,
+    ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
+        let snapshot = self.export_remote_snapshot_from_read_txn(txn)?;
         Ok(crate::snapshot::ServingCheckpoint {
             inodes: snapshot.inodes,
             dentries: snapshot.dentries,
@@ -479,6 +495,16 @@ impl RedbMetaEngine {
     /// data stay in the local database or PostgreSQL control-plane tables.
     pub fn export_serving_checkpoint_bytes(&self) -> MetaResult<Vec<u8>> {
         postcard::to_stdvec(&self.export_serving_checkpoint()?).map_err(|error| {
+            MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
+        })
+    }
+
+    pub(crate) fn export_serving_checkpoint_bytes_from_snapshot(
+        &self,
+        snapshot: &ServingCheckpointReadSnapshot,
+    ) -> MetaResult<Vec<u8>> {
+        let checkpoint = self.export_serving_checkpoint_from_read_txn(snapshot.read_txn())?;
+        postcard::to_stdvec(&checkpoint).map_err(|error| {
             MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
         })
     }

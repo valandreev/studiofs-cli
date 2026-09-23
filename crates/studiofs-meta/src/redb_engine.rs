@@ -46,6 +46,27 @@ pub struct RedbMetaEngine {
     allocator_state_write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
+pub(crate) struct ServingCheckpointReadSnapshot {
+    transaction: ReadTransaction,
+}
+
+impl ServingCheckpointReadSnapshot {
+    pub(crate) fn read_txn(&self) -> &ReadTransaction {
+        &self.transaction
+    }
+
+    pub(crate) fn get_counter(&self, name: &str) -> MetaResult<u64> {
+        let table = self
+            .transaction
+            .open_table(COUNTERS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(table
+            .get(name)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map_or(0, |value| value.value()))
+    }
+}
+
 struct RelaxedDurabilityState {
     started: Instant,
     interval_ms: u64,
@@ -562,6 +583,14 @@ impl RedbMetaEngine {
             .ok_or_else(|| MetaError::Storage("redb database handle is unavailable".to_string()))?
             .begin_read()
             .map_err(|error| MetaError::Storage(error.to_string()))
+    }
+
+    pub(crate) fn begin_serving_checkpoint_snapshot(
+        &self,
+    ) -> MetaResult<ServingCheckpointReadSnapshot> {
+        Ok(ServingCheckpointReadSnapshot {
+            transaction: self.begin_read_txn()?,
+        })
     }
 
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {

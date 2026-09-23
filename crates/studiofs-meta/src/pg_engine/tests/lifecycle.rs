@@ -5201,6 +5201,158 @@ fn pg_checkpoint_lease_takeover_advances_fence_and_rejects_old_owner() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_publishes_captured_cut_while_local_writes_continue_and_replays_tail() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-captured-cut");
+    let (_publisher_dir, publisher) = open_pg_publisher(&volume);
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 10000, total_event_payload_bytes = 10000 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("advance remote head for checkpoint refresh");
+    publisher
+        .local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 10_000)
+        .expect("persist the captured local version");
+    publisher.local_version.store(10_000, Ordering::Release);
+    publisher.observe_checkpoint_freshness();
+
+    let cut = publisher
+        .capture_checkpoint_source_cut()
+        .expect("capture checkpoint source cut")
+        .expect("checkpoint source should be eligible");
+    let owner = publisher.current_client_id().expect("checkpoint owner");
+    let lease = publisher
+        .try_claim_checkpoint_lease(&owner, Duration::from_secs(60))
+        .expect("claim checkpoint lease")
+        .expect("checkpoint lease should be available");
+
+    let stop_writer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop_writer);
+    let writer_engine = Arc::clone(&publisher);
+    let writer_start = Arc::new(std::sync::Barrier::new(2));
+    let writer_start_gate = Arc::clone(&writer_start);
+    let (first_write_tx, first_write_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let first_name = "checkpoint-cut-write-0";
+        writer_engine
+            .create_dir(ROOT_INO, first_name.as_bytes(), 0, 0, 0o755)
+            .expect("write after checkpoint cut");
+        first_write_tx
+            .send(first_name.to_string())
+            .expect("report first writer commit");
+        let mut writes = 1;
+        writer_start_gate.wait();
+        for index in 1..128 {
+            if writer_stop.load(Ordering::Acquire) {
+                break;
+            }
+            let name = format!("checkpoint-cut-write-{index}");
+            writer_engine
+                .create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
+                .expect("write during checkpoint publication");
+            writes += 1;
+        }
+        writes
+    });
+    let first_write = first_write_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer should commit after the captured cut");
+    writer_start.wait();
+
+    let publish_result = publisher.build_and_publish_checkpoint(&owner, lease, cut);
+    stop_writer.store(true, Ordering::Release);
+    let writer_count = writer.join().expect("join checkpoint writer");
+    publisher
+        .release_checkpoint_lease(&owner, lease)
+        .expect("release checkpoint lease");
+    assert!(
+        publish_result.expect("publish captured checkpoint cut"),
+        "a local write after capture must not invalidate the checkpoint cut"
+    );
+    assert!(
+        writer_count > 0,
+        "writer workload must run during publication"
+    );
+
+    let checkpoint = read_pg_checkpoint(&dsn, volume.volume_id);
+    let checkpoint_state: crate::snapshot::ServingCheckpoint =
+        postcard::from_bytes(&checkpoint.snapshot).expect("decode published checkpoint");
+    assert!(
+        checkpoint_state.dentries.iter().all(|(key, _)| {
+            !key.windows(first_write.len())
+                .any(|window| window == first_write.as_bytes())
+        }),
+        "the checkpoint bytes must remain at the captured cut"
+    );
+
+    let _recent_flush = {
+        let _guard = publisher
+            .replication_lock
+            .lock()
+            .expect("lock local replication for event-tail publication");
+        publisher
+            .ensure_remote_format_validated()
+            .expect("validate remote format before event-tail publication");
+        publisher
+            .replay_local_upload_ledger()
+            .expect("replay local upload ledger before event-tail publication");
+        let recent_flush = if let Some(batch) = publisher.claim_pending_batch(true) {
+            publisher
+                .flush_pending_claimed_batch_with_restore(batch)
+                .expect("publish the local event tail after the checkpoint")
+        } else {
+            None
+        };
+        publisher
+            .pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())
+            .expect("reconcile after event-tail publication");
+        recent_flush
+    };
+    let (remote_head, checkpoint_version) =
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT version, checkpoint_version FROM metadata_state WHERE vol = $1",
+                    &[&volume.volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(i64, i64), MetaError>((row.get(0), row.get(1)))
+        }))
+        .expect("read checkpoint and replay target");
+    assert!(remote_head > checkpoint_version);
+    assert_eq!(checkpoint_version, 10_000);
+
+    let cold_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let cold_db = cold_dir.path().join("cold.redb");
+    seed_local(&cold_db, &volume.format_info());
+    let cold = PgMetaEngine::open_with_options(
+        &cold_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open cold client");
+    cold.sync_metadata()
+        .expect("restore checkpoint and replay the post-cut event tail");
+    assert_eq!(cold.local_version.load(Ordering::Acquire), remote_head);
+    cold.lookup(ROOT_INO, first_write.as_bytes())
+        .expect("cold client should restore the cut and replay the later write");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_background_checkpoint_coordinator_coalesces_two_clients_and_publishes_exact_cut() {
     let Some(dsn) = pg_dsn() else {
         return;
