@@ -203,6 +203,20 @@ The implementation may schedule later bounded catch-up attempts, but it must
 not turn those attempts into an unbounded mount-start wait. Every retry has a
 typed failure outcome and an observable next-resume position.
 
+## Local Replay Lock Ordering
+
+Operations that update the local replay cursor together with serving state or
+pending mutation state acquire `local_position_lock` before `pending_state`.
+Replay page apply, local journal acknowledgment/restoration, and serving
+checkpoint import retain both locks across their coupled local transition.
+Helpers that persist a cursor while those locks are held must use their
+`*_locked` form instead of reacquiring `local_position_lock`.
+
+The network page/checkpoint read stays outside this lock scope. This ordering
+keeps a foreign replay page from racing with local mutation retirement while
+allowing replay and checkpoint import to wait for foreground mutations without
+forming a lock cycle with local acknowledgment.
+
 Remote event ordering is version-first and uses the event-log tie-breaker for
 rows in the same batch. Runtime queries and cursor persistence must use the
 same ordering contract; a client must not skip an earlier foreign batch merely

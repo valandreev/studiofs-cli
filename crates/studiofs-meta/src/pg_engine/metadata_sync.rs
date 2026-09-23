@@ -351,10 +351,7 @@ impl PgMetaEngine {
             );
         }
         let apply_started = Instant::now();
-        let mut pending_state = self
-            .pending_state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let (position_guard, mut pending_state) = self.lock_local_position_and_pending_state()?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
@@ -364,7 +361,7 @@ impl PgMetaEngine {
             &batches,
             target_version,
         )?;
-        let outcome = self.apply_replay_page_atomically(
+        let outcome = self.apply_replay_page_atomically_locked(
             batches,
             recent_flush,
             super::RemoteReplayApplyContext {
@@ -379,6 +376,7 @@ impl PgMetaEngine {
             self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
         }
         drop(pending_state);
+        drop(position_guard);
         self.record_pg_sync_page_applied(PgSyncPageDiagnostics {
             apply_duration_us: elapsed_micros(apply_started),
             total_duration_us: elapsed_micros(page_started),
@@ -387,7 +385,19 @@ impl PgMetaEngine {
         Ok(outcome.changed)
     }
 
+    #[cfg(test)]
     pub(super) fn apply_replay_page_atomically(
+        &self,
+        batches: Vec<super::remote_apply::DecodedReplayBatch>,
+        recent_flush: Option<&super::RecentFlush>,
+        context: super::RemoteReplayApplyContext,
+    ) -> MetaResult<super::RemoteReplayApplyOutcome> {
+        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
+        self.apply_replay_page_atomically_locked(batches, recent_flush, context)
+    }
+
+    /// Apply a page while the caller holds both locks in canonical order.
+    fn apply_replay_page_atomically_locked(
         &self,
         batches: Vec<super::remote_apply::DecodedReplayBatch>,
         recent_flush: Option<&super::RecentFlush>,
@@ -401,10 +411,6 @@ impl PgMetaEngine {
                 flushed_event_seq: None,
             });
         }
-        let _position_guard = self
-            .local_position_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
         let txn = self.local.begin_write_txn()?;
         let result = RemoteApplyCoordinator::new(&self.local).apply_decoded_batches_in_txn(
             &txn,
