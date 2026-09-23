@@ -338,7 +338,7 @@ impl PgMetaEngine {
     /// so the durable event cursor closes the bookkeeping window between those
     /// operations. Read it from the same redb transaction that will be
     /// exported. Callers must hold `replication_lock`.
-    fn checkpoint_source_event_seq(
+    pub(super) fn checkpoint_source_event_seq(
         &self,
         snapshot: &ServingCheckpointReadSnapshot,
     ) -> MetaResult<Option<u64>> {
@@ -484,6 +484,7 @@ impl PgMetaEngine {
                 "publish fenced bootstrap checkpoint",
                 move |client| {
                     Box::pin(async move {
+                        let sha_slice: &[u8] = &checkpoint.checkpoint_sha256;
                         let row = client
                             .query_opt(
                                 sql::UPSERT_FENCED_METADATA_CHECKPOINT,
@@ -494,7 +495,7 @@ impl PgMetaEngine {
                                     &version,
                                     &total_event_payload_bytes,
                                     &checkpoint.payload,
-                                    &&checkpoint.checkpoint_sha256[..],
+                                    &sha_slice,
                                     &checkpoint.format_info,
                                     &owner,
                                     &fencing_token,

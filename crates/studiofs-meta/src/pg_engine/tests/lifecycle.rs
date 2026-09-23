@@ -5200,6 +5200,41 @@ fn pg_checkpoint_lease_takeover_advances_fence_and_rejects_old_owner() {
 }
 
 #[test]
+fn checkpoint_source_event_seq_uses_captured_redb_counter() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let _replication_lock = pg.replication_lock.lock().expect("replication lock");
+    let snapshot = pg
+        .local
+        .begin_serving_checkpoint_snapshot()
+        .expect("capture local read transaction");
+    let captured_event_seq = snapshot
+        .get_counter("nextEventSeq")
+        .expect("read captured event sequence");
+
+    <crate::redb_engine::RedbMetaEngine as crate::engine::MetaFsOps>::create_dir(
+        pg.local.as_ref(),
+        ROOT_INO,
+        b"local-write-after-cut",
+        0,
+        0,
+        0o755,
+    )
+    .expect("write after cut without updating pg pending state");
+    let live_event_seq =
+        <crate::redb_engine::RedbMetaEngine as crate::engine::MetaInodes>::get_counter(
+            pg.local.as_ref(),
+            "nextEventSeq",
+        )
+        .expect("read live event sequence");
+    assert!(live_event_seq > captured_event_seq);
+    assert_eq!(
+        pg.checkpoint_source_event_seq(&snapshot)
+            .expect("check captured source position"),
+        Some(captured_event_seq)
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_checkpoint_publishes_captured_cut_while_local_writes_continue_and_replays_tail() {
     let Some(dsn) = pg_dsn() else {

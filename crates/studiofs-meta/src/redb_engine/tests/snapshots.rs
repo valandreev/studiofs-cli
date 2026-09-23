@@ -10,11 +10,23 @@ fn serving_checkpoint_read_snapshot_exports_only_the_captured_state() {
     let snapshot = engine
         .begin_serving_checkpoint_snapshot()
         .expect("capture checkpoint snapshot");
+    let captured_event_seq = snapshot
+        .get_counter("nextEventSeq")
+        .expect("read captured event sequence");
     for name in [b"checkpoint-after-c".as_slice(), b"checkpoint-after-d"] {
         engine
             .create_dir(ROOT_INO, name, 0, 0, 0o755)
             .expect("create entry after snapshot");
     }
+    assert!(
+        engine.get_counter("nextEventSeq").unwrap() > captured_event_seq,
+        "writes after capture should advance the live event sequence"
+    );
+    assert_eq!(
+        snapshot.get_counter("nextEventSeq").unwrap(),
+        captured_event_seq,
+        "the captured transaction must retain its event sequence"
+    );
 
     let captured_bytes = snapshot
         .export_serving_checkpoint_bytes()
@@ -81,7 +93,11 @@ fn import_serving_checkpoint_rebuilds_local_counters() {
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
             .unwrap()
     );
-    let checkpoint = source.export_serving_checkpoint().unwrap();
+    let checkpoint = source
+        .begin_serving_checkpoint_snapshot()
+        .unwrap()
+        .export_serving_checkpoint()
+        .unwrap();
 
     let dir = studiofs_test_support::workspace_target_tempdir("serving-checkpoint-");
     let target = RedbMetaEngine::open(dir.path().join("test.db")).unwrap();

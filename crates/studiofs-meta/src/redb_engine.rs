@@ -67,11 +67,16 @@ impl ServingCheckpointReadSnapshot {
     }
 
     pub(crate) fn export_serving_checkpoint_bytes(&self) -> MetaResult<Vec<u8>> {
-        let checkpoint =
-            RedbMetaEngine::export_serving_checkpoint_from_read_txn(&self.transaction)?;
+        let checkpoint = self.export_serving_checkpoint()?;
         postcard::to_stdvec(&checkpoint).map_err(|error| {
             MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
         })
+    }
+
+    pub(crate) fn export_serving_checkpoint(
+        &self,
+    ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
+        RedbMetaEngine::export_serving_checkpoint_from_read_txn(&self.transaction)
     }
 }
 

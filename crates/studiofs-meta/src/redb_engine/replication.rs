@@ -462,14 +462,6 @@ impl RedbMetaEngine {
         Ok(snapshot)
     }
 
-    /// Export only the shared serving state used as a PostgreSQL checkpoint.
-    pub(crate) fn export_serving_checkpoint(
-        &self,
-    ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
-        let txn = self.begin_read_txn()?;
-        Self::export_serving_checkpoint_from_read_txn(&txn)
-    }
-
     pub(super) fn export_serving_checkpoint_from_read_txn(
         txn: &ReadTransaction,
     ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
@@ -490,9 +482,8 @@ impl RedbMetaEngine {
     /// local counters, event journals, cleanup state, and snapshot control
     /// data stay in the local database or PostgreSQL control-plane tables.
     pub fn export_serving_checkpoint_bytes(&self) -> MetaResult<Vec<u8>> {
-        postcard::to_stdvec(&self.export_serving_checkpoint()?).map_err(|error| {
-            MetaError::Serialization(format!("serving checkpoint encode failed: {error}"))
-        })
+        self.begin_serving_checkpoint_snapshot()?
+            .export_serving_checkpoint_bytes()
     }
 
     /// Return symlink inode ids whose local state differs from the imported base view.
