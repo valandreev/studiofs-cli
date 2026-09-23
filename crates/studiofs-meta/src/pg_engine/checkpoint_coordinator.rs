@@ -1,3 +1,4 @@
+use super::metadata_io::CheckpointFreshnessObservation;
 use super::{PendingReplicationState, PgMetaEngine, sql};
 use crate::engine::{MetaError, MetaResult};
 use crate::redb_engine::ServingCheckpointReadSnapshot;
@@ -237,15 +238,15 @@ impl PgMetaEngine {
         } = cut;
         // The redb read transaction was captured with the source cut. Exporting
         // from it keeps the payload at that version while writes continue.
-        let payload = snapshot.export_serving_checkpoint_bytes()?;
         let format_info = snapshot.format_info()?;
-        drop(snapshot);
         let metadata_format_version = i16::try_from(format_info.format_version).map_err(|_| {
             MetaError::Storage("metadata format version exceeds PostgreSQL SMALLINT".to_string())
         })?;
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
+        let payload = snapshot.export_serving_checkpoint_bytes()?;
+        drop(snapshot);
         let checkpoint_sha256: [u8; 32] = Sha256::digest(&payload).into();
 
         let checkpoint = BuiltCheckpoint {
@@ -304,12 +305,7 @@ impl PgMetaEngine {
             MetaError::Storage("local metadata version must be nonnegative".to_string())
         })?;
 
-        // The byte baseline must correspond to the version captured in the checkpoint.
-        if freshness.head_version != local_version_u64 {
-            self.record_checkpoint_freshness_observation(freshness);
-            return Ok(None);
-        }
-        if freshness.checkpoint_version >= local_version_u64 && freshness.format_info_present {
+        if !checkpoint_source_cut_is_eligible(&freshness, local_version_u64) {
             self.record_checkpoint_freshness_observation(freshness);
             return Ok(None);
         }
@@ -521,6 +517,15 @@ fn checkpoint_source_version_if_stable(observed: i64, current: i64) -> Option<i6
     (observed == current).then_some(current)
 }
 
+fn checkpoint_source_cut_is_eligible(
+    freshness: &CheckpointFreshnessObservation,
+    local_version: u64,
+) -> bool {
+    // The byte baseline must correspond to the version captured in the checkpoint.
+    freshness.head_version == local_version
+        && (freshness.checkpoint_version < local_version || !freshness.format_info_present)
+}
+
 fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -578,6 +583,32 @@ fn should_wait_for_checkpoint_wakeup(wakeup_set: bool, retry_pending: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_source_cut_requires_matching_freshness_coordinates() {
+        for (head, checkpoint, has_format_info, expected) in [
+            (10, 9, true, true),
+            (9, 8, true, false),
+            (11, 8, true, false),
+            (10, 10, true, false),
+            (10, 11, true, false),
+            (10, 10, false, true),
+        ] {
+            let freshness = CheckpointFreshnessObservation {
+                head_version: head,
+                checkpoint_version: checkpoint,
+                total_event_payload_bytes: 0,
+                format_info_present: has_format_info,
+                event_payload_bytes: 0,
+                checkpoint_age: Duration::ZERO,
+            };
+            assert_eq!(
+                checkpoint_source_cut_is_eligible(&freshness, 10),
+                expected,
+                "head={head}, checkpoint={checkpoint}, has_format_info={has_format_info}"
+            );
+        }
+    }
 
     #[test]
     fn request_state_can_be_rearmed_after_consumption() {

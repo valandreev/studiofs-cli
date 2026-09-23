@@ -747,7 +747,7 @@ impl RedbMetaEngine {
 impl MetaInodes for RedbMetaEngine {
     fn get_counter(&self, name: &str) -> MetaResult<u64> {
         let txn = self.begin_read_txn()?;
-        RedbMetaEngine::read_counter_from_read_txn(&txn, name)
+        Self::read_counter_from_read_txn(&txn, name)
     }
 
     fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {

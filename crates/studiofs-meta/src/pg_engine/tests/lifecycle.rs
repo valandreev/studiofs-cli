@@ -5210,6 +5210,15 @@ fn checkpoint_source_event_seq_uses_captured_redb_counter() {
     let captured_event_seq = snapshot
         .get_counter("nextEventSeq")
         .expect("read captured event sequence");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::Acquire),
+        captured_event_seq,
+        "the initial event sequence should be fully flushed before capture"
+    );
+    assert!(
+        captured_event_seq > 0,
+        "the captured event sequence should start from a non-zero flushed baseline"
+    );
 
     <crate::redb_engine::RedbMetaEngine as crate::engine::MetaFsOps>::create_dir(
         pg.local.as_ref(),
