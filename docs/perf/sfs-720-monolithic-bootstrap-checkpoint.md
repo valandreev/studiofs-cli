@@ -42,6 +42,11 @@ baseline rather than being attributed to the measured delta.
 
 ## Commands and evidence
 
+The ignored benchmark defaults to 1,000 and 10,000 entries in debug builds,
+and to 1,000, 10,000, 50,000, and 100,000 entries in release builds. This
+keeps broad debug `--ignored` runs from preparing the larger fixtures; set
+`SFS720_NAMESPACE_SIZES` to override either default.
+
 The portable fixture proof and helper regressions passed:
 
 ```text

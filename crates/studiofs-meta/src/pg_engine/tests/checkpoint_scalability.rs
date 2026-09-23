@@ -166,8 +166,12 @@ fn parse_sfs720_namespace_sizes(raw: &str) -> Vec<usize> {
 }
 
 fn sfs720_namespace_sizes() -> Vec<usize> {
-    let raw = std::env::var("SFS720_NAMESPACE_SIZES")
-        .unwrap_or_else(|_| "1000,10000,50000,100000".to_string());
+    #[cfg(debug_assertions)]
+    const DEFAULT_SIZES: &str = "1000,10000";
+    #[cfg(not(debug_assertions))]
+    const DEFAULT_SIZES: &str = "1000,10000,50000,100000";
+
+    let raw = std::env::var("SFS720_NAMESPACE_SIZES").unwrap_or_else(|_| DEFAULT_SIZES.to_string());
     parse_sfs720_namespace_sizes(&raw)
 }
 
@@ -266,6 +270,12 @@ fn sfs720_namespace_sizes_ignore_empty_tokens() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn sfs720_debug_default_namespace_sizes_are_bounded() {
+    assert_eq!(sfs720_namespace_sizes(), vec![1000, 10000]);
+}
+
 #[test]
 fn sfs720_summarize_millis_handles_even_and_empty_samples() {
     let summary = summarize_millis(&[9.0, 1.0, 3.0, 7.0]);
@@ -300,6 +310,7 @@ fn sfs720_checkpoint_scalability() {
     let mut output = File::create(&output_path).expect("create SFS-720 output file");
 
     for namespace_entries in sizes {
+        eprintln!("SFS-720: preparing {namespace_entries} namespace entries");
         let fixture = build_sfs720_checkpoint_fixture(namespace_entries);
         let volume = PgTestVolume::new(&dsn, &format!("sfs720-{namespace_entries}"));
         publish_sfs720_checkpoint(
