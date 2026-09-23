@@ -1,10 +1,33 @@
 use super::{
     LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, LOCAL_PG_NAMESPACE_VERSION_COUNTER,
-    LOCAL_PG_VERSION_COUNTER, PendingReplicationState, PgMetaEngine, StartupSnapshotImportMode,
+    LOCAL_PG_VERSION_COUNTER, LocalEventProgress, LocalEventRange, PendingReplicationState,
+    PgMetaEngine, StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::RedbMetaEngine;
 use std::sync::atomic::Ordering;
+
+fn merge_local_event_ranges(ranges: &mut Vec<LocalEventRange>) {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<LocalEventRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
+}
+
+fn trim_local_event_ranges_before(ranges: &mut Vec<LocalEventRange>, cursor: u64) {
+    ranges.retain(|range| range.end > cursor);
+    for range in ranges.iter_mut() {
+        range.start = range.start.max(cursor);
+    }
+}
 
 impl PgMetaEngine {
     /// Acquire the local replay position and pending mutation state together.
@@ -86,6 +109,7 @@ impl PgMetaEngine {
         local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
     }
 
+    #[cfg(test)]
     pub(super) fn persist_flushed_event_seq(&self, seq: u64) -> MetaResult<()> {
         let _guard = self
             .local_position_lock
@@ -102,6 +126,138 @@ impl PgMetaEngine {
             .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, seq)?;
         self.flushed_event_seq.store(seq, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub(super) fn reject_local_event_ranges(&self, ranges: &[LocalEventRange]) -> MetaResult<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
+        let cursor = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
+        let mut progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        for range in ranges {
+            let start = range.start.max(cursor);
+            if start < range.end {
+                progress.rejected.push(LocalEventRange {
+                    start,
+                    end: range.end,
+                });
+            }
+        }
+        merge_local_event_ranges(&mut progress.rejected);
+        Ok(())
+    }
+
+    pub(super) fn mark_local_event_ranges_published(
+        &self,
+        ranges: &[LocalEventRange],
+    ) -> MetaResult<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
+        let mut progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        let cursor = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
+        for range in ranges {
+            let start = range.start.max(cursor);
+            if start < range.end {
+                progress.published.push(LocalEventRange {
+                    start,
+                    end: range.end,
+                });
+            }
+        }
+        merge_local_event_ranges(&mut progress.published);
+        Ok(())
+    }
+
+    pub(super) fn complete_local_event_ranges(&self, ranges: &[LocalEventRange]) -> MetaResult<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
+        self.complete_local_event_ranges_locked(ranges)
+    }
+
+    /// Complete ranges while the caller holds the local-position and pending-state locks.
+    pub(super) fn complete_local_event_ranges_locked(
+        &self,
+        ranges: &[LocalEventRange],
+    ) -> MetaResult<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let mut progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        let cursor = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
+        let mut completed_ranges = progress.completed.clone();
+        for range in ranges {
+            let start = range.start.max(cursor);
+            if start < range.end {
+                completed_ranges.push(LocalEventRange {
+                    start,
+                    end: range.end,
+                });
+            }
+        }
+        merge_local_event_ranges(&mut completed_ranges);
+
+        let current = self.flushed_event_seq.load(Ordering::SeqCst);
+        let mut next = current.max(1);
+        let mut advanced = false;
+        loop {
+            if progress
+                .rejected
+                .iter()
+                .any(|range| range.start <= next && next < range.end)
+            {
+                break;
+            }
+            let Some(completed) = completed_ranges
+                .iter()
+                .find(|range| range.start <= next && next < range.end)
+            else {
+                break;
+            };
+            next = completed.end;
+            advanced = true;
+        }
+        if advanced && next > current {
+            self.persist_flushed_event_seq_locked(next)?;
+            completed_ranges.retain(|range| range.end > next);
+        }
+        progress.completed = completed_ranges;
+        Ok(())
+    }
+
+    pub(super) fn trim_local_event_progress_before(&self, cursor: u64) -> MetaResult<()> {
+        let mut progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        trim_local_event_ranges_before(&mut progress.rejected, cursor);
+        trim_local_event_ranges_before(&mut progress.completed, cursor);
+        trim_local_event_ranges_before(&mut progress.published, cursor);
+        Ok(())
+    }
+
+    pub(super) fn unprocessed_local_event_progress(&self) -> MetaResult<LocalEventProgress> {
+        self.local_event_progress
+            .lock()
+            .map(|progress| LocalEventProgress {
+                rejected: progress.rejected.clone(),
+                completed: progress.completed.clone(),
+                published: progress.published.clone(),
+            })
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))
     }
 
     #[cfg(test)]

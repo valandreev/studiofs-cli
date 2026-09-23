@@ -13,16 +13,15 @@ enum LockOrderHookEvent {
 #[test]
 fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    pg.create_file(ROOT_INO, b"cancelled-local-file", 0, 0, 0o644)
-        .expect("create local file");
-    pg.unlink(ROOT_INO, b"cancelled-local-file")
-        .expect("unlink unpublished local file");
+    pg.create_dir(ROOT_INO, b"pending-local-dir", 0, 0, 0o755)
+        .expect("create pending local directory");
 
     let event_end = pg
         .local
         .get_counter("nextEventSeq")
         .expect("read local event end");
     let expected_state = *pg.pending_state.lock().expect("pending state");
+    let event_start = expected_state.event_start.expect("pending event start");
     let context = RemoteReplayApplyContext {
         last_seq: 0,
         current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
@@ -125,7 +124,8 @@ fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
         ack_ready_tx
             .send(contending)
             .expect("signal acknowledgement lock state");
-        let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+        let result =
+            ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_start, event_end);
         ack_tx.send(result).expect("send acknowledgement result");
     });
     ack_start.wait();
@@ -175,15 +175,14 @@ fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
 #[test]
 fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    pg.create_file(ROOT_INO, b"checkpoint-local-file", 0, 0, 0o644)
-        .expect("create local file");
-    pg.unlink(ROOT_INO, b"checkpoint-local-file")
-        .expect("unlink unpublished local file");
+    pg.create_dir(ROOT_INO, b"checkpoint-pending-dir", 0, 0, 0o755)
+        .expect("create pending local directory");
     let event_end = pg
         .local
         .get_counter("nextEventSeq")
         .expect("read local event end");
     let expected_state = *pg.pending_state.lock().expect("pending state");
+    let event_start = expected_state.event_start.expect("pending event start");
 
     let pg = Arc::new(pg);
     let (position_tx, position_rx) = mpsc::channel();
@@ -274,7 +273,8 @@ fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
         ack_ready_tx
             .send(contending)
             .expect("signal acknowledgement lock state");
-        let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+        let result =
+            ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_start, event_end);
         ack_tx.send(result).expect("send acknowledgement result");
     });
     ack_start.wait();
@@ -327,6 +327,7 @@ fn restore_pending_state_and_local_ack_share_the_canonical_lock_order() {
         .local
         .get_counter("nextEventSeq")
         .expect("read local event end");
+    let event_start = expected_state.event_start.expect("pending event start");
 
     let pg = Arc::new(pg);
     let restore_barrier = Arc::new(Barrier::new(2));
@@ -410,7 +411,8 @@ fn restore_pending_state_and_local_ack_share_the_canonical_lock_order() {
         ack_ready_tx
             .send(contending)
             .expect("signal acknowledgement lock state");
-        let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+        let result =
+            ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_start, event_end);
         ack_tx.send(result).expect("send acknowledgement result");
     });
     ack_start.wait();

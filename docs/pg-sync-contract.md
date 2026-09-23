@@ -177,6 +177,12 @@ once and completes the claim without restoring it, so later local events are
 not held behind the rejected range. The rejected event remains in the local
 event log with the local replay cursor unchanged; after increasing the byte
 limit, restart the client to reconstruct and retry the pending range.
+While that engine remains open, local-only retirements and self-acknowledgments
+for later ranges must not move the durable cursor across the rejected gap.
+Independent later batches may still publish, but restoration must not put the
+already rejected range back into the active flush queue. These in-memory
+rejection/publication markers reset on restart; the unchanged durable cursor
+then reconstructs the local journal from the gap under the current limits.
 
 The catch-up worker checks the operation deadline and cancellation boundary
 before each batch and rolls back without advancing the cursor when either is

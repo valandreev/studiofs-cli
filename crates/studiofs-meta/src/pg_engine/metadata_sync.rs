@@ -420,7 +420,7 @@ impl PgMetaEngine {
             recent_flush,
             context,
         );
-        let outcome = match result {
+        let mut outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Err(abort_error) = txn.abort() {
@@ -432,6 +432,20 @@ impl PgMetaEngine {
                 return Err(error);
             }
         };
+        if let Some(next_flushed_event_seq) = outcome.flushed_event_seq {
+            let current_flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
+            if let Some(gap) = self
+                .unprocessed_local_event_progress()?
+                .rejected
+                .into_iter()
+                .filter(|range| {
+                    current_flushed_event_seq < range.end && range.start < next_flushed_event_seq
+                })
+                .min_by_key(|range| range.start)
+            {
+                outcome.flushed_event_seq = Some(gap.start);
+            }
+        }
         if let Err(error) = Self::write_replay_position_in_txn(&txn, &outcome) {
             if let Err(abort_error) = txn.abort() {
                 tracing::warn!(
@@ -458,6 +472,9 @@ impl PgMetaEngine {
         }
         txn.commit()
             .map_err(|error| MetaError::Storage(error.to_string()))?;
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            self.trim_local_event_progress_before(flushed_event_seq)?;
+        }
 
         #[cfg(test)]
         self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterLocalCommit {

@@ -3,6 +3,24 @@ use crate::redb_engine::layout::encode_xattr_key;
 use std::sync::Barrier;
 use std::thread;
 
+fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
+    pg.remote_format_validated.store(true, Ordering::Release);
+    pg.sync_max_response_bytes_per_page = 1;
+    let cursor = pg.flushed_event_seq.load(Ordering::SeqCst);
+    pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
+        .expect("create oversized event");
+    let rejected = pg
+        .claim_pending_batch(true)
+        .expect("oversized event should be claimable");
+    let error = match pg.flush_pending_claimed_batch_with_restore(rejected) {
+        Ok(_) => panic!("oversized event must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MetaError::EventTooLarge { .. }));
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
+    cursor
+}
+
 #[test]
 fn flush_due_pending_skips_remote_validation_when_no_batch_is_due() {
     let (_dir, pg) = temp_pg_engine_for_unit();
@@ -1203,6 +1221,284 @@ fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
     assert!(
         later.event_start >= claimed.event_end,
         "later claim must start after the surfaced event range"
+    );
+}
+
+#[test]
+fn oversized_rejection_marker_failure_still_finishes_claim() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    pg.remote_format_validated.store(true, Ordering::Release);
+    pg.sync_max_response_bytes_per_page = 1;
+    pg.create_dir(
+        ROOT_INO,
+        b"oversized-with-poisoned-marker-lock",
+        0,
+        0,
+        0o755,
+    )
+    .expect("create oversized event");
+    let claimed = pg
+        .claim_pending_batch(true)
+        .expect("oversized event should be claimable");
+
+    let pg = std::sync::Arc::new(pg);
+    let poison_pg = std::sync::Arc::clone(&pg);
+    let _ = std::thread::spawn(move || {
+        let _guard = poison_pg
+            .local_position_lock
+            .lock()
+            .expect("acquire local position lock before poisoning it");
+        panic!("poison local position lock for rejection marker test");
+    })
+    .join();
+
+    assert!(
+        pg.flush_pending_claimed_batch_with_restore(claimed)
+            .is_err()
+    );
+    assert_eq!(
+        pg.replication_backlog().inflight_ops,
+        0,
+        "marker persistence failure must not leak the claimed operations"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local PostgreSQL"]
+fn oversized_event_gap_survives_local_delete_and_retries_after_restart() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-oversized-local-event-gap");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+
+    let low_limit = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "1024");
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open metadata engine with a small event cap");
+    let cursor_before_rejected_event = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let oversized_value = vec![b'x'; 8192];
+    pg.set_xattr(ROOT_INO, b"user.sfs726", &oversized_value, 0)
+        .expect("write oversized local event");
+    let error = pg
+        .flush_metadata()
+        .expect_err("oversized local event must not be published with the small cap");
+    assert!(matches!(error, MetaError::EventTooLarge { .. }));
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_rejected_event
+    );
+
+    pg.create_file(ROOT_INO, b"ephemeral-after-gap", 0, 0, 0o644)
+        .expect("create local-only file after the gap");
+    pg.unlink(ROOT_INO, b"ephemeral-after-gap")
+        .expect("delete local-only file after the gap");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_rejected_event,
+        "local-only deletion must not skip the oversized event"
+    );
+
+    pg.create_dir(ROOT_INO, b"small-independent-event", 0, 0, 0o755)
+        .expect("create independent later event");
+    pg.flush_metadata()
+        .expect("publish the independent event while the oversized range remains parked");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_rejected_event,
+        "self-acknowledging later work must not move the cursor past the gap"
+    );
+    pg.prepare_for_close()
+        .expect("close first local metadata engine");
+    drop(pg);
+    drop(low_limit);
+
+    let _higher_limit = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "8388608");
+    let reopened = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("reopen with a larger event cap");
+    assert_eq!(
+        reopened.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_rejected_event,
+        "restart must reconstruct from the durable gap"
+    );
+    reopened
+        .flush_metadata()
+        .expect("publish the restored oversized event under the larger cap");
+    let event_end = reopened
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read restored local event end");
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&reopened.local)
+            .expect("load durable cursor after restored publication"),
+        event_end
+    );
+    reopened
+        .prepare_for_close()
+        .expect("close reopened local metadata engine");
+    drop(reopened);
+
+    let verify_dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let verify_db = verify_dir.path().join("verify.redb");
+    seed_local(&verify_db, &volume.format_info());
+    let verifier = PgMetaEngine::open_with_options(
+        &verify_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open a fresh client to verify PostgreSQL publication");
+    verifier
+        .sync_metadata()
+        .expect("replay published event on a fresh client");
+    assert_eq!(
+        verifier
+            .get_xattr(ROOT_INO, b"user.sfs726")
+            .expect("read published root xattr"),
+        Some(oversized_value)
+    );
+    verifier
+        .prepare_for_close()
+        .expect("close verifying metadata engine");
+}
+
+#[test]
+fn local_only_deletion_does_not_advance_cursor_past_rejected_event() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    let cursor_before_rejected_event =
+        reject_oversized_test_event(&mut pg, b"oversized-before-local-delete");
+
+    pg.create_file(ROOT_INO, b"ephemeral-local-file", 0, 0, 0o644)
+        .expect("create local-only file");
+    pg.unlink(ROOT_INO, b"ephemeral-local-file")
+        .expect("delete local-only file");
+
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_rejected_event,
+        "retiring later local-only events must not advance past the rejected event"
+    );
+}
+
+#[test]
+fn restoration_does_not_requeue_rejected_prefix_ahead_of_later_work() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    let cursor_before_rejected_event = reject_oversized_test_event(&mut pg, b"oversized-prefix");
+
+    let later_event_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("next event seq");
+    pg.create_dir(ROOT_INO, b"later-small-event", 0, 0, 0o755)
+        .expect("create independent later event");
+    let later_event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("next event seq");
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore the remaining local event ranges");
+
+    let pending_state = pg.pending_state.lock().expect("pending state");
+    assert_eq!(pending_state.event_start, Some(later_event_start));
+    assert_eq!(pending_state.event_end, later_event_end);
+    assert!(pending_state.ops > 0, "later range should remain pending");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_rejected_event,
+        "restoring later work must leave the durable cursor at the rejected prefix"
+    );
+}
+
+#[test]
+fn published_later_range_stays_pending_at_rejected_cursor_until_self_ack() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    let cursor_before_rejected_event =
+        reject_oversized_test_event(&mut pg, b"oversized-before-publish");
+
+    let later_event_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("next event seq");
+    pg.create_dir(ROOT_INO, b"later-published-event", 0, 0, 0o755)
+        .expect("create independent later event");
+    let later_event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("next event seq");
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: later_event_start,
+        end: later_event_end,
+    }])
+    .expect("record the later range as published");
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore remaining local event ranges");
+
+    let pending_state = pg.pending_state.lock().expect("pending state");
+    assert_eq!(pending_state.event_start, None);
+    assert_eq!(pending_state.ops, 0);
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        cursor_before_rejected_event,
+        "publishing a later range must not advance the cursor across the gap"
+    );
+}
+
+#[test]
+fn self_acknowledgement_does_not_advance_past_rejected_prefix() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    let cursor_before_rejected_event =
+        reject_oversized_test_event(&mut pg, b"oversized-self-ack-prefix");
+
+    pg.create_dir(ROOT_INO, b"later-self-ack-event", 0, 0, 0o755)
+        .expect("create later event");
+    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let events = pg
+        .local
+        .read_events_range(cursor_before_rejected_event, event_end)
+        .expect("read local events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    let initial_overlay = pg.local_overlay_conflicts().expect("local overlays");
+
+    let outcome = pg
+        .apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: projected.events,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+                flushed_event_seq: cursor_before_rejected_event,
+                next_event_seq: event_end,
+                initial_overlay,
+            },
+        )
+        .expect("apply self acknowledgement page");
+
+    assert_eq!(
+        outcome.flushed_event_seq,
+        Some(cursor_before_rejected_event),
+        "a self acknowledgement spanning a rejected gap must stop at the gap"
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).expect("load durable cursor"),
+        cursor_before_rejected_event
     );
 }
 

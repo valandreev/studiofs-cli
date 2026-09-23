@@ -468,6 +468,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         local_version: AtomicI64::new(0),
         namespace_version: AtomicI64::new(0),
         flushed_event_seq: AtomicU64::new(flushed_event_seq),
+        local_event_progress: Mutex::new(LocalEventProgress::default()),
         local_position_lock: Mutex::new(()),
         replication_lock: Mutex::new(()),
         poll_interval: Duration::from_secs(60),
