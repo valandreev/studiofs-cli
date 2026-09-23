@@ -7,9 +7,7 @@ fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
     let cursor = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let mut xattr_name = b"user.sfs726.".to_vec();
-    xattr_name.extend_from_slice(name);
-    pg.set_xattr(ROOT_INO, &xattr_name, &[b'x'; 128], 0)
+    pg.set_xattr(ROOT_INO, b"user.sfs726.oversized", name, 0)
         .expect("append one oversized event");
     let rejected = pg
         .claim_pending_batch(true)
@@ -1541,7 +1539,7 @@ fn processed_local_ranges_stop_masking_foreign_dentries_across_rejected_gap() {
     assert!(
         overlay
             .xattr_keys
-            .contains(&encode_xattr_key(ROOT_INO, b"user.sfs726.overlay-gap")),
+            .contains(&encode_xattr_key(ROOT_INO, b"user.sfs726.oversized")),
         "the rejected event should retain local authority"
     );
     assert!(
