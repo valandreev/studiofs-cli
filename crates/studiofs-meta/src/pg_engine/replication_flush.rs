@@ -8,6 +8,7 @@ use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
 use crate::schema::{ChunkId, PayloadRefState, ROOT_INO, SliceRecord, UploadState};
 use crate::types::{FileType, Ino, InodeAttr};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -16,9 +17,14 @@ use tracing::warn;
 const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
 const LOCAL_ONLY_SUFFIX_CONTEXT_EVENTS: u64 = 16;
 
-struct SelectedLocalEvents {
-    events: Vec<MetaEvent>,
+struct SelectedLocalEvents<'a> {
+    events: Cow<'a, [MetaEvent]>,
     ranges: Vec<LocalEventRange>,
+}
+
+fn local_event_range_contains(ranges: &[LocalEventRange], seq: u64) -> bool {
+    let index = ranges.partition_point(|range| range.start <= seq);
+    index > 0 && seq < ranges[index - 1].end
 }
 
 #[derive(Default)]
@@ -96,42 +102,61 @@ fn push_repaired_overlay_events(
 }
 
 impl PgMetaEngine {
-    fn select_unprocessed_local_events(
+    fn select_unprocessed_local_events<'a>(
         &self,
         event_start: u64,
-        events: &[MetaEvent],
-    ) -> MetaResult<SelectedLocalEvents> {
+        events: &'a [MetaEvent],
+    ) -> MetaResult<SelectedLocalEvents<'a>> {
         let progress = self.unprocessed_local_event_progress()?;
-        let mut selected = SelectedLocalEvents {
-            events: Vec::with_capacity(events.len()),
-            ranges: Vec::new(),
-        };
         let first_seq = event_start.max(1);
+        let event_end = first_seq.saturating_add(events.len() as u64);
+        let has_processed_ranges = progress
+            .rejected
+            .iter()
+            .chain(progress.completed.iter())
+            .chain(progress.published.iter())
+            .any(|range| range.start < event_end && first_seq < range.end);
+        if !has_processed_ranges {
+            let ranges = (first_seq < event_end)
+                .then_some(LocalEventRange {
+                    start: first_seq,
+                    end: event_end,
+                })
+                .into_iter()
+                .collect();
+            return Ok(SelectedLocalEvents {
+                events: Cow::Borrowed(events),
+                ranges,
+            });
+        }
+
+        let mut selected_events = Vec::with_capacity(events.len());
+        let mut ranges: Vec<LocalEventRange> = Vec::new();
         for (index, event) in events.iter().enumerate() {
             let seq = first_seq.saturating_add(index as u64);
-            let already_processed = progress
-                .rejected
-                .iter()
-                .chain(progress.completed.iter())
-                .chain(progress.published.iter())
-                .any(|range| range.start <= seq && seq < range.end);
+            let already_processed = local_event_range_contains(&progress.rejected, seq)
+                || local_event_range_contains(&progress.completed, seq)
+                || local_event_range_contains(&progress.published, seq);
             if already_processed {
                 continue;
             }
-            selected.events.push(event.clone());
+            selected_events.push(event.clone());
             let event_end = seq.saturating_add(1);
-            if let Some(previous) = selected.ranges.last_mut()
+            if let Some(previous) = ranges.last_mut()
                 && previous.end == seq
             {
                 previous.end = event_end;
             } else {
-                selected.ranges.push(LocalEventRange {
+                ranges.push(LocalEventRange {
                     start: seq,
                     end: event_end,
                 });
             }
         }
-        Ok(selected)
+        Ok(SelectedLocalEvents {
+            events: Cow::Owned(selected_events),
+            ranges,
+        })
     }
 
     pub(super) fn acknowledge_pending_state_if_unchanged(
@@ -370,7 +395,7 @@ impl PgMetaEngine {
             Self::clear_pending_state(state);
             return Ok(());
         }
-        let projected = RemoteApplyCoordinator::project_local_batch(&selected.events);
+        let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
         if projected.visible_ops == 0 {
             if projected.needs_local_replay {
                 let now = Instant::now();
@@ -722,7 +747,7 @@ impl PgMetaEngine {
             self.restore_pending_state_from_local_log()?;
             return Ok(None);
         }
-        let projected = RemoteApplyCoordinator::project_local_batch(&selected.events);
+        let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
         if projected.events.is_empty() {
             if !projected.needs_local_replay {
                 self.complete_local_event_ranges(&selected.ranges)?;

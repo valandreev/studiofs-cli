@@ -8,6 +8,9 @@ use crate::redb_engine::RedbMetaEngine;
 use std::sync::atomic::Ordering;
 
 fn merge_local_event_ranges(ranges: &mut Vec<LocalEventRange>) {
+    if ranges.len() < 2 {
+        return;
+    }
     ranges.sort_by_key(|range| (range.start, range.end));
     let mut merged: Vec<LocalEventRange> = Vec::with_capacity(ranges.len());
     for range in ranges.drain(..) {
@@ -198,6 +201,7 @@ impl PgMetaEngine {
             .lock()
             .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
         let cursor = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
+        // Commit the in-memory ledger only after the matching durable cursor write succeeds.
         let mut completed_ranges = progress.completed.clone();
         for range in ranges {
             let start = range.start.max(cursor);
@@ -232,7 +236,9 @@ impl PgMetaEngine {
         }
         if advanced && next > current {
             self.persist_flushed_event_seq_locked(next)?;
-            completed_ranges.retain(|range| range.end > next);
+            trim_local_event_ranges_before(&mut completed_ranges, next);
+            trim_local_event_ranges_before(&mut progress.rejected, next);
+            trim_local_event_ranges_before(&mut progress.published, next);
         }
         progress.completed = completed_ranges;
         Ok(())
@@ -252,11 +258,7 @@ impl PgMetaEngine {
     pub(super) fn unprocessed_local_event_progress(&self) -> MetaResult<LocalEventProgress> {
         self.local_event_progress
             .lock()
-            .map(|progress| LocalEventProgress {
-                rejected: progress.rejected.clone(),
-                completed: progress.completed.clone(),
-                published: progress.published.clone(),
-            })
+            .map(|progress| progress.clone())
             .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))
     }
 

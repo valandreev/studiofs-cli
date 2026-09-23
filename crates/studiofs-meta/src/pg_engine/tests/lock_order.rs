@@ -10,18 +10,32 @@ enum LockOrderHookEvent {
     PendingStateRestored,
 }
 
+fn pending_cancelled_local_file_ack(
+    pg: &PgMetaEngine,
+    name: &[u8],
+) -> (u64, u64, PendingReplicationState) {
+    let event_start = pg.local.get_counter("nextEventSeq").expect("event start");
+    pg.local
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create local-only file");
+    pg.local
+        .unlink(ROOT_INO, name)
+        .expect("delete local-only file");
+    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let state = PendingReplicationState {
+        event_start: Some(event_start),
+        event_end,
+        ..PendingReplicationState::default()
+    };
+    *pg.pending_state.lock().expect("pending state") = state;
+    (event_start, event_end, state)
+}
+
 #[test]
 fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    pg.create_dir(ROOT_INO, b"pending-local-dir", 0, 0, 0o755)
-        .expect("create pending local directory");
-
-    let event_end = pg
-        .local
-        .get_counter("nextEventSeq")
-        .expect("read local event end");
-    let expected_state = *pg.pending_state.lock().expect("pending state");
-    let event_start = expected_state.event_start.expect("pending event start");
+    let (event_start, event_end, expected_state) =
+        pending_cancelled_local_file_ack(&pg, b"cancelled-local-file");
     let context = RemoteReplayApplyContext {
         last_seq: 0,
         current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
@@ -175,14 +189,8 @@ fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
 #[test]
 fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    pg.create_dir(ROOT_INO, b"checkpoint-pending-dir", 0, 0, 0o755)
-        .expect("create pending local directory");
-    let event_end = pg
-        .local
-        .get_counter("nextEventSeq")
-        .expect("read local event end");
-    let expected_state = *pg.pending_state.lock().expect("pending state");
-    let event_start = expected_state.event_start.expect("pending event start");
+    let (event_start, event_end, expected_state) =
+        pending_cancelled_local_file_ack(&pg, b"checkpoint-local-file");
 
     let pg = Arc::new(pg);
     let (position_tx, position_rx) = mpsc::channel();

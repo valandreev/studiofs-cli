@@ -183,6 +183,9 @@ Independent later batches may still publish, but restoration must not put the
 already rejected range back into the active flush queue. These in-memory
 rejection/publication markers reset on restart; the unchanged durable cursor
 then reconstructs the local journal from the gap under the current limits.
+Because the cursor is one contiguous watermark, that reconstructed suffix can
+include later ranges already published by the previous process; this recovery
+is at-least-once for event-log publication, not exactly-once row insertion.
 
 The catch-up worker checks the operation deadline and cancellation boundary
 before each batch and rolls back without advancing the cursor when either is

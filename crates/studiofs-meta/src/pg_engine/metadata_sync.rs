@@ -413,14 +413,18 @@ impl PgMetaEngine {
                 flushed_event_seq: None,
             });
         }
+        let local_event_ack_barrier = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?
+            .rejected
+            .first()
+            .map(|range| range.start);
         let txn = self.local.begin_write_txn()?;
-        let result = RemoteApplyCoordinator::new(&self.local).apply_decoded_batches_in_txn(
-            &txn,
-            batches,
-            recent_flush,
-            context,
-        );
-        let mut outcome = match result {
+        let result = RemoteApplyCoordinator::new(&self.local)
+            .with_local_event_ack_barrier(local_event_ack_barrier)
+            .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context);
+        let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Err(abort_error) = txn.abort() {
@@ -432,20 +436,6 @@ impl PgMetaEngine {
                 return Err(error);
             }
         };
-        if let Some(next_flushed_event_seq) = outcome.flushed_event_seq {
-            let current_flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
-            if let Some(gap) = self
-                .unprocessed_local_event_progress()?
-                .rejected
-                .into_iter()
-                .filter(|range| {
-                    current_flushed_event_seq < range.end && range.start < next_flushed_event_seq
-                })
-                .min_by_key(|range| range.start)
-            {
-                outcome.flushed_event_seq = Some(gap.start);
-            }
-        }
         if let Err(error) = Self::write_replay_position_in_txn(&txn, &outcome) {
             if let Err(abort_error) = txn.abort() {
                 tracing::warn!(

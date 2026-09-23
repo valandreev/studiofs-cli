@@ -59,11 +59,20 @@ pub(super) struct ProjectedRemoteBatch {
 
 pub(super) struct RemoteApplyCoordinator<'a> {
     pub(super) local: &'a RedbMetaEngine,
+    local_event_ack_barrier: Option<u64>,
 }
 
 impl<'a> RemoteApplyCoordinator<'a> {
     pub(super) fn new(local: &'a RedbMetaEngine) -> Self {
-        Self { local }
+        Self {
+            local,
+            local_event_ack_barrier: None,
+        }
+    }
+
+    pub(super) fn with_local_event_ack_barrier(mut self, barrier: Option<u64>) -> Self {
+        self.local_event_ack_barrier = barrier;
+        self
     }
 
     #[cfg(test)]
@@ -1904,7 +1913,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     context.flushed_event_seq,
                     context.next_event_seq,
                 )?;
-                if let Some(next_flushed_event_seq) = acknowledged_seq {
+                if let Some(next_flushed_event_seq) = acknowledged_seq
+                    && self
+                        .local_event_ack_barrier
+                        .is_none_or(|barrier| next_flushed_event_seq <= barrier)
+                {
                     context.flushed_event_seq = next_flushed_event_seq;
                     acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
                     overlay_is_dirty = true;

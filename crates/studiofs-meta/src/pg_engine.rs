@@ -413,13 +413,14 @@ struct PendingReplicationState {
     event_end: u64,
 }
 
+/// Half-open local journal sequence range: `start` is included and `end` is excluded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LocalEventRange {
     start: u64,
     end: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LocalEventProgress {
     rejected: Vec<LocalEventRange>,
     completed: Vec<LocalEventRange>,
