@@ -1252,7 +1252,7 @@ fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
         .expect("read published range end");
     let oversized_start = published_end;
     pg.local
-        .set_xattr(ROOT_INO, b"user.sfs726.oversized", &vec![b'x'; 8 * 1024], 0)
+        .set_xattr(ROOT_INO, b"user.sfs726.oversized", &[b'x'; 8 * 1024], 0)
         .expect("append one oversized event");
     let oversized_end = pg
         .local
