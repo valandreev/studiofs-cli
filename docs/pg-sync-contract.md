@@ -212,6 +212,12 @@ checkpoint import retain both locks across their coupled local transition.
 Helpers that persist a cursor while those locks are held must use their
 `*_locked` form instead of reacquiring `local_position_lock`.
 
+When replay or a `PreserveLocalState` checkpoint import also needs
+`active_open_inodes`, it is acquired after those two locks:
+`local_position_lock` → `pending_state` → `active_open_inodes`. Active-open
+tracking may hold `active_open_inodes` by itself, but must release it before
+acquiring either earlier lock.
+
 The network page/checkpoint read stays outside this lock scope. This ordering
 keeps a foreign replay page from racing with local mutation retirement while
 allowing replay and checkpoint import to wait for foreground mutations without

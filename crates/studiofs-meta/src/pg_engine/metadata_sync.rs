@@ -320,9 +320,6 @@ impl PgMetaEngine {
             ..PgSyncPageDiagnostics::default()
         };
         let should_log = self.record_pg_sync_page_selected(page_diagnostics);
-        // Keep the local event position, serving-state reconcile, and pending
-        // replay atomic with respect to local metadata mutations. The network
-        // query above deliberately stays outside this critical section.
         if page.batch_count > 0 && should_log {
             tracing::debug!(
                 volume_id = self.volume_id,
@@ -350,17 +347,20 @@ impl PgMetaEngine {
                 "postgres foreign event page contains an oversized atomic batch"
             );
         }
-        let apply_started = Instant::now();
-        let (position_guard, mut pending_state) = self.lock_local_position_and_pending_state()?;
-        let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
-        let next_event_seq = self.local.get_counter("nextEventSeq")?;
-        let initial_overlay = self.local_overlay_conflicts()?;
+
         let batches = RemoteApplyCoordinator::decode_event_rows(page.rows, client_id.as_str())?;
         RemoteApplyCoordinator::validate_decoded_batch_continuity(
             last_batch_version,
             &batches,
             target_version,
         )?;
+        // Keep the cursor snapshot, serving-state reconcile, and pending replay
+        // atomic with local metadata mutations after decoding the remote page.
+        let apply_started = Instant::now();
+        let (position_guard, mut pending_state) = self.lock_local_position_and_pending_state()?;
+        let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
+        let next_event_seq = self.local.get_counter("nextEventSeq")?;
+        let initial_overlay = self.local_overlay_conflicts()?;
         let outcome = self.apply_replay_page_atomically_locked(
             batches,
             recent_flush,
@@ -372,6 +372,8 @@ impl PgMetaEngine {
                 initial_overlay,
             },
         )?;
+        // Only an acknowledged self-batch advances the local journal cursor;
+        // foreign batches update the base view without changing pending events.
         if outcome.flushed_event_seq.is_some() {
             self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
         }

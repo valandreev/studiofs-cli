@@ -1,7 +1,24 @@
 use super::*;
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+fn wait_for_local_position_lock(pg: &PgMetaEngine, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match pg.local_position_lock.try_lock() {
+            Ok(guard) => drop(guard),
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("local position lock must not be poisoned")
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::yield_now();
+    }
+}
 
 #[test]
 fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
@@ -58,58 +75,71 @@ fn replay_page_apply_and_local_ack_share_the_canonical_lock_order() {
     let replay_start = Arc::new(Barrier::new(2));
     let worker_replay_start = Arc::clone(&replay_start);
     let replay_pg = Arc::clone(&pg);
+    let (replay_ready_tx, replay_ready_rx) = mpsc::channel();
     let (replay_tx, replay_rx) = mpsc::channel();
     let replay_worker = thread::spawn(move || {
         worker_replay_start.wait();
+        replay_ready_tx
+            .send(())
+            .expect("signal replay worker ready");
         let result = replay_pg.apply_replay_page_atomically(vec![batch], None, context);
         replay_tx.send(result).expect("send replay result");
     });
     replay_start.wait();
+    replay_ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("replay reaches the lock acquisition boundary");
 
-    // With the canonical order, replay owns local_position_lock and waits for
-    // this test's pending_state guard before it reaches the local commit hook.
-    let replay_reached_commit_while_pending_was_held =
-        hook_rx.recv_timeout(Duration::from_secs(1)).is_ok();
-
-    let ack_start = Arc::new(Barrier::new(2));
-    let worker_ack_start = Arc::clone(&ack_start);
-    let ack_pg = Arc::clone(&pg);
-    let (ack_tx, ack_rx) = mpsc::channel();
-    let ack_worker = thread::spawn(move || {
-        worker_ack_start.wait();
-        let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
-        ack_tx.send(result).expect("send acknowledgement result");
-    });
-    ack_start.wait();
-
-    if replay_reached_commit_while_pending_was_held {
-        // Release the pre-fix implementation safely so the test can report
-        // the ordering assertion instead of leaking a blocked worker.
-        hook_barrier.wait();
-    }
+    let replay_holds_position_before_pending_release =
+        wait_for_local_position_lock(&pg, Duration::from_secs(2));
+    let ack = if replay_holds_position_before_pending_release {
+        let ack_start = Arc::new(Barrier::new(2));
+        let worker_ack_start = Arc::clone(&ack_start);
+        let ack_pg = Arc::clone(&pg);
+        let (ack_ready_tx, ack_ready_rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let ack_worker = thread::spawn(move || {
+            worker_ack_start.wait();
+            ack_ready_tx.send(()).expect("signal acknowledgement ready");
+            let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+            ack_tx.send(result).expect("send acknowledgement result");
+        });
+        ack_start.wait();
+        ack_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("acknowledgement reaches the lock acquisition boundary");
+        Some((ack_rx, ack_worker))
+    } else {
+        None
+    };
     drop(pending_guard);
 
-    if !replay_reached_commit_while_pending_was_held {
-        hook_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("replay reaches its commit boundary after pending state is released");
-        hook_barrier.wait();
-    }
+    hook_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("replay reaches its commit boundary after pending state is released");
+    let replay_holds_position_at_commit = wait_for_local_position_lock(&pg, Duration::ZERO);
+    hook_barrier.wait();
 
     let replay_outcome = replay_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("replay page completes")
         .expect("apply replay page");
-    ack_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("local acknowledgement completes")
-        .expect("acknowledge pending state");
     replay_worker.join().expect("join replay worker");
-    ack_worker.join().expect("join acknowledgement worker");
+    if let Some((ack_rx, ack_worker)) = ack {
+        ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("local acknowledgement completes")
+            .expect("acknowledge pending state");
+        ack_worker.join().expect("join acknowledgement worker");
+    }
 
     assert!(
-        !replay_reached_commit_while_pending_was_held,
+        replay_holds_position_before_pending_release,
         "replay must acquire local_position_lock before pending_state"
+    );
+    assert!(
+        replay_holds_position_at_commit,
+        "replay must retain local_position_lock through commit"
     );
     assert!(replay_outcome.changed, "replay page must apply its batch");
     assert!(
@@ -143,16 +173,17 @@ fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
     }));
 
     let pg = Arc::new(pg);
-    let position_guard = pg
-        .local_position_lock
-        .lock()
-        .expect("hold local position lock");
+    let pending_guard = pg.pending_state.lock().expect("hold pending state");
     let import_start = Arc::new(Barrier::new(2));
     let worker_import_start = Arc::clone(&import_start);
     let import_pg = Arc::clone(&pg);
+    let (import_ready_tx, import_ready_rx) = mpsc::channel();
     let (import_tx, import_rx) = mpsc::channel();
     let import_worker = thread::spawn(move || {
         worker_import_start.wait();
+        import_ready_tx
+            .send(())
+            .expect("signal checkpoint import ready");
         let result = import_pg.import_serving_checkpoint_locked(
             StartupSnapshotImportMode::PreserveLocalState,
             &crate::snapshot::ServingCheckpoint::default(),
@@ -163,40 +194,17 @@ fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
             .expect("send checkpoint import result");
     });
     import_start.wait();
-
-    // The import hook runs after pending_state is acquired. It must remain
-    // unreachable while this test owns local_position_lock.
-    let import_reached_hook_before_position_release =
-        hook_rx.recv_timeout(Duration::from_secs(1)).is_ok();
-
-    if import_reached_hook_before_position_release {
-        hook_barrier.wait();
-        drop(position_guard);
-        import_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("pre-fix checkpoint import completes")
-            .expect("import serving checkpoint");
-        import_worker.join().expect("join checkpoint import worker");
-        assert!(
-            !import_reached_hook_before_position_release,
-            "checkpoint import must acquire local_position_lock before pending_state"
-        );
-        return;
-    }
-
-    drop(position_guard);
-    hook_rx
+    import_ready_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("checkpoint import reaches its guarded boundary");
+        .expect("checkpoint import reaches the lock acquisition boundary");
 
-    let import_holds_position_at_hook = matches!(
-        pg.local_position_lock.try_lock(),
-        Err(std::sync::TryLockError::WouldBlock)
-    );
-    if !import_holds_position_at_hook {
-        // A delayed pre-fix import reaches this hook while holding only
-        // pending_state. Let it finish before starting an acknowledgment, so
-        // the regression reports an assertion instead of recreating the ABBA.
+    let import_holds_position_before_pending_release =
+        wait_for_local_position_lock(&pg, Duration::from_secs(2));
+    if !import_holds_position_before_pending_release {
+        drop(pending_guard);
+        hook_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("checkpoint import reaches its guarded boundary");
         hook_barrier.wait();
         import_rx
             .recv_timeout(Duration::from_secs(2))
@@ -204,8 +212,8 @@ fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
             .expect("import serving checkpoint");
         import_worker.join().expect("join checkpoint import worker");
         assert!(
-            import_holds_position_at_hook,
-            "checkpoint import must retain local_position_lock through its transition"
+            import_holds_position_before_pending_release,
+            "checkpoint import must acquire local_position_lock before pending_state"
         );
         return;
     }
@@ -213,13 +221,24 @@ fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
     let ack_start = Arc::new(Barrier::new(2));
     let worker_ack_start = Arc::clone(&ack_start);
     let ack_pg = Arc::clone(&pg);
+    let (ack_ready_tx, ack_ready_rx) = mpsc::channel();
     let (ack_tx, ack_rx) = mpsc::channel();
     let ack_worker = thread::spawn(move || {
         worker_ack_start.wait();
+        ack_ready_tx.send(()).expect("signal acknowledgement ready");
         let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
         ack_tx.send(result).expect("send acknowledgement result");
     });
     ack_start.wait();
+    ack_ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("acknowledgement reaches the lock acquisition boundary");
+    drop(pending_guard);
+
+    hook_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("checkpoint import reaches its guarded boundary");
+    let import_holds_position_at_hook = wait_for_local_position_lock(&pg, Duration::ZERO);
     hook_barrier.wait();
 
     import_rx
@@ -233,4 +252,90 @@ fn checkpoint_import_and_local_ack_share_the_canonical_lock_order() {
     import_worker.join().expect("join checkpoint import worker");
     ack_worker.join().expect("join acknowledgement worker");
     assert!(*pg.pending_state.lock().expect("pending state") == PendingReplicationState::default());
+    assert!(
+        import_holds_position_before_pending_release,
+        "checkpoint import must acquire local_position_lock before pending_state"
+    );
+    assert!(
+        import_holds_position_at_hook,
+        "checkpoint import must retain local_position_lock through its transition"
+    );
+}
+
+#[test]
+fn restore_pending_state_and_local_ack_share_the_canonical_lock_order() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_file(ROOT_INO, b"restore-local-file", 0, 0, 0o644)
+        .expect("create local file");
+    let expected_state = *pg.pending_state.lock().expect("pending state");
+    assert!(
+        expected_state.event_start.is_some(),
+        "fixture must contain a pending event range"
+    );
+    let event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read local event end");
+
+    let pg = Arc::new(pg);
+    let pending_guard = pg.pending_state.lock().expect("hold pending state");
+    let restore_start = Arc::new(Barrier::new(2));
+    let worker_restore_start = Arc::clone(&restore_start);
+    let restore_pg = Arc::clone(&pg);
+    let (restore_ready_tx, restore_ready_rx) = mpsc::channel();
+    let (restore_tx, restore_rx) = mpsc::channel();
+    let restore_worker = thread::spawn(move || {
+        worker_restore_start.wait();
+        restore_ready_tx
+            .send(())
+            .expect("signal restore worker ready");
+        restore_tx
+            .send(restore_pg.restore_pending_state_from_local_log())
+            .expect("send restore result");
+    });
+    restore_start.wait();
+    restore_ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("restore reaches the lock acquisition boundary");
+
+    let restore_holds_position_before_pending_release =
+        wait_for_local_position_lock(&pg, Duration::from_secs(2));
+    let ack = if restore_holds_position_before_pending_release {
+        let ack_start = Arc::new(Barrier::new(2));
+        let worker_ack_start = Arc::clone(&ack_start);
+        let ack_pg = Arc::clone(&pg);
+        let (ack_ready_tx, ack_ready_rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let ack_worker = thread::spawn(move || {
+            worker_ack_start.wait();
+            ack_ready_tx.send(()).expect("signal acknowledgement ready");
+            let result = ack_pg.acknowledge_pending_state_if_unchanged(expected_state, event_end);
+            ack_tx.send(result).expect("send acknowledgement result");
+        });
+        ack_start.wait();
+        ack_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("acknowledgement reaches the lock acquisition boundary");
+        Some((ack_rx, ack_worker))
+    } else {
+        None
+    };
+    drop(pending_guard);
+
+    restore_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("pending state restoration completes")
+        .expect("restore pending state");
+    restore_worker.join().expect("join restore worker");
+    if let Some((ack_rx, ack_worker)) = ack {
+        ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("local acknowledgement completes")
+            .expect("acknowledge pending state");
+        ack_worker.join().expect("join acknowledgement worker");
+    }
+    assert!(
+        restore_holds_position_before_pending_release,
+        "pending restoration must acquire local_position_lock before pending_state"
+    );
 }
