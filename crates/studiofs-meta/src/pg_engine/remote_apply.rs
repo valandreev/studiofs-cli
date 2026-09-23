@@ -99,7 +99,21 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     pub(super) fn project_local_batch(events: &[MetaEvent]) -> ProjectedRemoteBatch {
-        let remote_events = Self::project_local_events(events);
+        Self::project_local_batch_inner(events, None)
+    }
+
+    pub(super) fn project_local_batch_with_event_sources(
+        events: &[MetaEvent],
+        source_event_indices: &mut Vec<usize>,
+    ) -> ProjectedRemoteBatch {
+        Self::project_local_batch_inner(events, Some(source_event_indices))
+    }
+
+    fn project_local_batch_inner(
+        events: &[MetaEvent],
+        source_event_indices: Option<&mut Vec<usize>>,
+    ) -> ProjectedRemoteBatch {
+        let remote_events = Self::project_local_events(events, source_event_indices);
         let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
         let needs_eager_flush = Self::local_events_need_eager_flush(&remote_events);
         let needs_local_replay = Self::local_events_need_serving_replay(events);
@@ -197,7 +211,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         })
     }
 
-    fn project_local_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
+    fn project_local_events(
+        events: &[MetaEvent],
+        mut source_event_indices: Option<&mut Vec<usize>>,
+    ) -> Vec<MetaEvent> {
         let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
         let hidden_regular_parent_attr_indices = events
             .windows(2)
@@ -242,6 +259,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 MetaEvent::RemoveAttr { ino } if hidden_regular_inodes.contains(ino) => {}
                 _ => {
                     if let Some(event) = Self::project_remote_event(event) {
+                        if let Some(source_event_indices) = source_event_indices.as_mut() {
+                            source_event_indices.push(index);
+                        }
                         out.push(event);
                     }
                 }

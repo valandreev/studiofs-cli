@@ -1,30 +1,32 @@
 use super::{
     LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, LOCAL_PG_NAMESPACE_VERSION_COUNTER,
-    LOCAL_PG_VERSION_COUNTER, LocalEventProgress, LocalEventRange, PendingReplicationState,
-    PgMetaEngine, StartupSnapshotImportMode,
+    LOCAL_PG_VERSION_COUNTER, LocalEventRange, PendingReplicationState, PgMetaEngine,
+    StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::RedbMetaEngine;
 use std::sync::atomic::Ordering;
 
+/// Sort ranges and merge overlaps or adjacency without replacing the vector.
 fn merge_local_event_ranges(ranges: &mut Vec<LocalEventRange>) {
     if ranges.len() < 2 {
         return;
     }
-    ranges.sort_by_key(|range| (range.start, range.end));
-    let mut merged: Vec<LocalEventRange> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(previous) = merged.last_mut()
-            && range.start <= previous.end
-        {
-            previous.end = previous.end.max(range.end);
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut write_index = 0;
+    for read_index in 1..ranges.len() {
+        let range = ranges[read_index];
+        if range.start <= ranges[write_index].end {
+            ranges[write_index].end = ranges[write_index].end.max(range.end);
         } else {
-            merged.push(range);
+            write_index += 1;
+            ranges[write_index] = range;
         }
     }
-    *ranges = merged;
+    ranges.truncate(write_index + 1);
 }
 
+/// Remove acknowledged intervals and clip a remaining interval at `cursor`.
 fn trim_local_event_ranges_before(ranges: &mut Vec<LocalEventRange>, cursor: u64) {
     ranges.retain(|range| range.end > cursor);
     for range in ranges.iter_mut() {
@@ -121,6 +123,7 @@ impl PgMetaEngine {
         self.persist_flushed_event_seq_locked(seq)
     }
 
+    /// Persist the cursor while the caller holds `local_position_lock`.
     pub(super) fn persist_flushed_event_seq_locked(&self, seq: u64) -> MetaResult<()> {
         if seq <= self.flushed_event_seq.load(Ordering::SeqCst) {
             return Ok(());
@@ -214,48 +217,52 @@ impl PgMetaEngine {
         }
         merge_local_event_ranges(&mut completed_ranges);
 
-        let current = self.flushed_event_seq.load(Ordering::SeqCst);
-        let mut next = current.max(1);
-        let mut advanced = false;
-        loop {
-            if progress
-                .rejected
-                .iter()
-                .any(|range| range.start <= next && next < range.end)
-            {
-                break;
-            }
-            let Some(completed) = completed_ranges
-                .iter()
-                .find(|range| range.start <= next && next < range.end)
-            else {
-                break;
-            };
-            next = completed.end;
-            advanced = true;
-        }
-        if advanced && next > current {
+        let next =
+            flushed_event_seq_after_completed_ranges(cursor, &completed_ranges, &progress.rejected);
+        if next > cursor {
             self.persist_flushed_event_seq_locked(next)?;
             trim_local_event_ranges_before(&mut completed_ranges, next);
-            trim_local_event_ranges_before(&mut progress.rejected, next);
             trim_local_event_ranges_before(&mut progress.published, next);
         }
         progress.completed = completed_ranges;
         Ok(())
     }
 
-    pub(super) fn trim_local_event_progress_before(&self, cursor: u64) -> MetaResult<()> {
+    /// Return the cursor implied by completed ranges without persisting it.
+    ///
+    /// The caller holds `local_position_lock` and `pending_state`, so progress
+    /// cannot change between this calculation and the replay transaction.
+    pub(super) fn flushed_event_seq_after_completed_ranges_locked(
+        &self,
+        cursor: u64,
+    ) -> MetaResult<u64> {
+        let progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        Ok(flushed_event_seq_after_completed_ranges(
+            cursor,
+            &progress.completed,
+            &progress.rejected,
+        ))
+    }
+
+    /// Trim acknowledged ranges while the caller holds `local_position_lock`
+    /// and `pending_state`.
+    pub(super) fn trim_local_event_progress_before_locked(&self, cursor: u64) -> MetaResult<()> {
         let mut progress = self
             .local_event_progress
             .lock()
             .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        let cursor = cursor.max(self.flushed_event_seq.load(Ordering::SeqCst));
         trim_local_event_ranges_before(&mut progress.rejected, cursor);
         trim_local_event_ranges_before(&mut progress.completed, cursor);
         trim_local_event_ranges_before(&mut progress.published, cursor);
         Ok(())
     }
 
-    pub(super) fn unprocessed_local_event_progress(&self) -> MetaResult<LocalEventProgress> {
+    #[cfg(test)]
+    pub(super) fn unprocessed_local_event_progress(&self) -> MetaResult<super::LocalEventProgress> {
         self.local_event_progress
             .lock()
             .map(|progress| progress.clone())
@@ -347,5 +354,76 @@ impl PgMetaEngine {
         checkpoint_version
             .max(0)
             .min(advertised_head_version.max(0))
+    }
+}
+
+/// Advance through completed intervals without crossing any rejected interval.
+fn flushed_event_seq_after_completed_ranges(
+    cursor: u64,
+    completed: &[LocalEventRange],
+    rejected: &[LocalEventRange],
+) -> u64 {
+    let mut next = cursor.max(1);
+    let mut completed_index = completed.partition_point(|range| range.end <= next);
+    let mut rejected_index = rejected.partition_point(|range| range.end <= next);
+
+    loop {
+        if rejected
+            .get(rejected_index)
+            .is_some_and(|range| range.start <= next)
+        {
+            break;
+        }
+        let Some(completed_range) = completed.get(completed_index) else {
+            break;
+        };
+        if completed_range.start > next {
+            break;
+        }
+        if let Some(rejected_range) = rejected.get(rejected_index)
+            && rejected_range.start < completed_range.end
+        {
+            next = rejected_range.start;
+            break;
+        }
+
+        next = completed_range.end;
+        completed_index += 1;
+        while rejected
+            .get(rejected_index)
+            .is_some_and(|range| range.end <= next)
+        {
+            rejected_index += 1;
+        }
+    }
+    next
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_local_event_ranges_reuses_capacity_and_coalesces_intervals() {
+        let mut ranges = Vec::with_capacity(16);
+        ranges.extend([
+            LocalEventRange { start: 9, end: 12 },
+            LocalEventRange { start: 1, end: 3 },
+            LocalEventRange { start: 3, end: 5 },
+            LocalEventRange { start: 4, end: 10 },
+            LocalEventRange { start: 15, end: 17 },
+        ]);
+        let capacity = ranges.capacity();
+
+        merge_local_event_ranges(&mut ranges);
+
+        assert_eq!(
+            ranges,
+            vec![
+                LocalEventRange { start: 1, end: 12 },
+                LocalEventRange { start: 15, end: 17 },
+            ]
+        );
+        assert_eq!(ranges.capacity(), capacity);
     }
 }

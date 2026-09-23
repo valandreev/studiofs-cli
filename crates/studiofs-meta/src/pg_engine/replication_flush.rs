@@ -107,7 +107,10 @@ impl PgMetaEngine {
         event_start: u64,
         events: &'a [MetaEvent],
     ) -> MetaResult<SelectedLocalEvents<'a>> {
-        let progress = self.unprocessed_local_event_progress()?;
+        let progress = self
+            .local_event_progress
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
         let first_seq = event_start.max(1);
         let event_end = first_seq.saturating_add(events.len() as u64);
         let has_processed_ranges = progress
@@ -157,6 +160,20 @@ impl PgMetaEngine {
             events: Cow::Owned(selected_events),
             ranges,
         })
+    }
+
+    fn selected_local_event_seq(
+        ranges: &[LocalEventRange],
+        mut selected_index: usize,
+    ) -> Option<u64> {
+        for range in ranges {
+            let range_len = usize::try_from(range.end.saturating_sub(range.start)).ok()?;
+            if selected_index < range_len {
+                return range.start.checked_add(u64::try_from(selected_index).ok()?);
+            }
+            selected_index -= range_len;
+        }
+        None
     }
 
     pub(super) fn acknowledge_pending_state_if_unchanged(
@@ -747,7 +764,11 @@ impl PgMetaEngine {
             self.restore_pending_state_from_local_log()?;
             return Ok(None);
         }
-        let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
+        let mut projected_source_event_indices = Vec::with_capacity(selected.events.len());
+        let projected = RemoteApplyCoordinator::project_local_batch_with_event_sources(
+            selected.events.as_ref(),
+            &mut projected_source_event_indices,
+        );
         if projected.events.is_empty() {
             if !projected.needs_local_replay {
                 self.complete_local_event_ranges(&selected.ranges)?;
@@ -755,7 +776,42 @@ impl PgMetaEngine {
             self.restore_pending_state_from_local_log()?;
             return Ok(None);
         }
-        let batch_version = self.push_projected_event_log_batch_locked(projected.events)?;
+        let mut oversized_projected_event_index = None;
+        let batch_version = match self.push_projected_event_log_batch_locked(
+            projected.events,
+            &mut oversized_projected_event_index,
+        ) {
+            Ok(batch_version) => batch_version,
+            Err(error @ MetaError::EventTooLarge { .. }) => {
+                let projected_index = oversized_projected_event_index.ok_or_else(|| {
+                    MetaError::Storage(
+                        "oversized event error did not identify its projected index".to_string(),
+                    )
+                })?;
+                let selected_index = *projected_source_event_indices
+                    .get(projected_index)
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "oversized projected event has no local source index".to_string(),
+                        )
+                    })?;
+                let event_start = Self::selected_local_event_seq(&selected.ranges, selected_index)
+                    .ok_or_else(|| {
+                        MetaError::Storage(
+                            "oversized projected event has no local journal sequence".to_string(),
+                        )
+                    })?;
+                let event_end = event_start.checked_add(1).ok_or_else(|| {
+                    MetaError::Storage("local event sequence exceeds u64".to_string())
+                })?;
+                self.reject_local_event_ranges(&[LocalEventRange {
+                    start: event_start,
+                    end: event_end,
+                }])?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         self.mark_local_event_ranges_published(&selected.ranges)?;
         // The replay pass acknowledges only the local prefix represented by the
         // projected batch. The remaining local-only suffix must stay replayable.
@@ -776,18 +832,14 @@ impl PgMetaEngine {
                 Ok(recent_flush)
             }
             Err(err @ MetaError::EventTooLarge { .. }) => {
-                let rejection_result = self.reject_local_event_ranges(&[LocalEventRange {
-                    start: batch.event_start,
-                    end: batch.event_end,
-                }]);
                 self.finish_claimed_batch(batch);
-                rejection_result?;
+                self.restore_pending_state_from_local_log()?;
                 warn!(
                     error = %err,
                     volume_id = self.volume_id,
-                    event_start = batch.event_start,
-                    event_end = batch.event_end,
-                    "postgres flush rejected an oversized event; pending claim was not restored"
+                    attempted_event_start = batch.event_start,
+                    attempted_event_end = batch.event_end,
+                    "postgres flush rejected one oversized event and restored remaining local work"
                 );
                 Err(err)
             }

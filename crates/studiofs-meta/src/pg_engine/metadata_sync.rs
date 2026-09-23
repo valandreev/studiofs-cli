@@ -424,7 +424,7 @@ impl PgMetaEngine {
         let result = RemoteApplyCoordinator::new(&self.local)
             .with_local_event_ack_barrier(local_event_ack_barrier)
             .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context);
-        let outcome = match result {
+        let mut outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Err(abort_error) = txn.abort() {
@@ -436,6 +436,10 @@ impl PgMetaEngine {
                 return Err(error);
             }
         };
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            outcome.flushed_event_seq =
+                Some(self.flushed_event_seq_after_completed_ranges_locked(flushed_event_seq)?);
+        }
         if let Err(error) = Self::write_replay_position_in_txn(&txn, &outcome) {
             if let Err(abort_error) = txn.abort() {
                 tracing::warn!(
@@ -462,15 +466,15 @@ impl PgMetaEngine {
         }
         txn.commit()
             .map_err(|error| MetaError::Storage(error.to_string()))?;
-        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
-            self.trim_local_event_progress_before(flushed_event_seq)?;
-        }
 
         #[cfg(test)]
         self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterLocalCommit {
             last_batch_version: outcome.max_version,
         })?;
         self.publish_replay_position(&outcome);
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            self.trim_local_event_progress_before_locked(flushed_event_seq)?;
+        }
         Ok(outcome)
     }
 

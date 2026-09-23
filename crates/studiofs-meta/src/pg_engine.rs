@@ -420,10 +420,19 @@ struct LocalEventRange {
     end: u64,
 }
 
+/// In-memory dispositions for local journal ranges not covered by the cursor.
+///
+/// These markers let a live engine skip work already rejected, locally retired,
+/// or published while the contiguous durable cursor remains behind a gap.
+/// They are discarded on restart; replay reloads the durable cursor and
+/// reevaluates the remaining local journal under the current limits.
 #[derive(Clone, Default)]
 struct LocalEventProgress {
+    /// Ranges whose current publication failed because an event was too large.
     rejected: Vec<LocalEventRange>,
+    /// Ranges that need no remote publication and no further serving replay.
     completed: Vec<LocalEventRange>,
+    /// Ranges committed to PostgreSQL and awaiting local self-acknowledgment.
     published: Vec<LocalEventRange>,
 }
 

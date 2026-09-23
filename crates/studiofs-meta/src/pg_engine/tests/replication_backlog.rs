@@ -7,8 +7,10 @@ fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
     let cursor = pg.flushed_event_seq.load(Ordering::SeqCst);
-    pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
-        .expect("create oversized event");
+    let mut xattr_name = b"user.sfs726.".to_vec();
+    xattr_name.extend_from_slice(name);
+    pg.set_xattr(ROOT_INO, &xattr_name, &[b'x'; 128], 0)
+        .expect("append one oversized event");
     let rejected = pg
         .claim_pending_batch(true)
         .expect("oversized event should be claimable");
@@ -1190,8 +1192,8 @@ fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
 
-    pg.create_dir(ROOT_INO, b"oversized-pending-event", 0, 0, 0o755)
-        .expect("create pending event");
+    pg.set_xattr(ROOT_INO, b"user.sfs726.permanent-size", &[b'x'; 128], 0)
+        .expect("create oversized pending event");
     let claimed = pg
         .claim_pending_batch(true)
         .expect("oversized event should be claimable");
@@ -1221,6 +1223,103 @@ fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
     assert!(
         later.event_start >= claimed.event_end,
         "later claim must start after the surfaced event range"
+    );
+}
+
+#[test]
+fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    pg.remote_format_validated.store(true, Ordering::Release);
+    pg.sync_max_response_bytes_per_page = 1024;
+
+    let event_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read first local event sequence");
+    pg.local
+        .set_xattr(ROOT_INO, b"user.small.before", b"ok", 0)
+        .expect("append valid event before published range");
+    let published_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read published range start");
+    pg.local
+        .set_xattr(ROOT_INO, b"user.published", b"ok", 0)
+        .expect("append event to mark already published");
+    let published_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read published range end");
+    let oversized_start = published_end;
+    pg.local
+        .set_xattr(ROOT_INO, b"user.sfs726.oversized", &vec![b'x'; 8 * 1024], 0)
+        .expect("append one oversized event");
+    let oversized_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read oversized event end");
+    pg.local
+        .set_xattr(ROOT_INO, b"user.small.after", b"ok", 0)
+        .expect("append valid event after oversized event");
+    let event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read final local event sequence");
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: published_start,
+        end: published_end,
+    }])
+    .expect("mark intervening event as published");
+
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        state.ops = 3;
+        state.force_flush = true;
+        state.event_start = Some(event_start);
+        state.event_end = event_end;
+    }
+    let claimed = pg
+        .claim_pending_batch(true)
+        .expect("claim surrounding independent events");
+    let error = match pg.flush_pending_claimed_batch_with_restore(claimed) {
+        Ok(_) => panic!("one oversized event must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MetaError::EventTooLarge { .. }));
+
+    let progress = pg
+        .unprocessed_local_event_progress()
+        .expect("read local event progress");
+    assert_eq!(
+        progress.rejected,
+        vec![LocalEventRange {
+            start: oversized_start,
+            end: oversized_end,
+        }],
+        "only the oversized event should be rejected"
+    );
+    assert_eq!(
+        progress.published,
+        vec![LocalEventRange {
+            start: published_start,
+            end: published_end,
+        }],
+        "an earlier publication must remain acknowledged"
+    );
+    {
+        let pending = pg.pending_state.lock().expect("restored pending state");
+        assert_eq!(pending.event_start, Some(event_start));
+        assert_eq!(pending.event_end, event_end);
+        assert_eq!(pending.ops, 2, "both independent events should be restored");
+        assert!(
+            pending.force_flush,
+            "restored independent work should be schedulable"
+        );
+    }
+    assert_eq!(
+        pg.replication_backlog().inflight_ops,
+        0,
+        "the oversized claim must be finished"
     );
 }
 
@@ -1390,6 +1489,137 @@ fn local_only_deletion_does_not_advance_cursor_past_rejected_event() {
         cursor_before_rejected_event,
         "retiring later local-only events must not advance past the rejected event"
     );
+}
+
+#[test]
+fn replay_ack_and_completed_suffix_persist_in_one_redb_transaction() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let event_start = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read replay event start");
+    pg.local
+        .set_xattr(ROOT_INO, b"user.sfs726.visible", b"published", 0)
+        .expect("append visible event to be self-acknowledged");
+    let acknowledged_cursor = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read self-ack event end");
+    let visible_events = pg
+        .local
+        .read_events_range(event_start, acknowledged_cursor)
+        .expect("read self-ack event");
+    let self_batch = RemoteApplyCoordinator::project_local_batch(&visible_events).events;
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: event_start,
+        end: acknowledged_cursor,
+    }])
+    .expect("mark self-ack range published");
+
+    let completed_start = acknowledged_cursor;
+    pg.local
+        .add_pending_deletion(700, 700)
+        .expect("append local-only completed event");
+    let completed_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read completed event end");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: completed_start,
+        end: completed_end,
+    }])
+    .expect("record local-only completion behind self-ack");
+
+    let before = pg.local.metadata_write_observability();
+    let outcome = pg
+        .apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: self_batch,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+                flushed_event_seq: event_start,
+                next_event_seq: completed_end,
+                initial_overlay: pg.local_overlay_conflicts().expect("local overlays"),
+            },
+        )
+        .expect("apply self-ack and completed suffix");
+    let after = pg.local.metadata_write_observability();
+
+    assert_eq!(outcome.flushed_event_seq, Some(completed_end));
+    assert_eq!(
+        after.begin_write.calls - before.begin_write.calls,
+        1,
+        "self-ack and completed suffix should share the replay page transaction"
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).expect("read committed cursor"),
+        completed_end
+    );
+}
+
+#[test]
+fn multiple_rejected_ranges_are_skipped_without_requeue() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    let first_gap = reject_oversized_test_event(&mut pg, b"first-oversized-range");
+    let first_gap_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read first rejected range end");
+
+    let published_start = first_gap_end;
+    pg.local
+        .create_dir(ROOT_INO, b"published-between-gaps", 0, 0, 0o755)
+        .expect("append published event between rejected ranges");
+    let published_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read intervening published range end");
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: published_start,
+        end: published_end,
+    }])
+    .expect("mark intervening range published");
+
+    reject_oversized_test_event(&mut pg, b"second-oversized-range");
+    let second_gap_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read second rejected range end");
+    let later_published_start = second_gap_end;
+    pg.local
+        .create_dir(ROOT_INO, b"published-after-gaps", 0, 0, 0o755)
+        .expect("append published event after rejected ranges");
+    let event_end = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("read later published range end");
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: later_published_start,
+        end: event_end,
+    }])
+    .expect("mark later range published");
+
+    let progress = pg
+        .unprocessed_local_event_progress()
+        .expect("read local event progress");
+    assert_eq!(progress.rejected.len(), 2);
+    assert_eq!(progress.rejected[0].start, first_gap);
+    assert_eq!(progress.rejected[1].start, published_end);
+    assert_eq!(
+        progress.rejected.first().map(|range| range.start),
+        Some(first_gap)
+    );
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore after both rejected and published ranges");
+    let pending = pg.pending_state.lock().expect("pending state");
+    assert_eq!(pending.event_start, None);
+    assert_eq!(pending.ops, 0);
 }
 
 #[test]

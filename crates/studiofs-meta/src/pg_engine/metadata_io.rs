@@ -559,12 +559,14 @@ impl PgMetaEngine {
     #[cfg(test)]
     pub(super) fn push_event_log_batch_locked(&self, events: &[MetaEvent]) -> MetaResult<i64> {
         let projected = RemoteApplyCoordinator::project_local_batch(events);
-        self.push_projected_event_log_batch_locked(projected.events)
+        let mut oversized_event_index = None;
+        self.push_projected_event_log_batch_locked(projected.events, &mut oversized_event_index)
     }
 
     pub(super) fn push_projected_event_log_batch_locked(
         &self,
         events: Vec<MetaEvent>,
+        oversized_event_index: &mut Option<usize>,
     ) -> MetaResult<i64> {
         if events.is_empty() {
             return Ok(self.local_version.load(Ordering::SeqCst));
@@ -577,6 +579,7 @@ impl PgMetaEngine {
             events,
             &client_id,
             self.sync_max_response_bytes_per_page,
+            oversized_event_index,
         )?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
@@ -765,6 +768,7 @@ impl PgMetaEngine {
         events: Vec<MetaEvent>,
         client_id: &str,
         max_response_bytes: i64,
+        oversized_event_index: &mut Option<usize>,
     ) -> MetaResult<Vec<EncodedRemoteEventBatch>> {
         let mut batches = Vec::new();
         let batch_capacity = events.len().min(PG_EVENT_INSERT_CHUNK_SIZE);
@@ -773,7 +777,7 @@ impl PgMetaEngine {
         let mut batch_response_bytes = 0_i64;
         let mut batch_payload_bytes = 0_i64;
 
-        for event in events {
+        for (event_index, event) in events.into_iter().enumerate() {
             let payload = encode_event(&event)?;
             let payload_len = i64::try_from(payload.len()).map_err(|_| {
                 MetaError::Storage("event payload length exceeds BIGINT".to_string())
@@ -781,6 +785,7 @@ impl PgMetaEngine {
             let event_response_bytes =
                 encoded_event_response_bytes(event.kind(), payload.len(), client_id)?;
             if event_response_bytes > max_response_bytes {
+                *oversized_event_index = Some(event_index);
                 return Err(MetaError::EventTooLarge {
                     estimated: event_response_bytes,
                     limit: max_response_bytes,
@@ -958,9 +963,14 @@ mod tests {
             .map(|event| encode_event(event).expect("test event should encode").len() as i64)
             .sum::<i64>();
 
-        let batches =
-            PgMetaEngine::split_projected_event_batches(events, "client-slot:1", i64::MAX)
-                .expect("test events should fit in one batch");
+        let mut oversized_event_index = None;
+        let batches = PgMetaEngine::split_projected_event_batches(
+            events,
+            "client-slot:1",
+            i64::MAX,
+            &mut oversized_event_index,
+        )
+        .expect("test events should fit in one batch");
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].payload_bytes, expected);
@@ -989,10 +999,12 @@ mod tests {
         assert!(response_bytes > 2 * 1024 * 1024);
         assert!(response_bytes <= 8 * 1024 * 1024);
 
+        let mut oversized_event_index = None;
         let batches = PgMetaEngine::split_projected_event_batches(
             vec![event],
             "client-slot:1",
             super::super::DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
+            &mut oversized_event_index,
         )
         .expect("a valid publication event must fit the default replay cap");
         assert_eq!(batches.len(), 1);
