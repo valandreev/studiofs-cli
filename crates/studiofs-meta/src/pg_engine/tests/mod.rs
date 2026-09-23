@@ -14,6 +14,7 @@ mod inode_allocator;
 mod janitor;
 mod lifecycle;
 mod lock_leases;
+mod lock_order;
 mod lock_workers;
 mod metadata_notify;
 mod metadata_paging;

@@ -91,21 +91,12 @@ fn push_repaired_overlay_events(
 }
 
 impl PgMetaEngine {
-    fn acknowledge_pending_state_if_unchanged(
+    pub(super) fn acknowledge_pending_state_if_unchanged(
         &self,
         expected_state: PendingReplicationState,
         event_end: u64,
     ) -> MetaResult<()> {
-        // `metadata_sync` takes local_position_lock before pending_state. Do
-        // the same here so persisting the cursor cannot deadlock with replay.
-        let _position_guard = self
-            .local_position_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
-        let mut state = self
-            .pending_state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let (_position_guard, mut state) = self.lock_local_position_and_pending_state()?;
         if *state != expected_state {
             return Ok(());
         }
@@ -272,13 +263,14 @@ impl PgMetaEngine {
     }
 
     pub(super) fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
-        let mut state = self
-            .pending_state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
-        self.restore_pending_state_from_local_log_with_state(&mut state)
+        let (_position_guard, mut state) = self.lock_local_position_and_pending_state()?;
+        self.restore_pending_state_from_local_log_with_state(&mut state)?;
+        #[cfg(test)]
+        self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterPendingStateRestore)?;
+        Ok(())
     }
 
+    /// Restore pending state while the caller holds both locks in canonical order.
     pub(super) fn restore_pending_state_from_local_log_with_state(
         &self,
         state: &mut PendingReplicationState,
@@ -301,7 +293,7 @@ impl PgMetaEngine {
             event_start = event_start
                 .max(1)
                 .saturating_add(initial_root_prefix_len as u64);
-            self.persist_flushed_event_seq(event_start)?;
+            self.persist_flushed_event_seq_locked(event_start)?;
         }
         let pending_events = &pending_events[initial_root_prefix_len..];
         let stale_setup_prefix_len = self.stale_published_setup_prefix_len(pending_events)?;
@@ -309,7 +301,7 @@ impl PgMetaEngine {
             event_start = event_start
                 .max(1)
                 .saturating_add(stale_setup_prefix_len as u64);
-            self.persist_flushed_event_seq(event_start)?;
+            self.persist_flushed_event_seq_locked(event_start)?;
         }
         let pending_events = &pending_events[stale_setup_prefix_len..];
         if pending_events.is_empty() {
@@ -330,7 +322,7 @@ impl PgMetaEngine {
                 state.last_mutation_at = Some(now);
                 return Ok(());
             }
-            self.persist_flushed_event_seq(event_end)?;
+            self.persist_flushed_event_seq_locked(event_end)?;
             Self::clear_pending_state(state);
             return Ok(());
         }

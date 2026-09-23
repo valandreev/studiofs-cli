@@ -1,12 +1,36 @@
 use super::{
     LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, LOCAL_PG_NAMESPACE_VERSION_COUNTER,
-    LOCAL_PG_VERSION_COUNTER, PgMetaEngine, StartupSnapshotImportMode,
+    LOCAL_PG_VERSION_COUNTER, PendingReplicationState, PgMetaEngine, StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::RedbMetaEngine;
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
+    /// Acquire the local replay position and pending mutation state together.
+    ///
+    /// When an operation needs both locks, it must acquire
+    /// `local_position_lock` before `pending_state` and retain both until the
+    /// coupled local cursor/serving-state transition is complete.
+    pub(super) fn lock_local_position_and_pending_state(
+        &self,
+    ) -> MetaResult<(
+        std::sync::MutexGuard<'_, ()>,
+        std::sync::MutexGuard<'_, PendingReplicationState>,
+    )> {
+        let position_guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        #[cfg(test)]
+        self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterLocalPositionLockAcquired)?;
+        let pending_state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        Ok((position_guard, pending_state))
+    }
+
     pub(super) fn load_persisted_local_version(local: &RedbMetaEngine) -> MetaResult<i64> {
         let version = local.get_counter(LOCAL_PG_VERSION_COUNTER)?;
         Ok(version.min(i64::MAX as u64) as i64)
@@ -17,14 +41,20 @@ impl PgMetaEngine {
         Ok(version.min(i64::MAX as u64) as i64)
     }
 
+    #[cfg(test)]
     pub(super) fn persist_local_version(&self, version: i64) -> MetaResult<()> {
-        if version < 0 {
-            return Ok(());
-        }
         let _guard = self
             .local_position_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        self.persist_local_version_locked(version)
+    }
+
+    /// Persist the version while the caller holds `local_position_lock`.
+    pub(super) fn persist_local_version_locked(&self, version: i64) -> MetaResult<()> {
+        if version < 0 {
+            return Ok(());
+        }
         if version <= self.local_version.load(Ordering::SeqCst) {
             return Ok(());
         }

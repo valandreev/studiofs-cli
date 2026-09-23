@@ -468,14 +468,11 @@ impl PgMetaEngine {
         checkpoint: &ServingCheckpoint,
         replay_start_version: i64,
     ) -> MetaResult<()> {
-        let _pending_state = self
-            .pending_state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
         let _active_open_inodes_guard =
             if import_mode == StartupSnapshotImportMode::PreserveLocalState {
                 Some(self.active_open_inodes.lock().map_err(|_| {
-                    MetaError::Storage("pg active open inode lock poisoned".to_string())
+                    MetaError::Storage("pg active open inodes lock poisoned".to_string())
                 })?)
             } else {
                 None
@@ -506,7 +503,7 @@ impl PgMetaEngine {
             (import_mode == StartupSnapshotImportMode::PreserveLocalState)
                 .then_some(&active_open_inodes),
         )?;
-        self.persist_local_version(replay_start_version)?;
+        self.persist_local_version_locked(replay_start_version)?;
         Ok(())
     }
 
