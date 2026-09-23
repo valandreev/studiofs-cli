@@ -52,14 +52,7 @@ pub(crate) struct ServingCheckpointReadSnapshot {
 
 impl ServingCheckpointReadSnapshot {
     pub(crate) fn get_counter(&self, name: &str) -> MetaResult<u64> {
-        let table = self
-            .transaction
-            .open_table(COUNTERS_TABLE)
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
-        Ok(table
-            .get(name)
-            .map_err(|error| MetaError::Storage(error.to_string()))?
-            .map_or(0, |value| value.value()))
+        RedbMetaEngine::read_counter_from_read_txn(&self.transaction, name)
     }
 
     pub(crate) fn format_info(&self) -> MetaResult<crate::schema::FormatInfo> {

@@ -304,7 +304,8 @@ impl PgMetaEngine {
             MetaError::Storage("local metadata version must be nonnegative".to_string())
         })?;
 
-        if freshness.head_version > local_version_u64 {
+        // The byte baseline must correspond to the version captured in the checkpoint.
+        if freshness.head_version != local_version_u64 {
             self.record_checkpoint_freshness_observation(freshness);
             return Ok(None);
         }
@@ -468,10 +469,6 @@ impl PgMetaEngine {
         total_event_payload_bytes: i64,
         checkpoint: BuiltCheckpoint,
     ) -> MetaResult<Option<super::metadata_io::CheckpointFreshnessObservation>> {
-        let _guard = self
-            .replication_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
         let command_pool = Arc::clone(&self.command_pool);
         let command_timeout = self.command_timeout;
         let volume_id = self.volume_id;

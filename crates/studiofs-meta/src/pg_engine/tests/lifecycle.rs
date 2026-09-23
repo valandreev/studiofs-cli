@@ -5304,12 +5304,41 @@ fn pg_checkpoint_publishes_captured_cut_while_local_writes_continue_and_replays_
         .expect("writer should commit after the captured cut");
     writer_start.wait();
 
-    let publish_result = publisher.build_and_publish_checkpoint(&owner, lease, cut);
+    let replication_guard = publisher
+        .replication_lock
+        .lock()
+        .expect("hold replication lock during checkpoint publication");
+    let build_publisher = Arc::clone(&publisher);
+    let build_owner = owner.clone();
+    let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(1);
+    let build_thread = std::thread::spawn(move || {
+        let result = build_publisher.build_and_publish_checkpoint(&build_owner, lease, cut);
+        publish_tx
+            .send(result)
+            .expect("report checkpoint publication result");
+    });
+    let result_while_replication_locked = publish_rx.recv_timeout(Duration::from_secs(15));
+    drop(replication_guard);
+    let (publish_result, published_without_replication_lock) = match result_while_replication_locked
+    {
+        Ok(result) => (result, true),
+        Err(_) => (
+            publish_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("checkpoint publication should finish after releasing replication lock"),
+            false,
+        ),
+    };
+    build_thread.join().expect("join checkpoint publication");
     stop_writer.store(true, Ordering::Release);
     let writer_count = writer.join().expect("join checkpoint writer");
     publisher
         .release_checkpoint_lease(&owner, lease)
         .expect("release checkpoint lease");
+    assert!(
+        published_without_replication_lock,
+        "checkpoint publication must not require replication_lock"
+    );
     assert!(
         publish_result.expect("publish captured checkpoint cut"),
         "a local write after capture must not invalidate the checkpoint cut"
@@ -5664,6 +5693,57 @@ fn pg_checkpoint_promotion_preserves_post_capture_event_tail() {
     assert_eq!(state.1, 0);
     assert!(state.2 > state.3);
     assert_eq!(state.3, 0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_skips_cut_when_freshness_head_lags_local_cursor() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _lag = set_test_env(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, "1");
+    let _bytes = set_test_env(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, "9223372036854775807");
+    let _age = set_test_env(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, "3600");
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-lagging-freshness");
+    let (_dir, pg) = open_pg_publisher(&volume);
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = 1, total_event_payload_bytes = 10 WHERE vol = $1",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("set freshness head below the local cursor");
+    pg.local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 2)
+        .expect("persist local cursor ahead of freshness row");
+    pg.local_version.store(2, Ordering::Release);
+    pg.observe_checkpoint_freshness();
+
+    assert!(
+        !pg.run_checkpoint_refresh_once(Duration::from_secs(60))
+            .expect("defer a source cut without matching freshness coordinates"),
+        "the coordinator must not publish with a byte baseline from an older head"
+    );
+    let lease_exists = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM bootstrap_checkpoint_leases WHERE vol = $1)",
+                &[&volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<bool, MetaError>(row.get(0))
+    }))
+    .expect("query lease after freshness mismatch");
+    assert!(
+        !lease_exists,
+        "mismatched freshness coordinates must not claim a lease"
+    );
 }
 
 #[test]

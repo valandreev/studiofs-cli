@@ -89,6 +89,16 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    pub(super) fn read_counter_from_read_txn(txn: &ReadTransaction, name: &str) -> MetaResult<u64> {
+        let table = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(table
+            .get(name)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map_or(0, |value| value.value()))
+    }
+
     /// Return the current lifecycle record for one inode, if it is a regular file.
     ///
     /// The persisted lifecycle row is a recovery aid, not the source of truth for
@@ -737,16 +747,7 @@ impl RedbMetaEngine {
 impl MetaInodes for RedbMetaEngine {
     fn get_counter(&self, name: &str) -> MetaResult<u64> {
         let txn = self.begin_read_txn()?;
-        let table = txn
-            .open_table(COUNTERS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match table
-            .get(name)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(v) => Ok(v.value()),
-            None => Ok(0),
-        }
+        RedbMetaEngine::read_counter_from_read_txn(&txn, name)
     }
 
     fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
