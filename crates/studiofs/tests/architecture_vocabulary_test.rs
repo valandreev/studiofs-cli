@@ -595,13 +595,15 @@ fn pg_sync_contract_contains_required_invariants() {
         "coordination lease",
         "permanently unmountable",
         "`destroy --local`",
-        "SFS-696 (implemented)",
-        "SFS-697 (implemented)",
-        "SFS-698 (implemented)",
-        "SFS-699 (implemented)",
-        "SFS-700 (implemented)",
-        "SFS-701 (implemented)",
-        "SFS-721 (implemented)",
+        "| SFS-696 | Implemented |",
+        "| SFS-697 | Implemented |",
+        "| SFS-698 | Implemented |",
+        "| SFS-699 | Implemented |",
+        "| SFS-700 | Implemented |",
+        "| SFS-701 | Implemented |",
+        "| SFS-711 | Implemented |",
+        "| SFS-712 | Implemented |",
+        "| SFS-721 | Implemented |",
         "checkpoint bootstrap",
         "bounded page replay",
         "resume after interruption",
@@ -623,13 +625,21 @@ fn pg_sync_contract_contains_required_invariants() {
         "SFS-695 PostgreSQL sync contract is missing required invariants or status markers:\n{}",
         missing.join("\n")
     );
-    let stale_hits: Vec<_> = [
-        "durable per-page progress and background session orchestration remain follow-up work",
-        "remaining follow-up work includes durable per-page progress",
-    ]
-    .into_iter()
-    .filter(|term| contains_doc_term(&contract, &normalized_contract, term))
-    .collect();
+}
+
+#[test]
+fn pg_sync_contract_drops_superseded_catch_up_status() {
+    let contract = read_workspace_file("docs/pg-sync-contract.md");
+    let normalized_contract = normalize_doc_whitespace(&contract);
+    let obsolete_markers = [
+        "durable per-page progress",
+        "background session orchestration",
+    ];
+    let stale_hits: Vec<_> = obsolete_markers
+        .into_iter()
+        .filter(|term| contains_doc_term(&contract, &normalized_contract, term))
+        .collect();
+
     assert!(
         stale_hits.is_empty(),
         "SFS-695 PostgreSQL sync contract contains obsolete catch-up status:\n{}",

@@ -3,9 +3,10 @@
 ## Status
 
 This document is the canonical PostgreSQL sync contract for SFS-695 and the
-implementation issues SFS-696 through SFS-701. The local-only destroy boundary
-from SFS-721 is already implemented on `main`; this document retains it as a
-shipped invariant that the cleanup implementation must preserve.
+implementation issues SFS-696 through SFS-701, SFS-711, and SFS-712. The
+local-only destroy boundary from SFS-721 is already implemented on `main`; this
+document retains it as a shipped invariant that the cleanup implementation
+must preserve.
 
 This is a breaking on-disk/protocol change. Migration compatibility is not
 required for existing test disks. A client or test fixture must use the new
@@ -313,9 +314,9 @@ rejects gaps between adjacent batches in one page. Those structural or
 corruption cases return typed `MetaError::ReplayGap`; an empty page while the
 cursor is below the requested target uses the same error with
 `first_available_version = local_version + 1` as an empty-window marker. Both
-errors record `Degraded` and block new mutations. SFS-711 owns the explicit
-rebootstrap signal; automatic checkpoint import and local rebase are owned by
-SFS-712.
+errors record `Degraded` and block new mutations. SFS-711 implements the
+explicit rebootstrap signal for retained-history gaps. SFS-712 implements
+automatic checkpoint import and local rebase while preserving local state.
 
 ## Finite Remote History and Recovery
 
@@ -393,17 +394,19 @@ credentials, full DSNs, or secret-bearing configuration.
 
 ## Contract-to-Implementation Map
 
-SFS-696 through SFS-701 are implemented in the current repository head:
+The implementation map reflects the current repository head:
 
-| Issue | Implementation in current HEAD |
-|---|---|
-| SFS-696 (implemented) | Establishes metadata format version `5` and rejects legacy PG sync state without migration. |
-| SFS-697 (implemented) | Defines PG sync lifecycle and separates local serving, catch-up progress, health, and write authority. |
-| SFS-698 (implemented) | Keeps remote history replay out of normal `PgMetaEngine` open so valid local state can serve first. |
-| SFS-699 (implemented) | Bounded complete-batch paging reads event-log pages without splitting a `batch_version`, between a replay cursor and fixed target. |
-| SFS-700 (implemented) | Atomic page progress and durable replay cursor commit each replay page's serving-state changes and cursor together in local `redb`. |
-| SFS-701 (implemented) | Bounded background catch-up drains toward one frozen startup target with a finite page budget; later sessions resume from the durable cursor. |
-| SFS-721 (implemented) | Local-only destroy preserves cleanup without PostgreSQL or S3. |
+| Issue | Status | Implementation in current HEAD |
+|---|---|---|
+| SFS-696 | Implemented | Establishes metadata format version `5` and rejects legacy PG sync state without migration. |
+| SFS-697 | Implemented | Defines PG sync lifecycle and separates local serving, catch-up progress, health, and write authority. |
+| SFS-698 | Implemented | Keeps remote history replay out of normal `PgMetaEngine` open so valid local state can serve first. |
+| SFS-699 | Implemented | Bounded complete-batch paging reads event-log pages without splitting a `batch_version`, between a replay cursor and fixed target. |
+| SFS-700 | Implemented | Atomic page progress and durable replay cursor commit each replay page's serving-state changes and cursor together in local `redb`. |
+| SFS-701 | Implemented | Bounded background catch-up drains toward one frozen startup target with a finite page budget; later sessions resume from the durable cursor. |
+| SFS-711 | Implemented | Reports retained-history gaps through the explicit `RebootstrapRequired` signal with checkpoint coordinates. |
+| SFS-712 | Implemented | Imports a fresh checkpoint while preserving local state, then resumes replay from the new checkpoint. |
+| SFS-721 | Implemented | Local-only destroy preserves cleanup without PostgreSQL or S3. |
 
 ## Validation Boundary
 
