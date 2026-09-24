@@ -215,7 +215,9 @@ fn signal_handlers_for_policy(
 ) -> io::Result<Option<CliSignalHandlers>> {
     match signal_handling {
         SignalHandling::Disabled => Ok(None),
-        SignalHandling::InstallForCli => CliSignalHandlers::install(),
+        SignalHandling::InstallForCli => CliSignalHandlers::install()?.map(Some).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AlreadyExists, "CLI signal handlers active")
+        }),
     }
 }
 
@@ -614,6 +616,26 @@ mod tests {
         assert!(super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));
         drop(watcher);
         assert!(!super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn concurrent_session_cannot_use_unowned_signal_handlers() {
+        let owner = super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None)
+            .expect("install first session signal handlers");
+        let duplicate =
+            super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None);
+        let duplicate_rejected = matches!(
+            &duplicate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        );
+        drop(duplicate);
+        assert!(super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));
+        drop(owner);
+        assert!(!super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            duplicate_rejected,
+            "second session must not run without handler ownership"
+        );
     }
 
     #[test]
