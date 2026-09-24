@@ -143,7 +143,12 @@ impl PgMetaEngine {
                 }
                 if !remote_operation_recorded {
                     self.record_pg_sync_failure(error);
-                    self.invalidate_remote_validation();
+                    if !matches!(
+                        error,
+                        MetaError::CatchUpCancelled | MetaError::CatchUpDeadlineExceeded
+                    ) {
+                        self.invalidate_remote_validation();
+                    }
                     self.record_metadata_source_result(result);
                     if matches!(
                         error,

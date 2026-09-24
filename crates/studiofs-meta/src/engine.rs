@@ -721,7 +721,7 @@ pub enum PgSyncFailure {
     RemoteUnavailable,
     /// A bounded synchronization operation exceeded its deadline.
     Timeout,
-    /// A catch-up page was cancelled before its next batch.
+    /// A catch-up page was cancelled before its transaction was committed.
     Cancelled,
     /// The local cursor fell behind the retained remote event history.
     ReplayGap {

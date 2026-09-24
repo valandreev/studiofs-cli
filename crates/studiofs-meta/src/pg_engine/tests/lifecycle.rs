@@ -775,14 +775,44 @@ fn startup_catch_up_session_honors_shutdown_signal() {
 }
 
 #[test]
-fn replay_cancellation_includes_caller_shutdown() {
-    let worker_shutdown = std::sync::atomic::AtomicBool::new(false);
-    let caller_shutdown = std::sync::atomic::AtomicBool::new(true);
+fn startup_catch_up_skips_page_fetch_after_worker_shutdown() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .metadata_startup_target_version
+        .store(1, std::sync::atomic::Ordering::Release);
+    engine
+        .background_workers
+        .poll_shutdown()
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.set_catch_up_fault_hook(std::sync::Arc::new(|_| {
+        Err(MetaError::Timeout("unexpected page fetch".to_string()))
+    }));
+    let caller_shutdown = std::sync::atomic::AtomicBool::new(false);
 
-    assert!(super::super::metadata_sync::replay_cancelled(
-        &worker_shutdown,
-        Some(&caller_shutdown)
-    ));
+    let changed = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &caller_shutdown)
+        .expect("worker shutdown should stop catch-up before fetching another page");
+
+    assert!(!changed);
+}
+
+#[test]
+fn replay_cancellation_includes_worker_and_caller_shutdown() {
+    use super::super::metadata_sync::replay_cancelled;
+
+    let shutdown = std::sync::atomic::AtomicBool::new(true);
+    let running = std::sync::atomic::AtomicBool::new(false);
+
+    assert!(!replay_cancelled(&running, None));
+    assert!(!replay_cancelled(&running, Some(&running)));
+    assert!(replay_cancelled(&shutdown, None));
+    assert!(replay_cancelled(&running, Some(&shutdown)));
+    assert!(replay_cancelled(&shutdown, Some(&running)));
+    assert!(replay_cancelled(&shutdown, Some(&shutdown)));
 }
 
 #[test]
@@ -3058,6 +3088,29 @@ fn metadata_sync_result_ignores_expected_catch_up_cancellation() {
     engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, true);
 
     assert_eq!(engine.pg_sync_diagnostics().sync_errors, 0);
+}
+
+#[test]
+fn metadata_sync_result_preserves_remote_validation_for_local_catch_up_abort() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    for error in [
+        MetaError::CatchUpCancelled,
+        MetaError::CatchUpDeadlineExceeded,
+    ] {
+        let result = Err(error);
+        engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, false);
+
+        assert!(
+            engine
+                .remote_format_validated
+                .load(std::sync::atomic::Ordering::Acquire),
+            "local catch-up abort must preserve successful remote validation"
+        );
+    }
 }
 
 #[test]

@@ -174,8 +174,11 @@ fn cancellation_after_last_replay_batch_rolls_back_before_commit() {
 
     let (_dir, pg) = temp_pg_engine_for_unit();
     let ino = ROOT_INO + 706;
-    let checked = Cell::new(false);
-    let cancelled = || checked.replace(true);
+    let checks = Cell::new(0);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() >= 3
+    };
     let execution = RemoteReplayExecution {
         deadline: Instant::now() + Duration::from_secs(60),
         cancelled: &cancelled,
@@ -201,10 +204,12 @@ fn cancellation_after_last_replay_batch_rolls_back_before_commit() {
     );
 
     assert!(matches!(result, Err(MetaError::CatchUpCancelled)));
+    assert_eq!(checks.get(), 3, "cancel after the reconciliation checks");
     assert_eq!(
         PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
         0
     );
+    assert_eq!(pg.local_version.load(Ordering::Acquire), 0);
     assert!(pg.local.get_attr(ino).is_err());
 }
 

@@ -414,12 +414,13 @@ impl PgMetaEngine {
                 }
                 result
             };
+            let worker_shutdown = self.background_workers.poll_shutdown();
             let drain_to_target = |target_version| {
                 drain_startup_catch_up_pages(
                     target_version,
                     || self.local_version.load(Ordering::Acquire),
                     || {
-                        !shutdown.load(Ordering::Acquire)
+                        !super::metadata_sync::replay_cancelled(&worker_shutdown, Some(shutdown))
                             && matches!(
                                 self.current_pg_sync_lifecycle(),
                                 PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
