@@ -47,6 +47,11 @@ const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUNT_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV: &str =
     "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL";
+
+#[cfg(all(test, target_os = "macos"))]
+// CLI signal dispositions are process-global; serialize test launches that own them.
+static MOUNT_LAUNCH_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 type MountProfileFinish = Box<dyn FnMut()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1776,6 +1781,8 @@ impl MountRuntimeGuard {
     }
 
     fn launch(mut self) -> anyhow::Result<()> {
+        #[cfg(all(test, target_os = "macos"))]
+        let _test_lock = MOUNT_LAUNCH_TEST_LOCK.get_or_init(|| Mutex::new(())).lock();
         #[cfg(target_os = "macos")]
         let _signal_guard = studiofs_macfuse::ProcessSignalGuard::install_for_cli()?;
         let mount_result = self.launch_mount();
