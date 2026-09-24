@@ -6,6 +6,9 @@ use crate::redb_engine::{RedbMetaEngine, RedbWriteTransaction};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+const REPLAY_LOCK_WAIT_SLICE: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Default)]
 pub(super) struct OverlayConflictSets {
@@ -48,6 +51,39 @@ pub(super) struct RemoteReplayApplyContext {
     pub(super) flushed_event_seq: u64,
     pub(super) next_event_seq: u64,
     pub(super) initial_overlay: OverlayConflictSets,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RemoteReplayExecution<'a> {
+    deadline: Instant,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl<'a> RemoteReplayExecution<'a> {
+    pub(super) fn new(deadline: Instant, cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            deadline,
+            cancelled,
+        }
+    }
+
+    pub(super) fn check(&self) -> MetaResult<()> {
+        if (self.cancelled)() {
+            return Err(MetaError::CatchUpCancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(MetaError::CatchUpDeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    pub(super) fn wait_for_lock_retry(&self) {
+        std::thread::park_timeout(
+            self.deadline
+                .saturating_duration_since(Instant::now())
+                .min(REPLAY_LOCK_WAIT_SLICE),
+        );
+    }
 }
 
 pub(super) struct ProjectedRemoteBatch {
@@ -321,14 +357,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
         events: &[MetaEvent],
         event_start: u64,
         excluded_ranges: &[LocalEventRange],
-    ) -> OverlayConflictSets {
-        if excluded_ranges.is_empty() {
-            return Self::overlay_conflicts_for_events(events);
+        execution: Option<&RemoteReplayExecution<'_>>,
+    ) -> MetaResult<OverlayConflictSets> {
+        if excluded_ranges.is_empty() && execution.is_none() {
+            return Ok(Self::overlay_conflicts_for_events(events));
         }
         let first_seq = event_start.max(1);
         let mut excluded_index = excluded_ranges.partition_point(|range| range.end <= first_seq);
         let mut overlay = OverlayConflictSets::default();
         for (index, event) in events.iter().enumerate() {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
             let seq = first_seq.saturating_add(index as u64);
             while excluded_ranges
                 .get(excluded_index)
@@ -343,7 +383,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 Self::add_event_overlay_conflicts(&mut overlay, event);
             }
         }
-        overlay
+        Ok(overlay)
     }
 
     fn add_event_overlay_conflicts(overlay: &mut OverlayConflictSets, event: &MetaEvent) {
@@ -1728,17 +1768,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         start: u64,
         end: u64,
         excluded_ranges: &[LocalEventRange],
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<OverlayConflictSets> {
         if end <= start {
             return Ok(OverlayConflictSets::default());
         }
 
-        let events = local.read_events_range(start, end)?;
-        Ok(Self::overlay_conflicts_for_local_events(
-            &events,
-            start,
-            excluded_ranges,
-        ))
+        let events = local.read_events_range_with_check(start, end, || {
+            execution.map_or(Ok(()), RemoteReplayExecution::check)
+        })?;
+        Self::overlay_conflicts_for_local_events(&events, start, excluded_ranges, execution)
     }
 
     fn overlay_conflicts_for_local_range_in_txn(
@@ -1746,16 +1785,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         start: u64,
         end: u64,
         excluded_ranges: &[LocalEventRange],
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<OverlayConflictSets> {
         if end <= start {
             return Ok(OverlayConflictSets::default());
         }
-        let events = RedbMetaEngine::read_events_range_in_write_txn(txn, start, end)?;
-        Ok(Self::overlay_conflicts_for_local_events(
-            &events,
-            start,
-            excluded_ranges,
-        ))
+        let events =
+            RedbMetaEngine::read_events_range_in_write_txn_with_check(txn, start, end, || {
+                execution.map_or(Ok(()), RemoteReplayExecution::check)
+            })?;
+        Self::overlay_conflicts_for_local_events(&events, start, excluded_ranges, execution)
     }
 
     #[cfg(test)]
@@ -1796,6 +1835,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         batch_events: &[MetaEvent],
         flushed_event_seq: u64,
         next_event_seq: u64,
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<Option<u64>> {
         if batch_events.is_empty() {
             return Ok(None);
@@ -1805,11 +1845,17 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if end <= start {
             return Ok(None);
         }
-        let local_events = RedbMetaEngine::read_events_range_in_write_txn(txn, start, end)?;
+        let local_events =
+            RedbMetaEngine::read_events_range_in_write_txn_with_check(txn, start, end, || {
+                execution.map_or(Ok(()), RemoteReplayExecution::check)
+            })?;
         if local_events.len() < batch_events.len() {
             return Ok(None);
         }
         for consumed_events in batch_events.len()..=local_events.len() {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
             let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
             if projected_prefix.events.len() != batch_events.len() {
                 continue;
@@ -1935,7 +1981,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         context: RemoteReplayApplyContext,
     ) -> MetaResult<RemoteReplayApplyOutcome> {
         let txn = self.local.begin_write_txn()?;
-        let result = self.apply_decoded_batches_in_txn(&txn, batches, recent_flush, context);
+        let result = self.apply_decoded_batches_in_txn(&txn, batches, recent_flush, context, None);
         match result {
             Ok(outcome) => {
                 txn.commit()
@@ -1955,6 +2001,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         batches: Vec<DecodedReplayBatch>,
         recent_flush: Option<&RecentFlush>,
         mut context: RemoteReplayApplyContext,
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<RemoteReplayApplyOutcome> {
         if batches.is_empty() {
             return Ok(RemoteReplayApplyOutcome {
@@ -1976,6 +2023,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut overlay_is_dirty = false;
         let empty_protected_base_inodes = HashSet::new();
         for batch in batches {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
             Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
             Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
             if batch.is_self_batch {
@@ -1985,6 +2035,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &batch.events,
                     context.flushed_event_seq,
                     context.next_event_seq,
+                    execution,
                 )?;
                 if let Some(next_flushed_event_seq) = acknowledged_seq
                     && self
@@ -2022,6 +2073,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     context.flushed_event_seq,
                     context.next_event_seq,
                     &self.local_event_overlay_exclusions,
+                    execution,
                 )?;
                 if batch.is_self_batch {
                     Self::clear_resolved_self_regular_file_protection(
@@ -2032,6 +2084,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
                 overlay_is_dirty = false;
             }
+        }
+        if let Some(execution) = execution {
+            execution.check()?;
         }
         let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
         applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay_in_txn(
@@ -2044,6 +2099,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             &reconcile_dentry_keys,
             &final_overlay,
         )?;
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
         Ok(RemoteReplayApplyOutcome {
             changed: applied_any,
             max_version,

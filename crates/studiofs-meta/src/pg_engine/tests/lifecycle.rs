@@ -775,6 +775,47 @@ fn startup_catch_up_session_honors_shutdown_signal() {
 }
 
 #[test]
+fn startup_catch_up_skips_page_fetch_after_worker_shutdown() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    engine
+        .metadata_startup_target_version
+        .store(1, std::sync::atomic::Ordering::Release);
+    engine
+        .background_workers
+        .poll_shutdown_ref()
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.set_catch_up_fault_hook(std::sync::Arc::new(|_| {
+        Err(MetaError::Timeout("unexpected page fetch".to_string()))
+    }));
+    let caller_shutdown = std::sync::atomic::AtomicBool::new(false);
+
+    let changed = engine
+        .run_startup_catch_up_session(MetadataSyncSource::Manual, &caller_shutdown)
+        .expect("worker shutdown should stop catch-up before fetching another page");
+
+    assert!(!changed);
+}
+
+#[test]
+fn replay_cancellation_includes_worker_and_caller_shutdown() {
+    use super::super::metadata_sync::replay_cancelled;
+
+    let shutdown = std::sync::atomic::AtomicBool::new(true);
+    let running = std::sync::atomic::AtomicBool::new(false);
+
+    assert!(!replay_cancelled(&running, None));
+    assert!(!replay_cancelled(&running, Some(&running)));
+    assert!(replay_cancelled(&shutdown, None));
+    assert!(replay_cancelled(&running, Some(&shutdown)));
+    assert!(replay_cancelled(&shutdown, Some(&running)));
+    assert!(replay_cancelled(&shutdown, Some(&shutdown)));
+}
+
+#[test]
 fn startup_catch_up_drain_honors_shutdown_after_a_page() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
@@ -2886,7 +2927,7 @@ fn remote_pull_requires_remote_identity_validation() {
         .store(1, std::sync::atomic::Ordering::Release);
 
     let error = engine
-        .pull_foreign_events_locked_to_target(None, 0)
+        .pull_foreign_events_locked_to_target(None, 0, None)
         .expect_err("remote pulls must validate remote identity first");
 
     assert!(error.is_reachability_error());
@@ -3037,6 +3078,62 @@ fn metadata_sync_result_does_not_repeat_recorded_remote_failure() {
         "aggregate recording must not invalidate a failure already recorded by the remote operation"
     );
     assert_eq!(engine.pg_sync_diagnostics().sync_errors, 1);
+}
+
+#[test]
+fn metadata_sync_result_ignores_expected_catch_up_cancellation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let result = Err(MetaError::CatchUpCancelled);
+
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, true);
+
+    assert_eq!(engine.pg_sync_diagnostics().sync_errors, 0);
+}
+
+#[test]
+fn local_catch_up_aborts_preserve_remote_validation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let assert_validation_preserved = || {
+        assert!(
+            engine
+                .remote_format_validated
+                .load(std::sync::atomic::Ordering::Acquire),
+            "local catch-up abort must preserve remote format validation"
+        );
+        assert!(
+            engine
+                .remote_identity_validated
+                .load(std::sync::atomic::Ordering::Acquire),
+            "local catch-up abort must preserve remote identity validation"
+        );
+    };
+
+    for result in [
+        Err(MetaError::CatchUpCancelled),
+        Err(MetaError::CatchUpDeadlineExceeded),
+    ] {
+        engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, false);
+        assert_validation_preserved();
+    }
+
+    for error in [
+        MetaError::CatchUpCancelled,
+        MetaError::CatchUpDeadlineExceeded,
+    ] {
+        assert!(
+            engine
+                .record_remote_operation_result::<()>(Err(error))
+                .is_err()
+        );
+        assert_validation_preserved();
+    }
 }
 
 #[test]

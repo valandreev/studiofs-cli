@@ -503,7 +503,7 @@ use janitor::PgJanitorLock;
 use remote_apply::DecodedReplayBatch;
 use remote_apply::{
     OverlayConflictSets, RecentFlush, RemoteApplyCoordinator, RemoteReplayApplyContext,
-    RemoteReplayApplyOutcome,
+    RemoteReplayApplyOutcome, RemoteReplayExecution,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1361,7 +1361,12 @@ impl PgMetaEngine {
                 .remote_transport_unavailable
                 .store(false, Ordering::Release),
             Err(error) => {
-                self.invalidate_remote_validation();
+                if !matches!(
+                    error,
+                    MetaError::CatchUpCancelled | MetaError::CatchUpDeadlineExceeded
+                ) {
+                    self.invalidate_remote_validation();
+                }
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
                 self.record_pg_sync_failure(error);

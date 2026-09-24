@@ -2,14 +2,22 @@
 
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
-    janitor::pg_event_log_prune_lock_key, sql,
+    RemoteReplayExecution, janitor::pg_event_log_prune_lock_key, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
 use crate::types::{FileType, Ino};
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::warn;
+
+pub(super) fn replay_cancelled(
+    worker_shutdown: &AtomicBool,
+    caller_shutdown: Option<&AtomicBool>,
+) -> bool {
+    worker_shutdown.load(Ordering::Acquire)
+        || caller_shutdown.is_some_and(|shutdown| shutdown.load(Ordering::Acquire))
+}
 
 impl PgMetaEngine {
     pub(super) fn frozen_sync_target_version(&self) -> MetaResult<i64> {
@@ -55,13 +63,17 @@ impl PgMetaEngine {
     }
 
     pub(super) fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
-        self.local_overlay_conflicts_with_active_open_inodes(None)
+        self.local_overlay_conflicts_with_active_open_inodes(None, None)
     }
 
     fn local_overlay_conflicts_with_active_open_inodes(
         &self,
         active_open_inodes: Option<&HashSet<Ino>>,
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<OverlayConflictSets> {
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
         let active_open_overlay = self.active_open_inode_overlay(active_open_inodes);
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
@@ -76,6 +88,7 @@ impl PgMetaEngine {
                 start,
                 end,
                 &overlay_exclusions,
+                execution,
             )?,
             &active_open_overlay,
         ))
@@ -92,7 +105,8 @@ impl PgMetaEngine {
             .filter(|attr| attr.kind == FileType::RegularFile)
             .map(|attr| attr.ino)
             .collect::<HashSet<_>>();
-        let overlay = self.local_overlay_conflicts_with_active_open_inodes(active_open_inodes)?;
+        let overlay =
+            self.local_overlay_conflicts_with_active_open_inodes(active_open_inodes, None)?;
         RemoteApplyCoordinator::new(&self.local)
             .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
         Ok(())
@@ -130,10 +144,17 @@ impl PgMetaEngine {
                 }
             }
             Err(error) => {
-                self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
+                if !matches!(error, MetaError::CatchUpCancelled) {
+                    self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 if !remote_operation_recorded {
                     self.record_pg_sync_failure(error);
-                    self.invalidate_remote_validation();
+                    if !matches!(
+                        error,
+                        MetaError::CatchUpCancelled | MetaError::CatchUpDeadlineExceeded
+                    ) {
+                        self.invalidate_remote_validation();
+                    }
                     self.record_metadata_source_result(result);
                     if matches!(
                         error,
@@ -169,7 +190,7 @@ impl PgMetaEngine {
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
         let target_version = self.frozen_sync_target_version()?;
-        self.pull_foreign_events_locked_to_target(recent_flush, target_version)
+        self.pull_foreign_events_locked_to_target(recent_flush, target_version, None)
     }
 
     /// Pull and replay foreign events up to an already-frozen target version.
@@ -181,10 +202,11 @@ impl PgMetaEngine {
         &self,
         recent_flush: Option<&RecentFlush>,
         target_version: i64,
+        caller_shutdown: Option<&AtomicBool>,
     ) -> MetaResult<bool> {
         let result = (|| {
             self.ensure_remote_format_validated()?;
-            self.pull_foreign_events_locked_inner(recent_flush, target_version)
+            self.pull_foreign_events_locked_inner(recent_flush, target_version, caller_shutdown)
         })();
         self.record_remote_operation_result(result)
     }
@@ -193,6 +215,7 @@ impl PgMetaEngine {
         &self,
         recent_flush: Option<&RecentFlush>,
         target_version: i64,
+        caller_shutdown: Option<&AtomicBool>,
     ) -> MetaResult<bool> {
         let last_batch_version = self.local_version.load(Ordering::SeqCst);
         if last_batch_version >= target_version {
@@ -363,10 +386,20 @@ impl PgMetaEngine {
         // Keep the cursor snapshot, serving-state reconcile, and pending replay
         // atomic with local metadata mutations after decoding the remote page.
         let apply_started = Instant::now();
-        let (position_guard, mut pending_state) = self.lock_local_position_and_pending_state()?;
+        let worker_shutdown = self.background_workers.poll_shutdown_ref();
+        let cancelled = || replay_cancelled(worker_shutdown, caller_shutdown);
+        // The PostgreSQL fetch has its own timeout; local replay gets a full budget.
+        let deadline = apply_started.checked_add(command_timeout).ok_or_else(|| {
+            MetaError::Storage("postgres catch-up replay deadline is out of range".to_string())
+        })?;
+        let execution = RemoteReplayExecution::new(deadline, &cancelled);
+        execution.check()?;
+        let (position_guard, mut pending_state) =
+            self.lock_local_position_and_pending_state_with_execution(Some(&execution))?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
-        let initial_overlay = self.local_overlay_conflicts()?;
+        let initial_overlay =
+            self.local_overlay_conflicts_with_active_open_inodes(None, Some(&execution))?;
         let outcome = self.apply_replay_page_atomically_locked(
             batches,
             recent_flush,
@@ -377,6 +410,7 @@ impl PgMetaEngine {
                 next_event_seq,
                 initial_overlay,
             },
+            Some(&execution),
         )?;
         // Only an acknowledged self-batch advances the local journal cursor;
         // foreign batches update the base view without changing pending events.
@@ -400,8 +434,20 @@ impl PgMetaEngine {
         recent_flush: Option<&super::RecentFlush>,
         context: super::RemoteReplayApplyContext,
     ) -> MetaResult<super::RemoteReplayApplyOutcome> {
-        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
-        self.apply_replay_page_atomically_locked(batches, recent_flush, context)
+        self.apply_replay_page_atomically_with_execution(batches, recent_flush, context, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_replay_page_atomically_with_execution(
+        &self,
+        batches: Vec<super::remote_apply::DecodedReplayBatch>,
+        recent_flush: Option<&super::RecentFlush>,
+        context: super::RemoteReplayApplyContext,
+        execution: Option<&RemoteReplayExecution<'_>>,
+    ) -> MetaResult<super::RemoteReplayApplyOutcome> {
+        let (_position_guard, _pending_state) =
+            self.lock_local_position_and_pending_state_with_execution(execution)?;
+        self.apply_replay_page_atomically_locked(batches, recent_flush, context, execution)
     }
 
     /// Apply a page while the caller holds both locks in canonical order.
@@ -410,6 +456,7 @@ impl PgMetaEngine {
         batches: Vec<super::remote_apply::DecodedReplayBatch>,
         recent_flush: Option<&super::RecentFlush>,
         context: super::RemoteReplayApplyContext,
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<super::RemoteReplayApplyOutcome> {
         if batches.is_empty() {
             return Ok(super::RemoteReplayApplyOutcome {
@@ -431,7 +478,7 @@ impl PgMetaEngine {
         let result = RemoteApplyCoordinator::new(&self.local)
             .with_local_event_ack_barrier(local_event_ack_barrier)
             .with_local_event_overlay_exclusions(local_event_overlay_exclusions)
-            .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context);
+            .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context, execution);
         let mut outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -468,6 +515,17 @@ impl PgMetaEngine {
                 tracing::warn!(
                     error = %abort_error,
                     "failed to abort redb write transaction during injected catch-up rollback"
+                );
+            }
+            return Err(error);
+        }
+        if let Some(execution) = execution
+            && let Err(error) = execution.check()
+        {
+            if let Err(abort_error) = txn.abort() {
+                tracing::warn!(
+                    error = %abort_error,
+                    "failed to abort redb write transaction during catch-up rollback"
                 );
             }
             return Err(error);

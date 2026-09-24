@@ -195,9 +195,14 @@ events; published and completed ranges no longer reserve their old keys.
 Rejected ranges remain local authority until replay can resume past the gap.
 
 The catch-up worker checks the operation deadline and cancellation boundary
-before each batch and rolls back without advancing the cursor when either is
-reached. The producer-side row/byte caps keep any one attempted batch bounded;
-the worker must not waive the operation-time bound for a large batch.
+before each batch, after the batch sequence, and after serving-state
+reconciliation. After writing the replay position into the transaction, it
+checks once more immediately before commit. Reaching any boundary aborts the
+page transaction without advancing the cursor. The local replay deadline
+starts after a page has been fetched and decoded, immediately before acquiring
+the local replay locks; the PostgreSQL page query has its own command timeout.
+The producer-side row/byte caps keep any one attempted batch bounded; the
+worker must not waive the operation-time bound for a large batch.
 
 The background startup session also has a finite page budget while it holds
 the replication lock. Reaching that budget returns a typed resumable outcome;
