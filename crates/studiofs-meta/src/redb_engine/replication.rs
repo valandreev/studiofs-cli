@@ -683,6 +683,15 @@ impl RedbMetaEngine {
         start_seq: u64,
         end_seq: u64,
     ) -> MetaResult<Vec<crate::events::MetaEvent>> {
+        self.read_events_range_with_check(start_seq, end_seq, || Ok(()))
+    }
+
+    pub(crate) fn read_events_range_with_check(
+        &self,
+        start_seq: u64,
+        end_seq: u64,
+        mut check: impl FnMut() -> MetaResult<()>,
+    ) -> MetaResult<Vec<crate::events::MetaEvent>> {
         if end_seq <= start_seq {
             return Ok(Vec::new());
         }
@@ -695,6 +704,7 @@ impl RedbMetaEngine {
             .range(start_seq..end_seq)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
+            check()?;
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let ev = crate::events::decode_event(bytes.value())?;
             out.push(ev);
@@ -702,10 +712,11 @@ impl RedbMetaEngine {
         Ok(out)
     }
 
-    pub(crate) fn read_events_range_in_write_txn(
+    pub(crate) fn read_events_range_in_write_txn_with_check(
         txn: &redb::WriteTransaction,
         start_seq: u64,
         end_seq: u64,
+        mut check: impl FnMut() -> MetaResult<()>,
     ) -> MetaResult<Vec<crate::events::MetaEvent>> {
         if end_seq <= start_seq {
             return Ok(Vec::new());
@@ -718,6 +729,7 @@ impl RedbMetaEngine {
             .range(start_seq..end_seq)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
+            check()?;
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             out.push(crate::events::decode_event(bytes.value())?);
         }

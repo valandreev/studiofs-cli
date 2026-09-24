@@ -355,6 +355,110 @@ fn cancelled_replay_page_rolls_back_self_ack_and_reapplies_entire_page() {
 }
 
 #[test]
+fn cancelled_replay_stops_while_scanning_local_journal() {
+    use std::cell::Cell;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let flushed_event_seq = pg.flushed_event_seq.load(Ordering::SeqCst);
+    pg.create_dir(ROOT_INO, b"self-prefix", 0, 0, 0o755)
+        .expect("create acknowledged local namespace event");
+    let self_prefix_end = pg.local.get_counter("nextEventSeq").unwrap();
+    let self_events = RemoteApplyCoordinator::project_local_batch(
+        &pg.local
+            .read_events_range(flushed_event_seq, self_prefix_end)
+            .unwrap(),
+    )
+    .events;
+    for index in 0..8 {
+        let name = format!("pending-{index}");
+        pg.create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
+            .expect("create pending local namespace event");
+    }
+    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let local_event_count = pg
+        .local
+        .read_events_range(flushed_event_seq, next_event_seq)
+        .unwrap()
+        .len();
+    assert!(local_event_count > 4, "fixture has enough journal rows");
+
+    let checks = Cell::new(0);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() >= local_event_count + 3
+    };
+    let execution =
+        RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
+    let result = pg.apply_replay_page_atomically_with_execution(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: self_events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq,
+            next_event_seq,
+            initial_overlay: OverlayConflictSets::default(),
+        },
+        Some(&execution),
+    );
+
+    assert!(matches!(result, Err(MetaError::CatchUpCancelled)));
+    assert_eq!(
+        checks.get(),
+        local_event_count + 3,
+        "cancel during the post-ack overlay scan"
+    );
+    assert!(
+        checks.get() < local_event_count * 2,
+        "do not scan the full journal twice"
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        0
+    );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn cancelled_replay_stops_while_preparing_local_overlay() {
+    use std::cell::Cell;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    for index in 0..8 {
+        let name = format!("pending-{index}");
+        pg.create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
+            .expect("create pending local namespace event");
+    }
+    let end = pg.local.get_counter("nextEventSeq").unwrap();
+    let event_count = pg.local.read_events_range(start, end).unwrap().len();
+    assert!(event_count > 3, "fixture has enough journal rows");
+
+    let checks = Cell::new(0);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() >= 4
+    };
+    let execution =
+        RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
+    let result = RemoteApplyCoordinator::overlay_conflicts_for_local_range(
+        &pg.local,
+        start,
+        end,
+        &[],
+        Some(&execution),
+    );
+
+    assert!(matches!(result, Err(MetaError::CatchUpCancelled)));
+    assert_eq!(checks.get(), 4, "stop at the cancellation point");
+    assert!(checks.get() < event_count, "do not decode the full journal");
+}
+
+#[test]
 fn empty_replay_page_returns_without_advancing_replay_state() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let outcome = pg

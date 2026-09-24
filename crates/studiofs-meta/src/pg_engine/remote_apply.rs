@@ -347,14 +347,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
         events: &[MetaEvent],
         event_start: u64,
         excluded_ranges: &[LocalEventRange],
-    ) -> OverlayConflictSets {
-        if excluded_ranges.is_empty() {
-            return Self::overlay_conflicts_for_events(events);
+        execution: Option<&RemoteReplayExecution<'_>>,
+    ) -> MetaResult<OverlayConflictSets> {
+        if excluded_ranges.is_empty() && execution.is_none() {
+            return Ok(Self::overlay_conflicts_for_events(events));
         }
         let first_seq = event_start.max(1);
         let mut excluded_index = excluded_ranges.partition_point(|range| range.end <= first_seq);
         let mut overlay = OverlayConflictSets::default();
         for (index, event) in events.iter().enumerate() {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
             let seq = first_seq.saturating_add(index as u64);
             while excluded_ranges
                 .get(excluded_index)
@@ -369,7 +373,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 Self::add_event_overlay_conflicts(&mut overlay, event);
             }
         }
-        overlay
+        Ok(overlay)
     }
 
     fn add_event_overlay_conflicts(overlay: &mut OverlayConflictSets, event: &MetaEvent) {
@@ -1754,17 +1758,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         start: u64,
         end: u64,
         excluded_ranges: &[LocalEventRange],
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<OverlayConflictSets> {
         if end <= start {
             return Ok(OverlayConflictSets::default());
         }
 
-        let events = local.read_events_range(start, end)?;
-        Ok(Self::overlay_conflicts_for_local_events(
-            &events,
-            start,
-            excluded_ranges,
-        ))
+        let events = local.read_events_range_with_check(start, end, || {
+            execution.map_or(Ok(()), RemoteReplayExecution::check)
+        })?;
+        Self::overlay_conflicts_for_local_events(&events, start, excluded_ranges, execution)
     }
 
     fn overlay_conflicts_for_local_range_in_txn(
@@ -1772,16 +1775,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         start: u64,
         end: u64,
         excluded_ranges: &[LocalEventRange],
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<OverlayConflictSets> {
         if end <= start {
             return Ok(OverlayConflictSets::default());
         }
-        let events = RedbMetaEngine::read_events_range_in_write_txn(txn, start, end)?;
-        Ok(Self::overlay_conflicts_for_local_events(
-            &events,
-            start,
-            excluded_ranges,
-        ))
+        let events =
+            RedbMetaEngine::read_events_range_in_write_txn_with_check(txn, start, end, || {
+                execution.map_or(Ok(()), RemoteReplayExecution::check)
+            })?;
+        Self::overlay_conflicts_for_local_events(&events, start, excluded_ranges, execution)
     }
 
     #[cfg(test)]
@@ -1822,6 +1825,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         batch_events: &[MetaEvent],
         flushed_event_seq: u64,
         next_event_seq: u64,
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<Option<u64>> {
         if batch_events.is_empty() {
             return Ok(None);
@@ -1831,11 +1835,17 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if end <= start {
             return Ok(None);
         }
-        let local_events = RedbMetaEngine::read_events_range_in_write_txn(txn, start, end)?;
+        let local_events =
+            RedbMetaEngine::read_events_range_in_write_txn_with_check(txn, start, end, || {
+                execution.map_or(Ok(()), RemoteReplayExecution::check)
+            })?;
         if local_events.len() < batch_events.len() {
             return Ok(None);
         }
         for consumed_events in batch_events.len()..=local_events.len() {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
             let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
             if projected_prefix.events.len() != batch_events.len() {
                 continue;
@@ -2015,6 +2025,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &batch.events,
                     context.flushed_event_seq,
                     context.next_event_seq,
+                    execution,
                 )?;
                 if let Some(next_flushed_event_seq) = acknowledged_seq
                     && self
@@ -2052,6 +2063,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     context.flushed_event_seq,
                     context.next_event_seq,
                     &self.local_event_overlay_exclusions,
+                    execution,
                 )?;
                 if batch.is_self_batch {
                     Self::clear_resolved_self_regular_file_protection(

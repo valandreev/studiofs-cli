@@ -6,6 +6,8 @@ This ExecPlan follows `.agent/PLANS.md` and stays current as the review fixes ar
 
 Metadata catch-up should keep making progress when a PostgreSQL page fetch uses most of its network timeout, and a startup session must be able to cancel a page using its own shutdown signal. Expected shutdown cancellation should not look like a synchronization failure to metrics or background logs. VFS callers should receive a retryable category for that cancellation. These behaviors can be checked with focused unit tests; live PostgreSQL remains optional for the integration path.
 
+The local replay deadline starts before local locks, is checked after acquiring them, and also bounds pending-journal reads and overlay construction.
+
 ## Progress
 
 - [x] (2026-09-24 15:14 UTC) Read the attached review as feedback, traced affected code, and classified all eight findings.
@@ -17,6 +19,7 @@ Metadata catch-up should keep making progress when a PostgreSQL page fetch uses 
 - [x] (2026-09-24 16:37 UTC) Correct the cancellation diagnostic comment and replay contract; run lifecycle/replay suites, crate check, Clippy, formatting, and diff checks.
 - [x] (2026-09-24 17:21 UTC) Verify all eight findings in `2026-09-24-sfs-729-rust-best-practices-code-review.md`; add a red-to-green pre-commit rollback regression and implement the confirmed code and test corrections.
 - [x] (2026-09-24 17:21 UTC) Re-run the 74 replay tests, 106 lifecycle tests, five diagnostics tests, crate check, Clippy, formatting, and diff checks; record the PostgreSQL-gated tests as ignored.
+- [x] (2026-09-24 17:52 UTC) Address the two follow-up annotations: make local journal reads and overlay aggregation cancellation-aware, check replay after lock acquisition, add replay and preflight regressions, and correct the stale test filters below.
 
 ## Surprises & Discoveries
 
@@ -33,6 +36,7 @@ Metadata catch-up should keep making progress when a PostgreSQL page fetch uses 
 - The redundant worker-shutdown `Arc` clones were only used to form local references. `poll_shutdown_ref` now serves those stack borrows; the owned `Arc` accessor remains for spawned work that must outlive the call.
 - `RemoteReplayExecution` now has private fields, a constructor, and `Copy`/`Clone`. It remains borrowed through `Option<&RemoteReplayExecution>` and keeps its `dyn Fn` callback: changing those forms would add generic or value-passing churn without evidence of lower cost.
 - The validation test now checks both remote validation flags and both result-recording paths; the deadline test uses the canonical persisted-version helper, the `Cell::replace` transition has a comment, and diagnostics behaviors have separate tests.
+- The replay preflight built its initial overlay from the complete pending redb journal before constructing `RemoteReplayExecution`. Self-batch acknowledgement and post-ack overlay rebuilding also read local event ranges without checking cancellation. These reads now check the existing execution context while decoding rows and while aggregating overlay conflicts.
 
 ## Decision Log
 
@@ -63,6 +67,9 @@ Metadata catch-up should keep making progress when a PostgreSQL page fetch uses 
 - Decision: Add private fields, a constructor, and `Copy`/`Clone` to `RemoteReplayExecution`, while keeping the borrowed API and callback representation.
   Rationale: This accepts the encapsulation and value-trait findings from the Rust review. The 32-byte wrapper is not proven cheaper to pass by value than by reference, and the current callback supports capturing closures; changing either form without profiling or a caller need would be speculative.
   Date/Author: 2026-09-24 / Codex.
+- Decision: Create the page replay execution context before local locks, check it after lock acquisition, and use that same context while scanning local event ranges.
+  Rationale: Lock wait must count toward the local deadline, and shutdown/deadline must stop preflight overlay preparation and self-ack scans before they decode the full journal.
+  Date/Author: 2026-09-24 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -71,6 +78,8 @@ Implementation and validation are complete. The focused tests and 73 replay-page
 The follow-up deep review is complete too. Its two confirmed behavior defects now have red-to-green regressions. The lifecycle suite passes 106 tests with 36 PostgreSQL-backed tests ignored; the replay suite passes 73 with 44 ignored. The post-reconciliation test fails when its production guard is temporarily removed. Crate check, Clippy with warnings denied, rustfmt, and `git diff --check` pass. Live PostgreSQL catch-up remains environment-gated.
 
 The Rust best-practices review is complete. Its missing pre-commit cancellation check was confirmed with a test that failed when the hook set shutdown after cursor write; adding an abort check immediately before commit made the test pass. The replay suite now passes 74 tests with 44 PostgreSQL-backed tests ignored, the lifecycle suite passes 106 with 36 ignored, and the diagnostic tests pass five. `cargo check -p studiofs-meta`, Clippy with warnings denied, rustfmt, and `git diff --check` pass. The review's encapsulation and trait suggestions were applied; static dispatch and pass-by-value changes were left out without measured benefit. Live PostgreSQL catch-up remains environment-gated.
+
+The follow-up annotations are resolved. A new self-batch replay regression failed before the fix because shutdown was only observed after the journal scan; it now cancels during post-ack overlay rebuilding. A focused initial-overlay regression confirms cancellation during preflight. The replay module passes 76 tests with 44 PostgreSQL-backed tests ignored; `cargo check -p studiofs-meta`, Clippy with warnings denied, rustfmt, and `git diff --check` pass. The two ExecPlan test filters now name the current tests and both were run with nonzero counts.
 
 ## Context and Orientation
 
@@ -90,13 +99,15 @@ Do not remove the final execution check after serving-state reconciliation. Do n
 
 For the follow-up, add a session-level test whose pre-fetch fault hook fails if worker shutdown does not stop the next page, and a bookkeeping test proving local cancellation/deadline errors preserve remote validation. Move the rollback test's cancellation to the third execution check and assert both persisted and in-memory cursors remain unchanged. Update `PgSyncFailure::Cancelled` and `docs/pg-sync-contract.md` to describe cancellation through the pre-commit boundary. For the Rust review, add a regression that sets shutdown after replay-position write and proves the transaction aborts, use borrowed shutdown accessors for local closures, and encapsulate the replay execution fields. Keep the wrapper borrowed and retain the capture-capable callback because neither static dispatch nor by-value passing has an evidenced benefit.
 
+For the annotation follow-up, construct `RemoteReplayExecution` before acquiring the local replay locks, check it after those locks are acquired, and pass it through initial overlay preparation, self-batch acknowledgement, and post-ack overlay rebuilding. Check each local journal row and overlay aggregation step. Replace the obsolete lifecycle and diagnostics filters with their current test names/prefixes.
+
 ## Concrete Steps
 
 Run commands from `/Volumes/Storage/dev/studiofs`. Before the production changes, the bridge assertion and cancellation-metric test failed as expected; the caller-predicate test failed to compile because that predicate did not yet exist. The new `PgSyncFailure` test covers mappings that were already implemented. After the fix, run:
 
     cargo test -p studiofs-meta --lib pg_engine::tests::remote_apply:: -- --nocapture
-    cargo test -p studiofs-meta --lib pg_engine::tests::lifecycle::replay_cancellation_includes_caller_shutdown
-    cargo test -p studiofs-meta --lib pg_sync_failure_maps_catch_up_cancellation_and_deadline
+    cargo test -p studiofs-meta --lib pg_engine::tests::lifecycle::replay_cancellation_includes_worker_and_caller_shutdown
+    cargo test -p studiofs-meta --lib pg_sync_failure_
     cargo test -p studiofs-meta --lib metadata_sync_result_ignores_expected_catch_up_cancellation
     cargo test -p studiofs-vfs --lib classify_vfs_error_preserves_catch_up_cancellation_as_retryable
     cargo check -p studiofs-meta -p studiofs-vfs
@@ -119,11 +130,23 @@ They reported 73 replay tests and 106 lifecycle tests passed, zero failures, wit
 
 After the Rust review, the same replay and lifecycle module commands reported 74 and 106 passed, zero failures, with 44 and 36 PostgreSQL-backed tests ignored. The focused `pg_sync_failure_` filter reported five passed. The new pre-commit regression failed before the guard because the page committed after shutdown, then passed with the guard restored. `cargo check -p studiofs-meta`, Clippy with warnings denied, rustfmt, and `git diff --check` pass.
 
+After the annotation follow-up:
+
+    cargo test -p studiofs-meta --lib pg_engine::tests::remote_apply -- --nocapture
+    cargo check -p studiofs-meta
+    cargo clippy -p studiofs-meta --all-targets -- -D warnings
+    cargo fmt --all -- --check
+    git diff --check
+
+The replay module reported 76 passed, 44 PostgreSQL-backed tests ignored, and zero failures. The red-to-green regression failed before the scan checks because replay returned successfully, then passed after the checks were threaded through local journal reads. Both corrected filters, `replay_cancellation_includes_worker_and_caller_shutdown` and `pg_sync_failure_`, were also run successfully earlier.
+
 ## Validation and Acceptance
 
 Acceptance is that a fetched page receives a fresh local replay budget, the cancellation predicate checks both startup caller and worker shutdown signals, and graceful cancellation leaves `metadata_sync_errors` unchanged and emits no background warning. `CatchUpCancelled` classifies as retryable at the VFS bridge. Diagnostics tests show the cancellation and deadline mappings, display text, and snake-case serialized value. Existing page rollback/deadline tests pass, including the post-reconciliation pre-commit check. The live PostgreSQL session path remains unverified in this environment because its opt-in tests require `STUDIOFS_TEST_PG_DSN`.
 
 The review additions are accepted when worker shutdown prevents an inter-page fetch, local cancellation and deadline errors leave remote validation set, all caller/worker predicate combinations are covered, and cancellation after replay-position write leaves both persisted and in-memory cursors unchanged. The cancellation diagnostic and documentation name the pre-commit transaction boundary. `RemoteReplayExecution` fields are private behind a constructor and the type derives `Copy`/`Clone`; the borrowed call convention and dynamic callback remain because the review supplied no performance evidence for changing them.
+
+The annotation fixes are accepted when shutdown or the replay deadline is observed after local locks and during initial pending-overlay preparation, self-acknowledgement, and post-ack overlay scans. The new tests stop before reading every local journal row; the replay module, check, Clippy, formatting, and whitespace validations pass.
 
     test result: 74 passed; 44 ignored; 0 failed
     cargo check: finished successfully
@@ -147,8 +170,12 @@ The third review is `docs/code-reviews/2026-09-24-sfs-729-rust-best-practices-co
 
 No dependency changes are needed. The page-pull method should accept an optional caller cancellation predicate or shutdown reference; ordinary callers continue with no extra cancellation source. The replay execution callback continues to check both the engine worker shutdown flag and the supplied startup caller signal.
 
+Redb event-range readers accept a per-row execution check for replay paths; ordinary range reads retain the no-op path.
+
 Revision note (2026-09-24): Updated the progress, discoveries, validation commands, and outcomes after focused tests and static checks completed; clarified that the PostgreSQL-backed end-to-end path remains environment-gated.
 
 Revision note (2026-09-24): Added dispositions and evidence for all eight deep-review findings, including the two confirmed fixes, strengthened cancellation tests, documentation updates, validation results, and the reason the `Clone`/`Copy` suggestion was not applied.
 
 Revision note (2026-09-24): Added all eight Rust-review dispositions, the red-to-green pre-commit regression, the borrowed-shutdown and `RemoteReplayExecution` API decisions, and current test/lint evidence.
+
+Revision note (2026-09-24): Addressed annotations on preflight journal cancellation and obsolete test filters; added cancellable local event scans, regression tests, and replay-module validation evidence.

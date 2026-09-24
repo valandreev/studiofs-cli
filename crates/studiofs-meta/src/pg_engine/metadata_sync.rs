@@ -63,13 +63,17 @@ impl PgMetaEngine {
     }
 
     pub(super) fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
-        self.local_overlay_conflicts_with_active_open_inodes(None)
+        self.local_overlay_conflicts_with_active_open_inodes(None, None)
     }
 
     fn local_overlay_conflicts_with_active_open_inodes(
         &self,
         active_open_inodes: Option<&HashSet<Ino>>,
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<OverlayConflictSets> {
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
         let active_open_overlay = self.active_open_inode_overlay(active_open_inodes);
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
@@ -84,6 +88,7 @@ impl PgMetaEngine {
                 start,
                 end,
                 &overlay_exclusions,
+                execution,
             )?,
             &active_open_overlay,
         ))
@@ -100,7 +105,8 @@ impl PgMetaEngine {
             .filter(|attr| attr.kind == FileType::RegularFile)
             .map(|attr| attr.ino)
             .collect::<HashSet<_>>();
-        let overlay = self.local_overlay_conflicts_with_active_open_inodes(active_open_inodes)?;
+        let overlay =
+            self.local_overlay_conflicts_with_active_open_inodes(active_open_inodes, None)?;
         RemoteApplyCoordinator::new(&self.local)
             .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
         Ok(())
@@ -380,10 +386,6 @@ impl PgMetaEngine {
         // Keep the cursor snapshot, serving-state reconcile, and pending replay
         // atomic with local metadata mutations after decoding the remote page.
         let apply_started = Instant::now();
-        let (position_guard, mut pending_state) = self.lock_local_position_and_pending_state()?;
-        let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
-        let next_event_seq = self.local.get_counter("nextEventSeq")?;
-        let initial_overlay = self.local_overlay_conflicts()?;
         let worker_shutdown = self.background_workers.poll_shutdown_ref();
         let cancelled = || replay_cancelled(worker_shutdown, caller_shutdown);
         // The PostgreSQL fetch has its own timeout; local replay gets a full budget.
@@ -391,6 +393,13 @@ impl PgMetaEngine {
             MetaError::Storage("postgres catch-up replay deadline is out of range".to_string())
         })?;
         let execution = RemoteReplayExecution::new(deadline, &cancelled);
+        execution.check()?;
+        let (position_guard, mut pending_state) = self.lock_local_position_and_pending_state()?;
+        execution.check()?;
+        let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
+        let next_event_seq = self.local.get_counter("nextEventSeq")?;
+        let initial_overlay =
+            self.local_overlay_conflicts_with_active_open_inodes(None, Some(&execution))?;
         let outcome = self.apply_replay_page_atomically_locked(
             batches,
             recent_flush,
