@@ -5974,29 +5974,51 @@ fn test_pg_checkpoint_does_not_move_remote_head_backwards() {
     let volume = PgTestVolume::new(&dsn, "pg-checkpoint-monotonic");
     seed_local(&db, &volume.format_info());
 
-    let pg = PgMetaEngine::open(&db).expect("open pg");
-    pg.local_version.store(10, Ordering::SeqCst);
+    let pg = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg");
+    let newer_version = 10;
+    // A checkpoint cut is eligible only when its local version matches the remote head.
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET version = $1 WHERE vol = $2",
+                &[&newer_version, &volume.volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok::<(), MetaError>(())
+    }))
+    .expect("advance remote metadata head");
+
+    pg.local_version.store(newer_version, Ordering::SeqCst);
     pg.write_checkpoint_with_lease()
         .expect("write newer checkpoint");
     pg.local_version.store(5, Ordering::SeqCst);
     pg.write_checkpoint_with_lease()
         .expect("write stale checkpoint");
 
-    let version = run_async(with_pg_test_client(&dsn, |client| async move {
+    let (version, checkpoint_version) = run_async(with_pg_test_client(&dsn, |client| async move {
         let row = client
             .query_one(
-                "SELECT version FROM metadata_state WHERE vol=$1",
+                "SELECT version, checkpoint_version FROM metadata_state WHERE vol=$1",
                 &[&volume.volume_id],
             )
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok::<i64, MetaError>(row.get(0))
+        Ok::<(i64, i64), MetaError>((row.get(0), row.get(1)))
     }))
-    .expect("query checkpoint version");
+    .expect("query checkpoint state");
 
     assert_eq!(
-        version, 10,
-        "stale checkpoint writes must not move the remote metadata head backwards"
+        (version, checkpoint_version),
+        (newer_version, newer_version),
+        "the first checkpoint should publish at the remote head and the stale write should be skipped"
     );
 }
 
