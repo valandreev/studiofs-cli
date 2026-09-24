@@ -75,8 +75,7 @@ impl MountBackend for MacFuseMountBackend {
         )
         .with_read_only(launch.read_only)
         .with_run_in_foreground(launch.run_in_foreground)
-        .with_mount_ready_callback(launch.mount_ready_callback)
-        .with_signal_handling(studiofs_macfuse::SignalHandling::InstallForCli);
+        .with_mount_ready_callback(launch.mount_ready_callback);
         studiofs_macfuse::mount_with_request(request)
     }
 }
@@ -99,8 +98,7 @@ impl MountBackend for MacFuseFsKitMountBackend {
         )
         .with_read_only(launch.read_only)
         .with_run_in_foreground(launch.run_in_foreground)
-        .with_mount_ready_callback(launch.mount_ready_callback)
-        .with_signal_handling(studiofs_macfuse::SignalHandling::InstallForCli);
+        .with_mount_ready_callback(launch.mount_ready_callback);
         studiofs_macfuse::mount_with_fskit_request(request)
     }
 }

@@ -1227,7 +1227,7 @@ fn hotspot_helper_records_progress_for_sync_barrier_phases() {
 
     run_hotspot_op_helper(
         "overwrite",
-        mount,
+        mount.clone(),
         "hotspot/slot-1.txt",
         None,
         Some(&payload),
@@ -1235,12 +1235,45 @@ fn hotspot_helper_records_progress_for_sync_barrier_phases() {
     )
     .unwrap();
 
-    let progress_log = std::fs::read_to_string(progress).unwrap();
+    let target = mount.join("hotspot/slot-1.txt");
+    run_hotspot_op_helper(
+        "sync-existing",
+        mount.clone(),
+        "hotspot/slot-1.txt",
+        None,
+        None,
+        Some(&progress),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(target).unwrap(), b"hotspot payload");
+
+    let progress_log = std::fs::read_to_string(&progress).unwrap();
     assert!(progress_log.contains("\"phase\":\"before_write\""));
     assert!(progress_log.contains("\"phase\":\"after_write\""));
     assert!(progress_log.contains("\"phase\":\"before_sync_all\""));
-    assert!(progress_log.contains("\"phase\":\"after_sync_all\""));
+    assert!(progress_log.lines().any(|line| {
+        line.contains("\"operation\":\"sync-existing\"")
+            && line.contains("\"phase\":\"after_sync_all\"")
+    }));
     assert!(progress_log.contains("\"phase\":\"completed\""));
+    assert!(progress_log.contains("\"operation\":\"sync-existing\""));
+    assert!(progress_log.contains("\"phase\":\"before_open_existing\""));
+    assert!(progress_log.contains("\"phase\":\"after_open_existing\""));
+
+    run_hotspot_op_helper(
+        "sync-mounted-existing",
+        mount,
+        "hotspot/slot-1.txt",
+        None,
+        None,
+        Some(&progress),
+    )
+    .unwrap();
+    let progress_log = std::fs::read_to_string(progress).unwrap();
+    assert!(progress_log.lines().any(|line| {
+        line.contains("\"operation\":\"sync-mounted-existing\"")
+            && line.contains("\"phase\":\"after_sync_all\"")
+    }));
 }
 
 #[test]

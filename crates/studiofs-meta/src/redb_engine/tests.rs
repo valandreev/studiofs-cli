@@ -543,13 +543,18 @@ include!("tests/chunk_state.rs");
 #[test]
 fn sync_local_metadata_executes_immediate_barrier() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
-    let engine = RedbMetaEngine::open_relaxed_for_test(dir.path().join("meta.redb"));
+    let path = dir.path().join("meta.redb");
+    let engine = RedbMetaEngine::open_relaxed_for_test(&path);
     engine.set_counter("barrier-test", 1).unwrap();
 
     assert!(engine.relaxed_pending_for_test());
     engine.sync_local_metadata().unwrap();
     assert!(!engine.relaxed_pending_for_test());
     assert_eq!(engine.immediate_barriers_for_test(), 1);
+    drop(engine);
+
+    let reopened = RedbMetaEngine::open(&path).expect("reopen metadata database");
+    assert_eq!(reopened.get_counter("barrier-test").unwrap(), 1);
 }
 
 #[test]
