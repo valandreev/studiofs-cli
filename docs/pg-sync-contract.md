@@ -3,10 +3,9 @@
 ## Status
 
 This document is the canonical PostgreSQL sync contract for SFS-695 and the
-follow-up implementation issues SFS-696, SFS-697, SFS-698, and SFS-699. The local-only
-destroy boundary from SFS-721 is already implemented on `main`; this document
-retains it as a shipped invariant that the cleanup implementation must
-preserve.
+implementation issues SFS-696 through SFS-701. The local-only destroy boundary
+from SFS-721 is already implemented on `main`; this document retains it as a
+shipped invariant that the cleanup implementation must preserve.
 
 This is a breaking on-disk/protocol change. Migration compatibility is not
 required for existing test disks. A client or test fixture must use the new
@@ -394,30 +393,24 @@ credentials, full DSNs, or secret-bearing configuration.
 
 ## Contract-to-Implementation Map
 
-The contract is intentionally defined before the runtime changes are complete:
+SFS-696 through SFS-701 are implemented in the current repository head:
 
-- SFS-696 introduces the incompatible PG sync format/version boundary.
-- SFS-697 adds explicit local-ready, catching-up, target-reached, and
-  read/write authority lifecycle state.
-- SFS-698 removes remote catch-up from `PgMetaEngine` open and moves bounded
-  replay behind local serving readiness.
-- SFS-699 adds the bounded complete-batch event-log page query used by runtime
-  replay; durable per-page progress and background session orchestration remain
-  follow-up work.
-- SFS-721 already implements the local-only destroy boundary on `main`; future
-  changes must preserve that boundary without PostgreSQL or S3.
+| Issue | Implementation in current HEAD |
+|---|---|
+| SFS-696 (implemented) | Establishes metadata format version `5` and rejects legacy PG sync state without migration. |
+| SFS-697 (implemented) | Defines PG sync lifecycle and separates local serving, catch-up progress, health, and write authority. |
+| SFS-698 (implemented) | Keeps remote history replay out of normal `PgMetaEngine` open so valid local state can serve first. |
+| SFS-699 (implemented): bounded complete-batch paging | Reads bounded event-log pages without splitting a `batch_version`, between a replay cursor and fixed target. |
+| SFS-700 (implemented): atomic page progress and durable replay cursor | Commits each replay page's serving-state changes and replay cursor together in local `redb`. |
+| SFS-701 (implemented): bounded background catch-up to a frozen startup target | Drains background catch-up toward one frozen target with a finite page budget; later sessions resume from the durable cursor. |
 
-The remaining follow-up work includes durable per-page progress and background
-catch-up session orchestration. SFS-721 is already shipped on `main`. This
-document remains the contract for those follow-ups; it does not make the page
-query responsible for their durable state transitions.
+SFS-721 implements the local-only destroy boundary on `main`; future changes
+must preserve cleanup without PostgreSQL or S3.
 
 ## Validation Boundary
 
 The portable SFS-695 documentation test checks that this contract and its
-cross-document links retain the required invariants. Runtime validation belongs
-to the follow-up issues and must include focused PostgreSQL tests for checkpoint
-bootstrap, bounded page replay, resume after interruption, target freezing,
-fresh-client read-only gating, finite-history recovery, and local-only destroy.
-Live PostgreSQL, S3, and native mounted checks are environment-gated and are
-not replaced by the documentation test.
+cross-document links retain the required invariants. Remaining validation
+gates are high-RTT catch-up benchmarks and catch-up while the active coordinator
+is under sustained high write load. Live PostgreSQL, S3, and native mounted
+checks are environment-gated and are not replaced by the documentation test.

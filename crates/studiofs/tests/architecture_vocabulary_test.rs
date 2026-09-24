@@ -598,6 +598,11 @@ fn pg_sync_contract_contains_required_invariants() {
         "SFS-696",
         "SFS-697",
         "SFS-698",
+        "SFS-699 (implemented): bounded complete-batch paging",
+        "SFS-700 (implemented): atomic page progress and durable replay cursor",
+        "SFS-701 (implemented): bounded background catch-up to a frozen startup target",
+        "high-RTT catch-up benchmarks",
+        "catch-up while the active coordinator is under sustained high write load",
         "SFS-721",
     ];
 
@@ -610,6 +615,13 @@ fn pg_sync_contract_contains_required_invariants() {
         missing.is_empty(),
         "SFS-695 PostgreSQL sync contract is missing required invariants:\n{}",
         missing.join("\n")
+    );
+    assert!(
+        !normalized_contract.contains(
+            "durable per-page progress and background session orchestration remain follow-up work"
+        ) && !normalized_contract
+            .contains("remaining follow-up work includes durable per-page progress"),
+        "SFS-695 PostgreSQL sync contract still marks completed catch-up work as pending"
     );
 }
 
