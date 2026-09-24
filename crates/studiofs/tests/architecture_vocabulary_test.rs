@@ -561,8 +561,8 @@ fn active_docs_drop_superseded_io_architecture_terms() {
 
 #[test]
 fn pg_sync_contract_contains_required_invariants() {
-    // CONTEXT: This is a documentation contract guard for SFS-695. Runtime
-    // startup behavior is implemented by the follow-up PG sync issues.
+    // CONTEXT: This guards the SFS-695 contract and the shipped PG sync map;
+    // it does not validate runtime startup behavior.
     let contract = read_workspace_file("docs/pg-sync-contract.md");
     let normalized_contract = normalize_doc_whitespace(&contract);
     let required_terms = [
@@ -595,15 +595,6 @@ fn pg_sync_contract_contains_required_invariants() {
         "coordination lease",
         "permanently unmountable",
         "`destroy --local`",
-        "| SFS-696 | Implemented |",
-        "| SFS-697 | Implemented |",
-        "| SFS-698 | Implemented |",
-        "| SFS-699 | Implemented |",
-        "| SFS-700 | Implemented |",
-        "| SFS-701 | Implemented |",
-        "| SFS-711 | Implemented |",
-        "| SFS-712 | Implemented |",
-        "| SFS-721 | Implemented |",
         "checkpoint bootstrap",
         "bounded page replay",
         "resume after interruption",
@@ -622,20 +613,34 @@ fn pg_sync_contract_contains_required_invariants() {
 
     assert!(
         missing.is_empty(),
-        "SFS-695 PostgreSQL sync contract is missing required invariants or status markers:\n{}",
+        "SFS-695 PostgreSQL sync contract is missing required invariants:\n{}",
         missing.join("\n")
     );
-}
 
-#[test]
-fn pg_sync_contract_drops_superseded_catch_up_status() {
-    let contract = read_workspace_file("docs/pg-sync-contract.md");
-    let normalized_contract = normalize_doc_whitespace(&contract);
-    let obsolete_markers = [
-        "durable per-page progress",
-        "background session orchestration",
+    let implemented_issues = [
+        "SFS-696", "SFS-697", "SFS-698", "SFS-699", "SFS-700", "SFS-701", "SFS-703", "SFS-704",
+        "SFS-705", "SFS-706", "SFS-709", "SFS-711", "SFS-712", "SFS-721", "SFS-729",
     ];
-    let stale_hits: Vec<_> = obsolete_markers
+    let missing_statuses: Vec<_> = implemented_issues
+        .into_iter()
+        .filter(|issue| {
+            !contract
+                .lines()
+                .any(|line| line.contains(*issue) && line.contains("Implemented"))
+        })
+        .collect();
+
+    assert!(
+        missing_statuses.is_empty(),
+        "SFS-695 PostgreSQL sync contract is missing implemented issue statuses:\n{}",
+        missing_statuses.join("\n")
+    );
+
+    let obsolete_statuses = [
+        "durable per-page progress and background session orchestration remain follow-up work",
+        "remaining follow-up work includes durable per-page progress",
+    ];
+    let stale_hits: Vec<_> = obsolete_statuses
         .into_iter()
         .filter(|term| contains_doc_term(&contract, &normalized_contract, term))
         .collect();
