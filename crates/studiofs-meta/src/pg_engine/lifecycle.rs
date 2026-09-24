@@ -134,6 +134,10 @@ impl PgBackgroundWorkers {
         self.poll_shutdown.clone()
     }
 
+    pub(super) fn poll_shutdown_ref(&self) -> &AtomicBool {
+        self.poll_shutdown.as_ref()
+    }
+
     pub(super) fn poll_wakeup(&self) -> Arc<(Mutex<bool>, Condvar)> {
         self.poll_wakeup.clone()
     }
@@ -414,13 +418,13 @@ impl PgMetaEngine {
                 }
                 result
             };
-            let worker_shutdown = self.background_workers.poll_shutdown();
+            let worker_shutdown = self.background_workers.poll_shutdown_ref();
             let drain_to_target = |target_version| {
                 drain_startup_catch_up_pages(
                     target_version,
                     || self.local_version.load(Ordering::Acquire),
                     || {
-                        !super::metadata_sync::replay_cancelled(&worker_shutdown, Some(shutdown))
+                        !super::metadata_sync::replay_cancelled(worker_shutdown, Some(shutdown))
                             && matches!(
                                 self.current_pg_sync_lifecycle(),
                                 PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded

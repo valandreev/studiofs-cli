@@ -44,17 +44,17 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
-        let shutdown = self.background_workers.poll_shutdown();
+        let shutdown = self.background_workers.poll_shutdown_ref();
         if matches!(
             self.current_pg_sync_lifecycle(),
             PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
         ) {
-            self.run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)?;
+            self.run_startup_catch_up_session(MetadataSyncSource::Manual, shutdown)?;
         } else {
             match self.sync_metadata_with_source(MetadataSyncSource::Manual) {
                 Ok(_) => {}
                 Err(MetaError::RebootstrapRequired { .. } | MetaError::ReplayGap { .. }) => {
-                    self.run_startup_catch_up_session(MetadataSyncSource::Manual, &shutdown)?;
+                    self.run_startup_catch_up_session(MetadataSyncSource::Manual, shutdown)?;
                 }
                 Err(error) => return Err(error),
             }

@@ -786,7 +786,7 @@ fn startup_catch_up_skips_page_fetch_after_worker_shutdown() {
         .store(1, std::sync::atomic::Ordering::Release);
     engine
         .background_workers
-        .poll_shutdown()
+        .poll_shutdown_ref()
         .store(true, std::sync::atomic::Ordering::Release);
     engine.set_catch_up_fault_hook(std::sync::Arc::new(|_| {
         Err(MetaError::Timeout("unexpected page fetch".to_string()))
@@ -3091,25 +3091,48 @@ fn metadata_sync_result_ignores_expected_catch_up_cancellation() {
 }
 
 #[test]
-fn metadata_sync_result_preserves_remote_validation_for_local_catch_up_abort() {
+fn local_catch_up_aborts_preserve_remote_validation() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
         .remote_format_validated
         .store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let assert_validation_preserved = || {
+        assert!(
+            engine
+                .remote_format_validated
+                .load(std::sync::atomic::Ordering::Acquire),
+            "local catch-up abort must preserve remote format validation"
+        );
+        assert!(
+            engine
+                .remote_identity_validated
+                .load(std::sync::atomic::Ordering::Acquire),
+            "local catch-up abort must preserve remote identity validation"
+        );
+    };
+
+    for result in [
+        Err(MetaError::CatchUpCancelled),
+        Err(MetaError::CatchUpDeadlineExceeded),
+    ] {
+        engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, false);
+        assert_validation_preserved();
+    }
 
     for error in [
         MetaError::CatchUpCancelled,
         MetaError::CatchUpDeadlineExceeded,
     ] {
-        let result = Err(error);
-        engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, false);
-
         assert!(
             engine
-                .remote_format_validated
-                .load(std::sync::atomic::Ordering::Acquire),
-            "local catch-up abort must preserve successful remote validation"
+                .record_remote_operation_result::<()>(Err(error))
+                .is_err()
         );
+        assert_validation_preserved();
     }
 }
 

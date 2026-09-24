@@ -138,10 +138,7 @@ fn expired_replay_page_deadline_rolls_back_without_advancing_cursor() {
     let ino = ROOT_INO + 704;
     let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
     let cancelled = || false;
-    let execution = RemoteReplayExecution {
-        deadline: Instant::now(),
-        cancelled: &cancelled,
-    };
+    let execution = RemoteReplayExecution::new(Instant::now(), &cancelled);
 
     let result = pg.apply_replay_page_atomically_with_execution(
         vec![DecodedReplayBatch {
@@ -163,13 +160,61 @@ fn expired_replay_page_deadline_rolls_back_without_advancing_cursor() {
     );
 
     assert!(matches!(result, Err(MetaError::CatchUpDeadlineExceeded)));
-    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 0);
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        0
+    );
     assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
     assert!(pg.local.get_attr(ino).is_err());
 }
 
 #[test]
-fn cancellation_after_last_replay_batch_rolls_back_before_commit() {
+fn cancellation_after_replay_position_write_aborts_before_commit() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let ino = ROOT_INO + 707;
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_in_hook = std::sync::Arc::clone(&shutdown);
+    pg.set_catch_up_fault_hook(std::sync::Arc::new(move |point| {
+        if matches!(point, CatchUpFaultPoint::BeforeLocalCommit { .. }) {
+            shutdown_in_hook.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }));
+    let cancelled = || shutdown.load(std::sync::atomic::Ordering::Acquire);
+    let execution =
+        RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
+    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+
+    let result = pg.apply_replay_page_atomically_with_execution(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: vec![MetaEvent::SetAttr {
+                attr: InodeAttr::new_dir(ino, ROOT_INO, 0, 0, 0o755),
+            }],
+            is_self_batch: false,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: next_event_seq,
+            next_event_seq,
+            initial_overlay: OverlayConflictSets::default(),
+        },
+        Some(&execution),
+    );
+
+    assert!(matches!(result, Err(MetaError::CatchUpCancelled)));
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        0
+    );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
+    assert!(pg.local.get_attr(ino).is_err());
+}
+
+#[test]
+fn cancellation_after_serving_state_reconciliation_rolls_back_before_commit() {
     use std::cell::Cell;
 
     let (_dir, pg) = temp_pg_engine_for_unit();
@@ -179,10 +224,8 @@ fn cancellation_after_last_replay_batch_rolls_back_before_commit() {
         checks.set(checks.get() + 1);
         checks.get() >= 3
     };
-    let execution = RemoteReplayExecution {
-        deadline: Instant::now() + Duration::from_secs(60),
-        cancelled: &cancelled,
-    };
+    let execution =
+        RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
     let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
     let result = pg.apply_replay_page_atomically_with_execution(
         vec![DecodedReplayBatch {
@@ -266,11 +309,10 @@ fn cancelled_replay_page_rolls_back_self_ack_and_reapplies_entire_page() {
         initial_overlay: pg.local_overlay_conflicts().unwrap(),
     };
     let checked = Cell::new(false);
+    // `replace` returns the old value: apply batch 1, then cancel before batch 2.
     let cancelled = || checked.replace(true);
-    let execution = RemoteReplayExecution {
-        deadline: Instant::now() + Duration::from_secs(60),
-        cancelled: &cancelled,
-    };
+    let execution =
+        RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
 
     let result = pg.apply_replay_page_atomically_with_execution(
         batches(),
@@ -295,10 +337,7 @@ fn cancelled_replay_page_rolls_back_self_ack_and_reapplies_entire_page() {
     assert!(pg.local.get_attr(remote_ino).is_err());
 
     let ready = || false;
-    let retry = RemoteReplayExecution {
-        deadline: Instant::now() + Duration::from_secs(60),
-        cancelled: &ready,
-    };
+    let retry = RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &ready);
     let outcome = pg
         .apply_replay_page_atomically_with_execution(batches(), None, context(), Some(&retry))
         .expect("retry full page from previous cursor");

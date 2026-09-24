@@ -51,13 +51,21 @@ pub(super) struct RemoteReplayApplyContext {
     pub(super) initial_overlay: OverlayConflictSets,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct RemoteReplayExecution<'a> {
-    pub(super) deadline: Instant,
-    pub(super) cancelled: &'a dyn Fn() -> bool,
+    deadline: Instant,
+    cancelled: &'a dyn Fn() -> bool,
 }
 
-impl RemoteReplayExecution<'_> {
-    fn check(&self) -> MetaResult<()> {
+impl<'a> RemoteReplayExecution<'a> {
+    pub(super) fn new(deadline: Instant, cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            deadline,
+            cancelled,
+        }
+    }
+
+    pub(super) fn check(&self) -> MetaResult<()> {
         if (self.cancelled)() {
             return Err(MetaError::CatchUpCancelled);
         }

@@ -196,7 +196,8 @@ Rejected ranges remain local authority until replay can resume past the gap.
 
 The catch-up worker checks the operation deadline and cancellation boundary
 before each batch, after the batch sequence, and after serving-state
-reconciliation immediately before commit. Reaching any boundary aborts the
+reconciliation. After writing the replay position into the transaction, it
+checks once more immediately before commit. Reaching any boundary aborts the
 page transaction without advancing the cursor. The local replay deadline
 starts after a page has been fetched and decoded, immediately before acquiring
 the local replay locks; the PostgreSQL page query has its own command timeout.

@@ -1970,15 +1970,23 @@ mod tests {
     }
 
     #[test]
-    fn pg_sync_failure_maps_catch_up_cancellation_and_deadline() {
+    fn pg_sync_failure_maps_catch_up_deadline_to_timeout() {
         assert_eq!(
             PgSyncFailure::from_error(&MetaError::CatchUpDeadlineExceeded),
             PgSyncFailure::Timeout
         );
+    }
+
+    #[test]
+    fn pg_sync_failure_maps_catch_up_cancellation_to_cancelled() {
         assert_eq!(
             PgSyncFailure::from_error(&MetaError::CatchUpCancelled),
             PgSyncFailure::Cancelled
         );
+    }
+
+    #[test]
+    fn pg_sync_failure_cancelled_display_and_serialization() {
         assert_eq!(PgSyncFailure::Cancelled.to_string(), "catch-up cancelled");
         assert_eq!(
             serde_json::to_string(&PgSyncFailure::Cancelled).expect("cancelled failure serializes"),

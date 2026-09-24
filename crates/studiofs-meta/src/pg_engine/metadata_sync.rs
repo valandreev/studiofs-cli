@@ -384,15 +384,13 @@ impl PgMetaEngine {
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
-        let worker_shutdown = self.background_workers.poll_shutdown();
-        let cancelled = || replay_cancelled(&worker_shutdown, caller_shutdown);
+        let worker_shutdown = self.background_workers.poll_shutdown_ref();
+        let cancelled = || replay_cancelled(worker_shutdown, caller_shutdown);
         // The PostgreSQL fetch has its own timeout; local replay gets a full budget.
-        let execution = RemoteReplayExecution {
-            deadline: apply_started.checked_add(command_timeout).ok_or_else(|| {
-                MetaError::Storage("postgres catch-up replay deadline is out of range".to_string())
-            })?,
-            cancelled: &cancelled,
-        };
+        let deadline = apply_started.checked_add(command_timeout).ok_or_else(|| {
+            MetaError::Storage("postgres catch-up replay deadline is out of range".to_string())
+        })?;
+        let execution = RemoteReplayExecution::new(deadline, &cancelled);
         let outcome = self.apply_replay_page_atomically_locked(
             batches,
             recent_flush,
@@ -507,6 +505,17 @@ impl PgMetaEngine {
                 tracing::warn!(
                     error = %abort_error,
                     "failed to abort redb write transaction during injected catch-up rollback"
+                );
+            }
+            return Err(error);
+        }
+        if let Some(execution) = execution
+            && let Err(error) = execution.check()
+        {
+            if let Err(abort_error) = txn.abort() {
+                tracing::warn!(
+                    error = %abort_error,
+                    "failed to abort redb write transaction during catch-up rollback"
                 );
             }
             return Err(error);
