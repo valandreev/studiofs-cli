@@ -775,6 +775,17 @@ fn startup_catch_up_session_honors_shutdown_signal() {
 }
 
 #[test]
+fn replay_cancellation_includes_caller_shutdown() {
+    let worker_shutdown = std::sync::atomic::AtomicBool::new(false);
+    let caller_shutdown = std::sync::atomic::AtomicBool::new(true);
+
+    assert!(super::super::metadata_sync::replay_cancelled(
+        &worker_shutdown,
+        Some(&caller_shutdown)
+    ));
+}
+
+#[test]
 fn startup_catch_up_drain_honors_shutdown_after_a_page() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
@@ -2886,7 +2897,7 @@ fn remote_pull_requires_remote_identity_validation() {
         .store(1, std::sync::atomic::Ordering::Release);
 
     let error = engine
-        .pull_foreign_events_locked_to_target(None, 0)
+        .pull_foreign_events_locked_to_target(None, 0, None)
         .expect_err("remote pulls must validate remote identity first");
 
     assert!(error.is_reachability_error());
@@ -3037,6 +3048,16 @@ fn metadata_sync_result_does_not_repeat_recorded_remote_failure() {
         "aggregate recording must not invalidate a failure already recorded by the remote operation"
     );
     assert_eq!(engine.pg_sync_diagnostics().sync_errors, 1);
+}
+
+#[test]
+fn metadata_sync_result_ignores_expected_catch_up_cancellation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    let result = Err(MetaError::CatchUpCancelled);
+
+    engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &result, true);
+
+    assert_eq!(engine.pg_sync_diagnostics().sync_errors, 0);
 }
 
 #[test]

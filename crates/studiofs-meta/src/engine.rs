@@ -330,11 +330,11 @@ pub enum MetaError {
     #[error("operation timed out: {0}")]
     Timeout(String),
 
-    /// A local replay page was cancelled before its next complete batch.
+    /// A local replay page was cancelled before its transaction was committed.
     #[error("postgres metadata catch-up cancelled")]
     CatchUpCancelled,
 
-    /// A local replay page exceeded its deadline before its next complete batch.
+    /// A local replay page exceeded its deadline before its transaction was committed.
     #[error("postgres metadata catch-up deadline exceeded")]
     CatchUpDeadlineExceeded,
 
@@ -1967,6 +1967,23 @@ mod tests {
         assert_eq!(failure, PgSyncFailure::RemoteUnavailable);
         let encoded = serde_json::to_string(&failure).expect("diagnostic failure serializes");
         assert!(!encoded.contains("test-postgres-dsn"));
+    }
+
+    #[test]
+    fn pg_sync_failure_maps_catch_up_cancellation_and_deadline() {
+        assert_eq!(
+            PgSyncFailure::from_error(&MetaError::CatchUpDeadlineExceeded),
+            PgSyncFailure::Timeout
+        );
+        assert_eq!(
+            PgSyncFailure::from_error(&MetaError::CatchUpCancelled),
+            PgSyncFailure::Cancelled
+        );
+        assert_eq!(PgSyncFailure::Cancelled.to_string(), "catch-up cancelled");
+        assert_eq!(
+            serde_json::to_string(&PgSyncFailure::Cancelled).expect("cancelled failure serializes"),
+            "\"cancelled\""
+        );
     }
 
     #[test]

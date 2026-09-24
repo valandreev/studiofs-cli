@@ -114,6 +114,7 @@ fn classify_meta_error(error: &MetaError) -> BridgeVfsErrorKind {
         MetaError::RepairRequired(_) => BridgeVfsErrorKind::RepairRequired,
         MetaError::RemoteUnavailable(_) => BridgeVfsErrorKind::RemoteUnavailable,
         MetaError::Timeout(_) | MetaError::CatchUpDeadlineExceeded => BridgeVfsErrorKind::TimedOut,
+        MetaError::CatchUpCancelled => BridgeVfsErrorKind::Retryable,
         MetaError::NonContiguousRegularFileGraph { .. } => BridgeVfsErrorKind::DataCorruption,
         MetaError::XattrValueTooLarge { .. } => BridgeVfsErrorKind::XattrValueTooLarge,
         MetaError::AccessDenied { .. } => BridgeVfsErrorKind::PermissionDenied,
@@ -425,6 +426,13 @@ mod tests {
         let error = crate::VfsError::Meta(MetaError::CatchUpDeadlineExceeded);
 
         assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn classify_vfs_error_preserves_catch_up_cancellation_as_retryable() {
+        let error = crate::VfsError::Meta(MetaError::CatchUpCancelled);
+
+        assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::Retryable);
     }
 
     #[test]

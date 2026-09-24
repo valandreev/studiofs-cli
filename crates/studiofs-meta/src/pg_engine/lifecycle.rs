@@ -407,7 +407,8 @@ impl PgMetaEngine {
                 }
             };
             let pull_page = |target_version| {
-                let result = self.pull_foreign_events_locked_to_target(None, target_version);
+                let result =
+                    self.pull_foreign_events_locked_to_target(None, target_version, Some(shutdown));
                 if result.is_err() {
                     remote_operation_recorded.set(true);
                 }
@@ -561,7 +562,9 @@ impl PgMetaEngine {
                                 "postgres background event-log pruning did not complete"
                             );
                         }
-                    } else if let Err(error) = sync_result {
+                    } else if let Err(error) = sync_result
+                        && !matches!(&error, MetaError::CatchUpCancelled)
+                    {
                         warn!(
                             error = %error,
                             volume_id = engine.volume_id,
