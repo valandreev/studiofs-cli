@@ -28,9 +28,10 @@ The PostgreSQL lifecycle contract is documented in
 for serving-first mount, checkpoint-first bootstrap, bounded/paged/resumable
 catch-up, frozen startup targets, read/write authority, checkpoint lag,
 finite-history recovery, and local-only destruction. It does not claim live
-PostgreSQL or mounted runtime behavior; the remaining startup/sync checks
-belong to SFS-696 through SFS-698. The local-only destruction boundary is
-already implemented by SFS-721 and should retain its focused coverage.
+PostgreSQL or mounted runtime behavior. The canonical contract's Validation
+Boundary summarizes focused runtime coverage and lists the remaining benchmark
+and environment-gated checks. The local-only destruction boundary shipped in
+SFS-721 and should retain its focused coverage.
 
 Run the four focused contract checks:
 

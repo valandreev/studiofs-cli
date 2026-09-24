@@ -624,9 +624,13 @@ fn pg_sync_contract_contains_required_invariants() {
     let missing_statuses: Vec<_> = implemented_issues
         .into_iter()
         .filter(|issue| {
-            !contract
-                .lines()
-                .any(|line| line.contains(*issue) && line.contains("Implemented"))
+            !contract.lines().any(|line| {
+                let mut cells = line.trim().trim_matches('|').split('|').map(str::trim);
+                cells
+                    .next()
+                    .is_some_and(|issue_cell| issue_cell.contains(*issue))
+                    && cells.next() == Some("Implemented")
+            })
         })
         .collect();
 
@@ -712,6 +716,7 @@ fn active_docs_drop_superseded_pg_startup_wording() {
             read_workspace_file("docs/architecture.md"),
         ),
         ("docs/metadata.md", read_workspace_file("docs/metadata.md")),
+        ("docs/tests.md", read_workspace_file("docs/tests.md")),
         (
             "docs/configuration.md",
             read_workspace_file("docs/configuration.md"),
@@ -721,6 +726,8 @@ fn active_docs_drop_superseded_pg_startup_wording() {
         "Before starting the filesystem, the client connects to the remote PostgreSQL database and compares the local UUID with the remote one.",
         "The operation is blocked because the identity of the disk cannot be verified.",
         "startup catch-up did not reach the current remote head",
+        "read-only until checkpoint import/rebase recovery owned by SFS-712 is available.",
+        "belong to SFS-696 through SFS-698.",
     ];
     let legacy_hits: Vec<String> = active_docs
         .iter()
