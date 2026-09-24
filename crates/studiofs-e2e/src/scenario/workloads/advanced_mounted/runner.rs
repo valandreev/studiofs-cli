@@ -982,6 +982,8 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     context: &ScenarioContext,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
+    let cursor_sync_operation =
+        super::large_history_cursor_sync_operation(cfg!(windows)).map_err(ScenarioError::Io)?;
     controller.create_clients(LARGE_HISTORY_CLIENT_NAMES.iter().copied())?;
     controller.init_first_client()?;
     let config = context.client_controller_config.as_ref().ok_or_else(|| {
@@ -1126,37 +1128,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         "{}/shard-00/file-00000.bin",
         super::large_history_fixture::FIXTURE_FILES_DIRECTORY_NAME
     ));
-    let cold_client_metadata_db_parent =
-        cold_client.local_metadata_db.parent().ok_or_else(|| {
-            ScenarioError::Io(io::Error::other(
-                "cold client metadata database has no parent",
-            ))
-        })?;
-    let cold_client_metadata_db_name = cold_client
-        .local_metadata_db
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            ScenarioError::Io(io::Error::other(
-                "cold client metadata database name is not valid UTF-8",
-            ))
-        })?;
-    let mut cold_client_metadata_db_sync_client = cold_client.clone();
-    cold_client_metadata_db_sync_client.mount_point = cold_client_metadata_db_parent.to_path_buf();
-    let (cursor_sync_client, cursor_sync_operation, cursor_sync_path) = if cfg!(target_os = "macos")
-    {
-        (
-            &cold_client,
-            "sync-mounted-existing",
-            cold_client_cursor_sync_path,
-        )
-    } else {
-        (
-            &cold_client_metadata_db_sync_client,
-            "sync-existing",
-            cold_client_metadata_db_name.to_string(),
-        )
-    };
     let cold_client_writer_marker_path = isolation.path("control/cold-client-writer-marker.txt");
     let cold_client_writer_marker_payload = isolation.payload(
         "cold_client_writer",
@@ -1194,15 +1165,17 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             }
             if is_first_post_restart_sample
                 && (sample.lifecycle != "CatchingUp"
-                    || super::large_history_partial_replay_version(
+                    || !super::large_history_resumed_partial_replay(
                         checkpoint_version,
                         sample.local_applied_version,
                         startup_target_version,
-                    )
-                    .is_none())
+                        applied_version_restart_index
+                            .and_then(|index| index.checked_sub(1))
+                            .and_then(|index| applied_version_progression.get(index).copied()),
+                    ))
             {
                 return Err(ScenarioError::Io(io::Error::other(
-                    "large-history cold client did not resume from a partial cursor",
+                    "large-history cold client did not resume from its durable partial cursor",
                 )));
             }
             update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
@@ -1271,15 +1244,15 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                     ))
                 })?;
 
-                // MacFUSE fsync enters the engine's immediate metadata barrier.
+                // Mounted fsync enters the engine's immediate metadata barrier.
                 let cursor_sync = timed_hotspot_helper_fs_op_with_helper(
                     context,
                     started,
                     operations.len() + 1,
-                    cursor_sync_client,
+                    &cold_client,
                     "cold_client_cursor_sync_barrier",
                     cursor_sync_operation,
-                    &cursor_sync_path,
+                    &cold_client_cursor_sync_path,
                     LARGE_HISTORY_CONVERGENCE_TIMEOUT,
                     None,
                     None,
@@ -1384,7 +1357,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let moving_writer_completed = moving_head_fixture_appended;
     let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
     let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
-    operations.push(timed_hotspot_helper_fs_op_with_helper(
+    let cold_writer = timed_hotspot_helper_fs_op_with_helper(
         context,
         started,
         operations.len() + 1,
@@ -1395,7 +1368,15 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         LARGE_HISTORY_CONVERGENCE_TIMEOUT,
         Some(&cold_client_writer_marker_payload),
         None,
-    )?);
+    )?;
+    let cold_writer_accepted = cold_writer.result == "accepted";
+    operations.push(cold_writer);
+    if !cold_writer_accepted {
+        write_namespace_collision_operations(context, &operations)?;
+        return Err(ScenarioError::Io(io::Error::other(
+            "large-history cold-client writer marker was rejected",
+        )));
+    }
     wait_for_mounted_initial_payloads_until_with_probe_timeout(
         &peer_clients,
         &[(

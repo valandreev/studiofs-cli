@@ -644,6 +644,28 @@ fn large_history_partial_replay_version(
         .then_some(applied_version)
 }
 
+fn large_history_cursor_sync_operation(windows: bool) -> io::Result<&'static str> {
+    if windows {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "large-history durable cursor sync requires a mounted fsync barrier on Windows",
+        ))
+    } else {
+        Ok("sync-mounted-existing")
+    }
+}
+
+fn large_history_resumed_partial_replay(
+    checkpoint_version: Option<u64>,
+    applied_version: Option<u64>,
+    target_version: Option<u64>,
+    durable_cursor: Option<u64>,
+) -> bool {
+    large_history_partial_replay_version(checkpoint_version, applied_version, target_version)
+        .zip(durable_cursor)
+        .is_some_and(|(applied, durable)| applied >= durable)
+}
+
 impl LargeHistorySummary {
     fn applied_version_progression_is_monotonic(&self) -> bool {
         self.applied_version_progression
@@ -711,6 +733,42 @@ impl LongHistoryValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_history_cursor_sync_requires_a_mounted_barrier() {
+        assert_eq!(
+            large_history_cursor_sync_operation(false).unwrap(),
+            "sync-mounted-existing"
+        );
+        assert_eq!(
+            large_history_cursor_sync_operation(true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn large_history_first_restart_sample_rejects_durable_cursor_rollback() {
+        assert!(!large_history_resumed_partial_replay(
+            Some(8),
+            Some(9),
+            Some(40),
+            Some(11)
+        ));
+        assert!(large_history_resumed_partial_replay(
+            Some(8),
+            Some(11),
+            Some(40),
+            Some(11)
+        ));
+        assert!(!large_history_resumed_partial_replay(
+            Some(8),
+            None,
+            Some(40),
+            Some(11)
+        ));
+    }
 
     #[test]
     fn large_history_match_rejects_intra_session_regression() {

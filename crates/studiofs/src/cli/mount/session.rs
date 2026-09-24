@@ -1776,6 +1776,8 @@ impl MountRuntimeGuard {
     }
 
     fn launch(mut self) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        let _signal_guard = studiofs_macfuse::ProcessSignalGuard::install_for_cli()?;
         let mount_result = self.launch_mount();
         let retain_failed_record = mount_result.is_err()
             && self.mount_status_monitor.is_some()
