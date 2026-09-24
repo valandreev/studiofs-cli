@@ -65,6 +65,7 @@ fn aborted_replay_page_does_not_persist_state_or_cursor() {
                 next_event_seq,
                 initial_overlay: OverlayConflictSets::default(),
             },
+            None,
         )
         .unwrap();
     PgMetaEngine::write_replay_position_in_txn(&txn, &outcome).unwrap();
@@ -129,6 +130,184 @@ fn failed_replay_page_does_not_persist_state_or_cursor() {
     assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
     assert_eq!(pg.namespace_version.load(Ordering::SeqCst), 0);
     assert!(pg.local.get_attr(remote_ino).is_err());
+}
+
+#[test]
+fn expired_replay_page_deadline_rolls_back_without_advancing_cursor() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let ino = ROOT_INO + 704;
+    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let cancelled = || false;
+    let execution = RemoteReplayExecution {
+        deadline: Instant::now(),
+        cancelled: &cancelled,
+    };
+
+    let result = pg.apply_replay_page_atomically_with_execution(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: vec![MetaEvent::SetAttr {
+                attr: InodeAttr::new_dir(ino, ROOT_INO, 0, 0, 0o755),
+            }],
+            is_self_batch: false,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: next_event_seq,
+            next_event_seq,
+            initial_overlay: OverlayConflictSets::default(),
+        },
+        Some(&execution),
+    );
+
+    assert!(matches!(result, Err(MetaError::CatchUpDeadlineExceeded)));
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 0);
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
+    assert!(pg.local.get_attr(ino).is_err());
+}
+
+#[test]
+fn cancellation_after_last_replay_batch_rolls_back_before_commit() {
+    use std::cell::Cell;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let ino = ROOT_INO + 706;
+    let checked = Cell::new(false);
+    let cancelled = || checked.replace(true);
+    let execution = RemoteReplayExecution {
+        deadline: Instant::now() + Duration::from_secs(60),
+        cancelled: &cancelled,
+    };
+    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let result = pg.apply_replay_page_atomically_with_execution(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: vec![MetaEvent::SetAttr {
+                attr: InodeAttr::new_dir(ino, ROOT_INO, 0, 0, 0o755),
+            }],
+            is_self_batch: false,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: next_event_seq,
+            next_event_seq,
+            initial_overlay: OverlayConflictSets::default(),
+        },
+        Some(&execution),
+    );
+
+    assert!(matches!(result, Err(MetaError::CatchUpCancelled)));
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        0
+    );
+    assert!(pg.local.get_attr(ino).is_err());
+}
+
+#[test]
+fn cancelled_replay_page_rolls_back_self_ack_and_reapplies_entire_page() {
+    use std::cell::Cell;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let flushed_before = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let durable_flushed_before = pg
+        .local
+        .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+        .unwrap();
+    pg.create_dir(ROOT_INO, b"self-page", 0, 0, 0o755)
+        .expect("create local namespace event");
+    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let local_events = pg
+        .local
+        .read_events_range(flushed_before, next_event_seq)
+        .unwrap();
+    let self_events = RemoteApplyCoordinator::project_local_batch(&local_events).events;
+    let remote_ino = ROOT_INO + 705;
+    let batches = || {
+        vec![
+            DecodedReplayBatch {
+                batch_version: 1,
+                events: self_events.clone(),
+                is_self_batch: true,
+            },
+            DecodedReplayBatch {
+                batch_version: 2,
+                events: vec![
+                    MetaEvent::SetAttr {
+                        attr: InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755),
+                    },
+                    MetaEvent::AddEntry {
+                        parent: ROOT_INO,
+                        name: b"foreign-page".to_vec(),
+                        entry: DirEntryValue {
+                            ino: remote_ino,
+                            kind: FileType::Directory,
+                        },
+                    },
+                ],
+                is_self_batch: false,
+            },
+        ]
+    };
+    let context = || RemoteReplayApplyContext {
+        last_seq: 0,
+        current_namespace_version: 0,
+        flushed_event_seq: flushed_before,
+        next_event_seq,
+        initial_overlay: pg.local_overlay_conflicts().unwrap(),
+    };
+    let checked = Cell::new(false);
+    let cancelled = || checked.replace(true);
+    let execution = RemoteReplayExecution {
+        deadline: Instant::now() + Duration::from_secs(60),
+        cancelled: &cancelled,
+    };
+
+    let result = pg.apply_replay_page_atomically_with_execution(
+        batches(),
+        None,
+        context(),
+        Some(&execution),
+    );
+    assert!(matches!(result, Err(MetaError::CatchUpCancelled)));
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        0
+    );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), flushed_before);
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .unwrap(),
+        durable_flushed_before
+    );
+    assert!(pg.local.lookup(ROOT_INO, b"foreign-page").is_err());
+    assert!(pg.local.get_attr(remote_ino).is_err());
+
+    let ready = || false;
+    let retry = RemoteReplayExecution {
+        deadline: Instant::now() + Duration::from_secs(60),
+        cancelled: &ready,
+    };
+    let outcome = pg
+        .apply_replay_page_atomically_with_execution(batches(), None, context(), Some(&retry))
+        .expect("retry full page from previous cursor");
+    assert_eq!(outcome.max_version, 2);
+    assert_eq!(outcome.flushed_event_seq, Some(next_event_seq));
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        2
+    );
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), next_event_seq);
+    assert_eq!(
+        pg.local.lookup(ROOT_INO, b"foreign-page").unwrap().ino,
+        remote_ino
+    );
 }
 
 #[test]
@@ -236,6 +415,7 @@ fn committed_replay_pages_persist_state_and_resume_from_next_version() {
                 next_event_seq: pg.local.get_counter("nextEventSeq").unwrap(),
                 initial_overlay: OverlayConflictSets::default(),
             },
+            None,
         )
         .unwrap();
     PgMetaEngine::write_replay_position_in_txn(&txn, &failed_page).unwrap();

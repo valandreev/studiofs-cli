@@ -330,6 +330,14 @@ pub enum MetaError {
     #[error("operation timed out: {0}")]
     Timeout(String),
 
+    /// A local replay page was cancelled before its next complete batch.
+    #[error("postgres metadata catch-up cancelled")]
+    CatchUpCancelled,
+
+    /// A local replay page exceeded its deadline before its next complete batch.
+    #[error("postgres metadata catch-up deadline exceeded")]
+    CatchUpDeadlineExceeded,
+
     /// Serialization or deserialization failure for persisted metadata.
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -713,6 +721,8 @@ pub enum PgSyncFailure {
     RemoteUnavailable,
     /// A bounded synchronization operation exceeded its deadline.
     Timeout,
+    /// A catch-up page was cancelled before its next batch.
+    Cancelled,
     /// The local cursor fell behind the retained remote event history.
     ReplayGap {
         /// Last local replay cursor before the missing range.
@@ -777,6 +787,8 @@ impl PgSyncFailure {
         match error {
             MetaError::RemoteUnavailable(_) => Self::RemoteUnavailable,
             MetaError::Timeout(_) => Self::Timeout,
+            MetaError::CatchUpDeadlineExceeded => Self::Timeout,
+            MetaError::CatchUpCancelled => Self::Cancelled,
             MetaError::ReplayGap {
                 local_version,
                 first_available_version,
@@ -851,6 +863,7 @@ impl std::fmt::Display for PgSyncFailure {
         match self {
             Self::RemoteUnavailable => formatter.write_str("remote unavailable"),
             Self::Timeout => formatter.write_str("synchronization timed out"),
+            Self::Cancelled => formatter.write_str("catch-up cancelled"),
             Self::ReplayGap {
                 local_version,
                 first_available_version,

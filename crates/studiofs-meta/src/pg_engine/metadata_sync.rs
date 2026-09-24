@@ -2,7 +2,7 @@
 
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
-    janitor::pg_event_log_prune_lock_key, sql,
+    RemoteReplayExecution, janitor::pg_event_log_prune_lock_key, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
 use crate::types::{FileType, Ino};
@@ -367,6 +367,14 @@ impl PgMetaEngine {
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay = self.local_overlay_conflicts()?;
+        let shutdown = self.background_workers.poll_shutdown();
+        let cancelled = || shutdown.load(Ordering::Acquire);
+        let execution = RemoteReplayExecution {
+            deadline: page_started.checked_add(command_timeout).ok_or_else(|| {
+                MetaError::Storage("postgres catch-up deadline is out of range".to_string())
+            })?,
+            cancelled: &cancelled,
+        };
         let outcome = self.apply_replay_page_atomically_locked(
             batches,
             recent_flush,
@@ -377,6 +385,7 @@ impl PgMetaEngine {
                 next_event_seq,
                 initial_overlay,
             },
+            Some(&execution),
         )?;
         // Only an acknowledged self-batch advances the local journal cursor;
         // foreign batches update the base view without changing pending events.
@@ -400,8 +409,19 @@ impl PgMetaEngine {
         recent_flush: Option<&super::RecentFlush>,
         context: super::RemoteReplayApplyContext,
     ) -> MetaResult<super::RemoteReplayApplyOutcome> {
+        self.apply_replay_page_atomically_with_execution(batches, recent_flush, context, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_replay_page_atomically_with_execution(
+        &self,
+        batches: Vec<super::remote_apply::DecodedReplayBatch>,
+        recent_flush: Option<&super::RecentFlush>,
+        context: super::RemoteReplayApplyContext,
+        execution: Option<&RemoteReplayExecution<'_>>,
+    ) -> MetaResult<super::RemoteReplayApplyOutcome> {
         let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
-        self.apply_replay_page_atomically_locked(batches, recent_flush, context)
+        self.apply_replay_page_atomically_locked(batches, recent_flush, context, execution)
     }
 
     /// Apply a page while the caller holds both locks in canonical order.
@@ -410,6 +430,7 @@ impl PgMetaEngine {
         batches: Vec<super::remote_apply::DecodedReplayBatch>,
         recent_flush: Option<&super::RecentFlush>,
         context: super::RemoteReplayApplyContext,
+        execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<super::RemoteReplayApplyOutcome> {
         if batches.is_empty() {
             return Ok(super::RemoteReplayApplyOutcome {
@@ -431,7 +452,7 @@ impl PgMetaEngine {
         let result = RemoteApplyCoordinator::new(&self.local)
             .with_local_event_ack_barrier(local_event_ack_barrier)
             .with_local_event_overlay_exclusions(local_event_overlay_exclusions)
-            .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context);
+            .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context, execution);
         let mut outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
