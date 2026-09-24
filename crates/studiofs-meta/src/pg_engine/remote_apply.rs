@@ -6,7 +6,9 @@ use crate::redb_engine::{RedbMetaEngine, RedbWriteTransaction};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const REPLAY_LOCK_WAIT_SLICE: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Default)]
 pub(super) struct OverlayConflictSets {
@@ -73,6 +75,14 @@ impl<'a> RemoteReplayExecution<'a> {
             return Err(MetaError::CatchUpDeadlineExceeded);
         }
         Ok(())
+    }
+
+    pub(super) fn wait_for_lock_retry(&self) {
+        std::thread::park_timeout(
+            self.deadline
+                .saturating_duration_since(Instant::now())
+                .min(REPLAY_LOCK_WAIT_SLICE),
+        );
     }
 }
 

@@ -394,8 +394,8 @@ impl PgMetaEngine {
         })?;
         let execution = RemoteReplayExecution::new(deadline, &cancelled);
         execution.check()?;
-        let (position_guard, mut pending_state) = self.lock_local_position_and_pending_state()?;
-        execution.check()?;
+        let (position_guard, mut pending_state) =
+            self.lock_local_position_and_pending_state_with_execution(Some(&execution))?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
         let next_event_seq = self.local.get_counter("nextEventSeq")?;
         let initial_overlay =
@@ -445,7 +445,8 @@ impl PgMetaEngine {
         context: super::RemoteReplayApplyContext,
         execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<super::RemoteReplayApplyOutcome> {
-        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
+        let (_position_guard, _pending_state) =
+            self.lock_local_position_and_pending_state_with_execution(execution)?;
         self.apply_replay_page_atomically_locked(batches, recent_flush, context, execution)
     }
 

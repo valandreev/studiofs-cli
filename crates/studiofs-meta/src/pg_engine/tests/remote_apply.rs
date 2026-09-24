@@ -169,6 +169,86 @@ fn expired_replay_page_deadline_rolls_back_without_advancing_cursor() {
 }
 
 #[test]
+fn replay_lock_acquisition_observes_cancellation_while_lock_is_held() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    for hold_pending_state in [false, true] {
+        let position_guard = (!hold_pending_state)
+            .then(|| pg.local_position_lock.lock().expect("lock local position"));
+        let pending_guard =
+            hold_pending_state.then(|| pg.pending_state.lock().expect("lock pending state"));
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let check_count = std::sync::atomic::AtomicUsize::new(0);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+        let inode = ROOT_INO + 800 + u64::from(hold_pending_state);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let cancelled_by_test = || {
+                    if check_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                        let _ = waiting_tx.send(());
+                    }
+                    cancelled.load(Ordering::SeqCst)
+                };
+                let execution = RemoteReplayExecution::new(
+                    Instant::now() + std::time::Duration::from_secs(30),
+                    &cancelled_by_test,
+                );
+                let result = pg.apply_replay_page_atomically_with_execution(
+                    vec![DecodedReplayBatch {
+                        batch_version: 1,
+                        events: vec![MetaEvent::SetAttr {
+                            attr: InodeAttr::new_dir(inode, ROOT_INO, 0, 0, 0o755),
+                        }],
+                        is_self_batch: false,
+                    }],
+                    None,
+                    RemoteReplayApplyContext {
+                        last_seq: 0,
+                        current_namespace_version: 0,
+                        flushed_event_seq: next_event_seq,
+                        next_event_seq,
+                        initial_overlay: OverlayConflictSets::default(),
+                    },
+                    Some(&execution),
+                );
+                result_tx
+                    .send(matches!(result, Err(MetaError::CatchUpCancelled)))
+                    .expect("report replay result");
+            });
+
+            let checked_while_waiting = waiting_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok();
+            cancelled.store(true, Ordering::SeqCst);
+            let result_while_locked = result_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok();
+            drop(position_guard);
+            drop(pending_guard);
+            let replay_was_cancelled = match result_while_locked {
+                Some(result) => result,
+                None => result_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("replay should finish after releasing the test lock"),
+            };
+
+            assert!(
+                checked_while_waiting,
+                "execution was not checked while waiting"
+            );
+            assert!(
+                result_while_locked.is_some(),
+                "replay waited for the held lock after cancellation"
+            );
+            assert!(replay_was_cancelled, "replay should report cancellation");
+        });
+    }
+}
+
+#[test]
 fn cancellation_after_replay_position_write_aborts_before_commit() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let ino = ROOT_INO + 707;

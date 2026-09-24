@@ -46,16 +46,31 @@ impl PgMetaEngine {
         std::sync::MutexGuard<'_, ()>,
         std::sync::MutexGuard<'_, PendingReplicationState>,
     )> {
-        let position_guard = self
-            .local_position_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        self.lock_local_position_and_pending_state_with_execution(None)
+    }
+
+    pub(super) fn lock_local_position_and_pending_state_with_execution(
+        &self,
+        execution: Option<&super::remote_apply::RemoteReplayExecution<'_>>,
+    ) -> MetaResult<(
+        std::sync::MutexGuard<'_, ()>,
+        std::sync::MutexGuard<'_, PendingReplicationState>,
+    )> {
+        let position_guard = lock_with_replay_execution(
+            &self.local_position_lock,
+            execution,
+            "pg local position lock poisoned",
+        )?;
         #[cfg(test)]
         self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterLocalPositionLockAcquired)?;
-        let pending_state = self
-            .pending_state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let pending_state = lock_with_replay_execution(
+            &self.pending_state,
+            execution,
+            "pg pending state lock poisoned",
+        )?;
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
         Ok((position_guard, pending_state))
     }
 
@@ -372,6 +387,29 @@ impl PgMetaEngine {
             .max(0)
             .min(advertised_head_version.max(0))
     }
+}
+
+fn lock_with_replay_execution<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    execution: Option<&super::remote_apply::RemoteReplayExecution<'_>>,
+    poison_message: &'static str,
+) -> MetaResult<std::sync::MutexGuard<'a, T>> {
+    if let Some(execution) = execution {
+        loop {
+            execution.check()?;
+            match mutex.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(MetaError::Storage(poison_message.to_string()));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => execution.wait_for_lock_retry(),
+            }
+        }
+    }
+
+    mutex
+        .lock()
+        .map_err(|_| MetaError::Storage(poison_message.to_string()))
 }
 
 /// Advance through completed intervals without crossing any rejected interval.
