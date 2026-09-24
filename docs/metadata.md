@@ -131,7 +131,10 @@ below the floor returns
 passed to foreign apply. A cursor at or above the floor continues normal
 replay; structural missing or non-contiguous batches remain
 `MetaError::ReplayGap`. Either condition records the client as `Degraded` and
-read-only until checkpoint import/rebase recovery owned by SFS-712 is available.
+blocks new mutations. Startup catch-up attempts checkpoint import/rebase under
+SFS-712 while preserving local state. On success, replay resumes from the
+imported checkpoint; if recovery cannot proceed, the client remains degraded
+and read-only.
 
 ### Backend Selection on Open
 

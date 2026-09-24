@@ -561,8 +561,8 @@ fn active_docs_drop_superseded_io_architecture_terms() {
 
 #[test]
 fn pg_sync_contract_contains_required_invariants() {
-    // CONTEXT: This is a documentation contract guard for SFS-695. Runtime
-    // startup behavior is implemented by the follow-up PG sync issues.
+    // CONTEXT: This guards the SFS-695 contract and the shipped PG sync map;
+    // it does not validate runtime startup behavior.
     let contract = read_workspace_file("docs/pg-sync-contract.md");
     let normalized_contract = normalize_doc_whitespace(&contract);
     let required_terms = [
@@ -595,10 +595,15 @@ fn pg_sync_contract_contains_required_invariants() {
         "coordination lease",
         "permanently unmountable",
         "`destroy --local`",
-        "SFS-696",
-        "SFS-697",
-        "SFS-698",
-        "SFS-721",
+        "checkpoint bootstrap",
+        "bounded page replay",
+        "resume after interruption",
+        "target freezing",
+        "fresh-client read-only gating",
+        "finite-history recovery",
+        "local-only destroy",
+        "high-RTT catch-up benchmarks",
+        "catch-up while the active coordinator is under sustained high write load",
     ];
 
     let missing: Vec<_> = required_terms
@@ -610,6 +615,44 @@ fn pg_sync_contract_contains_required_invariants() {
         missing.is_empty(),
         "SFS-695 PostgreSQL sync contract is missing required invariants:\n{}",
         missing.join("\n")
+    );
+
+    let implemented_issues = [
+        "SFS-696", "SFS-697", "SFS-698", "SFS-699", "SFS-700", "SFS-701", "SFS-703", "SFS-704",
+        "SFS-705", "SFS-706", "SFS-709", "SFS-711", "SFS-712", "SFS-721", "SFS-729",
+    ];
+    let missing_statuses: Vec<_> = implemented_issues
+        .into_iter()
+        .filter(|issue| {
+            !contract.lines().any(|line| {
+                let mut cells = line.trim().trim_matches('|').split('|').map(str::trim);
+                cells
+                    .next()
+                    .is_some_and(|issue_cell| issue_cell.contains(*issue))
+                    && cells.next() == Some("Implemented")
+            })
+        })
+        .collect();
+
+    assert!(
+        missing_statuses.is_empty(),
+        "SFS-695 PostgreSQL sync contract is missing implemented issue statuses:\n{}",
+        missing_statuses.join("\n")
+    );
+
+    let obsolete_statuses = [
+        "durable per-page progress and background session orchestration remain follow-up work",
+        "remaining follow-up work includes durable per-page progress",
+    ];
+    let stale_hits: Vec<_> = obsolete_statuses
+        .into_iter()
+        .filter(|term| contains_doc_term(&contract, &normalized_contract, term))
+        .collect();
+
+    assert!(
+        stale_hits.is_empty(),
+        "SFS-695 PostgreSQL sync contract contains obsolete catch-up status:\n{}",
+        stale_hits.join("\n")
     );
 }
 
@@ -673,6 +716,7 @@ fn active_docs_drop_superseded_pg_startup_wording() {
             read_workspace_file("docs/architecture.md"),
         ),
         ("docs/metadata.md", read_workspace_file("docs/metadata.md")),
+        ("docs/tests.md", read_workspace_file("docs/tests.md")),
         (
             "docs/configuration.md",
             read_workspace_file("docs/configuration.md"),
@@ -682,6 +726,8 @@ fn active_docs_drop_superseded_pg_startup_wording() {
         "Before starting the filesystem, the client connects to the remote PostgreSQL database and compares the local UUID with the remote one.",
         "The operation is blocked because the identity of the disk cannot be verified.",
         "startup catch-up did not reach the current remote head",
+        "read-only until checkpoint import/rebase recovery owned by SFS-712 is available.",
+        "belong to SFS-696 through SFS-698.",
     ];
     let legacy_hits: Vec<String> = active_docs
         .iter()
