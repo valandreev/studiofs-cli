@@ -595,15 +595,22 @@ fn pg_sync_contract_contains_required_invariants() {
         "coordination lease",
         "permanently unmountable",
         "`destroy --local`",
-        "SFS-696",
-        "SFS-697",
-        "SFS-698",
-        "SFS-699 (implemented): bounded complete-batch paging",
-        "SFS-700 (implemented): atomic page progress and durable replay cursor",
-        "SFS-701 (implemented): bounded background catch-up to a frozen startup target",
+        "SFS-696 (implemented)",
+        "SFS-697 (implemented)",
+        "SFS-698 (implemented)",
+        "SFS-699 (implemented)",
+        "SFS-700 (implemented)",
+        "SFS-701 (implemented)",
+        "SFS-721 (implemented)",
+        "checkpoint bootstrap",
+        "bounded page replay",
+        "resume after interruption",
+        "target freezing",
+        "fresh-client read-only gating",
+        "finite-history recovery",
+        "local-only destroy",
         "high-RTT catch-up benchmarks",
         "catch-up while the active coordinator is under sustained high write load",
-        "SFS-721",
     ];
 
     let missing: Vec<_> = required_terms
@@ -613,15 +620,20 @@ fn pg_sync_contract_contains_required_invariants() {
 
     assert!(
         missing.is_empty(),
-        "SFS-695 PostgreSQL sync contract is missing required invariants:\n{}",
+        "SFS-695 PostgreSQL sync contract is missing required invariants or status markers:\n{}",
         missing.join("\n")
     );
+    let stale_hits: Vec<_> = [
+        "durable per-page progress and background session orchestration remain follow-up work",
+        "remaining follow-up work includes durable per-page progress",
+    ]
+    .into_iter()
+    .filter(|term| contains_doc_term(&contract, &normalized_contract, term))
+    .collect();
     assert!(
-        !normalized_contract.contains(
-            "durable per-page progress and background session orchestration remain follow-up work"
-        ) && !normalized_contract
-            .contains("remaining follow-up work includes durable per-page progress"),
-        "SFS-695 PostgreSQL sync contract still marks completed catch-up work as pending"
+        stale_hits.is_empty(),
+        "SFS-695 PostgreSQL sync contract contains obsolete catch-up status:\n{}",
+        stale_hits.join("\n")
     );
 }
 
