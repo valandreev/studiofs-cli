@@ -10,10 +10,11 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 
+use parking_lot::Mutex;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 
@@ -134,8 +135,11 @@ impl MacFuseUnmountSignal {
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CLI_SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+extern "C" fn shutdown_signal_handler(sig: libc::c_int) {
+    if SHUTDOWN_REQUESTED.swap(true, Ordering::AcqRel) {
+        // SAFETY: POSIX `_exit` is async-signal-safe and does not run teardown.
+        unsafe { libc::_exit(128 + sig) }
+    }
 }
 
 struct CliSignalHandlers {
@@ -146,15 +150,13 @@ struct CliSignalHandlers {
 static CLI_SIGNAL_HANDLERS_FOR_PROCESS: Mutex<Option<CliSignalHandlers>> = Mutex::new(None);
 
 impl CliSignalHandlers {
-    fn install() -> io::Result<Self> {
-        CLI_SIGNAL_HANDLERS_INSTALLED
+    fn install() -> io::Result<Option<Self>> {
+        if CLI_SIGNAL_HANDLERS_INSTALLED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "macFUSE CLI signal handlers are already installed",
-                )
-            })?;
+            .is_err()
+        {
+            return Ok(None);
+        }
         // SAFETY: this explicitly mutates process-global CLI signal disposition
         // and restores the previous handlers in Drop.
         unsafe {
@@ -175,10 +177,10 @@ impl CliSignalHandlers {
                 CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self {
+            Ok(Some(Self {
                 previous_sigint,
                 previous_sigterm,
-            })
+            }))
         }
     }
 }
@@ -199,13 +201,7 @@ fn signal_handlers_for_policy(
 ) -> io::Result<Option<CliSignalHandlers>> {
     match signal_handling {
         SignalHandling::Disabled => Ok(None),
-        SignalHandling::InstallForCli => {
-            if CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
-                Ok(None)
-            } else {
-                CliSignalHandlers::install().map(Some)
-            }
-        }
+        SignalHandling::InstallForCli => CliSignalHandlers::install(),
     }
 }
 
@@ -224,9 +220,7 @@ impl Drop for SignalWatcher {
             let _ = thread.join();
         }
         if let Some(handlers) = self.handlers.take() {
-            let mut retained = CLI_SIGNAL_HANDLERS_FOR_PROCESS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut retained = CLI_SIGNAL_HANDLERS_FOR_PROCESS.lock();
             if retained.is_none() {
                 *retained = Some(handlers);
             }
@@ -548,11 +542,10 @@ mod tests {
             super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None)
                 .expect("install CLI signal handlers");
         drop(watcher);
+        assert!(matches!(super::CliSignalHandlers::install(), Ok(None)));
 
         let (still_installed, retained_for_process, term_handler_is_active) = {
-            let mut handlers = super::CLI_SIGNAL_HANDLERS_FOR_PROCESS
-                .lock()
-                .expect("process signal handler lock");
+            let mut handlers = super::CLI_SIGNAL_HANDLERS_FOR_PROCESS.lock();
             let still_installed =
                 super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire);
             let retained_for_process = handlers.is_some();
@@ -573,6 +566,44 @@ mod tests {
         };
 
         assert!(still_installed && retained_for_process && term_handler_is_active);
+    }
+
+    #[test]
+    fn second_shutdown_signal_exits_process() {
+        const CHILD_ENV: &str = "STUDIOFS_SECOND_SHUTDOWN_SIGNAL_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let _handlers = super::CliSignalHandlers::install()
+                .expect("install signal handlers")
+                .expect("fresh child process must install signal handlers");
+            // SAFETY: SIGTERM is installed above and raise targets this child process.
+            unsafe { libc::raise(libc::SIGTERM) };
+            assert!(
+                super::SHUTDOWN_REQUESTED.load(Ordering::Acquire),
+                "the first SIGTERM must reach the installed handler"
+            );
+            eprintln!("first SIGTERM handled and returned");
+            // SAFETY: the installed second-signal path terminates via async-signal-safe _exit.
+            unsafe { libc::raise(libc::SIGTERM) };
+            std::process::exit(0);
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .args([
+            "--exact",
+            "tests::second_shutdown_signal_exits_process",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("run second-signal child process");
+
+        assert_eq!(output.status.code(), Some(128 + libc::SIGTERM));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("first SIGTERM handled and returned"),
+            "the first signal should return through the installed handler"
+        );
     }
 
     #[test]

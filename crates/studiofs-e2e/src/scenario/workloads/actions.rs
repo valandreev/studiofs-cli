@@ -734,7 +734,7 @@ pub fn run_hotspot_op_helper(
                 BarrierWriteMode::CreateNew,
             )?;
         }
-        "sync-existing" => {
+        "sync-existing" | "sync-mounted-existing" => {
             record_hotspot_helper_progress(
                 progress,
                 "before_open_existing",
@@ -743,7 +743,11 @@ pub fn run_hotspot_op_helper(
                 target,
                 None,
             )?;
-            let file = fs::File::open(&path)?;
+            let file = if operation == "sync-existing" {
+                fs::OpenOptions::new().read(true).write(true).open(&path)?
+            } else {
+                fs::File::open(&path)?
+            };
             record_hotspot_helper_progress(
                 progress,
                 "after_open_existing",
