@@ -743,11 +743,7 @@ pub fn run_hotspot_op_helper(
                 target,
                 None,
             )?;
-            let file = if operation == "sync-existing" {
-                fs::OpenOptions::new().read(true).write(true).open(&path)?
-            } else {
-                fs::File::open(&path)?
-            };
+            let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
             record_hotspot_helper_progress(
                 progress,
                 "after_open_existing",
