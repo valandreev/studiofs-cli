@@ -1113,7 +1113,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let mut saw_catching_up = false;
     let mut restarted_during_catchup = false;
     let mut moving_head_observed = false;
-    let mut moving_head_fixture_appended = false;
     let clients = controller
         .clients()
         .into_iter()
@@ -1146,7 +1145,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                     .expect("large-history replay gate must be held until cold restart")
                     .release()?;
                 append_large_history_moving_head_fixture(config, &volume_name)?;
-                moving_head_fixture_appended = true;
                 operations.push(record_advanced_operation(
                     started,
                     operations.len() + 1,
@@ -1188,7 +1186,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     monitor_result?;
     replay_gate_result?;
     let reached_live = true;
-    let moving_writer_completed = moving_head_fixture_appended;
     let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
     let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
     let final_marker_path = isolation.path("control/final-read-write-marker.txt");
@@ -1221,7 +1218,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         LARGE_HISTORY_SNAPSHOT_ATTEMPT_TIMEOUT,
     )?;
     let final_read_write_converged = true;
-    if moving_writer_completed {
+    if restarted_during_catchup {
         let moving_head_baseline = after_initial_status
             .remote_head_version
             .or(initial_remote_head);

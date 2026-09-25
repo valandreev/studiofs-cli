@@ -628,23 +628,16 @@ pub(in crate::scenario) struct LargeHistorySummary {
 
 impl LargeHistorySummary {
     fn applied_version_progression_is_monotonic(&self) -> bool {
-        let Some(restart_index) = self.applied_version_restart_index else {
-            return self
+        self.applied_version_restart_index
+            .is_none_or(|index| index <= self.applied_version_progression.len())
+            && self
                 .applied_version_progression
                 .windows(2)
-                .all(|versions| versions[0] <= versions[1]);
-        };
-        self.applied_version_progression
-            .get(..restart_index)
-            .zip(self.applied_version_progression.get(restart_index..))
-            .is_some_and(|(before_restart, after_restart)| {
-                before_restart
-                    .windows(2)
-                    .all(|versions| versions[0] <= versions[1])
-                    && after_restart
-                        .windows(2)
-                        .all(|versions| versions[0] <= versions[1])
-            })
+                .enumerate()
+                .all(|(index, versions)| {
+                    self.applied_version_restart_index == Some(index + 1)
+                        || versions[0] <= versions[1]
+                })
     }
 
     fn matched(&self) -> bool {
