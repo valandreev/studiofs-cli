@@ -1642,9 +1642,9 @@ mod tests {
         let database_path = temp.path().join("cache.redb");
         let fixture_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redb-4.1-cache-index.redb");
-        std::fs::copy(&fixture_path, &database_path).unwrap_or_else(|err| {
-            panic!("failed to copy fixture {}: {err}", fixture_path.display())
-        });
+        studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(
+            |err| panic!("failed to copy fixture {}: {err}", fixture_path.display()),
+        );
 
         let index = open_index(&database_path);
         let entry = index.get_entry(41).unwrap().expect("fixture entry");
@@ -1666,6 +1666,14 @@ mod tests {
         assert_eq!(updated_stats.dirty_bytes, 19);
         assert_eq!(updated_stats.evictable_bytes, 50);
         assert!(index.get_entry(42).unwrap().is_some());
+
+        drop(index);
+
+        let reopened = open_index(&database_path);
+        assert_eq!(reopened.stats().unwrap(), updated_stats);
+        assert_eq!(reopened.dirty_object_count().unwrap(), 1);
+        assert!(reopened.get_entry(41).unwrap().is_some());
+        assert!(reopened.get_entry(42).unwrap().is_some());
     }
 
     #[test]

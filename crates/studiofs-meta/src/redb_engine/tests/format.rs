@@ -1,20 +1,7 @@
 #[test]
 fn test_format_info_roundtrip() {
     let engine = temp_engine();
-    let info = FormatInfo {
-        format_version: CURRENT_FORMAT_VERSION,
-        name: "test-vol".into(),
-        uuid: "abc-123".into(),
-        endpoint: "http://localhost:9000".into(),
-        bucket: "testbucket".into(),
-        access_key: "studiofs".into(),
-        secret_key: "studiofs123".into(),
-        region: "".into(),
-        data_prefix: "test-volume/objects/".into(),
-        metadata: MetadataConfig::default(),
-        encryption: EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH]),
-        block_size: DEFAULT_BLOCK_SIZE,
-    };
+    let info = test_format_info("test-vol");
     engine.set_format_info(&info).unwrap();
     let loaded = engine.get_format_info().unwrap();
     assert_eq!(loaded.name, "test-vol");
@@ -27,7 +14,7 @@ fn opens_redb_4_1_database_without_studiofs_format_migration() {
     let database_path = temp.path().join("metadata.redb");
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/redb-4.1-metadata.redb");
-    std::fs::copy(&fixture_path, &database_path).unwrap_or_else(|err| {
+    studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(|err| {
         panic!("failed to copy fixture {}: {err}", fixture_path.display())
     });
 
@@ -54,18 +41,42 @@ fn opens_redb_4_1_database_without_studiofs_format_migration() {
     ));
 
     engine.prepare_for_close().unwrap();
+    drop(engine);
+
+    let reopened = RedbMetaEngine::open(&database_path).unwrap();
+    assert_eq!(
+        reopened.get_format_info().unwrap().format_version,
+        CURRENT_FORMAT_VERSION
+    );
+    assert_eq!(
+        reopened.lookup(ROOT_INO, b"compat.txt").unwrap().kind,
+        FileType::RegularFile
+    );
+    assert_eq!(
+        reopened
+            .lookup(ROOT_INO, b"new_under_4_3.txt")
+            .unwrap()
+            .ino,
+        created.ino
+    );
+    reopened.prepare_for_close().unwrap();
 }
 
 #[test]
 fn open_meta_engine_recovers_a_genuinely_unclean_redb_database() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-redb-unclean-");
     let unclean_path = temp.path().join("unclean.redb");
-    // Use a saved unclean file rather than copying a live database with locks held.
-    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/redb-4.3-unclean-metadata.redb");
-    std::fs::copy(&fixture_path, &unclean_path).unwrap_or_else(|err| {
-        panic!("failed to copy fixture {}: {err}", fixture_path.display())
-    });
+    let engine = RedbMetaEngine::open(&unclean_path).unwrap();
+    engine.init_root(1000, 1000).unwrap();
+    engine
+        .set_format_info(&test_format_info("redb-unclean-compat"))
+        .unwrap();
+    engine
+        .create_file(ROOT_INO, b"unclean.txt", 1000, 1000, 0o644)
+        .unwrap();
+    engine.prepare_for_close().unwrap();
+    drop(engine);
+    studiofs_test_support::mark_redb_repair_required(&unclean_path).unwrap();
 
     assert!(matches!(
         RedbMetaEngine::read_format_info_readonly(&unclean_path),
@@ -86,6 +97,11 @@ fn open_meta_engine_recovers_a_genuinely_unclean_redb_database() {
         FileType::RegularFile
     );
     recovered.prepare_for_close().unwrap();
+    drop(recovered);
+
+    let probed = RedbMetaEngine::read_format_info_readonly(&unclean_path).unwrap();
+    assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
+    assert_eq!(probed.name, "redb-unclean-compat");
 }
 
 #[test]
