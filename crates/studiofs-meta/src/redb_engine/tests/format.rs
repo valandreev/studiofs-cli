@@ -22,6 +22,66 @@ fn test_format_info_roundtrip() {
 }
 
 #[test]
+fn opens_redb_4_1_database_without_studiofs_format_migration() {
+    let temp = tempfile::tempdir().unwrap();
+    let database_path = temp.path().join("metadata.redb");
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/redb-4.1-metadata.redb");
+    std::fs::copy(fixture_path, &database_path).unwrap();
+
+    let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
+    assert_eq!(probed.name, "redb-4.1-compat");
+    assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
+
+    let engine = RedbMetaEngine::open(&database_path).unwrap();
+    let loaded = engine.get_format_info().unwrap();
+    assert_eq!(loaded.format_version, CURRENT_FORMAT_VERSION);
+    let entry = engine.lookup(ROOT_INO, b"compat.txt").unwrap();
+    assert_eq!(entry.kind, FileType::RegularFile);
+    engine.prepare_for_close().unwrap();
+}
+
+#[test]
+fn open_meta_engine_recovers_a_genuinely_unclean_redb_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("open.redb");
+    let unclean_path = temp.path().join("unclean.redb");
+    let engine = RedbMetaEngine::open(&source_path).unwrap();
+    engine.init_root(1000, 1000).unwrap();
+    engine.set_format_info(&test_format_info("redb-unclean-compat")).unwrap();
+    engine
+        .create_file(ROOT_INO, b"unclean.txt", 1000, 1000, 0o644)
+        .unwrap();
+    engine.sync_local_metadata().unwrap();
+    engine.prepare_for_close().unwrap();
+
+    // Copy before dropping the database handle, so this file retains redb's
+    // unclean-shutdown marker while the source closes normally.
+    std::fs::copy(&source_path, &unclean_path).unwrap();
+    drop(engine);
+
+    assert!(matches!(
+        RedbMetaEngine::read_format_info_readonly(&unclean_path),
+        Err(MetaError::RepairRequired(_))
+    ));
+
+    let recovered = crate::open_meta_engine_with_options(
+        &unclean_path,
+        crate::MetaOpenOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.get_format_info().unwrap().format_version,
+        CURRENT_FORMAT_VERSION
+    );
+    assert_eq!(
+        recovered.lookup(ROOT_INO, b"unclean.txt").unwrap().kind,
+        FileType::RegularFile
+    );
+    recovered.prepare_for_close().unwrap();
+}
+
+#[test]
 fn format_info_roundtrip_preserves_required_encryption_config() {
     let engine = temp_engine();
     let info = FormatInfo {

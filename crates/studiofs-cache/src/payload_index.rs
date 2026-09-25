@@ -1637,6 +1637,23 @@ mod tests {
     }
 
     #[test]
+    fn cache_index_opens_redb_4_1_database_and_preserves_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let database_path = temp.path().join("cache.redb");
+        let fixture_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redb-4.1-cache-index.redb");
+        std::fs::copy(fixture_path, &database_path).unwrap();
+
+        let index = open_index(&database_path);
+        let entry = index.get_entry(41).unwrap().expect("fixture entry");
+        assert_eq!(entry.payload_key, b"payload/41.object");
+        assert_eq!(entry.payload_len, 19);
+        assert_eq!(entry.lifecycle, LocalPayloadLifecycleState::Dirty);
+        assert_eq!(entry.origin, LocalPayloadOrigin::Local);
+        assert_eq!(entry.upload_state, LocalPayloadUploadState::Pending);
+    }
+
+    #[test]
     fn accounting_is_exact_across_lifecycle_transitions() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");
