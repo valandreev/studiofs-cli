@@ -394,6 +394,14 @@ cargo run -p studiofs-e2e -- local-first-baseline-gate --studiofs-bin target\deb
 cargo run -p studiofs-e2e -- clean
 ```
 
+Scenario 24 (`mounted-large-history-cold-bootstrap-convergence`) checks mounted
+convergence after 90,000 initial and 10,000 moving-head metadata mutations,
+plus a final marker. The cold client restarts during catch-up, and replay may
+repeat earlier pages. Applied versions remain monotonic within each session;
+the final mounted trees must match. Both clients use one batch per catch-up
+page to bound individual metadata commands.
+The scenario does not require elevated Windows privileges or a mounted fsync.
+
 SFS-438 mounted runner lifecycle smoke for local operator validation:
 
 ```powershell

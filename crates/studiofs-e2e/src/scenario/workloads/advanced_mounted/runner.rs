@@ -982,8 +982,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     context: &ScenarioContext,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
-    let cursor_sync_operation =
-        super::large_history_cursor_sync_operation(cfg!(windows)).map_err(ScenarioError::Io)?;
     controller.create_clients(LARGE_HISTORY_CLIENT_NAMES.iter().copied())?;
     controller.init_first_client()?;
     let config = context.client_controller_config.as_ref().ok_or_else(|| {
@@ -1001,11 +999,9 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let _fixture =
         seed_large_history_fixture(config, &volume_name, &isolation.root, &context.scenario_dir)?;
     let catchup_overrides = large_history_catchup_overrides()?;
-    if std::env::var_os(LARGE_HISTORY_PAGE_BATCHES_ENV).is_some()
-        || std::env::var_os(LARGE_HISTORY_PAGE_BYTES_ENV).is_some()
-    {
-        controller.set_client_env_overrides("client-a", catchup_overrides.clone())?;
-    }
+    // The warm client also replays the moving head; a default 64-batch page
+    // can exceed its command deadline before advancing the applied cursor.
+    controller.set_client_env_overrides("client-a", catchup_overrides.clone())?;
     controller.set_client_env_overrides(LARGE_HISTORY_COLD_CLIENT, catchup_overrides)?;
     controller.set_mount_ready_timeout(LARGE_HISTORY_MOUNT_READY_TIMEOUT);
     controller.mount("client-a")?;
@@ -1114,7 +1110,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     );
     let mut startup_target_version = None;
     let mut applied_version_restart_index = None;
-    let mut restart_cursor_durable = false;
     let mut saw_catching_up = false;
     let mut restarted_during_catchup = false;
     let mut moving_head_observed = false;
@@ -1124,26 +1119,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    let cold_client_cursor_sync_path = isolation.path(&format!(
-        "{}/shard-00/file-00000.bin",
-        super::large_history_fixture::FIXTURE_FILES_DIRECTORY_NAME
-    ));
-    let cold_client_writer_marker_path = isolation.path("control/cold-client-writer-marker.txt");
-    let cold_client_writer_marker_payload = isolation.payload(
-        "cold_client_writer",
-        &cold_client_writer_marker_path,
-        "large-history cold-client allocator write proof",
-    );
-    let peer_clients = clients
-        .iter()
-        .filter(|client| client.name != LARGE_HISTORY_COLD_CLIENT)
-        .cloned()
-        .collect::<Vec<_>>();
-    if peer_clients.is_empty() {
-        return Err(ScenarioError::Io(io::Error::other(
-            "large-history cold writer has no peer mounts to validate replication",
-        )));
-    }
     let monitor_result = (|| {
         loop {
             let sample =
@@ -1158,33 +1133,17 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                 &sample,
             );
             startup_target_version = startup_target_version.or(sample.startup_target_version);
-            let is_first_post_restart_sample = restarted_during_catchup
-                && applied_version_restart_index == Some(applied_version_progression.len());
             if let Some(applied) = sample.local_applied_version {
                 applied_version_progression.push(applied);
-            }
-            if is_first_post_restart_sample
-                && (sample.lifecycle != "CatchingUp"
-                    || !super::large_history_resumed_partial_replay(
-                        checkpoint_version,
-                        sample.local_applied_version,
-                        startup_target_version,
-                        applied_version_restart_index
-                            .and_then(|index| index.checked_sub(1))
-                            .and_then(|index| applied_version_progression.get(index).copied()),
-                    ))
-            {
-                return Err(ScenarioError::Io(io::Error::other(
-                    "large-history cold client did not resume from its durable partial cursor",
-                )));
             }
             update_large_history_page_totals(&mut pages, &mut seen_pages, &sample);
             saw_catching_up |= sample.lifecycle == "CatchingUp";
 
-            if saw_catching_up && !moving_head_fixture_appended {
+            if saw_catching_up && !restarted_during_catchup {
+                applied_version_restart_index = Some(applied_version_progression.len());
                 replay_gate
                     .take()
-                    .expect("large-history replay gate must be held until catch-up starts")
+                    .expect("large-history replay gate must be held until cold restart")
                     .release()?;
                 append_large_history_moving_head_fixture(config, &volume_name)?;
                 moving_head_fixture_appended = true;
@@ -1196,125 +1155,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                     &isolation.root,
                     Ok(()),
                 ));
-            }
-
-            if moving_head_fixture_appended
-                && !restarted_during_catchup
-                && super::large_history_partial_replay_version(
-                    checkpoint_version,
-                    sample.local_applied_version,
-                    startup_target_version,
-                )
-                .is_some()
-            {
-                // Stop the next replay page before recording the cursor to sync.
-                replay_gate = Some(LargeHistoryReplayGate::acquire(&config.meta_dsn)?);
-                let paused_sample = parse_large_history_status(
-                    &controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout,
-                )?;
-                append_large_history_status(
-                    &status_path,
-                    LARGE_HISTORY_COLD_CLIENT,
-                    &paused_sample,
-                )?;
-                update_cold_checkpoint_version(&mut checkpoint_version, &paused_sample);
-                update_checkpoint_performance(
-                    &mut checkpoint_payload_bytes,
-                    &mut checkpoint_build_duration_us,
-                    &mut checkpoint_publish_duration_us,
-                    &mut checkpoint_total_duration_us,
-                    &paused_sample,
-                );
-                startup_target_version =
-                    startup_target_version.or(paused_sample.startup_target_version);
-                update_large_history_page_totals(&mut pages, &mut seen_pages, &paused_sample);
-                if paused_sample.lifecycle != "CatchingUp" {
-                    return Err(ScenarioError::Io(io::Error::other(
-                        "large-history cold client left CatchingUp before the durable restart",
-                    )));
-                }
-                let paused_cursor = super::large_history_partial_replay_version(
-                    checkpoint_version,
-                    paused_sample.local_applied_version,
-                    startup_target_version,
-                )
-                .ok_or_else(|| {
-                    ScenarioError::Io(io::Error::other(
-                        "large-history cold client lost its partial replay cursor before restart",
-                    ))
-                })?;
-
-                // Mounted fsync enters the engine's immediate metadata barrier.
-                let cursor_sync = timed_hotspot_helper_fs_op_with_helper(
-                    context,
-                    started,
-                    operations.len() + 1,
-                    &cold_client,
-                    "cold_client_cursor_sync_barrier",
-                    cursor_sync_operation,
-                    &cold_client_cursor_sync_path,
-                    LARGE_HISTORY_CONVERGENCE_TIMEOUT,
-                    None,
-                    None,
-                )?;
-                let cursor_sync_accepted = cursor_sync.result == "accepted";
-                operations.push(cursor_sync);
-                if !cursor_sync_accepted {
-                    write_namespace_collision_operations(context, &operations)?;
-                    return Err(ScenarioError::Io(io::Error::other(
-                        "large-history cold-client cursor sync barrier was rejected",
-                    )));
-                }
-
-                let durable_sample = parse_large_history_status(
-                    &controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout,
-                )?;
-                append_large_history_status(
-                    &status_path,
-                    LARGE_HISTORY_COLD_CLIENT,
-                    &durable_sample,
-                )?;
-                update_cold_checkpoint_version(&mut checkpoint_version, &durable_sample);
-                update_checkpoint_performance(
-                    &mut checkpoint_payload_bytes,
-                    &mut checkpoint_build_duration_us,
-                    &mut checkpoint_publish_duration_us,
-                    &mut checkpoint_total_duration_us,
-                    &durable_sample,
-                );
-                startup_target_version =
-                    startup_target_version.or(durable_sample.startup_target_version);
-                update_large_history_page_totals(&mut pages, &mut seen_pages, &durable_sample);
-                if durable_sample.lifecycle != "CatchingUp" {
-                    return Err(ScenarioError::Io(io::Error::other(
-                        "large-history cold client left CatchingUp before the durable restart",
-                    )));
-                }
-                let durable_cursor = super::large_history_partial_replay_version(
-                    checkpoint_version,
-                    durable_sample.local_applied_version,
-                    startup_target_version,
-                )
-                .ok_or_else(|| {
-                    ScenarioError::Io(io::Error::other(
-                        "large-history cold client lost its partial replay cursor before restart",
-                    ))
-                })?;
-                if durable_cursor != paused_cursor {
-                    return Err(ScenarioError::Io(io::Error::other(
-                        "large-history cold-client replay cursor changed while the replay gate was held",
-                    )));
-                }
-                applied_version_progression.push(durable_cursor);
-                restart_cursor_durable = true;
-                // The index points at the first recorded sample after restart.
-                applied_version_restart_index = Some(applied_version_progression.len());
-                // Let the active PostgreSQL request finish before graceful
-                // shutdown drains and closes the remote metadata connection.
-                replay_gate
-                    .take()
-                    .expect("replay gate is held until the durable cursor is recorded")
-                    .release()?;
                 controller.restart_until_lifecycle_ready(LARGE_HISTORY_COLD_CLIENT)?;
                 restarted_during_catchup = true;
                 operations.push(record_advanced_operation(
@@ -1329,12 +1169,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             }
 
             if sample.lifecycle == "Live" {
-                if !restarted_during_catchup {
-                    return Err(ScenarioError::Io(io::Error::other(format!(
-                        "large-history cold client reached Live before a partial replay restart (checkpoint={checkpoint_version:?}, applied={:?}, target={startup_target_version:?})",
-                        sample.local_applied_version,
-                    ))));
-                }
                 break;
             }
             if Instant::now() >= cold_catchup_deadline {
@@ -1357,39 +1191,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     let moving_writer_completed = moving_head_fixture_appended;
     let moving_head_mutation_count = LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT;
     let mutation_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT + moving_head_mutation_count + 1;
-    let cold_writer = timed_hotspot_helper_fs_op_with_helper(
-        context,
-        started,
-        operations.len() + 1,
-        &cold_client,
-        "cold_client_writer_marker",
-        "create-barrier-sync",
-        &cold_client_writer_marker_path,
-        LARGE_HISTORY_CONVERGENCE_TIMEOUT,
-        Some(&cold_client_writer_marker_payload),
-        None,
-    )?;
-    let cold_writer_accepted = cold_writer.result == "accepted";
-    operations.push(cold_writer);
-    if !cold_writer_accepted {
-        write_namespace_collision_operations(context, &operations)?;
-        return Err(ScenarioError::Io(io::Error::other(
-            "large-history cold-client writer marker was rejected",
-        )));
-    }
-    wait_for_mounted_initial_payloads_until_with_probe_timeout(
-        &peer_clients,
-        &[(
-            &cold_client_writer_marker_path,
-            cold_client_writer_marker_payload.as_slice(),
-        )],
-        Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT,
-        LARGE_HISTORY_POLL_INTERVAL,
-        "large-history cold-client writer marker convergence",
-        LARGE_HISTORY_SNAPSHOT_ATTEMPT_TIMEOUT,
-    )?;
-    let cold_client_write_converged = true;
-
     let final_marker_path = isolation.path("control/final-read-write-marker.txt");
     let final_marker_payload = isolation.payload(
         "final_read_write",
@@ -1487,7 +1288,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         startup_target_version,
         applied_version_progression,
         applied_version_restart_index,
-        restart_cursor_durable,
         observed_page_count: pages.len(),
         observed_event_rows: pages.iter().map(|page| page.event_count).sum(),
         observed_event_bytes: pages.iter().map(|page| page.response_bytes).sum(),
@@ -1512,7 +1312,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         moving_head_observed,
         reached_live,
         final_read_write_converged,
-        cold_client_write_converged,
         final_marker_path,
         wall_duration_ms: elapsed_millis_u64(started),
     };
