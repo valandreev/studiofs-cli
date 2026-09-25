@@ -1139,7 +1139,6 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
             saw_catching_up |= sample.lifecycle == "CatchingUp";
 
             if saw_catching_up && !restarted_during_catchup {
-                applied_version_restart_index = Some(applied_version_progression.len());
                 replay_gate
                     .take()
                     .expect("large-history replay gate must be held until cold restart")
@@ -1153,6 +1152,25 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
                     &isolation.root,
                     Ok(()),
                 ));
+                let pre_restart_sample = parse_large_history_status(
+                    &controller.status(LARGE_HISTORY_COLD_CLIENT)?.stdout,
+                )?;
+                append_large_history_status(
+                    &status_path,
+                    LARGE_HISTORY_COLD_CLIENT,
+                    &pre_restart_sample,
+                )?;
+                if let Some(applied) = pre_restart_sample.local_applied_version {
+                    applied_version_progression.push(applied);
+                }
+                update_large_history_page_totals(&mut pages, &mut seen_pages, &pre_restart_sample);
+                if pre_restart_sample.lifecycle != "CatchingUp" {
+                    return Err(ScenarioError::Io(io::Error::other(format!(
+                        "large-history cold client left CatchingUp before restart (lifecycle={})",
+                        pre_restart_sample.lifecycle,
+                    ))));
+                }
+                applied_version_restart_index = Some(applied_version_progression.len());
                 controller.restart_until_lifecycle_ready(LARGE_HISTORY_COLD_CLIENT)?;
                 restarted_during_catchup = true;
                 operations.push(record_advanced_operation(
