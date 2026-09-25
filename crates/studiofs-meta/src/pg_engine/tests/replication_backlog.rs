@@ -1867,6 +1867,57 @@ fn published_later_range_stays_pending_at_rejected_cursor_until_self_ack() {
 }
 
 #[test]
+fn pending_restore_does_not_resurrect_published_source_after_foreign_rename() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter("nextEventSeq").unwrap();
+    let attr = pg
+        .create_dir(ROOT_INO, b"rename-source", 0, 0, 0o755)
+        .unwrap();
+    let end = pg.local.get_counter("nextEventSeq").unwrap();
+    let entry = DirEntryValue {
+        ino: attr.ino,
+        kind: FileType::Directory,
+    };
+    pg.local
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"rename-source".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+    pg.mark_local_event_ranges_published(&[LocalEventRange { start, end }])
+        .unwrap();
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), start);
+
+    let rename = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"rename-source".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"renamed-final".to_vec(),
+        entry,
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+    pg.local
+        .apply_replica_events_to_base(std::slice::from_ref(&rename))
+        .unwrap();
+    pg.local
+        .apply_replica_serving_state(std::slice::from_ref(&rename))
+        .unwrap();
+    assert!(pg.lookup(ROOT_INO, b"rename-source").is_err());
+
+    pg.restore_pending_state_from_local_log().unwrap();
+    assert!(pg.lookup(ROOT_INO, b"rename-source").is_err());
+    assert!(pg.lookup(ROOT_INO, b"renamed-final").is_ok());
+}
+
+#[test]
 fn self_ack_with_contextually_filtered_prefix_preserves_local_overlay() {
     let (_dir, mut pg) = temp_pg_engine_for_unit();
     pg.remote_format_validated.store(true, Ordering::Release);

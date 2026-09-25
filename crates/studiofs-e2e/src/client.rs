@@ -2422,7 +2422,11 @@ fn windows_mount_lifecycle_is_ready(
 fn windows_mount_io_is_ready(mount_point: &Path, write_capable: bool) -> io::Result<bool> {
     let probe_path = mount_point.join(format!(
         ".studiofs-e2e-readiness-{}.tmp",
-        uuid::Uuid::new_v4().simple()
+        if write_capable {
+            std::process::id().to_string()
+        } else {
+            uuid::Uuid::new_v4().simple().to_string()
+        }
     ));
     windows_mount_io_is_ready_with(write_capable, || {
         let mut options = OpenOptions::new();
@@ -2431,17 +2435,21 @@ fn windows_mount_io_is_ready(mount_point: &Path, write_capable: bool) -> io::Res
             return options.open(&probe_path).map(|_| ());
         }
 
+        let remove_probe = || match fs::remove_file(&probe_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+        // An earlier readiness attempt can create the file before mounted I/O
+        // becomes writable. Do not accept readiness while it remains visible.
+        remove_probe()?;
         options.create_new(true);
-        let mut file = options.open(&probe_path)?;
-        let result = file
-            .write_all(b"studiofs-e2e-readiness")
-            .and_then(|()| file.sync_all());
-        drop(file);
-        if result.is_ok() {
-            fs::remove_file(&probe_path)?;
-        } else {
-            let _ = fs::remove_file(&probe_path);
-        }
+        let result = (|| {
+            let mut file = options.open(&probe_path)?;
+            file.write_all(b"studiofs-e2e-readiness")?;
+            file.sync_all()
+        })();
+        remove_probe()?;
         result
     })
 }
@@ -2457,6 +2465,7 @@ where
         // write-capable probe must create its unique path successfully.
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(!write_capable),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
+        Err(error) if error.raw_os_error() == Some(32) => Ok(false), // ERROR_SHARING_VIOLATION
         Err(error) => Err(error),
     }
 }
@@ -3475,6 +3484,43 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
 
     #[cfg(windows)]
     #[test]
+    fn windows_mount_io_readiness_cleans_orphaned_probe_before_accepting_mount() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let probe_path = temp.path().join(format!(
+            ".studiofs-e2e-readiness-{}.tmp",
+            std::process::id()
+        ));
+        fs::write(&probe_path, []).unwrap();
+
+        assert!(windows_mount_io_is_ready(temp.path(), true).unwrap());
+        assert!(!probe_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mount_io_readiness_waits_for_orphaned_probe_to_be_deletable() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let probe_path = temp.path().join(format!(
+            ".studiofs-e2e-readiness-{}.tmp",
+            std::process::id()
+        ));
+        fs::write(&probe_path, []).unwrap();
+        let held = OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(&probe_path)
+            .unwrap();
+
+        assert!(!windows_mount_io_is_ready(temp.path(), true).unwrap());
+        drop(held);
+        assert!(windows_mount_io_is_ready(temp.path(), true).unwrap());
+        assert!(!probe_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_mount_io_readiness_treats_driver_access_errors_as_transient() {
         assert!(windows_mount_io_is_ready_with(false, || Ok(())).unwrap());
         assert!(
@@ -3488,6 +3534,10 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
                 Err(io::Error::from(io::ErrorKind::NotFound))
             })
             .unwrap()
+        );
+        assert!(
+            !windows_mount_io_is_ready_with(true, || Err(io::Error::from_raw_os_error(32)))
+                .unwrap()
         );
         assert!(
             windows_mount_io_is_ready_with(false, || {

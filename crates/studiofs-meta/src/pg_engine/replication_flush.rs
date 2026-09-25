@@ -405,8 +405,25 @@ impl PgMetaEngine {
             Self::clear_pending_state(state);
             return Ok(());
         }
+        // Published ranges may remain behind a durable cursor gap after a foreign rename.
+        let replay_exclusions = self.local_event_overlay_exclusions()?;
+        let serving_events = if replay_exclusions.is_empty() {
+            Cow::Borrowed(pending_events)
+        } else {
+            Cow::Owned(
+                pending_events
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        let seq = event_start.max(1).saturating_add(*index as u64);
+                        !local_event_range_contains(&replay_exclusions, seq)
+                    })
+                    .map(|(_, event)| event.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
         self.local
-            .apply_replica_serving_state_for_pending_replay(pending_events)?;
+            .apply_replica_serving_state_for_pending_replay(&serving_events)?;
         let selected = self.select_unprocessed_local_events(event_start, pending_events)?;
         if selected.events.is_empty() {
             Self::clear_pending_state(state);

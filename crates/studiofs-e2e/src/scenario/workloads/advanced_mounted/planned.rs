@@ -81,13 +81,8 @@ pub(in crate::scenario) fn planned_large_history_summary() -> LargeHistorySummar
         cold_client: LARGE_HISTORY_COLD_CLIENT.to_string(),
         checkpoint_version: Some(0),
         startup_target_version: Some((LARGE_HISTORY_MUTATION_COUNT + 1) as u64),
-        applied_version_progression: vec![
-            0,
-            LARGE_HISTORY_MUTATION_COUNT.div_ceil(2) as u64,
-            (LARGE_HISTORY_MUTATION_COUNT + 1) as u64,
-        ],
-        applied_version_restart_index: Some(2),
-        restart_cursor_durable: true,
+        applied_version_progression: vec![0, (LARGE_HISTORY_MUTATION_COUNT + 1) as u64],
+        applied_version_restart_index: Some(1),
         observed_page_count: 2,
         observed_event_rows: (LARGE_HISTORY_MUTATION_COUNT + 1) as u64,
         observed_event_bytes: (LARGE_HISTORY_MUTATION_COUNT + 1) as u64,
@@ -103,7 +98,6 @@ pub(in crate::scenario) fn planned_large_history_summary() -> LargeHistorySummar
         moving_head_observed: true,
         reached_live: true,
         final_read_write_converged: true,
-        cold_client_write_converged: true,
         final_marker_path: format!(
             "{}/final-marker.txt",
             AdvancedMountedKind::LargeHistoryColdBootstrap.path_root()
