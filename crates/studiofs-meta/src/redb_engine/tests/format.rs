@@ -23,11 +23,13 @@ fn test_format_info_roundtrip() {
 
 #[test]
 fn opens_redb_4_1_database_without_studiofs_format_migration() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-redb-4-1-meta-");
     let database_path = temp.path().join("metadata.redb");
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/redb-4.1-metadata.redb");
-    std::fs::copy(fixture_path, &database_path).unwrap();
+    std::fs::copy(&fixture_path, &database_path).unwrap_or_else(|err| {
+        panic!("failed to copy fixture {}: {err}", fixture_path.display())
+    });
 
     let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
     assert_eq!(probed.name, "redb-4.1-compat");
@@ -38,27 +40,32 @@ fn opens_redb_4_1_database_without_studiofs_format_migration() {
     assert_eq!(loaded.format_version, CURRENT_FORMAT_VERSION);
     let entry = engine.lookup(ROOT_INO, b"compat.txt").unwrap();
     assert_eq!(entry.kind, FileType::RegularFile);
+
+    let created = engine
+        .create_file(ROOT_INO, b"new_under_4_3.txt", 1000, 1000, 0o644)
+        .unwrap();
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"new_under_4_3.txt").unwrap().ino,
+        created.ino
+    );
+    assert!(matches!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::Compacted | LocalStorageCompactionResult::NoWork
+    ));
+
     engine.prepare_for_close().unwrap();
 }
 
 #[test]
 fn open_meta_engine_recovers_a_genuinely_unclean_redb_database() {
-    let temp = tempfile::tempdir().unwrap();
-    let source_path = temp.path().join("open.redb");
+    let temp = studiofs_test_support::workspace_target_tempdir("test-redb-unclean-");
     let unclean_path = temp.path().join("unclean.redb");
-    let engine = RedbMetaEngine::open(&source_path).unwrap();
-    engine.init_root(1000, 1000).unwrap();
-    engine.set_format_info(&test_format_info("redb-unclean-compat")).unwrap();
-    engine
-        .create_file(ROOT_INO, b"unclean.txt", 1000, 1000, 0o644)
-        .unwrap();
-    engine.sync_local_metadata().unwrap();
-    engine.prepare_for_close().unwrap();
-
-    // Copy before dropping the database handle, so this file retains redb's
-    // unclean-shutdown marker while the source closes normally.
-    std::fs::copy(&source_path, &unclean_path).unwrap();
-    drop(engine);
+    // Use a saved unclean file rather than copying a live database with locks held.
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/redb-4.3-unclean-metadata.redb");
+    std::fs::copy(&fixture_path, &unclean_path).unwrap_or_else(|err| {
+        panic!("failed to copy fixture {}: {err}", fixture_path.display())
+    });
 
     assert!(matches!(
         RedbMetaEngine::read_format_info_readonly(&unclean_path),
