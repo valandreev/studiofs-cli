@@ -460,6 +460,11 @@ impl<'a> NamespaceDeleteTxn<'a> {
             RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
             RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
         }
+        if attr.kind == FileType::RegularFile {
+            RedbMetaEngine::refresh_pending_regular_file_recovery_metadata_in_txn(
+                self.txn, attr.ino,
+            )?;
+        }
 
         parent_attr.touch_mtime();
         RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &parent_attr)?;
@@ -958,6 +963,15 @@ impl MetaFsOps for RedbMetaEngine {
                 },
             )?;
         }
+        if src_entry.kind == FileType::RegularFile {
+            Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, src_entry.ino)?;
+        }
+        if let Some(displaced) = dst_entry_opt.as_ref()
+            && displaced.kind == FileType::RegularFile
+            && displaced.ino != src_entry.ino
+        {
+            Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, displaced.ino)?;
+        }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(RenameAtomicResult {
@@ -993,6 +1007,9 @@ impl MetaFsOps for RedbMetaEngine {
                 kind: attr.kind,
             };
             Self::set_dentry_overlay_in_txn(&txn, new_parent, new_name, &entry)?;
+            if attr.kind == FileType::RegularFile {
+                Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, ino)?;
+            }
 
             parent_attr.touch_mtime();
             Self::set_inode_overlay_in_txn(&txn, &parent_attr)?;

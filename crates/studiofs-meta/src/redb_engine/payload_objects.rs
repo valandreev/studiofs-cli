@@ -859,6 +859,7 @@ impl RedbMetaEngine {
         }
 
         Self::sync_inode_lifecycle_in_txn(txn, ino)?;
+        Self::sync_pending_regular_file_recovery_for_inode_in_txn(txn, ino)?;
 
         Self::append_event_in_txn(
             txn,

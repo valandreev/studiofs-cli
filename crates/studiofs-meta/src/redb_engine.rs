@@ -1009,6 +1009,7 @@ mod chunk_state;
 mod format;
 mod gc;
 mod inodes;
+pub(crate) use inodes::PendingRecoveryDentry;
 mod namespace;
 mod payload_objects;
 mod recovery;

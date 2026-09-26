@@ -6,6 +6,7 @@ use super::{
 };
 use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaResult};
 use crate::events::MetaEvent;
+use crate::redb_engine::PendingRecoveryDentry;
 use crate::schema::{ROOT_INO, RegularFileOverlayState, UploadState};
 use crate::types::{DirEntryValue, FileType, Ino, InodeAttr};
 use std::borrow::Cow;
@@ -15,7 +16,6 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 const LOCAL_ONLY_SUFFIX_CONTEXT_EVENTS: u64 = 16;
-type SavedRecoveryDentry = (Ino, Vec<u8>);
 
 struct SelectedLocalEvents<'a> {
     events: Cow<'a, [MetaEvent]>,
@@ -46,7 +46,7 @@ fn push_repaired_overlay_events(
     events: &mut Vec<MetaEvent>,
     attr: InodeAttr,
     overlay: RegularFileOverlayState,
-    dentries: &[(Ino, Vec<u8>)],
+    dentries: &[PendingRecoveryDentry],
 ) {
     let ino = attr.ino;
     events.push(MetaEvent::SetAttr { attr });
@@ -73,12 +73,8 @@ fn push_repaired_overlay_events(
 fn restorable_recovery_dentries(
     local: &crate::redb_engine::RedbMetaEngine,
     ino: Ino,
-    dentries: &[SavedRecoveryDentry],
-) -> MetaResult<Option<Vec<SavedRecoveryDentry>>> {
-    if dentries.is_empty() {
-        return Ok(None);
-    }
-
+    dentries: &[PendingRecoveryDentry],
+) -> MetaResult<Option<Vec<PendingRecoveryDentry>>> {
     let mut missing = Vec::new();
     for (parent, name) in dentries {
         let parent_attr = match local.get_attr(*parent) {
@@ -570,7 +566,49 @@ impl PgMetaEngine {
                     Vec::new()
                 }
             };
-            push_repaired_overlay_events(&mut restored_events, attr, recovery.overlay, &dentries);
+            let mut restored_attr = current.clone();
+            restored_attr.size = attr.size;
+            if let Some(baseline) = recovery.baseline_attr.as_ref()
+                && baseline.ino == attr.ino
+                && baseline.crtime == attr.crtime
+            {
+                if attr.mode != baseline.mode {
+                    restored_attr.mode = attr.mode;
+                }
+                if attr.uid != baseline.uid {
+                    restored_attr.uid = attr.uid;
+                }
+                if attr.gid != baseline.gid {
+                    restored_attr.gid = attr.gid;
+                }
+                if attr.mtime != baseline.mtime {
+                    restored_attr.mtime = attr.mtime;
+                }
+                if attr.ctime != baseline.ctime {
+                    restored_attr.ctime = attr.ctime;
+                }
+                if attr.atime != baseline.atime {
+                    restored_attr.atime = attr.atime;
+                }
+                if attr.parent != baseline.parent {
+                    restored_attr.parent = attr.parent;
+                }
+                if attr.win_attrs != baseline.win_attrs {
+                    restored_attr.win_attrs = attr.win_attrs;
+                }
+            }
+            restored_attr.nlink = restored_attr
+                .nlink
+                .saturating_add(u32::try_from(dentries.len()).unwrap_or(u32::MAX));
+            if !dentries.is_empty() {
+                restored_attr.ctime = attr.ctime;
+            }
+            push_repaired_overlay_events(
+                &mut restored_events,
+                restored_attr,
+                recovery.overlay,
+                &dentries,
+            );
             restored_inodes = restored_inodes.saturating_add(1);
         }
 

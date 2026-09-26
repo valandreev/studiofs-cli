@@ -180,6 +180,10 @@ impl RedbMetaEngine {
 }
 
 impl MetaGc for RedbMetaEngine {
+    fn reconcile_pending_regular_file_recoveries(&self) -> MetaResult<()> {
+        RedbMetaEngine::reconcile_pending_regular_file_recoveries(self)
+    }
+
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         let started = std::time::Instant::now();
         let mut bytes_before = None;
@@ -339,7 +343,6 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
-        self.reconcile_pending_regular_file_recoveries()?;
         let txn = self.begin_read_txn()?;
         let mut refs = HashSet::new();
         Self::regular_file_graph_object_ids_from_table(

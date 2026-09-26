@@ -911,6 +911,16 @@ impl PgMetaEngine {
             .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)?
             != 0
         {
+            let target = self.metadata_startup_target_version.load(Ordering::Acquire);
+            if target >= 0 && self.local_version.load(Ordering::Acquire) >= target {
+                // Keep polling remote history while graph repair denies write authority.
+                let _ = self.metadata_startup_target_version.compare_exchange(
+                    target,
+                    -1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
             self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
             return Ok(());
         }

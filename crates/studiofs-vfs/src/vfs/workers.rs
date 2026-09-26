@@ -1699,6 +1699,15 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
+            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.reconcile_pending_regular_file_recoveries()
+            })
+            .await
+            {
+                warn!(error = %error, "background GC recovery reconciliation failed");
+            }
+
+            let meta = self.meta.clone();
             let referenced_object_ids = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.get_referenced_object_ids()
             })
@@ -2041,6 +2050,15 @@ impl StudioVfs {
                         "janitor: upload reconciliation completion failed"
                     );
                 }
+            }
+
+            let meta = self.meta.clone();
+            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.reconcile_pending_regular_file_recoveries()
+            })
+            .await
+            {
+                warn!(cycle, error = %error, "janitor recovery reconciliation failed");
             }
 
             let meta = self.meta.clone();

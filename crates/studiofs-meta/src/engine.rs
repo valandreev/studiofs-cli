@@ -1687,6 +1687,11 @@ pub trait MetaGc: Send + Sync {
             .collect())
     }
 
+    /// Retire provably obsolete local recovery roots before a janitor sweep.
+    fn reconcile_pending_regular_file_recoveries(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
     /// Get currently referenced object IDs from the full reachability graph.
     ///
     /// Backends should include regular-file graph overlay/base rows and

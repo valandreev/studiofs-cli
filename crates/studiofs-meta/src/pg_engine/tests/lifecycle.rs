@@ -3747,6 +3747,13 @@ fn pending_local_graph_repair_marker_blocks_catchup_completion() {
 
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
     assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .metadata_startup_target_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        -1,
+        "a later poll must capture a new remote head after reaching the pinned target"
+    );
 }
 
 #[test]

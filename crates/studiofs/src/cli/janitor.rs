@@ -458,6 +458,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 
         let cycle_result = (|| -> anyhow::Result<(JanitorStats, HashSet<u64>, HashSet<u64>)> {
             let global_snapshot_pins = engine.get_global_snapshot_pins()?;
+            if !dry_run {
+                engine.reconcile_pending_regular_file_recoveries()?;
+            }
             let referenced = engine.get_referenced_object_ids()?;
             let pending: HashMap<u64, i64> = engine.get_pending_deletions()?.into_iter().collect();
 
