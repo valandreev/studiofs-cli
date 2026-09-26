@@ -9,14 +9,11 @@ use crate::events::MetaEvent;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-fn expire_local_storage_page_stats(engine: &RedbMetaEngine) {
-    engine
+fn invalidate_local_storage_page_stats(engine: &RedbMetaEngine) {
+    *engine
         .local_storage_page_stats
         .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .sampled_at = Instant::now() - LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL;
+        .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
 #[test]
@@ -868,6 +865,52 @@ fn local_storage_diagnostics_reuses_page_stats_when_writer_lock_is_busy() {
 }
 
 #[test]
+fn local_storage_diagnostics_returns_cached_stats_while_refresh_is_busy() {
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    let cached = engine
+        .local_storage_page_stats
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .expect("page stats were cached");
+    let stale_at = cached
+        .sampled_at
+        .checked_add(LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL)
+        .expect("test timestamp remains representable");
+    let _refresh = engine.local_storage_page_stats_refresh.lock().unwrap();
+
+    let stats = engine
+        .local_storage_page_stats_best_effort_at(stale_at)
+        .expect("the cached page sample is available during refresh");
+    assert_eq!(stats.allocated_pages, initial.allocated_pages.unwrap());
+}
+
+#[test]
+fn local_storage_diagnostics_recovers_poisoned_page_stats_cache() {
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(initial.allocated_pages.is_some());
+
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cache = engine.local_storage_page_stats.lock().unwrap();
+        panic!("poison page stats cache for recovery coverage");
+    }));
+    assert!(poisoned.is_err());
+
+    let recovered = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(recovered.allocated_pages, initial.allocated_pages);
+}
+
+#[test]
 fn local_storage_compaction_errors_are_counted() {
     let engine = temp_engine();
     let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -927,7 +970,7 @@ fn local_storage_diagnostics_track_delete_and_compaction() {
         }
     }
     write.commit().unwrap();
-    expire_local_storage_page_stats(&engine);
+    invalidate_local_storage_page_stats(&engine);
 
     let before_delete = engine
         .local_storage_diagnostics()
@@ -955,7 +998,7 @@ fn local_storage_diagnostics_track_delete_and_compaction() {
         }
     }
     delete.commit().unwrap();
-    expire_local_storage_page_stats(&engine);
+    invalidate_local_storage_page_stats(&engine);
 
     let after_delete = engine
         .local_storage_diagnostics()

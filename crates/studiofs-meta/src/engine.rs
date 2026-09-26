@@ -565,7 +565,7 @@ pub enum LocalStorageCompactionResult {
 /// Reason a local metadata storage compaction attempt could not proceed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalStorageCompactionSkipReason {
-    /// The VFS database lock was already held by another metadata operation.
+    /// The internal metadata database lock was already held by another operation.
     DatabaseLockContended,
     /// redb still had a transaction active when compaction was attempted.
     ActiveTransaction,

@@ -97,7 +97,7 @@ Local embedded serving store.
 - regular-file graphs are stored as chunk-local rows in `regular_file_overlay` and `regular_file_base`, keyed by `(ino, chunk_id)`
 - the existing `.studiofs-runtime-stats` / `studiofs perf` surface reports its physical file size, cached redb page statistics, local event-log sequence span, and per-mount compaction outcomes under `metadata_redb_*` metrics
 - physical file bytes are separate from redb stored/fragmented bytes; these statistics do not count logical StudioFS rows and do not scan table values
-- page statistics refresh at most once per five seconds when the shared writer mutex and database read lock are available; the stats-only write transaction can serialize metadata writes and durability barriers for the duration of a refresh. A busy writer/database gate keeps the prior sample; a concurrent diagnostics read can omit page gauges while the cache is being refreshed
+- successful page-stat samples are reused for five seconds; after that, diagnostics reads attempt a refresh through nonblocking writer/database gates. The stats-only write transaction can serialize metadata writes and durability barriers for the duration of a refresh. A busy gate or concurrent refresh returns the last sample, even if stale; page gauges are omitted until the first successful sample. Read-only snapshot mounts omit page gauges because redb 4.3 exposes them only through a write transaction
 - compaction counters reset when the local engine opens and are not persisted into the database
 
 ### `PgMetaEngine`

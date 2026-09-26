@@ -94,12 +94,48 @@ impl RedbMetaEngine {
             Some(first.map_or(0, |first| next.saturating_sub(first)));
     }
 
+    fn cached_local_storage_page_stats(&self) -> Option<CachedLocalStoragePageStats> {
+        *self
+            .local_storage_page_stats
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     fn local_storage_page_stats_best_effort(&self) -> Option<LocalStoragePageStats> {
+        self.local_storage_page_stats_best_effort_at(Instant::now())
+    }
+
+    pub(super) fn local_storage_page_stats_best_effort_at(
+        &self,
+        now: Instant,
+    ) -> Option<LocalStoragePageStats> {
         let db = self.db.as_ref()?;
-        let mut cached = self.local_storage_page_stats.try_lock().ok()?;
-        if cached.as_ref().is_none_or(|cached| {
-            cached.sampled_at.elapsed() >= LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL
-        }) && let Ok(_write_txn_guard) = self.write_txn_lock.try_lock()
+        let is_expired = |cached: Option<CachedLocalStoragePageStats>| {
+            cached.is_none_or(|cached| {
+                now.saturating_duration_since(cached.sampled_at)
+                    >= LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL
+            })
+        };
+        let cached = self.cached_local_storage_page_stats();
+        if !is_expired(cached) {
+            return cached.map(|cached| cached.stats);
+        }
+
+        let _refresh_guard = match self.local_storage_page_stats_refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return self
+                    .cached_local_storage_page_stats()
+                    .map(|cached| cached.stats);
+            }
+        };
+        let cached = self.cached_local_storage_page_stats();
+        if !is_expired(cached) {
+            return cached.map(|cached| cached.stats);
+        }
+
+        let stats = if let Ok(_write_txn_guard) = self.write_txn_lock.try_lock()
             && let Ok(db) = db.try_read()
             && let Ok(transaction) = db.begin_write()
         {
@@ -114,14 +150,22 @@ impl RedbMetaEngine {
                 page_size_bytes: u64::try_from(stats.page_size()).unwrap_or(u64::MAX),
             });
             let _ = transaction.abort();
-            if let Some(stats) = stats {
-                *cached = Some(CachedLocalStoragePageStats {
-                    sampled_at: Instant::now(),
-                    stats,
-                });
-            }
+            stats
+        } else {
+            None
+        };
+        if let Some(stats) = stats {
+            *self
+                .local_storage_page_stats
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(CachedLocalStoragePageStats {
+                sampled_at: Instant::now(),
+                stats,
+            });
+            Some(stats)
+        } else {
+            cached.map(|cached| cached.stats)
         }
-        cached.as_ref().map(|cached| cached.stats)
     }
 }
 
@@ -129,6 +173,7 @@ impl MetaGc for RedbMetaEngine {
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         let started = std::time::Instant::now();
         let mut bytes_before = None;
+        let mut bytes_after = None;
         let mut skip_reason = None;
         let result = (|| {
             let Some(db) = self.db.as_ref() else {
@@ -146,7 +191,10 @@ impl MetaGc for RedbMetaEngine {
             };
             bytes_before = self.physical_file_size_bytes();
             match db.compact() {
-                Ok(true) => Ok(LocalStorageCompactionResult::Compacted),
+                Ok(true) => {
+                    bytes_after = self.physical_file_size_bytes();
+                    Ok(LocalStorageCompactionResult::Compacted)
+                }
                 Ok(false) => Ok(LocalStorageCompactionResult::NoWork),
                 // ReadTransaction outlives our short RwLock read guard; redb
                 // reports active transactions here.
@@ -159,9 +207,6 @@ impl MetaGc for RedbMetaEngine {
                 ))),
             }
         })();
-        let bytes_after = matches!(&result, Ok(LocalStorageCompactionResult::Compacted))
-            .then(|| self.physical_file_size_bytes())
-            .flatten();
         if matches!(&result, Ok(LocalStorageCompactionResult::Compacted)) {
             *self
                 .local_storage_page_stats

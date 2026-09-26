@@ -61,6 +61,7 @@ struct LocalStoragePageStats {
     page_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct CachedLocalStoragePageStats {
     sampled_at: Instant,
     stats: LocalStoragePageStats,
@@ -73,6 +74,7 @@ pub struct RedbMetaEngine {
     metadata_path: PathBuf,
     local_storage_compaction: Mutex<LocalStorageCompactionStats>,
     local_storage_page_stats: Mutex<Option<CachedLocalStoragePageStats>>,
+    local_storage_page_stats_refresh: Mutex<()>,
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
     write_txn_lock: Arc<Mutex<()>>,
@@ -802,6 +804,7 @@ impl RedbMetaEngine {
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
             local_storage_page_stats: Mutex::default(),
+            local_storage_page_stats_refresh: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
             write_txn_lock,
@@ -844,6 +847,7 @@ impl RedbMetaEngine {
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
             local_storage_page_stats: Mutex::default(),
+            local_storage_page_stats_refresh: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability: None,
             write_txn_lock: Arc::new(Mutex::new(())),

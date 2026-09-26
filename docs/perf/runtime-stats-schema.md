@@ -150,12 +150,15 @@ redb.
 Physical file bytes and redb page statistics describe different things: the
 file may contain free or reusable pages, and redb stored bytes are not a count
 of logical StudioFS rows. The redb page gauges are best-effort and cached; a
-refresh is attempted no more than once every five seconds. redb 4.3 exposes
-them through `WriteTransaction::stats()`, so StudioFS refreshes them only when
-the shared metadata writer mutex and nonblocking database read lock are
-available. If either gate is busy, the previous sample is returned; page gauges
-are omitted until the first successful sample. A concurrent diagnostics read
-may omit page gauges while the cache is being refreshed. The stats-only
+successful sample is reused for five seconds. redb 4.3 exposes them through
+`WriteTransaction::stats()`, so StudioFS refreshes them only when the shared
+metadata writer mutex and nonblocking database read lock are available. After
+the sample expires, diagnostics reads attempt a refresh; if either gate or the
+refresh lock is busy, the previous sample is returned, even if stale. Page
+gauges are omitted until the first successful sample. Concurrent diagnostics
+reads use the previous sample while a refresh is in progress. Read-only snapshot
+mounts report file-size and event-log metrics but omit page gauges because redb
+4.3 exposes these statistics only through a write transaction. The stats-only
 transaction is aborted without changing metadata rows. A refresh can serialize
 metadata writes and durability barriers for the duration of the page/tree scan;
 the cache limits repeat scans, but a single refresh can still delay writers. An
