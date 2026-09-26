@@ -21,6 +21,7 @@ After this change, a developer can run one focused `studiofs-meta` test to creat
 - The current event log retains local events. Therefore the report must show its sequence span separately from live inode/dentry/xattr/ACL table counts; a growing event span is not itself evidence that the visible namespace grew.
 - The existing `studiofs perf` CLI only observes a mounted filesystem. A core local-storage workload belongs in the `studiofs-meta` test harness and can run without a mount or remote payload service.
 - The Windows default run kept four visible files and empty temporary directories while event-log span rose from 18 to 2,450 and ACL tombstones from 0 to 128. Those counts are observable logical state, so the workload reports them rather than asserting that every table returns to baseline.
+- The review pass added lifecycle and pending-compaction row counts. The churn files have local overlay chunk state and changed size, so unlink intentionally retains `DeletedBeforePublish` lifecycle rows without a remote cleanup worker; that count is reported rather than constrained to the four survivors.
 - `LocalStorageDiagnostics` page statistics are optional best-effort samples. The report keeps those fields as `Option` values instead of treating an unavailable sample as a workload failure.
 
 ## Decision Log

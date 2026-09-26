@@ -9,6 +9,7 @@ struct LocalChurnTableRows {
     overlay_inodes: u64,
     base_inodes: u64,
     inode_tombstones: u64,
+    inode_lifecycle: u64,
     overlay_dentries: u64,
     base_dentries: u64,
     overlay_dentry_index: u64,
@@ -16,6 +17,7 @@ struct LocalChurnTableRows {
     dentry_tombstones: u64,
     overlay_chunks: u64,
     base_chunks: u64,
+    pending_compaction: u64,
     overlay_xattrs: u64,
     base_xattrs: u64,
     xattr_tombstones: u64,
@@ -30,6 +32,7 @@ impl LocalChurnTableRows {
         self.overlay_inodes
             + self.base_inodes
             + self.inode_tombstones
+            + self.inode_lifecycle
             + self.overlay_dentries
             + self.base_dentries
             + self.overlay_dentry_index
@@ -37,6 +40,7 @@ impl LocalChurnTableRows {
             + self.dentry_tombstones
             + self.overlay_chunks
             + self.base_chunks
+            + self.pending_compaction
             + self.overlay_xattrs
             + self.base_xattrs
             + self.xattr_tombstones
@@ -69,6 +73,11 @@ fn local_churn_table_rows(engine: &RedbMetaEngine) -> LocalChurnTableRows {
             .expect("open inode tombstone table")
             .len()
             .expect("count inode tombstone rows"),
+        inode_lifecycle: transaction
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .expect("open inode lifecycle table")
+            .len()
+            .expect("count inode lifecycle rows"),
         overlay_dentries: transaction
             .open_table(DENTRIES_TABLE)
             .expect("open overlay dentry table")
@@ -104,6 +113,11 @@ fn local_churn_table_rows(engine: &RedbMetaEngine) -> LocalChurnTableRows {
             .expect("open regular-file base table")
             .len()
             .expect("count regular-file base rows"),
+        pending_compaction: transaction
+            .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+            .expect("open pending regular-file compaction table")
+            .len()
+            .expect("count pending regular-file compaction rows"),
         overlay_xattrs: transaction
             .open_table(XATTRS_TABLE)
             .expect("open overlay xattr table")
@@ -175,6 +189,14 @@ fn report_local_churn_checkpoint(
     }
     let visible_left_entries = engine.readdir(left_dir).expect("read left entries").len();
     let visible_right_entries = engine.readdir(right_dir).expect("read right entries").len();
+    assert_eq!(
+        visible_left_entries, 0,
+        "left churn directory must be empty at checkpoint {checkpoint}"
+    );
+    assert_eq!(
+        visible_right_entries, 0,
+        "right churn directory must be empty at checkpoint {checkpoint}"
+    );
     let table_rows = local_churn_table_rows(engine);
     assert_eq!(
         table_rows.overlay_dentries, table_rows.overlay_dentry_index,
@@ -183,6 +205,10 @@ fn report_local_churn_checkpoint(
     assert_eq!(
         table_rows.base_dentries, table_rows.base_dentry_index,
         "base dentry index should match stored dentry rows"
+    );
+    assert_eq!(
+        table_rows.pending_compaction, 0,
+        "temporary-file compaction markers should be cleared at checkpoint {checkpoint}"
     );
     let tracked_table_row_total = table_rows.total_rows();
     let tracked_metadata_table_rows = table_rows.metadata_rows();
@@ -295,6 +321,7 @@ fn local_metadata_churn_redb_growth_workload() {
                 &[(ChunkId(0), chunk.clone())],
                 &[(ChunkId(0), chunk)],
             );
+            set_regular_file_pending_compaction_rows(&engine, file.ino, &[ChunkId(0)]);
 
             let mut attr = engine.get_attr(file.ino).expect("read churn file attr");
             attr.size = (cycle * files_per_cycle + slot + 1) as u64;
@@ -348,6 +375,7 @@ fn local_metadata_churn_redb_growth_workload() {
                     parent: temporary_dir.ino,
                     name: source_name.as_bytes().to_vec(),
                 },
+                MetaEvent::RemoveRegularFileGraph { ino: file.ino },
                 MetaEvent::RemoveAttr { ino: file.ino },
                 MetaEvent::RemoveXattr {
                     ino: file.ino,
@@ -369,8 +397,6 @@ fn local_metadata_churn_redb_growth_workload() {
                 .expect("remove empty churn directory");
         }
 
-        assert!(engine.readdir(left.ino).expect("read left directory").is_empty());
-        assert!(engine.readdir(right.ino).expect("read right directory").is_empty());
         let cycle_diagnostics = report_local_churn_checkpoint(
             &engine,
             &format!("cycle-{cycle:04}"),
