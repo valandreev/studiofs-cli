@@ -405,25 +405,6 @@ impl RedbMetaEngine {
             .collect()
     }
 
-    pub(crate) fn remove_pending_regular_file_recoveries(&self, inos: &[Ino]) -> MetaResult<()> {
-        if inos.is_empty() {
-            return Ok(());
-        }
-
-        let txn = self.begin_immediate_write_txn()?;
-        let mut table = txn
-            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
-        for ino in inos {
-            let _ = table
-                .remove(*ino)
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-        }
-        drop(table);
-        txn.commit()
-            .map_err(|error| MetaError::Storage(error.to_string()))
-    }
-
     /// Capture legacy pending overlays from the recovered live view before a
     /// remote snapshot replaces that view during redb repair.
     pub(crate) fn backfill_missing_uploaded_regular_file_recoveries(&self) -> MetaResult<()> {
@@ -446,10 +427,11 @@ impl RedbMetaEngine {
             attrs
         };
 
+        let mut recoveries = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
         for attr in attrs {
-            let already_captured = txn
-                .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
-                .map_err(|error| MetaError::Storage(error.to_string()))?
+            let already_captured = recoveries
                 .get(attr.ino)
                 .map_err(|error| MetaError::Storage(error.to_string()))?
                 .is_some();
@@ -469,12 +451,12 @@ impl RedbMetaEngine {
             let ino = attr.ino;
             let overlay = crate::schema::RegularFileOverlayState { chunks };
             let bytes = encode(&PendingRegularFileRecoveryRecord { attr, overlay })?;
-            txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
-                .map_err(|error| MetaError::Storage(error.to_string()))?
+            recoveries
                 .insert(ino, bytes.as_slice())
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
         }
 
+        drop(recoveries);
         txn.commit()
             .map_err(|error| MetaError::Storage(error.to_string()))
     }

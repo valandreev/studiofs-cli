@@ -1600,6 +1600,65 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
 }
 
 #[test]
+fn test_backfill_pending_regular_file_recovery_preserves_existing_record() {
+    let engine = temp_engine();
+    let ino = engine
+        .create_file(ROOT_INO, b"backfill-recovery.bin", 1000, 1000, 0o644)
+        .unwrap()
+        .ino;
+    let mut slice = SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, 4096).unwrap(),
+        PayloadRef::new_partial(1203, 4096),
+    );
+    slice.payload_state = PayloadRefState::Uploaded;
+    let mut chunk = RegularFileChunkState::default();
+    chunk.insert_slice(slice);
+    set_regular_file_chunk_rows(&engine, ino, &[(ChunkId(0), chunk)], &[]);
+
+    let mut attr = engine.get_attr(ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+        .unwrap()
+        .remove(ino)
+        .unwrap();
+    txn.commit().unwrap();
+
+    engine
+        .backfill_missing_uploaded_regular_file_recoveries()
+        .unwrap();
+    let first = engine
+        .pending_uploaded_regular_file_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|(attr, _)| attr.ino == ino)
+        .expect("backfilled uploaded recovery row");
+
+    let mut changed_attr = engine.get_attr(ino).unwrap();
+    changed_attr.mode = 0o600;
+    engine
+        .apply_replica_serving_state(&[MetaEvent::SetAttr { attr: changed_attr }])
+        .unwrap();
+    engine
+        .backfill_missing_uploaded_regular_file_recoveries()
+        .unwrap();
+    let after = engine
+        .pending_uploaded_regular_file_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|(attr, _)| attr.ino == ino)
+        .expect("existing uploaded recovery row");
+
+    assert_eq!(first.0.mode, 0o644);
+    assert_eq!(after.0.mode, first.0.mode);
+    assert_eq!(after.1.chunks, first.1.chunks);
+}
+
+#[test]
 fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
     let engine = temp_engine();
     let ino = engine

@@ -426,21 +426,28 @@ impl PgMetaEngine {
         &self,
     ) -> MetaResult<()> {
         let overlays = self.local.pending_uploaded_regular_file_recoveries()?;
+        let inos: Vec<_> = overlays.iter().map(|(attr, _)| attr.ino).collect();
+        let current_attrs: HashMap<_, _> = self
+            .local
+            .get_attrs_batch(&inos)?
+            .into_iter()
+            .map(|attr| (attr.ino, attr))
+            .collect();
         let mut restored_inodes = 0usize;
         let mut obsolete_recovery_inodes = Vec::new();
         let mut restored_events = Vec::new();
         for (attr, overlay) in overlays {
             let ino = attr.ino;
 
-            let current = match self.local.get_attr(ino) {
-                Ok(current) => current,
-                Err(MetaError::InodeNotFound(_)) => {
-                    obsolete_recovery_inodes.push(ino);
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let Some(current) = current_attrs.get(&ino) else {
+                obsolete_recovery_inodes.push(ino);
+                continue;
             };
-            if !attrs_match_repair_candidate(&current, &attr) {
+            if current.kind != FileType::RegularFile || current.crtime != attr.crtime {
+                obsolete_recovery_inodes.push(ino);
+                continue;
+            }
+            if !attrs_match_repair_candidate(current, &attr) {
                 if current.content_epoch > attr.content_epoch
                     || (attr.content_epoch > attr.committed_content_epoch
                         && current.committed_content_epoch >= attr.content_epoch)
@@ -454,16 +461,14 @@ impl PgMetaEngine {
             restored_inodes = restored_inodes.saturating_add(1);
         }
 
+        self.local
+            .apply_redb_repair_recovery(&restored_events, &obsolete_recovery_inodes)?;
         if restored_inodes > 0 {
-            self.local.apply_replica_serving_state(&restored_events)?;
-            self.local.rebuild_inode_lifecycle_table()?;
             tracing::warn!(
                 restored_inodes,
                 "redb repair restored acknowledged uploaded regular-file serving overlays"
             );
         }
-        self.local
-            .remove_pending_regular_file_recoveries(&obsolete_recovery_inodes)?;
         Ok(())
     }
 
