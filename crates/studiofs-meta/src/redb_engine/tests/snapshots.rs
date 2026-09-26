@@ -122,6 +122,14 @@ fn pruned_local_dentry_mutation_survives_redb_reopen() {
             .local_dentry_mutations,
         vec![(key, LocalDentryMutation::Removed as u8)]
     );
+    assert_eq!(
+        reopened
+            .local_storage_diagnostics()
+            .expect("read reducer diagnostics")
+            .expect("writable local diagnostics")
+            .local_dentry_mutation_baseline_rows,
+        Some(1)
+    );
 }
 
 #[test]
@@ -141,6 +149,44 @@ fn local_snapshot_rejects_legacy_pruned_log_without_dentry_baseline() {
     engine
         .import_snapshot(&snapshot)
         .expect("an empty but covered dentry baseline is valid");
+}
+
+#[test]
+fn local_snapshot_rejects_invalid_dentry_mutation_rows() {
+    let engine = temp_engine();
+    let key = encode_dentry_key(ROOT_INO, b"local-authority");
+    let counters = vec![
+        (
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ.to_string(),
+            1,
+        ),
+        (
+            crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION.to_string(),
+            1,
+        ),
+    ];
+
+    for state in [0, 3, 255] {
+        let snapshot = RedbSnapshot {
+            counters: counters.clone(),
+            local_dentry_mutations: vec![(key.clone(), state)],
+            ..RedbSnapshot::default()
+        };
+        assert!(matches!(
+            engine.import_snapshot(&snapshot),
+            Err(MetaError::Storage(_))
+        ));
+    }
+
+    let malformed_key = RedbSnapshot {
+        counters,
+        local_dentry_mutations: vec![(b"short".to_vec(), LocalDentryMutation::Removed as u8)],
+        ..RedbSnapshot::default()
+    };
+    assert!(matches!(
+        engine.import_snapshot(&malformed_key),
+        Err(MetaError::Storage(_))
+    ));
 }
 
 #[test]
@@ -223,6 +269,23 @@ fn remote_snapshot_modes_do_not_replace_local_dentry_baseline() {
         "remote replacement must clear local reducer baseline"
     );
     assert_eq!(local.get_counter(marker).unwrap(), 0);
+}
+
+#[test]
+fn remote_snapshot_export_ignores_invalid_local_dentry_mutation_rows() {
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut baseline = txn.open_table(LOCAL_DENTRY_MUTATIONS_TABLE).unwrap();
+        baseline.insert(&b"not-a-dentry-key"[..], 255).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let snapshot = engine
+        .export_remote_snapshot()
+        .expect("local reducer corruption must not block remote checkpoint export");
+
+    assert!(snapshot.local_dentry_mutations.is_empty());
 }
 
 #[test]

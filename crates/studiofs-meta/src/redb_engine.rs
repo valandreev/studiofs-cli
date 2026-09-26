@@ -72,6 +72,7 @@ struct CachedLocalStoragePageStats {
 struct LocalEventLogPruneStats {
     rows_pruned: u64,
     payload_bytes_pruned: u64,
+    skipped_busy: u64,
     last_rows: Option<u64>,
     last_first_seq: Option<u64>,
     last_last_seq: Option<u64>,
@@ -86,6 +87,7 @@ pub(crate) struct LocalEventLogPruneBatch {
     pub(crate) last_seq: Option<u64>,
     pub(crate) payload_bytes: u64,
     pub(crate) floor_updated: bool,
+    pub(crate) skipped_busy: bool,
 }
 
 /// Metadata engine backed by redb.

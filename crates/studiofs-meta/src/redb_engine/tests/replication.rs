@@ -327,7 +327,9 @@ fn local_event_pruning_skips_write_transaction_before_the_first_sequence() {
         completed_on_time,
         "floor 1 has no eligible event rows and must not wait for the redb writer"
     );
-    assert_eq!(result.unwrap().rows, 0);
+    let batch = result.unwrap();
+    assert_eq!(batch.rows, 0);
+    assert!(!batch.skipped_busy, "no eligible rows is a successful no-op");
 }
 
 #[test]
@@ -404,6 +406,18 @@ fn local_event_pruning_skips_busy_writer_with_eligible_events() {
     assert!(completed_on_time, "background pruning must not wait for a busy writer");
     assert_eq!(result.unwrap().rows, 0);
     assert_eq!(event_log_sequences(&engine), original_events);
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        diagnostics.last_local_event_log_prune_rows,
+        None,
+        "a busy skip is not a completed zero-row attempt"
+    );
+    assert_eq!(
+        diagnostics.local_event_log_prune_skipped_busy_total, 1
+    );
     assert!(
         engine.prune_local_event_log_before(event_seq + 1, 10).unwrap().rows > 0,
         "the next idle attempt must prune the eligible event"
@@ -829,6 +843,61 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
     engine
         .create_symlink(ROOT_INO, b"renamed-link", b"target-v2.txt", 0, 0)
         .expect("locally unlinked destination must be reusable");
+}
+
+#[test]
+fn replica_serving_rename_preserves_unflushed_unlink_after_create_was_pruned() {
+    let source = temp_engine();
+    let entry = source
+        .create_symlink(ROOT_INO, b"source-link", b"remote-target.txt", 0, 0)
+        .unwrap();
+    let snapshot = source.export_remote_snapshot().unwrap();
+
+    let engine = temp_engine();
+    engine.import_snapshot(&snapshot).unwrap();
+    engine
+        .create_symlink(ROOT_INO, b"destination-link", b"local-target.txt", 0, 0)
+        .unwrap();
+    let acknowledged_through = engine.get_counter("nextEventSeq").unwrap();
+    engine
+        .set_counter("pgLastFlushedLocalEventSeq", acknowledged_through)
+        .unwrap();
+    assert!(
+        engine
+            .prune_local_event_log_before(acknowledged_through, 16)
+            .unwrap()
+            .rows
+            > 0
+    );
+    assert!(event_log_sequences(&engine).is_empty());
+    engine.unlink(ROOT_INO, b"destination-link").unwrap();
+    assert_eq!(
+        engine.first_event_seq().unwrap(),
+        Some(acknowledged_through),
+        "the unlink event suffix must remain unacknowledged"
+    );
+
+    let pg_winner = replica_rename_event(
+        ROOT_INO,
+        b"source-link",
+        ROOT_INO,
+        b"destination-link",
+        DirEntryValue {
+            ino: entry.ino,
+            kind: entry.kind,
+        },
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&pg_winner))
+        .unwrap();
+
+    assert!(
+        engine.lookup(ROOT_INO, b"destination-link").is_err(),
+        "a retained local unlink must override a created baseline when foreign rename targets the name"
+    );
 }
 
 #[test]

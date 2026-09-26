@@ -1,5 +1,5 @@
 use super::*;
-use redb::CompactionError;
+use redb::{CompactionError, ReadableTableMetadata};
 
 impl RedbMetaEngine {
     fn record_local_event_log_prune(
@@ -14,6 +14,12 @@ impl RedbMetaEngine {
         stats.last_duration_ns = Some(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         match result {
             Ok(batch) => {
+                if batch.skipped_busy {
+                    stats.skipped_busy = stats.skipped_busy.saturating_add(1);
+                    stats.last_rows = None;
+                    stats.last_payload_bytes = None;
+                    return;
+                }
                 let rows = u64::try_from(batch.rows).unwrap_or(u64::MAX);
                 stats.rows_pruned = stats.rows_pruned.saturating_add(rows);
                 stats.payload_bytes_pruned = stats
@@ -55,7 +61,10 @@ impl RedbMetaEngine {
             }
 
             let Some(txn) = self.try_begin_write_txn()? else {
-                return Ok(LocalEventLogPruneBatch::default());
+                return Ok(LocalEventLogPruneBatch {
+                    skipped_busy: true,
+                    ..LocalEventLogPruneBatch::default()
+                });
             };
             let batch =
                 match Self::prune_local_event_log_batch_in_txn(&txn, exclusive_floor, max_rows) {
@@ -266,6 +275,13 @@ impl RedbMetaEngine {
         transaction: &redb::ReadTransaction,
         diagnostics: &mut LocalStorageDiagnostics,
     ) {
+        match transaction.open_table(LOCAL_DENTRY_MUTATIONS_TABLE) {
+            Ok(baseline) => diagnostics.local_dentry_mutation_baseline_rows = baseline.len().ok(),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                diagnostics.local_dentry_mutation_baseline_rows = Some(0);
+            }
+            Err(_) => {}
+        }
         let pruned_through_seq = Self::read_counter_from_read_txn(
             transaction,
             crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
@@ -445,6 +461,7 @@ impl MetaGc for RedbMetaEngine {
         let mut diagnostics = LocalStorageDiagnostics {
             local_event_log_pruned_rows_total: prune.rows_pruned,
             local_event_log_pruned_payload_bytes_total: prune.payload_bytes_pruned,
+            local_event_log_prune_skipped_busy_total: prune.skipped_busy,
             last_local_event_log_prune_rows: prune.last_rows,
             last_local_event_log_prune_first_seq: prune.last_first_seq,
             last_local_event_log_prune_last_seq: prune.last_last_seq,

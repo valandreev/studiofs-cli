@@ -19,6 +19,7 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
 - [x] (2026-09-27) Run focused review-follow-up tests and the required metadata/VFS validation gates.
 - [x] (2026-09-27) Resolve the second inline review: preserve foreign-apply authority through pruning, reset the cursor after journal replacement, skip busy writers, verify restart replay, and correct diagnostics/documentation.
 - [x] (2026-09-27) Reject legacy positive-floor databases and local snapshots that lack proof the dentry authority summary covered the removed prefix; run focused regressions and metadata/VFS validation gates.
+- [x] (2026-09-27) Address the next review: distinguish retained from pruned `Created` state, use targeted summary lookups, expose busy skips and summary size, make replacement cursor reset infallible, isolate remote export from the local summary, correct metrics/docs, and cover malformed snapshots.
 
 ## Surprises & Discoveries
 
@@ -40,6 +41,14 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
   Evidence: `replacing_local_state_resets_the_in_memory_prune_cursor` failed before the cursor reset because the new unflushed event at sequence 1 was removed.
 - Observation: Databases pruned by an earlier build of this branch have irrecoverably lost any namespace events in that prefix, so creating an empty summary during upgrade would silently authorize a foreign rename to restore an unlinked name.
   Evidence: `foreign_rename_rejects_legacy_pruned_log_without_dentry_baseline`, `local_event_pruning_rejects_legacy_floor_without_dentry_baseline`, and `local_snapshot_rejects_legacy_pruned_log_without_dentry_baseline` all failed before the coverage guard and pass after it.
+- Observation: The summary must distinguish a `Created` value folded from pruned acknowledged history from a `Created` event in the retained suffix. Only the latter can be canceled by a following retained `RemoveEntry`; otherwise an unflushed unlink can be lost after its earlier create was pruned.
+  Evidence: `replica_serving_rename_preserves_unflushed_unlink_after_create_was_pruned` reproduced a foreign rename recreating the unlinked name before the retained reducer path was fixed.
+- Observation: Foreign rename reconciliation needs one destination membership lookup, not a materialized copy of the complete summary table. The summary has no safe incremental reclamation cutoff and may grow with distinct local authority changes.
+  Evidence: The reconciliation call is inside the redb write transaction; `Table::get` and `Table::len` support key lookup and row-count diagnostics without iterating every summary row.
+- Observation: Busy-writer admission skips maintenance; that is not a successful empty prune. A skip must leave last-batch row/byte gauges absent and remain observable as a cumulative counter.
+  Evidence: `local_event_pruning_skips_busy_writer_with_eligible_events` checks the unchanged event log, omitted last-row value, and incremented skip count.
+- Observation: Remote checkpoint export strips local dentry summaries from the artifact, so corrupt local summary values must not prevent export of remote-serving state. Local imports and local reconciliation still validate their keys and enum values.
+  Evidence: `remote_snapshot_export_ignores_invalid_local_dentry_mutation_rows` and `local_snapshot_rejects_invalid_dentry_mutation_rows` exercise the two boundaries.
 
 ## Decision Log
 
@@ -56,6 +65,12 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
 - Decision: Skip a background prune batch when the redb writer is busy. Rationale: mounting writes and durability barriers should not queue behind local maintenance when the writer is already occupied. Date/Author: 2026-09-27, Codex.
 - Decision: Fold pruned namespace events into a durable per-dentry `Created`/`Removed` summary in the same transaction as deletion; let foreign serving reconciliation start its reducer from that summary. Rationale: foreign rename must retain acknowledged local unlink authority even after event rows are removed. `Created` is needed so a later `RemoveEntry` cancels a locally created name instead of hiding an unrelated peer rename. Date/Author: 2026-09-27, Codex.
 - Decision: Record a versioned coverage counter with the first summary-backed prune and preserve or clear it together with the local journal. Reject positive-floor state without that counter before foreign reconciliation, further pruning, or local snapshot import. Rationale: a missing table or empty summary alone cannot distinguish a valid namespace-free prefix from history already deleted by an earlier build. Date/Author: 2026-09-27, Codex.
+- Decision: During foreign rename replay, only a `Created` state produced in the retained event suffix can cancel a later `RemoveEntry`. Load baseline rows lazily for keys touched by retained events and inspect only the destination key for rename authority. Rationale: baseline state represents acknowledged history and must not cancel a newer unflushed unlink; scanning the summary table under the writer lock would make rename cost grow with all historical names. Date/Author: 2026-09-27, Codex.
+- Decision: Expose the summary table's row count and document that it can grow without a safe incremental reclaim cutoff; full serving-checkpoint replacement clears it with the local journal. Rationale: pruning must not discard local unlink authority without a proven remote-authority cutoff, while operators need visibility into the retained summary's size. Date/Author: 2026-09-27, Codex.
+- Decision: Count busy-writer prune skips separately, omit last-row/byte gauges for skipped attempts, and let the next background poll retry. Rationale: a maintenance skip is neither an error nor a successful no-op and should not endanger or block mounted foreground writes. Date/Author: 2026-09-27, Codex.
+- Decision: Make the post-replacement in-memory event cursor reset infallible after the destructive local import commits. Rationale: remote replacement clears local event sequence state, so the correct cursor is zero and a poisoned progress mutex can be recovered without another storage read or a post-commit failure. Date/Author: 2026-09-27, Codex.
+- Decision: Include local dentry summary rows only in local snapshot export; remote checkpoint export skips reading this local-only table entirely. Keep key/value validation on local import and reconciliation paths. Rationale: remote export neither needs the summary nor should it fail or pay to scan an unbounded local-only table. Date/Author: 2026-09-27, Codex.
+- Decision: Report the prune watermark only when the best-effort read succeeds and its stored value is greater than zero. Rationale: zero is the no-prune state, and an omitted gauge can also mean diagnostics were unavailable. Date/Author: 2026-09-27, Codex.
 
 ## Outcomes & Retrospective
 
@@ -105,6 +120,20 @@ Validation passed:
 - `cargo check -p studiofs-meta -p studiofs-vfs`, `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` — passed.
 
 Already-pruned local history from a build without the summary cannot be reconstructed; the coverage guard returns a recovery error instead of silently losing local unlink authority. PostgreSQL integration and mounted FUSE/WinFSP runs were not executed for this local-storage review.
+
+The next review follow-up keeps acknowledged `Created` baseline state from canceling a newer retained unlink. Foreign rename reads only the destination baseline row and touched retained-event keys, rather than materializing the summary table. Busy writer skips increment a dedicated counter and omit the last-batch gauges; the next poll retries. Replacement imports reset the live event cursor to zero without fallible post-commit I/O. Remote checkpoint export omits the local summary table entirely, while local snapshot import continues to reject malformed keys and values. The row-count gauge makes summary growth observable; no safe incremental reclaim cutoff is known, so the summary remains unbounded until a full serving-checkpoint replacement clears local state.
+
+Validation passed:
+
+- `cargo test -p studiofs-meta --lib local_event_pruning` — 17 passed.
+- `cargo test -p studiofs-meta --lib replica_serving_rename` — 8 passed.
+- `cargo test -p studiofs-meta --lib local_snapshot_rejects_invalid_dentry_mutation_rows` — 1 passed.
+- `cargo test -p studiofs-meta --lib remote_snapshot_export_ignores_invalid_local_dentry_mutation_rows` — 1 passed.
+- `cargo test -p studiofs-meta --lib replacing_local_state` — 2 passed.
+- `cargo test -p studiofs-vfs --lib local_event_prune_runtime_stats_use_documented_units` — 1 passed.
+- `cargo test -p studiofs-vfs --lib runtime_stats_surface_reports_local_event_prune_metrics` — 1 passed.
+
+The legacy-history coverage error applies only to local databases written by earlier unreleased SFS-735 builds that pruned rows before recording the coverage marker. Pruning and foreign rename apply then fail closed; local state must be replaced from a serving checkpoint to recover. PostgreSQL integration and mounted FUSE/WinFSP runs remain unexecuted for this local redb review.
 
 ## Context and Orientation
 

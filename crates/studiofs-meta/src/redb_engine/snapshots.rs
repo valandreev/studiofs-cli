@@ -21,10 +21,13 @@ impl RedbMetaEngine {
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;
-        Self::export_snapshot_from_read_txn(&txn)
+        Self::export_snapshot_from_read_txn(&txn, true)
     }
 
-    pub(super) fn export_snapshot_from_read_txn(txn: &ReadTransaction) -> MetaResult<RedbSnapshot> {
+    pub(super) fn export_snapshot_from_read_txn(
+        txn: &ReadTransaction,
+        include_local_dentry_mutations: bool,
+    ) -> MetaResult<RedbSnapshot> {
         let mut snapshot = RedbSnapshot::default();
 
         {
@@ -79,22 +82,23 @@ impl RedbMetaEngine {
                     .push((k.value().to_vec(), v.value().to_vec()));
             }
         }
-        match txn.open_table(LOCAL_DENTRY_MUTATIONS_TABLE) {
-            Ok(table) => {
-                for row in table
-                    .iter()
-                    .map_err(|error| MetaError::Storage(error.to_string()))?
-                {
-                    let (key, state) =
-                        row.map_err(|error| MetaError::Storage(error.to_string()))?;
-                    let key = key.value().to_vec();
-                    decode_dentry_key(&key)?;
-                    LocalDentryMutation::try_from(state.value())?;
-                    snapshot.local_dentry_mutations.push((key, state.value()));
+        if include_local_dentry_mutations {
+            match txn.open_table(LOCAL_DENTRY_MUTATIONS_TABLE) {
+                Ok(table) => {
+                    for row in table
+                        .iter()
+                        .map_err(|error| MetaError::Storage(error.to_string()))?
+                    {
+                        let (key, state) =
+                            row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                        snapshot
+                            .local_dentry_mutations
+                            .push((key.value().to_vec(), state.value()));
+                    }
                 }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(MetaError::Storage(error.to_string())),
             }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(error) => return Err(MetaError::Storage(error.to_string())),
         }
         {
             snapshot.regular_file_overlay = Self::regular_file_snapshot_rows_from_txn(

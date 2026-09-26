@@ -129,13 +129,15 @@ database; these metrics do not describe `cache.redb`.
 | `metadata_redb_first_local_event_seq` | gauge / count | Lowest sequence still retained in the local metadata event log. Omitted when the event log is empty or unavailable. |
 | `metadata_redb_next_local_event_seq` | gauge / count | Reported exclusive next sequence; if the counter is missing or below the retained tail, diagnostics use one past the highest retained event. |
 | `metadata_redb_retained_local_event_span` | gauge / count | `next_local_event_seq - first_local_event_seq`, or zero when the event log is empty. This is a sequence span, not a row count. |
-| `metadata_redb_local_event_log_pruned_through_seq` | gauge / count | Inclusive acknowledged/pruned-through frontier persisted in local redb. No event-log row at or below it remains; the range can include sequence gaps that had no row. Omitted when no frontier is stored. |
+| `metadata_redb_local_dentry_mutation_baseline_rows` | gauge / count | Number of local dentry authority summary rows. Omitted when the table cannot be read. It can grow with distinct local authority changes; no safe incremental reclamation cutoff is currently established. |
+| `metadata_redb_local_event_log_pruned_through_seq` | gauge / count | Inclusive acknowledged/pruned-through frontier persisted in local redb. No event-log row at or below it remains; the range can include sequence gaps that had no row. Reported only when the counter can be read and is greater than zero; otherwise omitted. |
 | `metadata_redb_local_event_log_pruned_rows_total` | counter / count | Local event-log rows removed since this metadata engine opened. |
 | `metadata_redb_local_event_log_pruned_payload_bytes_total` | counter / bytes | Encoded event payload bytes removed since this metadata engine opened. |
-| `metadata_redb_local_event_log_prune_last_rows` | gauge / count | Rows removed by the latest prune attempt. Omitted before an attempt or when the latest attempt errors; a successful no-op reports zero. |
+| `metadata_redb_local_event_log_prune_skipped_busy_total` | counter / count | Background prune attempts skipped because a redb writer was busy since this metadata engine opened. |
+| `metadata_redb_local_event_log_prune_last_rows` | gauge / count | Rows removed by the latest completed prune attempt. Omitted before an attempt, after an error, or after a busy-writer skip; a successful no-op reports zero. |
 | `metadata_redb_local_event_log_prune_last_first_seq` | gauge / count | First sequence removed by the latest non-empty successful prune batch. |
 | `metadata_redb_local_event_log_prune_last_last_seq` | gauge / count | Last sequence removed by the latest non-empty successful prune batch. |
-| `metadata_redb_local_event_log_prune_last_payload_bytes` | gauge / bytes | Encoded payload bytes removed by the latest prune attempt. Omitted before an attempt or when the latest attempt errors; a successful no-op reports zero. |
+| `metadata_redb_local_event_log_prune_last_payload_bytes` | gauge / bytes | Encoded payload bytes removed by the latest completed prune attempt. Omitted before an attempt, after an error, or after a busy-writer skip; a successful no-op reports zero. |
 | `metadata_redb_local_event_log_prune_last_duration_ns` | gauge / ns | Elapsed time for the latest prune attempt, including attempts that error. |
 | `metadata_redb_compaction_attempts_total` | counter / count | Compaction calls since this metadata engine opened. |
 | `metadata_redb_compaction_compacted_total` | counter / count | Calls where redb compaction made progress. |
@@ -153,9 +155,10 @@ The boolean result gauges are `metadata_redb_compaction_last_result_compacted`,
 one is `1` after an attempt. A busy attempt sets either
 `metadata_redb_compaction_last_skip_reason_database_lock_contended` or
 `metadata_redb_compaction_last_skip_reason_active_transaction` to `1`. These
-Compaction counters, local prune row/byte totals, and last-attempt values reset
-when the local metadata engine opens. The acknowledged/pruned-through event
-sequence frontier is persisted in the local redb counter table.
+Compaction counters, local prune row/byte totals, prune busy-skip counts, and
+last-attempt values reset when the local metadata engine opens. The
+acknowledged/pruned-through event sequence frontier is persisted in the local
+redb counter table.
 
 Physical file bytes and redb page statistics describe different things: the
 file may contain free or reusable pages, and redb stored bytes are not a count

@@ -4281,6 +4281,31 @@ fn replacing_local_state_resets_the_in_memory_prune_cursor() {
 }
 
 #[test]
+fn replacing_local_state_succeeds_when_event_progress_lock_is_poisoned() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let checkpoint = pg
+        .local
+        .begin_serving_checkpoint_snapshot()
+        .expect("capture replacement checkpoint")
+        .export_serving_checkpoint()
+        .expect("export replacement checkpoint");
+    pg.flushed_event_seq.store(99, Ordering::SeqCst);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _progress = pg.local_event_progress.lock().unwrap();
+        panic!("poison the local event progress lock");
+    }));
+
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::ReplaceLocalState,
+        &checkpoint,
+        0,
+    )
+    .expect("post-import cursor reset must not fail");
+
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn startup_snapshot_replay_starts_from_snapshot_epoch_not_pg_head() {
     assert_eq!(
         PgMetaEngine::snapshot_replay_start_version(3, 9),

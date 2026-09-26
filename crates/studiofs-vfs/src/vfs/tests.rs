@@ -2492,6 +2492,18 @@ fn runtime_stats_surface_reports_local_event_prune_metrics() {
             .counters
             .contains_key("metadata_redb_local_event_log_pruned_payload_bytes_total")
     );
+    assert!(
+        initial_snapshot
+            .metadata
+            .gauges
+            .contains_key("metadata_redb_local_dentry_mutation_baseline_rows")
+    );
+    assert!(
+        initial_snapshot
+            .metadata
+            .counters
+            .contains_key("metadata_redb_local_event_log_prune_skipped_busy_total")
+    );
 
     meta.set_counter(
         studiofs_meta::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,

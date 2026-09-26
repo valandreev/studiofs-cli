@@ -604,6 +604,10 @@ pub struct LocalStorageDiagnostics {
     pub local_event_log_pruned_rows_total: u64,
     /// Cumulative encoded event payload bytes removed since this metadata engine was opened.
     pub local_event_log_pruned_payload_bytes_total: u64,
+    /// Background prune batches skipped because a redb writer was busy since this engine opened.
+    pub local_event_log_prune_skipped_busy_total: u64,
+    /// Number of local dentry authority summary rows, omitted when unavailable.
+    pub local_dentry_mutation_baseline_rows: Option<u64>,
     /// Rows removed by the latest prune attempt; `None` before an attempt or after an error.
     pub last_local_event_log_prune_rows: Option<u64>,
     /// First sequence removed by the most recent non-empty successful prune batch.
