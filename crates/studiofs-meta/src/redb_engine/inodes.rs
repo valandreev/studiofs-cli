@@ -3,6 +3,9 @@ use super::*;
 const INODE_LIFECYCLE_SCHEMA_VERSION_KEY: &str = "inode_lifecycle_schema_version";
 const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 
+/// Local-only recovery copy for one uploaded, unpublished content epoch.
+/// Snapshot replacement excludes this row; publication, superseding epochs, or
+/// inode deletion retire it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PendingRegularFileRecoveryRecord {
     attr: InodeAttr,
@@ -400,6 +403,25 @@ impl RedbMetaEngine {
                 Ok((record.attr, record.overlay))
             })
             .collect()
+    }
+
+    pub(crate) fn remove_pending_regular_file_recoveries(&self, inos: &[Ino]) -> MetaResult<()> {
+        if inos.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self.begin_immediate_write_txn()?;
+        let mut table = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        for ino in inos {
+            let _ = table
+                .remove(*ino)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+        }
+        drop(table);
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))
     }
 
     /// Capture legacy pending overlays from the recovered live view before a

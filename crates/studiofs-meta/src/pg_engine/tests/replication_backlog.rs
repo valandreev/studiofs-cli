@@ -764,6 +764,16 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         accepted.committed_content_epoch
     );
     assert_eq!(restored.upload_state, accepted.upload_state);
+    let lifecycle = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("restored lifecycle")
+        .expect("repaired inode has a lifecycle row");
+    assert_eq!(
+        lifecycle.state,
+        crate::schema::InodeLifecycleState::PublishReady
+    );
+    assert_eq!(lifecycle.local_content_epoch, restored.content_epoch);
     assert_eq!(
         lookup_object_ids(&pg, file.ino, restored.size).expect("restored object ids"),
         vec![payload.object_id],
@@ -870,6 +880,13 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
             .is_empty(),
         "the stale uploaded extent must stay unreachable under the newer remote state"
     );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records after published projection")
+            .is_empty(),
+        "a published epoch retires its obsolete local recovery record"
+    );
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
         flushed_event_seq_before_restore,
@@ -933,6 +950,13 @@ fn redb_repair_does_not_restore_superseded_or_deleted_uploaded_overlays() {
             .get_referenced_object_ids()
             .expect("projected object references")
             .is_empty()
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records after superseded/deleted projection")
+            .is_empty(),
+        "superseded and deleted inodes retire their obsolete recovery records"
     );
     assert_eq!(
         pg.local

@@ -762,6 +762,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(INODES_TABLE);
             let _ = txn.open_table(BASE_INODES_TABLE);
             let _ = txn.open_table(INODE_LIFECYCLE_TABLE);
+            let _ = txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE);
             let _ = txn.open_table(INODE_TOMBSTONES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(DENTRIES_BY_INODE_TABLE);

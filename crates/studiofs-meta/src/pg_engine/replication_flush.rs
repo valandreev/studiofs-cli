@@ -427,16 +427,26 @@ impl PgMetaEngine {
     ) -> MetaResult<()> {
         let overlays = self.local.pending_uploaded_regular_file_recoveries()?;
         let mut restored_inodes = 0usize;
+        let mut obsolete_recovery_inodes = Vec::new();
         let mut restored_events = Vec::new();
         for (attr, overlay) in overlays {
             let ino = attr.ino;
 
             let current = match self.local.get_attr(ino) {
                 Ok(current) => current,
-                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(MetaError::InodeNotFound(_)) => {
+                    obsolete_recovery_inodes.push(ino);
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             if !attrs_match_repair_candidate(&current, &attr) {
+                if current.content_epoch > attr.content_epoch
+                    || (attr.content_epoch > attr.committed_content_epoch
+                        && current.committed_content_epoch >= attr.content_epoch)
+                {
+                    obsolete_recovery_inodes.push(ino);
+                }
                 continue;
             }
 
@@ -452,6 +462,8 @@ impl PgMetaEngine {
                 "redb repair restored acknowledged uploaded regular-file serving overlays"
             );
         }
+        self.local
+            .remove_pending_regular_file_recoveries(&obsolete_recovery_inodes)?;
         Ok(())
     }
 
