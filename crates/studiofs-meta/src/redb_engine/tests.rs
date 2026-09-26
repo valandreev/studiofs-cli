@@ -546,6 +546,7 @@ include!("tests/inodes.rs");
 include!("tests/namespace.rs");
 include!("tests/fs_ops.rs");
 include!("tests/chunk_state.rs");
+include!("tests/local_storage_churn.rs");
 
 #[test]
 fn sync_local_metadata_executes_immediate_barrier() {
