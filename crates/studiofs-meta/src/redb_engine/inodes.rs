@@ -405,6 +405,33 @@ impl RedbMetaEngine {
             .collect()
     }
 
+    pub(super) fn pending_recovery_object_ids_from_read_txn(
+        txn: &ReadTransaction,
+        refs: &mut std::collections::HashSet<u64>,
+    ) -> MetaResult<()> {
+        let recoveries = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        for row in recoveries
+            .iter()
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+        {
+            let (_, value) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+            let record: PendingRegularFileRecoveryRecord = decode(value.value())?;
+            for slice in record
+                .overlay
+                .chunks
+                .values()
+                .flat_map(|chunk| chunk.slices.values())
+            {
+                if let Some(payload) = &slice.payload {
+                    refs.insert(payload.object_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Capture legacy pending overlays from the recovered live view before a
     /// remote snapshot replaces that view during redb repair.
     pub(crate) fn backfill_missing_uploaded_regular_file_recoveries(&self) -> MetaResult<()> {
@@ -479,29 +506,39 @@ impl RedbMetaEngine {
         attr: &InodeAttr,
         chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
     ) -> MetaResult<()> {
-        let previous = txn
+        let mut recoveries = txn
             .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
-            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let previous = recoveries
             .get(attr.ino)
             .map_err(|error| MetaError::Storage(error.to_string()))?
             .map(|value| decode::<PendingRegularFileRecoveryRecord>(value.value()))
             .transpose()?;
 
         if let Some(previous) = previous.as_ref()
+            && previous.attr.crtime == attr.crtime
             && previous.attr.content_epoch > attr.content_epoch
         {
             return Ok(());
         }
 
         if attr.kind != FileType::RegularFile || !attr.is_upload_pending() {
-            return Self::remove_pending_regular_file_recovery_in_txn(txn, attr.ino);
+            let _ = recoveries
+                .remove(attr.ino)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            return Ok(());
         }
 
         let previous = previous.filter(|previous| {
-            previous.attr.is_upload_pending() && previous.attr.content_epoch == attr.content_epoch
+            previous.attr.crtime == attr.crtime
+                && previous.attr.is_upload_pending()
+                && previous.attr.content_epoch == attr.content_epoch
         });
         if !chunks_have_uploaded_payload(chunks) && previous.is_none() {
-            return Self::remove_pending_regular_file_recovery_in_txn(txn, attr.ino);
+            let _ = recoveries
+                .remove(attr.ino)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            return Ok(());
         }
 
         let mut overlay = crate::schema::RegularFileOverlayState {
@@ -515,18 +552,19 @@ impl RedbMetaEngine {
                     }
                 }
             }
-        }
-
-        if !chunks_have_uploaded_payload(&overlay.chunks) {
-            return Self::remove_pending_regular_file_recovery_in_txn(txn, attr.ino);
+            if !chunks_have_uploaded_payload(&overlay.chunks) {
+                let _ = recoveries
+                    .remove(attr.ino)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+                return Ok(());
+            }
         }
 
         let bytes = encode(&PendingRegularFileRecoveryRecord {
             attr: attr.clone(),
             overlay,
         })?;
-        txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
-            .map_err(|error| MetaError::Storage(error.to_string()))?
+        recoveries
             .insert(attr.ino, bytes.as_slice())
             .map_err(|error| MetaError::Storage(error.to_string()))?;
         Ok(())
@@ -1281,6 +1319,90 @@ mod tests {
                 .values()
                 .flat_map(|chunk| chunk.slices.values())
                 .any(|slice| slice.payload_state == PayloadRefState::Uploaded)
+        );
+    }
+
+    #[test]
+    fn sync_recovery_replaces_a_previous_inode_identity() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp
+            .path()
+            .join("pending-file-recovery-inode-identity.redb");
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        engine
+            .set_format_info(&test_format_info("pending-file-recovery-inode-identity"))
+            .unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"reused-inode.bin", 1000, 1000, 0o644)
+            .unwrap();
+
+        let mut old_attr = engine.get_attr(file.ino).unwrap();
+        old_attr.size = 4096;
+        old_attr.content_epoch = 2;
+        engine.set_attr(&old_attr).unwrap();
+        engine
+            .flush_regular_file_overlay_slices(
+                file.ino,
+                &[(ChunkId(0), {
+                    vec![SliceRecord::new(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange::new(0, 4096).unwrap(),
+                        PayloadRef::new_partial(777_201, 4096),
+                    )]
+                })],
+            )
+            .unwrap();
+        assert!(
+            engine
+                .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 2, 777_201)
+                .unwrap()
+        );
+
+        let mut reused_attr = engine.get_attr(file.ino).unwrap();
+        reused_attr.crtime += 1;
+        reused_attr.content_epoch = 1;
+        reused_attr.upload_state = UploadState::Uploading;
+        let mut new_slice = SliceRecord::new(
+            SliceId(2),
+            SliceOrder(2),
+            SliceRange::new(0, 4096).unwrap(),
+            PayloadRef::new_partial(777_202, 4096),
+        );
+        new_slice.payload_state = PayloadRefState::Uploaded;
+        let mut new_chunk = RegularFileChunkState::default();
+        new_chunk.insert_slice(new_slice);
+        let new_chunks = std::collections::BTreeMap::from([(ChunkId(0), new_chunk)]);
+
+        let txn = engine.begin_immediate_write_txn().unwrap();
+        RedbMetaEngine::sync_pending_regular_file_recovery_in_txn(&txn, &reused_attr, &new_chunks)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let recoveries = engine.pending_uploaded_regular_file_recoveries().unwrap();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(recoveries[0].0.crtime, reused_attr.crtime);
+        assert_eq!(recoveries[0].0.content_epoch, reused_attr.content_epoch);
+        let payload_ids: Vec<_> = recoveries[0]
+            .1
+            .chunks
+            .values()
+            .flat_map(|chunk| chunk.slices.values())
+            .filter_map(|slice| slice.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(payload_ids, vec![777_202]);
+
+        let txn = engine.begin_immediate_write_txn().unwrap();
+        let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
+        overlay.remove(key.as_slice()).unwrap();
+        drop(overlay);
+        txn.commit().unwrap();
+
+        assert_eq!(
+            engine.get_referenced_object_ids().unwrap(),
+            std::collections::HashSet::from([777_202])
         );
     }
 }

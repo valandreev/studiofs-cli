@@ -453,6 +453,13 @@ impl PgMetaEngine {
                         && current.committed_content_epoch >= attr.content_epoch)
                 {
                     obsolete_recovery_inodes.push(ino);
+                } else {
+                    warn!(
+                        ino,
+                        recovery_epoch = attr.content_epoch,
+                        current_epoch = current.content_epoch,
+                        "redb repair retained an uploaded recovery row because inode attributes no longer match"
+                    );
                 }
                 continue;
             }

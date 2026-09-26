@@ -732,8 +732,8 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         pg.local
             .get_referenced_object_ids()
             .expect("references after repair projection")
-            .is_empty(),
-        "without repair replay startup cleanup would classify the uploaded object as stale"
+            .contains(&payload.object_id),
+        "the recovery row must keep the uploaded object reachable until repair restores its graph"
     );
 
     let path = dir.path().join("meta.redb");

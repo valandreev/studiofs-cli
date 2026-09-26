@@ -347,6 +347,7 @@ impl MetaGc for RedbMetaEngine {
             &mut refs,
         )?;
         Self::regular_file_graph_object_ids_from_table(&txn, REGULAR_FILE_BASE_TABLE, &mut refs)?;
+        Self::pending_recovery_object_ids_from_read_txn(&txn, &mut refs)?;
         Ok(refs)
     }
 }
