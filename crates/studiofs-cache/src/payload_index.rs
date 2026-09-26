@@ -1672,8 +1672,18 @@ mod tests {
         let reopened = open_index(&database_path);
         assert_eq!(reopened.stats().unwrap(), updated_stats);
         assert_eq!(reopened.dirty_object_count().unwrap(), 1);
-        assert!(reopened.get_entry(41).unwrap().is_some());
-        assert!(reopened.get_entry(42).unwrap().is_some());
+        assert!(
+            reopened.get_entry(41).unwrap().as_ref() == Some(&entry),
+            "reopened entry 41 differs from the fixture row"
+        );
+        let entry_42 = reopened.get_entry(42).unwrap().expect("reopened entry 42");
+        assert_eq!(entry_42.object_id, 42);
+        assert_eq!(entry_42.payload_key, b"payload/42.object");
+        assert_eq!(entry_42.payload_len, 50);
+        assert_eq!(entry_42.lifecycle, LocalPayloadLifecycleState::Uploaded);
+        assert_eq!(entry_42.origin, LocalPayloadOrigin::Downloaded);
+        assert_eq!(entry_42.upload_state, LocalPayloadUploadState::None);
+        assert!(entry_42.evictable);
     }
 
     #[test]

@@ -1,10 +1,11 @@
 #[test]
 fn test_format_info_roundtrip() {
     let engine = temp_engine();
-    let info = test_format_info("test-vol");
+    let info = test_format_info("updated-vol");
     engine.set_format_info(&info).unwrap();
     let loaded = engine.get_format_info().unwrap();
-    assert_eq!(loaded.name, "test-vol");
+    assert_eq!(loaded.name, "updated-vol");
+    assert_eq!(loaded.uuid, "updated-vol-uuid");
     assert_eq!(loaded.endpoint, "http://localhost:9000");
 }
 
@@ -48,10 +49,9 @@ fn opens_redb_4_1_database_without_studiofs_format_migration() {
         reopened.get_format_info().unwrap().format_version,
         CURRENT_FORMAT_VERSION
     );
-    assert_eq!(
-        reopened.lookup(ROOT_INO, b"compat.txt").unwrap().kind,
-        FileType::RegularFile
-    );
+    let reopened_entry = reopened.lookup(ROOT_INO, b"compat.txt").unwrap();
+    assert_eq!(reopened_entry.kind, FileType::RegularFile);
+    assert_eq!(reopened_entry.ino, entry.ino);
     assert_eq!(
         reopened
             .lookup(ROOT_INO, b"new_under_4_3.txt")
