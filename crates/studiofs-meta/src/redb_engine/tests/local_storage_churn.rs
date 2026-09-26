@@ -11,6 +11,8 @@ struct LocalChurnTableRows {
     inode_tombstones: u64,
     overlay_dentries: u64,
     base_dentries: u64,
+    overlay_dentry_index: u64,
+    base_dentry_index: u64,
     dentry_tombstones: u64,
     overlay_chunks: u64,
     base_chunks: u64,
@@ -30,6 +32,8 @@ impl LocalChurnTableRows {
             + self.inode_tombstones
             + self.overlay_dentries
             + self.base_dentries
+            + self.overlay_dentry_index
+            + self.base_dentry_index
             + self.dentry_tombstones
             + self.overlay_chunks
             + self.base_chunks
@@ -75,6 +79,16 @@ fn local_churn_table_rows(engine: &RedbMetaEngine) -> LocalChurnTableRows {
             .expect("open base dentry table")
             .len()
             .expect("count base dentry rows"),
+        overlay_dentry_index: transaction
+            .open_table(DENTRIES_BY_INODE_TABLE)
+            .expect("open overlay dentry index")
+            .len()
+            .expect("count overlay dentry index rows"),
+        base_dentry_index: transaction
+            .open_table(BASE_DENTRIES_BY_INODE_TABLE)
+            .expect("open base dentry index")
+            .len()
+            .expect("count base dentry index rows"),
         dentry_tombstones: transaction
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .expect("open dentry tombstone table")
@@ -144,17 +158,41 @@ fn report_local_churn_checkpoint(
     assert!(diagnostics.physical_file_bytes.is_some_and(|bytes| bytes > 0));
 
     let visible_live_entries = engine.readdir(live_dir).expect("read live entries").len();
+    assert_eq!(visible_live_entries, LOCAL_CHURN_LIVE_FILES);
+    for slot in 0..LOCAL_CHURN_LIVE_FILES {
+        let name = format!("survivor-{slot:04}");
+        let entry = engine
+            .lookup(live_dir, name.as_bytes())
+            .expect("survivor dentry exists");
+        assert_eq!(entry.kind, FileType::RegularFile);
+        assert_eq!(
+            engine
+                .get_attr(entry.ino)
+                .expect("survivor inode exists")
+                .kind,
+            FileType::RegularFile
+        );
+    }
     let visible_left_entries = engine.readdir(left_dir).expect("read left entries").len();
     let visible_right_entries = engine.readdir(right_dir).expect("read right entries").len();
     let table_rows = local_churn_table_rows(engine);
-    let table_row_total = table_rows.total_rows();
-    let metadata_table_rows = table_rows.metadata_rows();
+    assert_eq!(
+        table_rows.overlay_dentries, table_rows.overlay_dentry_index,
+        "overlay dentry index should match stored dentry rows"
+    );
+    assert_eq!(
+        table_rows.base_dentries, table_rows.base_dentry_index,
+        "base dentry index should match stored dentry rows"
+    );
+    let tracked_table_row_total = table_rows.total_rows();
+    let tracked_metadata_table_rows = table_rows.metadata_rows();
 
     println!(
         "SFS-733 checkpoint={checkpoint} files_per_cycle={files_per_cycle} \
          visible_live_entries={visible_live_entries} visible_left_entries={visible_left_entries} \
-         visible_right_entries={visible_right_entries} metadata_table_rows={metadata_table_rows} \
-         table_row_total={table_row_total} table_rows={table_rows:?} \
+         visible_right_entries={visible_right_entries} \
+         tracked_metadata_table_rows={tracked_metadata_table_rows} \
+         tracked_table_row_total={tracked_table_row_total} table_rows={table_rows:?} \
          redb={diagnostics:?}"
     );
     diagnostics
@@ -190,7 +228,7 @@ fn local_metadata_churn_redb_growth_workload() {
             .expect("create bounded live file");
     }
 
-    let diagnostics = report_local_churn_checkpoint(
+    report_local_churn_checkpoint(
         &engine,
         "initial",
         files_per_cycle,
@@ -331,10 +369,6 @@ fn local_metadata_churn_redb_growth_workload() {
                 .expect("remove empty churn directory");
         }
 
-        assert_eq!(
-            engine.readdir(live.ino).expect("read bounded live set").len(),
-            LOCAL_CHURN_LIVE_FILES
-        );
         assert!(engine.readdir(left.ino).expect("read left directory").is_empty());
         assert!(engine.readdir(right.ino).expect("read right directory").is_empty());
         let cycle_diagnostics = report_local_churn_checkpoint(
@@ -350,7 +384,11 @@ fn local_metadata_churn_redb_growth_workload() {
     }
 
     if compact_at_end {
-        let attempts_before = diagnostics.compaction_attempts;
+        let attempts_before = engine
+            .local_storage_diagnostics()
+            .expect("read pre-compaction redb diagnostics")
+            .expect("pre-compaction redb diagnostics are available")
+            .compaction_attempts;
         engine
             .compact_local_storage()
             .expect("compact local metadata database");
