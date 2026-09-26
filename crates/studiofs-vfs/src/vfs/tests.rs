@@ -2337,6 +2337,12 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     assert!(
         parsed
             .metadata
+            .gauges
+            .contains_key("metadata_redb_btree_tree_height")
+    );
+    assert!(
+        parsed
+            .metadata
             .counters
             .contains_key("metadata_redb_compaction_attempts_total")
     );

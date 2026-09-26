@@ -55,6 +55,7 @@ struct LocalStoragePageStats {
     allocated_pages: u64,
     leaf_pages: u64,
     branch_pages: u64,
+    tree_height: u32,
     stored_bytes: u64,
     metadata_bytes: u64,
     fragmented_bytes: u64,

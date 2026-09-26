@@ -574,7 +574,7 @@ pub enum LocalStorageCompactionSkipReason {
 /// Best-effort physical, page, event-log, and compaction diagnostics for local metadata redb.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalStorageDiagnostics {
-    /// Physical byte length of the metadata database file.
+    /// Logical length of the metadata database file from filesystem metadata.
     pub physical_file_bytes: Option<u64>,
     /// Page count reported by redb.
     pub allocated_pages: Option<u64>,
@@ -582,6 +582,8 @@ pub struct LocalStorageDiagnostics {
     pub leaf_pages: Option<u64>,
     /// User-data B-tree branch page count reported by redb.
     pub branch_pages: Option<u64>,
+    /// Maximum B-tree traversal distance reported by redb across tables.
+    pub tree_height: Option<u32>,
     /// Key and value bytes stored in redb leaf pages, excluding index overhead.
     pub stored_bytes: Option<u64>,
     /// Metadata bytes reported by redb, including B-tree index overhead.
@@ -592,7 +594,7 @@ pub struct LocalStorageDiagnostics {
     pub page_size_bytes: Option<u64>,
     /// Lowest sequence still present in the local metadata event log.
     pub first_local_event_seq: Option<u64>,
-    /// Next event sequence to allocate; this is an exclusive end coordinate.
+    /// Reported exclusive next sequence, at least one past the retained event tail.
     pub next_local_event_seq: Option<u64>,
     /// End-exclusive sequence span still retained in the local metadata event log.
     pub retained_local_event_span: Option<u64>,

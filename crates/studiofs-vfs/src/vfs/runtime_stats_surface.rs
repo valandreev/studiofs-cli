@@ -880,6 +880,11 @@ fn insert_local_storage_diagnostics(
             diagnostics.branch_pages,
         ),
         (
+            "metadata_redb_btree_tree_height",
+            "count",
+            diagnostics.tree_height.map(u64::from),
+        ),
+        (
             "metadata_redb_stored_bytes",
             "bytes",
             diagnostics.stored_bytes,

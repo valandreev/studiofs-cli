@@ -889,6 +889,27 @@ fn local_storage_diagnostics_returns_cached_stats_while_refresh_is_busy() {
 }
 
 #[test]
+fn local_storage_page_stats_cache_uses_the_supplied_sample_time() {
+    let engine = temp_engine();
+    let sampled_at = Instant::now()
+        .checked_add(LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL)
+        .expect("sample time remains representable");
+
+    assert!(
+        engine
+            .local_storage_page_stats_best_effort_at(sampled_at)
+            .is_some()
+    );
+    let cached = engine
+        .local_storage_page_stats
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .expect("page stats were cached");
+
+    assert_eq!(cached.sampled_at, sampled_at);
+}
+
+#[test]
 fn local_storage_diagnostics_recovers_poisoned_page_stats_cache() {
     let engine = temp_engine();
     let initial = engine
@@ -942,6 +963,55 @@ fn local_storage_diagnostics_report_empty_event_log_span() {
     assert_eq!(diagnostics.first_local_event_seq, None);
     assert_eq!(diagnostics.next_local_event_seq, Some(1));
     assert_eq!(diagnostics.retained_local_event_span, Some(0));
+}
+
+#[test]
+fn local_storage_diagnostics_keeps_exclusive_end_after_retained_event_tail() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open(dir.path().join("metadata.redb")).unwrap();
+    let write = engine.begin_write_txn().unwrap();
+    {
+        let mut events = write.open_table(EVENT_LOG_TABLE).unwrap();
+        events.insert(42, b"event".as_slice()).unwrap();
+        events.insert(47, b"event".as_slice()).unwrap();
+    }
+    write.commit().unwrap();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.first_local_event_seq, Some(42));
+    assert_eq!(diagnostics.next_local_event_seq, Some(48));
+    assert_eq!(diagnostics.retained_local_event_span, Some(6));
+}
+
+#[test]
+fn local_storage_compaction_records_no_work_after_compaction() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open(dir.path().join("metadata.redb")).unwrap();
+
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::Compacted
+    );
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::NoWork
+    );
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.compaction_attempts, 2);
+    assert_eq!(diagnostics.compaction_compacted, 1);
+    assert_eq!(diagnostics.compaction_no_work, 1);
+    assert_eq!(
+        diagnostics.last_compaction_result,
+        Some(LocalStorageCompactionResult::NoWork)
+    );
 }
 
 #[test]

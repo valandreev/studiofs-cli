@@ -84,10 +84,19 @@ impl RedbMetaEngine {
             return;
         };
         let first = first.map(|(seq, _)| seq.value());
+        let Ok(last) = events.last() else {
+            return;
+        };
+        let last = last.map(|(seq, _)| seq.value());
         let next =
             Self::read_counter_from_read_txn(transaction, crate::schema::counters::NEXT_EVENT_SEQ)
                 .unwrap_or(0)
                 .max(1);
+        let Some(minimum_next) = last.map_or(Some(1), |last| last.checked_add(1)) else {
+            diagnostics.first_local_event_seq = first;
+            return;
+        };
+        let next = next.max(minimum_next);
         diagnostics.first_local_event_seq = first;
         diagnostics.next_local_event_seq = Some(next);
         diagnostics.retained_local_event_span =
@@ -144,6 +153,7 @@ impl RedbMetaEngine {
                 allocated_pages: stats.allocated_pages(),
                 leaf_pages: stats.leaf_pages(),
                 branch_pages: stats.branch_pages(),
+                tree_height: stats.tree_height(),
                 stored_bytes: stats.stored_bytes(),
                 metadata_bytes: stats.metadata_bytes(),
                 fragmented_bytes: stats.fragmented_bytes(),
@@ -159,7 +169,7 @@ impl RedbMetaEngine {
                 .local_storage_page_stats
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = Some(CachedLocalStoragePageStats {
-                sampled_at: Instant::now(),
+                sampled_at: now,
                 stats,
             });
             Some(stats)
@@ -261,6 +271,7 @@ impl MetaGc for RedbMetaEngine {
             diagnostics.allocated_pages = Some(stats.allocated_pages);
             diagnostics.leaf_pages = Some(stats.leaf_pages);
             diagnostics.branch_pages = Some(stats.branch_pages);
+            diagnostics.tree_height = Some(stats.tree_height);
             diagnostics.stored_bytes = Some(stats.stored_bytes);
             diagnostics.metadata_bytes = Some(stats.metadata_bytes);
             diagnostics.fragmented_bytes = Some(stats.fragmented_bytes);

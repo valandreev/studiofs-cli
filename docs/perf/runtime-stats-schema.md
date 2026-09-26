@@ -117,16 +117,17 @@ database; these metrics do not describe `cache.redb`.
 
 | Metric | Kind / unit | Meaning |
 | --- | --- | --- |
-| `metadata_redb_physical_file_bytes` | gauge / bytes | Physical length of the local metadata database file. |
+| `metadata_redb_physical_file_bytes` | gauge / bytes | Logical file length from `std::fs::metadata().len()`; not filesystem-allocated disk blocks. |
 | `metadata_redb_allocated_pages` | gauge / count | redb allocated page count. |
 | `metadata_redb_leaf_pages` | gauge / count | redb user-data leaf page count. |
 | `metadata_redb_branch_pages` | gauge / count | redb user-data branch page count. |
+| `metadata_redb_btree_tree_height` | gauge / count | Maximum B-tree traversal distance reported by redb across tables. |
 | `metadata_redb_stored_bytes` | gauge / bytes | redb key and value bytes stored in leaf pages, excluding index overhead. |
 | `metadata_redb_metadata_bytes` | gauge / bytes | redb index and metadata bytes. |
 | `metadata_redb_fragmented_bytes` | gauge / bytes | redb fragmented data/metadata and free-page bytes. |
 | `metadata_redb_page_size_bytes` | gauge / bytes | redb page size. |
 | `metadata_redb_first_local_event_seq` | gauge / count | Lowest sequence still retained in the local metadata event log. Omitted when the event log is empty or unavailable. |
-| `metadata_redb_next_local_event_seq` | gauge / count | Exclusive next sequence to allocate. |
+| `metadata_redb_next_local_event_seq` | gauge / count | Reported exclusive next sequence; if the counter is missing or below the retained tail, diagnostics use one past the highest retained event. |
 | `metadata_redb_retained_local_event_span` | gauge / count | `next_local_event_seq - first_local_event_seq`, or zero when the event log is empty. This is a sequence span, not a row count. |
 | `metadata_redb_compaction_attempts_total` | counter / count | Compaction calls since this metadata engine opened. |
 | `metadata_redb_compaction_compacted_total` | counter / count | Calls where redb compaction made progress. |
