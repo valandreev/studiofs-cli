@@ -606,9 +606,9 @@ pub struct LocalStorageDiagnostics {
     pub local_event_log_pruned_payload_bytes_total: u64,
     /// Rows removed by the most recent successful prune attempt.
     pub last_local_event_log_prune_rows: Option<u64>,
-    /// First sequence removed by the most recent non-empty prune attempt.
+    /// First sequence removed by the most recent non-empty successful prune batch.
     pub last_local_event_log_prune_first_seq: Option<u64>,
-    /// Last sequence removed by the most recent non-empty prune attempt.
+    /// Last sequence removed by the most recent non-empty successful prune batch.
     pub last_local_event_log_prune_last_seq: Option<u64>,
     /// Encoded payload bytes removed by the most recent successful prune attempt.
     pub last_local_event_log_prune_payload_bytes: Option<u64>,

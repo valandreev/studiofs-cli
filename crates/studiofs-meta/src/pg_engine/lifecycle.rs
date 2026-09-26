@@ -524,7 +524,7 @@ impl PgMetaEngine {
                     let Some(engine) = engine.upgrade() else {
                         break;
                     };
-                    if let Err(error) = engine.prune_local_event_log_once() {
+                    if let Err(error) = engine.prune_local_event_log_for_poll(&shutdown) {
                         warn!(
                             error = %error,
                             volume_id = engine.volume_id,

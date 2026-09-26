@@ -113,6 +113,7 @@ pub(crate) const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamesp
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
 const LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS: usize = 256;
+const LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL: usize = 16;
 pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =
     "pgRedbRepairLocalGraphRecoveryPending";
 pub(crate) const LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER: &str = "pgFreshClientPending";

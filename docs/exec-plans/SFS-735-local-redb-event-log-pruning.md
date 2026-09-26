@@ -15,6 +15,8 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
 - [x] (2026-09-26) Add bounded, sparse-key, rollback, restart, safe-cursor, and SFS-734 recovery regressions.
 - [x] (2026-09-26) Implement bounded local redb pruning, persist its safe floor atomically, expose diagnostics, and run it before remote synchronization.
 - [x] (2026-09-26) Run focused metadata and runtime-diagnostics tests, crate checks, Clippy, formatting, and diff checks.
+- [x] (2026-09-27) Verify the SFS-735 review feedback; fix lock scope, poll backlog draining, idle-range telemetry, zero-floor diagnostics, and the floor-one write-transaction fast path.
+- [x] (2026-09-27) Run focused review-follow-up tests and the required metadata/VFS validation gates.
 
 ## Surprises & Discoveries
 
@@ -35,6 +37,11 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
 - Decision: Delete at most the configured row limit from sorted keys below the durable cursor, even when stored keys have gaps; preserve sequence keys and `nextEventSeq`. Keep the prune floor when an import preserves local event history, and clear it when an import replaces that history. Rationale: the durable cursor is the safety proof for every sequence below it, while full journal replacement starts a new local event-log state. Date/Author: 2026-09-26, Codex.
 - Decision: Run local pruning from the existing background metadata poll before remote synchronization and keep it outside the PostgreSQL global janitor-lock path. Rationale: local reclamation needs only local durable state and must still proceed when remote retention is contended or unavailable. Date/Author: 2026-09-26, Codex.
 - Decision: Report cumulative events pruned and the most recent batch's range, encoded-payload byte estimate, and duration through existing local metadata diagnostics. Rationale: these values are cheap to collect while rows are removed and fit the existing metadata-redb runtime-stat surface. Date/Author: 2026-09-26, Codex.
+- Decision: Retain only `local_position_lock` across the prune transaction, not `pending_state`. Rationale: cursor and snapshot transitions use the position lock, while queue-only edits do not change the durable prune boundary; cursor-advancing transitions still take the position lock. Avoiding the second lock shortens contention for replication work. Date/Author: 2026-09-27, Codex.
+- Decision: Let each poll drain at most 16 full 256-row transactions and check shutdown between transactions. Rationale: one batch per poll can leave a sustained eligible backlog; a finite budget raises cleanup throughput while keeping every redb transaction and each poll's total prune work bounded. The batch size and budget remain internal because no workload evidence calls for runtime configuration. Date/Author: 2026-09-27, Codex.
+- Decision: Preserve the last non-empty successful batch range through idle or failed passes, and report no prune watermark until the stored inclusive sequence is greater than zero. Rationale: an empty first pass is not a removed range, and sequence zero means no event was pruned. Date/Author: 2026-09-27, Codex.
+- Decision: Keep the persisted-floor maximum when a caller supplies a stale lower cursor. Rationale: the persisted floor is an already-proven safe watermark, and the sole production caller restores its cursor to at least one past that floor; the maximum also lets a valid prior proof cover any stale keys. Date/Author: 2026-09-27, Codex.
+- Decision: Skip making the 256-row transaction limit configurable and skip restructuring the final B-tree lookup without measured evidence. Rationale: the current fixed limit is part of bounded maintenance, while configuration and extra exit-state branches would add policy or code for an unmeasured cost. Date/Author: 2026-09-27, Codex.
 
 ## Outcomes & Retrospective
 
@@ -54,6 +61,16 @@ Validation passed:
 
 PostgreSQL integration and mounted FUSE/WinFSP tests were not needed for this local redb-only prune path.
 
+The 2026-09-27 code-review follow-up also passed:
+
+- `cargo test -p studiofs-meta --lib local_event_pruning` — 10 passed, including the cursor-lock, poll-budget, no-op transaction, idle-range, and zero-watermark regressions.
+- `cargo test -p studiofs-vfs --lib runtime_stats_surface_reports_overlay_batch_metrics` — 1 passed; the unpruned watermark is omitted and a positive watermark is surfaced.
+- `cargo check -p studiofs-meta -p studiofs-vfs` — passed.
+- `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings` — passed.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+
+The review's suggested stale-floor early return was not applied: the persisted floor is a previously proven safe watermark, and the production caller restores its cursor to at least one past it. Making the 256-row batch configurable and restructuring one B-tree lookup were also skipped because neither has workload measurements supporting more policy or code.
+
 ## Context and Orientation
 
 `RedbMetaEngine` owns `EVENT_LOG_TABLE` and allocates monotonically increasing sequence keys. `PgMetaEngine` owns the durable `LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER`, which records the first sequence not yet acknowledged as complete. The local repair state added by SFS-734 lives outside the event journal, so acknowledged journal history is no longer needed for that recovery path.
@@ -64,7 +81,7 @@ The metadata crate already computes `first_local_event_seq`, `next_local_event_s
 
 Tests at the existing redb and `PgMetaEngine` seams show that pruning removes at most its batch limit, never crosses the exclusive durable cursor, leaves rejected and pending suffixes available, and leaves the next-event counter unchanged. The uploaded-overlay repair regression removes the acknowledged event prefix before repair/reopen. Diagnostics cover the retained span, removed range, encoded payload estimate, and duration.
 
-The bounded redb helper removes the next stored key while it is below the safe cursor, commits deletions and the new floor atomically, and estimates removed logical payload bytes from the encoded values already in hand. It records results only after a successful commit. `PgMetaEngine` holds the established local-position and pending-state locks while it obtains the cursor and calls this helper, so a claim or cursor transition cannot move the floor during the delete.
+The bounded redb helper removes the next stored key while it is below the safe cursor, commits deletions and the new floor atomically, and estimates removed logical payload bytes from the encoded values already in hand. It records results only after a successful commit. `PgMetaEngine` retains `local_position_lock` while it obtains the cursor and prunes, which fences cursor and snapshot transitions; it does not hold `pending_state` during redb I/O because pending-queue edits do not change the durable safe boundary.
 
 Call the local prune pass from `start_background_poll` before its PostgreSQL sync and PostgreSQL event-log janitor work. It must not acquire the PostgreSQL global janitor lock. Add bounded counters and last-batch measurements to `LocalStorageDiagnostics`, then map them into the existing `metadata_redb_*` runtime stats in VFS.
 

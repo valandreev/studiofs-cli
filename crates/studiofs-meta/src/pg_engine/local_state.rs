@@ -1,11 +1,12 @@
 use super::{
+    LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS, LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL,
     LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, LOCAL_PG_NAMESPACE_VERSION_COUNTER,
     LOCAL_PG_VERSION_COUNTER, LocalEventRange, PendingReplicationState, PgMetaEngine,
     StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::{LocalEventLogPruneBatch, RedbMetaEngine};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Sort ranges and merge overlaps or adjacency without replacing the vector.
 fn merge_local_event_ranges(ranges: &mut Vec<LocalEventRange>) {
@@ -137,10 +138,27 @@ impl PgMetaEngine {
     }
 
     pub(super) fn prune_local_event_log_once(&self) -> MetaResult<LocalEventLogPruneBatch> {
-        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
+        // This fences cursor and snapshot changes; queue-only mutations do not move the safe boundary.
+        let _position_guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
         let exclusive_floor = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
         self.local
             .prune_local_event_log_before(exclusive_floor, super::LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS)
+    }
+
+    pub(super) fn prune_local_event_log_for_poll(&self, shutdown: &AtomicBool) -> MetaResult<()> {
+        for _ in 0..LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let batch = self.prune_local_event_log_once()?;
+            if batch.rows < LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS {
+                break;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]

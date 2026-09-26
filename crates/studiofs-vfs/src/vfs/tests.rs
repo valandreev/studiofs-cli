@@ -2445,28 +2445,53 @@ fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
 #[test]
 fn runtime_stats_surface_reports_overlay_batch_metrics() {
     let tmp = runtime_stats_test_tempdir();
-    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-overlay-batch");
-    let snapshot = vfs.runtime_stats_snapshot();
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-overlay-batch");
+    let initial_snapshot = vfs.runtime_stats_snapshot();
 
-    assert!(snapshot.metadata.counters.contains_key("overlay_enqueue"));
-    assert!(snapshot.metadata.gauges.contains_key("overlay_queue_depth"));
     assert!(
-        snapshot
+        initial_snapshot
+            .metadata
+            .counters
+            .contains_key("overlay_enqueue")
+    );
+    assert!(
+        initial_snapshot
+            .metadata
+            .gauges
+            .contains_key("overlay_queue_depth")
+    );
+    assert!(
+        initial_snapshot
             .metadata
             .gauges
             .contains_key("overlay_dirty_age_ms")
     );
     assert!(
-        snapshot
+        !initial_snapshot
             .metadata
             .gauges
             .contains_key("metadata_redb_local_event_log_pruned_through_seq")
     );
     assert!(
-        snapshot
+        initial_snapshot
             .metadata
             .counters
             .contains_key("metadata_redb_local_event_log_pruned_rows_total")
+    );
+
+    meta.set_counter(
+        studiofs_meta::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+        1,
+    )
+    .expect("seed a positive local prune watermark");
+    let pruned_snapshot = vfs.runtime_stats_snapshot();
+    assert_eq!(
+        pruned_snapshot
+            .metadata
+            .gauges
+            .get("metadata_redb_local_event_log_pruned_through_seq")
+            .map(|metric| metric.value),
+        Some(1)
     );
 }
 

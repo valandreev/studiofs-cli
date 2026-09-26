@@ -20,14 +20,14 @@ impl RedbMetaEngine {
                     .payload_bytes_pruned
                     .saturating_add(batch.payload_bytes);
                 stats.last_rows = Some(rows);
-                stats.last_first_seq = batch.first_seq;
-                stats.last_last_seq = batch.last_seq;
+                if batch.rows > 0 {
+                    stats.last_first_seq = batch.first_seq;
+                    stats.last_last_seq = batch.last_seq;
+                }
                 stats.last_payload_bytes = Some(batch.payload_bytes);
             }
             Err(_) => {
                 stats.last_rows = None;
-                stats.last_first_seq = None;
-                stats.last_last_seq = None;
                 stats.last_payload_bytes = None;
             }
         }
@@ -40,7 +40,12 @@ impl RedbMetaEngine {
     ) -> MetaResult<LocalEventLogPruneBatch> {
         let started = Instant::now();
         let result = (|| {
-            if max_rows == 0 {
+            if max_rows == 0
+                || (exclusive_floor <= 1
+                    && self
+                        .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)?
+                        == 0)
+            {
                 return Ok(LocalEventLogPruneBatch::default());
             }
 
@@ -73,6 +78,7 @@ impl RedbMetaEngine {
             .get(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
             .map_err(|error| MetaError::Storage(error.to_string()))?
             .map(|value| value.value());
+        // The persisted floor is already proven safe, even if a caller's cursor is stale.
         let exclusive_floor = exclusive_floor.max(persisted_floor.unwrap_or(0).saturating_add(1));
         if exclusive_floor <= 1 {
             return Ok(batch);
@@ -223,13 +229,13 @@ impl RedbMetaEngine {
         transaction: &redb::ReadTransaction,
         diagnostics: &mut LocalStorageDiagnostics,
     ) {
-        diagnostics.local_event_log_pruned_through_seq = Some(
-            Self::read_counter_from_read_txn(
-                transaction,
-                crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
-            )
-            .unwrap_or(0),
-        );
+        let pruned_through_seq = Self::read_counter_from_read_txn(
+            transaction,
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+        )
+        .unwrap_or(0);
+        diagnostics.local_event_log_pruned_through_seq =
+            (pruned_through_seq > 0).then_some(pruned_through_seq);
         let Ok(events) = transaction.open_table(EVENT_LOG_TABLE) else {
             return;
         };

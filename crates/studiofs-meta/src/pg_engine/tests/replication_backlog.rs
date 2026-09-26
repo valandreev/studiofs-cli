@@ -1,7 +1,8 @@
 use super::*;
 use crate::redb_engine::layout::{encode_dentry_key, encode_xattr_key};
-use std::sync::Barrier;
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
+use std::time::Duration;
 
 fn uploaded_pending_file(pg: &PgMetaEngine, name: &[u8], object_id: u64) -> InodeAttr {
     let file = pg
@@ -106,6 +107,77 @@ fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() 
     assert!(
         !pg.remote_format_validated.load(Ordering::Acquire),
         "local pruning must not require PostgreSQL validation"
+    );
+}
+
+#[test]
+fn local_event_pruning_does_not_wait_for_pending_replication_state() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let pg = Arc::new(pg);
+    let pending_guard = pg.pending_state.lock().unwrap();
+    let worker_pg = Arc::clone(&pg);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        sender.send(worker_pg.prune_local_event_log_once()).unwrap();
+    });
+
+    let completed_without_pending = receiver.recv_timeout(Duration::from_secs(2));
+    let completed_on_time = completed_without_pending.is_ok();
+    drop(pending_guard);
+    let result = match completed_without_pending {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune worker must finish after pending state is released"),
+    };
+    worker.join().unwrap();
+
+    assert!(
+        completed_on_time,
+        "pruning only needs the durable cursor and must not hold pending replication state"
+    );
+    result.expect("local event pruning should complete");
+}
+
+#[test]
+fn background_local_event_pruning_drains_full_batches_up_to_its_budget() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let next_event_seq = 5_001;
+    let txn = pg.local.begin_write_txn().unwrap();
+    {
+        let mut events = txn
+            .open_table(redb::TableDefinition::<u64, &[u8]>::new("event_log"))
+            .unwrap();
+        events.retain(|_, _| false).unwrap();
+        for seq in 1..next_event_seq {
+            events.insert(seq, &b"event"[..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    pg.local
+        .set_counter(crate::schema::counters::NEXT_EVENT_SEQ, next_event_seq)
+        .unwrap();
+    pg.persist_flushed_event_seq(next_event_seq)
+        .expect("persist acknowledged event cursor");
+
+    pg.prune_local_event_log_for_poll(&AtomicBool::new(false))
+        .expect("background prune should drain its bounded batch budget");
+
+    let diagnostics = pg
+        .local
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(
+        diagnostics.local_event_log_pruned_rows_total,
+        (LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS * LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL) as u64
+    );
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(4_097));
+    assert_eq!(
+        pg.local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap(),
+        next_event_seq
     );
 }
 

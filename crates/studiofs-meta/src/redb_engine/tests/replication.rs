@@ -176,6 +176,63 @@ fn local_event_pruning_reports_range_payload_estimate_and_duration() {
     assert_eq!(diagnostics.last_local_event_log_prune_last_seq, Some(2));
     assert_eq!(diagnostics.last_local_event_log_prune_payload_bytes, Some(10));
     assert!(diagnostics.last_local_event_log_prune_duration_ns.is_some());
+
+    assert_eq!(
+        engine.prune_local_event_log_before(3, 2).unwrap().rows,
+        0,
+        "the follow-up pass should find no eligible rows"
+    );
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available after an idle prune pass");
+    assert_eq!(diagnostics.last_local_event_log_prune_rows, Some(0));
+    assert_eq!(diagnostics.last_local_event_log_prune_first_seq, Some(1));
+    assert_eq!(diagnostics.last_local_event_log_prune_last_seq, Some(2));
+}
+
+#[test]
+fn local_event_pruning_diagnostics_omit_floor_before_any_pruning() {
+    let engine = temp_engine();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.local_event_log_pruned_through_seq, None);
+}
+
+#[test]
+fn local_event_pruning_skips_write_transaction_before_the_first_sequence() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = Arc::new(temp_engine());
+    let blocked_writer = engine.begin_write_txn().unwrap();
+    let worker_engine = Arc::clone(&engine);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        sender
+            .send(worker_engine.prune_local_event_log_before(1, 10))
+            .unwrap();
+    });
+
+    let completed_without_writer = receiver.recv_timeout(Duration::from_secs(2));
+    let completed_on_time = completed_without_writer.is_ok();
+    drop(blocked_writer);
+    let result = match completed_without_writer {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune worker must finish after the held write transaction is released"),
+    };
+    worker.join().unwrap();
+
+    assert!(
+        completed_on_time,
+        "floor 1 has no eligible event rows and must not wait for the redb writer"
+    );
+    assert_eq!(result.unwrap().rows, 0);
 }
 
 #[test]
