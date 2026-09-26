@@ -2478,6 +2478,14 @@ fn runtime_stats_surface_reports_overlay_batch_metrics() {
             .counters
             .contains_key("metadata_redb_local_event_log_pruned_rows_total")
     );
+    assert_eq!(
+        initial_snapshot
+            .metadata
+            .counters
+            .get("metadata_redb_local_event_log_pruned_payload_bytes_total")
+            .map(|metric| metric.unit.as_ref()),
+        Some("bytes")
+    );
 
     meta.set_counter(
         studiofs_meta::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,

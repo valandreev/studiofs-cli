@@ -40,12 +40,12 @@ impl RedbMetaEngine {
     ) -> MetaResult<LocalEventLogPruneBatch> {
         let started = Instant::now();
         let result = (|| {
-            if max_rows == 0
-                || (exclusive_floor <= 1
-                    && self
-                        .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)?
-                        == 0)
-            {
+            if max_rows == 0 {
+                return Ok(LocalEventLogPruneBatch::default());
+            }
+            let pruned_through =
+                self.get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)?;
+            if exclusive_floor.saturating_sub(1) <= pruned_through {
                 return Ok(LocalEventLogPruneBatch::default());
             }
 
@@ -78,36 +78,30 @@ impl RedbMetaEngine {
             .get(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
             .map_err(|error| MetaError::Storage(error.to_string()))?
             .map(|value| value.value());
-        // The persisted floor is already proven safe, even if a caller's cursor is stale.
-        let exclusive_floor = exclusive_floor.max(persisted_floor.unwrap_or(0).saturating_add(1));
-        if exclusive_floor <= 1 {
+        if exclusive_floor <= persisted_floor.unwrap_or(0).saturating_add(1) {
             return Ok(batch);
         }
         let mut pruned_through = persisted_floor.unwrap_or(0);
         let mut events = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|error| MetaError::Storage(error.to_string()))?;
-        let first_seq = events
+        let mut next_seq = events
             .first()
             .map_err(|error| MetaError::Storage(error.to_string()))?
             .map(|(seq, _)| seq.value());
 
         if persisted_floor.is_none() {
-            if let Some(first_seq) = first_seq.filter(|seq| *seq <= exclusive_floor) {
+            if let Some(first_seq) = next_seq.filter(|seq| *seq <= exclusive_floor) {
                 pruned_through = first_seq.saturating_sub(1);
                 batch.floor_updated = pruned_through > 0;
-            } else if first_seq.is_none() {
+            } else if next_seq.is_none() {
                 pruned_through = exclusive_floor - 1;
                 batch.floor_updated = pruned_through > 0;
             }
         }
 
         while batch.rows < max_rows {
-            let next = events
-                .first()
-                .map_err(|error| MetaError::Storage(error.to_string()))?
-                .map(|(seq, _)| seq.value());
-            let Some(seq) = next else {
+            let Some(seq) = next_seq else {
                 break;
             };
             if seq >= exclusive_floor {
@@ -118,24 +112,28 @@ impl RedbMetaEngine {
                 .pop_first()
                 .map_err(|error| MetaError::Storage(error.to_string()))?
             else {
+                next_seq = None;
                 break;
             };
-            let removed_seq = removed_seq.value();
-            batch.first_seq.get_or_insert(removed_seq);
-            batch.last_seq = Some(removed_seq);
+            let removed_seq_value = removed_seq.value();
+            let payload_bytes = payload.value().len();
+            drop(removed_seq);
+            drop(payload);
+            batch.first_seq.get_or_insert(removed_seq_value);
+            batch.last_seq = Some(removed_seq_value);
             batch.rows += 1;
             batch.payload_bytes = batch
                 .payload_bytes
-                .saturating_add(u64::try_from(payload.value().len()).unwrap_or(u64::MAX));
-            pruned_through = removed_seq;
+                .saturating_add(u64::try_from(payload_bytes).unwrap_or(u64::MAX));
+            pruned_through = removed_seq_value;
             batch.floor_updated = true;
+            next_seq = events
+                .first()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+                .map(|(seq, _)| seq.value());
         }
 
-        let remaining_first_seq = events
-            .first()
-            .map_err(|error| MetaError::Storage(error.to_string()))?
-            .map(|(seq, _)| seq.value());
-        if remaining_first_seq.is_none_or(|seq| seq >= exclusive_floor) {
+        if next_seq.is_none_or(|seq| seq >= exclusive_floor) {
             let acknowledged_through = exclusive_floor - 1;
             if pruned_through < acknowledged_through {
                 pruned_through = acknowledged_through;

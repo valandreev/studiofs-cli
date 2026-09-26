@@ -145,7 +145,7 @@ impl PgMetaEngine {
             .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
         let exclusive_floor = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
         self.local
-            .prune_local_event_log_before(exclusive_floor, super::LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS)
+            .prune_local_event_log_before(exclusive_floor, LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS)
     }
 
     pub(super) fn prune_local_event_log_for_poll(&self, shutdown: &AtomicBool) -> MetaResult<()> {

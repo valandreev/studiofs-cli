@@ -970,14 +970,17 @@ fn insert_local_storage_diagnostics(
         }
     }
 
+    insert_counter(
+        section,
+        "metadata_redb_local_event_log_pruned_payload_bytes_total",
+        "bytes",
+        diagnostics.local_event_log_pruned_payload_bytes_total,
+    );
+
     for (name, value) in [
         (
             "metadata_redb_local_event_log_pruned_rows_total",
             diagnostics.local_event_log_pruned_rows_total,
-        ),
-        (
-            "metadata_redb_local_event_log_pruned_payload_bytes_total",
-            diagnostics.local_event_log_pruned_payload_bytes_total,
         ),
         (
             "metadata_redb_compaction_attempts_total",

@@ -110,6 +110,30 @@ fn local_event_pruning_drop_before_commit_preserves_rows_and_floor() {
 }
 
 #[test]
+fn local_event_pruning_never_expands_caller_exclusive_floor() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        events.insert(10, &b"event"[..]).unwrap();
+        events.insert(20, &b"event"[..]).unwrap();
+    }
+    txn.commit().unwrap();
+    // Model a stale watermark to guard the helper's caller-supplied deletion ceiling.
+    engine
+        .set_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ, 50)
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let batch = RedbMetaEngine::prune_local_event_log_batch_in_txn(&txn, 15, 10).unwrap();
+    assert_eq!(batch.rows, 0);
+    drop(txn);
+
+    assert_eq!(event_log_sequences(&engine), vec![10, 20]);
+}
+
+#[test]
 fn local_event_pruning_floor_and_sequence_survive_reopen() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("metadata.redb");
@@ -231,6 +255,42 @@ fn local_event_pruning_skips_write_transaction_before_the_first_sequence() {
     assert!(
         completed_on_time,
         "floor 1 has no eligible event rows and must not wait for the redb writer"
+    );
+    assert_eq!(result.unwrap().rows, 0);
+}
+
+#[test]
+fn local_event_pruning_skips_write_transaction_after_persisted_floor() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = Arc::new(temp_engine());
+    engine
+        .set_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ, 9)
+        .unwrap();
+    let blocked_writer = engine.begin_write_txn().unwrap();
+    let worker_engine = Arc::clone(&engine);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        sender
+            .send(worker_engine.prune_local_event_log_before(10, 10))
+            .unwrap();
+    });
+
+    let completed_without_writer = receiver.recv_timeout(Duration::from_secs(2));
+    let completed_on_time = completed_without_writer.is_ok();
+    drop(blocked_writer);
+    let result = match completed_without_writer {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune worker must finish after the held write transaction is released"),
+    };
+    worker.join().unwrap();
+
+    assert!(
+        completed_on_time,
+        "a persisted floor covering every eligible sequence must not wait for the redb writer"
     );
     assert_eq!(result.unwrap().rows, 0);
 }

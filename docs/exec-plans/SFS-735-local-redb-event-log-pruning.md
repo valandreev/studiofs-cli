@@ -40,8 +40,8 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
 - Decision: Retain only `local_position_lock` across the prune transaction, not `pending_state`. Rationale: cursor and snapshot transitions use the position lock, while queue-only edits do not change the durable prune boundary; cursor-advancing transitions still take the position lock. Avoiding the second lock shortens contention for replication work. Date/Author: 2026-09-27, Codex.
 - Decision: Let each poll drain at most 16 full 256-row transactions and check shutdown between transactions. Rationale: one batch per poll can leave a sustained eligible backlog; a finite budget raises cleanup throughput while keeping every redb transaction and each poll's total prune work bounded. The batch size and budget remain internal because no workload evidence calls for runtime configuration. Date/Author: 2026-09-27, Codex.
 - Decision: Preserve the last non-empty successful batch range through idle or failed passes, and report no prune watermark until the stored inclusive sequence is greater than zero. Rationale: an empty first pass is not a removed range, and sequence zero means no event was pruned. Date/Author: 2026-09-27, Codex.
-- Decision: Keep the persisted-floor maximum when a caller supplies a stale lower cursor. Rationale: the persisted floor is an already-proven safe watermark, and the sole production caller restores its cursor to at least one past that floor; the maximum also lets a valid prior proof cover any stale keys. Date/Author: 2026-09-27, Codex.
-- Decision: Skip making the 256-row transaction limit configurable and skip restructuring the final B-tree lookup without measured evidence. Rationale: the current fixed limit is part of bounded maintenance, while configuration and extra exit-state branches would add policy or code for an unmeasured cost. Date/Author: 2026-09-27, Codex.
+- Decision: Keep `exclusive_floor` as a hard deletion ceiling and return an empty batch when the persisted prune watermark already covers it. Rationale: the batch helper must not widen its caller's authorization boundary; supported snapshot import paths preserve the event log and local watermark together or replace both. Date/Author: 2026-09-27, Codex.
+- Decision: Reuse the current first event sequence through the prune loop and keep the 256-row batch limit internal. Rationale: carrying the peeked key removes duplicate B-tree reads without adding configuration or changing bounded work. Date/Author: 2026-09-27, Codex.
 
 ## Outcomes & Retrospective
 
@@ -69,7 +69,15 @@ The 2026-09-27 code-review follow-up also passed:
 - `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings` — passed.
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
 
-The review's suggested stale-floor early return was not applied: the persisted floor is a previously proven safe watermark, and the production caller restores its cursor to at least one past it. Making the 256-row batch configurable and restructuring one B-tree lookup were also skipped because neither has workload measurements supporting more policy or code.
+The subsequent review follow-up added a read-side no-op check for already-pruned cursors, enforced the caller's exclusive floor in the batch helper, corrected the payload-byte metric unit, and reused the B-tree peek through each batch. Snapshot import code confirms that preserving imports keep the event log and local prune watermark together; replacement imports replace the log and clear local PG state. The caller's upper bound is still enforced independently of that invariant.
+
+Validation passed:
+
+- `cargo test -p studiofs-meta --lib local_event_pruning` — 12 passed, including regressions for the persisted-floor no-op and strict caller floor.
+- `cargo test -p studiofs-vfs --lib runtime_stats_surface_reports_overlay_batch_metrics` — 1 passed; the cumulative payload-byte metric reports `bytes`.
+- `cargo check -p studiofs-meta -p studiofs-vfs` — passed.
+- `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings` — passed.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
 
 ## Context and Orientation
 
