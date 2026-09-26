@@ -1611,6 +1611,9 @@ impl PgMetaEngine {
         // Startup checkpoint import is bounded bootstrap work; event-tail
         // catch-up belongs to the explicit replication/background path.
         let startup_bootstrap_succeeded = if repair_local_graph_recovery_pending {
+            engine
+                .local
+                .backfill_missing_uploaded_regular_file_recoveries()?;
             engine.pull_snapshot_locked(
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
             )?;

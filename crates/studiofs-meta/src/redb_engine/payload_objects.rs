@@ -444,6 +444,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
 
         for batch in candidates.chunks(COMPACTION_TXN_BATCH_SIZE) {
             let txn = self.begin_write_txn()?;
+            let mut recovery_inodes = HashSet::new();
             let mut overlay_table = txn
                 .open_table(REGULAR_FILE_OVERLAY_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -484,6 +485,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
                     let _ = pending_table
                         .remove(key.as_slice())
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    recovery_inodes.insert(ino);
                     Self::append_event_in_txn(
                         &txn,
                         &crate::events::MetaEvent::SetRegularFileOverlaySlices {
@@ -506,6 +508,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 overlay_table
                     .insert(key.as_slice(), encoded.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+                recovery_inodes.insert(ino);
 
                 let compacted_slices: Vec<crate::schema::SliceRecord> =
                     compacted_chunk.slices.values().cloned().collect();
@@ -531,6 +534,9 @@ impl MetaPayloadObjects for RedbMetaEngine {
 
             drop(pending_table);
             drop(overlay_table);
+            for ino in recovery_inodes {
+                Self::sync_pending_regular_file_recovery_for_inode_in_txn(&txn, ino)?;
+            }
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             if compacted >= max_chunks {

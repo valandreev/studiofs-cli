@@ -23,6 +23,10 @@ pub(super) const BASE_INODES_TABLE: TableDefinition<u64, &[u8]> =
 pub(super) const INODE_LIFECYCLE_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("inode_lifecycle");
 
+/// Recovery state for locally uploaded regular-file overlays awaiting publication.
+pub(super) const PENDING_REGULAR_FILE_RECOVERY_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("pending_regular_file_recovery");
+
 /// Local tombstones hiding remote-visible base attrs.
 pub(super) const INODE_TOMBSTONES_TABLE: TableDefinition<u64, u8> =
     TableDefinition::new("inode_tombstones");

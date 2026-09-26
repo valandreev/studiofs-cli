@@ -1511,12 +1511,14 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         SliceRange::new(0, 4096).expect("shadowed slice"),
         PayloadRef::new_partial(1201, 4096),
     ));
-    overlay_chunk.insert_slice(SliceRecord::new(
+    let mut visible_slice = SliceRecord::new(
         SliceId(2),
         SliceOrder(2),
         SliceRange::new(0, 4096).expect("visible slice"),
         PayloadRef::new_partial(1202, 4096),
-    ));
+    );
+    visible_slice.payload_state = PayloadRefState::Uploaded;
+    overlay_chunk.insert_slice(visible_slice);
     overlay_chunk.insert_slice(SliceRecord::tombstone(
         SliceId(3),
         SliceOrder(3),
@@ -1524,6 +1526,10 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
     ));
 
     set_regular_file_chunk_rows(&engine, ino, &[(ChunkId(0), overlay_chunk.clone())], &[]);
+    let mut attr = engine.get_attr(ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
 
     let txn = engine.begin_write_txn().unwrap();
     {
@@ -1578,6 +1584,19 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         }
     );
     assert!(!compacted_chunk.fragmentation.should_compact());
+    let recovery = engine
+        .pending_uploaded_regular_file_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|(attr, _)| attr.ino == ino)
+        .expect("uploaded overlay recovery row");
+    assert!(recovery
+        .1
+        .chunks
+        .values()
+        .flat_map(|chunk| chunk.slices.values())
+        .any(|slice| slice.payload.is_some_and(|payload| payload.object_id == 1202)
+            && slice.payload_state == PayloadRefState::Uploaded));
 }
 
 #[test]

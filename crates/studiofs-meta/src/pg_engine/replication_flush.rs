@@ -6,15 +6,14 @@ use super::{
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::events::MetaEvent;
-use crate::schema::{ChunkId, PayloadRefState, ROOT_INO, SliceRecord, UploadState};
+use crate::schema::{ROOT_INO, RegularFileOverlayState, UploadState};
 use crate::types::{FileType, Ino, InodeAttr};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
 const LOCAL_ONLY_SUFFIX_CONTEXT_EVENTS: u64 = 16;
 
 struct SelectedLocalEvents<'a> {
@@ -25,25 +24,6 @@ struct SelectedLocalEvents<'a> {
 fn local_event_range_contains(ranges: &[LocalEventRange], seq: u64) -> bool {
     let index = ranges.partition_point(|range| range.start <= seq);
     index > 0 && seq < ranges[index - 1].end
-}
-
-#[derive(Default)]
-struct RepairedRegularFileOverlay {
-    attr: Option<InodeAttr>,
-    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
-}
-
-impl RepairedRegularFileOverlay {
-    fn reset(&mut self) {
-        self.attr = None;
-        self.chunks.clear();
-    }
-
-    fn has_uploaded_payload(&self) -> bool {
-        self.chunks.values().flatten().any(|slice| {
-            slice.payload.is_some() && slice.payload_state == PayloadRefState::Uploaded
-        })
-    }
 }
 
 fn attrs_match_repair_identity(left: &InodeAttr, right: &InodeAttr) -> bool {
@@ -60,44 +40,20 @@ fn attrs_match_repair_candidate(current: &InodeAttr, candidate: &InodeAttr) -> b
             && current.size == candidate.committed_size)
 }
 
-fn preserve_repaired_uploaded_payload_state(
-    previous: &[SliceRecord],
-    incoming: &mut [SliceRecord],
-) {
-    for slice in incoming {
-        let Some(payload) = slice.payload else {
-            continue;
-        };
-        if !matches!(
-            slice.payload_state,
-            PayloadRefState::LocalOnly | PayloadRefState::Uploading | PayloadRefState::Recovering
-        ) {
-            continue;
-        }
-        if let Some(previous) = previous.iter().find(|previous| {
-            previous.payload == Some(payload)
-                && slice.range.start <= previous.range.start
-                && slice.range.end >= previous.range.end
-                && matches!(
-                    previous.payload_state,
-                    PayloadRefState::Uploaded | PayloadRefState::Published
-                )
-        }) {
-            slice.payload_state = previous.payload_state;
-        }
-    }
-}
-
 fn push_repaired_overlay_events(
     events: &mut Vec<MetaEvent>,
     attr: InodeAttr,
-    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
+    overlay: RegularFileOverlayState,
 ) {
     let ino = attr.ino;
     events.push(MetaEvent::SetAttr { attr });
     events.push(MetaEvent::SetRegularFileOverlaySlices {
         ino,
-        chunk_slices: chunks.into_iter().collect(),
+        chunk_slices: overlay
+            .chunks
+            .into_iter()
+            .map(|(chunk_id, chunk)| (chunk_id, chunk.slices.into_values().collect()))
+            .collect(),
     });
 }
 
@@ -463,62 +419,17 @@ impl PgMetaEngine {
     /// do not create a PostgreSQL metadata backlog.  A redb repair resets the
     /// remote replay position but must not turn that acknowledgement into a
     /// reason to discard the only durable local graph for the pending epoch.
-    /// This method replays only those journal records into serving state; it
-    /// never appends an event, moves the flushed cursor, or re-submits history.
+    /// This method applies only the durable recovery rows to serving state; it
+    /// never reads the local event journal, moves the flushed cursor, or
+    /// re-submits history.
     pub(super) fn restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair(
         &self,
     ) -> MetaResult<()> {
-        let event_end = self.local.get_counter("nextEventSeq")?;
-        let mut overlays = HashMap::<Ino, RepairedRegularFileOverlay>::new();
-
-        let mut event_start = self.local.first_event_seq()?.unwrap_or(event_end);
-        while event_start < event_end {
-            let event_batch_end = event_start
-                .saturating_add(REDB_REPAIR_EVENT_BATCH_SIZE)
-                .min(event_end);
-            for event in self.local.read_events_range(event_start, event_batch_end)? {
-                match event {
-                    MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
-                        let overlay = overlays.entry(ino).or_default();
-                        for (chunk_id, slices) in chunk_slices {
-                            let previous =
-                                overlay.chunks.get(&chunk_id).cloned().unwrap_or_default();
-                            let mut slices = slices;
-                            preserve_repaired_uploaded_payload_state(&previous, &mut slices);
-                            overlay.chunks.insert(chunk_id, slices);
-                        }
-                    }
-                    MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                        let overlay = overlays.entry(attr.ino).or_default();
-                        if !attr.is_upload_pending() {
-                            overlay.reset();
-                            continue;
-                        }
-                        overlay.attr = Some(attr);
-                    }
-                    MetaEvent::SetAttr { attr } => {
-                        overlays.remove(&attr.ino);
-                    }
-                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                    | MetaEvent::RemoveRegularFileGraph { ino }
-                    | MetaEvent::RemoveAttr { ino } => {
-                        overlays.remove(&ino);
-                    }
-                    _ => {}
-                }
-            }
-            event_start = event_batch_end;
-        }
-
+        let overlays = self.local.pending_uploaded_regular_file_recoveries()?;
         let mut restored_inodes = 0usize;
         let mut restored_events = Vec::new();
-        for (ino, overlay) in overlays {
-            if overlay.chunks.is_empty() || !overlay.has_uploaded_payload() {
-                continue;
-            }
-            let Some(attr) = overlay.attr else {
-                continue;
-            };
+        for (attr, overlay) in overlays {
+            let ino = attr.ino;
 
             let current = match self.local.get_attr(ino) {
                 Ok(current) => current,
@@ -529,7 +440,7 @@ impl PgMetaEngine {
                 continue;
             }
 
-            push_repaired_overlay_events(&mut restored_events, attr, overlay.chunks);
+            push_repaired_overlay_events(&mut restored_events, attr, overlay);
             restored_inodes = restored_inodes.saturating_add(1);
         }
 
@@ -933,7 +844,13 @@ mod repair_tests {
         let attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
         let mut events = Vec::new();
 
-        push_repaired_overlay_events(&mut events, attr.clone(), BTreeMap::new());
+        push_repaired_overlay_events(
+            &mut events,
+            attr.clone(),
+            RegularFileOverlayState {
+                chunks: std::collections::BTreeMap::new(),
+            },
+        );
 
         assert_eq!(events.len(), 2);
         assert!(matches!(

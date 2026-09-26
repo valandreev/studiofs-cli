@@ -3,6 +3,26 @@ use crate::redb_engine::layout::{encode_dentry_key, encode_xattr_key};
 use std::sync::Barrier;
 use std::thread;
 
+fn uploaded_pending_file(pg: &PgMetaEngine, name: &[u8], object_id: u64) -> InodeAttr {
+    let file = pg
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create pending file");
+    let payload = PayloadRef::new_partial(object_id, 152);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage pending payload");
+    set_file_state(pg, file.ino, 152, 1);
+    let attr = pg.get_attr(file.ino).expect("pending attr");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            file.ino,
+            attr.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark pending payload uploaded")
+    );
+    attr
+}
+
 fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
@@ -630,7 +650,7 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
 
 #[test]
 fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
-    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (dir, pg) = temp_pg_engine_for_unit();
     let file = pg
         .create_file(ROOT_INO, b"repair-uploaded-overlay.bin", 0, 0, 0o644)
         .expect("create file");
@@ -679,6 +699,19 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         "the local-only uploaded marker is deliberately acknowledged without a PG backlog"
     );
 
+    let mut repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
+    repair_snapshot.event_log.clear();
+    pg.local
+        .import_remote_snapshot(&repair_snapshot)
+        .expect("simulate repair with no retained local event rows");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none(),
+        "the repair snapshot must contain no old local event rows"
+    );
+
     let mut remote_projection = accepted.clone();
     remote_projection.size = 0;
     remote_projection.committed_size = 0;
@@ -703,6 +736,23 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         "without repair replay startup cleanup would classify the uploaded object as stale"
     );
 
+    let path = dir.path().join("meta.redb");
+    drop(pg);
+    let pg = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("reopen repaired local metadata without PostgreSQL");
+
+    let flushed_event_seq_before_restore = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let next_event_seq_before_restore = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("next event sequence before restore");
     pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
         .expect("restore acknowledged uploaded overlay");
 
@@ -721,8 +771,15 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
     );
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
-        acknowledged_end,
+        flushed_event_seq_before_restore,
         "repair replay must not reopen already-flushed metadata for PG publication"
+    );
+    assert_eq!(
+        pg.local
+            .get_counter("nextEventSeq")
+            .expect("next event sequence after restore"),
+        next_event_seq_before_restore,
+        "repair restore must not append to the local event journal"
     );
     assert_eq!(
         pg.replication_backlog().total_ops(),
@@ -765,26 +822,36 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
         )
         .expect("mark payload uploaded")
     );
-    let acknowledged_end = pg
-        .local
-        .get_counter("nextEventSeq")
-        .expect("uploaded-marker end");
-
     let mut newer_remote = accepted.clone();
     newer_remote.size = 0;
     newer_remote.committed_size = 0;
     newer_remote.content_epoch = accepted.content_epoch;
     newer_remote.committed_content_epoch = accepted.content_epoch;
     newer_remote.upload_state = UploadState::Ready;
+    let mut remote_snapshot = pg
+        .local
+        .export_snapshot()
+        .expect("export published snapshot");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == file.ino {
+            *bytes = postcard::to_stdvec(&newer_remote).expect("encode published attr");
+        }
+    }
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
     pg.local
-        .apply_replica_serving_state(&[
-            MetaEvent::RemoveAttr { ino: file.ino },
-            MetaEvent::SetAttr {
-                attr: newer_remote.clone(),
-            },
-        ])
-        .expect("simulate newer remote state after repair");
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate published remote snapshot");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none()
+    );
 
+    let flushed_event_seq_before_restore = pg.flushed_event_seq.load(Ordering::SeqCst);
     pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
         .expect("attempt repair replay");
 
@@ -805,8 +872,74 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
     );
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
-        acknowledged_end,
+        flushed_event_seq_before_restore,
         "guarded replay must leave the flushed cursor untouched"
+    );
+}
+
+#[test]
+fn redb_repair_does_not_restore_superseded_or_deleted_uploaded_overlays() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let superseded = uploaded_pending_file(&pg, b"repair-superseded.bin", 77_014);
+    let deleted = uploaded_pending_file(&pg, b"repair-deleted.bin", 77_015);
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == superseded.ino {
+            let mut attr: InodeAttr = postcard::from_bytes(bytes).expect("decode superseded attr");
+            attr.content_epoch = attr.content_epoch.saturating_add(1);
+            attr.size = 0;
+            attr.upload_state = UploadState::Uploading;
+            *bytes = postcard::to_stdvec(&attr).expect("encode superseded attr");
+        }
+    }
+    remote_snapshot
+        .inodes
+        .retain(|(ino, _)| *ino != deleted.ino);
+    remote_snapshot
+        .dentries
+        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, b"repair-deleted.bin"));
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != superseded.ino && *ino != deleted.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate superseded and deleted remote projection");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none()
+    );
+
+    let next_event_seq = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("event sequence");
+    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+        .expect("attempt repair restore");
+
+    let current = pg.get_attr(superseded.ino).expect("superseding attr");
+    assert_eq!(current.content_epoch, superseded.content_epoch + 1);
+    assert_eq!(current.size, 0);
+    assert_eq!(current.upload_state, UploadState::Uploading);
+    assert!(matches!(
+        pg.get_attr(deleted.ino),
+        Err(MetaError::InodeNotFound(_))
+    ));
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("projected object references")
+            .is_empty()
+    );
+    assert_eq!(
+        pg.local
+            .get_counter("nextEventSeq")
+            .expect("event sequence after restore"),
+        next_event_seq,
+        "repair restore must not append events"
     );
 }
 
@@ -848,9 +981,10 @@ fn redb_repair_merges_uploaded_payloads_across_stale_overlay_events() {
         }
         *bytes = postcard::to_stdvec(&state).expect("encode stale overlay snapshot");
     }
+    stale_snapshot.event_log.clear();
     pg.local
-        .import_remote_snapshot_preserving_local_event_log(&stale_snapshot)
-        .expect("replace serving state while retaining event log");
+        .import_remote_snapshot(&stale_snapshot)
+        .expect("replace serving state without retaining the old event log");
 
     pg.mark_regular_file_overlay_object_uploaded_if_matches(
         file.ino,
@@ -858,6 +992,18 @@ fn redb_repair_merges_uploaded_payloads_across_stale_overlay_events() {
         second.object_id,
     )
     .expect("mark second payload uploaded");
+
+    let mut repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
+    repair_snapshot.event_log.clear();
+    pg.local
+        .import_remote_snapshot(&repair_snapshot)
+        .expect("remove the remaining local event rows");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none()
+    );
 
     pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
         .expect("restore acknowledged uploaded overlay");

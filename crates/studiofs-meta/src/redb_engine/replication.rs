@@ -2059,6 +2059,7 @@ impl RedbMetaEngine {
     }
 
     /// Return the lowest sequence number still present in the local event log.
+    #[cfg(test)]
     pub(crate) fn first_event_seq(&self) -> MetaResult<Option<u64>> {
         let txn = self.begin_read_txn()?;
         let table = txn

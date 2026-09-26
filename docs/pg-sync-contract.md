@@ -336,8 +336,20 @@ When the required event range is unavailable, the client must:
 
 The recovery path must preserve local accepted state, must not invent remote
    history, and must expose enough state for a later reopen or sync cycle to
-   resume. A finite remote history must never make a disk permanently
-   unmountable solely because the old cursor cannot be replayed.
+resume. A finite remote history must never make a disk permanently
+unmountable solely because the old cursor cannot be replayed.
+
+Local redb graph repair also must not depend on retained local event history.
+Before a repair imports a remote serving checkpoint, it captures any missing
+recovery record for an upload-pending regular file whose overlay contains an
+uploaded payload. The record stores the inode attributes and current overlay
+graph in a local table that is excluded from checkpoint export and import. Its
+updates are atomic with local overlay/upload transitions; a new content epoch
+replaces the old row, and publication or deletion removes it. After checkpoint
+import, repair applies a record only when the current inode still matches its
+pending identity and committed-size fence. This preserves acknowledged
+uploaded data without reopening the flushed event cursor; it does not prune
+local events.
 
 ## Read/Write Authority
 
