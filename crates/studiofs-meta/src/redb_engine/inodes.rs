@@ -1720,6 +1720,11 @@ mod tests {
         let new_chunks = std::collections::BTreeMap::from([(ChunkId(0), new_chunk)]);
 
         let txn = engine.begin_immediate_write_txn().unwrap();
+        RedbMetaEngine::set_inode_overlay_in_txn(&txn, &reused_attr).unwrap();
+        let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
+        overlay.remove(key.as_slice()).unwrap();
+        drop(overlay);
         RedbMetaEngine::sync_pending_regular_file_recovery_in_txn(&txn, &reused_attr, &new_chunks)
             .unwrap();
         txn.commit().unwrap();
@@ -1736,13 +1741,6 @@ mod tests {
             .filter_map(|slice| slice.payload.map(|payload| payload.object_id))
             .collect();
         assert_eq!(payload_ids, vec![777_202]);
-
-        let txn = engine.begin_immediate_write_txn().unwrap();
-        let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
-        let key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
-        overlay.remove(key.as_slice()).unwrap();
-        drop(overlay);
-        txn.commit().unwrap();
 
         assert_eq!(
             engine.get_referenced_object_ids().unwrap(),
