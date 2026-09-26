@@ -131,6 +131,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
             removed_ids = removed_object_ids.into_iter().collect();
 
             Self::clear_regular_file_graph_in_txn(&txn, ino)?;
+            Self::remove_pending_regular_file_recovery_in_txn(&txn, ino)?;
             Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
             Self::append_event_in_txn(

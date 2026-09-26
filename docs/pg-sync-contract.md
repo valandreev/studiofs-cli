@@ -340,16 +340,27 @@ resume. A finite remote history must never make a disk permanently
 unmountable solely because the old cursor cannot be replayed.
 
 Local redb graph repair also must not depend on retained local event history.
-Before a repair imports a remote serving checkpoint, it captures any missing
-recovery record for an upload-pending regular file whose overlay contains an
-uploaded payload. The record stores the inode attributes and current overlay
-graph in a local table that is excluded from checkpoint export and import. Its
-updates are atomic with local overlay/upload transitions; a new content epoch
-replaces the old row, and publication or deletion removes it. After checkpoint
-import, repair applies a record only when the current inode still matches its
-pending identity and committed-size fence. This preserves acknowledged
-uploaded data without reopening the flushed event cursor; it does not prune
-local events.
+Before importing a remote serving checkpoint, it captures or refreshes a
+recovery record for each upload-pending regular file whose overlay contains an
+uploaded payload. The local-only row stores the inode attributes, uploaded
+overlay slices, namespace dentries, and whether the inode existed in the
+published base; checkpoint export and import exclude it. This lets repair
+restore a newly created unpublished inode and its name when the checkpoint
+omits both. Repair
+checks the content identity and committed-size fence without treating unrelated
+changes such as link count or timestamps as a different payload epoch, and it
+restores a saved dentry only when its parent is a directory and its name is
+available or already points to that inode.
+
+Repair retires a row when the inode identity changed, a previously published
+inode is absent, a strictly newer content epoch superseded it, or the published
+base contains every payload object retained by the row. A same-numbered
+committed epoch alone does not prove that the row's payload was published. An
+ambiguous identity or namespace conflict keeps the recovery row and its object
+references; startup leaves the local-graph repair marker set so a later open
+can retry. The janitor periodically removes only rows that can be proven
+obsolete from the serving inode and published payload graph. This recovery
+path does not reopen the flushed event cursor or prune local events.
 
 ## Read/Write Authority
 

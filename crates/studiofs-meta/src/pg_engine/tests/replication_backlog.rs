@@ -862,8 +862,11 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
     );
 
     let flushed_event_seq_before_restore = pg.flushed_event_seq.load(Ordering::SeqCst);
-    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
-        .expect("attempt repair replay");
+    assert!(
+        !pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("attempt repair replay"),
+        "an ambiguous retained row must keep startup repair pending"
+    );
 
     let current = pg.get_attr(file.ino).expect("current attr");
     assert_eq!(
@@ -877,15 +880,16 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
         pg.local
             .get_referenced_object_ids()
             .expect("current references")
-            .is_empty(),
-        "the stale uploaded extent must stay unreachable under the newer remote state"
+            .contains(&77_011),
+        "the remote epoch counter does not prove that this payload was published"
     );
-    assert!(
+    assert_eq!(
         pg.local
             .pending_uploaded_regular_file_recoveries()
-            .expect("recovery records after published projection")
-            .is_empty(),
-        "a published epoch retires its obsolete local recovery record"
+            .expect("recovery records after conflicting projection")
+            .len(),
+        1,
+        "the recovery row pins a payload absent from the published base graph"
     );
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
@@ -1081,7 +1085,38 @@ fn redb_repair_does_not_restore_superseded_uploaded_overlay() {
 #[test]
 fn redb_repair_does_not_restore_deleted_uploaded_overlay() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    let deleted = uploaded_pending_file(&pg, b"repair-deleted.bin", 77_015);
+    let name = b"repair-deleted.bin";
+    let created = pg
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create file");
+    pg.local
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: created.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+                entry: crate::types::DirEntryValue {
+                    ino: created.ino,
+                    kind: created.kind,
+                },
+            },
+        ])
+        .expect("publish inode identity before pending content");
+    let payload = PayloadRef::new_partial(77_015, 152);
+    pg.stage_payload_slice(created.ino, 0, &payload)
+        .expect("stage pending payload");
+    set_file_state(&pg, created.ino, 152, 1);
+    let deleted = pg.get_attr(created.ino).expect("pending attr");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            deleted.ino,
+            deleted.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark pending payload uploaded")
+    );
 
     let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
     remote_snapshot.event_log.clear();
@@ -1090,7 +1125,7 @@ fn redb_repair_does_not_restore_deleted_uploaded_overlay() {
         .retain(|(ino, _)| *ino != deleted.ino);
     remote_snapshot
         .dentries
-        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, b"repair-deleted.bin"));
+        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, name));
     remote_snapshot
         .regular_file_overlay
         .retain(|(ino, _)| *ino != deleted.ino);
@@ -1133,6 +1168,132 @@ fn redb_repair_does_not_restore_deleted_uploaded_overlay() {
             .expect("event sequence after restore"),
         next_event_seq,
         "repair restore must not append events"
+    );
+}
+
+#[test]
+fn garbage_collection_retires_superseded_uploaded_recovery_rows() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = uploaded_pending_file(&pg, b"recovery-gc-superseded.bin", 77_021);
+    let mut superseding = file.clone();
+    superseding.content_epoch = superseding.content_epoch.saturating_add(1);
+    superseding.committed_content_epoch = superseding.content_epoch;
+    superseding.size = 0;
+    superseding.committed_size = 0;
+    superseding.upload_state = UploadState::Ready;
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: Vec::new(),
+            },
+            MetaEvent::SetAttr { attr: superseding },
+        ])
+        .expect("apply superseding serving state");
+
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("reconcile recovery references")
+            .is_empty()
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("reconciled recovery rows")
+            .is_empty()
+    );
+}
+
+#[test]
+fn redb_repair_restores_unpublished_uploaded_file_missing_from_checkpoint() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-unpublished-missing.bin";
+    let file = uploaded_pending_file(&pg, name, 77_019);
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
+    remote_snapshot.event_log.clear();
+    remote_snapshot.inodes.retain(|(ino, _)| *ino != file.ino);
+    remote_snapshot
+        .dentries
+        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, name));
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate checkpoint omitting unpublished inode");
+
+    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+        .expect("restore unpublished uploaded file");
+
+    assert_eq!(pg.get_attr(file.ino).expect("restored inode"), file);
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, name)
+            .expect("restored namespace entry")
+            .ino,
+        file.ino
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, file.size).expect("restored uploaded payloads"),
+        vec![77_019]
+    );
+    assert_eq!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records")
+            .len(),
+        1,
+        "the recovery row remains available until publication retires it"
+    );
+}
+
+#[test]
+fn redb_repair_restores_pending_file_namespace_after_hardlink_metadata_drift() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-hardlink-source.bin";
+    let alias = b"repair-hardlink-alias.bin";
+    let before_link = uploaded_pending_file(&pg, name, 77_020);
+    let after_link = pg
+        .link(before_link.ino, ROOT_INO, alias)
+        .expect("create hardlink");
+    pg.local
+        .backfill_missing_uploaded_regular_file_recoveries()
+        .expect("refresh recovery metadata before checkpoint import");
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == before_link.ino {
+            *bytes = postcard::to_stdvec(&before_link).expect("encode pre-link attr");
+        }
+    }
+    remote_snapshot
+        .dentries
+        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, alias));
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != before_link.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate checkpoint missing a local hardlink");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore linked pending file")
+    );
+
+    assert_eq!(
+        pg.get_attr(before_link.ino).expect("restored attr"),
+        after_link
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, alias)
+            .expect("restored hardlink")
+            .ino,
+        before_link.ino
     );
 }
 

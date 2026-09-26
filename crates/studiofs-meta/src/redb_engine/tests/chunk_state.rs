@@ -1588,10 +1588,10 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         .pending_uploaded_regular_file_recoveries()
         .unwrap()
         .into_iter()
-        .find(|(attr, _)| attr.ino == ino)
+        .find(|record| record.attr.ino == ino)
         .expect("uploaded overlay recovery row");
     assert!(recovery
-        .1
+        .overlay
         .chunks
         .values()
         .flat_map(|chunk| chunk.slices.values())
@@ -1635,7 +1635,7 @@ fn test_backfill_pending_regular_file_recovery_preserves_existing_record() {
         .pending_uploaded_regular_file_recoveries()
         .unwrap()
         .into_iter()
-        .find(|(attr, _)| attr.ino == ino)
+        .find(|record| record.attr.ino == ino)
         .expect("backfilled uploaded recovery row");
 
     let mut changed_attr = engine.get_attr(ino).unwrap();
@@ -1650,12 +1650,12 @@ fn test_backfill_pending_regular_file_recovery_preserves_existing_record() {
         .pending_uploaded_regular_file_recoveries()
         .unwrap()
         .into_iter()
-        .find(|(attr, _)| attr.ino == ino)
+        .find(|record| record.attr.ino == ino)
         .expect("existing uploaded recovery row");
 
-    assert_eq!(first.0.mode, 0o644);
-    assert_eq!(after.0.mode, first.0.mode);
-    assert_eq!(after.1.chunks, first.1.chunks);
+    assert_eq!(first.attr.mode, 0o644);
+    assert_eq!(after.attr.mode, 0o600);
+    assert_eq!(after.overlay.chunks, first.overlay.chunks);
 }
 
 #[test]

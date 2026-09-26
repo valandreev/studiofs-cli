@@ -906,6 +906,15 @@ impl PgMetaEngine {
             return Ok(());
         }
 
+        if self
+            .local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)?
+            != 0
+        {
+            self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+            return Ok(());
+        }
+
         if !self.remote_identity_validated.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -1618,11 +1627,18 @@ impl PgMetaEngine {
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
             )?;
             engine.restore_pending_state_from_local_log()?;
-            engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
-            engine
-                .local
-                .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
-            true
+            let recovery_resolved =
+                engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
+            if recovery_resolved {
+                engine
+                    .local
+                    .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
+            } else {
+                warn!(
+                    "redb graph recovery remains pending because an uploaded recovery row could not be safely restored or retired"
+                );
+            }
+            recovery_resolved
         } else {
             // Preserve unflushed local overlays while optionally importing a
             // bounded startup checkpoint. Do not replay the remote event tail
