@@ -1826,6 +1826,8 @@ pub mod counters {
     pub const NEXT_INODE: &str = "nextInode";
     /// Legacy next object ID counter. New object IDs share the inode allocation stream.
     pub const NEXT_OBJECT_ID: &str = "nextObjectId";
+    /// Next sequence number to allocate in the local metadata event log.
+    pub const NEXT_EVENT_SEQ: &str = "nextEventSeq";
     /// Total used space in bytes.
     pub const USED_SPACE: &str = "usedSpace";
     /// Total number of inodes in use.

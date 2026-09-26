@@ -444,7 +444,7 @@ impl RedbMetaEngine {
         snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
         snapshot.event_log.clear();
         snapshot.counters.retain(|(name, _)| {
-            name.as_str() != "nextEventSeq"
+            name.as_str() != crate::schema::counters::NEXT_EVENT_SEQ
                 && !crate::pg_engine::is_local_pg_snapshot_state_counter(name)
         });
         if let Some((_, value)) = snapshot
@@ -1831,7 +1831,7 @@ impl RedbMetaEngine {
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let end_seq = counters
-            .get("nextEventSeq")
+            .get(crate::schema::counters::NEXT_EVENT_SEQ)
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .map(|value| value.value())
             .unwrap_or(1);
@@ -1984,7 +1984,7 @@ impl RedbMetaEngine {
             .map(|value| value.value())
             .unwrap_or(1);
         let end_seq = counters
-            .get("nextEventSeq")
+            .get(crate::schema::counters::NEXT_EVENT_SEQ)
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .map(|value| value.value())
             .unwrap_or(1);

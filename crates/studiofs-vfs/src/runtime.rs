@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use studiofs_meta::engine::{
-    DeferredDeleteRecord, MetadataAuthorityStatus, MetadataCheckpointFreshnessDiagnostics,
-    MetadataCoherenceProgress, MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
-    MetadataWriteObservability, PendingCreateRecord, PgSyncDiagnostics, PgSyncStatus, UndoLogKind,
-    UndoLogRecord,
+    DeferredDeleteRecord, LocalStorageCompactionResult, LocalStorageDiagnostics,
+    MetadataAuthorityStatus, MetadataCheckpointFreshnessDiagnostics, MetadataCoherenceProgress,
+    MetadataInvalidationDiagnostics, MetadataReplicationBacklog, MetadataWriteObservability,
+    PendingCreateRecord, PgSyncDiagnostics, PgSyncStatus, UndoLogKind, UndoLogRecord,
 };
 use studiofs_meta::snapshot_ports::{
     SnapshotCleanupStore, SnapshotJobStore, SnapshotPolicyStore, SnapshotSourceReader,
@@ -504,6 +504,10 @@ impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M>
 }
 
 impl<M: ?Sized + MetaGc> MetaGc for RuntimeMetaHandle<M> {
+    forward_method!(fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult>);
+    forward_method!(
+        fn local_storage_diagnostics(&self) -> MetaResult<Option<LocalStorageDiagnostics>>
+    );
     forward_method!(
         fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()>
     );
@@ -825,7 +829,7 @@ mod tests {
     use super::{MetaExecutor, cache_io_execution_model, into_vfs_meta, run_local_cache_io};
     use std::sync::Arc;
     use std::time::Duration;
-    use studiofs_meta::{FormatInfo, MetaError, MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{FormatInfo, MetaError, MetaFormat, MetaGc, RedbMetaEngine};
 
     #[test]
     fn cache_io_execution_model_is_inline_runtime_worker() {
@@ -894,6 +898,25 @@ mod tests {
             .expect("sync metadata call");
 
         assert_eq!(observed, "runtime-meta");
+    }
+
+    #[test]
+    fn runtime_meta_handle_forwards_local_metadata_compaction() {
+        let temp = studiofs_test_support::workspace_target_tempdir("runtime-meta-compact-");
+        let path = temp.path().join("meta.redb");
+        let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
+        let meta = into_vfs_meta(Arc::clone(&engine));
+
+        let outcome = meta
+            .compact_local_storage()
+            .expect("compact local metadata storage");
+        let diagnostics = engine
+            .local_storage_diagnostics()
+            .expect("read local storage diagnostics")
+            .expect("redb diagnostics are available");
+
+        assert_eq!(diagnostics.compaction_attempts, 1);
+        assert_eq!(diagnostics.last_compaction_result, Some(outcome));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

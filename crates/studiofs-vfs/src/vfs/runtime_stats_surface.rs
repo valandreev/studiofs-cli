@@ -1,4 +1,7 @@
-use studiofs_meta::{Ino, InodeAttr, ROOT_INO};
+use studiofs_meta::{
+    Ino, InodeAttr, LocalStorageCompactionResult, LocalStorageCompactionSkipReason,
+    LocalStorageDiagnostics, ROOT_INO,
+};
 
 use super::{
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot,
@@ -847,7 +850,150 @@ impl StudioVfs {
             overlay_batch.forced_barriers,
         );
 
+        if let Ok(Some(diagnostics)) = self.sync_meta().local_storage_diagnostics() {
+            insert_local_storage_diagnostics(&mut snapshot.metadata, &diagnostics);
+        }
+
         snapshot
+    }
+}
+
+fn insert_local_storage_diagnostics(
+    section: &mut RuntimeStatsSection,
+    diagnostics: &LocalStorageDiagnostics,
+) {
+    for (name, unit, value) in [
+        (
+            "metadata_redb_physical_file_bytes",
+            "bytes",
+            diagnostics.physical_file_bytes,
+        ),
+        (
+            "metadata_redb_allocated_pages",
+            "count",
+            diagnostics.allocated_pages,
+        ),
+        ("metadata_redb_leaf_pages", "count", diagnostics.leaf_pages),
+        (
+            "metadata_redb_branch_pages",
+            "count",
+            diagnostics.branch_pages,
+        ),
+        (
+            "metadata_redb_btree_tree_height",
+            "count",
+            diagnostics.tree_height.map(u64::from),
+        ),
+        (
+            "metadata_redb_stored_bytes",
+            "bytes",
+            diagnostics.stored_bytes,
+        ),
+        (
+            "metadata_redb_metadata_bytes",
+            "bytes",
+            diagnostics.metadata_bytes,
+        ),
+        (
+            "metadata_redb_fragmented_bytes",
+            "bytes",
+            diagnostics.fragmented_bytes,
+        ),
+        (
+            "metadata_redb_page_size_bytes",
+            "bytes",
+            diagnostics.page_size_bytes,
+        ),
+        (
+            "metadata_redb_first_local_event_seq",
+            "count",
+            diagnostics.first_local_event_seq,
+        ),
+        (
+            "metadata_redb_next_local_event_seq",
+            "count",
+            diagnostics.next_local_event_seq,
+        ),
+        (
+            "metadata_redb_retained_local_event_span",
+            "count",
+            diagnostics.retained_local_event_span,
+        ),
+        (
+            "metadata_redb_compaction_last_duration_ns",
+            "ns",
+            diagnostics.last_compaction_duration_ns,
+        ),
+        (
+            "metadata_redb_compaction_last_success_bytes_before",
+            "bytes",
+            diagnostics.last_success_bytes_before,
+        ),
+        (
+            "metadata_redb_compaction_last_success_bytes_after",
+            "bytes",
+            diagnostics.last_success_bytes_after,
+        ),
+    ] {
+        if let Some(value) = value {
+            insert_gauge(section, name, unit, value);
+        }
+    }
+
+    for (name, value) in [
+        (
+            "metadata_redb_compaction_attempts_total",
+            diagnostics.compaction_attempts,
+        ),
+        (
+            "metadata_redb_compaction_compacted_total",
+            diagnostics.compaction_compacted,
+        ),
+        (
+            "metadata_redb_compaction_no_work_total",
+            diagnostics.compaction_no_work,
+        ),
+        (
+            "metadata_redb_compaction_skipped_busy_total",
+            diagnostics.compaction_skipped_busy,
+        ),
+        (
+            "metadata_redb_compaction_errors_total",
+            diagnostics.compaction_errors,
+        ),
+    ] {
+        insert_counter(section, name, "count", value);
+    }
+
+    for (name, value) in [
+        (
+            "metadata_redb_compaction_last_result_compacted",
+            diagnostics.last_compaction_result == Some(LocalStorageCompactionResult::Compacted),
+        ),
+        (
+            "metadata_redb_compaction_last_result_no_work",
+            diagnostics.last_compaction_result == Some(LocalStorageCompactionResult::NoWork),
+        ),
+        (
+            "metadata_redb_compaction_last_result_skipped_busy",
+            diagnostics.last_compaction_result == Some(LocalStorageCompactionResult::SkippedBusy),
+        ),
+        (
+            "metadata_redb_compaction_last_result_error",
+            diagnostics.last_compaction_error,
+        ),
+        (
+            "metadata_redb_compaction_last_skip_reason_database_lock_contended",
+            diagnostics.last_compaction_skip_reason
+                == Some(LocalStorageCompactionSkipReason::DatabaseLockContended),
+        ),
+        (
+            "metadata_redb_compaction_last_skip_reason_active_transaction",
+            diagnostics.last_compaction_skip_reason
+                == Some(LocalStorageCompactionSkipReason::ActiveTransaction),
+        ),
+    ] {
+        insert_gauge(section, name, "count", u64::from(value));
     }
 }
 

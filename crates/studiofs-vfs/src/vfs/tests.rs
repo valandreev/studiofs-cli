@@ -2321,6 +2321,37 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
     assert!(parsed.cache.counters.contains_key("readahead_dropped_ops"));
     assert!(parsed.cache.counters.contains_key("readahead_useful_bytes"));
     assert!(parsed.upload_queue.gauges.contains_key("pending_depth"));
+    let metadata_redb_bytes = parsed
+        .metadata
+        .gauges
+        .get("metadata_redb_physical_file_bytes")
+        .expect("metadata redb file size is exposed");
+    assert!(metadata_redb_bytes.value > 0);
+    assert_eq!(metadata_redb_bytes.unit, "bytes");
+    assert!(
+        parsed
+            .metadata
+            .gauges
+            .contains_key("metadata_redb_allocated_pages")
+    );
+    assert!(
+        parsed
+            .metadata
+            .gauges
+            .contains_key("metadata_redb_btree_tree_height")
+    );
+    assert!(
+        parsed
+            .metadata
+            .counters
+            .contains_key("metadata_redb_compaction_attempts_total")
+    );
+    assert!(
+        !parsed
+            .cache
+            .gauges
+            .contains_key("metadata_redb_physical_file_bytes")
+    );
 }
 
 #[test]

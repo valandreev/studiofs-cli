@@ -6,8 +6,15 @@ use crate::MetaRecovery;
 use crate::contract_harness::{ContractCoreFixture, ContractCoreOp};
 use crate::engine::DeferredDeleteRecord;
 use crate::events::MetaEvent;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::thread;
+
+fn invalidate_local_storage_page_stats(engine: &RedbMetaEngine) {
+    *engine
+        .local_storage_page_stats
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
 
 #[test]
 fn coherence_journal_directory_rename_and_removal_retain_descendant_paths() {
@@ -723,22 +730,56 @@ fn sync_local_metadata_propagates_barrier_failure_and_keeps_pending_state() {
 }
 
 #[test]
-fn relaxed_barrier_preserves_write_committed_during_barrier() {
+fn relaxed_barrier_preserves_pending_for_writes_after_barrier() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = Arc::new(RedbMetaEngine::open_relaxed_for_test(
         dir.path().join("meta.redb"),
     ));
     engine.set_counter("before-barrier", 1).unwrap();
-    let barrier = Arc::new(Barrier::new(2));
-    engine.pause_after_barrier_commit_for_test(Arc::clone(&barrier));
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    engine.pause_after_barrier_commit_for_test(reached_tx, resume_rx);
 
     let sync_engine = Arc::clone(&engine);
     let sync = thread::spawn(move || sync_engine.sync_local_metadata());
-    barrier.wait();
-    engine.set_counter("during-barrier", 2).unwrap();
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("metadata barrier should reach the test hook");
+    resume_tx
+        .send(())
+        .expect("metadata barrier should remain paused until resumed");
     sync.join().unwrap().unwrap();
+    engine.set_counter("after-barrier", 2).unwrap();
 
     assert!(engine.relaxed_pending_for_test());
+}
+
+#[test]
+fn local_storage_diagnostics_does_not_collect_page_stats_during_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = Arc::new(RedbMetaEngine::open_relaxed_for_test(
+        dir.path().join("meta.redb"),
+    ));
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    engine.pause_after_barrier_commit_for_test(reached_tx, resume_rx);
+
+    let sync_engine = Arc::clone(&engine);
+    let sync = thread::spawn(move || sync_engine.sync_local_metadata());
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("metadata barrier should reach the test hook");
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    resume_tx
+        .send(())
+        .expect("metadata barrier should remain paused until resumed");
+    sync.join().unwrap().unwrap();
+
+    assert!(diagnostics.physical_file_bytes.is_some());
+    assert!(diagnostics.allocated_pages.is_none());
 }
 
 #[test]
@@ -750,6 +791,333 @@ fn local_storage_compaction_skips_when_read_transaction_is_active() {
         engine.compact_local_storage().unwrap(),
         LocalStorageCompactionResult::SkippedBusy
     );
+}
+
+#[test]
+fn local_storage_compaction_records_active_transaction_skip_reason() {
+    let engine = temp_engine();
+    let _read_txn = engine.begin_read_txn().unwrap();
+
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::SkippedBusy
+    );
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.compaction_attempts, 1);
+    assert_eq!(diagnostics.compaction_skipped_busy, 1);
+    assert_eq!(
+        diagnostics.last_compaction_result,
+        Some(LocalStorageCompactionResult::SkippedBusy)
+    );
+    assert_eq!(
+        diagnostics.last_compaction_skip_reason,
+        Some(LocalStorageCompactionSkipReason::ActiveTransaction)
+    );
+    assert!(diagnostics.last_compaction_duration_ns.is_some());
+}
+
+#[test]
+fn local_storage_compaction_records_database_lock_contention_reason() {
+    let engine = temp_engine();
+    {
+        let _database_lock = engine.db.as_ref().unwrap().write().unwrap();
+        assert_eq!(
+            engine.compact_local_storage().unwrap(),
+            LocalStorageCompactionResult::SkippedBusy
+        );
+    }
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.compaction_skipped_busy, 1);
+    assert_eq!(
+        diagnostics.last_compaction_skip_reason,
+        Some(LocalStorageCompactionSkipReason::DatabaseLockContended)
+    );
+}
+
+#[test]
+fn local_storage_diagnostics_omits_page_stats_when_writer_lock_is_busy() {
+    let engine = temp_engine();
+    let _writer_lock = engine.write_txn_lock.lock().unwrap();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(diagnostics.physical_file_bytes.is_some());
+    assert_eq!(diagnostics.allocated_pages, None);
+}
+
+#[test]
+fn local_storage_diagnostics_reuses_page_stats_when_writer_lock_is_busy() {
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(initial.allocated_pages.is_some());
+    let _writer_lock = engine.write_txn_lock.lock().unwrap();
+
+    let cached = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(cached.allocated_pages, initial.allocated_pages);
+}
+
+#[test]
+fn local_storage_diagnostics_returns_cached_stats_while_refresh_is_busy() {
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    let cached = engine
+        .local_storage_page_stats
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .expect("page stats were cached");
+    let stale_at = cached
+        .sampled_at
+        .checked_add(LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL)
+        .expect("test timestamp remains representable");
+    let _refresh = engine.local_storage_page_stats_refresh.lock().unwrap();
+
+    let stats = engine
+        .local_storage_page_stats_best_effort_at(stale_at)
+        .expect("the cached page sample is available during refresh");
+    assert_eq!(stats.allocated_pages, initial.allocated_pages.unwrap());
+}
+
+#[test]
+fn local_storage_page_stats_cache_uses_the_supplied_sample_time() {
+    let engine = temp_engine();
+    let sampled_at = Instant::now()
+        .checked_add(LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL)
+        .expect("sample time remains representable");
+
+    assert!(
+        engine
+            .local_storage_page_stats_best_effort_at(sampled_at)
+            .is_some()
+    );
+    let cached = engine
+        .local_storage_page_stats
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .expect("page stats were cached");
+
+    assert_eq!(cached.sampled_at, sampled_at);
+}
+
+#[test]
+fn local_storage_diagnostics_recovers_poisoned_page_stats_cache() {
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(initial.allocated_pages.is_some());
+
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cache = engine.local_storage_page_stats.lock().unwrap();
+        panic!("poison page stats cache for recovery coverage");
+    }));
+    assert!(poisoned.is_err());
+
+    let recovered = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(recovered.allocated_pages, initial.allocated_pages);
+}
+
+#[test]
+fn local_storage_compaction_errors_are_counted() {
+    let engine = temp_engine();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _database_lock = engine.db.as_ref().unwrap().write().unwrap();
+        panic!("poison database lock for compaction error coverage");
+    }));
+    assert!(poisoned.is_err());
+
+    assert!(engine.compact_local_storage().is_err());
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.compaction_attempts, 1);
+    assert_eq!(diagnostics.compaction_errors, 1);
+    assert!(diagnostics.last_compaction_error);
+}
+
+#[test]
+fn local_storage_diagnostics_report_empty_event_log_span() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open(dir.path().join("metadata.redb")).unwrap();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.first_local_event_seq, None);
+    assert_eq!(diagnostics.next_local_event_seq, Some(1));
+    assert_eq!(diagnostics.retained_local_event_span, Some(0));
+}
+
+#[test]
+fn local_storage_diagnostics_keeps_exclusive_end_after_retained_event_tail() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open(dir.path().join("metadata.redb")).unwrap();
+    let write = engine.begin_write_txn().unwrap();
+    {
+        let mut events = write.open_table(EVENT_LOG_TABLE).unwrap();
+        events.insert(42, b"event".as_slice()).unwrap();
+        events.insert(47, b"event".as_slice()).unwrap();
+    }
+    write.commit().unwrap();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.first_local_event_seq, Some(42));
+    assert_eq!(diagnostics.next_local_event_seq, Some(48));
+    assert_eq!(diagnostics.retained_local_event_span, Some(6));
+}
+
+#[test]
+fn local_storage_compaction_records_no_work_after_compaction() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open(dir.path().join("metadata.redb")).unwrap();
+
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::Compacted
+    );
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::NoWork
+    );
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.compaction_attempts, 2);
+    assert_eq!(diagnostics.compaction_compacted, 1);
+    assert_eq!(diagnostics.compaction_no_work, 1);
+    assert_eq!(
+        diagnostics.last_compaction_result,
+        Some(LocalStorageCompactionResult::NoWork)
+    );
+}
+
+#[test]
+fn local_storage_diagnostics_track_delete_and_compaction() {
+    const CHURN_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("sfs732_churn");
+
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(initial.physical_file_bytes.is_some_and(|bytes| bytes > 0));
+    let next_before_event = initial
+        .next_local_event_seq
+        .expect("next local event sequence is available");
+
+    engine
+        .add_pending_deletion(7, 11)
+        .expect("append one local event");
+    let write = engine.begin_write_txn().unwrap();
+    {
+        let mut table = write.open_table(CHURN_TABLE).unwrap();
+        let payload = vec![b'x'; 8 * 1024];
+        for key in 0..128 {
+            table.insert(key, payload.as_slice()).unwrap();
+        }
+    }
+    write.commit().unwrap();
+    invalidate_local_storage_page_stats(&engine);
+
+    let before_delete = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    let first_event = before_delete
+        .first_local_event_seq
+        .expect("local event log has a retained event");
+    let next_event = next_before_event + 1;
+    assert_eq!(
+        before_delete.first_local_event_seq,
+        initial.first_local_event_seq.or(Some(next_before_event))
+    );
+    assert_eq!(before_delete.next_local_event_seq, Some(next_event));
+    assert_eq!(
+        before_delete.retained_local_event_span,
+        Some(next_event.saturating_sub(first_event))
+    );
+
+    let delete = engine.begin_write_txn().unwrap();
+    {
+        let mut table = delete.open_table(CHURN_TABLE).unwrap();
+        for key in 0..128 {
+            table.remove(key).unwrap();
+        }
+    }
+    delete.commit().unwrap();
+    invalidate_local_storage_page_stats(&engine);
+
+    let after_delete = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(
+        after_delete.stored_bytes.unwrap() < before_delete.stored_bytes.unwrap(),
+        "deleted rows must reduce redb stored bytes"
+    );
+    assert_ne!(
+        after_delete.fragmented_bytes, before_delete.fragmented_bytes,
+        "redb fragmentation statistics must reflect the deleted rows"
+    );
+
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::Compacted
+    );
+    let after_compaction = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(after_compaction.compaction_attempts, 1);
+    assert_eq!(after_compaction.compaction_compacted, 1);
+    assert_eq!(
+        after_compaction.last_compaction_result,
+        Some(LocalStorageCompactionResult::Compacted)
+    );
+    assert_eq!(
+        after_compaction.last_success_bytes_before,
+        after_delete.physical_file_bytes
+    );
+    assert_eq!(
+        after_compaction.last_success_bytes_after,
+        after_compaction.physical_file_bytes
+    );
+    assert!(
+        after_compaction.physical_file_bytes.unwrap() < after_delete.physical_file_bytes.unwrap(),
+        "the controlled compaction must shrink the metadata database"
+    );
+    assert!(after_compaction.last_compaction_duration_ns.is_some());
 }
 
 #[test]

@@ -560,14 +560,14 @@ impl RedbMetaEngine {
 
         // Get the next sequence ID for the event log
         let seq_id = match counters
-            .get("nextEventSeq")
+            .get(crate::schema::counters::NEXT_EVENT_SEQ)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             Some(v) => v.value(),
             None => 1,
         };
         counters
-            .insert("nextEventSeq", seq_id + 1)
+            .insert(crate::schema::counters::NEXT_EVENT_SEQ, seq_id + 1)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         // Encode and insert the event
