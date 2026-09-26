@@ -920,6 +920,36 @@ fn insert_local_storage_diagnostics(
             diagnostics.retained_local_event_span,
         ),
         (
+            "metadata_redb_local_event_log_pruned_through_seq",
+            "count",
+            diagnostics.local_event_log_pruned_through_seq,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_rows",
+            "count",
+            diagnostics.last_local_event_log_prune_rows,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_first_seq",
+            "count",
+            diagnostics.last_local_event_log_prune_first_seq,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_last_seq",
+            "count",
+            diagnostics.last_local_event_log_prune_last_seq,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_payload_bytes",
+            "bytes",
+            diagnostics.last_local_event_log_prune_payload_bytes,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_duration_ns",
+            "ns",
+            diagnostics.last_local_event_log_prune_duration_ns,
+        ),
+        (
             "metadata_redb_compaction_last_duration_ns",
             "ns",
             diagnostics.last_compaction_duration_ns,
@@ -941,6 +971,14 @@ fn insert_local_storage_diagnostics(
     }
 
     for (name, value) in [
+        (
+            "metadata_redb_local_event_log_pruned_rows_total",
+            diagnostics.local_event_log_pruned_rows_total,
+        ),
+        (
+            "metadata_redb_local_event_log_pruned_payload_bytes_total",
+            diagnostics.local_event_log_pruned_payload_bytes_total,
+        ),
         (
             "metadata_redb_compaction_attempts_total",
             diagnostics.compaction_attempts,

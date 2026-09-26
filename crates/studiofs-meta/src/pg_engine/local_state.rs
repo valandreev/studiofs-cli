@@ -4,7 +4,7 @@ use super::{
     StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
-use crate::redb_engine::RedbMetaEngine;
+use crate::redb_engine::{LocalEventLogPruneBatch, RedbMetaEngine};
 use std::sync::atomic::Ordering;
 
 /// Sort ranges and merge overlaps or adjacency without replacing the vector.
@@ -126,7 +126,21 @@ impl PgMetaEngine {
     }
 
     pub(super) fn load_persisted_flushed_event_seq(local: &RedbMetaEngine) -> MetaResult<u64> {
-        local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+        let flushed = local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)?;
+        let pruned_through =
+            local.get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)?;
+        Ok(if pruned_through == 0 {
+            flushed
+        } else {
+            flushed.max(pruned_through.saturating_add(1))
+        })
+    }
+
+    pub(super) fn prune_local_event_log_once(&self) -> MetaResult<LocalEventLogPruneBatch> {
+        let (_position_guard, _pending_state) = self.lock_local_position_and_pending_state()?;
+        let exclusive_floor = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
+        self.local
+            .prune_local_event_log_before(exclusive_floor, super::LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS)
     }
 
     #[cfg(test)]
@@ -371,8 +385,8 @@ impl PgMetaEngine {
         if persisted_version > 0 {
             return Ok(None);
         }
-        let has_unflushed_local_events = local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)?
-            < local.get_counter("nextEventSeq")?;
+        let has_unflushed_local_events = Self::load_persisted_flushed_event_seq(local)?
+            < local.get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?;
         if has_unflushed_local_events && Self::has_any_local_overlay_mutation(local)? {
             return Ok(Some(StartupSnapshotImportMode::PreserveLocalState));
         }

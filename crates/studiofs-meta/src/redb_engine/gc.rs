@@ -2,6 +2,152 @@ use super::*;
 use redb::CompactionError;
 
 impl RedbMetaEngine {
+    fn record_local_event_log_prune(
+        &self,
+        result: &MetaResult<LocalEventLogPruneBatch>,
+        elapsed: std::time::Duration,
+    ) {
+        let mut stats = self
+            .local_event_log_prune
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        stats.last_duration_ns = Some(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        match result {
+            Ok(batch) => {
+                let rows = u64::try_from(batch.rows).unwrap_or(u64::MAX);
+                stats.rows_pruned = stats.rows_pruned.saturating_add(rows);
+                stats.payload_bytes_pruned = stats
+                    .payload_bytes_pruned
+                    .saturating_add(batch.payload_bytes);
+                stats.last_rows = Some(rows);
+                stats.last_first_seq = batch.first_seq;
+                stats.last_last_seq = batch.last_seq;
+                stats.last_payload_bytes = Some(batch.payload_bytes);
+            }
+            Err(_) => {
+                stats.last_rows = None;
+                stats.last_first_seq = None;
+                stats.last_last_seq = None;
+                stats.last_payload_bytes = None;
+            }
+        }
+    }
+
+    pub(crate) fn prune_local_event_log_before(
+        &self,
+        exclusive_floor: u64,
+        max_rows: usize,
+    ) -> MetaResult<LocalEventLogPruneBatch> {
+        let started = Instant::now();
+        let result = (|| {
+            if max_rows == 0 {
+                return Ok(LocalEventLogPruneBatch::default());
+            }
+
+            let txn = self.begin_write_txn()?;
+            let batch = Self::prune_local_event_log_batch_in_txn(&txn, exclusive_floor, max_rows)?;
+            if batch.rows > 0 || batch.floor_updated {
+                txn.commit()
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+            }
+            Ok(batch)
+        })();
+        self.record_local_event_log_prune(&result, started.elapsed());
+        result
+    }
+
+    pub(crate) fn prune_local_event_log_batch_in_txn(
+        txn: &redb::WriteTransaction,
+        exclusive_floor: u64,
+        max_rows: usize,
+    ) -> MetaResult<LocalEventLogPruneBatch> {
+        let mut batch = LocalEventLogPruneBatch::default();
+        if max_rows == 0 {
+            return Ok(batch);
+        }
+
+        let mut counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let persisted_floor = counters
+            .get(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|value| value.value());
+        let exclusive_floor = exclusive_floor.max(persisted_floor.unwrap_or(0).saturating_add(1));
+        if exclusive_floor <= 1 {
+            return Ok(batch);
+        }
+        let mut pruned_through = persisted_floor.unwrap_or(0);
+        let mut events = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let first_seq = events
+            .first()
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|(seq, _)| seq.value());
+
+        if persisted_floor.is_none() {
+            if let Some(first_seq) = first_seq.filter(|seq| *seq <= exclusive_floor) {
+                pruned_through = first_seq.saturating_sub(1);
+                batch.floor_updated = pruned_through > 0;
+            } else if first_seq.is_none() {
+                pruned_through = exclusive_floor - 1;
+                batch.floor_updated = pruned_through > 0;
+            }
+        }
+
+        while batch.rows < max_rows {
+            let next = events
+                .first()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+                .map(|(seq, _)| seq.value());
+            let Some(seq) = next else {
+                break;
+            };
+            if seq >= exclusive_floor {
+                break;
+            }
+
+            let Some((removed_seq, payload)) = events
+                .pop_first()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+            else {
+                break;
+            };
+            let removed_seq = removed_seq.value();
+            batch.first_seq.get_or_insert(removed_seq);
+            batch.last_seq = Some(removed_seq);
+            batch.rows += 1;
+            batch.payload_bytes = batch
+                .payload_bytes
+                .saturating_add(u64::try_from(payload.value().len()).unwrap_or(u64::MAX));
+            pruned_through = removed_seq;
+            batch.floor_updated = true;
+        }
+
+        let remaining_first_seq = events
+            .first()
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|(seq, _)| seq.value());
+        if remaining_first_seq.is_none_or(|seq| seq >= exclusive_floor) {
+            let acknowledged_through = exclusive_floor - 1;
+            if pruned_through < acknowledged_through {
+                pruned_through = acknowledged_through;
+                batch.floor_updated = true;
+            }
+        }
+
+        if batch.floor_updated {
+            counters
+                .insert(
+                    crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+                    pruned_through,
+                )
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+        }
+        Ok(batch)
+    }
+
     pub(super) fn add_pending_deletions_in_txn(
         txn: &redb::WriteTransaction,
         entries: &[(u64, i64)],
@@ -77,6 +223,13 @@ impl RedbMetaEngine {
         transaction: &redb::ReadTransaction,
         diagnostics: &mut LocalStorageDiagnostics,
     ) {
+        diagnostics.local_event_log_pruned_through_seq = Some(
+            Self::read_counter_from_read_txn(
+                transaction,
+                crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+            )
+            .unwrap_or(0),
+        );
         let Ok(events) = transaction.open_table(EVENT_LOG_TABLE) else {
             return;
         };
@@ -242,7 +395,18 @@ impl MetaGc for RedbMetaEngine {
             .local_storage_compaction
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let prune = *self
+            .local_event_log_prune
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut diagnostics = LocalStorageDiagnostics {
+            local_event_log_pruned_rows_total: prune.rows_pruned,
+            local_event_log_pruned_payload_bytes_total: prune.payload_bytes_pruned,
+            last_local_event_log_prune_rows: prune.last_rows,
+            last_local_event_log_prune_first_seq: prune.last_first_seq,
+            last_local_event_log_prune_last_seq: prune.last_last_seq,
+            last_local_event_log_prune_payload_bytes: prune.last_payload_bytes,
+            last_local_event_log_prune_duration_ns: prune.last_duration_ns,
             compaction_attempts: compaction.attempts,
             compaction_compacted: compaction.compacted,
             compaction_no_work: compaction.no_work,

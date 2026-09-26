@@ -598,6 +598,22 @@ pub struct LocalStorageDiagnostics {
     pub next_local_event_seq: Option<u64>,
     /// End-exclusive sequence span still retained in the local metadata event log.
     pub retained_local_event_span: Option<u64>,
+    /// Highest local event sequence safely removed from the event log.
+    pub local_event_log_pruned_through_seq: Option<u64>,
+    /// Cumulative local event rows removed since this metadata engine was opened.
+    pub local_event_log_pruned_rows_total: u64,
+    /// Cumulative encoded event payload bytes removed since this metadata engine was opened.
+    pub local_event_log_pruned_payload_bytes_total: u64,
+    /// Rows removed by the most recent successful prune attempt.
+    pub last_local_event_log_prune_rows: Option<u64>,
+    /// First sequence removed by the most recent non-empty prune attempt.
+    pub last_local_event_log_prune_first_seq: Option<u64>,
+    /// Last sequence removed by the most recent non-empty prune attempt.
+    pub last_local_event_log_prune_last_seq: Option<u64>,
+    /// Encoded payload bytes removed by the most recent successful prune attempt.
+    pub last_local_event_log_prune_payload_bytes: Option<u64>,
+    /// Elapsed nanoseconds for the most recent prune attempt.
+    pub last_local_event_log_prune_duration_ns: Option<u64>,
     /// Compaction calls since this metadata engine was opened.
     pub compaction_attempts: u64,
     /// Calls where redb compaction made progress.

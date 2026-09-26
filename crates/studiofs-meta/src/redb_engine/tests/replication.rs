@@ -27,6 +27,157 @@ fn first_event_seq_returns_lowest_durable_sequence() {
     assert_eq!(engine.first_event_seq().unwrap(), Some(1_000_000));
 }
 
+fn event_log_sequences(engine: &RedbMetaEngine) -> Vec<u64> {
+    let txn = engine.begin_read_txn().unwrap();
+    let events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+    events
+        .iter()
+        .unwrap()
+        .map(|row| row.unwrap().0.value())
+        .collect()
+}
+
+#[test]
+fn local_event_pruning_removes_bounded_prefix_below_exclusive_floor() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        for seq in 1..=6 {
+            events.insert(seq, &b"event"[..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 7).unwrap();
+
+    assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![3, 4, 5, 6]);
+    assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![5, 6]);
+    assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 0);
+    assert_eq!(engine.get_counter("nextEventSeq").unwrap(), 7);
+}
+
+#[test]
+fn local_event_pruning_removes_sparse_acknowledged_rows_across_batches() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        for seq in [1, 2, 4, 5] {
+            events.insert(seq, &b"event"[..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 6).unwrap();
+
+    assert_eq!(engine.prune_local_event_log_before(6, 2).unwrap().rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![4, 5]);
+    assert_eq!(engine.prune_local_event_log_before(6, 2).unwrap().rows, 2);
+    assert!(event_log_sequences(&engine).is_empty());
+}
+
+#[test]
+fn local_event_pruning_drop_before_commit_preserves_rows_and_floor() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        for seq in 1..=3 {
+            events.insert(seq, &b"event"[..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 4).unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let batch = RedbMetaEngine::prune_local_event_log_batch_in_txn(&txn, 4, 2).unwrap();
+    assert_eq!(batch.rows, 2);
+    assert_eq!(batch.first_seq, Some(1));
+    assert_eq!(batch.last_seq, Some(2));
+    drop(txn);
+
+    assert_eq!(event_log_sequences(&engine), vec![1, 2, 3]);
+    assert_eq!(
+        engine
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn local_event_pruning_floor_and_sequence_survive_reopen() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("metadata.redb");
+    let engine = RedbMetaEngine::open(&path).unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        for seq in [1, 2, 4, 5, 6] {
+            events.insert(seq, &b"event"[..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 7).unwrap();
+
+    let first_batch = engine.prune_local_event_log_before(6, 2).unwrap();
+    assert_eq!(first_batch.rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![4, 5, 6]);
+    drop(engine);
+
+    let reopened = RedbMetaEngine::open(&path).unwrap();
+    assert_eq!(event_log_sequences(&reopened), vec![4, 5, 6]);
+    assert_eq!(
+        reopened
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        2
+    );
+    assert_eq!(reopened.get_counter("nextEventSeq").unwrap(), 7);
+
+    let second_batch = reopened.prune_local_event_log_before(6, 2).unwrap();
+    assert_eq!(second_batch.rows, 2);
+    assert_eq!(event_log_sequences(&reopened), vec![6]);
+    assert_eq!(
+        reopened
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        5
+    );
+}
+
+#[test]
+fn local_event_pruning_reports_range_payload_estimate_and_duration() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        events.insert(1, &b"one"[..]).unwrap();
+        events.insert(2, &b"two-two"[..]).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let batch = engine.prune_local_event_log_before(3, 2).unwrap();
+    assert_eq!(batch.rows, 2);
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.local_event_log_pruned_through_seq, Some(2));
+    assert_eq!(diagnostics.local_event_log_pruned_rows_total, 2);
+    assert_eq!(diagnostics.local_event_log_pruned_payload_bytes_total, 10);
+    assert_eq!(diagnostics.last_local_event_log_prune_rows, Some(2));
+    assert_eq!(diagnostics.last_local_event_log_prune_first_seq, Some(1));
+    assert_eq!(diagnostics.last_local_event_log_prune_last_seq, Some(2));
+    assert_eq!(diagnostics.last_local_event_log_prune_payload_bytes, Some(10));
+    assert!(diagnostics.last_local_event_log_prune_duration_ns.is_some());
+}
+
 #[test]
 fn test_replica_apply_keeps_namespace_in_base_only() {
     let engine = temp_engine();

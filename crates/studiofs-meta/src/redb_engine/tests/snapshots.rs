@@ -366,13 +366,23 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
 #[test]
 fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
     let local = temp_engine();
-    let local_event_start = local.get_counter("nextEventSeq").unwrap();
     local
         .create_file(ROOT_INO, b"lost-serving-state.bin", 0, 0, 0o644)
         .unwrap();
     let local_event_end = local.get_counter("nextEventSeq").unwrap();
     local
         .set_counter("pgLastFlushedLocalEventSeq", local_event_end)
+        .unwrap();
+    let pruned = local
+        .prune_local_event_log_before(local_event_end, 1)
+        .unwrap();
+    assert_eq!(pruned.rows, 1);
+    let prune_floor = local
+        .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+        .unwrap();
+    let retained_event_start = local.first_event_seq().unwrap().unwrap();
+    let retained_events = local
+        .read_events_range(retained_event_start, local_event_end)
         .unwrap();
     local
         .set_counter("pgRedbRepairLocalGraphRecoveryPending", 1)
@@ -397,18 +407,25 @@ fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
         "repair import must install the authoritative remote namespace"
     );
     assert_eq!(local.get_counter("nextEventSeq").unwrap(), local_event_end);
+    assert_eq!(local.first_event_seq().unwrap(), Some(retained_event_start));
     assert_eq!(
         local
-            .read_events_range(local_event_start, local_event_end)
-            .unwrap()
-            .len(),
-        usize::try_from(local_event_end - local_event_start).unwrap(),
-        "repair import must retain the local event history needed for recovery"
+            .read_events_range(retained_event_start, local_event_end)
+            .unwrap(),
+        retained_events,
+        "repair import must retain the unpruned local event suffix"
     );
     assert_eq!(
         local.get_counter("pgLastFlushedLocalEventSeq").unwrap(),
         local_event_end,
         "repair import must not reopen acknowledged local metadata"
+    );
+    assert_eq!(
+        local
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        prune_floor,
+        "repair import must retain the durable local prune floor"
     );
     assert_eq!(
         local

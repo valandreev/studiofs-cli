@@ -54,6 +54,62 @@ fn flush_due_pending_skips_remote_validation_when_no_batch_is_due() {
 }
 
 #[test]
+fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"prune-acknowledged", 0, 0, 0o755)
+        .expect("create acknowledged directory");
+    let cursor = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .expect("read acknowledged end");
+    pg.persist_flushed_event_seq(cursor)
+        .expect("persist acknowledged local cursor");
+
+    pg.create_file(ROOT_INO, b"prune-rejected", 0, 0, 0o644)
+        .expect("create rejected suffix");
+    let completed_end = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .expect("read completed suffix end");
+    assert!(completed_end > cursor + 1);
+    pg.reject_local_event_ranges(&[LocalEventRange {
+        start: cursor,
+        end: cursor + 1,
+    }])
+    .expect("mark the first suffix event rejected");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: cursor + 1,
+        end: completed_end,
+    }])
+    .expect("complete later suffix events");
+    pg.create_dir(ROOT_INO, b"prune-unprocessed", 0, 0, 0o755)
+        .expect("create unprocessed suffix");
+    let next_event_seq = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .expect("read next event sequence");
+
+    let pruned = pg
+        .prune_local_event_log_once()
+        .expect("prune acknowledged local event prefix");
+
+    assert!(pruned.rows > 0);
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(cursor));
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
+    assert_eq!(
+        pg.local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap(),
+        next_event_seq,
+        "pruning must not renumber local event sequences"
+    );
+    assert!(
+        !pg.remote_format_validated.load(Ordering::Acquire),
+        "local pruning must not require PostgreSQL validation"
+    );
+}
+
+#[test]
 fn pending_replay_lock_blocks_local_mutation_before_commit() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let pg = Arc::new(pg);
@@ -699,8 +755,17 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         "the local-only uploaded marker is deliberately acknowledged without a PG backlog"
     );
 
-    let mut repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
-    repair_snapshot.event_log.clear();
+    let prune = pg
+        .prune_local_event_log_once()
+        .expect("prune acknowledged local event history before repair");
+    assert!(prune.rows > 0);
+    assert_eq!(
+        pg.local.first_event_seq().expect("first retained event"),
+        None,
+        "the acknowledged local journal prefix should be absent before redb repair"
+    );
+
+    let repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
     pg.local
         .import_remote_snapshot(&repair_snapshot)
         .expect("simulate repair with no retained local event rows");

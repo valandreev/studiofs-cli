@@ -1828,6 +1828,8 @@ pub mod counters {
     pub const NEXT_OBJECT_ID: &str = "nextObjectId";
     /// Next sequence number to allocate in the local metadata event log.
     pub const NEXT_EVENT_SEQ: &str = "nextEventSeq";
+    /// Highest local event sequence safely removed from the event log.
+    pub const LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ: &str = "localEventLogPrunedThroughSeq";
     /// Total used space in bytes.
     pub const USED_SPACE: &str = "usedSpace";
     /// Total number of inodes in use.

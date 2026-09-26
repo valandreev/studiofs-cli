@@ -524,6 +524,13 @@ impl PgMetaEngine {
                     let Some(engine) = engine.upgrade() else {
                         break;
                     };
+                    if let Err(error) = engine.prune_local_event_log_once() {
+                        warn!(
+                            error = %error,
+                            volume_id = engine.volume_id,
+                            "local redb event-log pruning did not complete"
+                        );
+                    }
                     let _ = engine.flush_due_pending();
                     let local_version_before = engine.local_version.load(Ordering::Acquire);
                     let sync_result = if matches!(

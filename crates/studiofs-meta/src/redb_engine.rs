@@ -68,12 +68,33 @@ struct CachedLocalStoragePageStats {
     stats: LocalStoragePageStats,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalEventLogPruneStats {
+    rows_pruned: u64,
+    payload_bytes_pruned: u64,
+    last_rows: Option<u64>,
+    last_first_seq: Option<u64>,
+    last_last_seq: Option<u64>,
+    last_payload_bytes: Option<u64>,
+    last_duration_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LocalEventLogPruneBatch {
+    pub(crate) rows: usize,
+    pub(crate) first_seq: Option<u64>,
+    pub(crate) last_seq: Option<u64>,
+    pub(crate) payload_bytes: u64,
+    pub(crate) floor_updated: bool,
+}
+
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
     db: Option<Arc<RwLock<Database>>>,
     read_only_db: Option<Arc<ReadOnlyDatabase>>,
     metadata_path: PathBuf,
     local_storage_compaction: Mutex<LocalStorageCompactionStats>,
+    local_event_log_prune: Mutex<LocalEventLogPruneStats>,
     local_storage_page_stats: Mutex<Option<CachedLocalStoragePageStats>>,
     local_storage_page_stats_refresh: Mutex<()>,
     write_metrics: Arc<MetadataWriteMetrics>,
@@ -831,6 +852,7 @@ impl RedbMetaEngine {
             read_only_db: None,
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
+            local_event_log_prune: Mutex::default(),
             local_storage_page_stats: Mutex::default(),
             local_storage_page_stats_refresh: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
@@ -874,6 +896,7 @@ impl RedbMetaEngine {
             read_only_db: Some(Arc::new(db)),
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
+            local_event_log_prune: Mutex::default(),
             local_storage_page_stats: Mutex::default(),
             local_storage_page_stats_refresh: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),

@@ -4770,6 +4770,12 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
     PgMetaEngine::persist_client_slot(&local, 3).expect("persist reserved local slot");
+    local
+        .set_counter(
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+            99,
+        )
+        .expect("persist local prune floor");
 
     let mut legacy_snapshot = RedbSnapshot::default();
     legacy_snapshot.counters.extend([
@@ -4823,6 +4829,13 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
             .expect("load flushed cursor"),
         0,
         "remote snapshot import must drop legacy local event-log cursor"
+    );
+    assert_eq!(
+        local
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .expect("load prune floor after remote snapshot import"),
+        0,
+        "replacing the local event log must reset its old prune floor"
     );
     assert_eq!(
         local
@@ -5039,6 +5052,18 @@ fn persisted_pg_flushed_event_seq_roundtrips_in_local_counter() {
         PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
             .expect("reload flushed event seq"),
         19
+    );
+    pg.local
+        .set_counter(
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+            24,
+        )
+        .expect("persist local prune floor");
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
+            .expect("reload cursor after pruned history"),
+        25,
+        "restart must not move the replay cursor behind durably pruned history"
     );
 }
 
