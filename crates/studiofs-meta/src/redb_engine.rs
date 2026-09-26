@@ -132,7 +132,12 @@ struct RelaxedDurabilityState {
     #[cfg(test)]
     fail_next_barrier: AtomicBool,
     #[cfg(test)]
-    after_barrier_commit: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    after_barrier_commit: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     #[cfg(test)]
     wait_count: AtomicU64,
     #[cfg(test)]
@@ -385,8 +390,8 @@ fn immediate_metadata_barrier(
                 .ok()
                 .and_then(|mut hook| hook.take())
         }) {
-            barrier.0.wait();
-            barrier.1.wait();
+            let _ = barrier.0.send(());
+            let _ = barrier.1.recv_timeout(Duration::from_secs(10));
         }
 
         Ok(())
@@ -963,8 +968,8 @@ impl RedbMetaEngine {
     #[cfg(test)]
     fn pause_after_barrier_commit_for_test(
         &self,
-        reached: Arc<std::sync::Barrier>,
-        resume: Arc<std::sync::Barrier>,
+        reached: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
     ) {
         if let Some(runtime) = &self.relaxed_durability {
             *runtime

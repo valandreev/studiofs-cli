@@ -6,7 +6,7 @@ use crate::MetaRecovery;
 use crate::contract_harness::{ContractCoreFixture, ContractCoreOp};
 use crate::engine::DeferredDeleteRecord;
 use crate::events::MetaEvent;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::thread;
 
 fn invalidate_local_storage_page_stats(engine: &RedbMetaEngine) {
@@ -736,14 +736,18 @@ fn relaxed_barrier_preserves_pending_for_writes_after_barrier() {
         dir.path().join("meta.redb"),
     ));
     engine.set_counter("before-barrier", 1).unwrap();
-    let reached = Arc::new(Barrier::new(2));
-    let resume = Arc::new(Barrier::new(2));
-    engine.pause_after_barrier_commit_for_test(Arc::clone(&reached), Arc::clone(&resume));
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    engine.pause_after_barrier_commit_for_test(reached_tx, resume_rx);
 
     let sync_engine = Arc::clone(&engine);
     let sync = thread::spawn(move || sync_engine.sync_local_metadata());
-    reached.wait();
-    resume.wait();
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("metadata barrier should reach the test hook");
+    resume_tx
+        .send(())
+        .expect("metadata barrier should remain paused until resumed");
     sync.join().unwrap().unwrap();
     engine.set_counter("after-barrier", 2).unwrap();
 
@@ -756,18 +760,22 @@ fn local_storage_diagnostics_does_not_collect_page_stats_during_barrier() {
     let engine = Arc::new(RedbMetaEngine::open_relaxed_for_test(
         dir.path().join("meta.redb"),
     ));
-    let reached = Arc::new(Barrier::new(2));
-    let resume = Arc::new(Barrier::new(2));
-    engine.pause_after_barrier_commit_for_test(Arc::clone(&reached), Arc::clone(&resume));
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    engine.pause_after_barrier_commit_for_test(reached_tx, resume_rx);
 
     let sync_engine = Arc::clone(&engine);
     let sync = thread::spawn(move || sync_engine.sync_local_metadata());
-    reached.wait();
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("metadata barrier should reach the test hook");
     let diagnostics = engine
         .local_storage_diagnostics()
         .unwrap()
         .expect("redb diagnostics are available");
-    resume.wait();
+    resume_tx
+        .send(())
+        .expect("metadata barrier should remain paused until resumed");
     sync.join().unwrap().unwrap();
 
     assert!(diagnostics.physical_file_bytes.is_some());
