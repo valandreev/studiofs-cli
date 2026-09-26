@@ -349,6 +349,10 @@ impl MetaPayloadObjects for PgMetaEngine {
 }
 
 impl MetaGc for PgMetaEngine {
+    fn reconcile_pending_regular_file_recoveries(&self) -> MetaResult<()> {
+        self.local.reconcile_pending_regular_file_recoveries()
+    }
+
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         self.local.compact_local_storage()
     }

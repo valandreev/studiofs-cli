@@ -336,8 +336,39 @@ When the required event range is unavailable, the client must:
 
 The recovery path must preserve local accepted state, must not invent remote
    history, and must expose enough state for a later reopen or sync cycle to
-   resume. A finite remote history must never make a disk permanently
-   unmountable solely because the old cursor cannot be replayed.
+resume. A finite remote history must never make a disk permanently
+unmountable solely because the old cursor cannot be replayed.
+
+Local redb graph repair also must not depend on retained local event history.
+Before importing a remote serving checkpoint, it captures or refreshes a
+recovery record for each upload-pending regular file whose overlay contains an
+uploaded payload. The local-only row stores the inode attributes, the full
+pending overlay, namespace dentries, whether the inode existed in the
+published base, and the base attributes used to identify local metadata changes.
+The versioned row remains readable across the previous recovery-row format;
+checkpoint export and import exclude it. This lets repair
+restore a newly created unpublished inode and its name when the checkpoint
+omits both. Repair checks the content identity and accepts a current size
+equal to either the pending or committed size without treating unrelated
+changes such as link count or timestamps as a different payload epoch, and it
+restores a saved dentry only when its parent is a directory and its name is
+available or already points to that inode.
+For an inode present in the checkpoint, repair keeps its metadata and link
+count, reapplies locally changed metadata fields, adds only missing saved
+dentries, and restores the pending size and overlay.
+
+Repair retires a row when the inode identity changed, a previously published
+inode is absent, a strictly newer content epoch superseded it, or the published
+base contains every payload object retained by the row. A same-numbered
+committed epoch alone does not prove that the row's payload was published. An
+ambiguous identity or namespace conflict keeps the recovery row and its object
+references. The local-graph repair marker then keeps the mount degraded and
+read-only for that session; reopening retries, but a persistent conflict or
+legacy row without namespace identity needs external resolution. Remote event
+polling continues while the marker is set. The janitor explicitly removes only
+rows that can be proven obsolete from the serving inode and published payload
+graph before its reachability scan. This recovery path does not reopen the
+flushed event cursor or prune local events.
 
 ## Read/Write Authority
 

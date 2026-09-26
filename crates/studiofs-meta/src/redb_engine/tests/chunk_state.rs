@@ -1511,12 +1511,14 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         SliceRange::new(0, 4096).expect("shadowed slice"),
         PayloadRef::new_partial(1201, 4096),
     ));
-    overlay_chunk.insert_slice(SliceRecord::new(
+    let mut visible_slice = SliceRecord::new(
         SliceId(2),
         SliceOrder(2),
         SliceRange::new(0, 4096).expect("visible slice"),
         PayloadRef::new_partial(1202, 4096),
-    ));
+    );
+    visible_slice.payload_state = PayloadRefState::Uploaded;
+    overlay_chunk.insert_slice(visible_slice);
     overlay_chunk.insert_slice(SliceRecord::tombstone(
         SliceId(3),
         SliceOrder(3),
@@ -1524,6 +1526,10 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
     ));
 
     set_regular_file_chunk_rows(&engine, ino, &[(ChunkId(0), overlay_chunk.clone())], &[]);
+    let mut attr = engine.get_attr(ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
 
     let txn = engine.begin_write_txn().unwrap();
     {
@@ -1578,6 +1584,78 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         }
     );
     assert!(!compacted_chunk.fragmentation.should_compact());
+    let recovery = engine
+        .pending_uploaded_regular_file_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.attr.ino == ino)
+        .expect("uploaded overlay recovery row");
+    assert!(recovery
+        .overlay
+        .chunks
+        .values()
+        .flat_map(|chunk| chunk.slices.values())
+        .any(|slice| slice.payload.is_some_and(|payload| payload.object_id == 1202)
+            && slice.payload_state == PayloadRefState::Uploaded));
+}
+
+#[test]
+fn test_backfill_pending_regular_file_recovery_preserves_existing_record() {
+    let engine = temp_engine();
+    let ino = engine
+        .create_file(ROOT_INO, b"backfill-recovery.bin", 1000, 1000, 0o644)
+        .unwrap()
+        .ino;
+    let mut slice = SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, 4096).unwrap(),
+        PayloadRef::new_partial(1203, 4096),
+    );
+    slice.payload_state = PayloadRefState::Uploaded;
+    let mut chunk = RegularFileChunkState::default();
+    chunk.insert_slice(slice);
+    set_regular_file_chunk_rows(&engine, ino, &[(ChunkId(0), chunk)], &[]);
+
+    let mut attr = engine.get_attr(ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+        .unwrap()
+        .remove(ino)
+        .unwrap();
+    txn.commit().unwrap();
+
+    engine
+        .backfill_missing_uploaded_regular_file_recoveries()
+        .unwrap();
+    let first = engine
+        .pending_uploaded_regular_file_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.attr.ino == ino)
+        .expect("backfilled uploaded recovery row");
+
+    let mut changed_attr = engine.get_attr(ino).unwrap();
+    changed_attr.mode = 0o600;
+    engine
+        .apply_replica_serving_state(&[MetaEvent::SetAttr { attr: changed_attr }])
+        .unwrap();
+    engine
+        .backfill_missing_uploaded_regular_file_recoveries()
+        .unwrap();
+    let after = engine
+        .pending_uploaded_regular_file_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.attr.ino == ino)
+        .expect("existing uploaded recovery row");
+
+    assert_eq!(first.attr.mode, 0o644);
+    assert_eq!(after.attr.mode, 0o600);
+    assert_eq!(after.overlay.chunks, first.overlay.chunks);
 }
 
 #[test]

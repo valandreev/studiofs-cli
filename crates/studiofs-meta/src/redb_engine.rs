@@ -637,6 +637,27 @@ impl RedbMetaEngine {
         }
     }
 
+    pub(crate) fn apply_redb_repair_recovery(
+        &self,
+        events: &[crate::events::MetaEvent],
+        obsolete_recovery_inodes: &[crate::types::Ino],
+    ) -> MetaResult<()> {
+        if events.is_empty() && obsolete_recovery_inodes.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self.begin_immediate_write_txn()?;
+        if !events.is_empty() {
+            Self::apply_replica_serving_state_in_txn(&txn, events, false)?;
+            Self::rebuild_inode_lifecycle_table_in_txn(&txn)?;
+        }
+        for ino in obsolete_recovery_inodes {
+            Self::remove_pending_regular_file_recovery_in_txn(&txn, *ino)?;
+        }
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))
+    }
+
     pub(crate) fn begin_read_txn(&self) -> MetaResult<ReadTransaction> {
         if let Some(db) = self.db.as_ref() {
             let db = db
@@ -762,6 +783,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(INODES_TABLE);
             let _ = txn.open_table(BASE_INODES_TABLE);
             let _ = txn.open_table(INODE_LIFECYCLE_TABLE);
+            let _ = txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE);
             let _ = txn.open_table(INODE_TOMBSTONES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(DENTRIES_BY_INODE_TABLE);
@@ -987,6 +1009,7 @@ mod chunk_state;
 mod format;
 mod gc;
 mod inodes;
+pub(crate) use inodes::PendingRecoveryDentry;
 mod namespace;
 mod payload_objects;
 mod recovery;

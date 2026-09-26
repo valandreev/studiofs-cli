@@ -26,6 +26,10 @@ fn opens_redb_4_1_database_without_studiofs_format_migration() {
     let engine = RedbMetaEngine::open(&database_path).unwrap();
     let loaded = engine.get_format_info().unwrap();
     assert_eq!(loaded.format_version, CURRENT_FORMAT_VERSION);
+    assert!(engine
+        .pending_uploaded_regular_file_recoveries()
+        .unwrap()
+        .is_empty());
     let entry = engine.lookup(ROOT_INO, b"compat.txt").unwrap();
     assert_eq!(entry.kind, FileType::RegularFile);
 

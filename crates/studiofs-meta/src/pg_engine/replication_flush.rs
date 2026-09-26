@@ -4,17 +4,17 @@ use super::{
     ClaimedPendingBatch, LocalEventRange, PendingMutationHint, PendingReplicationState,
     PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
-use crate::engine::{MetaError, MetaInodes, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaResult};
 use crate::events::MetaEvent;
-use crate::schema::{ChunkId, PayloadRefState, ROOT_INO, SliceRecord, UploadState};
-use crate::types::{FileType, Ino, InodeAttr};
+use crate::redb_engine::PendingRecoveryDentry;
+use crate::schema::{ROOT_INO, RegularFileOverlayState, UploadState};
+use crate::types::{DirEntryValue, FileType, Ino, InodeAttr};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-const REDB_REPAIR_EVENT_BATCH_SIZE: u64 = 10_000;
 const LOCAL_ONLY_SUFFIX_CONTEXT_EVENTS: u64 = 16;
 
 struct SelectedLocalEvents<'a> {
@@ -27,78 +27,72 @@ fn local_event_range_contains(ranges: &[LocalEventRange], seq: u64) -> bool {
     index > 0 && seq < ranges[index - 1].end
 }
 
-#[derive(Default)]
-struct RepairedRegularFileOverlay {
-    attr: Option<InodeAttr>,
-    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
-}
-
-impl RepairedRegularFileOverlay {
-    fn reset(&mut self) {
-        self.attr = None;
-        self.chunks.clear();
-    }
-
-    fn has_uploaded_payload(&self) -> bool {
-        self.chunks.values().flatten().any(|slice| {
-            slice.payload.is_some() && slice.payload_state == PayloadRefState::Uploaded
-        })
-    }
-}
-
 fn attrs_match_repair_identity(left: &InodeAttr, right: &InodeAttr) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    left.size = 0;
-    right.size = 0;
-    left == right
+    left.ino == right.ino
+        && left.kind == right.kind
+        && left.crtime == right.crtime
+        && left.content_epoch == right.content_epoch
+        && left.committed_size == right.committed_size
+        && left.committed_content_epoch == right.committed_content_epoch
+        && left.upload_state == right.upload_state
 }
 
 fn attrs_match_repair_candidate(current: &InodeAttr, candidate: &InodeAttr) -> bool {
-    current == candidate
-        || (attrs_match_repair_identity(current, candidate)
-            && current.size == candidate.committed_size)
-}
-
-fn preserve_repaired_uploaded_payload_state(
-    previous: &[SliceRecord],
-    incoming: &mut [SliceRecord],
-) {
-    for slice in incoming {
-        let Some(payload) = slice.payload else {
-            continue;
-        };
-        if !matches!(
-            slice.payload_state,
-            PayloadRefState::LocalOnly | PayloadRefState::Uploading | PayloadRefState::Recovering
-        ) {
-            continue;
-        }
-        if let Some(previous) = previous.iter().find(|previous| {
-            previous.payload == Some(payload)
-                && slice.range.start <= previous.range.start
-                && slice.range.end >= previous.range.end
-                && matches!(
-                    previous.payload_state,
-                    PayloadRefState::Uploaded | PayloadRefState::Published
-                )
-        }) {
-            slice.payload_state = previous.payload_state;
-        }
-    }
+    attrs_match_repair_identity(current, candidate)
+        && (current.size == candidate.size || current.size == candidate.committed_size)
 }
 
 fn push_repaired_overlay_events(
     events: &mut Vec<MetaEvent>,
     attr: InodeAttr,
-    chunks: BTreeMap<ChunkId, Vec<SliceRecord>>,
+    overlay: RegularFileOverlayState,
+    dentries: &[PendingRecoveryDentry],
 ) {
     let ino = attr.ino;
     events.push(MetaEvent::SetAttr { attr });
+    for (parent, name) in dentries {
+        events.push(MetaEvent::AddEntry {
+            parent: *parent,
+            name: name.clone(),
+            entry: DirEntryValue {
+                ino,
+                kind: FileType::RegularFile,
+            },
+        });
+    }
     events.push(MetaEvent::SetRegularFileOverlaySlices {
         ino,
-        chunk_slices: chunks.into_iter().collect(),
+        chunk_slices: overlay
+            .chunks
+            .into_iter()
+            .map(|(chunk_id, chunk)| (chunk_id, chunk.slices.into_values().collect()))
+            .collect(),
     });
+}
+
+fn restorable_recovery_dentries(
+    local: &crate::redb_engine::RedbMetaEngine,
+    ino: Ino,
+    dentries: &[PendingRecoveryDentry],
+) -> MetaResult<Option<Vec<PendingRecoveryDentry>>> {
+    let mut missing = Vec::new();
+    for (parent, name) in dentries {
+        let parent_attr = match local.get_attr(*parent) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if parent_attr.kind != FileType::Directory {
+            return Ok(None);
+        }
+        match local.lookup(*parent, name) {
+            Ok(entry) if entry.ino == ino && entry.kind == FileType::RegularFile => {}
+            Ok(_) => return Ok(None),
+            Err(MetaError::EntryNotFound { .. }) => missing.push((*parent, name.clone())),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(missing))
 }
 
 impl PgMetaEngine {
@@ -463,85 +457,170 @@ impl PgMetaEngine {
     /// do not create a PostgreSQL metadata backlog.  A redb repair resets the
     /// remote replay position but must not turn that acknowledgement into a
     /// reason to discard the only durable local graph for the pending epoch.
-    /// This method replays only those journal records into serving state; it
-    /// never appends an event, moves the flushed cursor, or re-submits history.
+    /// This method applies only the durable recovery rows to serving state; it
+    /// never reads the local event journal, moves the flushed cursor, or
+    /// re-submits history.
     pub(super) fn restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair(
         &self,
-    ) -> MetaResult<()> {
-        let event_end = self.local.get_counter("nextEventSeq")?;
-        let mut overlays = HashMap::<Ino, RepairedRegularFileOverlay>::new();
+    ) -> MetaResult<bool> {
+        let recoveries = self.local.pending_uploaded_regular_file_recoveries()?;
+        let inos: Vec<_> = recoveries.iter().map(|record| record.attr.ino).collect();
+        let current_attrs: HashMap<_, _> = self
+            .local
+            .get_attrs_batch(&inos)?
+            .into_iter()
+            .map(|attr| (attr.ino, attr))
+            .collect();
+        let mut restored_inodes = 0usize;
+        let mut obsolete_recovery_inodes = Vec::new();
+        let mut restored_events = Vec::new();
+        let mut unresolved_recoveries = 0usize;
+        for recovery in recoveries {
+            let attr = recovery.attr.clone();
+            let ino = attr.ino;
 
-        let mut event_start = self.local.first_event_seq()?.unwrap_or(event_end);
-        while event_start < event_end {
-            let event_batch_end = event_start
-                .saturating_add(REDB_REPAIR_EVENT_BATCH_SIZE)
-                .min(event_end);
-            for event in self.local.read_events_range(event_start, event_batch_end)? {
-                match event {
-                    MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
-                        let overlay = overlays.entry(ino).or_default();
-                        for (chunk_id, slices) in chunk_slices {
-                            let previous =
-                                overlay.chunks.get(&chunk_id).cloned().unwrap_or_default();
-                            let mut slices = slices;
-                            preserve_repaired_uploaded_payload_state(&previous, &mut slices);
-                            overlay.chunks.insert(chunk_id, slices);
-                        }
-                    }
-                    MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                        let overlay = overlays.entry(attr.ino).or_default();
-                        if !attr.is_upload_pending() {
-                            overlay.reset();
+            let Some(current) = current_attrs.get(&ino) else {
+                match recovery.had_published_inode {
+                    Some(true) => obsolete_recovery_inodes.push(ino),
+                    Some(false) => {
+                        let Some(saved_dentries) = recovery.dentries.as_deref() else {
+                            unresolved_recoveries = unresolved_recoveries.saturating_add(1);
+                            warn!(
+                                ino,
+                                "redb repair retained an unpublished uploaded recovery row without saved namespace identity"
+                            );
                             continue;
+                        };
+                        match restorable_recovery_dentries(&self.local, ino, saved_dentries)? {
+                            Some(dentries) => {
+                                push_repaired_overlay_events(
+                                    &mut restored_events,
+                                    attr,
+                                    recovery.overlay,
+                                    &dentries,
+                                );
+                                restored_inodes = restored_inodes.saturating_add(1);
+                            }
+                            None => {
+                                unresolved_recoveries = unresolved_recoveries.saturating_add(1);
+                                warn!(
+                                    ino,
+                                    "redb repair retained an unpublished uploaded recovery row without a restorable namespace entry"
+                                );
+                            }
                         }
-                        overlay.attr = Some(attr);
                     }
-                    MetaEvent::SetAttr { attr } => {
-                        overlays.remove(&attr.ino);
+                    None => {
+                        unresolved_recoveries = unresolved_recoveries.saturating_add(1);
+                        warn!(
+                            ino,
+                            "redb repair retained an uploaded recovery row with unknown publication state"
+                        );
                     }
-                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                    | MetaEvent::RemoveRegularFileGraph { ino }
-                    | MetaEvent::RemoveAttr { ino } => {
-                        overlays.remove(&ino);
+                }
+                continue;
+            };
+            if current.kind != FileType::RegularFile || current.crtime != attr.crtime {
+                obsolete_recovery_inodes.push(ino);
+                continue;
+            }
+            if !attrs_match_repair_candidate(current, &attr) {
+                if current.content_epoch > attr.content_epoch
+                    || (!current.is_upload_pending()
+                        && self
+                            .local
+                            .pending_recovery_payloads_are_published(&recovery)?)
+                {
+                    obsolete_recovery_inodes.push(ino);
+                } else {
+                    unresolved_recoveries = unresolved_recoveries.saturating_add(1);
+                    warn!(
+                        ino,
+                        recovery_epoch = attr.content_epoch,
+                        current_epoch = current.content_epoch,
+                        "redb repair retained an uploaded recovery row because its content identity no longer matches"
+                    );
+                }
+                continue;
+            }
+
+            let dentries = match recovery.dentries.as_deref() {
+                Some(saved) => match restorable_recovery_dentries(&self.local, ino, saved) {
+                    Ok(Some(dentries)) => dentries,
+                    Ok(None) => {
+                        unresolved_recoveries = unresolved_recoveries.saturating_add(1);
+                        warn!(
+                            ino,
+                            "redb repair restored uploaded data but retained the recovery row because its namespace entry conflicts"
+                        );
+                        Vec::new()
                     }
-                    _ => {}
+                    Err(error) => return Err(error),
+                },
+                None => {
+                    unresolved_recoveries = unresolved_recoveries.saturating_add(1);
+                    warn!(
+                        ino,
+                        "redb repair restored uploaded data but retained the recovery row because it has no saved namespace identity"
+                    );
+                    Vec::new()
+                }
+            };
+            let mut restored_attr = current.clone();
+            restored_attr.size = attr.size;
+            if let Some(baseline) = recovery.baseline_attr.as_ref()
+                && baseline.ino == attr.ino
+                && baseline.crtime == attr.crtime
+            {
+                if attr.mode != baseline.mode {
+                    restored_attr.mode = attr.mode;
+                }
+                if attr.uid != baseline.uid {
+                    restored_attr.uid = attr.uid;
+                }
+                if attr.gid != baseline.gid {
+                    restored_attr.gid = attr.gid;
+                }
+                if attr.mtime != baseline.mtime {
+                    restored_attr.mtime = attr.mtime;
+                }
+                if attr.ctime != baseline.ctime {
+                    restored_attr.ctime = attr.ctime;
+                }
+                if attr.atime != baseline.atime {
+                    restored_attr.atime = attr.atime;
+                }
+                if attr.parent != baseline.parent {
+                    restored_attr.parent = attr.parent;
+                }
+                if attr.win_attrs != baseline.win_attrs {
+                    restored_attr.win_attrs = attr.win_attrs;
                 }
             }
-            event_start = event_batch_end;
-        }
-
-        let mut restored_inodes = 0usize;
-        let mut restored_events = Vec::new();
-        for (ino, overlay) in overlays {
-            if overlay.chunks.is_empty() || !overlay.has_uploaded_payload() {
-                continue;
+            restored_attr.nlink = restored_attr
+                .nlink
+                .saturating_add(u32::try_from(dentries.len()).unwrap_or(u32::MAX));
+            if !dentries.is_empty() {
+                restored_attr.ctime = attr.ctime;
             }
-            let Some(attr) = overlay.attr else {
-                continue;
-            };
-
-            let current = match self.local.get_attr(ino) {
-                Ok(current) => current,
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(error) => return Err(error),
-            };
-            if !attrs_match_repair_candidate(&current, &attr) {
-                continue;
-            }
-
-            push_repaired_overlay_events(&mut restored_events, attr, overlay.chunks);
+            push_repaired_overlay_events(
+                &mut restored_events,
+                restored_attr,
+                recovery.overlay,
+                &dentries,
+            );
             restored_inodes = restored_inodes.saturating_add(1);
         }
 
+        self.local
+            .apply_redb_repair_recovery(&restored_events, &obsolete_recovery_inodes)?;
         if restored_inodes > 0 {
-            self.local.apply_replica_serving_state(&restored_events)?;
-            self.local.rebuild_inode_lifecycle_table()?;
             tracing::warn!(
                 restored_inodes,
                 "redb repair restored acknowledged uploaded regular-file serving overlays"
             );
         }
-        Ok(())
+        Ok(unresolved_recoveries == 0)
     }
 
     pub(super) fn mark_pending_after_mutation(
@@ -917,14 +996,15 @@ mod repair_tests {
     }
 
     #[test]
-    fn repair_identity_ignores_only_local_visible_size() {
+    fn repair_identity_ignores_namespace_metadata() {
         let left = InodeAttr::new_file(42, 1, 0, 0, 0o644);
         let mut right = left.clone();
-        right.size = 128;
+        right.nlink = right.nlink.saturating_add(1);
+        right.ctime = right.ctime.saturating_add(1);
 
         assert!(attrs_match_repair_identity(&left, &right));
 
-        right.committed_size = 64;
+        right.content_epoch = right.content_epoch.saturating_add(1);
         assert!(!attrs_match_repair_identity(&left, &right));
     }
 
@@ -933,7 +1013,14 @@ mod repair_tests {
         let attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
         let mut events = Vec::new();
 
-        push_repaired_overlay_events(&mut events, attr.clone(), BTreeMap::new());
+        push_repaired_overlay_events(
+            &mut events,
+            attr.clone(),
+            RegularFileOverlayState {
+                chunks: std::collections::BTreeMap::new(),
+            },
+            &[],
+        );
 
         assert_eq!(events.len(), 2);
         assert!(matches!(

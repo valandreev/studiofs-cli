@@ -3,6 +3,26 @@ use crate::redb_engine::layout::{encode_dentry_key, encode_xattr_key};
 use std::sync::Barrier;
 use std::thread;
 
+fn uploaded_pending_file(pg: &PgMetaEngine, name: &[u8], object_id: u64) -> InodeAttr {
+    let file = pg
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create pending file");
+    let payload = PayloadRef::new_partial(object_id, 152);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage pending payload");
+    set_file_state(pg, file.ino, 152, 1);
+    let attr = pg.get_attr(file.ino).expect("pending attr");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            file.ino,
+            attr.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark pending payload uploaded")
+    );
+    attr
+}
+
 fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
@@ -630,7 +650,7 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
 
 #[test]
 fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
-    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (dir, pg) = temp_pg_engine_for_unit();
     let file = pg
         .create_file(ROOT_INO, b"repair-uploaded-overlay.bin", 0, 0, 0o644)
         .expect("create file");
@@ -679,6 +699,19 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         "the local-only uploaded marker is deliberately acknowledged without a PG backlog"
     );
 
+    let mut repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
+    repair_snapshot.event_log.clear();
+    pg.local
+        .import_remote_snapshot(&repair_snapshot)
+        .expect("simulate repair with no retained local event rows");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none(),
+        "the repair snapshot must contain no old local event rows"
+    );
+
     let mut remote_projection = accepted.clone();
     remote_projection.size = 0;
     remote_projection.committed_size = 0;
@@ -699,12 +732,31 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         pg.local
             .get_referenced_object_ids()
             .expect("references after repair projection")
-            .is_empty(),
-        "without repair replay startup cleanup would classify the uploaded object as stale"
+            .contains(&payload.object_id),
+        "the recovery row must keep the uploaded object reachable until repair restores its graph"
     );
 
-    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
-        .expect("restore acknowledged uploaded overlay");
+    let path = dir.path().join("meta.redb");
+    drop(pg);
+    let pg = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("reopen repaired local metadata without PostgreSQL");
+
+    let flushed_event_seq_before_restore = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let next_event_seq_before_restore = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("next event sequence before restore");
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore acknowledged uploaded overlay")
+    );
 
     let restored = pg.get_attr(file.ino).expect("restored attr");
     assert_eq!(restored.size, accepted.size);
@@ -714,6 +766,16 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         accepted.committed_content_epoch
     );
     assert_eq!(restored.upload_state, accepted.upload_state);
+    let lifecycle = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("restored lifecycle")
+        .expect("repaired inode has a lifecycle row");
+    assert_eq!(
+        lifecycle.state,
+        crate::schema::InodeLifecycleState::PublishReady
+    );
+    assert_eq!(lifecycle.local_content_epoch, restored.content_epoch);
     assert_eq!(
         lookup_object_ids(&pg, file.ino, restored.size).expect("restored object ids"),
         vec![payload.object_id],
@@ -721,8 +783,15 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
     );
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
-        acknowledged_end,
+        flushed_event_seq_before_restore,
         "repair replay must not reopen already-flushed metadata for PG publication"
+    );
+    assert_eq!(
+        pg.local
+            .get_counter("nextEventSeq")
+            .expect("next event sequence after restore"),
+        next_event_seq_before_restore,
+        "repair restore must not append to the local event journal"
     );
     assert_eq!(
         pg.replication_backlog().total_ops(),
@@ -765,28 +834,41 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
         )
         .expect("mark payload uploaded")
     );
-    let acknowledged_end = pg
-        .local
-        .get_counter("nextEventSeq")
-        .expect("uploaded-marker end");
-
     let mut newer_remote = accepted.clone();
     newer_remote.size = 0;
     newer_remote.committed_size = 0;
     newer_remote.content_epoch = accepted.content_epoch;
     newer_remote.committed_content_epoch = accepted.content_epoch;
     newer_remote.upload_state = UploadState::Ready;
+    let mut remote_snapshot = pg
+        .local
+        .export_snapshot()
+        .expect("export published snapshot");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == file.ino {
+            *bytes = postcard::to_stdvec(&newer_remote).expect("encode published attr");
+        }
+    }
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
     pg.local
-        .apply_replica_serving_state(&[
-            MetaEvent::RemoveAttr { ino: file.ino },
-            MetaEvent::SetAttr {
-                attr: newer_remote.clone(),
-            },
-        ])
-        .expect("simulate newer remote state after repair");
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate published remote snapshot");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none()
+    );
 
-    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
-        .expect("attempt repair replay");
+    let flushed_event_seq_before_restore = pg.flushed_event_seq.load(Ordering::SeqCst);
+    assert!(
+        !pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("attempt repair replay"),
+        "an ambiguous retained row must keep startup repair pending"
+    );
 
     let current = pg.get_attr(file.ino).expect("current attr");
     assert_eq!(
@@ -800,13 +882,681 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
         pg.local
             .get_referenced_object_ids()
             .expect("current references")
-            .is_empty(),
-        "the stale uploaded extent must stay unreachable under the newer remote state"
+            .contains(&77_011),
+        "the remote epoch counter does not prove that this payload was published"
+    );
+    assert_eq!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records after conflicting projection")
+            .len(),
+        1,
+        "the recovery row pins a payload absent from the published base graph"
     );
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
-        acknowledged_end,
+        flushed_event_seq_before_restore,
         "guarded replay must leave the flushed cursor untouched"
+    );
+}
+
+#[test]
+fn redb_repair_retires_uploaded_recovery_after_inode_kind_change() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = uploaded_pending_file(&pg, b"repair-kind-change.bin", 77_016);
+    let mut replacement = file.clone();
+    replacement.kind = crate::types::FileType::Directory;
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: Vec::new(),
+            },
+            MetaEvent::SetAttr { attr: replacement },
+        ])
+        .expect("project changed inode kind");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("retire recovery for non-regular inode")
+    );
+
+    assert_eq!(
+        pg.get_attr(file.ino).expect("projected inode").kind,
+        crate::types::FileType::Directory
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records after kind change")
+            .is_empty()
+    );
+}
+
+#[test]
+fn redb_repair_retires_uploaded_recovery_after_creation_time_change() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = uploaded_pending_file(&pg, b"repair-crtime-change.bin", 77_017);
+    let mut replacement = file.clone();
+    replacement.crtime = replacement.crtime.saturating_add(1);
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: Vec::new(),
+            },
+            MetaEvent::SetAttr {
+                attr: replacement.clone(),
+            },
+        ])
+        .expect("project changed inode creation time");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("retire recovery for changed inode identity")
+    );
+
+    assert_eq!(
+        pg.get_attr(file.ino).expect("projected inode").crtime,
+        replacement.crtime
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records after identity change")
+            .is_empty()
+    );
+}
+
+#[test]
+fn redb_repair_does_not_partially_commit_when_lifecycle_rebuild_fails() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = uploaded_pending_file(&pg, b"repair-lifecycle-failure.bin", 77_018);
+    let mut remote_projection = file.clone();
+    remote_projection.size = 0;
+    remote_projection.committed_size = 0;
+    let mut remote_snapshot = pg
+        .local
+        .export_snapshot()
+        .expect("export remote projection");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == file.ino {
+            *bytes = postcard::to_stdvec(&remote_projection).expect("encode remote attr");
+        }
+    }
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("project remote inode without its overlay");
+    let txn = pg
+        .local
+        .begin_write_txn()
+        .expect("open lifecycle transaction");
+    txn.open_table(redb::TableDefinition::<u64, &[u8]>::new("inode_lifecycle"))
+        .expect("open lifecycle table")
+        .insert(file.ino, b"\xff".as_slice())
+        .expect("inject malformed lifecycle row");
+    txn.commit().expect("commit malformed lifecycle fixture");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .is_err()
+    );
+
+    assert_eq!(
+        pg.get_attr(file.ino)
+            .expect("inode after failed repair")
+            .size,
+        0
+    );
+    assert!(
+        lookup_object_ids(&pg, file.ino, file.size)
+            .expect("serving references after failed repair")
+            .is_empty()
+    );
+    assert_eq!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery row after failed repair")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn redb_repair_does_not_restore_superseded_uploaded_overlay() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let superseded = uploaded_pending_file(&pg, b"repair-superseded.bin", 77_014);
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == superseded.ino {
+            let mut attr: InodeAttr = postcard::from_bytes(bytes).expect("decode superseded attr");
+            attr.content_epoch = attr.content_epoch.saturating_add(1);
+            attr.size = 0;
+            attr.upload_state = UploadState::Uploading;
+            *bytes = postcard::to_stdvec(&attr).expect("encode superseded attr");
+        }
+    }
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != superseded.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate superseding remote projection");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none()
+    );
+
+    let next_event_seq = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("event sequence");
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("attempt repair restore")
+    );
+
+    let current = pg.get_attr(superseded.ino).expect("superseding attr");
+    assert_eq!(current.content_epoch, superseded.content_epoch + 1);
+    assert_eq!(current.size, 0);
+    assert_eq!(current.upload_state, UploadState::Uploading);
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("projected object references")
+            .is_empty()
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records after superseded/deleted projection")
+            .is_empty(),
+        "a superseded inode retires its obsolete recovery record"
+    );
+    assert_eq!(
+        pg.local
+            .get_counter("nextEventSeq")
+            .expect("event sequence after restore"),
+        next_event_seq,
+        "repair restore must not append events"
+    );
+}
+
+#[test]
+fn redb_repair_does_not_restore_deleted_uploaded_overlay() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-deleted.bin";
+    let created = pg
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create file");
+    pg.local
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: created.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+                entry: crate::types::DirEntryValue {
+                    ino: created.ino,
+                    kind: created.kind,
+                },
+            },
+        ])
+        .expect("publish inode identity before pending content");
+    let payload = PayloadRef::new_partial(77_015, 152);
+    pg.stage_payload_slice(created.ino, 0, &payload)
+        .expect("stage pending payload");
+    set_file_state(&pg, created.ino, 152, 1);
+    let deleted = pg.get_attr(created.ino).expect("pending attr");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            deleted.ino,
+            deleted.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark pending payload uploaded")
+    );
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
+    remote_snapshot.event_log.clear();
+    remote_snapshot
+        .inodes
+        .retain(|(ino, _)| *ino != deleted.ino);
+    remote_snapshot
+        .dentries
+        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, name));
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != deleted.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate deleted remote projection");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none()
+    );
+
+    let next_event_seq = pg
+        .local
+        .get_counter("nextEventSeq")
+        .expect("event sequence");
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("attempt repair restore")
+    );
+
+    assert!(matches!(
+        pg.get_attr(deleted.ino),
+        Err(MetaError::InodeNotFound(_))
+    ));
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("projected object references")
+            .is_empty()
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records after deletion")
+            .is_empty()
+    );
+    assert_eq!(
+        pg.local
+            .get_counter("nextEventSeq")
+            .expect("event sequence after restore"),
+        next_event_seq,
+        "repair restore must not append events"
+    );
+}
+
+#[test]
+fn garbage_collection_retires_superseded_uploaded_recovery_rows() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = uploaded_pending_file(&pg, b"recovery-gc-superseded.bin", 77_021);
+    let mut superseding = file.clone();
+    superseding.content_epoch = superseding.content_epoch.saturating_add(1);
+    superseding.committed_content_epoch = superseding.content_epoch;
+    superseding.size = 0;
+    superseding.committed_size = 0;
+    superseding.upload_state = UploadState::Ready;
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: Vec::new(),
+            },
+            MetaEvent::SetAttr { attr: superseding },
+        ])
+        .expect("apply superseding serving state");
+
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("read recovery references")
+            .contains(&77_021),
+        "reachability reads must not retire rows"
+    );
+    pg.local
+        .reconcile_pending_regular_file_recoveries()
+        .expect("retire superseded recovery row explicitly");
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .expect("references after reconciliation")
+            .is_empty()
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("reconciled recovery rows")
+            .is_empty()
+    );
+}
+
+#[test]
+fn redb_repair_restores_unpublished_uploaded_file_missing_from_checkpoint() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-unpublished-missing.bin";
+    let file = uploaded_pending_file(&pg, name, 77_019);
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
+    remote_snapshot.event_log.clear();
+    remote_snapshot.inodes.retain(|(ino, _)| *ino != file.ino);
+    remote_snapshot
+        .dentries
+        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, name));
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate checkpoint omitting unpublished inode");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore unpublished uploaded file")
+    );
+
+    assert_eq!(pg.get_attr(file.ino).expect("restored inode"), file);
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, name)
+            .expect("restored namespace entry")
+            .ino,
+        file.ino
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, file.size).expect("restored uploaded payloads"),
+        vec![77_019]
+    );
+    assert_eq!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery records")
+            .len(),
+        1,
+        "the recovery row remains available until publication retires it"
+    );
+}
+
+#[test]
+fn redb_repair_restores_nameless_pending_inode() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-nameless.bin";
+    let file = uploaded_pending_file(&pg, name, 77_023);
+    pg.local
+        .apply_replica_serving_state(&[MetaEvent::RemoveEntry {
+            parent: ROOT_INO,
+            name: name.to_vec(),
+        }])
+        .expect("remove the serving name");
+    pg.local
+        .backfill_missing_uploaded_regular_file_recoveries()
+        .expect("capture empty namespace");
+    assert_eq!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .expect("recovery row")[0]
+            .dentries,
+        Some(Vec::new())
+    );
+
+    let mut checkpoint = pg.local.export_snapshot().expect("export checkpoint");
+    checkpoint.inodes.retain(|(ino, _)| *ino != file.ino);
+    checkpoint
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&checkpoint)
+        .expect("import checkpoint without unnamed inode");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore nameless pending inode")
+    );
+    assert_eq!(
+        pg.get_attr(file.ino).expect("restored inode").size,
+        file.size
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, file.size).expect("restored payload"),
+        vec![77_023]
+    );
+}
+
+#[test]
+fn redb_repair_restores_pending_file_namespace_after_hardlink_metadata_drift() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-hardlink-source.bin";
+    let alias = b"repair-hardlink-alias.bin";
+    let before_link = uploaded_pending_file(&pg, name, 77_020);
+    let after_link = pg
+        .link(before_link.ino, ROOT_INO, alias)
+        .expect("create hardlink");
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export remote snapshot");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == before_link.ino {
+            *bytes = postcard::to_stdvec(&before_link).expect("encode pre-link attr");
+        }
+    }
+    remote_snapshot
+        .dentries
+        .retain(|(key, _)| key != &encode_dentry_key(ROOT_INO, alias));
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != before_link.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("simulate checkpoint missing a local hardlink");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore linked pending file")
+    );
+
+    assert_eq!(
+        pg.get_attr(before_link.ino).expect("restored attr"),
+        after_link
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, alias)
+            .expect("restored hardlink")
+            .ino,
+        before_link.ino
+    );
+}
+
+#[test]
+fn redb_repair_does_not_resurrect_old_name_after_pending_file_rename() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let old_name = b"repair-rename-old.bin";
+    let new_name = b"repair-rename-new.bin";
+    let file = uploaded_pending_file(&pg, old_name, 77_026);
+    pg.rename(ROOT_INO, old_name, ROOT_INO, new_name)
+        .expect("rename pending file");
+
+    let mut checkpoint = pg.local.export_snapshot().expect("export checkpoint");
+    checkpoint
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&checkpoint)
+        .expect("lose pending overlay during repair");
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore renamed pending file")
+    );
+    assert!(pg.lookup(ROOT_INO, old_name).is_err());
+    assert_eq!(
+        pg.lookup(ROOT_INO, new_name)
+            .expect("new name remains live")
+            .ino,
+        file.ino
+    );
+}
+
+#[test]
+fn redb_repair_preserves_checkpoint_metadata_and_link_count() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-peer-link.bin";
+    let alias = b"repair-peer-link-alias.bin";
+    let file = uploaded_pending_file(&pg, name, 77_022);
+
+    let mut remote_snapshot = pg.local.export_snapshot().expect("export checkpoint");
+    remote_snapshot.event_log.clear();
+    for (ino, bytes) in &mut remote_snapshot.inodes {
+        if *ino == file.ino {
+            let mut attr: InodeAttr = postcard::from_bytes(bytes).expect("decode inode");
+            attr.nlink = 2;
+            attr.mode = 0o600;
+            attr.uid = 42;
+            attr.gid = 43;
+            *bytes = postcard::to_stdvec(&attr).expect("encode peer metadata");
+        }
+    }
+    let entry = remote_snapshot
+        .dentries
+        .iter()
+        .find(|(key, _)| *key == encode_dentry_key(ROOT_INO, name))
+        .expect("original checkpoint dentry")
+        .1
+        .clone();
+    remote_snapshot
+        .dentries
+        .push((encode_dentry_key(ROOT_INO, alias), entry));
+    remote_snapshot
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("import peer metadata without local overlay");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore pending payload")
+    );
+    let restored = pg.get_attr(file.ino).expect("restored inode");
+    assert_eq!(
+        (restored.nlink, restored.mode, restored.uid, restored.gid),
+        (2, 0o600, 42, 43)
+    );
+    pg.unlink(ROOT_INO, name).expect("unlink one hardlink");
+    assert_eq!(
+        pg.lookup(ROOT_INO, alias).expect("surviving hardlink").ino,
+        file.ino
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, file.size).expect("surviving payload"),
+        vec![77_022]
+    );
+}
+
+#[test]
+fn redb_repair_preserves_local_permission_change_after_upload() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-local-chmod.bin";
+    let file = pg
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create file");
+    pg.local
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr: file.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+                entry: crate::types::DirEntryValue {
+                    ino: file.ino,
+                    kind: file.kind,
+                },
+            },
+        ])
+        .expect("publish original metadata");
+    let payload = PayloadRef::new_partial(77_027, 152);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage local payload");
+    set_file_state(&pg, file.ino, 152, 1);
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, payload.object_id)
+            .expect("upload payload")
+    );
+    let mut checkpoint = pg.local.export_snapshot().expect("export old permissions");
+    checkpoint
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    let mut chmod = pg.get_attr(file.ino).expect("pending inode");
+    chmod.mode = 0o600;
+    pg.set_attr(&chmod).expect("accept local chmod");
+    pg.local
+        .backfill_missing_uploaded_regular_file_recoveries()
+        .expect("capture local metadata before import");
+    pg.local
+        .import_remote_snapshot(&checkpoint)
+        .expect("import older permissions without pending overlay");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore local pending state")
+    );
+    assert_eq!(pg.get_attr(file.ino).expect("restored inode").mode, 0o600);
+}
+
+#[test]
+fn redb_repair_preserves_nonuploaded_sibling_in_same_chunk() {
+    use crate::schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord};
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"repair-partial-chunk.bin", 0, 0, 0o644)
+        .expect("create file");
+    let first = PayloadRef::new_partial(77_024, 4096);
+    let second = PayloadRef::new_partial(77_025, 4096);
+    pg.local
+        .flush_regular_file_overlay_slices(
+            file.ino,
+            &[(
+                ChunkId(0),
+                vec![
+                    SliceRecord::new(
+                        SliceId(0),
+                        SliceOrder(0),
+                        SliceRange::new(0, 4096).unwrap(),
+                        first,
+                    ),
+                    SliceRecord::new(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange::new(4096, 8192).unwrap(),
+                        second,
+                    ),
+                ],
+            )],
+        )
+        .expect("stage two slices in one chunk");
+    set_file_state(&pg, file.ino, 8192, 1);
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, first.object_id)
+            .expect("upload first slice")
+    );
+    let mut checkpoint = pg.local.export_snapshot().expect("export checkpoint");
+    checkpoint
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&checkpoint)
+        .expect("lose local overlay during repair");
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore mixed chunk")
+    );
+    let restored = pg.local.export_snapshot().expect("export restored graph");
+    let (_, bytes) = restored
+        .regular_file_overlay
+        .iter()
+        .find(|(ino, _)| *ino == file.ino)
+        .expect("restored chunk");
+    let state: crate::schema::RegularFileOverlayState =
+        postcard::from_bytes(bytes).expect("decode restored chunk");
+    let slices = &state.chunks[&ChunkId(0)].slices;
+    assert_eq!(slices[&SliceId(0)].payload_state, PayloadRefState::Uploaded);
+    assert_eq!(
+        slices[&SliceId(1)].payload_state,
+        PayloadRefState::LocalOnly
     );
 }
 
@@ -848,9 +1598,10 @@ fn redb_repair_merges_uploaded_payloads_across_stale_overlay_events() {
         }
         *bytes = postcard::to_stdvec(&state).expect("encode stale overlay snapshot");
     }
+    stale_snapshot.event_log.clear();
     pg.local
-        .import_remote_snapshot_preserving_local_event_log(&stale_snapshot)
-        .expect("replace serving state while retaining event log");
+        .import_remote_snapshot(&stale_snapshot)
+        .expect("replace serving state without retaining the old event log");
 
     pg.mark_regular_file_overlay_object_uploaded_if_matches(
         file.ino,
@@ -859,8 +1610,22 @@ fn redb_repair_merges_uploaded_payloads_across_stale_overlay_events() {
     )
     .expect("mark second payload uploaded");
 
-    pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
-        .expect("restore acknowledged uploaded overlay");
+    let mut repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
+    repair_snapshot.event_log.clear();
+    pg.local
+        .import_remote_snapshot(&repair_snapshot)
+        .expect("remove the remaining local event rows");
+    assert!(
+        pg.local
+            .first_event_seq()
+            .expect("first retained event")
+            .is_none()
+    );
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore acknowledged uploaded overlay")
+    );
 
     let restored = pg.local.export_snapshot().expect("export restored state");
     let (_, bytes) = restored

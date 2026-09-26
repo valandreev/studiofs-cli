@@ -3730,6 +3730,33 @@ fn allocator_bootstrap_does_not_hold_retry_lock_during_mint() {
 }
 
 #[test]
+fn pending_local_graph_repair_marker_blocks_catchup_completion() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .local
+        .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+        .expect("set local graph recovery marker");
+    engine
+        .metadata_startup_target_version
+        .store(0, std::sync::atomic::Ordering::Release);
+    engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+
+    engine
+        .try_complete_catchup_sync()
+        .expect("pending local graph recovery blocks catch-up completion");
+
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .metadata_startup_target_version
+            .load(std::sync::atomic::Ordering::Acquire),
+        -1,
+        "a later poll must capture a new remote head after reaching the pinned target"
+    );
+}
+
+#[test]
 fn allocator_bootstrap_panic_releases_in_flight_state_and_can_retry() {
     let (_dir, engine) = fresh_allocator_recovery_fixture();
     engine

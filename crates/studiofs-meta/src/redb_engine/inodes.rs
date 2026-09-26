@@ -2,6 +2,122 @@ use super::*;
 
 const INODE_LIFECYCLE_SCHEMA_VERSION_KEY: &str = "inode_lifecycle_schema_version";
 const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
+const PENDING_REGULAR_FILE_RECOVERY_WIRE_MAGIC: &[u8; 8] = b"SFS-PFR\0";
+const PENDING_REGULAR_FILE_RECOVERY_WIRE_VERSION: u8 = 2;
+pub(crate) type PendingRecoveryDentry = (Ino, Vec<u8>);
+
+#[derive(serde::Deserialize)]
+struct LegacyPendingRegularFileRecoveryRecord {
+    attr: InodeAttr,
+    overlay: crate::schema::RegularFileOverlayState,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Version1PendingRegularFileRecoveryRecord {
+    attr: InodeAttr,
+    overlay: crate::schema::RegularFileOverlayState,
+    dentries: Option<Vec<PendingRecoveryDentry>>,
+    had_published_inode: Option<bool>,
+}
+
+/// Local-only recovery copy of uploaded slices for one unpublished content epoch.
+/// Snapshot replacement excludes this versioned row; proven publication,
+/// superseding epochs, or inode deletion retire it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingRegularFileRecoveryRecord {
+    pub(crate) attr: InodeAttr,
+    pub(crate) overlay: crate::schema::RegularFileOverlayState,
+    #[serde(default)]
+    pub(crate) dentries: Option<Vec<PendingRecoveryDentry>>,
+    #[serde(default)]
+    pub(crate) had_published_inode: Option<bool>,
+    pub(crate) baseline_attr: Option<InodeAttr>,
+}
+
+fn encode_pending_regular_file_recovery(
+    record: &PendingRegularFileRecoveryRecord,
+) -> MetaResult<Vec<u8>> {
+    let payload = encode(record)?;
+    let mut bytes =
+        Vec::with_capacity(PENDING_REGULAR_FILE_RECOVERY_WIRE_MAGIC.len() + 1 + payload.len());
+    bytes.extend_from_slice(PENDING_REGULAR_FILE_RECOVERY_WIRE_MAGIC);
+    bytes.push(PENDING_REGULAR_FILE_RECOVERY_WIRE_VERSION);
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
+fn decode_pending_regular_file_recovery(
+    bytes: &[u8],
+) -> MetaResult<PendingRegularFileRecoveryRecord> {
+    if let Some(versioned) = bytes.strip_prefix(PENDING_REGULAR_FILE_RECOVERY_WIRE_MAGIC) {
+        let Some((&version, payload)) = versioned.split_first() else {
+            return Err(MetaError::Storage(
+                "pending regular-file recovery row has a truncated version".to_string(),
+            ));
+        };
+        return match version {
+            PENDING_REGULAR_FILE_RECOVERY_WIRE_VERSION => decode(payload),
+            1 => {
+                let old: Version1PendingRegularFileRecoveryRecord = decode(payload)?;
+                Ok(PendingRegularFileRecoveryRecord {
+                    attr: old.attr,
+                    overlay: old.overlay,
+                    dentries: old.dentries,
+                    had_published_inode: old.had_published_inode,
+                    baseline_attr: None,
+                })
+            }
+            _ => Err(MetaError::Storage(format!(
+                "unsupported pending regular-file recovery row version: {version}"
+            ))),
+        };
+    }
+
+    let legacy: LegacyPendingRegularFileRecoveryRecord = decode(bytes)?;
+    Ok(PendingRegularFileRecoveryRecord {
+        attr: legacy.attr,
+        overlay: legacy.overlay,
+        dentries: None,
+        had_published_inode: None,
+        baseline_attr: None,
+    })
+}
+
+fn chunks_have_uploaded_payload(chunks: &BTreeMap<ChunkId, RegularFileChunkState>) -> bool {
+    chunks
+        .values()
+        .flat_map(|chunk| chunk.slices.values())
+        .any(|slice| {
+            slice.payload.is_some()
+                && slice.payload_state == crate::schema::PayloadRefState::Uploaded
+        })
+}
+
+fn extend_chunk_payload_object_ids(
+    chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
+    ids: &mut std::collections::HashSet<u64>,
+) {
+    ids.extend(
+        chunks
+            .values()
+            .flat_map(|chunk| chunk.slices.values())
+            .filter_map(|slice| slice.payload.as_ref().map(|payload| payload.object_id)),
+    );
+}
+
+fn recovery_payloads_are_in_base(
+    recovery: &PendingRegularFileRecoveryRecord,
+    base: &BTreeMap<ChunkId, RegularFileChunkState>,
+) -> bool {
+    let mut recovery_ids = std::collections::HashSet::new();
+    extend_chunk_payload_object_ids(&recovery.overlay.chunks, &mut recovery_ids);
+    if recovery_ids.is_empty() {
+        return false;
+    }
+    let mut base_ids = std::collections::HashSet::new();
+    extend_chunk_payload_object_ids(base, &mut base_ids);
+    recovery_ids.is_subset(&base_ids)
+}
 
 impl RedbMetaEngine {
     pub(crate) fn set_attr_in_txn(
@@ -19,6 +135,7 @@ impl RedbMetaEngine {
         }
         Self::set_inode_overlay_in_txn(txn, &normalized)?;
         Self::sync_inode_lifecycle_in_txn(txn, normalized.ino)?;
+        Self::refresh_pending_regular_file_recovery_metadata_in_txn(txn, normalized.ino)?;
         Self::append_event_in_txn(
             txn,
             &crate::events::MetaEvent::SetAttr {
@@ -358,6 +475,7 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<()> {
+        Self::remove_pending_regular_file_recovery_in_txn(txn, ino)?;
         let mut table = txn
             .open_table(INODE_LIFECYCLE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -367,11 +485,456 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    pub(crate) fn pending_uploaded_regular_file_recoveries(
+        &self,
+    ) -> MetaResult<Vec<PendingRegularFileRecoveryRecord>> {
+        let txn = self.begin_read_txn()?;
+        let table = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        table
+            .iter()
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|row| {
+                let (_, value) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                decode_pending_regular_file_recovery(value.value())
+            })
+            .collect()
+    }
+
+    pub(crate) fn pending_recovery_payloads_are_published(
+        &self,
+        recovery: &PendingRegularFileRecoveryRecord,
+    ) -> MetaResult<bool> {
+        let txn = self.begin_read_txn()?;
+        Self::pending_recovery_payloads_are_published_in_read_txn(&txn, recovery)
+    }
+
+    pub(crate) fn reconcile_pending_regular_file_recoveries(&self) -> MetaResult<()> {
+        if self.db.is_none() {
+            return Ok(());
+        }
+
+        let has_records = {
+            let txn = self.begin_read_txn()?;
+            let table = txn
+                .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let mut rows = table
+                .iter()
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            rows.next().is_some()
+        };
+        if !has_records {
+            return Ok(());
+        }
+
+        let txn = self.begin_immediate_write_txn()?;
+        let records = {
+            let table = txn
+                .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            table
+                .iter()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+                .map(|row| {
+                    let (_, value) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                    decode_pending_regular_file_recovery(value.value())
+                })
+                .collect::<MetaResult<Vec<_>>>()?
+        };
+
+        for record in records {
+            if Self::pending_recovery_is_obsolete_in_write_txn(&txn, &record)? {
+                Self::remove_pending_regular_file_recovery_in_txn(&txn, record.attr.ino)?;
+            }
+        }
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))
+    }
+
+    fn pending_recovery_payloads_are_published_in_read_txn(
+        txn: &redb::ReadTransaction,
+        recovery: &PendingRegularFileRecoveryRecord,
+    ) -> MetaResult<bool> {
+        let base = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            txn,
+            REGULAR_FILE_BASE_TABLE,
+            recovery.attr.ino,
+        )?;
+        Ok(recovery_payloads_are_in_base(recovery, &base))
+    }
+
+    fn pending_recovery_is_obsolete_in_write_txn(
+        txn: &redb::WriteTransaction,
+        recovery: &PendingRegularFileRecoveryRecord,
+    ) -> MetaResult<bool> {
+        let Some(current) = Self::get_attr_from_write_table(txn, INODES_TABLE, recovery.attr.ino)?
+        else {
+            return Ok(recovery.had_published_inode == Some(true));
+        };
+        if current.kind != FileType::RegularFile || current.crtime != recovery.attr.crtime {
+            return Ok(true);
+        }
+        if current.content_epoch > recovery.attr.content_epoch {
+            return Ok(true);
+        }
+        if !current.is_upload_pending() {
+            let base = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                txn,
+                REGULAR_FILE_BASE_TABLE,
+                recovery.attr.ino,
+            )?;
+            return Ok(recovery_payloads_are_in_base(recovery, &base));
+        }
+        Ok(false)
+    }
+
+    pub(super) fn pending_recovery_object_ids_from_read_txn(
+        txn: &ReadTransaction,
+        refs: &mut std::collections::HashSet<u64>,
+    ) -> MetaResult<()> {
+        let recoveries = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        for row in recoveries
+            .iter()
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+        {
+            let (_, value) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+            let record = decode_pending_regular_file_recovery(value.value())?;
+            extend_chunk_payload_object_ids(&record.overlay.chunks, refs);
+        }
+        Ok(())
+    }
+
+    /// Capture legacy pending overlays from the recovered live view before a
+    /// remote snapshot replaces that view during redb repair.
+    pub(crate) fn backfill_missing_uploaded_regular_file_recoveries(&self) -> MetaResult<()> {
+        let txn = self.begin_immediate_write_txn()?;
+        let attrs = {
+            let table = txn
+                .open_table(INODES_TABLE)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let mut attrs = Vec::new();
+            for row in table
+                .iter()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+            {
+                let (_, value) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                let attr: InodeAttr = decode(value.value())?;
+                if attr.kind == FileType::RegularFile && attr.is_upload_pending() {
+                    attrs.push(attr);
+                }
+            }
+            attrs
+        };
+
+        let mut recoveries = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        for attr in attrs {
+            let previous = recoveries
+                .get(attr.ino)
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+                .map(|value| decode_pending_regular_file_recovery(value.value()))
+                .transpose()?;
+            let chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                attr.ino,
+            )?;
+            let ino = attr.ino;
+            let (dentries, had_published_inode) =
+                Self::pending_recovery_namespace_in_write_txn(&txn, ino)?;
+            let baseline_attr = previous
+                .as_ref()
+                .filter(|previous| {
+                    previous.attr.crtime == attr.crtime
+                        && previous.attr.content_epoch == attr.content_epoch
+                })
+                .and_then(|previous| previous.baseline_attr.clone())
+                .or(Self::get_base_attr_in_write_txn(&txn, ino)?);
+            let record = match previous {
+                Some(mut previous)
+                    if previous.attr.crtime == attr.crtime
+                        && previous.attr.content_epoch > attr.content_epoch =>
+                {
+                    previous.dentries.get_or_insert(dentries);
+                    previous.had_published_inode =
+                        Some(previous.had_published_inode.unwrap_or(false) || had_published_inode);
+                    previous
+                }
+                Some(previous)
+                    if previous.attr.crtime == attr.crtime
+                        && previous.attr.content_epoch == attr.content_epoch =>
+                {
+                    let overlay = Self::pending_regular_file_recovery_overlay(
+                        &chunks,
+                        Some(&previous.overlay),
+                    );
+                    if !chunks_have_uploaded_payload(&overlay.chunks) {
+                        let mut previous = previous;
+                        previous.attr = attr.clone();
+                        previous.dentries = Some(dentries);
+                        previous.had_published_inode = Some(
+                            previous.had_published_inode.unwrap_or(false) || had_published_inode,
+                        );
+                        previous.baseline_attr = baseline_attr;
+                        previous
+                    } else {
+                        PendingRegularFileRecoveryRecord {
+                            attr: attr.clone(),
+                            overlay,
+                            dentries: Some(dentries),
+                            had_published_inode: Some(
+                                previous.had_published_inode.unwrap_or(false)
+                                    || had_published_inode,
+                            ),
+                            baseline_attr,
+                        }
+                    }
+                }
+                _ => {
+                    let overlay = Self::pending_regular_file_recovery_overlay(&chunks, None);
+                    if !chunks_have_uploaded_payload(&overlay.chunks) {
+                        let _ = recoveries
+                            .remove(ino)
+                            .map_err(|error| MetaError::Storage(error.to_string()))?;
+                        continue;
+                    }
+                    PendingRegularFileRecoveryRecord {
+                        attr: attr.clone(),
+                        overlay,
+                        dentries: Some(dentries),
+                        had_published_inode: Some(had_published_inode),
+                        baseline_attr,
+                    }
+                }
+            };
+            let bytes = encode_pending_regular_file_recovery(&record)?;
+            recoveries
+                .insert(ino, bytes.as_slice())
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+        }
+
+        drop(recoveries);
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))
+    }
+
+    fn pending_recovery_namespace_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<(Vec<PendingRecoveryDentry>, bool)> {
+        let dentries =
+            Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, ino)?
+                .into_iter()
+                .map(|key| {
+                    let (parent, name) = decode_dentry_key(&key)?;
+                    Ok((parent, name.to_vec()))
+                })
+                .collect::<MetaResult<Vec<_>>>()?;
+        let had_published_inode = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .get(ino)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .is_some();
+        Ok((dentries, had_published_inode))
+    }
+
+    fn pending_regular_file_recovery_overlay(
+        chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
+        previous: Option<&crate::schema::RegularFileOverlayState>,
+    ) -> crate::schema::RegularFileOverlayState {
+        let mut chunks = chunks.clone();
+        if let Some(previous) = previous {
+            for (chunk_id, chunk) in &mut chunks {
+                if let Some(previous_chunk) = previous.chunks.get(chunk_id) {
+                    for slice in chunk.slices.values_mut() {
+                        Self::preserve_completed_overlay_payload_state(previous_chunk, slice);
+                    }
+                }
+            }
+        }
+        crate::schema::RegularFileOverlayState { chunks }
+    }
+
+    pub(super) fn remove_pending_regular_file_recovery_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let _ = table
+            .remove(ino)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn sync_pending_regular_file_recovery_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+        chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
+    ) -> MetaResult<()> {
+        if attr.kind != FileType::RegularFile || !attr.is_upload_pending() {
+            return Self::remove_pending_regular_file_recovery_in_txn(txn, attr.ino);
+        }
+
+        let mut recoveries = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let previous = recoveries
+            .get(attr.ino)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|value| decode_pending_regular_file_recovery(value.value()))
+            .transpose()?;
+
+        if let Some(previous) = previous.as_ref()
+            && previous.attr.crtime == attr.crtime
+            && previous.attr.is_upload_pending()
+            && previous.attr.content_epoch > attr.content_epoch
+        {
+            tracing::warn!(
+                ino = attr.ino,
+                recovery_epoch = previous.attr.content_epoch,
+                current_epoch = attr.content_epoch,
+                "kept a newer pending regular-file recovery row"
+            );
+            return Ok(());
+        }
+
+        let previous_for_epoch = previous.as_ref().filter(|previous| {
+            previous.attr.crtime == attr.crtime
+                && previous.attr.is_upload_pending()
+                && previous.attr.content_epoch == attr.content_epoch
+        });
+        if !chunks_have_uploaded_payload(chunks) && previous_for_epoch.is_none() {
+            let _ = recoveries
+                .remove(attr.ino)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            return Ok(());
+        }
+
+        let overlay = Self::pending_regular_file_recovery_overlay(
+            chunks,
+            previous_for_epoch.map(|previous| &previous.overlay),
+        );
+        if !chunks_have_uploaded_payload(&overlay.chunks) {
+            let _ = recoveries
+                .remove(attr.ino)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            return Ok(());
+        }
+
+        let (dentries, had_published_inode) =
+            Self::pending_recovery_namespace_in_write_txn(txn, attr.ino)?;
+        let baseline_attr = previous_for_epoch
+            .and_then(|previous| previous.baseline_attr.clone())
+            .or(Self::get_base_attr_in_write_txn(txn, attr.ino)?);
+        let had_published_inode = previous_for_epoch
+            .is_some_and(|previous| previous.had_published_inode == Some(true))
+            || had_published_inode;
+        if previous_for_epoch.is_some_and(|previous| {
+            previous.attr == *attr
+                && previous.overlay.chunks == overlay.chunks
+                && previous.dentries.as_ref() == Some(&dentries)
+                && previous.had_published_inode == Some(had_published_inode)
+                && previous.baseline_attr == baseline_attr
+        }) {
+            return Ok(());
+        }
+
+        let bytes = encode_pending_regular_file_recovery(&PendingRegularFileRecoveryRecord {
+            attr: attr.clone(),
+            overlay,
+            dentries: Some(dentries),
+            had_published_inode: Some(had_published_inode),
+            baseline_attr,
+        })?;
+        recoveries
+            .insert(attr.ino, bytes.as_slice())
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn sync_pending_regular_file_recovery_for_inode_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let Some(attr) = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? else {
+            return Self::remove_pending_regular_file_recovery_in_txn(txn, ino);
+        };
+        if attr.kind != FileType::RegularFile {
+            return Self::remove_pending_regular_file_recovery_in_txn(txn, ino);
+        }
+        let chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        Self::sync_pending_regular_file_recovery_in_txn(txn, &attr, &chunks)
+    }
+
+    pub(super) fn refresh_pending_regular_file_recovery_metadata_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let Some(mut record) = table
+            .get(ino)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|value| decode_pending_regular_file_recovery(value.value()))
+            .transpose()?
+        else {
+            return Ok(());
+        };
+        let Some(attr) = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? else {
+            return Ok(());
+        };
+        if attr.kind != FileType::RegularFile || attr.crtime != record.attr.crtime {
+            return Ok(());
+        }
+
+        let (dentries, had_published_inode) =
+            Self::pending_recovery_namespace_in_write_txn(txn, ino)?;
+        let baseline_attr = record
+            .baseline_attr
+            .clone()
+            .or(Self::get_base_attr_in_write_txn(txn, ino)?);
+        let had_published_inode =
+            record.had_published_inode.unwrap_or(false) || had_published_inode;
+        let same_epoch = attr.content_epoch == record.attr.content_epoch;
+        if (!same_epoch || record.attr == attr)
+            && record.dentries.as_ref() == Some(&dentries)
+            && record.had_published_inode == Some(had_published_inode)
+            && record.baseline_attr == baseline_attr
+        {
+            return Ok(());
+        }
+        if same_epoch {
+            record.attr = attr;
+        }
+        record.dentries = Some(dentries);
+        record.had_published_inode = Some(had_published_inode);
+        record.baseline_attr = baseline_attr;
+        let bytes = encode_pending_regular_file_recovery(&record)?;
+        table
+            .insert(ino, bytes.as_slice())
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(())
+    }
+
     pub(super) fn record_deleted_before_publish_in_txn(
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
         deferred_cleanup_object_ids: Vec<u64>,
     ) -> MetaResult<InodeLifecycleRecord> {
+        Self::remove_pending_regular_file_recovery_in_txn(txn, attr.ino)?;
         let has_published_base = attr.committed_size > 0 || attr.committed_content_epoch > 0;
         let record = InodeLifecycleRecord {
             ino: attr.ino,
@@ -400,10 +963,28 @@ impl RedbMetaEngine {
             }
         };
         if attr.kind != FileType::RegularFile {
+            Self::remove_pending_regular_file_recovery_in_txn(txn, ino)?;
             Self::remove_inode_lifecycle_in_txn(txn, ino)?;
             return Ok(None);
         }
-        let record = Self::compute_inode_lifecycle_record_in_txn(txn, &attr)?;
+        if !attr.is_upload_pending() {
+            Self::remove_pending_regular_file_recovery_in_txn(txn, ino)?;
+        }
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let has_published_base =
+            Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0;
+        let record = Self::compute_inode_lifecycle_record(
+            &attr,
+            overlay_chunks.values(),
+            has_published_base,
+            Vec::new(),
+        );
         Self::put_inode_lifecycle_in_txn(txn, &record)?;
         Ok(Some(record))
     }
@@ -417,6 +998,7 @@ impl RedbMetaEngine {
             REGULAR_FILE_OVERLAY_TABLE,
             attr.ino,
         )?;
+        Self::sync_pending_regular_file_recovery_in_txn(txn, attr, &overlay_chunks)?;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
         let has_published_base =
             Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?
@@ -1024,5 +1606,265 @@ mod tests {
         assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
         assert_eq!(lifecycle.local_visible_size, 4096);
         assert_eq!(lifecycle.local_content_epoch, 1);
+    }
+
+    #[test]
+    fn backfill_captures_uploaded_pending_overlay_when_recovery_row_is_missing() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp.path().join("pending-file-recovery-backfill.redb");
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        engine
+            .set_format_info(&test_format_info("pending-file-recovery-backfill"))
+            .unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"recover-after-repair.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+        engine
+            .flush_regular_file_overlay_slices(
+                file.ino,
+                &[(ChunkId(0), {
+                    let slice = SliceRecord::new(
+                        SliceId(0),
+                        SliceOrder(0),
+                        SliceRange::new(0, 4096).unwrap(),
+                        PayloadRef::new_partial(777_101, 4096),
+                    );
+                    vec![slice]
+                })],
+            )
+            .unwrap();
+        assert!(
+            engine
+                .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 777_101)
+                .unwrap()
+        );
+
+        let txn = engine.begin_write_txn().unwrap();
+        let mut recovery = txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE).unwrap();
+        recovery.remove(file.ino).unwrap();
+        drop(recovery);
+        txn.commit().unwrap();
+
+        engine
+            .backfill_missing_uploaded_regular_file_recoveries()
+            .unwrap();
+        let recoveries = engine.pending_uploaded_regular_file_recoveries().unwrap();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(recoveries[0].attr.ino, file.ino);
+        assert_eq!(
+            recoveries[0].dentries,
+            Some(vec![(ROOT_INO, b"recover-after-repair.bin".to_vec())])
+        );
+        assert_eq!(recoveries[0].had_published_inode, Some(false));
+        assert!(
+            recoveries[0]
+                .overlay
+                .chunks
+                .values()
+                .flat_map(|chunk| chunk.slices.values())
+                .any(|slice| slice.payload_state == PayloadRefState::Uploaded)
+        );
+
+        let mut published = recoveries[0].clone();
+        published.had_published_inode = Some(true);
+        let bytes = encode_pending_regular_file_recovery(&published).unwrap();
+        let txn = engine.begin_write_txn().unwrap();
+        txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .unwrap()
+            .insert(file.ino, bytes.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+
+        engine
+            .backfill_missing_uploaded_regular_file_recoveries()
+            .unwrap();
+        let recoveries = engine.pending_uploaded_regular_file_recoveries().unwrap();
+        assert_eq!(recoveries[0].had_published_inode, Some(true));
+    }
+
+    #[test]
+    fn recovery_record_decodes_rows_without_namespace_fields() {
+        #[derive(serde::Serialize)]
+        struct LegacyRecoveryRecord {
+            attr: InodeAttr,
+            overlay: crate::schema::RegularFileOverlayState,
+        }
+
+        let legacy = LegacyRecoveryRecord {
+            attr: InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644),
+            overlay: crate::schema::RegularFileOverlayState {
+                chunks: BTreeMap::new(),
+            },
+        };
+        let bytes = postcard::to_stdvec(&legacy).expect("encode legacy row");
+        let decoded = decode_pending_regular_file_recovery(&bytes).expect("decode old row");
+
+        assert_eq!(decoded.dentries, None);
+        assert_eq!(decoded.had_published_inode, None);
+        assert_eq!(decoded.baseline_attr, None);
+
+        let current = PendingRegularFileRecoveryRecord {
+            attr: legacy.attr,
+            overlay: legacy.overlay,
+            dentries: Some(vec![(ROOT_INO, b"recovered.bin".to_vec())]),
+            had_published_inode: Some(false),
+            baseline_attr: None,
+        };
+        let version1 = Version1PendingRegularFileRecoveryRecord {
+            attr: current.attr.clone(),
+            overlay: current.overlay.clone(),
+            dentries: current.dentries.clone(),
+            had_published_inode: current.had_published_inode,
+        };
+        let mut bytes = PENDING_REGULAR_FILE_RECOVERY_WIRE_MAGIC.to_vec();
+        bytes.push(1);
+        bytes.extend(postcard::to_stdvec(&version1).expect("encode version 1 row"));
+        let decoded = decode_pending_regular_file_recovery(&bytes).expect("decode version 1 row");
+        assert_eq!(decoded.dentries, current.dentries);
+        assert_eq!(decoded.baseline_attr, None);
+
+        let bytes = encode_pending_regular_file_recovery(&current).expect("encode versioned row");
+        assert!(bytes.starts_with(PENDING_REGULAR_FILE_RECOVERY_WIRE_MAGIC));
+        let decoded = decode_pending_regular_file_recovery(&bytes).expect("decode versioned row");
+        assert_eq!(decoded.attr, current.attr);
+        assert_eq!(decoded.overlay.chunks, current.overlay.chunks);
+        assert_eq!(decoded.dentries, current.dentries);
+        assert_eq!(decoded.had_published_inode, current.had_published_inode);
+        assert_eq!(decoded.baseline_attr, current.baseline_attr);
+    }
+
+    #[test]
+    fn recovery_overlay_keeps_nonuploaded_siblings() {
+        let mut uploaded = SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            SliceRange::new(0, 4096).unwrap(),
+            PayloadRef::new_partial(777_201, 4096),
+        );
+        uploaded.payload_state = PayloadRefState::Uploaded;
+        let local_only = SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(4096, 8192).unwrap(),
+            PayloadRef::new_partial(777_202, 4096),
+        );
+        let mut chunk = RegularFileChunkState::default();
+        chunk.insert_slice(uploaded);
+        chunk.insert_slice(local_only);
+
+        let recovery = RedbMetaEngine::pending_regular_file_recovery_overlay(
+            &BTreeMap::from([(ChunkId(0), chunk)]),
+            None,
+        );
+        let payload_ids: Vec<_> = recovery
+            .chunks
+            .values()
+            .flat_map(|chunk| chunk.slices.values())
+            .filter_map(|slice| slice.payload.map(|payload| payload.object_id))
+            .collect();
+
+        assert_eq!(payload_ids, vec![777_201, 777_202]);
+    }
+
+    #[test]
+    fn sync_recovery_replaces_a_previous_inode_identity() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp
+            .path()
+            .join("pending-file-recovery-inode-identity.redb");
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        engine
+            .set_format_info(&test_format_info("pending-file-recovery-inode-identity"))
+            .unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"reused-inode.bin", 1000, 1000, 0o644)
+            .unwrap();
+
+        let mut old_attr = engine.get_attr(file.ino).unwrap();
+        old_attr.size = 4096;
+        old_attr.content_epoch = 2;
+        engine.set_attr(&old_attr).unwrap();
+        engine
+            .flush_regular_file_overlay_slices(
+                file.ino,
+                &[(ChunkId(0), {
+                    vec![SliceRecord::new(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange::new(0, 4096).unwrap(),
+                        PayloadRef::new_partial(777_201, 4096),
+                    )]
+                })],
+            )
+            .unwrap();
+        assert!(
+            engine
+                .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 2, 777_201)
+                .unwrap()
+        );
+
+        let mut reused_attr = engine.get_attr(file.ino).unwrap();
+        reused_attr.crtime += 1;
+        reused_attr.content_epoch = 1;
+        reused_attr.upload_state = UploadState::Uploading;
+        let mut new_slice = SliceRecord::new(
+            SliceId(2),
+            SliceOrder(2),
+            SliceRange::new(0, 4096).unwrap(),
+            PayloadRef::new_partial(777_202, 4096),
+        );
+        new_slice.payload_state = PayloadRefState::Uploaded;
+        let mut new_chunk = RegularFileChunkState::default();
+        new_chunk.insert_slice(new_slice);
+        let new_chunks = std::collections::BTreeMap::from([(ChunkId(0), new_chunk)]);
+
+        let txn = engine.begin_immediate_write_txn().unwrap();
+        RedbMetaEngine::set_inode_overlay_in_txn(&txn, &reused_attr).unwrap();
+        let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
+        let key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
+        overlay.remove(key.as_slice()).unwrap();
+        drop(overlay);
+        RedbMetaEngine::sync_pending_regular_file_recovery_in_txn(&txn, &reused_attr, &new_chunks)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let recoveries = engine.pending_uploaded_regular_file_recoveries().unwrap();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(recoveries[0].attr.crtime, reused_attr.crtime);
+        assert_eq!(recoveries[0].attr.content_epoch, reused_attr.content_epoch);
+        let payload_ids: Vec<_> = recoveries[0]
+            .overlay
+            .chunks
+            .values()
+            .flat_map(|chunk| chunk.slices.values())
+            .filter_map(|slice| slice.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(payload_ids, vec![777_202]);
+
+        assert_eq!(
+            engine.get_referenced_object_ids().unwrap(),
+            std::collections::HashSet::from([777_202])
+        );
+
+        let txn = engine.begin_immediate_write_txn().unwrap();
+        RedbMetaEngine::sync_pending_regular_file_recovery_in_txn(
+            &txn,
+            &reused_attr,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert!(
+            engine
+                .pending_uploaded_regular_file_recoveries()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
