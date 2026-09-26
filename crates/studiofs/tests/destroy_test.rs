@@ -9,8 +9,7 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -298,28 +297,6 @@ fn create_local_metadata(
     meta.set_format_info(&format_info).expect("set format info");
 }
 
-fn mark_redb_repair_required(path: &Path) {
-    const REDB_GOD_BYTE_OFFSET: u64 = 9;
-    const REDB_RECOVERY_REQUIRED: u8 = 2;
-    const REDB_TWO_PHASE_COMMIT: u8 = 4;
-
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .expect("open redb header");
-    file.seek(SeekFrom::Start(REDB_GOD_BYTE_OFFSET))
-        .expect("seek to redb god byte");
-    let mut flags = [0u8; 1];
-    file.read_exact(&mut flags).expect("read redb god byte");
-    flags[0] |= REDB_RECOVERY_REQUIRED;
-    flags[0] &= !REDB_TWO_PHASE_COMMIT;
-    file.seek(SeekFrom::Start(REDB_GOD_BYTE_OFFSET))
-        .expect("seek to redb god byte");
-    file.write_all(&flags).expect("write redb god byte");
-    file.sync_all().expect("sync redb header");
-}
-
 fn create_local_metadata_with_bad_s3_secret(
     meta_dir: &Path,
     name: &str,
@@ -517,7 +494,8 @@ fn destroy_local_only_recovers_unclean_local_state_without_remote_services() {
         &remote_env,
         &Uuid::new_v4().to_string(),
     );
-    mark_redb_repair_required(&meta_dir.join(format!("{name}.db")));
+    studiofs_test_support::mark_redb_repair_required(meta_dir.join(format!("{name}.db")))
+        .expect("mark redb header for recovery");
 
     let output = run_destroy_cmd(home.path(), &name, true, &name);
     let text = output_text(&output);
@@ -557,7 +535,8 @@ fn destroy_local_only_does_not_repair_before_confirmation() {
         &Uuid::new_v4().to_string(),
     );
     let db_path = meta_dir.join(format!("{name}.db"));
-    mark_redb_repair_required(&db_path);
+    studiofs_test_support::mark_redb_repair_required(&db_path)
+        .expect("mark redb header for recovery");
 
     let output = run_destroy_cmd_with_input(home.path(), &name, true, "n\n");
 

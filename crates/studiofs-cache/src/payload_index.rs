@@ -1637,6 +1637,56 @@ mod tests {
     }
 
     #[test]
+    fn cache_index_opens_redb_4_1_database_and_preserves_rows() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-redb-4-1-cache-");
+        let database_path = temp.path().join("cache.redb");
+        let fixture_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redb-4.1-cache-index.redb");
+        studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(
+            |err| panic!("failed to copy fixture {}: {err}", fixture_path.display()),
+        );
+
+        let index = open_index(&database_path);
+        let entry = index.get_entry(41).unwrap().expect("fixture entry");
+        assert_eq!(entry.payload_key, b"payload/41.object");
+        assert_eq!(entry.payload_len, 19);
+        assert_eq!(entry.lifecycle, LocalPayloadLifecycleState::Dirty);
+        assert_eq!(entry.origin, LocalPayloadOrigin::Local);
+        assert_eq!(entry.upload_state, LocalPayloadUploadState::Pending);
+
+        let stats = index.stats().unwrap();
+        assert_eq!(stats.current_bytes, 19);
+        assert_eq!(stats.dirty_bytes, 19);
+        assert_eq!(stats.evictable_bytes, 0);
+        assert_eq!(index.dirty_object_count().unwrap(), 1);
+
+        upsert_uploaded(&index, 42, 50);
+        let updated_stats = index.stats().unwrap();
+        assert_eq!(updated_stats.current_bytes, 69);
+        assert_eq!(updated_stats.dirty_bytes, 19);
+        assert_eq!(updated_stats.evictable_bytes, 50);
+        assert!(index.get_entry(42).unwrap().is_some());
+
+        drop(index);
+
+        let reopened = open_index(&database_path);
+        assert_eq!(reopened.stats().unwrap(), updated_stats);
+        assert_eq!(reopened.dirty_object_count().unwrap(), 1);
+        assert!(
+            reopened.get_entry(41).unwrap().as_ref() == Some(&entry),
+            "reopened entry 41 differs from the fixture row"
+        );
+        let entry_42 = reopened.get_entry(42).unwrap().expect("reopened entry 42");
+        assert_eq!(entry_42.object_id, 42);
+        assert_eq!(entry_42.payload_key, b"payload/42.object");
+        assert_eq!(entry_42.payload_len, 50);
+        assert_eq!(entry_42.lifecycle, LocalPayloadLifecycleState::Uploaded);
+        assert_eq!(entry_42.origin, LocalPayloadOrigin::Downloaded);
+        assert_eq!(entry_42.upload_state, LocalPayloadUploadState::None);
+        assert!(entry_42.evictable);
+    }
+
+    #[test]
     fn accounting_is_exact_across_lifecycle_transitions() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp.path().join("cache.redb");

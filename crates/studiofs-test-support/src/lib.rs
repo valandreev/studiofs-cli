@@ -1,11 +1,52 @@
 //! Shared test helpers for StudioFS workspace crates.
 #![forbid(unsafe_code)]
 
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const TARGET_TEST_DIR: &str = "studiofs-tests";
+const REDB_MAGIC: [u8; 9] = *b"redb\x1a\n\xa9\r\n";
+
+/// Copies a file's contents to a new destination without copying its permissions.
+pub fn copy_file_contents(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> io::Result<u64> {
+    let mut source = std::fs::File::open(source)?;
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    io::copy(&mut source, &mut destination)
+}
+
+/// Marks a cleanly closed redb file as requiring recovery on its next open.
+pub fn mark_redb_repair_required(path: impl AsRef<Path>) -> io::Result<()> {
+    const REDB_GOD_BYTE_OFFSET: u64 = REDB_MAGIC.len() as u64;
+    const REDB_RECOVERY_REQUIRED: u8 = 2;
+    const REDB_TWO_PHASE_COMMIT: u8 = 4;
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut magic = [0; REDB_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    if magic != REDB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "target file does not have a valid redb magic number",
+        ));
+    }
+    file.seek(SeekFrom::Start(REDB_GOD_BYTE_OFFSET))?;
+    let mut flags = [0u8; 1];
+    file.read_exact(&mut flags)?;
+    flags[0] |= REDB_RECOVERY_REQUIRED;
+    flags[0] &= !REDB_TWO_PHASE_COMMIT;
+    file.seek(SeekFrom::Start(REDB_GOD_BYTE_OFFSET))?;
+    file.write_all(&flags)?;
+    file.sync_all()
+}
 
 /// Returns the StudioFS workspace root for helper calls made from this crate.
 #[must_use]
@@ -109,6 +150,49 @@ fn cargo_target_dir(cargo_target_dir: Option<std::ffi::OsString>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_file_contents_keeps_destination_writable_for_read_only_source() {
+        let temp = workspace_target_tempdir("helper-copy-");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::write(&source, b"fixture").unwrap();
+        let original_permissions = std::fs::metadata(&source).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        std::fs::set_permissions(&source, read_only_permissions).unwrap();
+
+        let copy_result = copy_file_contents(&source, &destination);
+        let _ = std::fs::set_permissions(&source, original_permissions);
+        assert_eq!(copy_result.unwrap(), 7);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"fixture");
+
+        let mut copied_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&destination)
+            .unwrap();
+        copied_file.write_all(b"!").unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"fixture!");
+    }
+
+    #[test]
+    fn mark_redb_repair_required_validates_magic_and_sets_recovery_flags() {
+        let temp = workspace_target_tempdir("helper-redb-marker-");
+        let redb_path = temp.path().join("valid.redb");
+        let mut header = REDB_MAGIC.to_vec();
+        header.push(0b101);
+        std::fs::write(&redb_path, header).unwrap();
+
+        mark_redb_repair_required(&redb_path).unwrap();
+        assert_eq!(std::fs::read(&redb_path).unwrap()[9], 0b011);
+
+        let other_path = temp.path().join("other-file");
+        let other_file = b"not a redb database";
+        std::fs::write(&other_path, other_file).unwrap();
+        let error = mark_redb_repair_required(&other_path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&other_path).unwrap(), other_file);
+    }
 
     #[test]
     fn workspace_target_tempdir_creates_dir_under_workspace_target() {
