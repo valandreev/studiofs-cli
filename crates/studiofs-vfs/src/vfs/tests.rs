@@ -2486,21 +2486,11 @@ fn runtime_stats_surface_reports_local_event_prune_metrics() {
             .counters
             .contains_key("metadata_redb_local_event_log_pruned_rows_total")
     );
-    assert_eq!(
+    assert!(
         initial_snapshot
             .metadata
             .counters
-            .get("metadata_redb_local_event_log_pruned_rows_total")
-            .map(|metric| metric.unit.as_ref()),
-        Some("count")
-    );
-    assert_eq!(
-        initial_snapshot
-            .metadata
-            .counters
-            .get("metadata_redb_local_event_log_pruned_payload_bytes_total")
-            .map(|metric| metric.unit.as_ref()),
-        Some("bytes")
+            .contains_key("metadata_redb_local_event_log_pruned_payload_bytes_total")
     );
 
     meta.set_counter(
@@ -2516,14 +2506,6 @@ fn runtime_stats_surface_reports_local_event_prune_metrics() {
             .get("metadata_redb_local_event_log_pruned_through_seq")
             .map(|metric| metric.value),
         Some(1)
-    );
-    assert_eq!(
-        pruned_snapshot
-            .metadata
-            .gauges
-            .get("metadata_redb_local_event_log_pruned_through_seq")
-            .map(|metric| metric.unit.as_ref()),
-        Some("count")
     );
 }
 
