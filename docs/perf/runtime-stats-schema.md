@@ -149,14 +149,19 @@ redb.
 
 Physical file bytes and redb page statistics describe different things: the
 file may contain free or reusable pages, and redb stored bytes are not a count
-of logical StudioFS rows. The redb page gauges are best-effort. redb 4.3 exposes
-them through `WriteTransaction::stats()`, so StudioFS collects them only when
-the existing metadata writer mutex and nonblocking database read lock are
-available. The stats-only transaction is aborted without changing metadata
-rows. This can serialize metadata writes while the page/tree statistics are
-collected; an active stats reader does not take the exclusive database lock
-used by compaction. Page gauges are omitted if either try-lock is busy, while
-event-sequence and physical-size metrics use separate best-effort reads.
+of logical StudioFS rows. The redb page gauges are best-effort and cached; a
+refresh is attempted no more than once every five seconds. redb 4.3 exposes
+them through `WriteTransaction::stats()`, so StudioFS refreshes them only when
+the shared metadata writer mutex and nonblocking database read lock are
+available. If either gate is busy, the previous sample is returned; page gauges
+are omitted until the first successful sample. A concurrent diagnostics read
+may omit page gauges while the cache is being refreshed. The stats-only
+transaction is aborted without changing metadata rows. A refresh can serialize
+metadata writes and durability barriers for the duration of the page/tree scan;
+the cache limits repeat scans, but a single refresh can still delay writers. An
+active stats reader does not take the exclusive database lock used by
+compaction.
+Event-sequence and physical-size metrics use separate best-effort reads.
 
 ## Text Representation
 

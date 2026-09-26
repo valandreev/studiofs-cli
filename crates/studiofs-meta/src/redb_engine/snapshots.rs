@@ -518,7 +518,7 @@ impl RedbMetaEngine {
                 .retain(|name, _| {
                     preserve_local_state
                         || (preserve_event_log
-                            && (name == "nextEventSeq"
+                            && (name == crate::schema::counters::NEXT_EVENT_SEQ
                                 || crate::pg_engine::is_local_pg_snapshot_state_counter(name)))
                         || (enable_remote_namespace_filter
                             && name == crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
@@ -526,7 +526,7 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.counters {
                 if enable_remote_namespace_filter
-                    && (k.as_str() == "nextEventSeq"
+                    && (k.as_str() == crate::schema::counters::NEXT_EVENT_SEQ
                         || preserve_local_state && k.as_str() == counters::NEXT_INODE
                         || crate::pg_engine::is_local_pg_snapshot_state_counter(k))
                 {

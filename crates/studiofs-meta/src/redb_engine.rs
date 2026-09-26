@@ -32,16 +32,50 @@ mod fs_ops;
 
 static VOLATILE_DURABILITY_WARN: Once = Once::new();
 const REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS: u64 = 1_000;
+// ponytail: page scans still block new writes; cache for five seconds and move sampling off-read-path if measured scans remain costly.
+const LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalStorageCompactionStats {
+    attempts: u64,
+    compacted: u64,
+    no_work: u64,
+    skipped_busy: u64,
+    errors: u64,
+    last_result: Option<LocalStorageCompactionResult>,
+    last_error: bool,
+    last_skip_reason: Option<LocalStorageCompactionSkipReason>,
+    last_duration_ns: Option<u64>,
+    last_success_bytes_before: Option<u64>,
+    last_success_bytes_after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalStoragePageStats {
+    allocated_pages: u64,
+    leaf_pages: u64,
+    branch_pages: u64,
+    stored_bytes: u64,
+    metadata_bytes: u64,
+    fragmented_bytes: u64,
+    page_size_bytes: u64,
+}
+
+struct CachedLocalStoragePageStats {
+    sampled_at: Instant,
+    stats: LocalStoragePageStats,
+}
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
     db: Option<Arc<RwLock<Database>>>,
     read_only_db: Option<Arc<ReadOnlyDatabase>>,
     metadata_path: PathBuf,
-    local_storage_compaction: Mutex<LocalStorageDiagnostics>,
+    local_storage_compaction: Mutex<LocalStorageCompactionStats>,
+    local_storage_page_stats: Mutex<Option<CachedLocalStoragePageStats>>,
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
-    write_txn_lock: Mutex<()>,
+    write_txn_lock: Arc<Mutex<()>>,
     invalidation_journal: Mutex<InvalidationJournal>,
     pub(crate) invalidation_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -95,7 +129,7 @@ struct RelaxedDurabilityState {
     #[cfg(test)]
     fail_next_barrier: AtomicBool,
     #[cfg(test)]
-    after_barrier_commit: Mutex<Option<Arc<std::sync::Barrier>>>,
+    after_barrier_commit: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     #[cfg(test)]
     wait_count: AtomicU64,
     #[cfg(test)]
@@ -310,6 +344,7 @@ fn begin_immediate_redb_write_txn(db: &Database) -> MetaResult<WriteTransaction>
 
 fn immediate_metadata_barrier(
     db: &RwLock<Database>,
+    write_txn_lock: &Mutex<()>,
     relaxed_durability: Option<&RelaxedDurabilityState>,
 ) -> MetaResult<()> {
     let pending_was_cleared = relaxed_durability
@@ -325,6 +360,9 @@ fn immediate_metadata_barrier(
             ));
         }
 
+        let _write_txn_guard = write_txn_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("redb write lock poisoned".to_string()))?;
         let db = db
             .read()
             .map_err(|_| MetaError::Storage("redb lock poisoned".to_string()))?;
@@ -344,7 +382,8 @@ fn immediate_metadata_barrier(
                 .ok()
                 .and_then(|mut hook| hook.take())
         }) {
-            barrier.wait();
+            barrier.0.wait();
+            barrier.1.wait();
         }
 
         Ok(())
@@ -396,6 +435,7 @@ fn relaxed_barrier_wait_timeout(state: &RelaxedDurabilityState) -> Duration {
 
 fn start_relaxed_durability_runtime_with_interval(
     db: &Arc<RwLock<Database>>,
+    write_txn_lock: Arc<Mutex<()>>,
     interval: Duration,
 ) -> MetaResult<Arc<RelaxedDurabilityRuntime>> {
     let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
@@ -418,6 +458,7 @@ fn start_relaxed_durability_runtime_with_interval(
         last_wait_timeout_ms: AtomicU64::new(0),
     });
     let worker_state = Arc::clone(&state);
+    let worker_write_txn_lock = Arc::clone(&write_txn_lock);
     let weak_db: Weak<RwLock<Database>> = Arc::downgrade(db);
     let worker = std::thread::Builder::new()
         .name("studiofs-redb-durability".to_string())
@@ -457,7 +498,9 @@ fn start_relaxed_durability_runtime_with_interval(
                 let Some(db) = weak_db.upgrade() else {
                     break;
                 };
-                if let Err(error) = immediate_metadata_barrier(&db, Some(&worker_state)) {
+                if let Err(error) =
+                    immediate_metadata_barrier(&db, &worker_write_txn_lock, Some(&worker_state))
+                {
                     warn!(%error, "periodic redb metadata durability barrier failed");
                 }
             }
@@ -741,8 +784,10 @@ impl RedbMetaEngine {
 
         debug!("opened metadata database at {:?}", path.as_ref());
         let db = Arc::new(RwLock::new(db));
+        let write_txn_lock = Arc::new(Mutex::new(()));
         let relaxed_durability = Some(start_relaxed_durability_runtime_with_interval(
             &db,
+            Arc::clone(&write_txn_lock),
             durability_interval,
         )?);
         VOLATILE_DURABILITY_WARN.call_once(|| {
@@ -756,9 +801,10 @@ impl RedbMetaEngine {
             read_only_db: None,
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
+            local_storage_page_stats: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
-            write_txn_lock: Mutex::new(()),
+            write_txn_lock,
             invalidation_journal: Mutex::default(),
             invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -797,9 +843,10 @@ impl RedbMetaEngine {
             read_only_db: Some(Arc::new(db)),
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
+            local_storage_page_stats: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability: None,
-            write_txn_lock: Mutex::new(()),
+            write_txn_lock: Arc::new(Mutex::new(())),
             invalidation_journal: Mutex::default(),
             invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -846,7 +893,7 @@ impl RedbMetaEngine {
             && relaxed_barrier_due(&runtime.state)
             && let Some(db) = self.db.as_ref()
         {
-            immediate_metadata_barrier(db, Some(&runtime.state))?;
+            immediate_metadata_barrier(db, &self.write_txn_lock, Some(&runtime.state))?;
         }
         Ok(())
     }
@@ -857,6 +904,7 @@ impl RedbMetaEngine {
         };
         immediate_metadata_barrier(
             db,
+            &self.write_txn_lock,
             self.relaxed_durability
                 .as_deref()
                 .map(|runtime| runtime.state.as_ref()),
@@ -908,13 +956,17 @@ impl RedbMetaEngine {
     }
 
     #[cfg(test)]
-    fn pause_after_barrier_commit_for_test(&self, barrier: Arc<std::sync::Barrier>) {
+    fn pause_after_barrier_commit_for_test(
+        &self,
+        reached: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    ) {
         if let Some(runtime) = &self.relaxed_durability {
             *runtime
                 .state
                 .after_barrier_commit
                 .lock()
-                .expect("barrier hook lock") = Some(barrier);
+                .expect("barrier hook lock") = Some((reached, resume));
         }
     }
 }

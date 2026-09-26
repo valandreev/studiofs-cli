@@ -572,7 +572,7 @@ pub enum LocalStorageCompactionSkipReason {
 }
 
 /// Best-effort physical, page, event-log, and compaction diagnostics for local metadata redb.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalStorageDiagnostics {
     /// Physical byte length of the metadata database file.
     pub physical_file_bytes: Option<u64>,

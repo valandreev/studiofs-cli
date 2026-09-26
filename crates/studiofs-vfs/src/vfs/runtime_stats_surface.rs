@@ -851,7 +851,7 @@ impl StudioVfs {
         );
 
         if let Ok(Some(diagnostics)) = self.sync_meta().local_storage_diagnostics() {
-            insert_local_storage_diagnostics(&mut snapshot.metadata, diagnostics);
+            insert_local_storage_diagnostics(&mut snapshot.metadata, &diagnostics);
         }
 
         snapshot
@@ -860,7 +860,7 @@ impl StudioVfs {
 
 fn insert_local_storage_diagnostics(
     section: &mut RuntimeStatsSection,
-    diagnostics: LocalStorageDiagnostics,
+    diagnostics: &LocalStorageDiagnostics,
 ) {
     for (name, unit, value) in [
         (

@@ -95,9 +95,9 @@ Local embedded serving store.
 - foreground source of truth for the mounted client
 - stores local overlay attrs/dentries/symlinks/xattrs, remote-visible base attrs/dentries/symlinks/xattrs, chunk-local regular-file overlay/base graphs, counters, and the local event log
 - regular-file graphs are stored as chunk-local rows in `regular_file_overlay` and `regular_file_base`, keyed by `(ino, chunk_id)`
-- the existing `.studiofs-runtime-stats` / `studiofs perf` surface reports its physical file size, redb page statistics when immediately available, local event-log sequence span, and per-mount compaction outcomes under `metadata_redb_*` metrics
+- the existing `.studiofs-runtime-stats` / `studiofs perf` surface reports its physical file size, cached redb page statistics, local event-log sequence span, and per-mount compaction outcomes under `metadata_redb_*` metrics
 - physical file bytes are separate from redb stored/fragmented bytes; these statistics do not count logical StudioFS rows and do not scan table values
-- page statistics use redb's stats-only write transaction on the explicit runtime-stats read path; this can serialize metadata writes while page/tree metrics are collected, and page metrics are omitted if the writer or database lock is already busy
+- page statistics refresh at most once per five seconds when the shared writer mutex and database read lock are available; the stats-only write transaction can serialize metadata writes and durability barriers for the duration of a refresh. A busy writer/database gate keeps the prior sample; a concurrent diagnostics read can omit page gauges while the cache is being refreshed
 - compaction counters reset when the local engine opens and are not persisted into the database
 
 ### `PgMetaEngine`

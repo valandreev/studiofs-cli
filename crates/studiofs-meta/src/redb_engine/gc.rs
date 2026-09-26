@@ -49,29 +49,26 @@ impl RedbMetaEngine {
             .local_storage_compaction
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        diagnostics.compaction_attempts = diagnostics.compaction_attempts.saturating_add(1);
-        diagnostics.last_compaction_result = result.as_ref().ok().copied();
-        diagnostics.last_compaction_error = result.is_err();
-        diagnostics.last_compaction_skip_reason = skip_reason;
-        diagnostics.last_compaction_duration_ns =
-            Some(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        diagnostics.attempts = diagnostics.attempts.saturating_add(1);
+        diagnostics.last_result = result.as_ref().ok().copied();
+        diagnostics.last_error = result.is_err();
+        diagnostics.last_skip_reason = skip_reason;
+        diagnostics.last_duration_ns = Some(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
 
         match result {
             Ok(LocalStorageCompactionResult::Compacted) => {
-                diagnostics.compaction_compacted =
-                    diagnostics.compaction_compacted.saturating_add(1);
+                diagnostics.compacted = diagnostics.compacted.saturating_add(1);
                 diagnostics.last_success_bytes_before = bytes_before;
                 diagnostics.last_success_bytes_after = bytes_after;
             }
             Ok(LocalStorageCompactionResult::NoWork) => {
-                diagnostics.compaction_no_work = diagnostics.compaction_no_work.saturating_add(1);
+                diagnostics.no_work = diagnostics.no_work.saturating_add(1);
             }
             Ok(LocalStorageCompactionResult::SkippedBusy) => {
-                diagnostics.compaction_skipped_busy =
-                    diagnostics.compaction_skipped_busy.saturating_add(1);
+                diagnostics.skipped_busy = diagnostics.skipped_busy.saturating_add(1);
             }
             Err(_) => {
-                diagnostics.compaction_errors = diagnostics.compaction_errors.saturating_add(1);
+                diagnostics.errors = diagnostics.errors.saturating_add(1);
             }
         }
     }
@@ -87,20 +84,51 @@ impl RedbMetaEngine {
             return;
         };
         let first = first.map(|(seq, _)| seq.value());
-        let next = Self::read_counter_from_read_txn(transaction, "nextEventSeq")
-            .unwrap_or(0)
-            .max(1);
+        let next =
+            Self::read_counter_from_read_txn(transaction, crate::schema::counters::NEXT_EVENT_SEQ)
+                .unwrap_or(0)
+                .max(1);
         diagnostics.first_local_event_seq = first;
         diagnostics.next_local_event_seq = Some(next);
         diagnostics.retained_local_event_span =
             Some(first.map_or(0, |first| next.saturating_sub(first)));
+    }
+
+    fn local_storage_page_stats_best_effort(&self) -> Option<LocalStoragePageStats> {
+        let db = self.db.as_ref()?;
+        let mut cached = self.local_storage_page_stats.try_lock().ok()?;
+        if cached.as_ref().is_none_or(|cached| {
+            cached.sampled_at.elapsed() >= LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL
+        }) && let Ok(_write_txn_guard) = self.write_txn_lock.try_lock()
+            && let Ok(db) = db.try_read()
+            && let Ok(transaction) = db.begin_write()
+        {
+            // redb 4.3 exposes page stats only on WriteTransaction; reuse this scan for five seconds.
+            let stats = transaction.stats().ok().map(|stats| LocalStoragePageStats {
+                allocated_pages: stats.allocated_pages(),
+                leaf_pages: stats.leaf_pages(),
+                branch_pages: stats.branch_pages(),
+                stored_bytes: stats.stored_bytes(),
+                metadata_bytes: stats.metadata_bytes(),
+                fragmented_bytes: stats.fragmented_bytes(),
+                page_size_bytes: u64::try_from(stats.page_size()).unwrap_or(u64::MAX),
+            });
+            let _ = transaction.abort();
+            if let Some(stats) = stats {
+                *cached = Some(CachedLocalStoragePageStats {
+                    sampled_at: Instant::now(),
+                    stats,
+                });
+            }
+        }
+        cached.as_ref().map(|cached| cached.stats)
     }
 }
 
 impl MetaGc for RedbMetaEngine {
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         let started = std::time::Instant::now();
-        let bytes_before = self.physical_file_size_bytes();
+        let mut bytes_before = None;
         let mut skip_reason = None;
         let result = (|| {
             let Some(db) = self.db.as_ref() else {
@@ -116,6 +144,7 @@ impl MetaGc for RedbMetaEngine {
                     return Err(MetaError::Storage("redb lock poisoned".to_string()));
                 }
             };
+            bytes_before = self.physical_file_size_bytes();
             match db.compact() {
                 Ok(true) => Ok(LocalStorageCompactionResult::Compacted),
                 Ok(false) => Ok(LocalStorageCompactionResult::NoWork),
@@ -133,6 +162,12 @@ impl MetaGc for RedbMetaEngine {
         let bytes_after = matches!(&result, Ok(LocalStorageCompactionResult::Compacted))
             .then(|| self.physical_file_size_bytes())
             .flatten();
+        if matches!(&result, Ok(LocalStorageCompactionResult::Compacted)) {
+            *self
+                .local_storage_page_stats
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+        }
         self.record_local_storage_compaction(
             &result,
             skip_reason,
@@ -144,42 +179,47 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn local_storage_diagnostics(&self) -> MetaResult<Option<LocalStorageDiagnostics>> {
-        let mut diagnostics = *self
+        let compaction = *self
             .local_storage_compaction
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let mut diagnostics = LocalStorageDiagnostics {
+            compaction_attempts: compaction.attempts,
+            compaction_compacted: compaction.compacted,
+            compaction_no_work: compaction.no_work,
+            compaction_skipped_busy: compaction.skipped_busy,
+            compaction_errors: compaction.errors,
+            last_compaction_result: compaction.last_result,
+            last_compaction_error: compaction.last_error,
+            last_compaction_skip_reason: compaction.last_skip_reason,
+            last_compaction_duration_ns: compaction.last_duration_ns,
+            last_success_bytes_before: compaction.last_success_bytes_before,
+            last_success_bytes_after: compaction.last_success_bytes_after,
+            ..LocalStorageDiagnostics::default()
+        };
         diagnostics.physical_file_bytes = self.physical_file_size_bytes();
 
-        let read_transaction = if let Some(db) = self.db.as_ref() {
-            db.try_read().ok().and_then(|db| db.begin_read().ok())
-        } else {
-            self.read_only_db
-                .as_ref()
-                .and_then(|db| db.begin_read().ok())
-        };
-        if let Some(transaction) = read_transaction {
-            Self::read_event_log_diagnostics(&transaction, &mut diagnostics);
+        {
+            let read_transaction = if let Some(db) = self.db.as_ref() {
+                db.try_read().ok().and_then(|db| db.begin_read().ok())
+            } else {
+                self.read_only_db
+                    .as_ref()
+                    .and_then(|db| db.begin_read().ok())
+            };
+            if let Some(transaction) = read_transaction {
+                Self::read_event_log_diagnostics(&transaction, &mut diagnostics);
+            }
         }
 
-        // redb 4.3 exposes page statistics on WriteTransaction. Acquire the
-        // existing writer mutex and database read lock without waiting, then
-        // abort the stats-only transaction. This does not take compaction's
-        // exclusive database lock; omit page metrics when either gate is busy.
-        if let (Some(db), Ok(_write_txn_guard)) = (self.db.as_ref(), self.write_txn_lock.try_lock())
-            && let Ok(db) = db.try_read()
-            && let Ok(transaction) = db.begin_write()
-        {
-            if let Ok(stats) = transaction.stats() {
-                diagnostics.allocated_pages = Some(stats.allocated_pages());
-                diagnostics.leaf_pages = Some(stats.leaf_pages());
-                diagnostics.branch_pages = Some(stats.branch_pages());
-                diagnostics.stored_bytes = Some(stats.stored_bytes());
-                diagnostics.metadata_bytes = Some(stats.metadata_bytes());
-                diagnostics.fragmented_bytes = Some(stats.fragmented_bytes());
-                diagnostics.page_size_bytes =
-                    Some(u64::try_from(stats.page_size()).unwrap_or(u64::MAX));
-            }
-            let _ = transaction.abort();
+        if let Some(stats) = self.local_storage_page_stats_best_effort() {
+            diagnostics.allocated_pages = Some(stats.allocated_pages);
+            diagnostics.leaf_pages = Some(stats.leaf_pages);
+            diagnostics.branch_pages = Some(stats.branch_pages);
+            diagnostics.stored_bytes = Some(stats.stored_bytes);
+            diagnostics.metadata_bytes = Some(stats.metadata_bytes);
+            diagnostics.fragmented_bytes = Some(stats.fragmented_bytes);
+            diagnostics.page_size_bytes = Some(stats.page_size_bytes);
         }
 
         Ok(Some(diagnostics))

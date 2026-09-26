@@ -9,6 +9,16 @@ use crate::events::MetaEvent;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+fn expire_local_storage_page_stats(engine: &RedbMetaEngine) {
+    engine
+        .local_storage_page_stats
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .sampled_at = Instant::now() - LOCAL_STORAGE_PAGE_STATS_REFRESH_INTERVAL;
+}
+
 #[test]
 fn coherence_journal_directory_rename_and_removal_retain_descendant_paths() {
     use crate::coherence::InvalidationIntent;
@@ -723,22 +733,48 @@ fn sync_local_metadata_propagates_barrier_failure_and_keeps_pending_state() {
 }
 
 #[test]
-fn relaxed_barrier_preserves_write_committed_during_barrier() {
+fn relaxed_barrier_preserves_pending_for_writes_after_barrier() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let engine = Arc::new(RedbMetaEngine::open_relaxed_for_test(
         dir.path().join("meta.redb"),
     ));
     engine.set_counter("before-barrier", 1).unwrap();
-    let barrier = Arc::new(Barrier::new(2));
-    engine.pause_after_barrier_commit_for_test(Arc::clone(&barrier));
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    engine.pause_after_barrier_commit_for_test(Arc::clone(&reached), Arc::clone(&resume));
 
     let sync_engine = Arc::clone(&engine);
     let sync = thread::spawn(move || sync_engine.sync_local_metadata());
-    barrier.wait();
-    engine.set_counter("during-barrier", 2).unwrap();
+    reached.wait();
+    resume.wait();
     sync.join().unwrap().unwrap();
+    engine.set_counter("after-barrier", 2).unwrap();
 
     assert!(engine.relaxed_pending_for_test());
+}
+
+#[test]
+fn local_storage_diagnostics_does_not_collect_page_stats_during_barrier() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = Arc::new(RedbMetaEngine::open_relaxed_for_test(
+        dir.path().join("meta.redb"),
+    ));
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    engine.pause_after_barrier_commit_for_test(Arc::clone(&reached), Arc::clone(&resume));
+
+    let sync_engine = Arc::clone(&engine);
+    let sync = thread::spawn(move || sync_engine.sync_local_metadata());
+    reached.wait();
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    resume.wait();
+    sync.join().unwrap().unwrap();
+
+    assert!(diagnostics.physical_file_bytes.is_some());
+    assert!(diagnostics.allocated_pages.is_none());
 }
 
 #[test]
@@ -777,6 +813,77 @@ fn local_storage_compaction_records_active_transaction_skip_reason() {
         Some(LocalStorageCompactionSkipReason::ActiveTransaction)
     );
     assert!(diagnostics.last_compaction_duration_ns.is_some());
+}
+
+#[test]
+fn local_storage_compaction_records_database_lock_contention_reason() {
+    let engine = temp_engine();
+    {
+        let _database_lock = engine.db.as_ref().unwrap().write().unwrap();
+        assert_eq!(
+            engine.compact_local_storage().unwrap(),
+            LocalStorageCompactionResult::SkippedBusy
+        );
+    }
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.compaction_skipped_busy, 1);
+    assert_eq!(
+        diagnostics.last_compaction_skip_reason,
+        Some(LocalStorageCompactionSkipReason::DatabaseLockContended)
+    );
+}
+
+#[test]
+fn local_storage_diagnostics_omits_page_stats_when_writer_lock_is_busy() {
+    let engine = temp_engine();
+    let _writer_lock = engine.write_txn_lock.lock().unwrap();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(diagnostics.physical_file_bytes.is_some());
+    assert_eq!(diagnostics.allocated_pages, None);
+}
+
+#[test]
+fn local_storage_diagnostics_reuses_page_stats_when_writer_lock_is_busy() {
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(initial.allocated_pages.is_some());
+    let _writer_lock = engine.write_txn_lock.lock().unwrap();
+
+    let cached = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(cached.allocated_pages, initial.allocated_pages);
+}
+
+#[test]
+fn local_storage_compaction_errors_are_counted() {
+    let engine = temp_engine();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _database_lock = engine.db.as_ref().unwrap().write().unwrap();
+        panic!("poison database lock for compaction error coverage");
+    }));
+    assert!(poisoned.is_err());
+
+    assert!(engine.compact_local_storage().is_err());
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.compaction_attempts, 1);
+    assert_eq!(diagnostics.compaction_errors, 1);
+    assert!(diagnostics.last_compaction_error);
 }
 
 #[test]
@@ -820,6 +927,7 @@ fn local_storage_diagnostics_track_delete_and_compaction() {
         }
     }
     write.commit().unwrap();
+    expire_local_storage_page_stats(&engine);
 
     let before_delete = engine
         .local_storage_diagnostics()
@@ -847,6 +955,7 @@ fn local_storage_diagnostics_track_delete_and_compaction() {
         }
     }
     delete.commit().unwrap();
+    expire_local_storage_page_stats(&engine);
 
     let after_delete = engine
         .local_storage_diagnostics()
