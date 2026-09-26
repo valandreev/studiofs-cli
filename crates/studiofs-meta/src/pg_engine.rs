@@ -153,6 +153,7 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
         name,
         LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER
             | crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ
+            | crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION
             | LOCAL_PG_CLIENT_SLOT_COUNTER
             | LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER
             | LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER

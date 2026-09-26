@@ -95,10 +95,10 @@ Local embedded serving store.
 - foreground source of truth for the mounted client
 - stores local overlay attrs/dentries/symlinks/xattrs, remote-visible base attrs/dentries/symlinks/xattrs, chunk-local regular-file overlay/base graphs, counters, and the local event log
 - regular-file graphs are stored as chunk-local rows in `regular_file_overlay` and `regular_file_base`, keyed by `(ino, chunk_id)`
-- the existing `.studiofs-runtime-stats` / `studiofs perf` surface reports its logical file length, cached redb page statistics, local event-log sequence span, and per-mount compaction outcomes under `metadata_redb_*` metrics
+- the existing `.studiofs-runtime-stats` / `studiofs perf` surface reports its logical file length, cached redb page statistics, local event-log sequence span and pruning progress, and per-mount compaction outcomes under `metadata_redb_*` metrics
 - `metadata_redb_physical_file_bytes` reports the logical file length from `std::fs::metadata().len()`, not filesystem-allocated disk blocks; it is separate from redb stored/fragmented bytes, which do not count logical StudioFS rows or scan table values
 - successful page-stat samples are reused for five seconds; after that, diagnostics reads attempt a refresh through nonblocking writer/database gates. The stats-only write transaction can serialize metadata writes and durability barriers for the duration of a refresh. A busy gate or concurrent refresh returns the last sample, even if stale; page gauges are omitted until the first successful sample. Read-only snapshot mounts omit page gauges because redb 4.3 exposes them only through a write transaction
-- compaction counters reset when the local engine opens and are not persisted into the database
+- compaction counters and local prune totals/last-attempt values reset when the local engine opens; the inclusive local prune frontier is persisted in the redb counter table
 
 ### `PgMetaEngine`
 

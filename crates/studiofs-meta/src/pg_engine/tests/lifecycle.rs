@@ -4242,6 +4242,45 @@ fn startup_snapshot_replaces_acknowledged_local_overlay() {
 }
 
 #[test]
+fn replacing_local_state_resets_the_in_memory_prune_cursor() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let checkpoint = pg
+        .local
+        .begin_serving_checkpoint_snapshot()
+        .expect("capture replacement checkpoint")
+        .export_serving_checkpoint()
+        .expect("export replacement checkpoint");
+    for name in [b"old-a".as_slice(), b"old-b", b"old-c"] {
+        pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create acknowledged local directory");
+    }
+    let old_cursor = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .unwrap();
+    pg.persist_flushed_event_seq(old_cursor)
+        .expect("acknowledge old local events");
+
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::ReplaceLocalState,
+        &checkpoint,
+        0,
+    )
+    .expect("replace local serving state");
+    pg.create_dir(ROOT_INO, b"new-unflushed", 0, 0, 0o755)
+        .expect("create unflushed event after replacement");
+
+    pg.prune_local_event_log_once()
+        .expect("prune acknowledged events after replacement");
+
+    assert_eq!(
+        pg.local.first_event_seq().unwrap(),
+        Some(1),
+        "the live cursor must reset with the replaced event log so new events are not pruned"
+    );
+}
+
+#[test]
 fn startup_snapshot_replay_starts_from_snapshot_epoch_not_pg_head() {
     assert_eq!(
         PgMetaEngine::snapshot_replay_start_version(3, 9),

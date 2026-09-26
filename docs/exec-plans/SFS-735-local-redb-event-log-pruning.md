@@ -17,6 +17,8 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
 - [x] (2026-09-26) Run focused metadata and runtime-diagnostics tests, crate checks, Clippy, formatting, and diff checks.
 - [x] (2026-09-27) Verify the SFS-735 review feedback; fix lock scope, poll backlog draining, idle-range telemetry, zero-floor diagnostics, and the floor-one write-transaction fast path.
 - [x] (2026-09-27) Run focused review-follow-up tests and the required metadata/VFS validation gates.
+- [x] (2026-09-27) Resolve the second inline review: preserve foreign-apply authority through pruning, reset the cursor after journal replacement, skip busy writers, verify restart replay, and correct diagnostics/documentation.
+- [x] (2026-09-27) Reject legacy positive-floor databases and local snapshots that lack proof the dentry authority summary covered the removed prefix; run focused regressions and metadata/VFS validation gates.
 
 ## Surprises & Discoveries
 
@@ -30,6 +32,14 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
   Evidence: `local_event_pruning_removes_sparse_acknowledged_rows_across_batches` covers sparse keys over two bounded batches; `local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres` checks the cursor boundary.
 - Observation: Snapshot replacement has two event-journal contracts. Imports that preserve the local journal must retain its prune floor; full remote replacement clears the journal and resets local sequence state, so it must reset the old floor too.
   Evidence: `import_remote_snapshot_preserving_local_event_log_replaces_serving_state` and `import_remote_snapshot_drops_legacy_local_pg_state`.
+- Observation: When a stored watermark is ahead of stale event rows, a bounded prune batch previously wrote the last removed key and regressed that watermark.
+  Evidence: `local_event_pruning_never_moves_persisted_floor_backwards` failed with stored `50` becoming `10` before the monotonic update and passes afterward.
+- Observation: Foreign serving rename derives local unlink authority by reducing the local event log. Removing its acknowledged prefix without retaining the reducer state can recreate a locally unlinked destination.
+  Evidence: `replica_serving_rename_does_not_resurrect_locally_unlinked_destination` fails after the prefix is pruned and the foreign rename is applied.
+- Observation: A full serving-checkpoint replacement restarts the local event sequence allocator, but the live `flushed_event_seq` previously retained its old value.
+  Evidence: `replacing_local_state_resets_the_in_memory_prune_cursor` failed before the cursor reset because the new unflushed event at sequence 1 was removed.
+- Observation: Databases pruned by an earlier build of this branch have irrecoverably lost any namespace events in that prefix, so creating an empty summary during upgrade would silently authorize a foreign rename to restore an unlinked name.
+  Evidence: `foreign_rename_rejects_legacy_pruned_log_without_dentry_baseline`, `local_event_pruning_rejects_legacy_floor_without_dentry_baseline`, and `local_snapshot_rejects_legacy_pruned_log_without_dentry_baseline` all failed before the coverage guard and pass after it.
 
 ## Decision Log
 
@@ -42,6 +52,10 @@ PostgreSQL `event_log` retention is a separate feature and must not change here.
 - Decision: Preserve the last non-empty successful batch range through idle or failed passes, and report no prune watermark until the stored inclusive sequence is greater than zero. Rationale: an empty first pass is not a removed range, and sequence zero means no event was pruned. Date/Author: 2026-09-27, Codex.
 - Decision: Keep `exclusive_floor` as a hard deletion ceiling and return an empty batch when the persisted prune watermark already covers it. Rationale: the batch helper must not widen its caller's authorization boundary; supported snapshot import paths preserve the event log and local watermark together or replace both. Date/Author: 2026-09-27, Codex.
 - Decision: Reuse the current first event sequence through the prune loop and keep the 256-row batch limit internal. Rationale: carrying the peeked key removes duplicate B-tree reads without adding configuration or changing bounded work. Date/Author: 2026-09-27, Codex.
+- Decision: Treat the persisted inclusive prune floor as an acknowledged-through frontier, including sequence gaps that never had a row, and keep it monotonic. Rationale: the durable exclusive cursor already authorizes every sequence below it; setting the floor only to the last physically removed row would lose progress over empty or sparse prefixes. Date/Author: 2026-09-27, Codex.
+- Decision: Skip a background prune batch when the redb writer is busy. Rationale: mounting writes and durability barriers should not queue behind local maintenance when the writer is already occupied. Date/Author: 2026-09-27, Codex.
+- Decision: Fold pruned namespace events into a durable per-dentry `Created`/`Removed` summary in the same transaction as deletion; let foreign serving reconciliation start its reducer from that summary. Rationale: foreign rename must retain acknowledged local unlink authority even after event rows are removed. `Created` is needed so a later `RemoveEntry` cancels a locally created name instead of hiding an unrelated peer rename. Date/Author: 2026-09-27, Codex.
+- Decision: Record a versioned coverage counter with the first summary-backed prune and preserve or clear it together with the local journal. Reject positive-floor state without that counter before foreign reconciliation, further pruning, or local snapshot import. Rationale: a missing table or empty summary alone cannot distinguish a valid namespace-free prefix from history already deleted by an earlier build. Date/Author: 2026-09-27, Codex.
 
 ## Outcomes & Retrospective
 
@@ -79,9 +93,24 @@ Validation passed:
 - `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings` — passed.
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
 
+The second inline review added an atomic dentry authority summary for pruned events, a coverage guard for pre-summary pruned state, a nonblocking redb writer admission check, a cursor reset after full journal replacement, and direct restart/reconciliation regressions. The inclusive floor remains an acknowledged-through frontier: it may cross sequence gaps with no stored rows, and it cannot move backwards.
+
+Validation passed:
+
+- `cargo test -p studiofs-meta --lib prun` — 28 passed, 4 PostgreSQL-gated ignored.
+- `cargo test -p studiofs-meta --lib replica_serving_rename` — 7 passed, including rename after prune and redb reopen and local create-then-remove across one-row prune batches.
+- `cargo test -p studiofs-meta --lib remote_snapshot_modes_do_not_replace_local_dentry_baseline` — 1 passed.
+- `cargo test -p studiofs-vfs --lib runtime_stats_surface_reports_local_event_prune_metrics` — 1 passed.
+- `cargo test -p studiofs-vfs --lib local_event_prune_runtime_stats_use_documented_units` — 1 passed.
+- `cargo check -p studiofs-meta -p studiofs-vfs`, `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` — passed.
+
+Already-pruned local history from a build without the summary cannot be reconstructed; the coverage guard returns a recovery error instead of silently losing local unlink authority. PostgreSQL integration and mounted FUSE/WinFSP runs were not executed for this local-storage review.
+
 ## Context and Orientation
 
 `RedbMetaEngine` owns `EVENT_LOG_TABLE` and allocates monotonically increasing sequence keys. `PgMetaEngine` owns the durable `LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER`, which records the first sequence not yet acknowledged as complete. The local repair state added by SFS-734 lives outside the event journal, so acknowledged journal history is no longer needed for that recovery path.
+
+The foreign serving-rename path also reduces local namespace events to decide whether a destination remains locally removed. Its durable `Created`/`Removed` summary must cover the pruned prefix before replaying retained events.
 
 The metadata crate already computes `first_local_event_seq`, `next_local_event_seq`, and `retained_local_event_span` without scanning event values. Its `LocalStorageDiagnostics` then flows through `studiofs-vfs` to the runtime stats file. Add pruning measurements to this path rather than adding a new telemetry surface.
 

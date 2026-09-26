@@ -707,6 +707,24 @@ impl RedbMetaEngine {
             .write_txn_lock
             .lock()
             .map_err(|_| MetaError::Storage("redb write lock poisoned".to_string()))?;
+        self.begin_write_txn_with_guard(write_txn_guard)
+    }
+
+    fn try_begin_write_txn(&self) -> MetaResult<Option<RedbWriteTransaction<'_>>> {
+        let write_txn_guard = match self.write_txn_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(MetaError::Storage("redb write lock poisoned".to_string()));
+            }
+        };
+        self.begin_write_txn_with_guard(write_txn_guard).map(Some)
+    }
+
+    fn begin_write_txn_with_guard<'a>(
+        &'a self,
+        write_txn_guard: MutexGuard<'a, ()>,
+    ) -> MetaResult<RedbWriteTransaction<'a>> {
         let db = self.db.as_ref().ok_or_else(|| MetaError::AccessDenied {
             ino: ROOT_INO,
             principal: "snapshot-read-only".to_string(),

@@ -1,4 +1,231 @@
 #[test]
+fn pruning_invalid_event_keeps_event_rows_and_floor_unchanged() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("metadata.redb");
+    let engine = RedbMetaEngine::open(&path).expect("open redb metadata");
+    {
+        let txn = engine
+            .begin_write_txn()
+            .expect("begin event setup transaction");
+        {
+            let mut events = txn.open_table(EVENT_LOG_TABLE).expect("open event log");
+            let valid_prefix =
+                crate::events::encode_event(&crate::events::MetaEvent::RemoveEntry {
+                    parent: ROOT_INO,
+                    name: b"locally-removed".to_vec(),
+                })
+                .expect("encode valid reducer event");
+            events
+                .insert(1, valid_prefix.as_slice())
+                .expect("insert valid event before malformed event");
+            events
+                .insert(2, b"malformed-event".as_slice())
+                .expect("insert malformed event");
+        }
+        {
+            let mut counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
+            counters
+                .insert(crate::schema::counters::NEXT_EVENT_SEQ, 3)
+                .expect("set next event sequence");
+        }
+        txn.commit().expect("commit event setup");
+    }
+
+    let error = engine
+        .prune_local_event_log_before(3, 2)
+        .expect_err("malformed events must stop pruning");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown legacy MetaEvent ordinal"),
+        "unexpected error: {error}"
+    );
+
+    let txn = engine.begin_read_txn().expect("read after failed prune");
+    let events = txn.open_table(EVENT_LOG_TABLE).expect("open event log");
+    let sequences: Vec<_> = events
+        .iter()
+        .expect("iterate retained events")
+        .map(|row| row.expect("read event row").0.value())
+        .collect();
+    assert_eq!(
+        sequences,
+        vec![1, 2],
+        "failed pruning must retain every row"
+    );
+    drop(events);
+    drop(txn);
+    assert_eq!(
+        engine
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .expect("read prune floor"),
+        0,
+        "failed pruning must not advance the floor"
+    );
+    assert!(
+        engine
+            .export_snapshot()
+            .expect("export unchanged reducer state")
+            .local_dentry_mutations
+            .is_empty(),
+        "failed pruning must not persist a partial reducer state"
+    );
+}
+
+#[test]
+fn pruned_local_dentry_mutation_survives_redb_reopen() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("metadata.redb");
+    let key = encode_dentry_key(ROOT_INO, b"locally-removed");
+    {
+        let engine = RedbMetaEngine::open(&path).expect("open redb metadata");
+        let txn = engine
+            .begin_write_txn()
+            .expect("begin event setup transaction");
+        {
+            let mut events = txn.open_table(EVENT_LOG_TABLE).expect("open event log");
+            let event = crate::events::encode_event(&crate::events::MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"locally-removed".to_vec(),
+            })
+            .expect("encode remove event");
+            events
+                .insert(1, event.as_slice())
+                .expect("insert remove event");
+        }
+        {
+            let mut counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
+            counters
+                .insert(crate::schema::counters::NEXT_EVENT_SEQ, 2)
+                .expect("set next event sequence");
+        }
+        txn.commit().expect("commit event setup");
+
+        let batch = engine
+            .prune_local_event_log_before(2, 1)
+            .expect("prune acknowledged remove event");
+        assert_eq!(batch.rows, 1);
+        assert_eq!(
+            engine
+                .export_snapshot()
+                .expect("export local reducer state")
+                .local_dentry_mutations,
+            vec![(key.clone(), LocalDentryMutation::Removed as u8)]
+        );
+    }
+
+    let reopened = RedbMetaEngine::open(&path).expect("reopen redb metadata");
+    assert_eq!(
+        reopened
+            .export_snapshot()
+            .expect("export reopened reducer state")
+            .local_dentry_mutations,
+        vec![(key, LocalDentryMutation::Removed as u8)]
+    );
+}
+
+#[test]
+fn local_snapshot_rejects_legacy_pruned_log_without_dentry_baseline() {
+    let engine = temp_engine();
+    let mut snapshot = engine.export_snapshot().unwrap();
+    snapshot.counters.push((
+        crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ.to_string(),
+        1,
+    ));
+
+    assert!(matches!(engine.import_snapshot(&snapshot), Err(MetaError::Storage(_))));
+    snapshot.counters.push((
+        crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION.to_string(),
+        1,
+    ));
+    engine
+        .import_snapshot(&snapshot)
+        .expect("an empty but covered dentry baseline is valid");
+}
+
+#[test]
+fn remote_snapshot_modes_do_not_replace_local_dentry_baseline() {
+    let local_key = encode_dentry_key(ROOT_INO, b"local-authority");
+    let remote_key = encode_dentry_key(ROOT_INO, b"remote-authority");
+    let marker = crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION;
+    let local_snapshot = RedbSnapshot {
+        counters: vec![
+            (
+                crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ.to_string(),
+                1,
+            ),
+            (marker.to_string(), 1),
+        ],
+        local_dentry_mutations: vec![(local_key.clone(), LocalDentryMutation::Removed as u8)],
+        ..RedbSnapshot::default()
+    };
+    let remote_snapshot = RedbSnapshot {
+        counters: vec![(marker.to_string(), 99)],
+        local_dentry_mutations: vec![(remote_key, LocalDentryMutation::Removed as u8)],
+        ..RedbSnapshot::default()
+    };
+
+    let local = temp_engine();
+    local
+        .import_snapshot(&local_snapshot)
+        .expect("import local reducer baseline");
+    assert!(
+        local
+            .export_remote_snapshot()
+            .expect("export remote snapshot")
+            .local_dentry_mutations
+            .is_empty(),
+        "remote snapshots must not publish a local reducer baseline"
+    );
+    assert_eq!(
+        local
+            .export_remote_snapshot()
+            .unwrap()
+            .counters
+            .iter()
+            .find(|(name, _)| name == marker),
+        None,
+        "remote snapshots must not publish local baseline coverage"
+    );
+
+    local
+        .import_remote_snapshot_preserving_local_state(&remote_snapshot)
+        .expect("preserve local state while importing remote snapshot");
+    assert_eq!(
+        local
+            .export_snapshot()
+            .expect("export preserved local baseline")
+            .local_dentry_mutations,
+        local_snapshot.local_dentry_mutations
+    );
+    assert_eq!(local.get_counter(marker).unwrap(), 1);
+    local
+        .import_remote_snapshot_preserving_local_event_log(&remote_snapshot)
+        .expect("preserve local baseline with event log");
+    assert_eq!(
+        local
+            .export_snapshot()
+            .expect("export baseline preserved with event log")
+            .local_dentry_mutations,
+        local_snapshot.local_dentry_mutations
+    );
+    assert_eq!(local.get_counter(marker).unwrap(), 1);
+
+    local
+        .import_remote_snapshot(&remote_snapshot)
+        .expect("replace local state from remote snapshot");
+    assert!(
+        local
+            .export_snapshot()
+            .expect("export remote replacement state")
+            .local_dentry_mutations
+            .is_empty(),
+        "remote replacement must clear local reducer baseline"
+    );
+    assert_eq!(local.get_counter(marker).unwrap(), 0);
+}
+
+#[test]
 fn serving_checkpoint_read_snapshot_exports_only_the_captured_state() {
     let engine = temp_engine();
     for name in [b"checkpoint-before-a".as_slice(), b"checkpoint-before-b"] {
@@ -963,6 +1190,7 @@ fn test_redb_snapshot_defaults_missing_regular_file_fields() {
     let snapshot: RedbSnapshot = serde_json::from_slice(snapshot_json.as_bytes()).unwrap();
     assert!(snapshot.regular_file_overlay.is_empty());
     assert!(snapshot.regular_file_base.is_empty());
+    assert!(snapshot.local_dentry_mutations.is_empty());
 }
 
 #[test]

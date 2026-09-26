@@ -45,14 +45,31 @@ impl RedbMetaEngine {
             }
             let pruned_through =
                 self.get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)?;
+            if pruned_through > 0 {
+                let baseline_version = self
+                    .get_counter(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION)?;
+                Self::ensure_pruned_dentry_baseline(pruned_through, Some(baseline_version))?;
+            }
             if exclusive_floor.saturating_sub(1) <= pruned_through {
                 return Ok(LocalEventLogPruneBatch::default());
             }
 
-            let txn = self.begin_write_txn()?;
-            let batch = Self::prune_local_event_log_batch_in_txn(&txn, exclusive_floor, max_rows)?;
+            let Some(txn) = self.try_begin_write_txn()? else {
+                return Ok(LocalEventLogPruneBatch::default());
+            };
+            let batch =
+                match Self::prune_local_event_log_batch_in_txn(&txn, exclusive_floor, max_rows) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let _ = txn.abort();
+                        return Err(error);
+                    }
+                };
             if batch.rows > 0 || batch.floor_updated {
                 txn.commit()
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+            } else {
+                txn.abort()
                     .map_err(|error| MetaError::Storage(error.to_string()))?;
             }
             Ok(batch)
@@ -78,6 +95,11 @@ impl RedbMetaEngine {
             .get(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
             .map_err(|error| MetaError::Storage(error.to_string()))?
             .map(|value| value.value());
+        let baseline_version = counters
+            .get(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|value| value.value());
+        Self::ensure_pruned_dentry_baseline(persisted_floor.unwrap_or(0), baseline_version)?;
         if exclusive_floor <= persisted_floor.unwrap_or(0).saturating_add(1) {
             return Ok(batch);
         }
@@ -85,6 +107,10 @@ impl RedbMetaEngine {
         let mut events = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let mut baseline = txn
+            .open_table(LOCAL_DENTRY_MUTATIONS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let mut reducer = super::replication::LocalDentryMutationReducer::default();
         let mut next_seq = events
             .first()
             .map_err(|error| MetaError::Storage(error.to_string()))?
@@ -108,15 +134,16 @@ impl RedbMetaEngine {
                 break;
             }
 
-            let Some((removed_seq, payload)) = events
+            let (removed_seq, payload) = events
                 .pop_first()
                 .map_err(|error| MetaError::Storage(error.to_string()))?
-            else {
-                next_seq = None;
-                break;
-            };
+                .ok_or_else(|| {
+                    MetaError::Storage("event log first row disappeared during pruning".to_string())
+                })?;
             let removed_seq_value = removed_seq.value();
             let payload_bytes = payload.value().len();
+            let event = crate::events::decode_event(payload.value())?;
+            reducer.apply_to_table(&baseline, &event)?;
             drop(removed_seq);
             drop(payload);
             batch.first_seq.get_or_insert(removed_seq_value);
@@ -125,8 +152,10 @@ impl RedbMetaEngine {
             batch.payload_bytes = batch
                 .payload_bytes
                 .saturating_add(u64::try_from(payload_bytes).unwrap_or(u64::MAX));
-            pruned_through = removed_seq_value;
-            batch.floor_updated = true;
+            if removed_seq_value > pruned_through {
+                pruned_through = removed_seq_value;
+                batch.floor_updated = true;
+            }
             next_seq = events
                 .first()
                 .map_err(|error| MetaError::Storage(error.to_string()))?
@@ -141,11 +170,21 @@ impl RedbMetaEngine {
             }
         }
 
+        reducer.persist_touched(&mut baseline)?;
+
         if batch.floor_updated {
             counters
                 .insert(
                     crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
                     pruned_through,
+                )
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+        }
+        if (batch.rows > 0 || batch.floor_updated) && baseline_version.is_none() {
+            counters
+                .insert(
+                    crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION,
+                    1,
                 )
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
         }

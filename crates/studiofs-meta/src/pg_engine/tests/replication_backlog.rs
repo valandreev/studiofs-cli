@@ -111,6 +111,62 @@ fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() 
 }
 
 #[test]
+fn pruned_acknowledged_prefix_reopens_with_unacknowledged_journal_suffix() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    for name in [b"acknowledged-a".as_slice(), b"acknowledged-b"] {
+        pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create acknowledged directory");
+    }
+    let suffix_start = pg.local.get_counter("nextEventSeq").unwrap();
+    pg.persist_flushed_event_seq(suffix_start)
+        .expect("persist acknowledged prefix cursor");
+    pg.create_dir(ROOT_INO, b"unacknowledged", 0, 0, 0o755)
+        .expect("create unacknowledged suffix");
+    let suffix_end = pg.local.get_counter("nextEventSeq").unwrap();
+    let expected_suffix = pg
+        .local
+        .read_events_range(suffix_start, suffix_end)
+        .expect("read unacknowledged suffix before prune");
+    assert!(!expected_suffix.is_empty());
+
+    let pruned = pg
+        .prune_local_event_log_once()
+        .expect("prune acknowledged prefix");
+    assert!(pruned.rows > 0);
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(suffix_start));
+    drop(pg);
+
+    let reopened = PgMetaEngine::open_with_options(
+        dir.path().join("meta.redb"),
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("reopen local metadata without PostgreSQL");
+    let cursor = reopened.flushed_event_seq.load(Ordering::SeqCst);
+    assert_eq!(cursor, suffix_start);
+    let restored_suffix = reopened
+        .local
+        .read_events_range(cursor, suffix_end)
+        .expect("read retained suffix after reopen");
+    assert_eq!(restored_suffix, expected_suffix);
+
+    {
+        let mut state = reopened.pending_state.lock().unwrap();
+        *state = PendingReplicationState::default();
+    }
+    reopened
+        .restore_pending_state_from_local_log()
+        .expect("restore pending suffix after restart");
+    let state = reopened.pending_state.lock().unwrap();
+    assert!(state.force_flush);
+    assert_eq!(state.event_start, Some(suffix_start));
+    assert_eq!(state.event_end, suffix_end);
+}
+
+#[test]
 fn local_event_pruning_does_not_wait_for_pending_replication_state() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let pg = Arc::new(pg);
@@ -143,6 +199,7 @@ fn local_event_pruning_does_not_wait_for_pending_replication_state() {
 fn background_local_event_pruning_drains_full_batches_up_to_its_budget() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let next_event_seq = 5_001;
+    let event = encode_event(&MetaEvent::RemovePendingDeletion { object_id: 1 }).unwrap();
     let txn = pg.local.begin_write_txn().unwrap();
     {
         let mut events = txn
@@ -150,7 +207,7 @@ fn background_local_event_pruning_drains_full_batches_up_to_its_budget() {
             .unwrap();
         events.retain(|_, _| false).unwrap();
         for seq in 1..next_event_seq {
-            events.insert(seq, &b"event"[..]).unwrap();
+            events.insert(seq, event.as_slice()).unwrap();
         }
     }
     txn.commit().unwrap();
@@ -179,6 +236,52 @@ fn background_local_event_pruning_drains_full_batches_up_to_its_budget() {
             .unwrap(),
         next_event_seq
     );
+}
+
+#[test]
+fn background_local_event_pruning_skips_work_after_shutdown() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"shutdown-pending", 0, 0, 0o755)
+        .expect("create pruneable event");
+    let cursor = pg.local.get_counter("nextEventSeq").unwrap();
+    pg.persist_flushed_event_seq(cursor)
+        .expect("acknowledge pruneable event");
+
+    pg.prune_local_event_log_for_poll(&AtomicBool::new(true))
+        .expect("shutdown should end background pruning");
+
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(1));
+    assert_eq!(
+        pg.local
+            .local_storage_diagnostics()
+            .unwrap()
+            .unwrap()
+            .local_event_log_pruned_rows_total,
+        0
+    );
+}
+
+#[test]
+fn background_local_event_pruning_stops_after_short_batch() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"short-prune-batch", 0, 0, 0o755)
+        .expect("create an acknowledged local event");
+    let cursor = pg.local.get_counter("nextEventSeq").unwrap();
+    let eligible_rows = usize::try_from(cursor - 1).unwrap();
+    assert!(eligible_rows < LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS);
+    pg.persist_flushed_event_seq(cursor)
+        .expect("acknowledge local events");
+
+    pg.prune_local_event_log_for_poll(&AtomicBool::new(false))
+        .expect("prune the short batch");
+
+    let diagnostics = pg.local.local_storage_diagnostics().unwrap().unwrap();
+    assert_eq!(
+        diagnostics.last_local_event_log_prune_rows,
+        Some(u64::try_from(eligible_rows).unwrap()),
+        "a second empty pass would replace the short batch's last-attempt result"
+    );
+    assert!(pg.local.first_event_seq().unwrap().is_none());
 }
 
 #[test]

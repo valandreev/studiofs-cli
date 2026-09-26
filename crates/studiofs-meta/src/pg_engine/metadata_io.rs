@@ -486,6 +486,7 @@ impl PgMetaEngine {
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
                 self.local.import_serving_checkpoint(checkpoint)?;
+                self.reset_local_event_progress_after_state_replacement_locked()?;
             }
             StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog => {
                 self.local

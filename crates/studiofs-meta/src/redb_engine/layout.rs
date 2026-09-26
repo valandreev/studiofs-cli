@@ -50,6 +50,32 @@ pub(super) const BASE_DENTRIES_BY_INODE_TABLE: TableDefinition<&[u8], u8> =
 pub(super) const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("dentry_tombstones");
 
+/// Compact local namespace authority retained when acknowledged events are pruned.
+// ponytail: distinct removed names can accumulate; reclaim only with a proven remote-authority cutoff.
+pub(super) const LOCAL_DENTRY_MUTATIONS_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("local_dentry_mutations");
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum LocalDentryMutation {
+    Created = 1,
+    Removed = 2,
+}
+
+impl TryFrom<u8> for LocalDentryMutation {
+    type Error = MetaError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Created),
+            2 => Ok(Self::Removed),
+            value => Err(MetaError::Storage(format!(
+                "invalid local dentry mutation value: {value}"
+            ))),
+        }
+    }
+}
+
 /// Local overlay regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
 pub(super) const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("regular_file_overlay");
@@ -153,6 +179,9 @@ pub struct RedbSnapshot {
     pub acl_rules: Vec<(Vec<u8>, u8)>,
     /// Local event-log rows as `(sequence, encoded_event)` pairs.
     pub event_log: Vec<(u64, Vec<u8>)>,
+    /// Compact local dentry mutation rows as `(encoded_key, status)` pairs.
+    #[serde(default)]
+    pub local_dentry_mutations: Vec<(Vec<u8>, u8)>,
 }
 
 pub(crate) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {

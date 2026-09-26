@@ -2445,7 +2445,7 @@ fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
 #[test]
 fn runtime_stats_surface_reports_overlay_batch_metrics() {
     let tmp = runtime_stats_test_tempdir();
-    let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-overlay-batch");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-overlay-batch");
     let initial_snapshot = vfs.runtime_stats_snapshot();
 
     assert!(
@@ -2466,6 +2466,14 @@ fn runtime_stats_surface_reports_overlay_batch_metrics() {
             .gauges
             .contains_key("overlay_dirty_age_ms")
     );
+}
+
+#[test]
+fn runtime_stats_surface_reports_local_event_prune_metrics() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-local-event-prune");
+    let initial_snapshot = vfs.runtime_stats_snapshot();
+
     assert!(
         !initial_snapshot
             .metadata
@@ -2477,6 +2485,14 @@ fn runtime_stats_surface_reports_overlay_batch_metrics() {
             .metadata
             .counters
             .contains_key("metadata_redb_local_event_log_pruned_rows_total")
+    );
+    assert_eq!(
+        initial_snapshot
+            .metadata
+            .counters
+            .get("metadata_redb_local_event_log_pruned_rows_total")
+            .map(|metric| metric.unit.as_ref()),
+        Some("count")
     );
     assert_eq!(
         initial_snapshot
@@ -2500,6 +2516,14 @@ fn runtime_stats_surface_reports_overlay_batch_metrics() {
             .get("metadata_redb_local_event_log_pruned_through_seq")
             .map(|metric| metric.value),
         Some(1)
+    );
+    assert_eq!(
+        pruned_snapshot
+            .metadata
+            .gauges
+            .get("metadata_redb_local_event_log_pruned_through_seq")
+            .map(|metric| metric.unit.as_ref()),
+        Some("count")
     );
 }
 

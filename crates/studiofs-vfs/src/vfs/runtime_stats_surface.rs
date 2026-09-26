@@ -1079,3 +1079,60 @@ fn insert_latency(
 fn ms_sum_to_ns(value: f64) -> u64 {
     (value.max(0.0) * 1_000_000.0).round() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_event_prune_runtime_stats_use_documented_units() {
+        let diagnostics = LocalStorageDiagnostics {
+            local_event_log_pruned_through_seq: Some(7),
+            local_event_log_pruned_rows_total: 2,
+            local_event_log_pruned_payload_bytes_total: 19,
+            last_local_event_log_prune_rows: Some(2),
+            last_local_event_log_prune_first_seq: Some(5),
+            last_local_event_log_prune_last_seq: Some(6),
+            last_local_event_log_prune_payload_bytes: Some(19),
+            last_local_event_log_prune_duration_ns: Some(23),
+            ..LocalStorageDiagnostics::default()
+        };
+        let mut section = RuntimeStatsSection::default();
+        insert_local_storage_diagnostics(&mut section, &diagnostics);
+
+        for (name, expected_unit) in [
+            ("metadata_redb_local_event_log_pruned_through_seq", "count"),
+            ("metadata_redb_local_event_log_prune_last_rows", "count"),
+            (
+                "metadata_redb_local_event_log_prune_last_first_seq",
+                "count",
+            ),
+            ("metadata_redb_local_event_log_prune_last_last_seq", "count"),
+            (
+                "metadata_redb_local_event_log_prune_last_payload_bytes",
+                "bytes",
+            ),
+            ("metadata_redb_local_event_log_prune_last_duration_ns", "ns"),
+        ] {
+            let metric = section
+                .gauges
+                .get(name)
+                .unwrap_or_else(|| panic!("missing gauge {name}"));
+            assert_eq!(metric.unit.as_ref(), expected_unit, "{name}");
+        }
+
+        for (name, expected_unit) in [
+            ("metadata_redb_local_event_log_pruned_rows_total", "count"),
+            (
+                "metadata_redb_local_event_log_pruned_payload_bytes_total",
+                "bytes",
+            ),
+        ] {
+            let metric = section
+                .counters
+                .get(name)
+                .unwrap_or_else(|| panic!("missing counter {name}"));
+            assert_eq!(metric.unit.as_ref(), expected_unit, "{name}");
+        }
+    }
+}

@@ -1828,8 +1828,10 @@ pub mod counters {
     pub const NEXT_OBJECT_ID: &str = "nextObjectId";
     /// Next sequence number to allocate in the local metadata event log.
     pub const NEXT_EVENT_SEQ: &str = "nextEventSeq";
-    /// Highest local event sequence safely removed from the event log.
+    /// Inclusive acknowledged/pruned-through frontier; gaps may have no corresponding event row.
     pub const LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ: &str = "localEventLogPrunedThroughSeq";
+    /// Version of the dentry authority summary that covers the pruned local event prefix.
+    pub const LOCAL_DENTRY_MUTATION_BASELINE_VERSION: &str = "localDentryMutationBaselineVersion";
     /// Total used space in bytes.
     pub const USED_SPACE: &str = "usedSpace";
     /// Total number of inodes in use.
