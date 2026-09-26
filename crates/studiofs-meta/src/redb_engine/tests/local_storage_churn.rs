@@ -415,9 +415,16 @@ fn local_metadata_churn_redb_growth_workload() {
             .expect("read pre-compaction redb diagnostics")
             .expect("pre-compaction redb diagnostics are available")
             .compaction_attempts;
-        engine
+        let compaction_result = engine
             .compact_local_storage()
             .expect("compact local metadata database");
+        assert!(
+            matches!(
+                compaction_result,
+                LocalStorageCompactionResult::Compacted | LocalStorageCompactionResult::NoWork
+            ),
+            "explicit compaction was skipped: {compaction_result:?}"
+        );
         let after = report_local_churn_checkpoint(
             &engine,
             "after-compaction",
