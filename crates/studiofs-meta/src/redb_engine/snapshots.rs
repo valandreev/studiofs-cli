@@ -21,10 +21,13 @@ impl RedbMetaEngine {
     /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self.begin_read_txn()?;
-        Self::export_snapshot_from_read_txn(&txn)
+        Self::export_snapshot_from_read_txn(&txn, true)
     }
 
-    pub(super) fn export_snapshot_from_read_txn(txn: &ReadTransaction) -> MetaResult<RedbSnapshot> {
+    pub(super) fn export_snapshot_from_read_txn(
+        txn: &ReadTransaction,
+        include_local_dentry_mutations: bool,
+    ) -> MetaResult<RedbSnapshot> {
         let mut snapshot = RedbSnapshot::default();
 
         {
@@ -77,6 +80,24 @@ impl RedbMetaEngine {
                 snapshot
                     .dentries
                     .push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        if include_local_dentry_mutations {
+            match txn.open_table(LOCAL_DENTRY_MUTATIONS_TABLE) {
+                Ok(table) => {
+                    for row in table
+                        .iter()
+                        .map_err(|error| MetaError::Storage(error.to_string()))?
+                    {
+                        let (key, state) =
+                            row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                        snapshot
+                            .local_dentry_mutations
+                            .push((key.value().to_vec(), state.value()));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(MetaError::Storage(error.to_string())),
             }
         }
         {
@@ -417,6 +438,7 @@ impl RedbMetaEngine {
         snapshot.xattrs = checkpoint.xattrs.clone();
         snapshot.acl_rules = checkpoint.acl_rules.clone();
         snapshot.event_log.clear();
+        snapshot.local_dentry_mutations.clear();
         Ok(snapshot)
     }
 
@@ -434,6 +456,19 @@ impl RedbMetaEngine {
         mode: SnapshotImportMode,
         extra_preserved_inodes: Option<&HashSet<Ino>>,
     ) -> MetaResult<()> {
+        if mode == SnapshotImportMode::Local {
+            let counter = |name| {
+                snapshot
+                    .counters
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| *value)
+            };
+            Self::ensure_pruned_dentry_baseline(
+                counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ).unwrap_or(0),
+                counter(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION),
+            )?;
+        }
         let enable_remote_namespace_filter = mode != SnapshotImportMode::Local;
         let preserve_local_state = mode == SnapshotImportMode::RemotePreserveLocalState;
         let preserve_event_log =
@@ -761,6 +796,28 @@ impl RedbMetaEngine {
             if !preserve_local_state {
                 Self::clear_table_in_txn(&txn, ACL_RULE_TOMBSTONES_TABLE)?;
             }
+        }
+        match mode {
+            SnapshotImportMode::Local => {
+                let mut table = txn
+                    .open_table(LOCAL_DENTRY_MUTATIONS_TABLE)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+                table
+                    .retain(|_, _| false)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+                for (key, state) in &snapshot.local_dentry_mutations {
+                    decode_dentry_key(key)?;
+                    LocalDentryMutation::try_from(*state)?;
+                    table
+                        .insert(key.as_slice(), *state)
+                        .map_err(|error| MetaError::Storage(error.to_string()))?;
+                }
+            }
+            SnapshotImportMode::RemoteReplace => {
+                Self::clear_table_in_txn(&txn, LOCAL_DENTRY_MUTATIONS_TABLE)?;
+            }
+            SnapshotImportMode::RemoteReplacePreservingEventLog
+            | SnapshotImportMode::RemotePreserveLocalState => {}
         }
         {
             if !preserve_event_log {

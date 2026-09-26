@@ -598,6 +598,26 @@ pub struct LocalStorageDiagnostics {
     pub next_local_event_seq: Option<u64>,
     /// End-exclusive sequence span still retained in the local metadata event log.
     pub retained_local_event_span: Option<u64>,
+    /// Inclusive acknowledged/pruned-through frontier; gaps may have no corresponding event row.
+    pub local_event_log_pruned_through_seq: Option<u64>,
+    /// Cumulative local event rows removed since this metadata engine was opened.
+    pub local_event_log_pruned_rows_total: u64,
+    /// Cumulative encoded event payload bytes removed since this metadata engine was opened.
+    pub local_event_log_pruned_payload_bytes_total: u64,
+    /// Background prune batches skipped because a redb writer was busy since this engine opened.
+    pub local_event_log_prune_skipped_busy_total: u64,
+    /// Number of local dentry authority summary rows, omitted when unavailable.
+    pub local_dentry_mutation_baseline_rows: Option<u64>,
+    /// Rows removed by the latest prune attempt; `None` before an attempt or after an error.
+    pub last_local_event_log_prune_rows: Option<u64>,
+    /// First sequence removed by the most recent non-empty successful prune batch.
+    pub last_local_event_log_prune_first_seq: Option<u64>,
+    /// Last sequence removed by the most recent non-empty successful prune batch.
+    pub last_local_event_log_prune_last_seq: Option<u64>,
+    /// Encoded payload bytes removed by the latest attempt; `None` before an attempt or on error.
+    pub last_local_event_log_prune_payload_bytes: Option<u64>,
+    /// Elapsed nanoseconds for the most recent prune attempt.
+    pub last_local_event_log_prune_duration_ns: Option<u64>,
     /// Compaction calls since this metadata engine was opened.
     pub compaction_attempts: u64,
     /// Calls where redb compaction made progress.

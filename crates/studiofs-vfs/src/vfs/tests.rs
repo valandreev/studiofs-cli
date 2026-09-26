@@ -2446,15 +2446,78 @@ fn runtime_stats_surface_read_respects_offset_and_buffer_len() {
 fn runtime_stats_surface_reports_overlay_batch_metrics() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-overlay-batch");
-    let snapshot = vfs.runtime_stats_snapshot();
+    let initial_snapshot = vfs.runtime_stats_snapshot();
 
-    assert!(snapshot.metadata.counters.contains_key("overlay_enqueue"));
-    assert!(snapshot.metadata.gauges.contains_key("overlay_queue_depth"));
     assert!(
-        snapshot
+        initial_snapshot
+            .metadata
+            .counters
+            .contains_key("overlay_enqueue")
+    );
+    assert!(
+        initial_snapshot
+            .metadata
+            .gauges
+            .contains_key("overlay_queue_depth")
+    );
+    assert!(
+        initial_snapshot
             .metadata
             .gauges
             .contains_key("overlay_dirty_age_ms")
+    );
+}
+
+#[test]
+fn runtime_stats_surface_reports_local_event_prune_metrics() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "runtime-stats-local-event-prune");
+    let initial_snapshot = vfs.runtime_stats_snapshot();
+
+    assert!(
+        !initial_snapshot
+            .metadata
+            .gauges
+            .contains_key("metadata_redb_local_event_log_pruned_through_seq")
+    );
+    assert!(
+        initial_snapshot
+            .metadata
+            .counters
+            .contains_key("metadata_redb_local_event_log_pruned_rows_total")
+    );
+    assert!(
+        initial_snapshot
+            .metadata
+            .counters
+            .contains_key("metadata_redb_local_event_log_pruned_payload_bytes_total")
+    );
+    assert!(
+        initial_snapshot
+            .metadata
+            .gauges
+            .contains_key("metadata_redb_local_dentry_mutation_baseline_rows")
+    );
+    assert!(
+        initial_snapshot
+            .metadata
+            .counters
+            .contains_key("metadata_redb_local_event_log_prune_skipped_busy_total")
+    );
+
+    meta.set_counter(
+        studiofs_meta::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+        1,
+    )
+    .expect("seed a positive local prune watermark");
+    let pruned_snapshot = vfs.runtime_stats_snapshot();
+    assert_eq!(
+        pruned_snapshot
+            .metadata
+            .gauges
+            .get("metadata_redb_local_event_log_pruned_through_seq")
+            .map(|metric| metric.value),
+        Some(1)
     );
 }
 

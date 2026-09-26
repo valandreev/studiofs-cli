@@ -1,7 +1,205 @@
 use super::*;
-use redb::CompactionError;
+use redb::{CompactionError, ReadableTableMetadata};
 
 impl RedbMetaEngine {
+    fn record_local_event_log_prune(
+        &self,
+        result: &MetaResult<LocalEventLogPruneBatch>,
+        elapsed: std::time::Duration,
+    ) {
+        let mut stats = self
+            .local_event_log_prune
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        stats.last_duration_ns = Some(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        match result {
+            Ok(batch) => {
+                if batch.skipped_busy {
+                    stats.skipped_busy = stats.skipped_busy.saturating_add(1);
+                    stats.last_rows = None;
+                    stats.last_payload_bytes = None;
+                    return;
+                }
+                let rows = u64::try_from(batch.rows).unwrap_or(u64::MAX);
+                stats.rows_pruned = stats.rows_pruned.saturating_add(rows);
+                stats.payload_bytes_pruned = stats
+                    .payload_bytes_pruned
+                    .saturating_add(batch.payload_bytes);
+                stats.last_rows = Some(rows);
+                if batch.rows > 0 {
+                    stats.last_first_seq = batch.first_seq;
+                    stats.last_last_seq = batch.last_seq;
+                }
+                stats.last_payload_bytes = Some(batch.payload_bytes);
+            }
+            Err(_) => {
+                stats.last_rows = None;
+                stats.last_payload_bytes = None;
+            }
+        }
+    }
+
+    pub(crate) fn prune_local_event_log_before(
+        &self,
+        exclusive_floor: u64,
+        max_rows: usize,
+    ) -> MetaResult<LocalEventLogPruneBatch> {
+        let started = Instant::now();
+        let result = (|| {
+            if max_rows == 0 {
+                return Ok(LocalEventLogPruneBatch::default());
+            }
+            let pruned_through =
+                self.get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)?;
+            if pruned_through > 0 {
+                let baseline_version = self
+                    .get_counter(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION)?;
+                Self::ensure_pruned_dentry_baseline(pruned_through, Some(baseline_version))?;
+            }
+            if exclusive_floor.saturating_sub(1) <= pruned_through {
+                return Ok(LocalEventLogPruneBatch::default());
+            }
+
+            let Some(txn) = self.try_begin_write_txn()? else {
+                return Ok(LocalEventLogPruneBatch {
+                    skipped_busy: true,
+                    ..LocalEventLogPruneBatch::default()
+                });
+            };
+            let batch =
+                match Self::prune_local_event_log_batch_in_txn(&txn, exclusive_floor, max_rows) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let _ = txn.abort();
+                        return Err(error);
+                    }
+                };
+            if batch.rows > 0 || batch.floor_updated {
+                txn.commit()
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+            } else {
+                txn.abort()
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+            }
+            Ok(batch)
+        })();
+        self.record_local_event_log_prune(&result, started.elapsed());
+        result
+    }
+
+    pub(crate) fn prune_local_event_log_batch_in_txn(
+        txn: &redb::WriteTransaction,
+        exclusive_floor: u64,
+        max_rows: usize,
+    ) -> MetaResult<LocalEventLogPruneBatch> {
+        let mut batch = LocalEventLogPruneBatch::default();
+        if max_rows == 0 {
+            return Ok(batch);
+        }
+
+        let mut counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let persisted_floor = counters
+            .get(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|value| value.value());
+        let baseline_version = counters
+            .get(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|value| value.value());
+        Self::ensure_pruned_dentry_baseline(persisted_floor.unwrap_or(0), baseline_version)?;
+        if exclusive_floor <= persisted_floor.unwrap_or(0).saturating_add(1) {
+            return Ok(batch);
+        }
+        let mut pruned_through = persisted_floor.unwrap_or(0);
+        let mut events = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let mut baseline = txn
+            .open_table(LOCAL_DENTRY_MUTATIONS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let mut reducer = super::replication::LocalDentryMutationReducer::default();
+        let mut next_seq = events
+            .first()
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|(seq, _)| seq.value());
+
+        if persisted_floor.is_none() {
+            if let Some(first_seq) = next_seq.filter(|seq| *seq <= exclusive_floor) {
+                pruned_through = first_seq.saturating_sub(1);
+                batch.floor_updated = pruned_through > 0;
+            } else if next_seq.is_none() {
+                pruned_through = exclusive_floor - 1;
+                batch.floor_updated = pruned_through > 0;
+            }
+        }
+
+        while batch.rows < max_rows {
+            let Some(seq) = next_seq else {
+                break;
+            };
+            if seq >= exclusive_floor {
+                break;
+            }
+
+            let (removed_seq, payload) = events
+                .pop_first()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+                .ok_or_else(|| {
+                    MetaError::Storage("event log first row disappeared during pruning".to_string())
+                })?;
+            let removed_seq_value = removed_seq.value();
+            let payload_bytes = payload.value().len();
+            let event = crate::events::decode_event(payload.value())?;
+            reducer.apply_to_table(&baseline, &event)?;
+            drop(removed_seq);
+            drop(payload);
+            batch.first_seq.get_or_insert(removed_seq_value);
+            batch.last_seq = Some(removed_seq_value);
+            batch.rows += 1;
+            batch.payload_bytes = batch
+                .payload_bytes
+                .saturating_add(u64::try_from(payload_bytes).unwrap_or(u64::MAX));
+            if removed_seq_value > pruned_through {
+                pruned_through = removed_seq_value;
+                batch.floor_updated = true;
+            }
+            next_seq = events
+                .first()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+                .map(|(seq, _)| seq.value());
+        }
+
+        if next_seq.is_none_or(|seq| seq >= exclusive_floor) {
+            let acknowledged_through = exclusive_floor - 1;
+            if pruned_through < acknowledged_through {
+                pruned_through = acknowledged_through;
+                batch.floor_updated = true;
+            }
+        }
+
+        reducer.persist_touched(&mut baseline)?;
+
+        if batch.floor_updated {
+            counters
+                .insert(
+                    crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+                    pruned_through,
+                )
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+        }
+        if (batch.rows > 0 || batch.floor_updated) && baseline_version.is_none() {
+            counters
+                .insert(
+                    crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION,
+                    1,
+                )
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+        }
+        Ok(batch)
+    }
+
     pub(super) fn add_pending_deletions_in_txn(
         txn: &redb::WriteTransaction,
         entries: &[(u64, i64)],
@@ -77,6 +275,20 @@ impl RedbMetaEngine {
         transaction: &redb::ReadTransaction,
         diagnostics: &mut LocalStorageDiagnostics,
     ) {
+        match transaction.open_table(LOCAL_DENTRY_MUTATIONS_TABLE) {
+            Ok(baseline) => diagnostics.local_dentry_mutation_baseline_rows = baseline.len().ok(),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                diagnostics.local_dentry_mutation_baseline_rows = Some(0);
+            }
+            Err(_) => {}
+        }
+        let pruned_through_seq = Self::read_counter_from_read_txn(
+            transaction,
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+        )
+        .unwrap_or(0);
+        diagnostics.local_event_log_pruned_through_seq =
+            (pruned_through_seq > 0).then_some(pruned_through_seq);
         let Ok(events) = transaction.open_table(EVENT_LOG_TABLE) else {
             return;
         };
@@ -242,7 +454,19 @@ impl MetaGc for RedbMetaEngine {
             .local_storage_compaction
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let prune = *self
+            .local_event_log_prune
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut diagnostics = LocalStorageDiagnostics {
+            local_event_log_pruned_rows_total: prune.rows_pruned,
+            local_event_log_pruned_payload_bytes_total: prune.payload_bytes_pruned,
+            local_event_log_prune_skipped_busy_total: prune.skipped_busy,
+            last_local_event_log_prune_rows: prune.last_rows,
+            last_local_event_log_prune_first_seq: prune.last_first_seq,
+            last_local_event_log_prune_last_seq: prune.last_last_seq,
+            last_local_event_log_prune_payload_bytes: prune.last_payload_bytes,
+            last_local_event_log_prune_duration_ns: prune.last_duration_ns,
             compaction_attempts: compaction.attempts,
             compaction_compacted: compaction.compacted,
             compaction_no_work: compaction.no_work,

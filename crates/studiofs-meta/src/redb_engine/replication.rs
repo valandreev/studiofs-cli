@@ -1,4 +1,184 @@
 use super::*;
+
+#[derive(Default)]
+pub(super) struct LocalDentryMutationReducer {
+    states: HashMap<Vec<u8>, LocalDentryMutation>,
+    loaded: HashSet<Vec<u8>>,
+    touched: HashSet<Vec<u8>>,
+    retained_created: HashSet<Vec<u8>>,
+}
+
+impl LocalDentryMutationReducer {
+    pub(super) fn load_key_from_table(
+        &mut self,
+        table: &redb::Table<'_, &[u8], u8>,
+        key: &[u8],
+    ) -> MetaResult<()> {
+        if self.loaded.insert(key.to_vec())
+            && let Some(value) = table
+                .get(key)
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+        {
+            self.states
+                .insert(key.to_vec(), LocalDentryMutation::try_from(value.value())?);
+        }
+        Ok(())
+    }
+
+    fn load_event_keys_from_table(
+        &mut self,
+        table: &redb::Table<'_, &[u8], u8>,
+        event: &crate::events::MetaEvent,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+
+        match event {
+            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+                self.load_key_from_table(table, &encode_dentry_key(*parent, name))?;
+            }
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            } => {
+                self.load_key_from_table(table, &encode_dentry_key(*parent, name))?;
+                self.load_key_from_table(table, &encode_dentry_key(*new_parent, new_name))?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_to_table(
+        &mut self,
+        table: &redb::Table<'_, &[u8], u8>,
+        event: &crate::events::MetaEvent,
+    ) -> MetaResult<()> {
+        self.load_event_keys_from_table(table, event)?;
+        self.apply(event);
+        Ok(())
+    }
+
+    pub(super) fn apply_retained_to_table(
+        &mut self,
+        table: &redb::Table<'_, &[u8], u8>,
+        event: &crate::events::MetaEvent,
+    ) -> MetaResult<()> {
+        self.load_event_keys_from_table(table, event)?;
+        self.apply_retained(event);
+        Ok(())
+    }
+
+    pub(super) fn apply(&mut self, event: &crate::events::MetaEvent) {
+        use crate::events::MetaEvent;
+
+        match event {
+            MetaEvent::AddEntry { parent, name, .. } => {
+                let key = encode_dentry_key(*parent, name);
+                self.touched.insert(key.clone());
+                self.states.insert(key, LocalDentryMutation::Created);
+            }
+            MetaEvent::RemoveEntry { parent, name } => {
+                let key = encode_dentry_key(*parent, name);
+                self.touched.insert(key.clone());
+                if self.states.remove(&key) != Some(LocalDentryMutation::Created) {
+                    self.states.insert(key, LocalDentryMutation::Removed);
+                }
+            }
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            } => {
+                let source_key = encode_dentry_key(*parent, name);
+                let destination_key = encode_dentry_key(*new_parent, new_name);
+                let was_created =
+                    self.states.get(&source_key) == Some(&LocalDentryMutation::Created);
+                if was_created {
+                    self.states.remove(&source_key);
+                    self.touched.insert(source_key);
+                }
+                self.states.remove(&destination_key);
+                self.touched.insert(destination_key.clone());
+                if was_created {
+                    self.states
+                        .insert(destination_key, LocalDentryMutation::Created);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn is_removed(&self, key: &[u8]) -> bool {
+        self.states.get(key) == Some(&LocalDentryMutation::Removed)
+    }
+
+    fn apply_retained(&mut self, event: &crate::events::MetaEvent) {
+        use crate::events::MetaEvent;
+
+        match event {
+            MetaEvent::AddEntry { parent, name, .. } => {
+                let key = encode_dentry_key(*parent, name);
+                self.loaded.insert(key.clone());
+                self.retained_created.insert(key.clone());
+                self.states.insert(key, LocalDentryMutation::Created);
+            }
+            MetaEvent::RemoveEntry { parent, name } => {
+                let key = encode_dentry_key(*parent, name);
+                self.loaded.insert(key.clone());
+                if self.retained_created.remove(&key) {
+                    self.states.remove(&key);
+                } else {
+                    self.states.insert(key, LocalDentryMutation::Removed);
+                }
+            }
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            } => {
+                let source_key = encode_dentry_key(*parent, name);
+                let destination_key = encode_dentry_key(*new_parent, new_name);
+                let was_created =
+                    self.states.get(&source_key) == Some(&LocalDentryMutation::Created);
+                self.retained_created.remove(&source_key);
+                if was_created {
+                    self.states.remove(&source_key);
+                }
+                self.retained_created.remove(&destination_key);
+                self.states.remove(&destination_key);
+                if was_created {
+                    self.states
+                        .insert(destination_key.clone(), LocalDentryMutation::Created);
+                    self.retained_created.insert(destination_key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn persist_touched(&self, table: &mut redb::Table<'_, &[u8], u8>) -> MetaResult<()> {
+        for key in &self.touched {
+            if let Some(state) = self.states.get(key) {
+                table
+                    .insert(key.as_slice(), *state as u8)
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+            } else {
+                let _ = table
+                    .remove(key.as_slice())
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 use std::cell::Cell;
 
@@ -8,6 +188,19 @@ thread_local! {
 }
 
 impl RedbMetaEngine {
+    pub(super) fn ensure_pruned_dentry_baseline(
+        pruned_through: u64,
+        baseline_version: Option<u64>,
+    ) -> MetaResult<()> {
+        if (pruned_through == 0 && baseline_version.is_none()) || baseline_version == Some(1) {
+            Ok(())
+        } else {
+            Err(MetaError::Storage(
+                "local event history was pruned before dentry authority was recorded; replace local state from a serving checkpoint".to_string(),
+            ))
+        }
+    }
+
     fn invalidation_binding(
         txn: &RedbWriteTransaction<'_>,
         key: &[u8],
@@ -374,7 +567,7 @@ impl RedbMetaEngine {
     }
 
     fn export_remote_snapshot_from_read_txn(txn: &ReadTransaction) -> MetaResult<RedbSnapshot> {
-        let mut snapshot = Self::export_snapshot_from_read_txn(txn)?;
+        let mut snapshot = Self::export_snapshot_from_read_txn(txn, false)?;
         let mut published_regular_inodes = HashSet::new();
         for (ino, bytes) in &snapshot.regular_file_base {
             let regular: RegularFileBaseState = decode(bytes)?;
@@ -1803,14 +1996,14 @@ impl RedbMetaEngine {
         Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new())?;
 
         if dst_in_base {
-            let local_removed_dentries = Self::local_removed_dentries_in_txn(txn)?;
+            let destination_key = encode_dentry_key(new_parent, new_name);
             // The base rename winner moved this logical source to the
             // destination.  Remove any serving entry still occupying the old
             // source name, even if it points at a local overlay inode; payload
             // and inode protection are handled separately from namespace
             // visibility.
             Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-            if local_removed_dentries.contains(&encode_dentry_key(new_parent, new_name)) {
+            if Self::local_dentry_removed_in_txn(txn, &destination_key)? {
                 Self::remove_dentry_overlay_in_txn(txn, new_parent, new_name)?;
             } else {
                 Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
@@ -1826,7 +2019,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn local_removed_dentries_in_txn(txn: &redb::WriteTransaction) -> MetaResult<HashSet<Vec<u8>>> {
+    fn local_dentry_removed_in_txn(
+        txn: &redb::WriteTransaction,
+        dentry_key: &[u8],
+    ) -> MetaResult<bool> {
         let counters = txn
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1835,11 +2031,23 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .map(|value| value.value())
             .unwrap_or(1);
+        let pruned_through = counters
+            .get(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| value.value())
+            .unwrap_or(0);
+        let baseline_version = counters
+            .get(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| value.value());
         drop(counters);
+        Self::ensure_pruned_dentry_baseline(pruned_through, baseline_version)?;
 
-        let mut locally_created = HashSet::new();
-        let mut locally_renamed = HashSet::new();
-        let mut removed = HashSet::new();
+        let baseline = txn
+            .open_table(LOCAL_DENTRY_MUTATIONS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut reducer = LocalDentryMutationReducer::default();
+        reducer.load_key_from_table(&baseline, dentry_key)?;
         let events = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1849,53 +2057,17 @@ impl RedbMetaEngine {
             .map(|(seq, _)| seq.value())
             .unwrap_or(end_seq);
         if end_seq <= start_seq {
-            return Ok(removed);
+            return Ok(reducer.is_removed(dentry_key));
         }
         for row in events
             .range(start_seq..end_seq)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            match crate::events::decode_event(bytes.value())? {
-                crate::events::MetaEvent::AddEntry { parent, name, .. } => {
-                    let key = encode_dentry_key(parent, &name);
-                    locally_renamed.remove(&key);
-                    removed.remove(&key);
-                    locally_created.insert(key);
-                }
-                crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    let key = encode_dentry_key(parent, &name);
-                    if locally_created.remove(&key) {
-                        removed.remove(&key);
-                    } else {
-                        locally_renamed.remove(&key);
-                        removed.insert(key);
-                    }
-                }
-                crate::events::MetaEvent::RenameEntry {
-                    parent,
-                    name,
-                    new_parent,
-                    new_name,
-                    ..
-                } => {
-                    let source_key = encode_dentry_key(parent, &name);
-                    let destination_key = encode_dentry_key(new_parent, &new_name);
-                    let was_created = locally_created.remove(&source_key);
-                    locally_renamed.remove(&source_key);
-                    locally_created.remove(&destination_key);
-                    locally_renamed.remove(&destination_key);
-                    removed.remove(&destination_key);
-                    if was_created {
-                        locally_created.insert(destination_key);
-                    } else {
-                        locally_renamed.insert(destination_key);
-                    }
-                }
-                _ => {}
-            }
+            let event = crate::events::decode_event(bytes.value())?;
+            reducer.apply_retained_to_table(&baseline, &event)?;
         }
-        Ok(removed)
+        Ok(reducer.is_removed(dentry_key))
     }
 
     fn remove_dentry_mirror_if_matches_in_txn(

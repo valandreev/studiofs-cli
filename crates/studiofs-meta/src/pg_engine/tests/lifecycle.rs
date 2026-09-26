@@ -4242,6 +4242,70 @@ fn startup_snapshot_replaces_acknowledged_local_overlay() {
 }
 
 #[test]
+fn replacing_local_state_resets_the_in_memory_prune_cursor() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let checkpoint = pg
+        .local
+        .begin_serving_checkpoint_snapshot()
+        .expect("capture replacement checkpoint")
+        .export_serving_checkpoint()
+        .expect("export replacement checkpoint");
+    for name in [b"old-a".as_slice(), b"old-b", b"old-c"] {
+        pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create acknowledged local directory");
+    }
+    let old_cursor = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .unwrap();
+    pg.persist_flushed_event_seq(old_cursor)
+        .expect("acknowledge old local events");
+
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::ReplaceLocalState,
+        &checkpoint,
+        0,
+    )
+    .expect("replace local serving state");
+    pg.create_dir(ROOT_INO, b"new-unflushed", 0, 0, 0o755)
+        .expect("create unflushed event after replacement");
+
+    pg.prune_local_event_log_once()
+        .expect("prune acknowledged events after replacement");
+
+    assert_eq!(
+        pg.local.first_event_seq().unwrap(),
+        Some(1),
+        "the live cursor must reset with the replaced event log so new events are not pruned"
+    );
+}
+
+#[test]
+fn replacing_local_state_succeeds_when_event_progress_lock_is_poisoned() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let checkpoint = pg
+        .local
+        .begin_serving_checkpoint_snapshot()
+        .expect("capture replacement checkpoint")
+        .export_serving_checkpoint()
+        .expect("export replacement checkpoint");
+    pg.flushed_event_seq.store(99, Ordering::SeqCst);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _progress = pg.local_event_progress.lock().unwrap();
+        panic!("poison the local event progress lock");
+    }));
+
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::ReplaceLocalState,
+        &checkpoint,
+        0,
+    )
+    .expect("post-import cursor reset must not fail");
+
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn startup_snapshot_replay_starts_from_snapshot_epoch_not_pg_head() {
     assert_eq!(
         PgMetaEngine::snapshot_replay_start_version(3, 9),
@@ -4770,6 +4834,12 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
     let local = RedbMetaEngine::open(&path).expect("open local redb");
     local.init_root(0, 0).expect("init root");
     PgMetaEngine::persist_client_slot(&local, 3).expect("persist reserved local slot");
+    local
+        .set_counter(
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+            99,
+        )
+        .expect("persist local prune floor");
 
     let mut legacy_snapshot = RedbSnapshot::default();
     legacy_snapshot.counters.extend([
@@ -4823,6 +4893,13 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
             .expect("load flushed cursor"),
         0,
         "remote snapshot import must drop legacy local event-log cursor"
+    );
+    assert_eq!(
+        local
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .expect("load prune floor after remote snapshot import"),
+        0,
+        "replacing the local event log must reset its old prune floor"
     );
     assert_eq!(
         local
@@ -5039,6 +5116,18 @@ fn persisted_pg_flushed_event_seq_roundtrips_in_local_counter() {
         PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
             .expect("reload flushed event seq"),
         19
+    );
+    pg.local
+        .set_counter(
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+            24,
+        )
+        .expect("persist local prune floor");
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
+            .expect("reload cursor after pruned history"),
+        25,
+        "restart must not move the replay cursor behind durably pruned history"
     );
 }
 

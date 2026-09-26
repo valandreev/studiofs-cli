@@ -920,6 +920,41 @@ fn insert_local_storage_diagnostics(
             diagnostics.retained_local_event_span,
         ),
         (
+            "metadata_redb_local_dentry_mutation_baseline_rows",
+            "count",
+            diagnostics.local_dentry_mutation_baseline_rows,
+        ),
+        (
+            "metadata_redb_local_event_log_pruned_through_seq",
+            "count",
+            diagnostics.local_event_log_pruned_through_seq,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_rows",
+            "count",
+            diagnostics.last_local_event_log_prune_rows,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_first_seq",
+            "count",
+            diagnostics.last_local_event_log_prune_first_seq,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_last_seq",
+            "count",
+            diagnostics.last_local_event_log_prune_last_seq,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_payload_bytes",
+            "bytes",
+            diagnostics.last_local_event_log_prune_payload_bytes,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_last_duration_ns",
+            "ns",
+            diagnostics.last_local_event_log_prune_duration_ns,
+        ),
+        (
             "metadata_redb_compaction_last_duration_ns",
             "ns",
             diagnostics.last_compaction_duration_ns,
@@ -940,7 +975,22 @@ fn insert_local_storage_diagnostics(
         }
     }
 
+    insert_counter(
+        section,
+        "metadata_redb_local_event_log_pruned_payload_bytes_total",
+        "bytes",
+        diagnostics.local_event_log_pruned_payload_bytes_total,
+    );
+
     for (name, value) in [
+        (
+            "metadata_redb_local_event_log_pruned_rows_total",
+            diagnostics.local_event_log_pruned_rows_total,
+        ),
+        (
+            "metadata_redb_local_event_log_prune_skipped_busy_total",
+            diagnostics.local_event_log_prune_skipped_busy_total,
+        ),
         (
             "metadata_redb_compaction_attempts_total",
             diagnostics.compaction_attempts,
@@ -1037,4 +1087,94 @@ fn insert_latency(
 
 fn ms_sum_to_ns(value: f64) -> u64 {
     (value.max(0.0) * 1_000_000.0).round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_event_prune_runtime_stats_use_documented_units() {
+        let diagnostics = LocalStorageDiagnostics {
+            local_dentry_mutation_baseline_rows: Some(4),
+            local_event_log_pruned_through_seq: Some(7),
+            local_event_log_pruned_rows_total: 2,
+            local_event_log_pruned_payload_bytes_total: 19,
+            local_event_log_prune_skipped_busy_total: 3,
+            last_local_event_log_prune_rows: Some(2),
+            last_local_event_log_prune_first_seq: Some(5),
+            last_local_event_log_prune_last_seq: Some(6),
+            last_local_event_log_prune_payload_bytes: Some(19),
+            last_local_event_log_prune_duration_ns: Some(23),
+            ..LocalStorageDiagnostics::default()
+        };
+        let mut section = RuntimeStatsSection::default();
+        insert_local_storage_diagnostics(&mut section, &diagnostics);
+
+        for (name, expected_unit, expected_value) in [
+            (
+                "metadata_redb_local_dentry_mutation_baseline_rows",
+                "count",
+                4,
+            ),
+            (
+                "metadata_redb_local_event_log_pruned_through_seq",
+                "count",
+                7,
+            ),
+            ("metadata_redb_local_event_log_prune_last_rows", "count", 2),
+            (
+                "metadata_redb_local_event_log_prune_last_first_seq",
+                "count",
+                5,
+            ),
+            (
+                "metadata_redb_local_event_log_prune_last_last_seq",
+                "count",
+                6,
+            ),
+            (
+                "metadata_redb_local_event_log_prune_last_payload_bytes",
+                "bytes",
+                19,
+            ),
+            (
+                "metadata_redb_local_event_log_prune_last_duration_ns",
+                "ns",
+                23,
+            ),
+        ] {
+            let metric = section
+                .gauges
+                .get(name)
+                .unwrap_or_else(|| panic!("missing gauge {name}"));
+            assert_eq!(metric.unit.as_ref(), expected_unit, "{name}");
+            assert_eq!(metric.value, expected_value, "{name}");
+        }
+
+        for (name, expected_unit, expected_value) in [
+            (
+                "metadata_redb_local_event_log_pruned_rows_total",
+                "count",
+                2,
+            ),
+            (
+                "metadata_redb_local_event_log_prune_skipped_busy_total",
+                "count",
+                3,
+            ),
+            (
+                "metadata_redb_local_event_log_pruned_payload_bytes_total",
+                "bytes",
+                19,
+            ),
+        ] {
+            let metric = section
+                .counters
+                .get(name)
+                .unwrap_or_else(|| panic!("missing counter {name}"));
+            assert_eq!(metric.unit.as_ref(), expected_unit, "{name}");
+            assert_eq!(metric.value, expected_value, "{name}");
+        }
+    }
 }

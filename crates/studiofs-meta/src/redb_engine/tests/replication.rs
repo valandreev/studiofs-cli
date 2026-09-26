@@ -27,6 +27,403 @@ fn first_event_seq_returns_lowest_durable_sequence() {
     assert_eq!(engine.first_event_seq().unwrap(), Some(1_000_000));
 }
 
+fn event_log_sequences(engine: &RedbMetaEngine) -> Vec<u64> {
+    let txn = engine.begin_read_txn().unwrap();
+    let events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+    events
+        .iter()
+        .unwrap()
+        .map(|row| row.unwrap().0.value())
+        .collect()
+}
+
+fn synthetic_prunable_event(name: &[u8]) -> Vec<u8> {
+    crate::events::encode_event(&crate::events::MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: name.to_vec(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn local_event_pruning_removes_bounded_prefix_below_exclusive_floor() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        let event = synthetic_prunable_event(b"test-event");
+        for seq in 1..=6 {
+            events.insert(seq, event.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 7).unwrap();
+
+    assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![3, 4, 5, 6]);
+    assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![5, 6]);
+    assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 0);
+    assert_eq!(engine.get_counter("nextEventSeq").unwrap(), 7);
+}
+
+#[test]
+fn local_event_pruning_removes_sparse_acknowledged_rows_across_batches() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        let event = synthetic_prunable_event(b"test-event");
+        for seq in [1, 2, 4, 5] {
+            events.insert(seq, event.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 6).unwrap();
+
+    assert_eq!(engine.prune_local_event_log_before(6, 2).unwrap().rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![4, 5]);
+    assert_eq!(engine.prune_local_event_log_before(6, 2).unwrap().rows, 2);
+    assert!(event_log_sequences(&engine).is_empty());
+}
+
+#[test]
+fn local_event_pruning_drop_before_commit_preserves_rows_and_floor() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        let event = synthetic_prunable_event(b"test-event");
+        for seq in 1..=3 {
+            events.insert(seq, event.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 4).unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let batch = RedbMetaEngine::prune_local_event_log_batch_in_txn(&txn, 4, 2).unwrap();
+    assert_eq!(batch.rows, 2);
+    assert_eq!(batch.first_seq, Some(1));
+    assert_eq!(batch.last_seq, Some(2));
+    drop(txn);
+
+    assert_eq!(event_log_sequences(&engine), vec![1, 2, 3]);
+    assert_eq!(
+        engine
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn local_event_pruning_never_expands_caller_exclusive_floor() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        let event = synthetic_prunable_event(b"test-event");
+        events.insert(10, event.as_slice()).unwrap();
+        events.insert(20, event.as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+    // Model a stale watermark to guard the helper's caller-supplied deletion ceiling.
+    engine
+        .set_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ, 50)
+        .unwrap();
+    engine
+        .set_counter(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION, 1)
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let batch = RedbMetaEngine::prune_local_event_log_batch_in_txn(&txn, 15, 10).unwrap();
+    assert_eq!(batch.rows, 0);
+    drop(txn);
+
+    assert_eq!(event_log_sequences(&engine), vec![10, 20]);
+}
+
+#[test]
+fn local_event_pruning_never_moves_persisted_floor_backwards() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        let event = synthetic_prunable_event(b"test-event");
+        for seq in [10, 20, 60] {
+            events.insert(seq, event.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine
+        .set_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ, 50)
+        .unwrap();
+    engine
+        .set_counter(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION, 1)
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let batch = RedbMetaEngine::prune_local_event_log_batch_in_txn(&txn, 100, 1).unwrap();
+    assert_eq!(batch.rows, 1);
+    txn.commit().unwrap();
+
+    assert_eq!(event_log_sequences(&engine), vec![20, 60]);
+    assert_eq!(
+        engine
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        50
+    );
+}
+
+#[test]
+fn local_event_pruning_rejects_legacy_floor_without_dentry_baseline() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    engine
+        .set_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ, 1)
+        .unwrap();
+
+    assert!(matches!(
+        engine.prune_local_event_log_before(2, 1),
+        Err(MetaError::Storage(_))
+    ));
+    assert!(matches!(
+        engine.prune_local_event_log_before(3, 1),
+        Err(MetaError::Storage(_))
+    ));
+}
+
+#[test]
+fn local_event_pruning_floor_and_sequence_survive_reopen() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("metadata.redb");
+    let engine = RedbMetaEngine::open(&path).unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        let event = synthetic_prunable_event(b"test-event");
+        for seq in [1, 2, 4, 5, 6] {
+            events.insert(seq, event.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    engine.set_counter("nextEventSeq", 7).unwrap();
+
+    let first_batch = engine.prune_local_event_log_before(6, 2).unwrap();
+    assert_eq!(first_batch.rows, 2);
+    assert_eq!(event_log_sequences(&engine), vec![4, 5, 6]);
+    drop(engine);
+
+    let reopened = RedbMetaEngine::open(&path).unwrap();
+    assert_eq!(event_log_sequences(&reopened), vec![4, 5, 6]);
+    assert_eq!(
+        reopened
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        2
+    );
+    assert_eq!(reopened.get_counter("nextEventSeq").unwrap(), 7);
+
+    let second_batch = reopened.prune_local_event_log_before(6, 2).unwrap();
+    assert_eq!(second_batch.rows, 2);
+    assert_eq!(event_log_sequences(&reopened), vec![6]);
+    assert_eq!(
+        reopened
+            .get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)
+            .unwrap(),
+        5
+    );
+}
+
+#[test]
+fn local_event_pruning_reports_range_payload_estimate_and_duration() {
+    let engine = temp_engine();
+    clear_event_log_for_test(&engine);
+    let txn = engine.begin_write_txn().unwrap();
+    let one = synthetic_prunable_event(b"one");
+    let two = synthetic_prunable_event(b"two-two");
+    let payload_bytes = u64::try_from(one.len() + two.len()).unwrap();
+    {
+        let mut events = txn.open_table(EVENT_LOG_TABLE).unwrap();
+        events.insert(1, one.as_slice()).unwrap();
+        events.insert(2, two.as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let batch = engine.prune_local_event_log_before(3, 2).unwrap();
+    assert_eq!(batch.rows, 2);
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.local_event_log_pruned_through_seq, Some(2));
+    assert_eq!(diagnostics.local_event_log_pruned_rows_total, 2);
+    assert_eq!(diagnostics.local_event_log_pruned_payload_bytes_total, payload_bytes);
+    assert_eq!(diagnostics.last_local_event_log_prune_rows, Some(2));
+    assert_eq!(diagnostics.last_local_event_log_prune_first_seq, Some(1));
+    assert_eq!(diagnostics.last_local_event_log_prune_last_seq, Some(2));
+    assert_eq!(diagnostics.last_local_event_log_prune_payload_bytes, Some(payload_bytes));
+    assert!(diagnostics.last_local_event_log_prune_duration_ns.is_some());
+
+    assert_eq!(
+        engine.prune_local_event_log_before(3, 2).unwrap().rows,
+        0,
+        "the follow-up pass should find no eligible rows"
+    );
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available after an idle prune pass");
+    assert_eq!(diagnostics.last_local_event_log_prune_rows, Some(0));
+    assert_eq!(diagnostics.last_local_event_log_prune_first_seq, Some(1));
+    assert_eq!(diagnostics.last_local_event_log_prune_last_seq, Some(2));
+}
+
+#[test]
+fn local_event_pruning_diagnostics_omit_floor_before_any_pruning() {
+    let engine = temp_engine();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(diagnostics.local_event_log_pruned_through_seq, None);
+}
+
+#[test]
+fn local_event_pruning_skips_write_transaction_before_the_first_sequence() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = Arc::new(temp_engine());
+    let blocked_writer = engine.begin_write_txn().unwrap();
+    let worker_engine = Arc::clone(&engine);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        sender
+            .send(worker_engine.prune_local_event_log_before(1, 10))
+            .unwrap();
+    });
+
+    let completed_without_writer = receiver.recv_timeout(Duration::from_secs(2));
+    let completed_on_time = completed_without_writer.is_ok();
+    drop(blocked_writer);
+    let result = match completed_without_writer {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune worker must finish after the held write transaction is released"),
+    };
+    worker.join().unwrap();
+
+    assert!(
+        completed_on_time,
+        "floor 1 has no eligible event rows and must not wait for the redb writer"
+    );
+    let batch = result.unwrap();
+    assert_eq!(batch.rows, 0);
+    assert!(!batch.skipped_busy, "no eligible rows is a successful no-op");
+}
+
+#[test]
+fn local_event_pruning_skips_write_transaction_after_persisted_floor() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = Arc::new(temp_engine());
+    engine
+        .set_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ, 9)
+        .unwrap();
+    engine
+        .set_counter(crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION, 1)
+        .unwrap();
+    let blocked_writer = engine.begin_write_txn().unwrap();
+    let worker_engine = Arc::clone(&engine);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        sender
+            .send(worker_engine.prune_local_event_log_before(10, 10))
+            .unwrap();
+    });
+
+    let completed_without_writer = receiver.recv_timeout(Duration::from_secs(2));
+    let completed_on_time = completed_without_writer.is_ok();
+    drop(blocked_writer);
+    let result = match completed_without_writer {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune worker must finish after the held write transaction is released"),
+    };
+    worker.join().unwrap();
+
+    assert!(
+        completed_on_time,
+        "a persisted floor covering every eligible sequence must not wait for the redb writer"
+    );
+    assert_eq!(result.unwrap().rows, 0);
+}
+
+#[test]
+fn local_event_pruning_skips_busy_writer_with_eligible_events() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = Arc::new(temp_engine());
+    clear_event_log_for_test(&engine);
+    engine
+        .create_file(ROOT_INO, b"busy-prune.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let event_seq = engine.first_event_seq().unwrap().unwrap();
+    let original_events = event_log_sequences(&engine);
+    let blocked_writer = engine.begin_write_txn().unwrap();
+    let worker_engine = Arc::clone(&engine);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        sender
+            .send(worker_engine.prune_local_event_log_before(event_seq + 1, 10))
+            .unwrap();
+    });
+
+    let completed_without_writer = receiver.recv_timeout(Duration::from_secs(2));
+    let completed_on_time = completed_without_writer.is_ok();
+    drop(blocked_writer);
+    let result = match completed_without_writer {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune worker must finish after the held write transaction is released"),
+    };
+    worker.join().unwrap();
+
+    assert!(completed_on_time, "background pruning must not wait for a busy writer");
+    assert_eq!(result.unwrap().rows, 0);
+    assert_eq!(event_log_sequences(&engine), original_events);
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        diagnostics.last_local_event_log_prune_rows,
+        None,
+        "a busy skip is not a completed zero-row attempt"
+    );
+    assert_eq!(
+        diagnostics.local_event_log_prune_skipped_busy_total, 1
+    );
+    assert!(
+        engine.prune_local_event_log_before(event_seq + 1, 10).unwrap().rows > 0,
+        "the next idle attempt must prune the eligible event"
+    );
+}
+
 #[test]
 fn test_replica_apply_keeps_namespace_in_base_only() {
     let engine = temp_engine();
@@ -382,7 +779,9 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
         .unwrap();
     let snapshot = source.export_remote_snapshot().unwrap();
 
-    let engine = temp_engine();
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("metadata.redb");
+    let engine = RedbMetaEngine::open(&path).unwrap();
     engine.import_snapshot(&snapshot).unwrap();
     engine
         .rename_atomic(ROOT_INO, b"source-link", ROOT_INO, b"renamed-link")
@@ -403,6 +802,12 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
         )
         .unwrap();
     assert!(engine.lookup(ROOT_INO, b"renamed-link").is_err());
+    let prune_cursor = engine.get_counter("nextEventSeq").unwrap();
+    let pruned = engine.prune_local_event_log_before(prune_cursor, 32).unwrap();
+    assert!(pruned.rows >= 2);
+    assert!(event_log_sequences(&engine).is_empty());
+    drop(engine);
+    let engine = RedbMetaEngine::open(&path).unwrap();
 
     let pg_winner = replica_rename_event(
         ROOT_INO,
@@ -438,6 +843,139 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
     engine
         .create_symlink(ROOT_INO, b"renamed-link", b"target-v2.txt", 0, 0)
         .expect("locally unlinked destination must be reusable");
+}
+
+#[test]
+fn replica_serving_rename_preserves_unflushed_unlink_after_create_was_pruned() {
+    let source = temp_engine();
+    let entry = source
+        .create_symlink(ROOT_INO, b"source-link", b"remote-target.txt", 0, 0)
+        .unwrap();
+    let snapshot = source.export_remote_snapshot().unwrap();
+
+    let engine = temp_engine();
+    engine.import_snapshot(&snapshot).unwrap();
+    engine
+        .create_symlink(ROOT_INO, b"destination-link", b"local-target.txt", 0, 0)
+        .unwrap();
+    let acknowledged_through = engine.get_counter("nextEventSeq").unwrap();
+    engine
+        .set_counter("pgLastFlushedLocalEventSeq", acknowledged_through)
+        .unwrap();
+    assert!(
+        engine
+            .prune_local_event_log_before(acknowledged_through, 16)
+            .unwrap()
+            .rows
+            > 0
+    );
+    assert!(event_log_sequences(&engine).is_empty());
+    engine.unlink(ROOT_INO, b"destination-link").unwrap();
+    assert_eq!(
+        engine.first_event_seq().unwrap(),
+        Some(acknowledged_through),
+        "the unlink event suffix must remain unacknowledged"
+    );
+
+    let pg_winner = replica_rename_event(
+        ROOT_INO,
+        b"source-link",
+        ROOT_INO,
+        b"destination-link",
+        DirEntryValue {
+            ino: entry.ino,
+            kind: entry.kind,
+        },
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&pg_winner))
+        .unwrap();
+
+    assert!(
+        engine.lookup(ROOT_INO, b"destination-link").is_err(),
+        "a retained local unlink must override a created baseline when foreign rename targets the name"
+    );
+}
+
+#[test]
+fn replica_serving_rename_can_reuse_pruned_local_create_then_remove_name() {
+    let source = temp_engine();
+    let entry = source
+        .create_symlink(ROOT_INO, b"source-link", b"remote-target.txt", 0, 0)
+        .unwrap();
+    let snapshot = source.export_remote_snapshot().unwrap();
+
+    let engine = temp_engine();
+    engine.import_snapshot(&snapshot).unwrap();
+    engine
+        .create_symlink(ROOT_INO, b"destination-link", b"local-target.txt", 0, 0)
+        .unwrap();
+    engine.unlink(ROOT_INO, b"destination-link").unwrap();
+    let prune_cursor = engine.get_counter("nextEventSeq").unwrap();
+    let rows_before = event_log_sequences(&engine).len();
+    assert!(rows_before > 1);
+    for _ in 0..rows_before {
+        let txn = engine.begin_write_txn().unwrap();
+        let batch = RedbMetaEngine::prune_local_event_log_batch_in_txn(&txn, prune_cursor, 1)
+            .unwrap();
+        assert_eq!(batch.rows, 1);
+        txn.commit().unwrap();
+    }
+    assert!(event_log_sequences(&engine).is_empty());
+
+    let pg_winner = replica_rename_event(
+        ROOT_INO,
+        b"source-link",
+        ROOT_INO,
+        b"destination-link",
+        DirEntryValue {
+            ino: entry.ino,
+            kind: entry.kind,
+        },
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&pg_winner))
+        .unwrap();
+
+    assert_eq!(engine.lookup(ROOT_INO, b"destination-link").unwrap().ino, entry.ino);
+}
+
+#[test]
+fn foreign_rename_rejects_legacy_pruned_log_without_dentry_baseline() {
+    let source = temp_engine();
+    let entry = source
+        .create_symlink(ROOT_INO, b"source-link", b"remote-target.txt", 0, 0)
+        .unwrap();
+    let snapshot = source.export_remote_snapshot().unwrap();
+    let engine = temp_engine();
+    engine.import_snapshot(&snapshot).unwrap();
+    engine
+        .set_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ, 1)
+        .unwrap();
+    let pg_winner = replica_rename_event(
+        ROOT_INO,
+        b"source-link",
+        ROOT_INO,
+        b"destination-link",
+        DirEntryValue {
+            ino: entry.ino,
+            kind: entry.kind,
+        },
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
+        .unwrap();
+
+    assert!(matches!(
+        engine.apply_replica_serving_state(std::slice::from_ref(&pg_winner)),
+        Err(MetaError::Storage(_))
+    ));
 }
 
 #[test]

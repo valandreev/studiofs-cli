@@ -1,7 +1,8 @@
 use super::*;
 use crate::redb_engine::layout::{encode_dentry_key, encode_xattr_key};
-use std::sync::Barrier;
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
+use std::time::Duration;
 
 fn uploaded_pending_file(pg: &PgMetaEngine, name: &[u8], object_id: u64) -> InodeAttr {
     let file = pg
@@ -51,6 +52,236 @@ fn flush_due_pending_skips_remote_validation_when_no_batch_is_due() {
         !pg.remote_format_validated.load(Ordering::Acquire),
         "idle flush must leave the pending format validation state unchanged"
     );
+}
+
+#[test]
+fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"prune-acknowledged", 0, 0, 0o755)
+        .expect("create acknowledged directory");
+    let cursor = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .expect("read acknowledged end");
+    pg.persist_flushed_event_seq(cursor)
+        .expect("persist acknowledged local cursor");
+
+    pg.create_file(ROOT_INO, b"prune-rejected", 0, 0, 0o644)
+        .expect("create rejected suffix");
+    let completed_end = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .expect("read completed suffix end");
+    assert!(completed_end > cursor + 1);
+    pg.reject_local_event_ranges(&[LocalEventRange {
+        start: cursor,
+        end: cursor + 1,
+    }])
+    .expect("mark the first suffix event rejected");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: cursor + 1,
+        end: completed_end,
+    }])
+    .expect("complete later suffix events");
+    pg.create_dir(ROOT_INO, b"prune-unprocessed", 0, 0, 0o755)
+        .expect("create unprocessed suffix");
+    let next_event_seq = pg
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .expect("read next event sequence");
+
+    let pruned = pg
+        .prune_local_event_log_once()
+        .expect("prune acknowledged local event prefix");
+
+    assert!(pruned.rows > 0);
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(cursor));
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
+    assert_eq!(
+        pg.local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap(),
+        next_event_seq,
+        "pruning must not renumber local event sequences"
+    );
+    assert!(
+        !pg.remote_format_validated.load(Ordering::Acquire),
+        "local pruning must not require PostgreSQL validation"
+    );
+}
+
+#[test]
+fn pruned_acknowledged_prefix_reopens_with_unacknowledged_journal_suffix() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    for name in [b"acknowledged-a".as_slice(), b"acknowledged-b"] {
+        pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create acknowledged directory");
+    }
+    let suffix_start = pg.local.get_counter("nextEventSeq").unwrap();
+    pg.persist_flushed_event_seq(suffix_start)
+        .expect("persist acknowledged prefix cursor");
+    pg.create_dir(ROOT_INO, b"unacknowledged", 0, 0, 0o755)
+        .expect("create unacknowledged suffix");
+    let suffix_end = pg.local.get_counter("nextEventSeq").unwrap();
+    let expected_suffix = pg
+        .local
+        .read_events_range(suffix_start, suffix_end)
+        .expect("read unacknowledged suffix before prune");
+    assert!(!expected_suffix.is_empty());
+
+    let pruned = pg
+        .prune_local_event_log_once()
+        .expect("prune acknowledged prefix");
+    assert!(pruned.rows > 0);
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(suffix_start));
+    drop(pg);
+
+    let reopened = PgMetaEngine::open_with_options(
+        dir.path().join("meta.redb"),
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("reopen local metadata without PostgreSQL");
+    let cursor = reopened.flushed_event_seq.load(Ordering::SeqCst);
+    assert_eq!(cursor, suffix_start);
+    let restored_suffix = reopened
+        .local
+        .read_events_range(cursor, suffix_end)
+        .expect("read retained suffix after reopen");
+    assert_eq!(restored_suffix, expected_suffix);
+
+    {
+        let mut state = reopened.pending_state.lock().unwrap();
+        *state = PendingReplicationState::default();
+    }
+    reopened
+        .restore_pending_state_from_local_log()
+        .expect("restore pending suffix after restart");
+    let state = reopened.pending_state.lock().unwrap();
+    assert!(state.force_flush);
+    assert_eq!(state.event_start, Some(suffix_start));
+    assert_eq!(state.event_end, suffix_end);
+}
+
+#[test]
+fn local_event_pruning_does_not_wait_for_pending_replication_state() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let pg = Arc::new(pg);
+    let pending_guard = pg.pending_state.lock().unwrap();
+    let worker_pg = Arc::clone(&pg);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        sender.send(worker_pg.prune_local_event_log_once()).unwrap();
+    });
+
+    let completed_without_pending = receiver.recv_timeout(Duration::from_secs(2));
+    let completed_on_time = completed_without_pending.is_ok();
+    drop(pending_guard);
+    let result = match completed_without_pending {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune worker must finish after pending state is released"),
+    };
+    worker.join().unwrap();
+
+    assert!(
+        completed_on_time,
+        "pruning only needs the durable cursor and must not hold pending replication state"
+    );
+    result.expect("local event pruning should complete");
+}
+
+#[test]
+fn background_local_event_pruning_drains_full_batches_up_to_its_budget() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let next_event_seq = 5_001;
+    let event = encode_event(&MetaEvent::RemovePendingDeletion { object_id: 1 }).unwrap();
+    let txn = pg.local.begin_write_txn().unwrap();
+    {
+        let mut events = txn
+            .open_table(redb::TableDefinition::<u64, &[u8]>::new("event_log"))
+            .unwrap();
+        events.retain(|_, _| false).unwrap();
+        for seq in 1..next_event_seq {
+            events.insert(seq, event.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    pg.local
+        .set_counter(crate::schema::counters::NEXT_EVENT_SEQ, next_event_seq)
+        .unwrap();
+    pg.persist_flushed_event_seq(next_event_seq)
+        .expect("persist acknowledged event cursor");
+
+    pg.prune_local_event_log_for_poll(&AtomicBool::new(false))
+        .expect("background prune should drain its bounded batch budget");
+
+    let diagnostics = pg
+        .local
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(
+        diagnostics.local_event_log_pruned_rows_total,
+        (LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS * LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL) as u64
+    );
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(4_097));
+    assert_eq!(
+        pg.local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap(),
+        next_event_seq
+    );
+}
+
+#[test]
+fn background_local_event_pruning_skips_work_after_shutdown() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"shutdown-pending", 0, 0, 0o755)
+        .expect("create pruneable event");
+    let cursor = pg.local.get_counter("nextEventSeq").unwrap();
+    pg.persist_flushed_event_seq(cursor)
+        .expect("acknowledge pruneable event");
+
+    pg.prune_local_event_log_for_poll(&AtomicBool::new(true))
+        .expect("shutdown should end background pruning");
+
+    assert_eq!(pg.local.first_event_seq().unwrap(), Some(1));
+    assert_eq!(
+        pg.local
+            .local_storage_diagnostics()
+            .unwrap()
+            .unwrap()
+            .local_event_log_pruned_rows_total,
+        0
+    );
+}
+
+#[test]
+fn background_local_event_pruning_stops_after_short_batch() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"short-prune-batch", 0, 0, 0o755)
+        .expect("create an acknowledged local event");
+    let cursor = pg.local.get_counter("nextEventSeq").unwrap();
+    let eligible_rows = usize::try_from(cursor - 1).unwrap();
+    assert!(eligible_rows < LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS);
+    pg.persist_flushed_event_seq(cursor)
+        .expect("acknowledge local events");
+
+    pg.prune_local_event_log_for_poll(&AtomicBool::new(false))
+        .expect("prune the short batch");
+
+    let diagnostics = pg.local.local_storage_diagnostics().unwrap().unwrap();
+    assert_eq!(
+        diagnostics.last_local_event_log_prune_rows,
+        Some(u64::try_from(eligible_rows).unwrap()),
+        "a second empty pass would replace the short batch's last-attempt result"
+    );
+    assert!(pg.local.first_event_seq().unwrap().is_none());
 }
 
 #[test]
@@ -699,8 +930,17 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
         "the local-only uploaded marker is deliberately acknowledged without a PG backlog"
     );
 
-    let mut repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
-    repair_snapshot.event_log.clear();
+    let prune = pg
+        .prune_local_event_log_once()
+        .expect("prune acknowledged local event history before repair");
+    assert!(prune.rows > 0);
+    assert_eq!(
+        pg.local.first_event_seq().expect("first retained event"),
+        None,
+        "the acknowledged local journal prefix should be absent before redb repair"
+    );
+
+    let repair_snapshot = pg.local.export_snapshot().expect("export repair snapshot");
     pg.local
         .import_remote_snapshot(&repair_snapshot)
         .expect("simulate repair with no retained local event rows");

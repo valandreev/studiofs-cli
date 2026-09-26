@@ -68,12 +68,35 @@ struct CachedLocalStoragePageStats {
     stats: LocalStoragePageStats,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalEventLogPruneStats {
+    rows_pruned: u64,
+    payload_bytes_pruned: u64,
+    skipped_busy: u64,
+    last_rows: Option<u64>,
+    last_first_seq: Option<u64>,
+    last_last_seq: Option<u64>,
+    last_payload_bytes: Option<u64>,
+    last_duration_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LocalEventLogPruneBatch {
+    pub(crate) rows: usize,
+    pub(crate) first_seq: Option<u64>,
+    pub(crate) last_seq: Option<u64>,
+    pub(crate) payload_bytes: u64,
+    pub(crate) floor_updated: bool,
+    pub(crate) skipped_busy: bool,
+}
+
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
     db: Option<Arc<RwLock<Database>>>,
     read_only_db: Option<Arc<ReadOnlyDatabase>>,
     metadata_path: PathBuf,
     local_storage_compaction: Mutex<LocalStorageCompactionStats>,
+    local_event_log_prune: Mutex<LocalEventLogPruneStats>,
     local_storage_page_stats: Mutex<Option<CachedLocalStoragePageStats>>,
     local_storage_page_stats_refresh: Mutex<()>,
     write_metrics: Arc<MetadataWriteMetrics>,
@@ -686,6 +709,24 @@ impl RedbMetaEngine {
             .write_txn_lock
             .lock()
             .map_err(|_| MetaError::Storage("redb write lock poisoned".to_string()))?;
+        self.begin_write_txn_with_guard(write_txn_guard)
+    }
+
+    fn try_begin_write_txn(&self) -> MetaResult<Option<RedbWriteTransaction<'_>>> {
+        let write_txn_guard = match self.write_txn_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(MetaError::Storage("redb write lock poisoned".to_string()));
+            }
+        };
+        self.begin_write_txn_with_guard(write_txn_guard).map(Some)
+    }
+
+    fn begin_write_txn_with_guard<'a>(
+        &'a self,
+        write_txn_guard: MutexGuard<'a, ()>,
+    ) -> MetaResult<RedbWriteTransaction<'a>> {
         let db = self.db.as_ref().ok_or_else(|| MetaError::AccessDenied {
             ino: ROOT_INO,
             principal: "snapshot-read-only".to_string(),
@@ -831,6 +872,7 @@ impl RedbMetaEngine {
             read_only_db: None,
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
+            local_event_log_prune: Mutex::default(),
             local_storage_page_stats: Mutex::default(),
             local_storage_page_stats_refresh: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
@@ -874,6 +916,7 @@ impl RedbMetaEngine {
             read_only_db: Some(Arc::new(db)),
             metadata_path: path.as_ref().to_path_buf(),
             local_storage_compaction: Mutex::default(),
+            local_event_log_prune: Mutex::default(),
             local_storage_page_stats: Mutex::default(),
             local_storage_page_stats_refresh: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
