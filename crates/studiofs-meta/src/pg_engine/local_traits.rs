@@ -1,9 +1,9 @@
 use super::{PendingMutationHint, PgMetaEngine};
 use crate::engine::{
-    DeferredDeleteRecord, LocalStorageCompactionResult, MetaAcl, MetaEngine, MetaFormat, MetaFsOps,
-    MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication,
-    MetaResult, MetaSymlink, MetaXattr, NamespaceMutation, PendingCreateRecord, UndoLogKind,
-    UndoLogRecord,
+    DeferredDeleteRecord, LocalStorageCompactionResult, LocalStorageDiagnostics, MetaAcl,
+    MetaEngine, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects,
+    MetaRecovery, MetaReplication, MetaResult, MetaSymlink, MetaXattr, NamespaceMutation,
+    PendingCreateRecord, UndoLogKind, UndoLogRecord,
 };
 use crate::types::*;
 use std::collections::HashSet;
@@ -351,6 +351,10 @@ impl MetaPayloadObjects for PgMetaEngine {
 impl MetaGc for PgMetaEngine {
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         self.local.compact_local_storage()
+    }
+
+    fn local_storage_diagnostics(&self) -> MetaResult<Option<LocalStorageDiagnostics>> {
+        self.local.local_storage_diagnostics()
     }
 
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {

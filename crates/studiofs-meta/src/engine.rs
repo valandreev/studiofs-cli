@@ -562,6 +562,64 @@ pub enum LocalStorageCompactionResult {
     NoWork,
 }
 
+/// Reason a local metadata storage compaction attempt could not proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalStorageCompactionSkipReason {
+    /// The VFS database lock was already held by another metadata operation.
+    DatabaseLockContended,
+    /// redb still had a transaction active when compaction was attempted.
+    ActiveTransaction,
+}
+
+/// Best-effort physical, page, event-log, and compaction diagnostics for local metadata redb.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalStorageDiagnostics {
+    /// Physical byte length of the metadata database file.
+    pub physical_file_bytes: Option<u64>,
+    /// Page count reported by redb.
+    pub allocated_pages: Option<u64>,
+    /// User-data leaf page count reported by redb.
+    pub leaf_pages: Option<u64>,
+    /// User-data B-tree branch page count reported by redb.
+    pub branch_pages: Option<u64>,
+    /// Key and value bytes stored in redb leaf pages, excluding index overhead.
+    pub stored_bytes: Option<u64>,
+    /// Metadata bytes reported by redb, including B-tree index overhead.
+    pub metadata_bytes: Option<u64>,
+    /// Fragmented bytes reported by redb, including free pages.
+    pub fragmented_bytes: Option<u64>,
+    /// Page size reported by redb.
+    pub page_size_bytes: Option<u64>,
+    /// Lowest sequence still present in the local metadata event log.
+    pub first_local_event_seq: Option<u64>,
+    /// Next event sequence to allocate; this is an exclusive end coordinate.
+    pub next_local_event_seq: Option<u64>,
+    /// End-exclusive sequence span still retained in the local metadata event log.
+    pub retained_local_event_span: Option<u64>,
+    /// Compaction calls since this metadata engine was opened.
+    pub compaction_attempts: u64,
+    /// Calls where redb compaction made progress.
+    pub compaction_compacted: u64,
+    /// Calls where redb had no compaction work.
+    pub compaction_no_work: u64,
+    /// Calls skipped because a lock or redb transaction was busy.
+    pub compaction_skipped_busy: u64,
+    /// Calls that returned a storage error.
+    pub compaction_errors: u64,
+    /// Outcome of the most recent attempt, if it did not return an error.
+    pub last_compaction_result: Option<LocalStorageCompactionResult>,
+    /// Whether the most recent attempt returned an error.
+    pub last_compaction_error: bool,
+    /// Busy reason for the most recent attempt, if it was skipped.
+    pub last_compaction_skip_reason: Option<LocalStorageCompactionSkipReason>,
+    /// Elapsed nanoseconds for the most recent attempt.
+    pub last_compaction_duration_ns: Option<u64>,
+    /// Physical file bytes immediately before the most recent successful compaction.
+    pub last_success_bytes_before: Option<u64>,
+    /// Physical file bytes immediately after the most recent successful compaction.
+    pub last_success_bytes_after: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Whether this engine instance is still allowed to accept new mutations.
 pub struct MetadataAuthorityStatus {
@@ -1586,6 +1644,14 @@ pub trait MetaGc: Send + Sync {
     /// busy, or had no work to do.
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
         Ok(LocalStorageCompactionResult::NoWork)
+    }
+
+    /// Return best-effort local metadata storage diagnostics, when supported.
+    ///
+    /// Implementations should use best-effort lock acquisition and avoid scanning
+    /// metadata rows or values to derive these metrics.
+    fn local_storage_diagnostics(&self) -> MetaResult<Option<LocalStorageDiagnostics>> {
+        Ok(None)
     }
 
     /// Add a block to pending deletions (mark for GC).

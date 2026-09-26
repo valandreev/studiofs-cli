@@ -753,6 +753,144 @@ fn local_storage_compaction_skips_when_read_transaction_is_active() {
 }
 
 #[test]
+fn local_storage_compaction_records_active_transaction_skip_reason() {
+    let engine = temp_engine();
+    let _read_txn = engine.begin_read_txn().unwrap();
+
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::SkippedBusy
+    );
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.compaction_attempts, 1);
+    assert_eq!(diagnostics.compaction_skipped_busy, 1);
+    assert_eq!(
+        diagnostics.last_compaction_result,
+        Some(LocalStorageCompactionResult::SkippedBusy)
+    );
+    assert_eq!(
+        diagnostics.last_compaction_skip_reason,
+        Some(LocalStorageCompactionSkipReason::ActiveTransaction)
+    );
+    assert!(diagnostics.last_compaction_duration_ns.is_some());
+}
+
+#[test]
+fn local_storage_diagnostics_report_empty_event_log_span() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let engine = RedbMetaEngine::open(dir.path().join("metadata.redb")).unwrap();
+
+    let diagnostics = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+
+    assert_eq!(diagnostics.first_local_event_seq, None);
+    assert_eq!(diagnostics.next_local_event_seq, Some(1));
+    assert_eq!(diagnostics.retained_local_event_span, Some(0));
+}
+
+#[test]
+fn local_storage_diagnostics_track_delete_and_compaction() {
+    const CHURN_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("sfs732_churn");
+
+    let engine = temp_engine();
+    let initial = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(initial.physical_file_bytes.is_some_and(|bytes| bytes > 0));
+    let next_before_event = initial
+        .next_local_event_seq
+        .expect("next local event sequence is available");
+
+    engine
+        .add_pending_deletion(7, 11)
+        .expect("append one local event");
+    let write = engine.begin_write_txn().unwrap();
+    {
+        let mut table = write.open_table(CHURN_TABLE).unwrap();
+        let payload = vec![b'x'; 8 * 1024];
+        for key in 0..128 {
+            table.insert(key, payload.as_slice()).unwrap();
+        }
+    }
+    write.commit().unwrap();
+
+    let before_delete = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    let first_event = before_delete
+        .first_local_event_seq
+        .expect("local event log has a retained event");
+    let next_event = next_before_event + 1;
+    assert_eq!(
+        before_delete.first_local_event_seq,
+        initial.first_local_event_seq.or(Some(next_before_event))
+    );
+    assert_eq!(before_delete.next_local_event_seq, Some(next_event));
+    assert_eq!(
+        before_delete.retained_local_event_span,
+        Some(next_event.saturating_sub(first_event))
+    );
+
+    let delete = engine.begin_write_txn().unwrap();
+    {
+        let mut table = delete.open_table(CHURN_TABLE).unwrap();
+        for key in 0..128 {
+            table.remove(key).unwrap();
+        }
+    }
+    delete.commit().unwrap();
+
+    let after_delete = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert!(
+        after_delete.stored_bytes.unwrap() < before_delete.stored_bytes.unwrap(),
+        "deleted rows must reduce redb stored bytes"
+    );
+    assert_ne!(
+        after_delete.fragmented_bytes, before_delete.fragmented_bytes,
+        "redb fragmentation statistics must reflect the deleted rows"
+    );
+
+    assert_eq!(
+        engine.compact_local_storage().unwrap(),
+        LocalStorageCompactionResult::Compacted
+    );
+    let after_compaction = engine
+        .local_storage_diagnostics()
+        .unwrap()
+        .expect("redb diagnostics are available");
+    assert_eq!(after_compaction.compaction_attempts, 1);
+    assert_eq!(after_compaction.compaction_compacted, 1);
+    assert_eq!(
+        after_compaction.last_compaction_result,
+        Some(LocalStorageCompactionResult::Compacted)
+    );
+    assert_eq!(
+        after_compaction.last_success_bytes_before,
+        after_delete.physical_file_bytes
+    );
+    assert_eq!(
+        after_compaction.last_success_bytes_after,
+        after_compaction.physical_file_bytes
+    );
+    assert!(
+        after_compaction.physical_file_bytes.unwrap() < after_delete.physical_file_bytes.unwrap(),
+        "the controlled compaction must shrink the metadata database"
+    );
+    assert!(after_compaction.last_compaction_duration_ns.is_some());
+}
+
+#[test]
 fn pending_deletions_limited_stops_at_limit() {
     let engine = temp_engine();
     engine.add_pending_deletion(10, 100).unwrap();

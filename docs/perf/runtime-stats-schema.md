@@ -109,6 +109,55 @@ Recommended latency names:
 | `object_io` | `get`, `put`, `delete` |
 | `metadata` | `commit`, `query`, `listener_poll` |
 
+## Local Metadata redb
+
+The `metadata` section exposes local metadata database measurements with the
+`metadata_redb_` prefix. The prefix and section identify the serving metadata
+database; these metrics do not describe `cache.redb`.
+
+| Metric | Kind / unit | Meaning |
+| --- | --- | --- |
+| `metadata_redb_physical_file_bytes` | gauge / bytes | Physical length of the local metadata database file. |
+| `metadata_redb_allocated_pages` | gauge / count | redb allocated page count. |
+| `metadata_redb_leaf_pages` | gauge / count | redb user-data leaf page count. |
+| `metadata_redb_branch_pages` | gauge / count | redb user-data branch page count. |
+| `metadata_redb_stored_bytes` | gauge / bytes | redb key and value bytes stored in leaf pages, excluding index overhead. |
+| `metadata_redb_metadata_bytes` | gauge / bytes | redb index and metadata bytes. |
+| `metadata_redb_fragmented_bytes` | gauge / bytes | redb fragmented data/metadata and free-page bytes. |
+| `metadata_redb_page_size_bytes` | gauge / bytes | redb page size. |
+| `metadata_redb_first_local_event_seq` | gauge / count | Lowest sequence still retained in the local metadata event log. Omitted when the event log is empty or unavailable. |
+| `metadata_redb_next_local_event_seq` | gauge / count | Exclusive next sequence to allocate. |
+| `metadata_redb_retained_local_event_span` | gauge / count | `next_local_event_seq - first_local_event_seq`, or zero when the event log is empty. This is a sequence span, not a row count. |
+| `metadata_redb_compaction_attempts_total` | counter / count | Compaction calls since this metadata engine opened. |
+| `metadata_redb_compaction_compacted_total` | counter / count | Calls where redb compaction made progress. |
+| `metadata_redb_compaction_no_work_total` | counter / count | Calls where redb reported no work. |
+| `metadata_redb_compaction_skipped_busy_total` | counter / count | Calls skipped because a database lock or redb transaction was active. |
+| `metadata_redb_compaction_errors_total` | counter / count | Calls that returned a storage error. |
+| `metadata_redb_compaction_last_duration_ns` | gauge / ns | Elapsed time for the latest compaction attempt. |
+| `metadata_redb_compaction_last_success_bytes_before` | gauge / bytes | Physical file bytes before the latest successful compaction. |
+| `metadata_redb_compaction_last_success_bytes_after` | gauge / bytes | Physical file bytes after the latest successful compaction. |
+
+The boolean result gauges are `metadata_redb_compaction_last_result_compacted`,
+`metadata_redb_compaction_last_result_no_work`,
+`metadata_redb_compaction_last_result_skipped_busy`, and
+`metadata_redb_compaction_last_result_error`. Each is `0` or `1`, and exactly
+one is `1` after an attempt. A busy attempt sets either
+`metadata_redb_compaction_last_skip_reason_database_lock_contended` or
+`metadata_redb_compaction_last_skip_reason_active_transaction` to `1`. These
+counters reset when the local metadata engine opens; no metric is persisted to
+redb.
+
+Physical file bytes and redb page statistics describe different things: the
+file may contain free or reusable pages, and redb stored bytes are not a count
+of logical StudioFS rows. The redb page gauges are best-effort. redb 4.3 exposes
+them through `WriteTransaction::stats()`, so StudioFS collects them only when
+the existing metadata writer mutex and nonblocking database read lock are
+available. The stats-only transaction is aborted without changing metadata
+rows. This can serialize metadata writes while the page/tree statistics are
+collected; an active stats reader does not take the exclusive database lock
+used by compaction. Page gauges are omitted if either try-lock is busy, while
+event-sequence and physical-size metrics use separate best-effort reads.
+
 ## Text Representation
 
 The local text representation is line-oriented and machine-readable:

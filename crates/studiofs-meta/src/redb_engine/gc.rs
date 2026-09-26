@@ -30,34 +30,159 @@ impl RedbMetaEngine {
         }
         Ok(())
     }
+
+    fn physical_file_size_bytes(&self) -> Option<u64> {
+        std::fs::metadata(&self.metadata_path)
+            .ok()
+            .map(|metadata| metadata.len())
+    }
+
+    fn record_local_storage_compaction(
+        &self,
+        result: &MetaResult<LocalStorageCompactionResult>,
+        skip_reason: Option<LocalStorageCompactionSkipReason>,
+        elapsed: std::time::Duration,
+        bytes_before: Option<u64>,
+        bytes_after: Option<u64>,
+    ) {
+        let mut diagnostics = self
+            .local_storage_compaction
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        diagnostics.compaction_attempts = diagnostics.compaction_attempts.saturating_add(1);
+        diagnostics.last_compaction_result = result.as_ref().ok().copied();
+        diagnostics.last_compaction_error = result.is_err();
+        diagnostics.last_compaction_skip_reason = skip_reason;
+        diagnostics.last_compaction_duration_ns =
+            Some(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+
+        match result {
+            Ok(LocalStorageCompactionResult::Compacted) => {
+                diagnostics.compaction_compacted =
+                    diagnostics.compaction_compacted.saturating_add(1);
+                diagnostics.last_success_bytes_before = bytes_before;
+                diagnostics.last_success_bytes_after = bytes_after;
+            }
+            Ok(LocalStorageCompactionResult::NoWork) => {
+                diagnostics.compaction_no_work = diagnostics.compaction_no_work.saturating_add(1);
+            }
+            Ok(LocalStorageCompactionResult::SkippedBusy) => {
+                diagnostics.compaction_skipped_busy =
+                    diagnostics.compaction_skipped_busy.saturating_add(1);
+            }
+            Err(_) => {
+                diagnostics.compaction_errors = diagnostics.compaction_errors.saturating_add(1);
+            }
+        }
+    }
+
+    fn read_event_log_diagnostics(
+        transaction: &redb::ReadTransaction,
+        diagnostics: &mut LocalStorageDiagnostics,
+    ) {
+        let Ok(events) = transaction.open_table(EVENT_LOG_TABLE) else {
+            return;
+        };
+        let Ok(first) = events.first() else {
+            return;
+        };
+        let first = first.map(|(seq, _)| seq.value());
+        let next = Self::read_counter_from_read_txn(transaction, "nextEventSeq")
+            .unwrap_or(0)
+            .max(1);
+        diagnostics.first_local_event_seq = first;
+        diagnostics.next_local_event_seq = Some(next);
+        diagnostics.retained_local_event_span =
+            Some(first.map_or(0, |first| next.saturating_sub(first)));
+    }
 }
 
 impl MetaGc for RedbMetaEngine {
     fn compact_local_storage(&self) -> MetaResult<LocalStorageCompactionResult> {
-        let Some(db) = self.db.as_ref() else {
-            return Ok(LocalStorageCompactionResult::NoWork);
+        let started = std::time::Instant::now();
+        let bytes_before = self.physical_file_size_bytes();
+        let mut skip_reason = None;
+        let result = (|| {
+            let Some(db) = self.db.as_ref() else {
+                return Ok(LocalStorageCompactionResult::NoWork);
+            };
+            let mut db = match db.try_write() {
+                Ok(db) => db,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    skip_reason = Some(LocalStorageCompactionSkipReason::DatabaseLockContended);
+                    return Ok(LocalStorageCompactionResult::SkippedBusy);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(MetaError::Storage("redb lock poisoned".to_string()));
+                }
+            };
+            match db.compact() {
+                Ok(true) => Ok(LocalStorageCompactionResult::Compacted),
+                Ok(false) => Ok(LocalStorageCompactionResult::NoWork),
+                // ReadTransaction outlives our short RwLock read guard; redb
+                // reports active transactions here.
+                Err(CompactionError::TransactionInProgress) => {
+                    skip_reason = Some(LocalStorageCompactionSkipReason::ActiveTransaction);
+                    Ok(LocalStorageCompactionResult::SkippedBusy)
+                }
+                Err(error) => Err(MetaError::Storage(format!(
+                    "failed to compact local redb: {error}"
+                ))),
+            }
+        })();
+        let bytes_after = matches!(&result, Ok(LocalStorageCompactionResult::Compacted))
+            .then(|| self.physical_file_size_bytes())
+            .flatten();
+        self.record_local_storage_compaction(
+            &result,
+            skip_reason,
+            started.elapsed(),
+            bytes_before,
+            bytes_after,
+        );
+        result
+    }
+
+    fn local_storage_diagnostics(&self) -> MetaResult<Option<LocalStorageDiagnostics>> {
+        let mut diagnostics = *self
+            .local_storage_compaction
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        diagnostics.physical_file_bytes = self.physical_file_size_bytes();
+
+        let read_transaction = if let Some(db) = self.db.as_ref() {
+            db.try_read().ok().and_then(|db| db.begin_read().ok())
+        } else {
+            self.read_only_db
+                .as_ref()
+                .and_then(|db| db.begin_read().ok())
         };
-        let mut db = match db.try_write() {
-            Ok(db) => db,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Ok(LocalStorageCompactionResult::SkippedBusy);
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(MetaError::Storage("redb lock poisoned".to_string()));
-            }
-        };
-        match db.compact() {
-            Ok(true) => Ok(LocalStorageCompactionResult::Compacted),
-            Ok(false) => Ok(LocalStorageCompactionResult::NoWork),
-            // ReadTransaction outlives our short RwLock read guard; redb
-            // reports active transactions here.
-            Err(CompactionError::TransactionInProgress) => {
-                Ok(LocalStorageCompactionResult::SkippedBusy)
-            }
-            Err(error) => Err(MetaError::Storage(format!(
-                "failed to compact local redb: {error}"
-            ))),
+        if let Some(transaction) = read_transaction {
+            Self::read_event_log_diagnostics(&transaction, &mut diagnostics);
         }
+
+        // redb 4.3 exposes page statistics on WriteTransaction. Acquire the
+        // existing writer mutex and database read lock without waiting, then
+        // abort the stats-only transaction. This does not take compaction's
+        // exclusive database lock; omit page metrics when either gate is busy.
+        if let (Some(db), Ok(_write_txn_guard)) = (self.db.as_ref(), self.write_txn_lock.try_lock())
+            && let Ok(db) = db.try_read()
+            && let Ok(transaction) = db.begin_write()
+        {
+            if let Ok(stats) = transaction.stats() {
+                diagnostics.allocated_pages = Some(stats.allocated_pages());
+                diagnostics.leaf_pages = Some(stats.leaf_pages());
+                diagnostics.branch_pages = Some(stats.branch_pages());
+                diagnostics.stored_bytes = Some(stats.stored_bytes());
+                diagnostics.metadata_bytes = Some(stats.metadata_bytes());
+                diagnostics.fragmented_bytes = Some(stats.fragmented_bytes());
+                diagnostics.page_size_bytes =
+                    Some(u64::try_from(stats.page_size()).unwrap_or(u64::MAX));
+            }
+            let _ = transaction.abort();
+        }
+
+        Ok(Some(diagnostics))
     }
 
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {

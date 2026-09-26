@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, Mutex, MutexGuard, Once, RwLock, RwLockReadGuard, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -37,6 +37,8 @@ const REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS: u64 = 1_000;
 pub struct RedbMetaEngine {
     db: Option<Arc<RwLock<Database>>>,
     read_only_db: Option<Arc<ReadOnlyDatabase>>,
+    metadata_path: PathBuf,
+    local_storage_compaction: Mutex<LocalStorageDiagnostics>,
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
     write_txn_lock: Mutex<()>,
@@ -752,6 +754,8 @@ impl RedbMetaEngine {
         let engine = Self {
             db: Some(db),
             read_only_db: None,
+            metadata_path: path.as_ref().to_path_buf(),
+            local_storage_compaction: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
             write_txn_lock: Mutex::new(()),
@@ -791,6 +795,8 @@ impl RedbMetaEngine {
         Ok(Self {
             db: None,
             read_only_db: Some(Arc::new(db)),
+            metadata_path: path.as_ref().to_path_buf(),
+            local_storage_compaction: Mutex::default(),
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability: None,
             write_txn_lock: Mutex::new(()),

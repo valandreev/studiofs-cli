@@ -348,6 +348,10 @@ impl<M> MetaGc for ReadOnlyMetaEngine<M>
 where
     M: ?Sized + MetaEngine,
 {
+    fn local_storage_diagnostics(&self) -> MetaResult<Option<LocalStorageDiagnostics>> {
+        self.inner.local_storage_diagnostics()
+    }
+
     fn add_pending_deletion(&self, _object_id: u64, _timestamp: i64) -> MetaResult<()> {
         Err(read_only_error(ROOT_INO))
     }
@@ -650,5 +654,30 @@ mod tests {
         assert_eq!(status.lifecycle, expected_lifecycle);
         assert_eq!(status.authority, MetadataAuthorityStatus::read_only());
         assert!(!status.allows_new_mutations());
+    }
+
+    #[test]
+    fn read_only_meta_forwards_local_storage_diagnostics() {
+        let dir = studiofs_test_support::workspace_target_tempdir("read-only-storage-stats-");
+        let path = dir.path().join("meta.redb");
+        let writable = RedbMetaEngine::open(&path).expect("open local metadata");
+        writable
+            .add_pending_deletion(7, 11)
+            .expect("write one local event");
+        drop(writable);
+
+        let inner = Arc::new(RedbMetaEngine::open_read_only(&path).expect("open read-only redb"));
+        let expected = inner
+            .local_storage_diagnostics()
+            .expect("read-only inner diagnostics")
+            .expect("redb supports local diagnostics");
+        let read_only = ReadOnlyMetaEngine::new(inner);
+
+        assert_eq!(
+            read_only
+                .local_storage_diagnostics()
+                .expect("forward local diagnostics"),
+            Some(expected)
+        );
     }
 }
