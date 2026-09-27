@@ -739,7 +739,11 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use std::future;
+    use std::future::{self, Future as _};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
 
     use super::{
@@ -751,6 +755,22 @@ mod tests {
     use studiofs_cache::local::LocalPayloadBackendError;
     use studiofs_data::store::DataError;
     use studiofs_meta::MetaError;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct WarningFlag(Arc<AtomicBool>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningFlag {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn background_tasks_share_one_join_deadline() {
@@ -820,6 +840,66 @@ mod tests {
         release_tx.send(()).expect("release compaction task");
         join.await;
         assert!(state.local_metadata_compaction_task.lock().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_compaction_join_waits_past_timeout_without_aborting_task() {
+        let state = ShutdownState::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            release_rx.await.expect("release compaction task");
+            completed_tx.send(()).expect("report task completion");
+        });
+        *state.local_metadata_compaction_task.lock() = Some(handle);
+
+        let mut join = Box::pin(StudioVfs::join_local_metadata_compaction_task(
+            &state,
+            Duration::from_millis(1),
+        ));
+        let before_timeout =
+            future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        assert!(before_timeout.is_pending());
+
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let after_timeout =
+            future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        assert!(
+            after_timeout.is_pending(),
+            "join must keep waiting for the task"
+        );
+
+        release_tx
+            .send(())
+            .expect("task must still be running after timeout");
+        join.await;
+        completed_rx
+            .await
+            .expect("compaction task must complete normally");
+        assert!(state.local_metadata_compaction_task.lock().is_none());
+    }
+
+    #[test]
+    fn cancelled_local_compaction_join_does_not_warn() {
+        let state = ShutdownState::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let handle = runtime.spawn(future::pending::<()>());
+        handle.abort();
+        *state.local_metadata_compaction_task.lock() = Some(handle);
+
+        let saw_warning = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(WarningFlag(Arc::clone(&saw_warning)));
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(StudioVfs::join_local_metadata_compaction_task(
+                &state,
+                Duration::from_secs(1),
+            ));
+        });
+
+        assert!(!saw_warning.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
