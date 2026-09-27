@@ -1473,12 +1473,21 @@ unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_v
         return;
     }
     let key = data as usize;
-    let token = interrupt_registry()
-        .get(&key)
-        .map(|entry| entry.value().clone());
-    if let Some(token) = token {
-        token.cancel();
+    // An unwind crossing this non-unwinding C ABI boundary aborts the process.
+    if !catch_interrupt_callback(|| {
+        let token = interrupt_registry()
+            .get(&key)
+            .map(|entry| entry.value().clone());
+        if let Some(token) = token {
+            token.cancel();
+        }
+    }) {
+        warn!("macFUSE interrupt callback panicked; request cancellation may be incomplete");
     }
+}
+
+fn catch_interrupt_callback(callback: impl FnOnce() + std::panic::UnwindSafe) -> bool {
+    std::panic::catch_unwind(callback).is_ok()
 }
 
 /// Low-level reply sender that consumes request ownership.
@@ -2195,6 +2204,13 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_callback_boundary_contains_unwind() {
+        assert!(!catch_interrupt_callback(|| {
+            std::panic::resume_unwind(Box::new("simulated callback panic"));
+        }));
+    }
+
+    #[test]
     fn interrupt_registry_callback_cancels_registered_token() {
         let key = next_interrupt_key();
         let token = CancellationToken::new();
@@ -2260,12 +2276,17 @@ mod tests {
         workers: usize,
         requests_per_worker: usize,
     ) -> Duration {
-        let barrier = Arc::new(std::sync::Barrier::new(workers + 1));
+        let ready_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
+        let start_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
+        let done_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
         let mut threads = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let barrier = Arc::clone(&barrier);
+            let ready_barrier = Arc::clone(&ready_barrier);
+            let start_barrier = Arc::clone(&start_barrier);
+            let done_barrier = Arc::clone(&done_barrier);
             threads.push(std::thread::spawn(move || {
-                barrier.wait();
+                ready_barrier.wait();
+                start_barrier.wait();
                 for _ in 0..requests_per_worker {
                     let key = next_interrupt_key();
                     let token = CancellationToken::new();
@@ -2276,13 +2297,14 @@ mod tests {
                     }
                     remove_interrupt_token(key);
                 }
-                barrier.wait();
+                done_barrier.wait();
             }));
         }
 
+        ready_barrier.wait();
         let started = Instant::now();
-        barrier.wait();
-        barrier.wait();
+        start_barrier.wait();
+        done_barrier.wait();
         let elapsed = started.elapsed();
         for thread in threads {
             thread.join().expect("benchmark worker should complete");

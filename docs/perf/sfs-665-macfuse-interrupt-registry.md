@@ -1,8 +1,8 @@
 # SFS-665 macFUSE Interrupt Registry Benchmark
 
-This record keeps the original mutex comparison and separates it from the
-follow-up benchmark, whose timing and workload were revised after code review.
-Do not compare numbers across those two benchmark methods.
+This record keeps the historical mutex comparisons and separates the current
+three-phase benchmark snapshot from earlier harnesses. Do not compare numbers
+across different benchmark methods.
 
 ## Original Mutex and Default DashMap Comparison
 
@@ -33,44 +33,76 @@ common registration/removal path from callback lookup and excludes worker
 joins, so this table remains historical evidence rather than a direct baseline
 for its newer measurements.
 
-## Corrected Mutex Baseline and Hasher Comparison
+## Paired Two-barrier Mutex Baseline and Hasher Comparison
 
-After code review, the ignored benchmark was updated to measure two workloads:
-`register-remove` covers the usual request path, while
-`register-callback-remove` deliberately invokes cancellation on every cycle to
-stress callback lookup. Each worker performs 25,000 cycles per sample. The
-benchmark warms both workloads once per worker count, takes seven samples,
-alternates workload order for each sample, starts timing before the start
-barrier, and stops after every worker reaches the completion barrier. Thread
-creation is outside the timed interval; joins happen after timing stops. The
-two barriers remain part of the measurement.
+The paired comparison below used the two-barrier harness. It measures two
+workloads: `register-remove` covers the usual request path, while
+`register-callback-remove` invokes cancellation on every cycle to stress
+callback lookup. Each worker performs 25,000 cycles per sample. The benchmark
+warms both workloads once per worker count, takes seven samples, alternates
+workload order, starts timing before the first barrier, and stops after every
+worker reaches the completion barrier. Thread creation and joins are outside
+the timed interval, but worker startup and scheduling while reaching the first
+barrier are included. Each cycle also creates and clones a fresh
+`CancellationToken`, so this is lifecycle cost rather than isolated map/hash
+throughput.
 
 The mutex variant used the registry and callback lock behavior from base commit
 `8215f783`; the benchmark harness was otherwise identical. It ran three times.
 Default-hasher DashMap ran three times, and `foldhash::fast::RandomState` ran
 four times. The table compares the median run-level median throughput for each
-variant; values are thousands of request lifecycles per second. Repeated
-results varied under host scheduling, especially at two and four workers.
+variant; values are thousands of request lifecycles per second. These variants
+are paired under the same method, but the included startup/scheduling jitter
+made results vary under host scheduling, especially at two and four workers.
+Treat this as historical evidence and do not compare it with the three-phase
+snapshot below.
 
 | Workers | Workload | Mutex | Default DashMap | Foldhash DashMap | Foldhash vs mutex |
 | ---: |---|---:|---:|---:|---:|
-| 1 | register/remove | 12,702 | 9,628 | 14,352 | +13.0% |
-| 1 | register/callback/remove | 8,056 | 5,581 | 8,448 | +4.9% |
-| 2 | register/remove | 6,616 | 10,678 | 12,149 | +83.6% |
-| 2 | register/callback/remove | 4,844 | 4,719 | 5,126 | +5.8% |
-| 4 | register/remove | 4,438 | 15,415 | 14,298 | +222.2% |
-| 4 | register/callback/remove | 3,094 | 11,291 | 11,160 | +260.7% |
-| 8 | register/remove | 3,934 | 15,332 | 15,689 | +298.8% |
-| 8 | register/callback/remove | 2,918 | 11,503 | 13,059 | +350.8% |
+| 1 | `register-remove` | 12,702 | 9,628 | 14,352 | +13.0% |
+| 1 | `register-callback-remove` | 8,056 | 5,581 | 8,448 | +4.9% |
+| 2 | `register-remove` | 6,616 | 10,678 | 12,149 | +83.6% |
+| 2 | `register-callback-remove` | 4,844 | 4,719 | 5,126 | +5.8% |
+| 4 | `register-remove` | 4,438 | 15,415 | 14,298 | +222.2% |
+| 4 | `register-callback-remove` | 3,094 | 11,291 | 11,160 | +260.7% |
+| 8 | `register-remove` | 3,934 | 15,332 | 15,689 | +298.8% |
+| 8 | `register-callback-remove` | 2,918 | 11,503 | 13,059 | +350.8% |
 
-The corrected comparison confirms that the mutex serializes concurrent
-registration and cleanup. At one worker, default DashMap was 24% slower than
+The paired comparison shows the mutex serializing concurrent registration and
+cleanup. At one worker, default DashMap was 24% slower than
 the mutex for register/remove and 31% slower for register/callback/remove;
 Foldhash was 13% and 5% faster, respectively. Foldhash improved these two
 single-worker paths over default DashMap by about 49–51%. Multi-worker hasher
 differences were smaller and mixed. This supports lower single-worker hashing
 overhead without claiming that hashing explains all of the historical 21.7%
 regression.
+
+## Current Three-phase Foldhash Snapshot
+
+The current harness waits for every worker at a `ready` barrier before starting
+the timer, then uses separate `start` and `done` barriers. It excludes thread
+creation and the initial readiness wait, but includes the start/completion
+barriers, worker scheduling during the measured work, and the fresh token
+allocation in each lifecycle. Workload names in the output and tables use the
+same hyphenated identifiers.
+
+One release-mode run after this timing change produced these within-run median
+values (each is the median of seven samples; the invocation was run once):
+
+| Workers | Workload | Foldhash requests/s | Elapsed |
+| ---: |---|---:|---:|
+| 1 | `register-remove` | 11,876,722 | 2.105 ms |
+| 1 | `register-callback-remove` | 6,564,264 | 3.808 ms |
+| 2 | `register-remove` | 11,685,085 | 4.279 ms |
+| 2 | `register-callback-remove` | 5,217,233 | 9.584 ms |
+| 4 | `register-remove` | 14,150,108 | 7.067 ms |
+| 4 | `register-callback-remove` | 10,281,014 | 9.727 ms |
+| 8 | `register-remove` | 15,755,527 | 12.694 ms |
+| 8 | `register-callback-remove` | 12,535,517 | 15.955 ms |
+
+This Foldhash-only snapshot cannot be combined with earlier two-barrier results
+because it has a different timer boundary. It remains an in-process synthetic
+measurement, not mounted filesystem throughput.
 
 ## Native Mounted Validation
 
