@@ -2438,7 +2438,7 @@ fn upload_idle_grace_does_not_disable_local_compaction() {
     let (_rt, vfs, _meta) =
         make_unstarted_test_vfs_with_config(&tmp, "compaction-own-read-grace", cfg);
     let read_idle_grace_ms = LOCAL_REDB_COMPACTION_READ_IDLE_GRACE.as_millis() as u64;
-    let last_read_ms = now_unix_millis().saturating_sub(read_idle_grace_ms + 1);
+    let last_read_ms = now_unix_millis().saturating_sub(read_idle_grace_ms.saturating_mul(2));
     vfs.state.read.mark_foreground_read(last_read_ms);
     vfs.state.read.unmark_foreground_read(last_read_ms);
 

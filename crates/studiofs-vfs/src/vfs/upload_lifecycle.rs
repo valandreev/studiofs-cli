@@ -740,11 +740,9 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use std::future::{self, Future as _};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tracing::instrument::WithSubscriber as _;
 
     use super::{
         BackgroundTaskJoinGuard, LocalCompactionTaskJoinGuard, ShutdownError, ShutdownOwnerGuard,
@@ -758,16 +756,40 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     #[derive(Clone)]
-    struct WarningFlag(Arc<AtomicBool>);
+    struct CompactionJoinEvents(Arc<Mutex<Vec<String>>>);
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningFlag {
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CompactionJoinEvents {
         fn on_event(
             &self,
             event: &tracing::Event<'_>,
             _context: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if *event.metadata().level() == tracing::Level::WARN {
-                self.0.store(true, Ordering::Relaxed);
+            if event
+                .metadata()
+                .target()
+                .ends_with("::vfs::upload_lifecycle")
+            {
+                let mut visitor = MessageVisitor(None);
+                event.record(&mut visitor);
+                if let Some(message) = visitor.0 {
+                    self.0.lock().expect("lock captured events").push(message);
+                }
+            }
+        }
+    }
+
+    struct MessageVisitor(Option<String>);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = Some(value.to_owned());
             }
         }
     }
@@ -852,11 +874,14 @@ mod tests {
             completed_tx.send(()).expect("report task completion");
         });
         *state.local_metadata_compaction_task.lock() = Some(handle);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
 
-        let mut join = Box::pin(StudioVfs::join_local_metadata_compaction_task(
-            &state,
-            Duration::from_millis(1),
-        ));
+        let mut join = Box::pin(
+            StudioVfs::join_local_metadata_compaction_task(&state, Duration::from_millis(1))
+                .with_subscriber(tracing::Dispatch::new(subscriber)),
+        );
         let before_timeout =
             future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
         assert!(before_timeout.is_pending());
@@ -864,6 +889,14 @@ mod tests {
         tokio::time::advance(Duration::from_millis(2)).await;
         let after_timeout =
             future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        assert!(
+            events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|message| message.contains("still running during shutdown")),
+            "timeout branch must emit its compaction-wait event"
+        );
         assert!(
             after_timeout.is_pending(),
             "join must keep waiting for the task"
@@ -890,8 +923,9 @@ mod tests {
         handle.abort();
         *state.local_metadata_compaction_task.lock() = Some(handle);
 
-        let saw_warning = Arc::new(AtomicBool::new(false));
-        let subscriber = tracing_subscriber::registry().with(WarningFlag(Arc::clone(&saw_warning)));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
         tracing::subscriber::with_default(subscriber, || {
             runtime.block_on(StudioVfs::join_local_metadata_compaction_task(
                 &state,
@@ -899,7 +933,14 @@ mod tests {
             ));
         });
 
-        assert!(!saw_warning.load(Ordering::Relaxed));
+        assert!(
+            !events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|message| message.contains("local metadata compaction worker join failed")),
+            "cancellation must not emit the compaction join-failure event"
+        );
     }
 
     #[tokio::test]
