@@ -47,7 +47,27 @@ cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_supe
 ## Test Layers
 
 1. Fast local/unit tests (default).
-2. Ignored integration tests with RustFS/S3 + PostgreSQL.
+2. PostgreSQL-only ignored metadata and CLI regressions, run automatically in RWX.
+3. Other ignored integration tests that need RustFS/S3, mounted filesystems, or multiple processes.
+
+### PostgreSQL CI gate
+
+The automatic Linux gate in `.rwx/ci.yml` starts an ephemeral `postgres:18-alpine`
+service and runs the ignored tests in `studiofs-meta`'s `pg_engine` module and
+the `studiofs` CLI binary, serially. It lists each selection before running it,
+prints the selected count and Cargo's pass/failure totals, and fails if the
+service is unhealthy or a selection matches zero tests. The service uses
+test-only trust authentication and contains no credentials. These tests do not
+need RustFS; S3-backed and mounted suites remain separate.
+
+For local runs, the ignored test helpers load `STUDIOFS_TEST_PG_DSN` from the
+workspace `.env` file when it is not already set. On macOS, use the OrbStack
+Docker context for the local PostgreSQL service.
+
+```bash
+cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1
+cargo test -p studiofs --bin studiofs -- --ignored --test-threads=1
+```
 
 ### SFS-638 Shutdown and Upload-Idle Regressions
 
@@ -267,7 +287,8 @@ subscriber and requires an explicitly selected unused WinFSP drive.
 | Focused lint/check validation | `cargo clippy -p <crate> --all-targets -- -D warnings` and `cargo check -p <crate>` |
 | Full fast suite | `cargo test --workspace --all-targets -- --nocapture` |
 | Full ignored integration suite | `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1` |
-| PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1` |
+| PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1` |
+| PG CLI tests | `cargo test -p studiofs --bin studiofs -- --ignored --test-threads=1` |
 | VFS ignored suite | `cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1` |
 | Local-first VFS fast checks (no S3) | See [Local-first VFS fast checks](#local-first-vfs-fast-checks-no-s3). |
 | CLI surface enforcement | `cargo test -p studiofs -- --nocapture` |

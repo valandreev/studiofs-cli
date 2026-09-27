@@ -125,11 +125,87 @@ tasks:
     env:
       RUSTFLAGS: "-Dwarnings"
 
+  - key: cargo-test-postgresql
+    use: [code, rust, linux-packages, cargo-fetch]
+    docker: true
+    run: |
+      set -euo pipefail
+
+      postgres_container=""
+      cleanup_postgres() {
+        if [[ -n "${postgres_container}" ]]; then
+          docker rm --force "${postgres_container}" >/dev/null 2>&1 || true
+        fi
+      }
+      trap cleanup_postgres EXIT
+
+      postgres_container="$(docker run --detach \
+        --env POSTGRES_HOST_AUTH_METHOD=trust \
+        --publish 127.0.0.1::5432 \
+        --health-cmd 'pg_isready -U postgres -d postgres' \
+        --health-interval 2s \
+        --health-timeout 5s \
+        --health-retries 30 \
+        postgres:18-alpine)"
+
+      postgres_status=""
+      for attempt in $(seq 1 60); do
+        postgres_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${postgres_container}")"
+        case "${postgres_status}" in
+          healthy)
+            break
+            ;;
+          unhealthy|exited|dead)
+            docker logs "${postgres_container}" >&2 || true
+            echo "PostgreSQL service failed health check: ${postgres_status}" >&2
+            exit 1
+            ;;
+        esac
+        sleep 1
+      done
+
+      if [[ "${postgres_status}" != "healthy" ]]; then
+        docker logs "${postgres_container}" >&2 || true
+        echo "PostgreSQL service did not become healthy within 60 seconds" >&2
+        exit 1
+      fi
+
+      postgres_port="$(docker port "${postgres_container}" 5432/tcp | awk -F: 'NR == 1 { print $NF }')"
+      if [[ ! "${postgres_port}" =~ ^[0-9]+$ ]]; then
+        echo "PostgreSQL service did not publish a usable host port" >&2
+        exit 1
+      fi
+
+      export STUDIOFS_TEST_PG_DSN="host=127.0.0.1 port=${postgres_port} user=postgres dbname=postgres sslmode=disable"
+
+      run_ignored_tests() {
+        local label="$1"
+        shift
+        local test_list
+        local test_count
+
+        test_list="$(cargo test "$@" -- --ignored --list)"
+        test_count="$(awk '/: test$/ { count += 1 } END { print count + 0 }' <<< "${test_list}")"
+        if [[ "${test_count}" -eq 0 ]]; then
+          echo "PostgreSQL test gate failed: ${label} matched zero ignored tests" >&2
+          return 1
+        fi
+
+        echo "PostgreSQL test gate selected ${test_count} ignored tests: ${label}"
+        cargo test "$@" -- --ignored --test-threads=1
+      }
+
+      run_ignored_tests "studiofs-meta pg_engine" -p studiofs-meta pg_engine::tests:: --lib
+      run_ignored_tests "studiofs CLI" -p studiofs --bin studiofs
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
   - key: ubuntu-linux
     use:
       - quality
       - cargo-test-linux-workspace
       - cargo-test-local-first-offline-vfs-fast
+      - cargo-test-postgresql
     run: echo "Ubuntu Linux checks passed"
 
   - key: rocky-linux
