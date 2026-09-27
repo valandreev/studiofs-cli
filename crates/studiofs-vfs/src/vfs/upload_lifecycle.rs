@@ -756,7 +756,7 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     #[derive(Clone)]
-    struct CompactionJoinEvents(Arc<Mutex<Vec<String>>>);
+    struct CompactionJoinEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CompactionJoinEvents {
         fn on_event(
@@ -772,7 +772,10 @@ mod tests {
                 let mut visitor = MessageVisitor(None);
                 event.record(&mut visitor);
                 if let Some(message) = visitor.0 {
-                    self.0.lock().expect("lock captured events").push(message);
+                    self.0
+                        .lock()
+                        .expect("lock captured events")
+                        .push((*event.metadata().level(), message));
                 }
             }
         }
@@ -889,14 +892,15 @@ mod tests {
         tokio::time::advance(Duration::from_millis(2)).await;
         let after_timeout =
             future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
-        assert!(
-            events
-                .lock()
-                .expect("lock captured events")
-                .iter()
-                .any(|message| message.contains("still running during shutdown")),
-            "timeout branch must emit its compaction-wait event"
-        );
+        {
+            let events = events.lock().expect("lock captured events");
+            assert!(
+                events
+                    .iter()
+                    .any(|(_, message)| message.contains("still running during shutdown")),
+                "timeout branch must emit its compaction-wait event"
+            );
+        }
         assert!(
             after_timeout.is_pending(),
             "join must keep waiting for the task"
@@ -933,13 +937,18 @@ mod tests {
             ));
         });
 
+        let events = events.lock().expect("lock captured events");
+        assert!(
+            !events.iter().any(
+                |(_, message)| message.contains("local metadata compaction worker join failed")
+            ),
+            "cancellation must not emit the compaction join-failure event"
+        );
         assert!(
             !events
-                .lock()
-                .expect("lock captured events")
                 .iter()
-                .any(|message| message.contains("local metadata compaction worker join failed")),
-            "cancellation must not emit the compaction join-failure event"
+                .any(|(level, _)| *level == tracing::Level::WARN),
+            "cancellation must not emit a compaction warning"
         );
     }
 
