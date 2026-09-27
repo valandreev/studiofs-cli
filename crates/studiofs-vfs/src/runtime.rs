@@ -635,9 +635,9 @@ pub struct MetaExecutor<M: ?Sized> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetaExecutorActivitySnapshot {
-    /// Generation advanced by observed foreground metadata work.
+    /// Generation advanced by foreground operations that explicitly record activity.
     pub(crate) activity_generation: u64,
-    /// In-flight foreground and maintenance metadata calls.
+    /// In-flight operations currently holding a `MetaExecutor` activity guard.
     pub(crate) active_calls: usize,
 }
 
@@ -701,7 +701,9 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
         self.backend.sync_engine()
     }
 
-    /// Return the synchronous metadata view and mark observed foreground work.
+    /// Return a synchronous metadata view and record foreground activity once.
+    ///
+    /// The returned view is not activity-guarded for the duration of its use.
     pub(crate) fn foreground_view(&self) -> Arc<M> {
         self.activity.record_activity();
         self.sync_view()

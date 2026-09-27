@@ -2420,6 +2420,7 @@ struct ShutdownState {
     uploader_shutdown_token: CancellationToken,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
+    local_metadata_compaction_task: OrderedMutex<Option<JoinHandle<()>>>,
     uploader_task: OrderedMutex<Option<JoinHandle<()>>>,
 }
 
@@ -2435,6 +2436,7 @@ impl ShutdownState {
             uploader_shutdown_token: CancellationToken::new(),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
+            local_metadata_compaction_task: OrderedMutex::new(None, LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }
     }
@@ -5070,7 +5072,7 @@ impl StudioVfs {
             return;
         }
         let vfs = self.clone();
-        self.track_background_task(tokio::spawn(async move {
+        self.set_local_metadata_compaction_task(tokio::spawn(async move {
             vfs.background_local_metadata_compaction().await;
         }));
     }
@@ -6825,6 +6827,13 @@ impl StudioVfs {
             return true;
         }
         self.os_cache.lock().active_foreground_handle_count() > 0
+    }
+
+    /// Return whether a foreground read is active or recent, excluding open handles.
+    fn foreground_read_active_for_compaction(&self) -> bool {
+        self.state
+            .read
+            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace)
     }
 
     fn foreground_reads_active(&self) -> bool {

@@ -43,18 +43,18 @@ impl LocalRedbCompactionSchedule {
         }
     }
 
-    /// Reset quiet time on foreground activity, but retain it while maintenance is active.
+    /// Reset on observed metadata/read activity; retain quiet time during maintenance.
     fn observe_activity(
         &mut self,
         now: Instant,
         activity_generation: u64,
         active_calls: usize,
-        foreground_io_active: bool,
+        recent_foreground_reads_active: bool,
         shutdown_requested: bool,
     ) -> Option<Duration> {
         if shutdown_requested
             || activity_generation != self.last_activity_generation
-            || foreground_io_active
+            || recent_foreground_reads_active
         {
             self.last_activity_generation = activity_generation;
             self.idle_since = None;
@@ -118,11 +118,13 @@ fn local_redb_compaction_worthwhile(diagnostics: &LocalStorageDiagnostics) -> bo
             >= file_bytes
 }
 
-/// Retry incomplete samples quickly and complete below-threshold samples hourly.
+/// Retry missing or incomplete samples quickly and complete below-threshold samples hourly.
 fn local_redb_compaction_diagnostics_retry_delay(
-    diagnostics: &LocalStorageDiagnostics,
+    diagnostics: Option<&LocalStorageDiagnostics>,
 ) -> Duration {
-    if diagnostics.physical_file_bytes.is_none() || diagnostics.fragmented_bytes.is_none() {
+    if diagnostics.is_none_or(|diagnostics| {
+        diagnostics.physical_file_bytes.is_none() || diagnostics.fragmented_bytes.is_none()
+    }) {
         LOCAL_REDB_COMPACTION_POLL_INTERVAL
     } else {
         LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK
@@ -1768,11 +1770,13 @@ impl StudioVfs {
     pub(super) async fn background_local_metadata_compaction(self: Arc<Self>) {
         let mut poll = tokio::time::interval(LOCAL_REDB_COMPACTION_POLL_INTERVAL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let shutdown_token = self.state.shutdown.background_shutdown_token.clone();
         let mut schedule =
             LocalRedbCompactionSchedule::new(self.meta.activity_snapshot().activity_generation);
 
         loop {
             tokio::select! {
+                _ = shutdown_token.cancelled() => break,
                 _ = self.state.shutdown.shutdown_notify.notified() => break,
                 _ = poll.tick() => {}
             }
@@ -1786,7 +1790,7 @@ impl StudioVfs {
                 now,
                 activity.activity_generation,
                 activity.active_calls,
-                self.foreground_io_active(),
+                self.foreground_read_active_for_compaction(),
                 self.shutdown_requested(),
             ) else {
                 continue;
@@ -1803,7 +1807,7 @@ impl StudioVfs {
                     let activity = vfs.meta.activity_snapshot();
                     if activity.activity_generation != expected_activity
                         || activity.active_calls != 1
-                        || vfs.foreground_io_active()
+                        || vfs.foreground_read_active_for_compaction()
                         || vfs.shutdown_requested()
                     {
                         return Ok((false, None));
@@ -1814,7 +1818,10 @@ impl StudioVfs {
             {
                 Ok((true, Some(diagnostics))) => diagnostics,
                 Ok((true, None)) => {
-                    schedule.defer_probe(Instant::now(), LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK);
+                    schedule.defer_probe(
+                        Instant::now(),
+                        local_redb_compaction_diagnostics_retry_delay(None),
+                    );
                     continue;
                 }
                 Ok((false, _)) => {
@@ -1834,7 +1841,7 @@ impl StudioVfs {
                 now,
                 activity.activity_generation,
                 activity.active_calls,
-                self.foreground_io_active(),
+                self.foreground_read_active_for_compaction(),
                 self.shutdown_requested(),
             ) else {
                 continue;
@@ -1845,7 +1852,7 @@ impl StudioVfs {
             if !local_redb_compaction_worthwhile(&diagnostics) {
                 schedule.defer_probe(
                     now,
-                    local_redb_compaction_diagnostics_retry_delay(&diagnostics),
+                    local_redb_compaction_diagnostics_retry_delay(Some(&diagnostics)),
                 );
                 continue;
             }
@@ -1859,7 +1866,7 @@ impl StudioVfs {
                     let activity_before = vfs.meta.activity_snapshot();
                     if activity_before.activity_generation != expected_activity
                         || activity_before.active_calls != 1
-                        || vfs.foreground_io_active()
+                        || vfs.foreground_read_active_for_compaction()
                         || vfs.shutdown_requested()
                     {
                         return Ok(None);
@@ -1871,7 +1878,7 @@ impl StudioVfs {
                     let activity_after = vfs.meta.activity_snapshot();
                     let foreground_work_arrived = activity_after.activity_generation
                         != activity_before.activity_generation
-                        || vfs.foreground_io_active();
+                        || vfs.foreground_read_active_for_compaction();
                     let diagnostics = engine.local_storage_diagnostics();
                     Ok(Some((
                         result,
@@ -2740,11 +2747,15 @@ mod tests {
         };
 
         assert_eq!(
-            local_redb_compaction_diagnostics_retry_delay(&incomplete),
+            local_redb_compaction_diagnostics_retry_delay(None),
             LOCAL_REDB_COMPACTION_POLL_INTERVAL
         );
         assert_eq!(
-            local_redb_compaction_diagnostics_retry_delay(&complete_but_below_threshold),
+            local_redb_compaction_diagnostics_retry_delay(Some(&incomplete)),
+            LOCAL_REDB_COMPACTION_POLL_INTERVAL
+        );
+        assert_eq!(
+            local_redb_compaction_diagnostics_retry_delay(Some(&complete_but_below_threshold)),
             LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK
         );
     }

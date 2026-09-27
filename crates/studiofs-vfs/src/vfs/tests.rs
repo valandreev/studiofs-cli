@@ -2388,6 +2388,55 @@ fn synchronization_state_snapshot_does_not_record_foreground_metadata_activity()
 }
 
 #[test]
+fn foreground_getattr_records_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "getattr-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.getattr(ROOT_INO).expect("get root attributes");
+
+    assert!(vfs.meta.activity_snapshot().activity_generation > generation);
+}
+
+#[test]
+fn idle_open_read_handle_does_not_block_compaction_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "idle-reader-compaction-activity");
+    let attr = vfs
+        .create(ROOT_INO, b"idle-reader.txt", 1000, 1000, 0o644)
+        .expect("create file");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open read handle");
+    let _ = vfs.prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+
+    assert!(vfs.foreground_io_active());
+    assert!(!vfs.foreground_read_active_for_compaction());
+
+    rt.block_on(async { vfs.release_fh(fh).await.expect("release read handle") });
+}
+
+#[test]
+fn local_metadata_compaction_worker_observes_sticky_shutdown() {
+    let tmp = runtime_stats_test_tempdir();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "compaction-sticky-shutdown");
+    vfs.state.shutdown.background_shutdown_token.cancel();
+
+    let result = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&vfs).background_local_metadata_compaction(),
+        )
+        .await
+    });
+
+    assert!(
+        result.is_ok(),
+        "a previously cancelled shutdown token must stop the worker promptly"
+    );
+}
+
+#[test]
 fn startup_compaction_skips_read_only_mounts() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_read_only_test_vfs(&tmp, "startup-compaction-read-only");

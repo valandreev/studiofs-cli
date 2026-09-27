@@ -79,6 +79,32 @@ impl Drop for BackgroundTaskJoinGuard<'_> {
     }
 }
 
+struct LocalCompactionTaskJoinGuard<'a> {
+    state: &'a super::ShutdownState,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl<'a> LocalCompactionTaskJoinGuard<'a> {
+    fn new(state: &'a super::ShutdownState, handle: JoinHandle<()>) -> Self {
+        Self {
+            state,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for LocalCompactionTaskJoinGuard<'_> {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let mut tracked = self.state.local_metadata_compaction_task.lock();
+        if tracked.is_none() {
+            *tracked = Some(handle);
+        }
+    }
+}
+
 struct UploaderTaskJoinGuard<'a> {
     state: &'a super::ShutdownState,
     handle: Option<JoinHandle<()>>,
@@ -172,6 +198,10 @@ enum ShutdownWaitResult {
 impl StudioVfs {
     pub(super) fn track_background_task(&self, handle: JoinHandle<()>) {
         self.state.shutdown.background_tasks.lock().push(handle);
+    }
+
+    pub(super) fn set_local_metadata_compaction_task(&self, handle: JoinHandle<()>) {
+        *self.state.shutdown.local_metadata_compaction_task.lock() = Some(handle);
     }
 
     pub(super) fn set_uploader_task(&self, handle: JoinHandle<()>) {
@@ -289,6 +319,20 @@ impl StudioVfs {
         };
         let mut guard = BackgroundTaskJoinGuard::new(&self.state.shutdown, handles);
         Self::join_background_task_handles(&mut guard.handles, timeout).await;
+    }
+
+    async fn join_local_metadata_compaction_task(state: &super::ShutdownState) {
+        let handle = state.local_metadata_compaction_task.lock().take();
+        let Some(handle) = handle else {
+            return;
+        };
+        let mut guard = LocalCompactionTaskJoinGuard::new(state, handle);
+        if let Some(handle) = guard.handle.as_mut()
+            && let Err(error) = handle.await
+        {
+            warn!(error = %error, "local metadata compaction worker join failed");
+        }
+        guard.handle.take();
     }
 
     async fn join_background_task_handles(handles: &mut Vec<JoinHandle<()>>, timeout: Duration) {
@@ -480,6 +524,7 @@ impl StudioVfs {
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.state.namespace.deferred.notify.notify_waiters();
+        Self::join_local_metadata_compaction_task(&self.state.shutdown).await;
         let deferred_namespace_result = self
             .wait_for_deferred_namespace_metadata_during_shutdown(background_join_timeout)
             .await;
@@ -669,8 +714,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BackgroundTaskJoinGuard, ShutdownError, ShutdownOwnerGuard, StudioVfs,
-        UploaderTaskJoinGuard, finish_shutdown_result, replay_shutdown_result,
+        BackgroundTaskJoinGuard, LocalCompactionTaskJoinGuard, ShutdownError, ShutdownOwnerGuard,
+        StudioVfs, UploaderTaskJoinGuard, finish_shutdown_result, replay_shutdown_result,
         select_metadata_barrier_error, select_shutdown_result, shutdown_recoverable_on_restart,
     };
     use crate::vfs::{ShutdownState, VfsError};
@@ -720,6 +765,45 @@ mod tests {
             .lock()
             .pop()
             .expect("cancelled join must restore the task handle");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn local_compaction_join_waits_for_task_completion() {
+        let state = ShutdownState::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = release_rx.await;
+        });
+        *state.local_metadata_compaction_task.lock() = Some(handle);
+
+        let mut join = Box::pin(StudioVfs::join_local_metadata_compaction_task(&state));
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut join)
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).expect("release compaction task");
+        join.await;
+        assert!(state.local_metadata_compaction_task.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_local_compaction_join_guard_restores_handle() {
+        let state = ShutdownState::new();
+        let handle = tokio::spawn(future::pending::<()>());
+
+        {
+            let _guard = LocalCompactionTaskJoinGuard::new(&state, handle);
+        }
+
+        let handle = state
+            .local_metadata_compaction_task
+            .lock()
+            .take()
+            .expect("cancelled join must restore the compaction handle");
         handle.abort();
         let _ = handle.await;
     }
