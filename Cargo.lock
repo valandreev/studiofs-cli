@@ -4955,6 +4955,7 @@ version = "0.1.1"
 dependencies = [
  "cc",
  "dashmap",
+ "foldhash 0.2.0",
  "libc",
  "lru",
  "parking_lot",

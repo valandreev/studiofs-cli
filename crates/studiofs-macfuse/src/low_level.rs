@@ -18,12 +18,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use studiofs_vfs::{KernelInvalidator, StudioVfs, VfsFuseInvalidationSnapshot};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
@@ -33,19 +34,66 @@ const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 // instead of dropping invalidations when this finite metadata budget is exhausted.
 const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
+#[cfg(test)]
+static INTERRUPT_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // Interrupt callbacks can race with request reply/drop after macFUSE has
-// copied callback data out of its session lock. This registry keeps callback
-// data as an opaque key instead of a Rust pointer; the mutex serializes cancel
-// lookup/removal at the cost of lower throughput under heavy interrupt load.
-static INTERRUPT_REGISTRY: OnceLock<ParkingMutex<HashMap<usize, CancellationToken>>> =
-    OnceLock::new();
+// copied callback data out of its session lock. Keep callback data as an opaque
+// key and shard independent requests so their registry operations can proceed
+// concurrently.
+type InterruptRegistry = DashMap<usize, CancellationToken, foldhash::fast::RandomState>;
+static INTERRUPT_REGISTRY: OnceLock<InterruptRegistry> = OnceLock::new();
 
-fn interrupt_registry() -> &'static ParkingMutex<HashMap<usize, CancellationToken>> {
-    INTERRUPT_REGISTRY.get_or_init(|| ParkingMutex::new(HashMap::new()))
+fn interrupt_registry() -> &'static InterruptRegistry {
+    INTERRUPT_REGISTRY.get_or_init(|| {
+        // Keys are locally generated, so the fast integer hasher is sufficient.
+        DashMap::with_hasher(foldhash::fast::RandomState::default())
+    })
+}
+
+#[cfg(test)]
+fn lock_interrupt_registry_for_test() -> std::sync::MutexGuard<'static, ()> {
+    INTERRUPT_REGISTRY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn insert_interrupt_token(key: usize, token: CancellationToken) -> bool {
+    match interrupt_registry().entry(key) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => {
+            drop(entry);
+            // The read task starts after registration, so cancelling its token
+            // makes this request return without replacing the existing entry.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| token.cancel()));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                error!(
+                    key,
+                    "macFUSE interrupt key collision; cancelling read request"
+                );
+            }));
+            false
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(token);
+            true
+        }
+    }
+}
+
+fn remove_interrupt_token(key: usize) {
+    interrupt_registry().remove(&key);
 }
 
 fn next_interrupt_key() -> usize {
-    NEXT_INTERRUPT_KEY.fetch_add(1, Ordering::Relaxed)
+    next_interrupt_key_from(&NEXT_INTERRUPT_KEY)
+}
+
+fn next_interrupt_key_from(next_key: &AtomicUsize) -> usize {
+    loop {
+        let key = next_key.fetch_add(1, Ordering::Relaxed);
+        if key != 0 {
+            return key;
+        }
+    }
 }
 
 pub(crate) mod raw {
@@ -1392,7 +1440,9 @@ impl Request {
         };
         self.clear_interrupt_token();
         let key = next_interrupt_key();
-        interrupt_registry().lock().insert(key, token);
+        if !insert_interrupt_token(key, token) {
+            return;
+        }
         self.interrupt_key = Some(key);
         // SAFETY: `raw` is a live low-level request. The callback data is an
         // opaque integer key, never a dereferenced pointer.
@@ -1416,7 +1466,7 @@ impl Request {
                 raw::fuse_req_interrupt_func(raw.as_ptr(), None, std::ptr::null_mut());
             }
         }
-        interrupt_registry().lock().remove(&key);
+        remove_interrupt_token(key);
     }
 
     fn as_ptr(&self) -> *mut raw::FuseReq {
@@ -1452,8 +1502,23 @@ unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_v
         return;
     }
     let key = data as usize;
-    if let Some(token) = interrupt_registry().lock().get(&key) {
-        token.cancel();
+    // An unwind crossing this non-unwinding C ABI boundary aborts the process.
+    let cancellation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let token = interrupt_registry()
+            .get(&key)
+            .map(|entry| entry.value().clone());
+        if let Some(token) = token {
+            token.cancel();
+        }
+    }));
+    if cancellation.is_err() {
+        // Tokio stops notifying this token's remaining waiters when a waker
+        // panics; they may stay asleep until another event polls them again.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            error!(
+                "macFUSE interrupt cancellation panicked; some waiters may remain asleep until polled again"
+            );
+        }));
     }
 }
 
@@ -1761,6 +1826,7 @@ fn reply_result(result: c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -2162,5 +2228,353 @@ mod tests {
         queue.close();
 
         assert_eq!(queue.next(), None);
+    }
+
+    fn invoke_interrupt_callback(key: usize) {
+        // SAFETY: The callback treats `data` as an opaque integer key and does
+        // not dereference either pointer.
+        unsafe { request_interrupted(std::ptr::null_mut(), key as *mut c_void) };
+    }
+
+    struct RegistryLookupWake {
+        key: usize,
+        registry_was_unlocked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::task::Wake for RegistryLookupWake {
+        fn wake(self: Arc<Self>) {
+            self.registry_was_unlocked.store(
+                interrupt_registry().try_get_mut(&self.key).is_present(),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    #[test]
+    fn request_interrupted_contains_panics_from_cancellation_and_logging() {
+        struct PanickingWake;
+
+        impl std::task::Wake for PanickingWake {
+            fn wake(self: Arc<Self>) {
+                std::panic::resume_unwind(Box::new("simulated waker panic"));
+            }
+        }
+
+        struct PanickingSubscriber {
+            saw_error: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl tracing::Subscriber for PanickingSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                self.saw_error.store(
+                    *event.metadata().level() == tracing::Level::ERROR,
+                    Ordering::Relaxed,
+                );
+                std::panic::resume_unwind(Box::new("simulated subscriber panic"));
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let _registry_lock = lock_interrupt_registry_for_test();
+        let saw_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatch = tracing::Dispatch::new(PanickingSubscriber {
+            saw_error: Arc::clone(&saw_error),
+        });
+        tracing::dispatcher::with_default(&dispatch, || {
+            let token = CancellationToken::new();
+            let mut cancelled = Box::pin(token.cancelled());
+            let waker = std::task::Waker::from(Arc::new(PanickingWake));
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(cancelled.as_mut().poll(&mut context).is_pending());
+
+            let key = next_interrupt_key();
+            assert!(
+                insert_interrupt_token(key, token.clone()),
+                "fresh key must be vacant"
+            );
+
+            invoke_interrupt_callback(key);
+
+            assert!(token.is_cancelled());
+            remove_interrupt_token(key);
+        });
+        assert!(
+            saw_error.load(Ordering::Relaxed),
+            "panic containment must emit an error-level diagnostic"
+        );
+    }
+
+    #[test]
+    fn interrupt_registry_callback_cancels_registered_token() {
+        let _registry_lock = lock_interrupt_registry_for_test();
+        let key = next_interrupt_key();
+        let token = CancellationToken::new();
+        assert!(
+            insert_interrupt_token(key, token.clone()),
+            "fresh key must be vacant"
+        );
+
+        invoke_interrupt_callback(key);
+
+        assert!(token.is_cancelled());
+        remove_interrupt_token(key);
+    }
+
+    #[test]
+    fn interrupt_registry_removal_makes_later_callback_a_noop() {
+        let _registry_lock = lock_interrupt_registry_for_test();
+        let key = next_interrupt_key();
+        let token = CancellationToken::new();
+        assert!(
+            insert_interrupt_token(key, token.clone()),
+            "fresh key must be vacant"
+        );
+        remove_interrupt_token(key);
+
+        invoke_interrupt_callback(key);
+
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn interrupt_registry_preserves_original_token_on_duplicate_key() {
+        let _registry_lock = lock_interrupt_registry_for_test();
+        let key = next_interrupt_key();
+        let original = CancellationToken::new();
+        let duplicate = CancellationToken::new();
+        let duplicate_registry_was_unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut duplicate_cancelled = Box::pin(duplicate.cancelled());
+        let waker = std::task::Waker::from(Arc::new(RegistryLookupWake {
+            key,
+            registry_was_unlocked: Arc::clone(&duplicate_registry_was_unlocked),
+        }));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(duplicate_cancelled.as_mut().poll(&mut context).is_pending());
+        assert!(
+            insert_interrupt_token(key, original.clone()),
+            "fresh key must be vacant"
+        );
+
+        let registration = insert_interrupt_token(key, duplicate.clone());
+        invoke_interrupt_callback(key);
+        let original_cancelled = original.is_cancelled();
+        let duplicate_was_cancelled = duplicate.is_cancelled();
+        let duplicate_fallback_released_registry =
+            duplicate_registry_was_unlocked.load(Ordering::Relaxed);
+        remove_interrupt_token(key);
+
+        assert!(!registration, "duplicate registration must be rejected");
+        assert!(
+            original_cancelled,
+            "callback must retain the original token"
+        );
+        assert!(
+            duplicate_was_cancelled,
+            "duplicate registration must cancel the newly registered read"
+        );
+        assert!(
+            duplicate_fallback_released_registry,
+            "duplicate fallback must drop the occupied entry before cancellation"
+        );
+    }
+
+    #[test]
+    fn request_interrupted_releases_registry_guard_before_cancelling() {
+        let _registry_lock = lock_interrupt_registry_for_test();
+        let key = next_interrupt_key();
+        let token = CancellationToken::new();
+        let registry_was_unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut cancelled = Box::pin(token.cancelled());
+        let waker = std::task::Waker::from(Arc::new(RegistryLookupWake {
+            key,
+            registry_was_unlocked: Arc::clone(&registry_was_unlocked),
+        }));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
+        assert!(
+            insert_interrupt_token(key, token.clone()),
+            "fresh key must be vacant"
+        );
+
+        invoke_interrupt_callback(key);
+
+        let woke_without_registry_guard = registry_was_unlocked.load(Ordering::Relaxed);
+        remove_interrupt_token(key);
+        assert!(token.is_cancelled());
+        assert!(
+            woke_without_registry_guard,
+            "callback must release the registry entry before notifying wakers"
+        );
+    }
+
+    #[test]
+    fn next_interrupt_key_skips_zero_after_wrap() {
+        let next_key = AtomicUsize::new(usize::MAX);
+
+        assert_eq!(next_interrupt_key_from(&next_key), usize::MAX);
+        assert_eq!(next_interrupt_key_from(&next_key), 1);
+    }
+
+    #[test]
+    fn interrupt_registry_callback_and_removal_are_race_safe() {
+        let _registry_lock = lock_interrupt_registry_for_test();
+        for _ in 0..64 {
+            let key = next_interrupt_key();
+            let token = CancellationToken::new();
+            assert!(
+                insert_interrupt_token(key, token),
+                "fresh key must be vacant"
+            );
+            let start = Arc::new(std::sync::Barrier::new(3));
+
+            let callback_start = Arc::clone(&start);
+            let callback = std::thread::spawn(move || {
+                callback_start.wait();
+                invoke_interrupt_callback(key);
+            });
+
+            let removal_start = Arc::clone(&start);
+            let removal = std::thread::spawn(move || {
+                removal_start.wait();
+                remove_interrupt_token(key);
+            });
+
+            start.wait();
+            callback.join().expect("interrupt callback should complete");
+            removal.join().expect("registry removal should complete");
+            assert!(
+                interrupt_registry().get(&key).is_none(),
+                "interrupt registry retained key {key} after concurrent removal"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupt_benchmark_span_uses_first_start_and_last_finish() {
+        let baseline = Instant::now();
+
+        assert_eq!(
+            interrupt_worker_span_duration(&[
+                (
+                    baseline + Duration::from_millis(2),
+                    baseline + Duration::from_millis(5)
+                ),
+                (baseline, baseline + Duration::from_millis(7)),
+            ]),
+            Duration::from_millis(7)
+        );
+    }
+
+    fn interrupt_worker_span_duration(worker_spans: &[(Instant, Instant)]) -> Duration {
+        let started = worker_spans
+            .iter()
+            .map(|(started, _)| *started)
+            .min()
+            .expect("benchmark always has at least one worker");
+        let finished = worker_spans
+            .iter()
+            .map(|(_, finished)| *finished)
+            .max()
+            .expect("benchmark always has at least one worker");
+        finished.duration_since(started)
+    }
+
+    fn measure_interrupt_registry_sample<const WITH_CALLBACK: bool>(
+        workers: usize,
+        requests_per_worker: usize,
+    ) -> Duration {
+        let ready_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
+        let start_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
+        let mut threads = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let ready_barrier = Arc::clone(&ready_barrier);
+            let start_barrier = Arc::clone(&start_barrier);
+            threads.push(std::thread::spawn(move || {
+                ready_barrier.wait();
+                start_barrier.wait();
+                let started = Instant::now();
+                for _ in 0..requests_per_worker {
+                    let key = next_interrupt_key();
+                    let token = CancellationToken::new();
+                    assert!(
+                        insert_interrupt_token(key, token.clone()),
+                        "fresh key must be vacant"
+                    );
+                    if WITH_CALLBACK {
+                        invoke_interrupt_callback(key);
+                        std::hint::black_box(token.is_cancelled());
+                    }
+                    remove_interrupt_token(key);
+                }
+                (started, Instant::now())
+            }));
+        }
+
+        ready_barrier.wait();
+        start_barrier.wait();
+        let worker_spans = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("benchmark worker should complete"))
+            .collect::<Vec<_>>();
+        interrupt_worker_span_duration(&worker_spans)
+    }
+
+    #[test]
+    #[ignore = "manual release-mode registry contention measurement"]
+    fn interrupt_registry_contention_benchmark() {
+        const REQUESTS_PER_WORKER: usize = 25_000;
+        const SAMPLES: usize = 7;
+
+        let _registry_lock = lock_interrupt_registry_for_test();
+        for workers in [1, 2, 4, 8] {
+            let _ = measure_interrupt_registry_sample::<false>(workers, REQUESTS_PER_WORKER);
+            let _ = measure_interrupt_registry_sample::<true>(workers, REQUESTS_PER_WORKER);
+            let mut elapsed_samples = [Vec::with_capacity(SAMPLES), Vec::with_capacity(SAMPLES)];
+
+            for sample in 0..SAMPLES {
+                let workloads = if sample % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
+                for with_callback in workloads {
+                    let elapsed = if with_callback {
+                        measure_interrupt_registry_sample::<true>(workers, REQUESTS_PER_WORKER)
+                    } else {
+                        measure_interrupt_registry_sample::<false>(workers, REQUESTS_PER_WORKER)
+                    };
+                    elapsed_samples[usize::from(with_callback)].push(elapsed);
+                }
+            }
+
+            for (workload, mut elapsed_samples) in ["register-remove", "register-callback-remove"]
+                .into_iter()
+                .zip(elapsed_samples)
+            {
+                elapsed_samples.sort_unstable();
+                let median = elapsed_samples[SAMPLES / 2];
+                let requests = workers * REQUESTS_PER_WORKER;
+                println!(
+                    "workload={workload} workers={workers} median_requests_per_second={:.0} median_elapsed_ms={:.3}",
+                    requests as f64 / median.as_secs_f64(),
+                    median.as_secs_f64() * 1_000.0,
+                );
+            }
+        }
     }
 }

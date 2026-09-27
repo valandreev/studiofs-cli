@@ -81,6 +81,7 @@ winfsp = "0.12"
 # Utils
 parking_lot = "0.12"
 dashmap = "6"
+foldhash = "0.2"
 mimalloc = "0.1"
 uuid = { version = "1", features = ["v4", "v5"] }
 tempfile = "3"
