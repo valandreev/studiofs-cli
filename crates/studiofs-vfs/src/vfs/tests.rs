@@ -2366,6 +2366,28 @@ fn runtime_stats_snapshot_does_not_record_foreground_metadata_activity() {
 }
 
 #[test]
+fn sync_status_does_not_record_foreground_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-status-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.sync_status();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
+fn synchronization_state_snapshot_does_not_record_foreground_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-state-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.synchronization_state_snapshot();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
 fn startup_compaction_skips_read_only_mounts() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_read_only_test_vfs(&tmp, "startup-compaction-read-only");

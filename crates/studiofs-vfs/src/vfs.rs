@@ -7497,7 +7497,7 @@ impl StudioVfs {
     }
 
     fn metadata_sync_status(&self) -> PgSyncStatus {
-        let mut status = self.meta.foreground_view().pg_sync_status();
+        let mut status = self.meta.run_sync_maintenance(|meta| meta.pg_sync_status());
         if self.read_only_mount {
             status.authority = MetadataAuthorityStatus::read_only();
         }
@@ -7515,7 +7515,9 @@ impl StudioVfs {
     }
 
     fn metadata_sync_diagnostics(&self) -> PgSyncDiagnostics {
-        let mut diagnostics = self.meta.foreground_view().pg_sync_diagnostics();
+        let mut diagnostics = self
+            .meta
+            .run_sync_maintenance(|meta| meta.pg_sync_diagnostics());
         #[cfg(test)]
         {
             let mut overridden = false;
@@ -7595,7 +7597,7 @@ impl StudioVfs {
 
     fn known_hard_lock_blocks_new_mutation(&self, ino: Ino) -> Option<FileLockLease> {
         let lease = self.known_file_lock_lease_snapshot(ino)?;
-        let self_client_id = self.meta.foreground_view().invalidation_sender_id();
+        let self_client_id = self.meta.sync_view().invalidation_sender_id();
         let self_exclusive_owner = self_client_id
             .as_deref()
             .is_some_and(|client_id| lease.exclusive_owner.as_deref() == Some(client_id));

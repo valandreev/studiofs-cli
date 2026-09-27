@@ -34,6 +34,7 @@ struct LocalRedbCompactionSchedule {
 }
 
 impl LocalRedbCompactionSchedule {
+    /// Initialize with the observed generation and no accumulated quiet time.
     fn new(activity_generation: u64) -> Self {
         Self {
             last_activity_generation: activity_generation,
@@ -42,6 +43,7 @@ impl LocalRedbCompactionSchedule {
         }
     }
 
+    /// Reset quiet time on foreground activity, but retain it while maintenance is active.
     fn observe_activity(
         &mut self,
         now: Instant,
@@ -52,11 +54,13 @@ impl LocalRedbCompactionSchedule {
     ) -> Option<Duration> {
         if shutdown_requested
             || activity_generation != self.last_activity_generation
-            || active_calls > 0
             || foreground_io_active
         {
             self.last_activity_generation = activity_generation;
             self.idle_since = None;
+            return None;
+        }
+        if active_calls > 0 {
             return None;
         }
 
@@ -64,20 +68,24 @@ impl LocalRedbCompactionSchedule {
         Some(now.saturating_duration_since(idle_since))
     }
 
+    /// Admit a probe after the quiet window and any previous retry deadline.
     fn ready_to_probe(&self, now: Instant, idle_for: Duration) -> bool {
         idle_for >= LOCAL_REDB_COMPACTION_IDLE_WINDOW
             && self.next_probe_at.is_none_or(|next| now >= next)
     }
 
+    /// Set the earliest time at which the next probe may run.
     fn defer_probe(&mut self, now: Instant, delay: Duration) {
         self.next_probe_at = Some(now + delay);
     }
 
+    /// Clear accumulated quiet time after recording a new generation.
     fn reset_idle(&mut self, activity_generation: u64) {
         self.last_activity_generation = activity_generation;
         self.idle_since = None;
     }
 
+    /// Schedule the bounded retry interval associated with this attempt's outcome.
     fn record_attempt<E>(
         &mut self,
         now: Instant,
@@ -94,6 +102,7 @@ impl LocalRedbCompactionSchedule {
     }
 }
 
+/// Apply physical-size, absolute-fragmentation, and relative-fragmentation thresholds.
 fn local_redb_compaction_worthwhile(diagnostics: &LocalStorageDiagnostics) -> bool {
     let (Some(file_bytes), Some(fragmented_bytes)) = (
         diagnostics.physical_file_bytes,
@@ -109,6 +118,7 @@ fn local_redb_compaction_worthwhile(diagnostics: &LocalStorageDiagnostics) -> bo
             >= file_bytes
 }
 
+/// Retry incomplete samples quickly and complete below-threshold samples hourly.
 fn local_redb_compaction_diagnostics_retry_delay(
     diagnostics: &LocalStorageDiagnostics,
 ) -> Duration {
@@ -2740,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn local_redb_compaction_idle_window_resets_on_activity_and_exclusions() {
+    fn local_redb_compaction_idle_window_resets_on_activity_and_preserves_maintenance() {
         let started = Instant::now();
         let mut schedule = LocalRedbCompactionSchedule::new(10);
         assert_eq!(
@@ -2763,21 +2773,32 @@ mod tests {
             schedule.observe_activity(activity_at, 11, 0, false, false),
             Some(Duration::ZERO)
         );
+
+        let maintenance_at =
+            activity_at + LOCAL_REDB_COMPACTION_IDLE_WINDOW - Duration::from_secs(1);
         assert_eq!(
-            schedule.observe_activity(activity_at, 11, 1, false, false),
+            schedule.observe_activity(maintenance_at, 11, 0, false, false),
+            Some(LOCAL_REDB_COMPACTION_IDLE_WINDOW - Duration::from_secs(1))
+        );
+        assert_eq!(
+            schedule.observe_activity(maintenance_at + Duration::from_secs(1), 11, 1, false, false),
             None
         );
         assert_eq!(
-            schedule.observe_activity(activity_at, 11, 0, true, false),
+            schedule.observe_activity(maintenance_at + Duration::from_secs(2), 11, 0, false, false),
+            Some(LOCAL_REDB_COMPACTION_IDLE_WINDOW + Duration::from_secs(1))
+        );
+        assert_eq!(
+            schedule.observe_activity(maintenance_at + Duration::from_secs(2), 11, 0, true, false),
             None
         );
         assert_eq!(
-            schedule.observe_activity(activity_at, 11, 0, false, true),
+            schedule.observe_activity(maintenance_at + Duration::from_secs(2), 11, 0, false, true),
             None
         );
         schedule.reset_idle(11);
         assert_eq!(
-            schedule.observe_activity(activity_at, 11, 0, false, false),
+            schedule.observe_activity(maintenance_at + Duration::from_secs(2), 11, 0, false, false),
             Some(Duration::ZERO)
         );
     }

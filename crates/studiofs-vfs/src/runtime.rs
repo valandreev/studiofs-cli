@@ -635,7 +635,9 @@ pub struct MetaExecutor<M: ?Sized> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetaExecutorActivitySnapshot {
+    /// Generation advanced by observed foreground metadata work.
     pub(crate) activity_generation: u64,
+    /// In-flight foreground and maintenance metadata calls.
     pub(crate) active_calls: usize,
 }
 
