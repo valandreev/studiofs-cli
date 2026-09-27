@@ -23,3 +23,8 @@ Remove-Item Env:STUDIOFS_REDB_CHURN_FILES
 Use the release profile for compaction timing comparisons and larger soak runs; debug-build timings are not comparable to optimized runs. On Linux or macOS, use `STUDIOFS_REDB_CHURN_FILES=1024 cargo test --release -p studiofs-meta local_metadata_churn_redb_growth_workload -- --ignored --nocapture` from the repository root. Add `STUDIOFS_REDB_CHURN_COMPACT=1` to that command to include compaction.
 
 Compare the reported values across runs and commits, but do not require identical physical bytes across filesystems or operating systems. Page statistics are best-effort and are printed as `None` when unavailable. The event log and metadata tombstones are reported as logical rows, separately from the visible namespace; their growth is evidence for retention work, not a platform-independent pass/fail threshold. This workload does not set a production compaction threshold.
+
+## Recorded baseline
+
+The Windows-only measurements collected for SFS-737 on 2026-09-27 are recorded
+in [the Windows redb growth baseline](sfs-737-windows-redb-growth-baseline.md).
