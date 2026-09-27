@@ -64,7 +64,25 @@ fn pg_dsn() -> Option<String> {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_test_database_is_reachable_for_ci_gate() {
-    let _dsn = pg_dsn().expect("PostgreSQL test gate requires a reachable STUDIOFS_TEST_PG_DSN");
+    let dsn = pg_dsn().expect("PostgreSQL test gate requires a reachable STUDIOFS_TEST_PG_DSN");
+    let metadata_query = run_async(async move {
+        let (client, connection) = crate::connect_studiofs_postgres(&dsn).await?;
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let result = client
+            .query_one("SELECT 1", &[])
+            .await
+            .map(|row| row.get::<_, i32>(0))
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()));
+        connection_task.abort();
+        let _ = connection_task.await;
+        result
+    });
+    assert!(
+        matches!(metadata_query, Ok(1)),
+        "PostgreSQL test gate must query the StudioFS metadata database"
+    );
 }
 
 fn run_async<T, F>(fut: F) -> MetaResult<T>
