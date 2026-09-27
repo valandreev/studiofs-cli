@@ -5691,10 +5691,17 @@ fn pg_background_checkpoint_coordinator_coalesces_two_clients_and_publishes_exac
     );
 
     assert!(
-        wait_until(Duration::from_secs(5), || {
-            !first.checkpoint_freshness_diagnostics().refresh_needed
-                && !second.checkpoint_freshness_diagnostics().refresh_needed
-        }),
+        wait_until(
+            PgMetaEngine::default_checkpoint_retry_interval()
+                .max(Duration::from_secs(
+                    super::super::checkpoint_coordinator::MAX_CHECKPOINT_RETRY_SECS,
+                ))
+                .saturating_add(Duration::from_secs(5)),
+            || {
+                !first.checkpoint_freshness_diagnostics().refresh_needed
+                    && !second.checkpoint_freshness_diagnostics().refresh_needed
+            },
+        ),
         "both checkpoint clients should observe the published checkpoint"
     );
 
