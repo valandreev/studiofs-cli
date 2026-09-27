@@ -54,19 +54,21 @@ cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_supe
 
 The automatic Linux gate in `.rwx/ci.yml` starts an ephemeral `postgres:18-alpine`
 service and runs the ignored tests in `studiofs-meta`'s `pg_engine` module and
-the `studiofs` CLI binary, serially. It lists each selection before running it,
-prints the selected count and Cargo's pass/failure totals, and fails if the
-service is unhealthy or a selection matches zero tests. The service uses
-test-only trust authentication and contains no credentials. These tests do not
-need RustFS; S3-backed and mounted suites remain separate.
+the `studiofs` CLI binary, serially. It skips the SFS-720 scalability benchmark,
+which remains a separate [performance measurement](plans/sfs-720-validate-monolithic-bootstrap-checkpoint-scalability.md).
+The gate lists each selection before running it, prints the selected count and
+Cargo's pass/failure totals, and fails if the service is unhealthy or a
+selection matches zero tests. The service uses test-only trust authentication
+and contains no credentials. These tests do not need RustFS; S3-backed and
+mounted suites remain separate.
 
 For local runs, the ignored test helpers load `STUDIOFS_TEST_PG_DSN` from the
 workspace `.env` file when it is not already set. On macOS, use the OrbStack
 Docker context for the local PostgreSQL service.
 
 ```bash
-cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1
-cargo test -p studiofs --bin studiofs -- --ignored --test-threads=1
+cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1 --nocapture --skip checkpoint_scalability
+cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --nocapture
 ```
 
 ### SFS-638 Shutdown and Upload-Idle Regressions
@@ -287,8 +289,8 @@ subscriber and requires an explicitly selected unused WinFSP drive.
 | Focused lint/check validation | `cargo clippy -p <crate> --all-targets -- -D warnings` and `cargo check -p <crate>` |
 | Full fast suite | `cargo test --workspace --all-targets -- --nocapture` |
 | Full ignored integration suite | `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1` |
-| PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1` |
-| PG CLI tests | `cargo test -p studiofs --bin studiofs -- --ignored --test-threads=1` |
+| PG metadata regressions (excluding SFS-720 benchmark) | `cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1 --nocapture --skip checkpoint_scalability` |
+| PG CLI tests | `cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --nocapture` |
 | VFS ignored suite | `cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1` |
 | Local-first VFS fast checks (no S3) | See [Local-first VFS fast checks](#local-first-vfs-fast-checks-no-s3). |
 | CLI surface enforcement | `cargo test -p studiofs -- --nocapture` |

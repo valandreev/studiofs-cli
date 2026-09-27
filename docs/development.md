@@ -158,8 +158,8 @@ $env:NO_PROXY='localhost,127.0.0.1,::1'
 
 Targeted:
 ```bash
-cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1
-cargo test -p studiofs --bin studiofs -- --ignored --test-threads=1
+cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1 --nocapture --skip checkpoint_scalability
+cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --nocapture
 cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-data --test integration_test -- --ignored --nocapture
 cargo test -p studiofs-e2e --test runner_contract

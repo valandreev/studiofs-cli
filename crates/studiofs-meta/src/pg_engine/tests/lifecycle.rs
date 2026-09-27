@@ -5690,6 +5690,14 @@ fn pg_background_checkpoint_coordinator_coalesces_two_clients_and_publishes_exac
         "background coordinator should publish a checkpoint"
     );
 
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !first.checkpoint_freshness_diagnostics().refresh_needed
+                && !second.checkpoint_freshness_diagnostics().refresh_needed
+        }),
+        "both checkpoint clients should observe the published checkpoint"
+    );
+
     first.prepare_for_close().expect("close first pg engine");
     second.prepare_for_close().expect("close second pg engine");
 
