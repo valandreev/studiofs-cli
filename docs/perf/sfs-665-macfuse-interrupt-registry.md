@@ -115,26 +115,30 @@ worker finish. This includes scheduling spread between workers while excluding
 time before any worker starts, thread creation, and thread join/exit. The
 completion boundary comes from worker timestamps, not another barrier. Each
 lifecycle still creates and clones a fresh `CancellationToken`, so allocator
-cost is included. The seven-sample medians below are from one release-mode run
-after this timing correction.
+cost is included. The command was run three times after this timing correction.
+Each cell below records that invocation's seven-sample median as
+`requests/s / elapsed ms`.
 
 Command:
 
     cargo test -p studiofs-macfuse --release --lib interrupt_registry_contention_benchmark -- --ignored --nocapture --test-threads=1
 
-| Workers | Workload | Foldhash requests/s | Elapsed |
-| ---: |---|---:|---:|
-| 1 | `register-remove` | 11,158,224 | 2.240 ms |
-| 1 | `register-callback-remove` | 6,018,175 | 4.154 ms |
-| 2 | `register-remove` | 12,465,719 | 4.011 ms |
-| 2 | `register-callback-remove` | 5,296,914 | 9.439 ms |
-| 4 | `register-remove` | 16,672,455 | 5.998 ms |
-| 4 | `register-callback-remove` | 11,780,933 | 8.488 ms |
-| 8 | `register-remove` | 14,925,373 | 13.400 ms |
-| 8 | `register-callback-remove` | 12,670,357 | 15.785 ms |
+| Workers | Workload | Run 1 | Run 2 | Run 3 |
+|---:|---|---:|---:|---:|
+| 1 | `register-remove` | 9,842,520 / 2.540 ms | 15,150,753 / 1.650 ms | 14,641,649 / 1.707 ms |
+| 1 | `register-callback-remove` | 5,941,418 / 4.208 ms | 8,661,884 / 2.886 ms | 8,288,668 / 3.016 ms |
+| 2 | `register-remove` | 12,174,707 / 4.107 ms | 12,007,924 / 4.164 ms | 12,721,973 / 3.930 ms |
+| 2 | `register-callback-remove` | 6,677,424 / 7.488 ms | 8,876,791 / 5.633 ms | 8,845,122 / 5.653 ms |
+| 4 | `register-remove` | 14,722,662 / 6.792 ms | 17,464,961 / 5.726 ms | 15,225,143 / 6.568 ms |
+| 4 | `register-callback-remove` | 11,666,967 / 8.571 ms | 12,746,092 / 7.846 ms | 12,202,004 / 8.195 ms |
+| 8 | `register-remove` | 16,610,606 / 12.041 ms | 16,481,083 / 12.135 ms | 15,908,736 / 12.572 ms |
+| 8 | `register-callback-remove` | 13,782,529 / 14.511 ms | 13,390,616 / 14.936 ms | 13,842,706 / 14.448 ms |
 
-This in-process synthetic measurement is not mounted filesystem throughput and
-is not comparable with the earlier timer boundaries above.
+Run-to-run medians vary most at one worker: register/remove ranges from 9.84M
+to 15.15M requests/s, and register/callback/remove from 5.94M to 8.66M. At
+eight workers, the respective ranges are 15.91M–16.61M and 13.39M–13.84M.
+This in-process synthetic measurement is not mounted filesystem throughput
+and is not comparable with the earlier timer boundaries above.
 
 ## Native Mounted Validation
 

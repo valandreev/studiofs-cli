@@ -49,6 +49,11 @@ read scenario when its services and runner are available.
   builds, and measure the span between actual worker starts and finishes.
   Record the new release benchmark results separately from previous timing
   methods.
+- [x] (2026-09-27 19:08Z) Resolve the four follow-up comments: make duplicate
+  registration cancel the incoming read without panicking or replacing the
+  occupied entry, log cancellation-waker failures at ERROR with the residual
+  wakeup risk documented, pin guard release with a nonblocking regression, and
+  record three worker-spanned benchmark invocations.
 
 ## Surprises & Discoveries
 
@@ -134,9 +139,21 @@ read scenario when its services and runner are available.
   distinct invalidation targets, not active reads, while read admission uses a
   byte-weighted semaphore. No measured shard-growth stall justifies a guessed
   capacity.
-- Added a debug assertion for duplicate registry keys. The generator does not
-  reuse a nonzero key until a full `usize` wrap, but the assertion makes an
-  accidental collision visible during development.
+- The duplicate-key debug assertion ran synchronously inside a non-unwinding
+  macFUSE read callback and could abort the daemon. Registration now preserves
+  the occupied entry, drops its shard guard, cancels the incoming read token,
+  and emits a caught error diagnostic; no panic is used as a development
+  tripwire.
+- A panic from one cancellation waker can stop Tokio's notification walk and
+  leave other waiters asleep until polled again. The callback now logs this
+  residual risk at ERROR. Arbitrary panic payload text is omitted because it
+  can contain secret-bearing data.
+- A regression waker probes `DashMap::try_get_mut` during notification. It
+  passes only when the callback has released the shard before calling
+  `cancel()`, and stays bounded even if a future edit keeps the guard alive.
+- The updated worker-spanned benchmark ran three times. Run-level medians show
+  noticeable one-worker variation; the complete per-invocation values and
+  ranges are recorded in the performance report.
 - Kept token allocation in the benchmark. Cancellation tokens are one-shot and
   production allocates one per asynchronous read; recycling cancelled tokens
   would no longer measure that lifecycle.
@@ -210,14 +227,16 @@ read scenario when its services and runner are available.
 
 The global mutex map is replaced by a `DashMap` using
 `foldhash::fast::RandomState`; callbacks clone the token before releasing the
-entry guard and cancelling. Callback keys skip zero after counter wrap, and a
-debug assertion detects duplicate registration. The race test verifies
-registry cleanup after both threads join. The benchmark measures ordinary
-registration/removal separately from forced callback lookup and spans the
-earliest worker start through the latest finish. Matched mutex and earlier
-Foldhash snapshots remain historical. Mounted timings overlap, so no end-to-end
-gain is claimed. The runner does not report interrupt callback counts, so
-cancellation frequency remains unmeasured.
+entry guard and cancelling. Callback keys skip zero after counter wrap.
+Duplicate registration preserves the existing token and cancels the new read
+after releasing the occupied shard. Cancellation-waker panics are contained and
+reported at ERROR, with the possibility of remaining sleepers stated in the
+diagnostic. Regressions check both guard-release paths. The race test verifies
+registry cleanup after both threads join. The worker-spanned benchmark measures
+ordinary registration/removal separately from forced callback lookup; three
+invocations and their spread are retained. Mounted timings overlap, so no
+end-to-end gain is claimed. The runner does not report interrupt callback
+counts, so cancellation frequency remains unmeasured.
 
 ## Context and Orientation
 
@@ -239,7 +258,8 @@ The registry uses the existing `DashMap` dependency with the workspace's
 ## Plan of Work
 
 The low-level tests characterize cancellation, removal, callback/removal races,
-duplicate-key detection, and the non-null key invariant at counter wrap. The
+safe duplicate-key fallback, guard release before cancellation, and the
+non-null key invariant at counter wrap. The
 ignored release benchmark has a normal register/remove mode and a forced
 callback stress mode. The current method uses ready/start barriers and records
 each worker's start and finish; prior paired and three-phase measurements remain
@@ -275,9 +295,11 @@ do not invent a runner scenario name.
 ## Validation and Acceptance
 
 The lifecycle tests must pass with a nonzero test count and prove callback
-cancellation, cancellation/log panic containment at the real callback, removal
-behavior, race cleanup, duplicate-key detection in debug builds, and that
-generated keys never become null at atomic wrap. The release benchmark must
+cancellation, cancellation/log panic containment at the real callback,
+error-level reporting when a waker panics, removal behavior, race cleanup,
+duplicate-key fallback without replacing the existing token, shard release
+before cancellation, and that generated keys never become null at atomic wrap.
+The release benchmark must
 measure both registration/removal and registration/callback/removal, with
 matched worker counts for mutex and DashMap variants. It must exclude thread
 creation, time before worker start, and joins from the timed interval. The
@@ -356,3 +378,17 @@ benchmark passed (1/1). `cargo check -p studiofs-macfuse`, Clippy with
 `-D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. The
 mounted scenario was not rerun for this callback and synthetic-benchmark review
 follow-up.
+
+Update (2026-09-27 19:08Z): the incoming token is now cancelled on duplicate
+registration after dropping the occupied DashMap entry; the original entry is
+preserved. The release-before-cancel regression uses nonblocking
+`try_get_mut`, and the panic-diagnostic test asserts ERROR while containing a
+panicking subscriber. Both added regressions were observed failing against
+their prior conditions, and the guard test also failed under a temporary
+guard-held mutation. Three fresh release benchmark invocations are recorded in
+`docs/perf/sfs-665-macfuse-interrupt-registry.md`.
+Validation (2026-09-27 19:08Z): `cargo test -p studiofs-macfuse --lib interrupt
+-- --test-threads=1` passed (9 passed, one ignored). The release benchmark
+passed three times; `cargo check -p studiofs-macfuse`, Clippy with `-D
+warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. No
+mounted scenario was rerun for these review-only corrections.
