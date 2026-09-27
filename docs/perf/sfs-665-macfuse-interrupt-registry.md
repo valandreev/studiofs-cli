@@ -1,8 +1,8 @@
 # SFS-665 macFUSE Interrupt Registry Benchmark
 
-This record keeps the historical mutex comparisons and separates the current
-three-phase benchmark snapshot from earlier harnesses. Do not compare numbers
-across different benchmark methods.
+This record keeps historical mutex comparisons separate from the current
+worker-spanned benchmark snapshot. Do not compare numbers across different
+benchmark methods.
 
 ## Original Mutex and Default DashMap Comparison
 
@@ -77,14 +77,14 @@ differences were smaller and mixed. This supports lower single-worker hashing
 overhead without claiming that hashing explains all of the historical 21.7%
 regression.
 
-## Current Three-phase Foldhash Snapshot
+## Previous Three-phase Foldhash Snapshot
 
-The current harness waits for every worker at a `ready` barrier before starting
-the timer, then uses separate `start` and `done` barriers. It excludes thread
-creation and the initial readiness wait, but includes the start/completion
-barriers, worker scheduling during the measured work, and the fresh token
-allocation in each lifecycle. Workload names in the output and tables use the
-same hyphenated identifiers.
+This earlier harness waited for every worker at a `ready` barrier before
+starting the timer, then used separate `start` and `done` barriers. It excluded
+thread creation and the initial readiness wait, but included the start and
+completion barriers, worker scheduling during the measured work, and the fresh
+token allocation in each lifecycle. Its values are retained as historical
+evidence; workload names use the same hyphenated identifiers.
 
 One release-mode run after this timing change produced these within-run median
 values (each is the median of seven samples; the invocation was run once):
@@ -102,7 +102,39 @@ values (each is the median of seven samples; the invocation was run once):
 
 This Foldhash-only snapshot cannot be combined with earlier two-barrier results
 because it has a different timer boundary. It remains an in-process synthetic
-measurement, not mounted filesystem throughput.
+measurement, not mounted filesystem throughput. It is superseded by the
+worker-spanned method below, which excludes barrier release time before actual
+worker work begins.
+
+## Worker-spanned Foldhash Snapshot
+
+The harness waits for all workers at `ready` and `start` barriers. Each worker
+records its own start immediately after the start barrier and its finish after
+the request loop. A sample spans the earliest worker start through the latest
+worker finish. This includes scheduling spread between workers while excluding
+time before any worker starts, thread creation, and thread join/exit. The
+completion boundary comes from worker timestamps, not another barrier. Each
+lifecycle still creates and clones a fresh `CancellationToken`, so allocator
+cost is included. The seven-sample medians below are from one release-mode run
+after this timing correction.
+
+Command:
+
+    cargo test -p studiofs-macfuse --release --lib interrupt_registry_contention_benchmark -- --ignored --nocapture --test-threads=1
+
+| Workers | Workload | Foldhash requests/s | Elapsed |
+| ---: |---|---:|---:|
+| 1 | `register-remove` | 11,158,224 | 2.240 ms |
+| 1 | `register-callback-remove` | 6,018,175 | 4.154 ms |
+| 2 | `register-remove` | 12,465,719 | 4.011 ms |
+| 2 | `register-callback-remove` | 5,296,914 | 9.439 ms |
+| 4 | `register-remove` | 16,672,455 | 5.998 ms |
+| 4 | `register-callback-remove` | 11,780,933 | 8.488 ms |
+| 8 | `register-remove` | 14,925,373 | 13.400 ms |
+| 8 | `register-callback-remove` | 12,670,357 | 15.785 ms |
+
+This in-process synthetic measurement is not mounted filesystem throughput and
+is not comparable with the earlier timer boundaries above.
 
 ## Native Mounted Validation
 

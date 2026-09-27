@@ -49,7 +49,11 @@ fn interrupt_registry() -> &'static InterruptRegistry {
 }
 
 fn insert_interrupt_token(key: usize, token: CancellationToken) {
-    interrupt_registry().insert(key, token);
+    let replaced = interrupt_registry().insert(key, token);
+    debug_assert!(
+        replaced.is_none(),
+        "interrupt token registered for already occupied key {key}"
+    );
 }
 
 fn remove_interrupt_token(key: usize) {
@@ -1474,20 +1478,19 @@ unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_v
     }
     let key = data as usize;
     // An unwind crossing this non-unwinding C ABI boundary aborts the process.
-    if !catch_interrupt_callback(|| {
+    let cancellation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let token = interrupt_registry()
             .get(&key)
             .map(|entry| entry.value().clone());
         if let Some(token) = token {
             token.cancel();
         }
-    }) {
-        warn!("macFUSE interrupt callback panicked; request cancellation may be incomplete");
+    }));
+    if cancellation.is_err() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            warn!("macFUSE interrupt callback panicked; request cancellation may be incomplete");
+        }));
     }
-}
-
-fn catch_interrupt_callback(callback: impl FnOnce() + std::panic::UnwindSafe) -> bool {
-    std::panic::catch_unwind(callback).is_ok()
 }
 
 /// Low-level reply sender that consumes request ownership.
@@ -1794,6 +1797,7 @@ fn reply_result(result: c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -2204,10 +2208,55 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_callback_boundary_contains_unwind() {
-        assert!(!catch_interrupt_callback(|| {
-            std::panic::resume_unwind(Box::new("simulated callback panic"));
-        }));
+    fn request_interrupted_contains_panics_from_cancellation_and_logging() {
+        struct PanickingWake;
+
+        impl std::task::Wake for PanickingWake {
+            fn wake(self: Arc<Self>) {
+                std::panic::resume_unwind(Box::new("simulated waker panic"));
+            }
+        }
+
+        struct PanickingSubscriber;
+
+        impl tracing::Subscriber for PanickingSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, _: &tracing::Event<'_>) {
+                std::panic::resume_unwind(Box::new("simulated subscriber panic"));
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let dispatch = tracing::Dispatch::new(PanickingSubscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            let token = CancellationToken::new();
+            let mut cancelled = Box::pin(token.cancelled());
+            let waker = std::task::Waker::from(Arc::new(PanickingWake));
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(cancelled.as_mut().poll(&mut context).is_pending());
+
+            let key = next_interrupt_key();
+            insert_interrupt_token(key, token.clone());
+
+            invoke_interrupt_callback(key);
+
+            assert!(token.is_cancelled());
+            remove_interrupt_token(key);
+        });
     }
 
     #[test]
@@ -2232,6 +2281,23 @@ mod tests {
         invoke_interrupt_callback(key);
 
         assert!(!token.is_cancelled());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn interrupt_registry_detects_duplicate_key_registration() {
+        let key = next_interrupt_key();
+        insert_interrupt_token(key, CancellationToken::new());
+
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            insert_interrupt_token(key, CancellationToken::new());
+        }));
+        remove_interrupt_token(key);
+
+        assert!(
+            duplicate.is_err(),
+            "duplicate interrupt keys must be rejected"
+        );
     }
 
     #[test]
@@ -2272,21 +2338,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interrupt_benchmark_span_uses_first_start_and_last_finish() {
+        let baseline = Instant::now();
+
+        assert_eq!(
+            interrupt_worker_span_duration(&[
+                (
+                    baseline + Duration::from_millis(2),
+                    baseline + Duration::from_millis(5)
+                ),
+                (baseline, baseline + Duration::from_millis(7)),
+            ]),
+            Duration::from_millis(7)
+        );
+    }
+
+    fn interrupt_worker_span_duration(worker_spans: &[(Instant, Instant)]) -> Duration {
+        let started = worker_spans
+            .iter()
+            .map(|(started, _)| *started)
+            .min()
+            .expect("benchmark always has at least one worker");
+        let finished = worker_spans
+            .iter()
+            .map(|(_, finished)| *finished)
+            .max()
+            .expect("benchmark always has at least one worker");
+        finished.duration_since(started)
+    }
+
     fn measure_interrupt_registry_sample<const WITH_CALLBACK: bool>(
         workers: usize,
         requests_per_worker: usize,
     ) -> Duration {
         let ready_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
         let start_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
-        let done_barrier = Arc::new(std::sync::Barrier::new(workers + 1));
         let mut threads = Vec::with_capacity(workers);
         for _ in 0..workers {
             let ready_barrier = Arc::clone(&ready_barrier);
             let start_barrier = Arc::clone(&start_barrier);
-            let done_barrier = Arc::clone(&done_barrier);
             threads.push(std::thread::spawn(move || {
                 ready_barrier.wait();
                 start_barrier.wait();
+                let started = Instant::now();
                 for _ in 0..requests_per_worker {
                     let key = next_interrupt_key();
                     let token = CancellationToken::new();
@@ -2297,19 +2392,17 @@ mod tests {
                     }
                     remove_interrupt_token(key);
                 }
-                done_barrier.wait();
+                (started, Instant::now())
             }));
         }
 
         ready_barrier.wait();
-        let started = Instant::now();
         start_barrier.wait();
-        done_barrier.wait();
-        let elapsed = started.elapsed();
-        for thread in threads {
-            thread.join().expect("benchmark worker should complete");
-        }
-        elapsed
+        let worker_spans = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("benchmark worker should complete"))
+            .collect::<Vec<_>>();
+        interrupt_worker_span_duration(&worker_spans)
     }
 
     #[test]
