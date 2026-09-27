@@ -38,10 +38,14 @@ static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // copied callback data out of its session lock. Keep callback data as an opaque
 // key and shard independent requests so their registry operations can proceed
 // concurrently.
-static INTERRUPT_REGISTRY: OnceLock<DashMap<usize, CancellationToken>> = OnceLock::new();
+type InterruptRegistry = DashMap<usize, CancellationToken, foldhash::fast::RandomState>;
+static INTERRUPT_REGISTRY: OnceLock<InterruptRegistry> = OnceLock::new();
 
-fn interrupt_registry() -> &'static DashMap<usize, CancellationToken> {
-    INTERRUPT_REGISTRY.get_or_init(DashMap::new)
+fn interrupt_registry() -> &'static InterruptRegistry {
+    INTERRUPT_REGISTRY.get_or_init(|| {
+        // Keys are locally generated, so the fast integer hasher is sufficient.
+        DashMap::with_hasher(foldhash::fast::RandomState::default())
+    })
 }
 
 fn insert_interrupt_token(key: usize, token: CancellationToken) {
@@ -53,7 +57,16 @@ fn remove_interrupt_token(key: usize) {
 }
 
 fn next_interrupt_key() -> usize {
-    NEXT_INTERRUPT_KEY.fetch_add(1, Ordering::Relaxed)
+    next_interrupt_key_from(&NEXT_INTERRUPT_KEY)
+}
+
+fn next_interrupt_key_from(next_key: &AtomicUsize) -> usize {
+    loop {
+        let key = next_key.fetch_add(1, Ordering::Relaxed);
+        if key != 0 {
+            return key;
+        }
+    }
 }
 
 pub(crate) mod raw {
@@ -2206,6 +2219,14 @@ mod tests {
     }
 
     #[test]
+    fn next_interrupt_key_skips_zero_after_wrap() {
+        let next_key = AtomicUsize::new(usize::MAX);
+
+        assert_eq!(next_interrupt_key_from(&next_key), usize::MAX);
+        assert_eq!(next_interrupt_key_from(&next_key), 1);
+    }
+
+    #[test]
     fn interrupt_registry_callback_and_removal_are_race_safe() {
         for _ in 0..64 {
             let key = next_interrupt_key();
@@ -2228,51 +2249,87 @@ mod tests {
             start.wait();
             callback.join().expect("interrupt callback should complete");
             removal.join().expect("registry removal should complete");
+            assert!(
+                interrupt_registry().get(&key).is_none(),
+                "interrupt registry retained key {key} after concurrent removal"
+            );
         }
+    }
+
+    fn measure_interrupt_registry_sample<const WITH_CALLBACK: bool>(
+        workers: usize,
+        requests_per_worker: usize,
+    ) -> Duration {
+        let barrier = Arc::new(std::sync::Barrier::new(workers + 1));
+        let mut threads = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..requests_per_worker {
+                    let key = next_interrupt_key();
+                    let token = CancellationToken::new();
+                    insert_interrupt_token(key, token.clone());
+                    if WITH_CALLBACK {
+                        invoke_interrupt_callback(key);
+                        std::hint::black_box(token.is_cancelled());
+                    }
+                    remove_interrupt_token(key);
+                }
+                barrier.wait();
+            }));
+        }
+
+        let started = Instant::now();
+        barrier.wait();
+        barrier.wait();
+        let elapsed = started.elapsed();
+        for thread in threads {
+            thread.join().expect("benchmark worker should complete");
+        }
+        elapsed
     }
 
     #[test]
     #[ignore = "manual release-mode registry contention measurement"]
     fn interrupt_registry_contention_benchmark() {
         const REQUESTS_PER_WORKER: usize = 25_000;
-        const SAMPLES: usize = 5;
+        const SAMPLES: usize = 7;
 
         for workers in [1, 2, 4, 8] {
-            let mut elapsed_samples = Vec::with_capacity(SAMPLES);
-            for _ in 0..SAMPLES {
-                let start = Arc::new(std::sync::Barrier::new(workers + 1));
-                let mut threads = Vec::with_capacity(workers);
-                for _ in 0..workers {
-                    let start = Arc::clone(&start);
-                    threads.push(std::thread::spawn(move || {
-                        start.wait();
-                        for _ in 0..REQUESTS_PER_WORKER {
-                            let key = next_interrupt_key();
-                            let token = CancellationToken::new();
-                            insert_interrupt_token(key, token.clone());
-                            invoke_interrupt_callback(key);
-                            std::hint::black_box(token.is_cancelled());
-                            remove_interrupt_token(key);
-                        }
-                    }));
-                }
+            let _ = measure_interrupt_registry_sample::<false>(workers, REQUESTS_PER_WORKER);
+            let _ = measure_interrupt_registry_sample::<true>(workers, REQUESTS_PER_WORKER);
+            let mut elapsed_samples = [Vec::with_capacity(SAMPLES), Vec::with_capacity(SAMPLES)];
 
-                let started = Instant::now();
-                start.wait();
-                for thread in threads {
-                    thread.join().expect("benchmark worker should complete");
+            for sample in 0..SAMPLES {
+                let workloads = if sample % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
+                for with_callback in workloads {
+                    let elapsed = if with_callback {
+                        measure_interrupt_registry_sample::<true>(workers, REQUESTS_PER_WORKER)
+                    } else {
+                        measure_interrupt_registry_sample::<false>(workers, REQUESTS_PER_WORKER)
+                    };
+                    elapsed_samples[usize::from(with_callback)].push(elapsed);
                 }
-                elapsed_samples.push(started.elapsed());
             }
 
-            elapsed_samples.sort_unstable();
-            let median = elapsed_samples[SAMPLES / 2];
-            let requests = workers * REQUESTS_PER_WORKER;
-            println!(
-                "workers={workers} median_requests_per_second={:.0} median_elapsed_ms={:.3}",
-                requests as f64 / median.as_secs_f64(),
-                median.as_secs_f64() * 1_000.0,
-            );
+            for (workload, mut elapsed_samples) in ["register-remove", "register-callback-remove"]
+                .into_iter()
+                .zip(elapsed_samples)
+            {
+                elapsed_samples.sort_unstable();
+                let median = elapsed_samples[SAMPLES / 2];
+                let requests = workers * REQUESTS_PER_WORKER;
+                println!(
+                    "workload={workload} workers={workers} median_requests_per_second={:.0} median_elapsed_ms={:.3}",
+                    requests as f64 / median.as_secs_f64(),
+                    median.as_secs_f64() * 1_000.0,
+                );
+            }
         }
     }
 }

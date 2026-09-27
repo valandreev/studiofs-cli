@@ -31,6 +31,16 @@ read scenario when its services and runner are available.
   concurrent-read scenario.
 - [x] (2026-09-27 16:01Z) Record measurements, mounted-run evidence, and the
   measurement boundary below.
+- [x] (2026-09-27 16:45Z) Verify the supplied review against the code and issue.
+  Add a nonzero-key wrap regression, assert race cleanup, separate ordinary
+  registration/removal from forced callback lookup, and stop benchmark timing
+  before thread joins.
+- [x] (2026-09-27 16:45Z) Compare the base mutex, default DashMap, and
+  Foldhash-backed DashMap with the corrected benchmark. The fast hasher removes
+  the one-worker regression seen with default DashMap; multi-worker results
+  remain workload-dependent.
+- [x] (2026-09-27 16:50Z) Re-run crate tests, check, Clippy, formatting, release
+  build, and the registered native scenario after the review follow-up.
 
 ## Surprises & Discoveries
 
@@ -59,6 +69,41 @@ read scenario when its services and runner are available.
 - The E2E scenario source is excluded from the code graph, so any scenario
   selection must be checked against its source and `cargo run -p studiofs-e2e
   -- list`.
+- A key of zero becomes a null `void *` when passed to macFUSE, and the callback
+  intentionally treats null as absent callback data. A red regression showed
+  that the atomic counter returned zero after wrapping; the generator now skips
+  that value.
+- The reviewed race test joined both threads but did not inspect final registry
+  state. It now checks that the key is absent after every concurrent callback
+  and removal pair.
+- The corrected benchmark has separate register/remove and
+  register/callback/remove workloads, alternates their order, warms both, and
+  stops at a completion barrier before joining workers. It measures ordinary
+  cancellable-read registration and cleanup separately from forced callback
+  lookup.
+- With that harness, the default DashMap was slower than the mutex at one
+  worker. An A/B using `foldhash::fast::RandomState` improved both one-worker
+  paths by about 49–51% versus default DashMap and put them 5–13% above the
+  mutex. At two and four workers, hasher results varied; at eight workers,
+  Foldhash remained near or above default DashMap. These are in-process
+  registry measurements, not mounted throughput.
+- The old and corrected benchmark timers differ: the original timing included
+  worker joins, while the corrected timing includes start/completion barrier
+  costs and excludes joins. Historical figures are retained but are not
+  compared directly with corrected measurements.
+- The corrected harness passed against the base mutex implementation, default
+  DashMap, and Foldhash-backed DashMap. At eight workers the Foldhash result was
+  15.7 million register/remove lifecycles per second and 13.1 million
+  register/callback/remove lifecycles per second; the mutex medians were 3.9
+  million and 2.9 million, respectively.
+- The rebuilt Foldhash binary passed the native `collision-overwrite-vs-read`
+  scenario in 8,344 ms. Setup, run, validation, runner cleanup, and mount
+  cleanup passed. This single run overlaps the earlier native timings and does
+  not establish an end-to-end throughput gain.
+- The first sandboxed native attempt stopped at preflight because access to the
+  configured OrbStack Docker socket and port checks was denied. Re-running the
+  same registered scenario with permission to access those local resources
+  passed; no product scenario ran during the failed preflight.
 
 ## Decision Log
 
@@ -88,20 +133,42 @@ read scenario when its services and runner are available.
   Rationale: One mutex run and two DashMap runs overlap in scenario duration,
   and the scenario does not report an interrupt callback count.
   Date/Author: 2026-09-27 / Codex.
+- Decision: Use `foldhash::fast::RandomState` as the DashMap hasher after an
+  A/B measurement.
+  Rationale: With identical workloads and timer boundaries, default DashMap
+  was 24–31% slower than the mutex at one worker, while Foldhash was 5–13%
+  faster than the mutex and roughly 49–51% faster than default DashMap. The
+  keys are generated locally, so the fast hasher's reduced resistance to
+  attacker-chosen collisions does not expose an untrusted-key boundary.
+  Date/Author: 2026-09-27 / Codex.
+- Decision: Skip zero when allocating callback keys.
+  Rationale: macFUSE receives the key as `void *`; zero is null and the callback
+  returns without cancellation for null callback data. A focused wrap test
+  reproduced the failure, and skipping zero fixes that exact contract violation.
+  Date/Author: 2026-09-27 / Codex.
+- Decision: Keep both benchmark workloads and time only through worker
+  completion.
+  Rationale: Every cancellable read registers and removes a token, while the
+  callback is only run for interrupted reads. A completion barrier excludes
+  thread teardown from the measurement, and the separate forced-callback mode
+  retains a stress case for lookup/cancel contention.
+  Date/Author: 2026-09-27 / Codex.
 
 ## Outcomes & Retrospective
 
-Completed. The global mutex map is now a `DashMap`, and callback cancellation
-uses a cloned token after the map guard is dropped. The low-level characterization
-tests pass, the full macFUSE library test run passed 185 tests with one ignored
-benchmark, `cargo check`, Clippy, formatting, and diff checks passed, and the
-registered native macFUSE concurrent read/overwrite scenario passed with
-cleanup for both binaries. The release benchmark improved eight-worker
-throughput by 218.0%; the one-worker result regressed by 21.7%. Mounted scenario
-durations were 9,192 ms for the mutex and 8,466/9,218 ms for `DashMap`, so no
-mounted performance gain is established. The benchmark isolates registry
-cycles, and the mounted scenario does not expose interrupt callback counts, so
-no claim is made about end-to-end cancellation frequency.
+The global mutex map is replaced by a `DashMap` using
+`foldhash::fast::RandomState`; callbacks clone the token before releasing the
+entry guard and cancelling. Callback keys skip zero after counter wrap, and the
+race test verifies registry cleanup after both threads join. The revised
+benchmark measures ordinary registration/removal separately from forced
+callback lookup and stops timing before worker joins. Its matched mutex
+comparison shows substantial multi-worker improvement and the fast hasher
+removes the measured one-worker regression. All 186 macFUSE library tests
+passed, with the manual benchmark ignored in that suite; `cargo check`, Clippy,
+formatting, diff checks, release build, and the registered native scenario
+passed. Mounted timings overlap, so no end-to-end gain is claimed. The runner
+does not report interrupt callback counts, so cancellation frequency remains
+unmeasured.
 
 ## Context and Orientation
 
@@ -113,59 +180,66 @@ key. `Request::take_raw` and `Drop` both use the same cleanup method.
 `crates/studiofs-macfuse/src/adapter.rs` registers the read cancellation token
 from `StudioVfsAdapter::queue_read_reply`.
 
-The registry change is limited to synchronization for those entries. It must
-not alter read admission, local-first I/O, FFI callback data, request ownership,
-or shutdown state. A callback lookup returns a `CancellationToken` clone; the
-map guard must be gone before `cancel()` runs. No new crate dependency is
-needed.
+The registry change is limited to synchronization and hashing for those
+entries. It must not alter read admission, local-first I/O, FFI callback data,
+request ownership, or shutdown state. A callback lookup returns a
+`CancellationToken` clone; the map guard must be gone before `cancel()` runs.
+The registry uses the existing `DashMap` dependency with the workspace's
+`foldhash` dependency declared directly for this crate.
 
 ## Plan of Work
 
-The low-level tests characterize cancellation, removal, and callback/removal
-races. The ignored release benchmark recorded the mutex baseline before the
-map change. The eight-worker result showed measurable contention, so the
-registry now uses the existing `DashMap`. Registration still inserts before
-FFI callback setup, callbacks clone the token before releasing the entry guard
-and cancelling, and teardown still unregisters FFI before map removal. The same
-tests and benchmark passed after the change; crate checks and the registered
-native macFUSE concurrent-read scenario also passed.
+The low-level tests characterize cancellation, removal, callback/removal races,
+and the non-null key invariant at counter wrap. The ignored release benchmark
+has a normal register/remove mode and a forced callback stress mode. A corrected
+run measured the base mutex implementation, default DashMap, and DashMap with
+`foldhash::fast::RandomState`; it stops timing at a completion barrier before
+joining workers. Registration still inserts before FFI callback setup,
+callbacks clone the token before releasing the entry guard and cancelling, and
+teardown still unregisters FFI before map removal.
 
 ## Concrete Steps
 
 Run from `/Volumes/Storage/dev/studiofs`:
 
     cargo test -p studiofs-macfuse --lib interrupt_registry -- --nocapture
+    cargo test -p studiofs-macfuse --lib next_interrupt_key_skips_zero_after_wrap -- --test-threads=1
+    cargo test -p studiofs-macfuse --lib interrupt_registry_callback_and_removal_are_race_safe
     cargo test -p studiofs-macfuse --release --lib interrupt_registry_contention_benchmark -- --ignored --nocapture --test-threads=1
     cargo test -p studiofs-macfuse --lib
     cargo check -p studiofs-macfuse
     cargo build -p studiofs --release
-    target/debug/studiofs-e2e run collision-overwrite-vs-read --studiofs-bin target/release/studiofs --platform macos-fuse --infra compose --retain always --run-id sfs665-macos-read-20260927 --seed 665
+    target/debug/studiofs-e2e run collision-overwrite-vs-read --studiofs-bin target/release/studiofs --platform macos-fuse --infra compose --retain always --run-id sfs665-foldhash-read-20260927 --seed 665
     cargo fmt --all -- --check
     cargo clippy -p studiofs-macfuse --all-targets -- -D warnings
     git diff --check
 
-Run the exact benchmark command once before and once after the map change. Save
-the worker counts, operations per second, OS/macFUSE versions, and command in
-`docs/perf/sfs-665-macfuse-interrupt-registry.md`. Use `cargo run -p
-studiofs-e2e -- list` to select an existing scenario before attempting any
-mounted validation; do not invent a runner scenario name.
+The historical before/after numbers used a timer that included worker joins and
+a callback on every cycle. Keep them labeled as historical. The corrected
+benchmark has two workloads, seven timed samples after one warm-up per workload
+and worker count, alternating workload order, and a completion barrier before
+the timer stops. Record matched mutex/default-DashMap/Foldhash runs separately
+in `docs/perf/sfs-665-macfuse-interrupt-registry.md`. Use `cargo run -p
+studiofs-e2e -- list` to select an existing scenario before mounted validation;
+do not invent a runner scenario name.
 
 ## Validation and Acceptance
 
 The lifecycle tests must pass with a nonzero test count and prove callback
-cancellation, removal behavior, and race safety. The release benchmark must
-exercise concurrent insert, callback lookup/cancel, and removal on the same
-registry path before and after the change. Report measured throughput and
-percentage change for matching worker counts; claim a reduction only if the
-measurement supports it.
+cancellation, removal behavior, race cleanup, and that generated keys never
+become null at atomic wrap. The release benchmark must measure both
+registration/removal and registration/callback/removal, with matched worker
+counts for mutex and DashMap variants. It must exclude thread creation and
+thread joins from the timed interval. Report measured throughput and percentage
+change; claim a reduction only where the measurement supports it.
 
 The native mounted result is separate from the in-process benchmark. The same
-registered `collision-overwrite-vs-read` scenario passed with the clean-HEAD
-mutex binary and twice with the `DashMap` binary. Scenario durations were
-9,192 ms, 8,466 ms, and 9,218 ms; the overlap does not support an end-to-end
-performance claim. Reports are retained in the three corresponding
-`target/e2e-runs/sfs665-macos-read*` directories, and no mount remained after
-cleanup. The callback behavior is proved by the low-level tests, and the
+registered `collision-overwrite-vs-read` scenario passed once with the
+clean-HEAD mutex binary, twice with default DashMap, and once with Foldhash.
+Scenario durations were 9,192 ms, 8,466 ms, 9,218 ms, and 8,344 ms. The overlap
+does not support an end-to-end performance claim. Reports are retained in the
+corresponding `target/e2e-runs/sfs665-*` directories, and no mount remained
+after cleanup. The callback behavior is proved by the low-level tests, and the
 contention improvement by the in-process registry benchmark.
 
 ## Idempotence and Recovery
@@ -186,11 +260,19 @@ that one proves the other.
 ## Interfaces and Dependencies
 
 Keep the existing private key generator and `Request` API. The registry remains
-private to `low_level.rs`; the only collection dependency for the change is the
-workspace's existing `dashmap` crate. Do not add configuration, metrics, public
-API, or teardown state for this optimization.
+private to `low_level.rs`; it uses the workspace's `dashmap` and `foldhash`
+crates. Do not add configuration, metrics, public API, or teardown state for
+this optimization.
 
 Plan update (2026-09-27 16:01Z): recorded before/after benchmark results and the
 first native mounted run. Update (2026-09-27 16:11Z): added the clean-HEAD
 mounted baseline and repeat optimized run; this records the overlapping native
 timings and avoids claiming an end-to-end gain that the scenario did not show.
+Update (2026-09-27 16:45Z): incorporated verified code review findings. Added
+non-null key allocation and race cleanup assertions, corrected benchmark
+coverage/timing, remeasured base mutex/default DashMap/Foldhash variants, and
+recorded the fast hasher choice. Update (2026-09-27 16:50Z): the full macFUSE
+library test suite passed (186 passed, one ignored benchmark), as did `cargo
+check`, Clippy with warnings denied, formatting, diff check, release build, and
+the registered native scenario. The retained native report is
+`target/e2e-runs/sfs665-foldhash-read-20260927/report.json`.
