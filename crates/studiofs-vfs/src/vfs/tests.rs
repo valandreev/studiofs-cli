@@ -2417,6 +2417,53 @@ fn idle_open_read_handle_does_not_block_compaction_activity() {
 }
 
 #[test]
+fn upload_idle_grace_does_not_disable_local_compaction() {
+    let tmp = runtime_stats_test_tempdir();
+    let cfg = VfsConfig {
+        upload_user_idle_grace_ms: 900_000,
+        ..VfsConfig::default()
+    };
+    let (_rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "compaction-own-read-grace", cfg);
+    let last_read_ms = now_unix_millis().saturating_sub(3 * 60 * 1_000);
+    vfs.state.read.mark_foreground_read(last_read_ms);
+    vfs.state.read.unmark_foreground_read(last_read_ms);
+
+    assert!(vfs.foreground_io_active());
+    assert!(!vfs.foreground_read_active_for_compaction());
+}
+
+#[test]
+fn active_writer_does_not_hold_compaction_read_gate_and_writes_record_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "compaction-writer-activity");
+    let attr = vfs
+        .create(ROOT_INO, b"writer.txt", 1000, 1000, 0o644)
+        .expect("create file");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open writer");
+
+    let generation_before_write = vfs.meta.activity_snapshot().activity_generation;
+    rt.block_on(vfs.write_fh(fh, attr.ino, 0, b"foreground write"))
+        .expect("write file");
+    assert!(vfs.meta.activity_snapshot().activity_generation > generation_before_write);
+    let active_writer_handles = vfs
+        .state
+        .read
+        .active_access_class_count(AccessClass::SequentialWriter)
+        + vfs
+            .state
+            .read
+            .active_access_class_count(AccessClass::RandomWriter);
+    assert!(active_writer_handles > 0);
+    assert!(vfs.foreground_io_active());
+    assert!(!vfs.foreground_read_active_for_compaction());
+
+    rt.block_on(async { vfs.release_fh(fh).await.expect("release writer") });
+}
+
+#[test]
 fn local_metadata_compaction_worker_observes_sticky_shutdown() {
     let tmp = runtime_stats_test_tempdir();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "compaction-sticky-shutdown");

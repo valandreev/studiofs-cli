@@ -228,6 +228,7 @@ const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+const LOCAL_REDB_COMPACTION_READ_IDLE_GRACE: Duration = Duration::from_secs(2 * 60);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 200;
 const WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT: usize = 32;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
@@ -6833,7 +6834,7 @@ impl StudioVfs {
     fn foreground_read_active_for_compaction(&self) -> bool {
         self.state
             .read
-            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace)
+            .foreground_read_active(now_unix_millis(), LOCAL_REDB_COMPACTION_READ_IDLE_GRACE)
     }
 
     fn foreground_reads_active(&self) -> bool {

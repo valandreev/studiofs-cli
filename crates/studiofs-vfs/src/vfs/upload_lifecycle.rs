@@ -321,14 +321,42 @@ impl StudioVfs {
         Self::join_background_task_handles(&mut guard.handles, timeout).await;
     }
 
-    async fn join_local_metadata_compaction_task(state: &super::ShutdownState) {
+    async fn join_local_metadata_compaction_task(state: &super::ShutdownState, timeout: Duration) {
         let handle = state.local_metadata_compaction_task.lock().take();
         let Some(handle) = handle else {
             return;
         };
         let mut guard = LocalCompactionTaskJoinGuard::new(state, handle);
-        if let Some(handle) = guard.handle.as_mut()
-            && let Err(error) = handle.await
+        let started = Instant::now();
+        let join_result = tokio::time::timeout(
+            timeout,
+            guard
+                .handle
+                .as_mut()
+                .expect("compaction task join guard retains its handle"),
+        )
+        .await;
+        let join_result = match join_result {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "local metadata compaction worker is still running during shutdown"
+                );
+                let result = guard
+                    .handle
+                    .as_mut()
+                    .expect("compaction task join guard retains its handle")
+                    .await;
+                info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "local metadata compaction worker finished during shutdown"
+                );
+                result
+            }
+        };
+        if let Err(error) = join_result
+            && !error.is_cancelled()
         {
             warn!(error = %error, "local metadata compaction worker join failed");
         }
@@ -524,7 +552,8 @@ impl StudioVfs {
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.state.namespace.deferred.notify.notify_waiters();
-        Self::join_local_metadata_compaction_task(&self.state.shutdown).await;
+        Self::join_local_metadata_compaction_task(&self.state.shutdown, background_join_timeout)
+            .await;
         let deferred_namespace_result = self
             .wait_for_deferred_namespace_metadata_during_shutdown(background_join_timeout)
             .await;
@@ -778,7 +807,10 @@ mod tests {
         });
         *state.local_metadata_compaction_task.lock() = Some(handle);
 
-        let mut join = Box::pin(StudioVfs::join_local_metadata_compaction_task(&state));
+        let mut join = Box::pin(StudioVfs::join_local_metadata_compaction_task(
+            &state,
+            Duration::from_secs(2),
+        ));
         assert!(
             tokio::time::timeout(Duration::ZERO, &mut join)
                 .await
