@@ -645,15 +645,15 @@ struct MetaExecutorActivity {
     active_calls: AtomicUsize,
 }
 
-struct MetaExecutorActivityGuard(Arc<MetaExecutorActivity>);
+struct MetaExecutorActivityGuard<'a>(&'a MetaExecutorActivity);
 
 impl MetaExecutorActivity {
-    fn enter(self: &Arc<Self>) -> MetaExecutorActivityGuard {
+    fn enter(&self) -> MetaExecutorActivityGuard<'_> {
         self.active_calls.fetch_add(1, Ordering::SeqCst);
-        MetaExecutorActivityGuard(self.clone())
+        MetaExecutorActivityGuard(self)
     }
 
-    fn enter_activity(self: &Arc<Self>) -> MetaExecutorActivityGuard {
+    fn enter_activity(&self) -> MetaExecutorActivityGuard<'_> {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.enter()
     }
@@ -670,7 +670,7 @@ impl MetaExecutorActivity {
     }
 }
 
-impl Drop for MetaExecutorActivityGuard {
+impl Drop for MetaExecutorActivityGuard<'_> {
     fn drop(&mut self) {
         self.0.active_calls.fetch_sub(1, Ordering::SeqCst);
     }
@@ -713,6 +713,12 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
     pub fn run_sync<T>(&self, operation: impl FnOnce(Arc<M>) -> MetaResult<T>) -> VfsResult<T> {
         let _activity = self.activity.enter_activity();
         operation(self.sync_view()).map_err(VfsError::Meta)
+    }
+
+    /// Run synchronous maintenance without recording foreground activity.
+    pub(crate) fn run_sync_maintenance<T>(&self, operation: impl FnOnce(Arc<M>) -> T) -> T {
+        let _activity = self.activity.enter();
+        operation(self.sync_view())
     }
 
     /// Execute a metadata operation on the sync adapter from async context.
@@ -881,6 +887,14 @@ pub async fn run_meta<M: ?Sized + Send + Sync + 'static, T: Send + 'static>(
     engine.run(operation).await
 }
 
+/// Run a metadata closure on the blocking pool without counting it as foreground activity.
+pub(crate) async fn run_meta_maintenance<M: ?Sized + Send + Sync + 'static, T: Send + 'static>(
+    engine: MetaExecutor<M>,
+    operation: impl FnOnce(Arc<M>) -> MetaResult<T> + Send + 'static,
+) -> VfsResult<T> {
+    engine.run_maintenance(operation).await
+}
+
 /// Race an async operation against timeout and cancellation.
 pub async fn run_with_timeout_or_cancel<T>(
     cancel_token: &CancellationToken,
@@ -1042,11 +1056,12 @@ mod tests {
         let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
         let executor = MetaExecutor::new(into_vfs_meta(engine));
 
-        executor
-            .run_maintenance(|_| Ok::<(), MetaError>(()))
+        super::run_meta_maintenance(executor.clone(), |_| Ok::<(), MetaError>(()))
             .await
             .expect("maintenance operation");
+        executor.run_sync_maintenance(|engine| engine.replication_backlog());
         assert_eq!(executor.activity_snapshot().activity_generation, 0);
+        assert_eq!(executor.activity_snapshot().active_calls, 0);
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

@@ -23,6 +23,7 @@ const LOCAL_REDB_COMPACTION_ERROR_BACKOFF: Duration = Duration::from_secs(6 * 60
 const LOCAL_REDB_COMPACTION_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCAL_REDB_COMPACTION_MIN_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const LOCAL_REDB_COMPACTION_MIN_FRAGMENTED_BYTES: u64 = 1024 * 1024;
+const LOCAL_REDB_COMPACTION_MIN_FRAGMENTATION_RATIO_DENOMINATOR: u64 = 4;
 
 #[derive(Debug)]
 struct LocalRedbCompactionSchedule {
@@ -102,7 +103,19 @@ fn local_redb_compaction_worthwhile(diagnostics: &LocalStorageDiagnostics) -> bo
 
     file_bytes >= LOCAL_REDB_COMPACTION_MIN_FILE_BYTES
         && fragmented_bytes >= LOCAL_REDB_COMPACTION_MIN_FRAGMENTED_BYTES
-        && fragmented_bytes.saturating_mul(4) >= file_bytes
+        && fragmented_bytes
+            .saturating_mul(LOCAL_REDB_COMPACTION_MIN_FRAGMENTATION_RATIO_DENOMINATOR)
+            >= file_bytes
+}
+
+fn local_redb_compaction_diagnostics_retry_delay(
+    diagnostics: &LocalStorageDiagnostics,
+) -> Duration {
+    if diagnostics.physical_file_bytes.is_none() || diagnostics.fragmented_bytes.is_none() {
+        LOCAL_REDB_COMPACTION_POLL_INTERVAL
+    } else {
+        LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK
+    }
 }
 
 struct MetadataTraversalSnapshot {
@@ -513,14 +526,14 @@ impl StudioVfs {
                             }),
                         );
                         if Self::is_invalid_regular_file_graph_error(&err) {
-                            let attr_size =
-                                run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                                    engine.get_attr(ino)
-                                })
-                                .await
-                                .ok()
-                                .map(|attr| attr.size)
-                                .unwrap_or(0);
+                            let attr_size = run_meta_maintenance(
+                                self.meta.clone(),
+                                move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino),
+                            )
+                            .await
+                            .ok()
+                            .map(|attr| attr.size)
+                            .unwrap_or(0);
                             warn!(
                                 ino,
                                 content_epoch,
@@ -691,8 +704,8 @@ impl StudioVfs {
             .map(|pending| (pending.batch, pending.attempts))
             .collect::<Vec<_>>();
         batches.extend(
-            self.sync_meta()
-                .take_invalidation_batches()
+            self.meta
+                .run_sync_maintenance(|meta| meta.take_invalidation_batches())
                 .into_iter()
                 .map(|batch| (batch, 0)),
         );
@@ -1209,7 +1222,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
-        let meta = self.sync_meta();
+        let meta = self.meta.sync_view();
         let metadata_notifier = meta.metadata_invalidation_notifier();
         // Do not mark startup metadata as already invalidated. The PG listener
         // can advance local metadata before this task reaches its first wait;
@@ -1239,7 +1252,7 @@ impl StudioVfs {
             let meta = self.meta.clone();
             let previous_namespace_token = last_namespace_token.clone();
             let previous_metadata_token = last_metadata_token.clone();
-            let sync = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            let sync = run_meta_maintenance(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 let before_namespace = engine.namespace_version_token();
                 let before_metadata = engine.metadata_version_token();
                 if should_run_invalidation_poll_sync(
@@ -1302,22 +1315,23 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            let current_snapshot = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                Self::collect_metadata_snapshot(engine.as_ref())
-            })
-            .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    warn!(
-                        ?wake_reason,
-                        error = %error,
-                        "metadata invalidation snapshot failed; retrying on the next wake"
-                    );
-                    self.note_coherence_apply_failure();
-                    continue;
-                }
-            };
+            let current_snapshot =
+                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                    Self::collect_metadata_snapshot(engine.as_ref())
+                })
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        warn!(
+                            ?wake_reason,
+                            error = %error,
+                            "metadata invalidation snapshot failed; retrying on the next wake"
+                        );
+                        self.note_coherence_apply_failure();
+                        continue;
+                    }
+                };
             let namespace_changed = metadata_namespace_changed(
                 token_namespace_changed,
                 last_snapshot.as_ref(),
@@ -1435,7 +1449,9 @@ impl StudioVfs {
                         .unwrap_or(u64::from(self.block_size))
                 })
                 .sum::<u64>();
-            let metadata_backlog = self.sync_meta().replication_backlog();
+            let metadata_backlog = self
+                .meta
+                .run_sync_maintenance(|meta| meta.replication_backlog());
             let pending_metadata_ops = metadata_backlog.total_ops();
             let active_uploads = self.upload_scheduler.in_flight();
             let active_upload_workers = self
@@ -1816,7 +1832,10 @@ impl StudioVfs {
                 continue;
             }
             if !local_redb_compaction_worthwhile(&diagnostics) {
-                schedule.defer_probe(now, LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK);
+                schedule.defer_probe(
+                    now,
+                    local_redb_compaction_diagnostics_retry_delay(&diagnostics),
+                );
                 continue;
             }
 
@@ -1853,17 +1872,17 @@ impl StudioVfs {
                 })
                 .await;
 
-            let Some((result, elapsed, foreground_work_arrived, diagnostics_after)) = (match attempt
-            {
-                Ok(attempt) => attempt,
+            let (result, elapsed, foreground_work_arrived, diagnostics_after) = match attempt {
+                Ok(Some(attempt)) => attempt,
+                Ok(None) => {
+                    schedule.reset_idle(self.meta.activity_snapshot().activity_generation);
+                    continue;
+                }
                 Err(error) => {
                     warn!(error = %error, "local metadata compaction worker failed");
                     schedule.defer_probe(Instant::now(), LOCAL_REDB_COMPACTION_ERROR_BACKOFF);
                     continue;
                 }
-            }) else {
-                schedule.reset_idle(self.meta.activity_snapshot().activity_generation);
-                continue;
             };
 
             let compaction_diagnostics = diagnostics_after
@@ -1944,7 +1963,7 @@ impl StudioVfs {
             gc_cycle = gc_cycle.saturating_add(1);
 
             let meta = self.meta.clone();
-            let lock_acquired = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            let lock_acquired = match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.try_acquire_global_janitor_lock()
             })
             .await
@@ -1962,7 +1981,7 @@ impl StudioVfs {
 
             const CHUNK_COMPACTION_BATCH_LIMIT: usize = 32;
             let meta = self.meta.clone();
-            match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.compact_fragmented_regular_file_chunks(CHUNK_COMPACTION_BATCH_LIMIT)
             })
             .await
@@ -1978,7 +1997,7 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            if let Err(error) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.reconcile_pending_regular_file_recoveries()
             })
             .await
@@ -1987,28 +2006,29 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            let referenced_object_ids = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.get_referenced_object_ids()
-            })
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.release_global_janitor_lock()
-                    })
-                    .await;
-                    warn!(
-                        error = %e,
-                        "background GC skipped: metadata reachability query failed"
-                    );
-                    continue;
-                }
-            };
+            let referenced_object_ids =
+                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.get_referenced_object_ids()
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let meta = self.meta.clone();
+                        let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                            engine.release_global_janitor_lock()
+                        })
+                        .await;
+                        warn!(
+                            error = %e,
+                            "background GC skipped: metadata reachability query failed"
+                        );
+                        continue;
+                    }
+                };
 
             let meta = self.meta.clone();
-            let snapshot_pins = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            let snapshot_pins = match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.get_global_snapshot_pins()
             })
             .await
@@ -2016,7 +2036,7 @@ impl StudioVfs {
                 Ok(v) => v,
                 Err(e) => {
                     let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                         engine.release_global_janitor_lock()
                     })
                     .await;
@@ -2036,7 +2056,7 @@ impl StudioVfs {
 
             const PENDING_DELETION_GC_BATCH_LIMIT: usize = 1_000;
             let meta = self.meta.clone();
-            match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.get_pending_deletions_limited(PENDING_DELETION_GC_BATCH_LIMIT + 1)
             })
             .await
@@ -2064,7 +2084,7 @@ impl StudioVfs {
 
                         let meta = self.meta.clone();
                         let claim_owner = deletion_owner.clone();
-                        let deletion_claim = match run_meta(
+                        let deletion_claim = match run_meta_maintenance(
                             meta,
                             move |engine: Arc<dyn VfsMeta>| {
                                 engine.claim_uploaded_object_deletion(object_id, &claim_owner)
@@ -2124,15 +2144,16 @@ impl StudioVfs {
                         if let Some(fencing_token) = fencing_token {
                             let meta = self.meta.clone();
                             let finish_owner = deletion_owner.clone();
-                            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                                engine.finish_uploaded_object_deletion(
-                                    object_id,
-                                    &finish_owner,
-                                    fencing_token,
-                                    deletion_outcome,
-                                )
-                            })
-                            .await
+                            if let Err(error) =
+                                run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                                    engine.finish_uploaded_object_deletion(
+                                        object_id,
+                                        &finish_owner,
+                                        fencing_token,
+                                        deletion_outcome,
+                                    )
+                                })
+                                .await
                             {
                                 warn!(object_id, error = %error, "GC: failed to finish object deletion claim");
                                 continue;
@@ -2140,10 +2161,11 @@ impl StudioVfs {
                         }
                         if !delete_failed {
                             let meta = self.meta.clone();
-                            if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                                engine.remove_pending_deletion(object_id)
-                            })
-                            .await
+                            if let Err(e) =
+                                run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                                    engine.remove_pending_deletion(object_id)
+                                })
+                                .await
                             {
                                 warn!("failed to remove pending deletion for {}: {}", object_id, e);
                             }
@@ -2164,7 +2186,7 @@ impl StudioVfs {
                 }
                 Err(e) => {
                     let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                         engine.release_global_janitor_lock()
                     })
                     .await;
@@ -2173,7 +2195,7 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            if let Err(e) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.release_global_janitor_lock()
             })
             .await
@@ -2203,7 +2225,7 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            let lock_acquired = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            let lock_acquired = match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.try_acquire_global_janitor_lock()
             })
             .await
@@ -2220,15 +2242,16 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            let mut global_snapshot_pins = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.get_global_snapshot_pins()
-            })
+            let mut global_snapshot_pins = match run_meta_maintenance(
+                meta,
+                move |engine: Arc<dyn VfsMeta>| engine.get_global_snapshot_pins(),
+            )
             .await
             {
                 Ok(v) => v,
                 Err(e) => {
                     let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                         engine.release_global_janitor_lock()
                     })
                     .await;
@@ -2240,15 +2263,18 @@ impl StudioVfs {
             let meta = self.meta.clone();
             let reconciliation_owner = format!("janitor-{cycle}");
             let claim_owner = reconciliation_owner.clone();
-            let reconciliation_claims = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.claim_uploaded_fragment_reconciliation(&claim_owner)
-            })
+            let reconciliation_claims = match run_meta_maintenance(
+                meta,
+                move |engine: Arc<dyn VfsMeta>| {
+                    engine.claim_uploaded_fragment_reconciliation(&claim_owner)
+                },
+            )
             .await
             {
                 Ok(claims) => claims,
                 Err(e) => {
                     let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                         engine.release_global_janitor_lock()
                     })
                     .await;
@@ -2315,7 +2341,7 @@ impl StudioVfs {
                 let owner = reconciliation_owner.clone();
                 let object_id = claim.entry.object_id;
                 let meta = self.meta.clone();
-                if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                if let Err(e) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.finish_uploaded_fragment_reconciliation(&owner, &claim, outcome)
                 })
                 .await
@@ -2332,7 +2358,7 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            if let Err(error) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.reconcile_pending_regular_file_recoveries()
             })
             .await
@@ -2341,7 +2367,7 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            let referenced = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            let referenced = match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.get_referenced_object_ids()
             })
             .await
@@ -2349,7 +2375,7 @@ impl StudioVfs {
                 Ok(v) => v,
                 Err(e) => {
                     let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                         engine.release_global_janitor_lock()
                     })
                     .await;
@@ -2359,7 +2385,7 @@ impl StudioVfs {
             };
             let meta = self.meta.clone();
             let pending_map: HashMap<u64, i64> =
-                match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.get_pending_deletions()
                 })
                 .await
@@ -2372,17 +2398,18 @@ impl StudioVfs {
                 };
 
             let meta = self.meta.clone();
-            let recovered_undo_parents = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.recover_pending_creates()
-            })
-            .await
-            {
-                Ok(parents) => parents,
-                Err(e) => {
-                    warn!(cycle, error = %e, "janitor: pending-create replay failed");
-                    Vec::new()
-                }
-            };
+            let recovered_undo_parents =
+                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.recover_pending_creates()
+                })
+                .await
+                {
+                    Ok(parents) => parents,
+                    Err(e) => {
+                        warn!(cycle, error = %e, "janitor: pending-create replay failed");
+                        Vec::new()
+                    }
+                };
             if !recovered_undo_parents.is_empty() {
                 for parent in recovered_undo_parents.iter().copied() {
                     self.dentry_cache_invalidate_parent(parent);
@@ -2391,7 +2418,7 @@ impl StudioVfs {
             }
             let meta = self.meta.clone();
             let (undo_total, undo_started, undo_replaying, undo_completed) =
-                match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.list_undo_logs()
                 })
                 .await
@@ -2425,7 +2452,7 @@ impl StudioVfs {
                 Ok(v) => v,
                 Err(e) => {
                     let meta = self.meta.clone();
-                    let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                         engine.release_global_janitor_lock()
                     })
                     .await;
@@ -2514,9 +2541,12 @@ impl StudioVfs {
                 let meta = self.meta.clone();
                 let object_deletion_owner = deletion_owner.clone();
                 let claim_owner = object_deletion_owner.clone();
-                let deletion_claim = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.claim_uploaded_object_deletion(object_id, &claim_owner)
-                })
+                let deletion_claim = match run_meta_maintenance(
+                    meta,
+                    move |engine: Arc<dyn VfsMeta>| {
+                        engine.claim_uploaded_object_deletion(object_id, &claim_owner)
+                    },
+                )
                 .await
                 {
                     Ok(claim) => claim,
@@ -2563,15 +2593,16 @@ impl StudioVfs {
                 };
                 if let Some(fencing_token) = fencing_token {
                     let meta = self.meta.clone();
-                    if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.finish_uploaded_object_deletion(
-                            object_id,
-                            &object_deletion_owner,
-                            fencing_token,
-                            deletion_outcome,
-                        )
-                    })
-                    .await
+                    if let Err(error) =
+                        run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                            engine.finish_uploaded_object_deletion(
+                                object_id,
+                                &object_deletion_owner,
+                                fencing_token,
+                                deletion_outcome,
+                            )
+                        })
+                        .await
                     {
                         delete_errors = delete_errors.saturating_add(1);
                         warn!(cycle, object_id, error = %error, "janitor: failed to finish object deletion claim");
@@ -2587,7 +2618,7 @@ impl StudioVfs {
 
             if let Some(err) = list_error {
                 let meta = self.meta.clone();
-                let _ = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.release_global_janitor_lock()
                 })
                 .await;
@@ -2625,7 +2656,7 @@ impl StudioVfs {
             );
 
             let meta = self.meta.clone();
-            if let Err(e) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            if let Err(e) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.release_global_janitor_lock()
             })
             .await
@@ -2678,6 +2709,28 @@ mod tests {
         ] {
             assert!(!local_redb_compaction_worthwhile(&diagnostics));
         }
+    }
+
+    #[test]
+    fn local_redb_compaction_retries_incomplete_diagnostics_on_next_poll() {
+        let incomplete = LocalStorageDiagnostics {
+            physical_file_bytes: Some(8 * 1024 * 1024),
+            ..LocalStorageDiagnostics::default()
+        };
+        let complete_but_below_threshold = LocalStorageDiagnostics {
+            physical_file_bytes: Some(8 * 1024 * 1024),
+            fragmented_bytes: Some(1024 * 1024),
+            ..LocalStorageDiagnostics::default()
+        };
+
+        assert_eq!(
+            local_redb_compaction_diagnostics_retry_delay(&incomplete),
+            LOCAL_REDB_COMPACTION_POLL_INTERVAL
+        );
+        assert_eq!(
+            local_redb_compaction_diagnostics_retry_delay(&complete_but_below_threshold),
+            LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK
+        );
     }
 
     #[test]

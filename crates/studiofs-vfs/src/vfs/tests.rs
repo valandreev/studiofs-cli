@@ -2355,6 +2355,28 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
 }
 
 #[test]
+fn runtime_stats_snapshot_does_not_record_foreground_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "runtime-stats-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.runtime_stats_snapshot();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
+fn startup_compaction_skips_read_only_mounts() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_read_only_test_vfs(&tmp, "startup-compaction-read-only");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.run_startup_local_metadata_compaction();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
 fn runtime_stats_surface_has_stable_attributes() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-stable-attr");

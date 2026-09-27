@@ -140,7 +140,7 @@ use crate::{LockTier, OrderedMutex};
 
 use crate::runtime::{
     LocalCacheIoTiming, MetaExecutor, TimeoutOrCancel, VfsMeta, cache_io_execution_model,
-    into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta,
+    into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta, run_meta_maintenance,
     run_with_timeout_or_cancel,
 };
 #[cfg(test)]
@@ -3993,7 +3993,9 @@ impl StudioVfs {
 
     /// Snapshot metadata replication and session synchronization state.
     pub fn synchronization_state_snapshot(&self) -> VfsSynchronizationStateSnapshot {
-        let metadata_backlog = self.sync_meta().replication_backlog();
+        let metadata_backlog = self
+            .meta
+            .run_sync_maintenance(|meta| meta.replication_backlog());
         VfsSynchronizationStateSnapshot {
             file_sessions: self.file_session_stats(),
             foreground_reads: self.foreground_read_protection_stats(),
@@ -4178,7 +4180,6 @@ impl StudioVfs {
             return ZeroIoObjectView::default();
         }
 
-        let meta = self.sync_meta();
         let mut live_extent_count = 0;
         for (_, object_id, content_epoch) in self.live_extent_records_for_inode(ino) {
             if content_epoch == lifecycle.local_content_epoch {
@@ -4193,26 +4194,28 @@ impl StudioVfs {
             };
         }
 
-        if meta.has_local_regular_file_overlay(ino).unwrap_or(false) {
-            if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
-                object_ids.extend(ids);
+        self.meta.run_sync_maintenance(|meta| {
+            if meta.has_local_regular_file_overlay(ino).unwrap_or(false) {
+                if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
+                    object_ids.extend(ids);
+                }
+                if !object_ids.is_empty() {
+                    return ZeroIoObjectView {
+                        object_ids: object_ids.into_iter().collect(),
+                        live_extent_count,
+                    };
+                }
             }
-            if !object_ids.is_empty() {
-                return ZeroIoObjectView {
-                    object_ids: object_ids.into_iter().collect(),
-                    live_extent_count,
-                };
+
+            if let Ok(usage) = meta.get_regular_file_graph_object_usage(ino) {
+                object_ids.extend(usage.into_iter().map(|(object_id, _)| object_id));
             }
-        }
 
-        if let Ok(usage) = meta.get_regular_file_graph_object_usage(ino) {
-            object_ids.extend(usage.into_iter().map(|(object_id, _)| object_id));
-        }
-
-        ZeroIoObjectView {
-            object_ids: object_ids.into_iter().collect(),
-            live_extent_count,
-        }
+            ZeroIoObjectView {
+                object_ids: object_ids.into_iter().collect(),
+                live_extent_count,
+            }
+        })
     }
 
     fn zeroio_object_bytes(&self, object_ids: &[u64]) -> u64 {
@@ -4402,8 +4405,10 @@ impl StudioVfs {
             ..VfsZeroIoRuntimeSnapshot::default()
         };
 
-        let meta = self.sync_meta();
-        let lifecycles = match meta.list_inode_lifecycles() {
+        let lifecycles = match self
+            .meta
+            .run_sync_maintenance(|meta| meta.list_inode_lifecycles())
+        {
             Ok(lifecycles) => lifecycles,
             Err(error) => {
                 warn!(
@@ -4843,6 +4848,10 @@ impl StudioVfs {
     }
 
     fn run_startup_local_metadata_compaction(&self) {
+        if self.read_only_mount {
+            return;
+        }
+
         let started = Instant::now();
         let result = self.meta.run_sync(|engine| engine.compact_local_storage());
         let elapsed = started.elapsed();
@@ -5995,22 +6004,24 @@ impl StudioVfs {
     }
 
     fn collect_regular_file_object_ids_for_recovery(&self, ino: Ino, size: u64) -> HashSet<u64> {
-        let mut object_ids = HashSet::new();
-        if size > 0
-            && let Ok(spans) = self.sync_meta().lookup_regular_file_slices(ino, 0, size)
-        {
-            for span in spans {
-                if let Some(block) = span.payload {
-                    object_ids.insert(block.object_id);
+        self.meta.run_sync_maintenance(|meta| {
+            let mut object_ids = HashSet::new();
+            if size > 0
+                && let Ok(spans) = meta.lookup_regular_file_slices(ino, 0, size)
+            {
+                for span in spans {
+                    if let Some(block) = span.payload {
+                        object_ids.insert(block.object_id);
+                    }
                 }
             }
-        }
 
-        if let Ok(ids) = self.sync_meta().get_regular_file_overlay_object_ids(ino) {
-            object_ids.extend(ids);
-        }
+            if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
+                object_ids.extend(ids);
+            }
 
-        object_ids
+            object_ids
+        })
     }
 
     fn quarantine_invalid_regular_file_graph(
@@ -9450,7 +9461,9 @@ impl StudioVfs {
                 metadata_commit_interval_histogram,
                 elapsed,
             ),
-            metadata_engine: self.sync_meta().vfs_metadata_write_observability(),
+            metadata_engine: self
+                .meta
+                .run_sync_maintenance(|meta| meta.vfs_metadata_write_observability()),
             namespace_create: VfsNamespaceCreateObservabilityStats {
                 inode_allocation: Self::build_stage_latency_stats(
                     namespace_inode_allocation_calls,
