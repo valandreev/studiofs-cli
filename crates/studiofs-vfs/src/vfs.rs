@@ -140,7 +140,7 @@ use crate::{LockTier, OrderedMutex};
 
 use crate::runtime::{
     LocalCacheIoTiming, MetaExecutor, TimeoutOrCancel, VfsMeta, cache_io_execution_model,
-    into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta,
+    into_vfs_meta, run_local_cache_io, run_local_cache_io_blocking, run_meta, run_meta_maintenance,
     run_with_timeout_or_cancel,
 };
 #[cfg(test)]
@@ -228,6 +228,7 @@ const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+const LOCAL_REDB_COMPACTION_READ_IDLE_GRACE: Duration = Duration::from_secs(2 * 60);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 200;
 const WRITER_STACK_PREFETCHED_OBJECT_ID_RANGE_LIMIT: usize = 32;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
@@ -2420,6 +2421,7 @@ struct ShutdownState {
     uploader_shutdown_token: CancellationToken,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
+    local_metadata_compaction_task: OrderedMutex<Option<JoinHandle<()>>>,
     uploader_task: OrderedMutex<Option<JoinHandle<()>>>,
 }
 
@@ -2435,6 +2437,7 @@ impl ShutdownState {
             uploader_shutdown_token: CancellationToken::new(),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
+            local_metadata_compaction_task: OrderedMutex::new(None, LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }
     }
@@ -3993,7 +3996,9 @@ impl StudioVfs {
 
     /// Snapshot metadata replication and session synchronization state.
     pub fn synchronization_state_snapshot(&self) -> VfsSynchronizationStateSnapshot {
-        let metadata_backlog = self.sync_meta().replication_backlog();
+        let metadata_backlog = self
+            .meta
+            .run_sync_maintenance(|meta| meta.replication_backlog());
         VfsSynchronizationStateSnapshot {
             file_sessions: self.file_session_stats(),
             foreground_reads: self.foreground_read_protection_stats(),
@@ -4178,7 +4183,6 @@ impl StudioVfs {
             return ZeroIoObjectView::default();
         }
 
-        let meta = self.sync_meta();
         let mut live_extent_count = 0;
         for (_, object_id, content_epoch) in self.live_extent_records_for_inode(ino) {
             if content_epoch == lifecycle.local_content_epoch {
@@ -4193,26 +4197,28 @@ impl StudioVfs {
             };
         }
 
-        if meta.has_local_regular_file_overlay(ino).unwrap_or(false) {
-            if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
-                object_ids.extend(ids);
+        self.meta.run_sync_maintenance(|meta| {
+            if meta.has_local_regular_file_overlay(ino).unwrap_or(false) {
+                if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
+                    object_ids.extend(ids);
+                }
+                if !object_ids.is_empty() {
+                    return ZeroIoObjectView {
+                        object_ids: object_ids.into_iter().collect(),
+                        live_extent_count,
+                    };
+                }
             }
-            if !object_ids.is_empty() {
-                return ZeroIoObjectView {
-                    object_ids: object_ids.into_iter().collect(),
-                    live_extent_count,
-                };
+
+            if let Ok(usage) = meta.get_regular_file_graph_object_usage(ino) {
+                object_ids.extend(usage.into_iter().map(|(object_id, _)| object_id));
             }
-        }
 
-        if let Ok(usage) = meta.get_regular_file_graph_object_usage(ino) {
-            object_ids.extend(usage.into_iter().map(|(object_id, _)| object_id));
-        }
-
-        ZeroIoObjectView {
-            object_ids: object_ids.into_iter().collect(),
-            live_extent_count,
-        }
+            ZeroIoObjectView {
+                object_ids: object_ids.into_iter().collect(),
+                live_extent_count,
+            }
+        })
     }
 
     fn zeroio_object_bytes(&self, object_ids: &[u64]) -> u64 {
@@ -4402,8 +4408,10 @@ impl StudioVfs {
             ..VfsZeroIoRuntimeSnapshot::default()
         };
 
-        let meta = self.sync_meta();
-        let lifecycles = match meta.list_inode_lifecycles() {
+        let lifecycles = match self
+            .meta
+            .run_sync_maintenance(|meta| meta.list_inode_lifecycles())
+        {
             Ok(lifecycles) => lifecycles,
             Err(error) => {
                 warn!(
@@ -4832,6 +4840,7 @@ impl StudioVfs {
         self.spawn_epoch_finalizer_worker();
         self.spawn_upload_stats_worker();
         self.spawn_fetch_warmup_task();
+        self.spawn_local_metadata_compaction_worker();
         self.spawn_gc_worker();
         self.spawn_metadata_invalidation_worker();
         self.spawn_janitor_worker();
@@ -4839,6 +4848,47 @@ impl StudioVfs {
         self.spawn_snapshot_cleanup_worker();
         self.spawn_snapshot_policy_evaluator();
         Ok(())
+    }
+
+    fn run_startup_local_metadata_compaction(&self) {
+        if self.read_only_mount {
+            return;
+        }
+
+        let started = Instant::now();
+        let result = self
+            .meta
+            .run_sync_maintenance(|engine| engine.compact_local_storage());
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        match result {
+            Ok(LocalStorageCompactionResult::Compacted) => {
+                if elapsed > Duration::from_secs(2) {
+                    warn!(
+                        elapsed_ms,
+                        "startup local metadata compaction took longer than expected"
+                    );
+                } else {
+                    info!(elapsed_ms, "startup compacted local metadata storage");
+                }
+            }
+            Ok(LocalStorageCompactionResult::SkippedBusy) => {
+                debug!(
+                    elapsed_ms,
+                    "startup local metadata compaction skipped because metadata was busy"
+                );
+            }
+            Ok(LocalStorageCompactionResult::NoWork) => {
+                debug!(elapsed_ms, "startup local metadata compaction had no work");
+            }
+            Err(error) => {
+                warn!(
+                    elapsed_ms,
+                    error = %error,
+                    "startup local metadata compaction failed"
+                );
+            }
+        }
     }
 
     fn spawn_snapshot_worker(self: &Arc<Self>) {
@@ -4925,41 +4975,6 @@ impl StudioVfs {
                 _ = tokio::time::sleep(retry_delay) => {}
             }
             retry_delay = retry_delay.saturating_mul(2).min(max_delay);
-        }
-    }
-
-    fn run_startup_local_metadata_compaction(&self) {
-        let started = Instant::now();
-        let result = self.meta.run_sync(|engine| engine.compact_local_storage());
-        let elapsed = started.elapsed();
-        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        match result {
-            Ok(LocalStorageCompactionResult::Compacted) => {
-                if elapsed > Duration::from_secs(2) {
-                    warn!(
-                        elapsed_ms,
-                        "startup local metadata compaction took longer than expected"
-                    );
-                } else {
-                    info!(elapsed_ms, "startup compacted local metadata storage");
-                }
-            }
-            Ok(LocalStorageCompactionResult::SkippedBusy) => {
-                debug!(
-                    elapsed_ms,
-                    "startup local metadata compaction skipped because metadata was busy"
-                );
-            }
-            Ok(LocalStorageCompactionResult::NoWork) => {
-                debug!(elapsed_ms, "startup local metadata compaction had no work");
-            }
-            Err(error) => {
-                warn!(
-                    elapsed_ms,
-                    error = %error,
-                    "startup local metadata compaction failed"
-                );
-            }
         }
     }
 
@@ -5050,6 +5065,16 @@ impl StudioVfs {
         let vfs = self.clone();
         self.track_background_task(tokio::spawn(async move {
             vfs.background_janitor().await;
+        }));
+    }
+
+    fn spawn_local_metadata_compaction_worker(self: &Arc<Self>) {
+        if self.read_only_mount {
+            return;
+        }
+        let vfs = self.clone();
+        self.set_local_metadata_compaction_task(tokio::spawn(async move {
+            vfs.background_local_metadata_compaction().await;
         }));
     }
 
@@ -5984,22 +6009,24 @@ impl StudioVfs {
     }
 
     fn collect_regular_file_object_ids_for_recovery(&self, ino: Ino, size: u64) -> HashSet<u64> {
-        let mut object_ids = HashSet::new();
-        if size > 0
-            && let Ok(spans) = self.sync_meta().lookup_regular_file_slices(ino, 0, size)
-        {
-            for span in spans {
-                if let Some(block) = span.payload {
-                    object_ids.insert(block.object_id);
+        self.meta.run_sync_maintenance(|meta| {
+            let mut object_ids = HashSet::new();
+            if size > 0
+                && let Ok(spans) = meta.lookup_regular_file_slices(ino, 0, size)
+            {
+                for span in spans {
+                    if let Some(block) = span.payload {
+                        object_ids.insert(block.object_id);
+                    }
                 }
             }
-        }
 
-        if let Ok(ids) = self.sync_meta().get_regular_file_overlay_object_ids(ino) {
-            object_ids.extend(ids);
-        }
+            if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
+                object_ids.extend(ids);
+            }
 
-        object_ids
+            object_ids
+        })
     }
 
     fn quarantine_invalid_regular_file_graph(
@@ -6735,7 +6762,7 @@ impl StudioVfs {
     /// In async paths, prefer `self.meta.run(...)` so blocking work stays behind
     /// one explicit metadata boundary.
     fn sync_meta(&self) -> Arc<dyn VfsMeta> {
-        self.meta.sync_view()
+        self.meta.foreground_view()
     }
 
     /// Get metadata engine reference.
@@ -6801,6 +6828,13 @@ impl StudioVfs {
             return true;
         }
         self.os_cache.lock().active_foreground_handle_count() > 0
+    }
+
+    /// Return whether a foreground read is active or recent, excluding open handles.
+    fn foreground_read_active_for_compaction(&self) -> bool {
+        self.state
+            .read
+            .foreground_read_active(now_unix_millis(), LOCAL_REDB_COMPACTION_READ_IDLE_GRACE)
     }
 
     fn foreground_reads_active(&self) -> bool {
@@ -7473,7 +7507,7 @@ impl StudioVfs {
     }
 
     fn metadata_sync_status(&self) -> PgSyncStatus {
-        let mut status = self.meta.sync_view().pg_sync_status();
+        let mut status = self.meta.run_sync_maintenance(|meta| meta.pg_sync_status());
         if self.read_only_mount {
             status.authority = MetadataAuthorityStatus::read_only();
         }
@@ -7491,7 +7525,9 @@ impl StudioVfs {
     }
 
     fn metadata_sync_diagnostics(&self) -> PgSyncDiagnostics {
-        let mut diagnostics = self.meta.sync_view().pg_sync_diagnostics();
+        let mut diagnostics = self
+            .meta
+            .run_sync_maintenance(|meta| meta.pg_sync_diagnostics());
         #[cfg(test)]
         {
             let mut overridden = false;
@@ -7564,8 +7600,9 @@ impl StudioVfs {
             return Some(lease);
         }
 
-        let _ = self.meta.sync_view().ensure_known_file_lock_monitoring();
-        self.meta.sync_view().known_file_lock_lease(ino)
+        let meta = self.meta.foreground_view();
+        let _ = meta.ensure_known_file_lock_monitoring();
+        meta.known_file_lock_lease(ino)
     }
 
     fn known_hard_lock_blocks_new_mutation(&self, ino: Ino) -> Option<FileLockLease> {
@@ -9436,7 +9473,9 @@ impl StudioVfs {
                 metadata_commit_interval_histogram,
                 elapsed,
             ),
-            metadata_engine: self.sync_meta().vfs_metadata_write_observability(),
+            metadata_engine: self
+                .meta
+                .run_sync_maintenance(|meta| meta.vfs_metadata_write_observability()),
             namespace_create: VfsNamespaceCreateObservabilityStats {
                 inode_allocation: Self::build_stage_latency_stats(
                     namespace_inode_allocation_calls,

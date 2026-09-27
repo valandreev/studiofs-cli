@@ -79,6 +79,32 @@ impl Drop for BackgroundTaskJoinGuard<'_> {
     }
 }
 
+struct LocalCompactionTaskJoinGuard<'a> {
+    state: &'a super::ShutdownState,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl<'a> LocalCompactionTaskJoinGuard<'a> {
+    fn new(state: &'a super::ShutdownState, handle: JoinHandle<()>) -> Self {
+        Self {
+            state,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for LocalCompactionTaskJoinGuard<'_> {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let mut tracked = self.state.local_metadata_compaction_task.lock();
+        if tracked.is_none() {
+            *tracked = Some(handle);
+        }
+    }
+}
+
 struct UploaderTaskJoinGuard<'a> {
     state: &'a super::ShutdownState,
     handle: Option<JoinHandle<()>>,
@@ -172,6 +198,10 @@ enum ShutdownWaitResult {
 impl StudioVfs {
     pub(super) fn track_background_task(&self, handle: JoinHandle<()>) {
         self.state.shutdown.background_tasks.lock().push(handle);
+    }
+
+    pub(super) fn set_local_metadata_compaction_task(&self, handle: JoinHandle<()>) {
+        *self.state.shutdown.local_metadata_compaction_task.lock() = Some(handle);
     }
 
     pub(super) fn set_uploader_task(&self, handle: JoinHandle<()>) {
@@ -289,6 +319,48 @@ impl StudioVfs {
         };
         let mut guard = BackgroundTaskJoinGuard::new(&self.state.shutdown, handles);
         Self::join_background_task_handles(&mut guard.handles, timeout).await;
+    }
+
+    async fn join_local_metadata_compaction_task(state: &super::ShutdownState, timeout: Duration) {
+        let handle = state.local_metadata_compaction_task.lock().take();
+        let Some(handle) = handle else {
+            return;
+        };
+        let mut guard = LocalCompactionTaskJoinGuard::new(state, handle);
+        let started = Instant::now();
+        let join_result = tokio::time::timeout(
+            timeout,
+            guard
+                .handle
+                .as_mut()
+                .expect("compaction task join guard retains its handle"),
+        )
+        .await;
+        let join_result = match join_result {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "local metadata compaction worker is still running during shutdown"
+                );
+                let result = guard
+                    .handle
+                    .as_mut()
+                    .expect("compaction task join guard retains its handle")
+                    .await;
+                info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "local metadata compaction worker finished during shutdown"
+                );
+                result
+            }
+        };
+        if let Err(error) = join_result
+            && !error.is_cancelled()
+        {
+            warn!(error = %error, "local metadata compaction worker join failed");
+        }
+        guard.handle.take();
     }
 
     async fn join_background_task_handles(handles: &mut Vec<JoinHandle<()>>, timeout: Duration) {
@@ -480,6 +552,8 @@ impl StudioVfs {
         self.state.shutdown.background_shutdown_token.cancel();
         self.state.shutdown.shutdown_notify.notify_waiters();
         self.state.namespace.deferred.notify.notify_waiters();
+        Self::join_local_metadata_compaction_task(&self.state.shutdown, background_join_timeout)
+            .await;
         let deferred_namespace_result = self
             .wait_for_deferred_namespace_metadata_during_shutdown(background_join_timeout)
             .await;
@@ -665,18 +739,63 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use std::future;
+    use std::future::{self, Future as _};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tracing::instrument::WithSubscriber as _;
 
     use super::{
-        BackgroundTaskJoinGuard, ShutdownError, ShutdownOwnerGuard, StudioVfs,
-        UploaderTaskJoinGuard, finish_shutdown_result, replay_shutdown_result,
+        BackgroundTaskJoinGuard, LocalCompactionTaskJoinGuard, ShutdownError, ShutdownOwnerGuard,
+        StudioVfs, UploaderTaskJoinGuard, finish_shutdown_result, replay_shutdown_result,
         select_metadata_barrier_error, select_shutdown_result, shutdown_recoverable_on_restart,
     };
     use crate::vfs::{ShutdownState, VfsError};
     use studiofs_cache::local::LocalPayloadBackendError;
     use studiofs_data::store::DataError;
     use studiofs_meta::MetaError;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct CompactionJoinEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CompactionJoinEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event
+                .metadata()
+                .target()
+                .ends_with("::vfs::upload_lifecycle")
+            {
+                let mut visitor = MessageVisitor(None);
+                event.record(&mut visitor);
+                if let Some(message) = visitor.0 {
+                    self.0
+                        .lock()
+                        .expect("lock captured events")
+                        .push((*event.metadata().level(), message));
+                }
+            }
+        }
+    }
+
+    struct MessageVisitor(Option<String>);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn background_tasks_share_one_join_deadline() {
@@ -720,6 +839,133 @@ mod tests {
             .lock()
             .pop()
             .expect("cancelled join must restore the task handle");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn local_compaction_join_waits_for_task_completion() {
+        let state = ShutdownState::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = release_rx.await;
+        });
+        *state.local_metadata_compaction_task.lock() = Some(handle);
+
+        let mut join = Box::pin(StudioVfs::join_local_metadata_compaction_task(
+            &state,
+            Duration::from_secs(2),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut join)
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).expect("release compaction task");
+        join.await;
+        assert!(state.local_metadata_compaction_task.lock().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_compaction_join_waits_past_timeout_without_aborting_task() {
+        let state = ShutdownState::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            release_rx.await.expect("release compaction task");
+            completed_tx.send(()).expect("report task completion");
+        });
+        *state.local_metadata_compaction_task.lock() = Some(handle);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
+
+        let mut join = Box::pin(
+            StudioVfs::join_local_metadata_compaction_task(&state, Duration::from_millis(1))
+                .with_subscriber(tracing::Dispatch::new(subscriber)),
+        );
+        let before_timeout =
+            future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        assert!(before_timeout.is_pending());
+
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let after_timeout =
+            future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        {
+            let events = events.lock().expect("lock captured events");
+            assert!(
+                events
+                    .iter()
+                    .any(|(_, message)| message.contains("still running during shutdown")),
+                "timeout branch must emit its compaction-wait event"
+            );
+        }
+        assert!(
+            after_timeout.is_pending(),
+            "join must keep waiting for the task"
+        );
+
+        release_tx
+            .send(())
+            .expect("task must still be running after timeout");
+        join.await;
+        completed_rx
+            .await
+            .expect("compaction task must complete normally");
+        assert!(state.local_metadata_compaction_task.lock().is_none());
+    }
+
+    #[test]
+    fn cancelled_local_compaction_join_does_not_warn() {
+        let state = ShutdownState::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let handle = runtime.spawn(future::pending::<()>());
+        handle.abort();
+        *state.local_metadata_compaction_task.lock() = Some(handle);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(StudioVfs::join_local_metadata_compaction_task(
+                &state,
+                Duration::from_secs(1),
+            ));
+        });
+
+        let events = events.lock().expect("lock captured events");
+        assert!(
+            !events.iter().any(
+                |(_, message)| message.contains("local metadata compaction worker join failed")
+            ),
+            "cancellation must not emit the compaction join-failure event"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(level, _)| *level == tracing::Level::WARN),
+            "cancellation must not emit a compaction warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_local_compaction_join_guard_restores_handle() {
+        let state = ShutdownState::new();
+        let handle = tokio::spawn(future::pending::<()>());
+
+        {
+            let _guard = LocalCompactionTaskJoinGuard::new(&state, handle);
+        }
+
+        let handle = state
+            .local_metadata_compaction_task
+            .lock()
+            .take()
+            .expect("cancelled join must restore the compaction handle");
         handle.abort();
         let _ = handle.await;
     }

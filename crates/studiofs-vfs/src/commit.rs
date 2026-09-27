@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use studiofs_meta::InodeLifecycleState;
 
-use crate::runtime::{MetaExecutor, TimeoutOrCancel, run_meta, run_with_timeout_or_cancel};
+use crate::runtime::{
+    MetaExecutor, TimeoutOrCancel, run_meta_maintenance, run_with_timeout_or_cancel,
+};
 use crate::{VfsError, VfsMeta, VfsResult};
 use tokio_util::sync::CancellationToken;
 
@@ -110,7 +112,7 @@ impl EpochPublicationBatcher {
                 .iter()
                 .map(|request| (request.ino, request.content_epoch))
                 .collect();
-            let result = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            let result = run_meta_maintenance(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.publish_regular_file_overlay_to_base_if_matches_batch(&keys)
             })
             .await;
@@ -137,11 +139,14 @@ impl EpochPublicationBatcher {
                     for request in requests {
                         let ino = request.ino;
                         let content_epoch = request.content_epoch;
-                        let result = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                            engine
-                                .publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-                        })
-                        .await;
+                        let result =
+                            run_meta_maintenance(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                                engine.publish_regular_file_overlay_to_base_if_matches(
+                                    ino,
+                                    content_epoch,
+                                )
+                            })
+                            .await;
                         let result = result.map_err(Arc::new);
                         let _ = request.completion.send(result);
                     }
@@ -189,7 +194,7 @@ impl CommitCoordinator {
             .await
             .map_err(|e| VfsError::Other(format!("commit qos permit failed: {e}")))?;
 
-        let attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+        let attr = match run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.get_attr(ino)
         })
         .await
@@ -222,7 +227,7 @@ impl CommitCoordinator {
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
             return Ok(EpochFinalizeStatus::Deferred);
         }
-        let meta = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+        let meta = run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             let has_persisted_overlay = engine.has_local_regular_file_overlay(ino)?;
             let lifecycle = engine.get_inode_lifecycle(ino)?;
             let object_ids = if has_persisted_overlay {
@@ -279,24 +284,25 @@ impl CommitCoordinator {
             .file_session
             .enter_op(ino, FileSessionOperation::Finalize)
             .await;
-        let latest_attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.get_attr(ino)
-        })
-        .await
-        {
-            Ok(attr) => attr,
-            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                vfs.clear_inode_incarnation(ino);
-                drop(finalize_session);
-                vfs.state.file_session.gc_if_idle(ino);
-                return Ok(EpochFinalizeStatus::Skipped);
-            }
-            Err(err) => {
-                drop(finalize_session);
-                vfs.state.file_session.gc_if_idle(ino);
-                return Err(err);
-            }
-        };
+        let latest_attr =
+            match run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_attr(ino)
+            })
+            .await
+            {
+                Ok(attr) => attr,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                    vfs.clear_inode_incarnation(ino);
+                    drop(finalize_session);
+                    vfs.state.file_session.gc_if_idle(ino);
+                    return Ok(EpochFinalizeStatus::Skipped);
+                }
+                Err(err) => {
+                    drop(finalize_session);
+                    vfs.state.file_session.gc_if_idle(ino);
+                    return Err(err);
+                }
+            };
         if latest_attr.content_epoch != content_epoch
             || latest_attr.upload_state == MetaUploadState::Ready
             || !StudioVfs::needs_epoch_finalization(&latest_attr)
@@ -341,7 +347,7 @@ impl CommitCoordinator {
                 .publish(vfs.meta.clone(), ino, content_epoch)
                 .await
         } else {
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
             })
             .await
@@ -356,18 +362,19 @@ impl CommitCoordinator {
         if !published {
             drop(finalize_session);
             vfs.state.file_session.gc_if_idle(ino);
-            let latest_attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.get_attr(ino)
-            })
-            .await
-            {
-                Ok(attr) => attr,
-                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                    vfs.clear_inode_incarnation(ino);
-                    return Ok(EpochFinalizeStatus::Skipped);
-                }
-                Err(err) => return Err(err),
-            };
+            let latest_attr =
+                match run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                    engine.get_attr(ino)
+                })
+                .await
+                {
+                    Ok(attr) => attr,
+                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                        vfs.clear_inode_incarnation(ino);
+                        return Ok(EpochFinalizeStatus::Skipped);
+                    }
+                    Err(err) => return Err(err),
+                };
             if latest_attr.content_epoch != content_epoch
                 || latest_attr.upload_state == MetaUploadState::Ready
                 || !StudioVfs::needs_epoch_finalization(&latest_attr)
@@ -432,7 +439,7 @@ impl CommitCoordinator {
         };
 
         let published_attr = if let Ok(attr) =
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.get_attr(ino)
             })
             .await

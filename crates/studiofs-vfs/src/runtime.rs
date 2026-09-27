@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use studiofs_meta::engine::{
@@ -629,12 +630,59 @@ where
 /// Runtime adapter around sync metadata engines with async/sync execution helpers.
 pub struct MetaExecutor<M: ?Sized> {
     backend: SyncMetaEngineAdapter<M>,
+    activity: Arc<MetaExecutorActivity>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MetaExecutorActivitySnapshot {
+    /// Generation advanced by foreground operations that explicitly record activity.
+    pub(crate) activity_generation: u64,
+    /// In-flight operations currently holding a `MetaExecutor` activity guard.
+    pub(crate) active_calls: usize,
+}
+
+#[derive(Default)]
+struct MetaExecutorActivity {
+    generation: AtomicU64,
+    active_calls: AtomicUsize,
+}
+
+struct MetaExecutorActivityGuard<'a>(&'a MetaExecutorActivity);
+
+impl MetaExecutorActivity {
+    fn enter(&self) -> MetaExecutorActivityGuard<'_> {
+        self.active_calls.fetch_add(1, Ordering::SeqCst);
+        MetaExecutorActivityGuard(self)
+    }
+
+    fn enter_activity(&self) -> MetaExecutorActivityGuard<'_> {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.enter()
+    }
+
+    fn record_activity(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> MetaExecutorActivitySnapshot {
+        MetaExecutorActivitySnapshot {
+            activity_generation: self.generation.load(Ordering::SeqCst),
+            active_calls: self.active_calls.load(Ordering::SeqCst),
+        }
+    }
+}
+
+impl Drop for MetaExecutorActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.0.active_calls.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl<M: ?Sized> Clone for MetaExecutor<M> {
     fn clone(&self) -> Self {
         Self {
             backend: self.backend.clone(),
+            activity: self.activity.clone(),
         }
     }
 }
@@ -644,6 +692,7 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
     pub fn new(engine: Arc<M>) -> Self {
         Self {
             backend: SyncMetaEngineAdapter::new(engine),
+            activity: Arc::default(),
         }
     }
 
@@ -652,9 +701,29 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
         self.backend.sync_engine()
     }
 
+    /// Return a synchronous metadata view and record foreground activity once.
+    ///
+    /// The returned view is not activity-guarded for the duration of its use.
+    pub(crate) fn foreground_view(&self) -> Arc<M> {
+        self.activity.record_activity();
+        self.sync_view()
+    }
+
+    /// Snapshot foreground activity and all active metadata calls, including maintenance.
+    pub(crate) fn activity_snapshot(&self) -> MetaExecutorActivitySnapshot {
+        self.activity.snapshot()
+    }
+
     /// Execute a metadata operation synchronously on the current thread.
     pub fn run_sync<T>(&self, operation: impl FnOnce(Arc<M>) -> MetaResult<T>) -> VfsResult<T> {
+        let _activity = self.activity.enter_activity();
         operation(self.sync_view()).map_err(VfsError::Meta)
+    }
+
+    /// Run synchronous maintenance without recording foreground activity.
+    pub(crate) fn run_sync_maintenance<T>(&self, operation: impl FnOnce(Arc<M>) -> T) -> T {
+        let _activity = self.activity.enter();
+        operation(self.sync_view())
     }
 
     /// Execute a metadata operation on the sync adapter from async context.
@@ -662,10 +731,33 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
         &self,
         operation: impl FnOnce(Arc<M>) -> MetaResult<T> + Send + 'static,
     ) -> VfsResult<T> {
-        execute_sync_meta(self.backend.clone(), operation)
-            .await
-            .map_err(VfsError::Join)?
-            .map_err(VfsError::Meta)
+        self.run_inner(operation, true).await
+    }
+
+    /// Execute worker maintenance without counting it as metadata activity.
+    pub(crate) async fn run_maintenance<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Arc<M>) -> MetaResult<T> + Send + 'static,
+    ) -> VfsResult<T> {
+        self.run_inner(operation, false).await
+    }
+
+    async fn run_inner<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Arc<M>) -> MetaResult<T> + Send + 'static,
+        records_activity: bool,
+    ) -> VfsResult<T> {
+        if records_activity {
+            self.activity.record_activity();
+        }
+        let activity = self.activity.clone();
+        execute_sync_meta(self.backend.clone(), move |engine| {
+            let _activity = activity.enter();
+            operation(engine)
+        })
+        .await
+        .map_err(VfsError::Join)?
+        .map_err(VfsError::Meta)
     }
 }
 
@@ -798,6 +890,14 @@ pub async fn run_meta<M: ?Sized + Send + Sync + 'static, T: Send + 'static>(
     operation: impl FnOnce(Arc<M>) -> MetaResult<T> + Send + 'static,
 ) -> VfsResult<T> {
     engine.run(operation).await
+}
+
+/// Run a metadata closure on the blocking pool without counting it as foreground activity.
+pub(crate) async fn run_meta_maintenance<M: ?Sized + Send + Sync + 'static, T: Send + 'static>(
+    engine: MetaExecutor<M>,
+    operation: impl FnOnce(Arc<M>) -> MetaResult<T> + Send + 'static,
+) -> VfsResult<T> {
+    engine.run_maintenance(operation).await
 }
 
 /// Race an async operation against timeout and cancellation.
@@ -952,5 +1052,54 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn meta_executor_run_records_completed_metadata_activity() {
+        let temp = studiofs_test_support::workspace_target_tempdir("runtime-meta-activity-");
+        let path = temp.path().join("meta.redb");
+        let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
+        let executor = MetaExecutor::new(into_vfs_meta(engine));
+
+        super::run_meta_maintenance(executor.clone(), |_| Ok::<(), MetaError>(()))
+            .await
+            .expect("maintenance operation");
+        executor.run_sync_maintenance(|engine| engine.replication_backlog());
+        assert_eq!(executor.activity_snapshot().activity_generation, 0);
+        assert_eq!(executor.activity_snapshot().active_calls, 0);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let running_executor = executor.clone();
+        let running = tokio::spawn(async move {
+            running_executor
+                .run(move |_| {
+                    started_tx.send(()).expect("test receiver remains live");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test releases metadata operation");
+                    Ok::<(), MetaError>(())
+                })
+                .await
+        });
+
+        started_rx.await.expect("metadata operation started");
+        let active = executor.activity_snapshot();
+        assert_eq!(active.activity_generation, 1);
+        assert_eq!(active.active_calls, 1);
+        release_tx.send(()).expect("metadata operation is blocked");
+        running
+            .await
+            .expect("metadata task joins")
+            .expect("metadata operation succeeds");
+
+        executor
+            .run(|_| Ok::<(), MetaError>(()))
+            .await
+            .expect("metadata operation");
+
+        let activity = executor.activity_snapshot();
+        assert_eq!(activity.activity_generation, 2);
+        assert_eq!(activity.active_calls, 0);
     }
 }

@@ -1,7 +1,7 @@
 use super::super::{FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
 use crate::runtime::{
-    MetaExecutor, TimeoutOrCancel, run_blocking, run_meta, run_with_timeout_or_cancel,
+    MetaExecutor, TimeoutOrCancel, run_blocking, run_meta_maintenance, run_with_timeout_or_cancel,
 };
 use crate::utils::now_unix_millis;
 use bytes::Bytes;
@@ -1415,7 +1415,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
     async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>> {
         let meta = self.vfs.meta.clone();
         Ok(
-            run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino))
+            run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino))
                 .await
                 .ok(),
         )
@@ -1428,7 +1428,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
         object_id: u64,
     ) -> VfsResult<bool> {
         let meta = self.vfs.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+        run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
         })
         .await
@@ -1478,7 +1478,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
         }
         let meta = self.vfs.meta.clone();
         let object_ids = object_ids.to_vec();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+        run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.mark_regular_file_overlay_objects_uploaded_if_match(
                 ino,
                 expected_epoch,
@@ -1504,7 +1504,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
             return Ok(None);
         };
         let meta = self.vfs.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+        run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
             let latest_attr = match engine.get_attr(ino) {
                 Ok(attr) => attr,
                 Err(studiofs_meta::MetaError::InodeNotFound(_)) => return Ok(None),
@@ -1575,7 +1575,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
 
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()> {
         let meta = self.vfs.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+        run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.add_pending_deletion(object_id, timestamp)
         })
         .await
@@ -1633,15 +1633,18 @@ async fn drain_upload_ledger_batch_queue(
             .iter()
             .flat_map(|request| request.entries.iter().cloned())
             .collect::<Vec<_>>();
-        let result = run_meta(
-            meta.clone(),
-            move |engine: Arc<dyn VfsMeta>| match operation {
-                UploadLedgerBatchOperation::Begin => engine.begin_fragment_uploads(&entries),
-                UploadLedgerBatchOperation::Confirm => engine.confirm_fragment_uploads(&entries),
-            },
-        )
-        .await
-        .map_err(Arc::new);
+        let result =
+            run_meta_maintenance(
+                meta.clone(),
+                move |engine: Arc<dyn VfsMeta>| match operation {
+                    UploadLedgerBatchOperation::Begin => engine.begin_fragment_uploads(&entries),
+                    UploadLedgerBatchOperation::Confirm => {
+                        engine.confirm_fragment_uploads(&entries)
+                    }
+                },
+            )
+            .await
+            .map_err(Arc::new);
         for request in requests {
             let _ = request.result.send(result.clone());
         }
@@ -1760,7 +1763,7 @@ impl VfsRemoteUploadPort {
         if let Some(volume_id) = *cached {
             return Ok(volume_id);
         }
-        let volume_id = run_meta(self.vfs.meta.clone(), |engine: Arc<dyn VfsMeta>| {
+        let volume_id = run_meta_maintenance(self.vfs.meta.clone(), |engine: Arc<dyn VfsMeta>| {
             engine.fragment_ledger_volume_id()
         })
         .await?;
@@ -2087,7 +2090,7 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
 
     async fn invalid_regular_file_graph_attr_size(&self, ino: Ino) -> u64 {
         let meta = self.vfs.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino))
+        run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino))
             .await
             .ok()
             .map(|attr| attr.size)
@@ -2117,7 +2120,8 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
 
     async fn refresh_incarnation_state(&self, ino: Ino) {
         let meta = self.vfs.meta.clone();
-        match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await {
+        match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await
+        {
             Ok(attr) => {
                 self.vfs
                     .refresh_inode_incarnation_state_from_attr(ino, &attr);

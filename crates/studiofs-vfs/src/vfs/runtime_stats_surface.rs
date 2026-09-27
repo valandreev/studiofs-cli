@@ -850,7 +850,10 @@ impl StudioVfs {
             overlay_batch.forced_barriers,
         );
 
-        if let Ok(Some(diagnostics)) = self.sync_meta().local_storage_diagnostics() {
+        if let Ok(Some(diagnostics)) = self
+            .meta
+            .run_sync_maintenance(|meta| meta.local_storage_diagnostics())
+        {
             insert_local_storage_diagnostics(&mut snapshot.metadata, &diagnostics);
         }
 

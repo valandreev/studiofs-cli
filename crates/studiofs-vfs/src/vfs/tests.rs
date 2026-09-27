@@ -2355,6 +2355,186 @@ fn runtime_stats_surface_is_root_local_parseable_and_not_persisted() {
 }
 
 #[test]
+fn runtime_stats_snapshot_does_not_record_foreground_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "runtime-stats-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.runtime_stats_snapshot();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
+fn sync_status_does_not_record_foreground_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-status-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.sync_status();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
+fn synchronization_state_snapshot_does_not_record_foreground_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-state-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.synchronization_state_snapshot();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
+fn foreground_getattr_records_metadata_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "getattr-activity");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.getattr(ROOT_INO).expect("get root attributes");
+
+    assert!(vfs.meta.activity_snapshot().activity_generation > generation);
+}
+
+#[test]
+fn idle_open_read_handle_does_not_block_compaction_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "idle-reader-compaction-activity");
+    let attr = vfs
+        .create(ROOT_INO, b"idle-reader.txt", 1000, 1000, 0o644)
+        .expect("create file");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open read handle");
+    let _ = vfs.prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
+
+    assert!(vfs.foreground_io_active());
+    assert!(!vfs.foreground_read_active_for_compaction());
+
+    rt.block_on(async { vfs.release_fh(fh).await.expect("release read handle") });
+}
+
+#[test]
+fn completed_foreground_read_temporarily_blocks_compaction() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "recent-read-compaction-gate");
+
+    vfs.begin_foreground_read_handle();
+    assert!(vfs.foreground_read_active_for_compaction());
+    vfs.end_foreground_read_handle();
+
+    assert!(vfs.foreground_read_active_for_compaction());
+}
+
+#[test]
+fn upload_idle_grace_does_not_disable_local_compaction() {
+    let tmp = runtime_stats_test_tempdir();
+    let cfg = VfsConfig {
+        upload_user_idle_grace_ms: 900_000,
+        ..VfsConfig::default()
+    };
+    let (_rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "compaction-own-read-grace", cfg);
+    let read_idle_grace_ms = LOCAL_REDB_COMPACTION_READ_IDLE_GRACE.as_millis() as u64;
+    let last_read_ms = now_unix_millis().saturating_sub(read_idle_grace_ms.saturating_mul(2));
+    vfs.state.read.mark_foreground_read(last_read_ms);
+    vfs.state.read.unmark_foreground_read(last_read_ms);
+
+    assert!(vfs.foreground_io_active());
+    assert!(!vfs.foreground_read_active_for_compaction());
+}
+
+#[test]
+fn active_writer_does_not_hold_compaction_read_gate_and_writes_record_activity() {
+    let tmp = runtime_stats_test_tempdir();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "compaction-writer-activity");
+    let attr = vfs
+        .create(ROOT_INO, b"writer.txt", 1000, 1000, 0o644)
+        .expect("create file");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open writer");
+
+    let generation_before_write = vfs.meta.activity_snapshot().activity_generation;
+    rt.block_on(vfs.write_fh(fh, attr.ino, 0, b"foreground write"))
+        .expect("write file");
+    assert!(vfs.meta.activity_snapshot().activity_generation > generation_before_write);
+    let active_writer_handles = vfs
+        .state
+        .read
+        .active_access_class_count(AccessClass::SequentialWriter)
+        + vfs
+            .state
+            .read
+            .active_access_class_count(AccessClass::RandomWriter);
+    assert!(active_writer_handles > 0);
+    assert!(vfs.foreground_io_active());
+    assert!(!vfs.foreground_read_active_for_compaction());
+
+    rt.block_on(async { vfs.release_fh(fh).await.expect("release writer") });
+}
+
+#[test]
+fn local_metadata_compaction_worker_observes_sticky_shutdown() {
+    let tmp = runtime_stats_test_tempdir();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "compaction-sticky-shutdown");
+    vfs.state.shutdown.background_shutdown_token.cancel();
+
+    let result = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&vfs).background_local_metadata_compaction(),
+        )
+        .await
+    });
+
+    assert!(
+        result.is_ok(),
+        "a previously cancelled shutdown token must stop the worker promptly"
+    );
+}
+
+#[test]
+fn startup_compaction_skips_read_only_mounts() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_read_only_test_vfs(&tmp, "startup-compaction-read-only");
+    let generation = vfs.meta.activity_snapshot().activity_generation;
+
+    vfs.run_startup_local_metadata_compaction();
+
+    assert_eq!(vfs.meta.activity_snapshot().activity_generation, generation);
+}
+
+#[test]
+fn startup_compaction_does_not_record_foreground_metadata_activity() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-compaction-activity");
+    let activity_before = vfs.meta.activity_snapshot();
+    let attempts_before = meta
+        .local_storage_diagnostics()
+        .expect("read local storage diagnostics")
+        .expect("redb diagnostics are available")
+        .compaction_attempts;
+
+    vfs.run_startup_local_metadata_compaction();
+
+    let activity_after = vfs.meta.activity_snapshot();
+    let attempts_after = meta
+        .local_storage_diagnostics()
+        .expect("read local storage diagnostics")
+        .expect("redb diagnostics are available")
+        .compaction_attempts;
+    assert_eq!(
+        activity_after.activity_generation,
+        activity_before.activity_generation
+    );
+    assert_eq!(activity_after.active_calls, 0);
+    assert_eq!(attempts_after, attempts_before + 1);
+}
+
+#[test]
 fn runtime_stats_surface_has_stable_attributes() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-stable-attr");
