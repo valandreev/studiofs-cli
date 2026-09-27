@@ -31,8 +31,8 @@ The available summary for the two runs reports these start/end values:
 
 ### Explicit compaction
 
-Each of the three runs reported the same physical size before and after
-compaction; the duration varied by run:
+Across all three runs, the pre-compaction size was 8,425,472 bytes and the
+post-compaction size was 4,255,744 bytes; only the duration varied by run:
 
 | Run | Before | After | Bytes reclaimed | Duration |
 | ---: | ---: | ---: | ---: | ---: |
