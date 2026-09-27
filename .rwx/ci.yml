@@ -138,11 +138,13 @@ tasks:
         fi
       }
       trap cleanup_postgres EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
 
       postgres_container="$(docker run --detach \
         --env POSTGRES_HOST_AUTH_METHOD=trust \
         --publish 127.0.0.1::5432 \
-        --health-cmd 'pg_isready -U postgres -d postgres' \
+        --health-cmd 'grep -qx postgres /proc/1/comm && pg_isready -h 127.0.0.1 -U postgres -d postgres' \
         --health-interval 2s \
         --health-timeout 5s \
         --health-retries 30 \
@@ -192,11 +194,11 @@ tasks:
         fi
 
         echo "PostgreSQL test gate selected ${test_count} ignored tests: ${label}"
-        cargo test "$@" -- --ignored --test-threads=1
+        cargo test "$@" -- --ignored --test-threads=1 --nocapture
       }
 
       run_ignored_tests "studiofs-meta pg_engine" -p studiofs-meta pg_engine::tests:: --lib
-      run_ignored_tests "studiofs CLI" -p studiofs --bin studiofs
+      run_ignored_tests "studiofs CLI" -p studiofs --bin studiofs cli::
     env:
       RUSTFLAGS: "-Dwarnings"
 
