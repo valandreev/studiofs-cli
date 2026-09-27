@@ -4853,7 +4853,9 @@ impl StudioVfs {
         }
 
         let started = Instant::now();
-        let result = self.meta.run_sync(|engine| engine.compact_local_storage());
+        let result = self
+            .meta
+            .run_sync_maintenance(|engine| engine.compact_local_storage());
         let elapsed = started.elapsed();
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
         match result {
@@ -7586,11 +7588,9 @@ impl StudioVfs {
             return Some(lease);
         }
 
-        let _ = self
-            .meta
-            .foreground_view()
-            .ensure_known_file_lock_monitoring();
-        self.meta.foreground_view().known_file_lock_lease(ino)
+        let meta = self.meta.foreground_view();
+        let _ = meta.ensure_known_file_lock_monitoring();
+        meta.known_file_lock_lease(ino)
     }
 
     fn known_hard_lock_blocks_new_mutation(&self, ino: Ino) -> Option<FileLockLease> {

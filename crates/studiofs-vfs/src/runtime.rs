@@ -705,6 +705,7 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
         self.sync_view()
     }
 
+    /// Snapshot foreground activity and all active metadata calls, including maintenance.
     pub(crate) fn activity_snapshot(&self) -> MetaExecutorActivitySnapshot {
         self.activity.snapshot()
     }

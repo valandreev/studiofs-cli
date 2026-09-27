@@ -25,6 +25,7 @@ const LOCAL_REDB_COMPACTION_MIN_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const LOCAL_REDB_COMPACTION_MIN_FRAGMENTED_BYTES: u64 = 1024 * 1024;
 const LOCAL_REDB_COMPACTION_MIN_FRAGMENTATION_RATIO_DENOMINATOR: u64 = 4;
 
+/// Tracks foreground quiet time and the next local-compaction retry deadline.
 #[derive(Debug)]
 struct LocalRedbCompactionSchedule {
     last_activity_generation: u64,
@@ -1842,11 +1843,10 @@ impl StudioVfs {
             let expected_activity = activity.activity_generation;
             let file_bytes_before = diagnostics.physical_file_bytes;
             let vfs = self.clone();
-            let activity_meta = self.meta.clone();
             let attempt = self
                 .meta
                 .run_maintenance(move |engine: Arc<dyn VfsMeta>| {
-                    let activity_before = activity_meta.activity_snapshot();
+                    let activity_before = vfs.meta.activity_snapshot();
                     if activity_before.activity_generation != expected_activity
                         || activity_before.active_calls != 1
                         || vfs.foreground_io_active()
@@ -1858,7 +1858,7 @@ impl StudioVfs {
                     let started = Instant::now();
                     let result = engine.compact_local_storage();
                     let elapsed = started.elapsed();
-                    let activity_after = activity_meta.activity_snapshot();
+                    let activity_after = vfs.meta.activity_snapshot();
                     let foreground_work_arrived = activity_after.activity_generation
                         != activity_before.activity_generation
                         || vfs.foreground_io_active();
@@ -1904,12 +1904,18 @@ impl StudioVfs {
             .or_else(|| compaction_diagnostics.and_then(|d| d.physical_file_bytes));
             let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
             let idle_ms = idle_for.as_millis().min(u128::from(u64::MAX)) as u64;
+            let result_label = match &result {
+                Ok(LocalStorageCompactionResult::Compacted) => "compacted",
+                Ok(LocalStorageCompactionResult::NoWork) => "no_work",
+                Ok(LocalStorageCompactionResult::SkippedBusy) => "skipped_busy",
+                Err(_) => "error",
+            };
 
             match &result {
                 Ok(LocalStorageCompactionResult::Compacted) => info!(
                     trigger_reason = "redb_size_and_fragmentation_threshold",
                     idle_ms,
-                    result = "compacted",
+                    result = result_label,
                     elapsed_ms,
                     bytes_before = ?bytes_before,
                     bytes_after = ?bytes_after,
@@ -1917,12 +1923,12 @@ impl StudioVfs {
                     "local metadata redb compaction attempt"
                 ),
                 Ok(
-                    outcome @ (LocalStorageCompactionResult::NoWork
-                    | LocalStorageCompactionResult::SkippedBusy),
+                    LocalStorageCompactionResult::NoWork
+                    | LocalStorageCompactionResult::SkippedBusy,
                 ) => debug!(
                     trigger_reason = "redb_size_and_fragmentation_threshold",
                     idle_ms,
-                    result = ?outcome,
+                    result = result_label,
                     elapsed_ms,
                     bytes_before = ?bytes_before,
                     bytes_after = ?bytes_after,
@@ -1932,7 +1938,7 @@ impl StudioVfs {
                 Err(error) => warn!(
                     trigger_reason = "redb_size_and_fragmentation_threshold",
                     idle_ms,
-                    result = "error",
+                    result = result_label,
                     elapsed_ms,
                     bytes_before = ?bytes_before,
                     bytes_after = ?bytes_after,
@@ -2800,6 +2806,23 @@ mod tests {
             ));
             assert!(schedule.ready_to_probe(started + delay, LOCAL_REDB_COMPACTION_IDLE_WINDOW,));
         }
+    }
+
+    #[test]
+    fn local_redb_compaction_cooldown_holds_after_twenty_idle_hours() {
+        let attempted_at = Instant::now();
+        let mut schedule = LocalRedbCompactionSchedule::new(0);
+        schedule.record_attempt(
+            attempted_at,
+            &Ok::<_, ()>(LocalStorageCompactionResult::Compacted),
+        );
+        let idle_for = Duration::from_secs(20 * 60 * 60);
+
+        assert!(!schedule.ready_to_probe(
+            attempted_at + LOCAL_REDB_COMPACTION_COOLDOWN - Duration::from_secs(1),
+            idle_for,
+        ));
+        assert!(schedule.ready_to_probe(attempted_at + LOCAL_REDB_COMPACTION_COOLDOWN, idle_for,));
     }
 
     fn token(value: &str) -> Option<String> {

@@ -2377,6 +2377,33 @@ fn startup_compaction_skips_read_only_mounts() {
 }
 
 #[test]
+fn startup_compaction_does_not_record_foreground_metadata_activity() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-compaction-activity");
+    let activity_before = vfs.meta.activity_snapshot();
+    let attempts_before = meta
+        .local_storage_diagnostics()
+        .expect("read local storage diagnostics")
+        .expect("redb diagnostics are available")
+        .compaction_attempts;
+
+    vfs.run_startup_local_metadata_compaction();
+
+    let activity_after = vfs.meta.activity_snapshot();
+    let attempts_after = meta
+        .local_storage_diagnostics()
+        .expect("read local storage diagnostics")
+        .expect("redb diagnostics are available")
+        .compaction_attempts;
+    assert_eq!(
+        activity_after.activity_generation,
+        activity_before.activity_generation
+    );
+    assert_eq!(activity_after.active_calls, 0);
+    assert_eq!(attempts_after, attempts_before + 1);
+}
+
+#[test]
 fn runtime_stats_surface_has_stable_attributes() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-stable-attr");
