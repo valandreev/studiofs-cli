@@ -26,5 +26,6 @@ Compare the reported values across runs and commits, but do not require identica
 
 ## Recorded baseline
 
-The Windows-only measurements collected for SFS-737 on 2026-09-27 are recorded
-in [the Windows redb growth baseline](sfs-737-windows-redb-growth-baseline.md).
+The Windows and macOS measurements collected for SFS-737 on 2026-09-27 are
+recorded in the [Windows redb growth baseline](sfs-737-windows-redb-growth-baseline.md)
+and [macOS redb growth and recovery baseline](sfs-737-macos-redb-growth-baseline.md).
