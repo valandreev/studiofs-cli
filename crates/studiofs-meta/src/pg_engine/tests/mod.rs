@@ -61,6 +61,12 @@ fn pg_dsn() -> Option<String> {
     )
 }
 
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_test_database_is_reachable_for_ci_gate() {
+    let _dsn = pg_dsn().expect("PostgreSQL test gate requires a reachable STUDIOFS_TEST_PG_DSN");
+}
+
 fn run_async<T, F>(fut: F) -> MetaResult<T>
 where
     F: std::future::Future<Output = MetaResult<T>>,
