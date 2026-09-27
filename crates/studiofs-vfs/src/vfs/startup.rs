@@ -95,7 +95,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, MetaGc, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -266,7 +266,12 @@ mod tests {
     #[test]
     fn studio_vfs_start_is_idempotent_once_running() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-idempotent");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "start-idempotent");
+        let compaction_attempts_before = meta
+            .local_storage_diagnostics()
+            .expect("read local storage diagnostics")
+            .expect("redb diagnostics are available")
+            .compaction_attempts;
 
         let _guard = rt.enter();
         vfs.start().expect("first start");
@@ -275,12 +280,30 @@ mod tests {
             initial_background_task_count > 0,
             "first start should register background tasks"
         );
+        let compaction_attempts_after_start = meta
+            .local_storage_diagnostics()
+            .expect("read local storage diagnostics")
+            .expect("redb diagnostics are available")
+            .compaction_attempts;
+        assert_eq!(
+            compaction_attempts_after_start,
+            compaction_attempts_before + 1,
+            "first start should make one local compaction attempt"
+        );
 
         vfs.start().expect("second start should be a no-op");
         assert_eq!(
             vfs.state.shutdown.background_tasks.lock().len(),
             initial_background_task_count,
             "second start should not register duplicate background tasks"
+        );
+        assert_eq!(
+            meta.local_storage_diagnostics()
+                .expect("read local storage diagnostics")
+                .expect("redb diagnostics are available")
+                .compaction_attempts,
+            compaction_attempts_after_start,
+            "idempotent start should not compact the database again"
         );
         assert!(
             matches!(vfs.startup.lifecycle.lock().status, StartupStatus::Running),

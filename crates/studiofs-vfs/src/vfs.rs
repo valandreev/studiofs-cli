@@ -4832,6 +4832,7 @@ impl StudioVfs {
         self.spawn_epoch_finalizer_worker();
         self.spawn_upload_stats_worker();
         self.spawn_fetch_warmup_task();
+        self.spawn_local_metadata_compaction_worker();
         self.spawn_gc_worker();
         self.spawn_metadata_invalidation_worker();
         self.spawn_janitor_worker();
@@ -4839,6 +4840,41 @@ impl StudioVfs {
         self.spawn_snapshot_cleanup_worker();
         self.spawn_snapshot_policy_evaluator();
         Ok(())
+    }
+
+    fn run_startup_local_metadata_compaction(&self) {
+        let started = Instant::now();
+        let result = self.meta.run_sync(|engine| engine.compact_local_storage());
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        match result {
+            Ok(LocalStorageCompactionResult::Compacted) => {
+                if elapsed > Duration::from_secs(2) {
+                    warn!(
+                        elapsed_ms,
+                        "startup local metadata compaction took longer than expected"
+                    );
+                } else {
+                    info!(elapsed_ms, "startup compacted local metadata storage");
+                }
+            }
+            Ok(LocalStorageCompactionResult::SkippedBusy) => {
+                debug!(
+                    elapsed_ms,
+                    "startup local metadata compaction skipped because metadata was busy"
+                );
+            }
+            Ok(LocalStorageCompactionResult::NoWork) => {
+                debug!(elapsed_ms, "startup local metadata compaction had no work");
+            }
+            Err(error) => {
+                warn!(
+                    elapsed_ms,
+                    error = %error,
+                    "startup local metadata compaction failed"
+                );
+            }
+        }
     }
 
     fn spawn_snapshot_worker(self: &Arc<Self>) {
@@ -4925,41 +4961,6 @@ impl StudioVfs {
                 _ = tokio::time::sleep(retry_delay) => {}
             }
             retry_delay = retry_delay.saturating_mul(2).min(max_delay);
-        }
-    }
-
-    fn run_startup_local_metadata_compaction(&self) {
-        let started = Instant::now();
-        let result = self.meta.run_sync(|engine| engine.compact_local_storage());
-        let elapsed = started.elapsed();
-        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        match result {
-            Ok(LocalStorageCompactionResult::Compacted) => {
-                if elapsed > Duration::from_secs(2) {
-                    warn!(
-                        elapsed_ms,
-                        "startup local metadata compaction took longer than expected"
-                    );
-                } else {
-                    info!(elapsed_ms, "startup compacted local metadata storage");
-                }
-            }
-            Ok(LocalStorageCompactionResult::SkippedBusy) => {
-                debug!(
-                    elapsed_ms,
-                    "startup local metadata compaction skipped because metadata was busy"
-                );
-            }
-            Ok(LocalStorageCompactionResult::NoWork) => {
-                debug!(elapsed_ms, "startup local metadata compaction had no work");
-            }
-            Err(error) => {
-                warn!(
-                    elapsed_ms,
-                    error = %error,
-                    "startup local metadata compaction failed"
-                );
-            }
         }
     }
 
@@ -5050,6 +5051,16 @@ impl StudioVfs {
         let vfs = self.clone();
         self.track_background_task(tokio::spawn(async move {
             vfs.background_janitor().await;
+        }));
+    }
+
+    fn spawn_local_metadata_compaction_worker(self: &Arc<Self>) {
+        if self.read_only_mount {
+            return;
+        }
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_local_metadata_compaction().await;
         }));
     }
 
@@ -6735,7 +6746,7 @@ impl StudioVfs {
     /// In async paths, prefer `self.meta.run(...)` so blocking work stays behind
     /// one explicit metadata boundary.
     fn sync_meta(&self) -> Arc<dyn VfsMeta> {
-        self.meta.sync_view()
+        self.meta.foreground_view()
     }
 
     /// Get metadata engine reference.
@@ -7473,7 +7484,7 @@ impl StudioVfs {
     }
 
     fn metadata_sync_status(&self) -> PgSyncStatus {
-        let mut status = self.meta.sync_view().pg_sync_status();
+        let mut status = self.meta.foreground_view().pg_sync_status();
         if self.read_only_mount {
             status.authority = MetadataAuthorityStatus::read_only();
         }
@@ -7491,7 +7502,7 @@ impl StudioVfs {
     }
 
     fn metadata_sync_diagnostics(&self) -> PgSyncDiagnostics {
-        let mut diagnostics = self.meta.sync_view().pg_sync_diagnostics();
+        let mut diagnostics = self.meta.foreground_view().pg_sync_diagnostics();
         #[cfg(test)]
         {
             let mut overridden = false;
@@ -7564,13 +7575,16 @@ impl StudioVfs {
             return Some(lease);
         }
 
-        let _ = self.meta.sync_view().ensure_known_file_lock_monitoring();
-        self.meta.sync_view().known_file_lock_lease(ino)
+        let _ = self
+            .meta
+            .foreground_view()
+            .ensure_known_file_lock_monitoring();
+        self.meta.foreground_view().known_file_lock_lease(ino)
     }
 
     fn known_hard_lock_blocks_new_mutation(&self, ino: Ino) -> Option<FileLockLease> {
         let lease = self.known_file_lock_lease_snapshot(ino)?;
-        let self_client_id = self.meta.sync_view().invalidation_sender_id();
+        let self_client_id = self.meta.foreground_view().invalidation_sender_id();
         let self_exclusive_owner = self_client_id
             .as_deref()
             .is_some_and(|client_id| lease.exclusive_owner.as_deref() == Some(client_id));

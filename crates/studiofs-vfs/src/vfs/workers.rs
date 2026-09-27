@@ -2,7 +2,9 @@ use futures::StreamExt;
 use opendal::ErrorKind;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use studiofs_meta::engine::MetadataCoherenceProgress;
+use studiofs_meta::engine::{
+    LocalStorageCompactionResult, LocalStorageDiagnostics, MetadataCoherenceProgress,
+};
 use tokio::time::MissedTickBehavior;
 
 use super::*;
@@ -13,6 +15,95 @@ use crate::{JanitorMeta, VfsMeta};
 const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
 const COHERENCE_PENDING_INVALIDATION_CAPACITY: usize = 128;
 const COHERENCE_INVALIDATION_RETRY_LIMIT: u8 = 3;
+const LOCAL_REDB_COMPACTION_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const LOCAL_REDB_COMPACTION_IDLE_WINDOW: Duration = Duration::from_secs(15 * 60);
+const LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK: Duration = Duration::from_secs(60 * 60);
+const LOCAL_REDB_COMPACTION_BUSY_BACKOFF: Duration = Duration::from_secs(30 * 60);
+const LOCAL_REDB_COMPACTION_ERROR_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
+const LOCAL_REDB_COMPACTION_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+const LOCAL_REDB_COMPACTION_MIN_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const LOCAL_REDB_COMPACTION_MIN_FRAGMENTED_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug)]
+struct LocalRedbCompactionSchedule {
+    last_activity_generation: u64,
+    idle_since: Option<Instant>,
+    next_probe_at: Option<Instant>,
+}
+
+impl LocalRedbCompactionSchedule {
+    fn new(activity_generation: u64) -> Self {
+        Self {
+            last_activity_generation: activity_generation,
+            idle_since: None,
+            next_probe_at: None,
+        }
+    }
+
+    fn observe_activity(
+        &mut self,
+        now: Instant,
+        activity_generation: u64,
+        active_calls: usize,
+        foreground_io_active: bool,
+        shutdown_requested: bool,
+    ) -> Option<Duration> {
+        if shutdown_requested
+            || activity_generation != self.last_activity_generation
+            || active_calls > 0
+            || foreground_io_active
+        {
+            self.last_activity_generation = activity_generation;
+            self.idle_since = None;
+            return None;
+        }
+
+        let idle_since = *self.idle_since.get_or_insert(now);
+        Some(now.saturating_duration_since(idle_since))
+    }
+
+    fn ready_to_probe(&self, now: Instant, idle_for: Duration) -> bool {
+        idle_for >= LOCAL_REDB_COMPACTION_IDLE_WINDOW
+            && self.next_probe_at.is_none_or(|next| now >= next)
+    }
+
+    fn defer_probe(&mut self, now: Instant, delay: Duration) {
+        self.next_probe_at = Some(now + delay);
+    }
+
+    fn reset_idle(&mut self, activity_generation: u64) {
+        self.last_activity_generation = activity_generation;
+        self.idle_since = None;
+    }
+
+    fn record_attempt<E>(
+        &mut self,
+        now: Instant,
+        result: &Result<LocalStorageCompactionResult, E>,
+    ) {
+        let delay = match result {
+            Ok(LocalStorageCompactionResult::SkippedBusy) => LOCAL_REDB_COMPACTION_BUSY_BACKOFF,
+            Err(_) => LOCAL_REDB_COMPACTION_ERROR_BACKOFF,
+            Ok(LocalStorageCompactionResult::Compacted | LocalStorageCompactionResult::NoWork) => {
+                LOCAL_REDB_COMPACTION_COOLDOWN
+            }
+        };
+        self.defer_probe(now, delay);
+    }
+}
+
+fn local_redb_compaction_worthwhile(diagnostics: &LocalStorageDiagnostics) -> bool {
+    let (Some(file_bytes), Some(fragmented_bytes)) = (
+        diagnostics.physical_file_bytes,
+        diagnostics.fragmented_bytes,
+    ) else {
+        return false;
+    };
+
+    file_bytes >= LOCAL_REDB_COMPACTION_MIN_FILE_BYTES
+        && fragmented_bytes >= LOCAL_REDB_COMPACTION_MIN_FRAGMENTED_BYTES
+        && fragmented_bytes.saturating_mul(4) >= file_bytes
+}
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
@@ -1647,6 +1738,194 @@ impl StudioVfs {
         }
     }
 
+    pub(super) async fn background_local_metadata_compaction(self: Arc<Self>) {
+        let mut poll = tokio::time::interval(LOCAL_REDB_COMPACTION_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut schedule =
+            LocalRedbCompactionSchedule::new(self.meta.activity_snapshot().activity_generation);
+
+        loop {
+            tokio::select! {
+                _ = self.state.shutdown.shutdown_notify.notified() => break,
+                _ = poll.tick() => {}
+            }
+            if self.shutdown_requested() {
+                break;
+            }
+
+            let activity = self.meta.activity_snapshot();
+            let now = Instant::now();
+            let Some(idle_for) = schedule.observe_activity(
+                now,
+                activity.activity_generation,
+                activity.active_calls,
+                self.foreground_io_active(),
+                self.shutdown_requested(),
+            ) else {
+                continue;
+            };
+            if !schedule.ready_to_probe(now, idle_for) {
+                continue;
+            }
+
+            let expected_activity = activity.activity_generation;
+            let vfs = self.clone();
+            let diagnostics = match self
+                .meta
+                .run_maintenance(move |engine: Arc<dyn VfsMeta>| {
+                    let activity = vfs.meta.activity_snapshot();
+                    if activity.activity_generation != expected_activity
+                        || activity.active_calls != 1
+                        || vfs.foreground_io_active()
+                        || vfs.shutdown_requested()
+                    {
+                        return Ok((false, None));
+                    }
+                    Ok((true, engine.local_storage_diagnostics()?))
+                })
+                .await
+            {
+                Ok((true, Some(diagnostics))) => diagnostics,
+                Ok((true, None)) => {
+                    schedule.defer_probe(Instant::now(), LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK);
+                    continue;
+                }
+                Ok((false, _)) => {
+                    schedule.reset_idle(self.meta.activity_snapshot().activity_generation);
+                    continue;
+                }
+                Err(error) => {
+                    warn!(error = %error, "local metadata compaction diagnostics failed");
+                    schedule.defer_probe(Instant::now(), LOCAL_REDB_COMPACTION_ERROR_BACKOFF);
+                    continue;
+                }
+            };
+
+            let activity = self.meta.activity_snapshot();
+            let now = Instant::now();
+            let Some(idle_for) = schedule.observe_activity(
+                now,
+                activity.activity_generation,
+                activity.active_calls,
+                self.foreground_io_active(),
+                self.shutdown_requested(),
+            ) else {
+                continue;
+            };
+            if !schedule.ready_to_probe(now, idle_for) {
+                continue;
+            }
+            if !local_redb_compaction_worthwhile(&diagnostics) {
+                schedule.defer_probe(now, LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK);
+                continue;
+            }
+
+            let expected_activity = activity.activity_generation;
+            let file_bytes_before = diagnostics.physical_file_bytes;
+            let vfs = self.clone();
+            let activity_meta = self.meta.clone();
+            let attempt = self
+                .meta
+                .run_maintenance(move |engine: Arc<dyn VfsMeta>| {
+                    let activity_before = activity_meta.activity_snapshot();
+                    if activity_before.activity_generation != expected_activity
+                        || activity_before.active_calls != 1
+                        || vfs.foreground_io_active()
+                        || vfs.shutdown_requested()
+                    {
+                        return Ok(None);
+                    }
+
+                    let started = Instant::now();
+                    let result = engine.compact_local_storage();
+                    let elapsed = started.elapsed();
+                    let activity_after = activity_meta.activity_snapshot();
+                    let foreground_work_arrived = activity_after.activity_generation
+                        != activity_before.activity_generation
+                        || vfs.foreground_io_active();
+                    let diagnostics = engine.local_storage_diagnostics();
+                    Ok(Some((
+                        result,
+                        elapsed,
+                        foreground_work_arrived,
+                        diagnostics,
+                    )))
+                })
+                .await;
+
+            let Some((result, elapsed, foreground_work_arrived, diagnostics_after)) = (match attempt
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    warn!(error = %error, "local metadata compaction worker failed");
+                    schedule.defer_probe(Instant::now(), LOCAL_REDB_COMPACTION_ERROR_BACKOFF);
+                    continue;
+                }
+            }) else {
+                schedule.reset_idle(self.meta.activity_snapshot().activity_generation);
+                continue;
+            };
+
+            let compaction_diagnostics = diagnostics_after
+                .as_ref()
+                .ok()
+                .and_then(|diagnostics| diagnostics.as_ref());
+            let compacted = matches!(&result, Ok(LocalStorageCompactionResult::Compacted));
+            let bytes_before = if compacted {
+                compaction_diagnostics.and_then(|d| d.last_success_bytes_before)
+            } else {
+                None
+            }
+            .or(file_bytes_before);
+            let bytes_after = if compacted {
+                compaction_diagnostics.and_then(|d| d.last_success_bytes_after)
+            } else {
+                None
+            }
+            .or_else(|| compaction_diagnostics.and_then(|d| d.physical_file_bytes));
+            let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+            let idle_ms = idle_for.as_millis().min(u128::from(u64::MAX)) as u64;
+
+            match &result {
+                Ok(LocalStorageCompactionResult::Compacted) => info!(
+                    trigger_reason = "redb_size_and_fragmentation_threshold",
+                    idle_ms,
+                    result = "compacted",
+                    elapsed_ms,
+                    bytes_before = ?bytes_before,
+                    bytes_after = ?bytes_after,
+                    foreground_metadata_work_arrived = foreground_work_arrived,
+                    "local metadata redb compaction attempt"
+                ),
+                Ok(
+                    outcome @ (LocalStorageCompactionResult::NoWork
+                    | LocalStorageCompactionResult::SkippedBusy),
+                ) => debug!(
+                    trigger_reason = "redb_size_and_fragmentation_threshold",
+                    idle_ms,
+                    result = ?outcome,
+                    elapsed_ms,
+                    bytes_before = ?bytes_before,
+                    bytes_after = ?bytes_after,
+                    foreground_metadata_work_arrived = foreground_work_arrived,
+                    "local metadata redb compaction attempt"
+                ),
+                Err(error) => warn!(
+                    trigger_reason = "redb_size_and_fragmentation_threshold",
+                    idle_ms,
+                    result = "error",
+                    elapsed_ms,
+                    bytes_before = ?bytes_before,
+                    bytes_after = ?bytes_after,
+                    foreground_metadata_work_arrived = foreground_work_arrived,
+                    error = %error,
+                    "local metadata redb compaction attempt"
+                ),
+            }
+            schedule.record_attempt(Instant::now(), &result);
+        }
+    }
+
     pub(super) async fn background_gc(self: Arc<Self>) {
         debug!("background GC started");
 
@@ -2360,6 +2639,115 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_redb_compaction_requires_measured_file_and_fragmentation_thresholds() {
+        let measured_workload = LocalStorageDiagnostics {
+            physical_file_bytes: Some(6_320_128),
+            fragmented_bytes: Some(1_786_496),
+            ..LocalStorageDiagnostics::default()
+        };
+        assert!(local_redb_compaction_worthwhile(&measured_workload));
+
+        let minimum_size_and_fragmentation = LocalStorageDiagnostics {
+            physical_file_bytes: Some(4 * 1024 * 1024),
+            fragmented_bytes: Some(1024 * 1024),
+            ..LocalStorageDiagnostics::default()
+        };
+        assert!(local_redb_compaction_worthwhile(
+            &minimum_size_and_fragmentation
+        ));
+
+        for diagnostics in [
+            LocalStorageDiagnostics {
+                physical_file_bytes: Some(1024 * 1024),
+                fragmented_bytes: Some(1_007_924),
+                ..LocalStorageDiagnostics::default()
+            },
+            LocalStorageDiagnostics {
+                physical_file_bytes: Some(6_320_128),
+                fragmented_bytes: Some(1_048_575),
+                ..LocalStorageDiagnostics::default()
+            },
+            LocalStorageDiagnostics {
+                physical_file_bytes: Some(6_320_128),
+                fragmented_bytes: Some(1_048_576),
+                ..LocalStorageDiagnostics::default()
+            },
+            LocalStorageDiagnostics::default(),
+        ] {
+            assert!(!local_redb_compaction_worthwhile(&diagnostics));
+        }
+    }
+
+    #[test]
+    fn local_redb_compaction_idle_window_resets_on_activity_and_exclusions() {
+        let started = Instant::now();
+        let mut schedule = LocalRedbCompactionSchedule::new(10);
+        assert_eq!(
+            schedule.observe_activity(started, 10, 0, false, false),
+            Some(Duration::ZERO)
+        );
+
+        let almost_idle = started + LOCAL_REDB_COMPACTION_IDLE_WINDOW - Duration::from_secs(1);
+        assert_eq!(
+            schedule.observe_activity(almost_idle, 10, 0, false, false),
+            Some(LOCAL_REDB_COMPACTION_IDLE_WINDOW - Duration::from_secs(1))
+        );
+
+        let activity_at = started + LOCAL_REDB_COMPACTION_IDLE_WINDOW;
+        assert_eq!(
+            schedule.observe_activity(activity_at, 11, 0, false, false),
+            None
+        );
+        assert_eq!(
+            schedule.observe_activity(activity_at, 11, 0, false, false),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            schedule.observe_activity(activity_at, 11, 1, false, false),
+            None
+        );
+        assert_eq!(
+            schedule.observe_activity(activity_at, 11, 0, true, false),
+            None
+        );
+        assert_eq!(
+            schedule.observe_activity(activity_at, 11, 0, false, true),
+            None
+        );
+        schedule.reset_idle(11);
+        assert_eq!(
+            schedule.observe_activity(activity_at, 11, 0, false, false),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn local_redb_compaction_outcomes_use_bounded_backoff() {
+        let started = Instant::now();
+        let mut schedule = LocalRedbCompactionSchedule::new(0);
+        schedule.observe_activity(started, 0, 0, false, false);
+
+        for (result, delay) in [
+            (
+                Ok(LocalStorageCompactionResult::SkippedBusy),
+                LOCAL_REDB_COMPACTION_BUSY_BACKOFF,
+            ),
+            (
+                Ok(LocalStorageCompactionResult::Compacted),
+                LOCAL_REDB_COMPACTION_COOLDOWN,
+            ),
+            (Err(()), LOCAL_REDB_COMPACTION_ERROR_BACKOFF),
+        ] {
+            schedule.record_attempt(started, &result);
+            assert!(!schedule.ready_to_probe(
+                started + delay - Duration::from_secs(1),
+                LOCAL_REDB_COMPACTION_IDLE_WINDOW,
+            ));
+            assert!(schedule.ready_to_probe(started + delay, LOCAL_REDB_COMPACTION_IDLE_WINDOW,));
+        }
+    }
 
     fn token(value: &str) -> Option<String> {
         Some(value.to_string())
