@@ -18,6 +18,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use studiofs_vfs::{KernelInvalidator, StudioVfs, VfsFuseInvalidationSnapshot};
@@ -34,14 +35,21 @@ const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
-// copied callback data out of its session lock. This registry keeps callback
-// data as an opaque key instead of a Rust pointer; the mutex serializes cancel
-// lookup/removal at the cost of lower throughput under heavy interrupt load.
-static INTERRUPT_REGISTRY: OnceLock<ParkingMutex<HashMap<usize, CancellationToken>>> =
-    OnceLock::new();
+// copied callback data out of its session lock. Keep callback data as an opaque
+// key and shard independent requests so their registry operations can proceed
+// concurrently.
+static INTERRUPT_REGISTRY: OnceLock<DashMap<usize, CancellationToken>> = OnceLock::new();
 
-fn interrupt_registry() -> &'static ParkingMutex<HashMap<usize, CancellationToken>> {
-    INTERRUPT_REGISTRY.get_or_init(|| ParkingMutex::new(HashMap::new()))
+fn interrupt_registry() -> &'static DashMap<usize, CancellationToken> {
+    INTERRUPT_REGISTRY.get_or_init(DashMap::new)
+}
+
+fn insert_interrupt_token(key: usize, token: CancellationToken) {
+    interrupt_registry().insert(key, token);
+}
+
+fn remove_interrupt_token(key: usize) {
+    interrupt_registry().remove(&key);
 }
 
 fn next_interrupt_key() -> usize {
@@ -1392,7 +1400,7 @@ impl Request {
         };
         self.clear_interrupt_token();
         let key = next_interrupt_key();
-        interrupt_registry().lock().insert(key, token);
+        insert_interrupt_token(key, token);
         self.interrupt_key = Some(key);
         // SAFETY: `raw` is a live low-level request. The callback data is an
         // opaque integer key, never a dereferenced pointer.
@@ -1416,7 +1424,7 @@ impl Request {
                 raw::fuse_req_interrupt_func(raw.as_ptr(), None, std::ptr::null_mut());
             }
         }
-        interrupt_registry().lock().remove(&key);
+        remove_interrupt_token(key);
     }
 
     fn as_ptr(&self) -> *mut raw::FuseReq {
@@ -1452,7 +1460,10 @@ unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_v
         return;
     }
     let key = data as usize;
-    if let Some(token) = interrupt_registry().lock().get(&key) {
+    let token = interrupt_registry()
+        .get(&key)
+        .map(|entry| entry.value().clone());
+    if let Some(token) = token {
         token.cancel();
     }
 }
@@ -2162,5 +2173,106 @@ mod tests {
         queue.close();
 
         assert_eq!(queue.next(), None);
+    }
+
+    fn invoke_interrupt_callback(key: usize) {
+        // SAFETY: The callback treats `data` as an opaque integer key and does
+        // not dereference either pointer.
+        unsafe { request_interrupted(std::ptr::null_mut(), key as *mut c_void) };
+    }
+
+    #[test]
+    fn interrupt_registry_callback_cancels_registered_token() {
+        let key = next_interrupt_key();
+        let token = CancellationToken::new();
+        insert_interrupt_token(key, token.clone());
+
+        invoke_interrupt_callback(key);
+
+        assert!(token.is_cancelled());
+        remove_interrupt_token(key);
+    }
+
+    #[test]
+    fn interrupt_registry_removal_makes_later_callback_a_noop() {
+        let key = next_interrupt_key();
+        let token = CancellationToken::new();
+        insert_interrupt_token(key, token.clone());
+        remove_interrupt_token(key);
+
+        invoke_interrupt_callback(key);
+
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn interrupt_registry_callback_and_removal_are_race_safe() {
+        for _ in 0..64 {
+            let key = next_interrupt_key();
+            let token = CancellationToken::new();
+            insert_interrupt_token(key, token);
+            let start = Arc::new(std::sync::Barrier::new(3));
+
+            let callback_start = Arc::clone(&start);
+            let callback = std::thread::spawn(move || {
+                callback_start.wait();
+                invoke_interrupt_callback(key);
+            });
+
+            let removal_start = Arc::clone(&start);
+            let removal = std::thread::spawn(move || {
+                removal_start.wait();
+                remove_interrupt_token(key);
+            });
+
+            start.wait();
+            callback.join().expect("interrupt callback should complete");
+            removal.join().expect("registry removal should complete");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode registry contention measurement"]
+    fn interrupt_registry_contention_benchmark() {
+        const REQUESTS_PER_WORKER: usize = 25_000;
+        const SAMPLES: usize = 5;
+
+        for workers in [1, 2, 4, 8] {
+            let mut elapsed_samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let start = Arc::new(std::sync::Barrier::new(workers + 1));
+                let mut threads = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let start = Arc::clone(&start);
+                    threads.push(std::thread::spawn(move || {
+                        start.wait();
+                        for _ in 0..REQUESTS_PER_WORKER {
+                            let key = next_interrupt_key();
+                            let token = CancellationToken::new();
+                            insert_interrupt_token(key, token.clone());
+                            invoke_interrupt_callback(key);
+                            std::hint::black_box(token.is_cancelled());
+                            remove_interrupt_token(key);
+                        }
+                    }));
+                }
+
+                let started = Instant::now();
+                start.wait();
+                for thread in threads {
+                    thread.join().expect("benchmark worker should complete");
+                }
+                elapsed_samples.push(started.elapsed());
+            }
+
+            elapsed_samples.sort_unstable();
+            let median = elapsed_samples[SAMPLES / 2];
+            let requests = workers * REQUESTS_PER_WORKER;
+            println!(
+                "workers={workers} median_requests_per_second={:.0} median_elapsed_ms={:.3}",
+                requests as f64 / median.as_secs_f64(),
+                median.as_secs_f64() * 1_000.0,
+            );
+        }
     }
 }
