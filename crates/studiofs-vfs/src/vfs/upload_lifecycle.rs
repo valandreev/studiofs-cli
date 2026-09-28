@@ -727,9 +727,7 @@ impl StudioVfs {
             self.state.shutdown.mutating_operation_gate.write(),
         )
         .await
-        .map_err(|_| {
-            VfsError::Other("timed out waiting for admitted VFS mutations before shutdown".into())
-        })?;
+        .map_err(|_| VfsError::shutdown_admission_timeout())?;
         let t0 = Instant::now();
         self.stop_coherence();
 

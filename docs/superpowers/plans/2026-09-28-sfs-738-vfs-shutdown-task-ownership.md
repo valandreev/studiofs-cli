@@ -18,6 +18,7 @@ When this change is complete, graceful VFS shutdown will stop admitting foregrou
 - [x] (2026-09-28 16:43Z) Close synchronous mutation admission before task draining and add a regression for cleanup registered by an already-admitted mutation.
 - [x] (2026-09-28) Bound abandoned namespace cleanup's pre-storage Delete-gate wait by shutdown cancellation, make queued file-session accounting cancellation-safe, and log compaction completion only after successful joins.
 - [x] (2026-09-28) Apply the admission gate to every synchronous metadata mutator, bound shutdown's write-lock wait without cancelling retryable work, and filter only shutdown-skipped cleanup inodes from the final dirty drain.
+- [x] (2026-09-28) Retry the typed admission-timeout result in the one-shot mount shutdown caller, and remove the unreachable size dispatch from the attr-only setter.
 
 ## Milestones
 
@@ -41,6 +42,8 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - A skipped cleanup inode also remained in the final dirty-inode list, which would reacquire the same blocked session gate during shutdown's flush phase. Filtering all `cleanup_errors` also excluded unrelated earlier cleanup failures, so a dedicated shutdown-skipped set now controls that exclusion.
 - The admission read guard originally covered only `run_sync_future`; direct create, mkdir, symlink, setattr, xattr, and ACL mutators could still write during shutdown. A shared admission helper now covers those synchronous entry points, and deferred namespace registration does not recheck shutdown after an operation has already been admitted.
 - The shutdown write-side admission wait was unbounded and ran before token cancellation. It now uses the existing two-second join timeout and returns a retryable error before cancelling background cleanup if admitted mutations do not finish.
+- The mount teardown helper was the only production caller of `StudioVfs::shutdown` and called it once. It now retries only that admission-timeout error; all other shutdown errors still terminate the helper. Each attempt remains bounded by the two-second VFS timeout while the mount waits for admitted work to finish before persistence.
+- Linux FUSE routes only `size.is_none()` setattr arguments through `setattr_attr_only_deferred_metadata`; its early size return bypassed the timer and deferred SetAttr enqueue. The helper's pre-existing size fallback remains the only size dispatch.
 
 ## Decision Log
 
@@ -57,6 +60,8 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - Skip moving native thread creation outside the shutdown-list lock because registration must stay atomic against the shutdown snapshot; skip the one-call `String` parameter style suggestion as cosmetic.
 - Close synchronous mutation admission through one `tokio::sync::RwLock<()>`: a shared helper takes a nonblocking read guard for direct metadata mutators and `run_sync_future`; shutdown takes the write guard after claiming ownership and holds it through persistence. An admitted operation can finish registration after shutdown is requested, while later operations are rejected.
 - Bound the write-side admission wait by the existing two-second background join timeout. If it expires, return before cancelling the background token so the aborted shutdown owner can be retried after the active mutation finishes.
+- Keep the VFS API's per-attempt admission wait bounded, and have the production mount teardown retry that specific result rather than abandoning durability drain. Use a VfsError predicate instead of adding an enum variant, preserving exhaustive downstream matches.
+- Remove the size branch from the attr-only public entrypoint because the actual FUSE caller excludes size; keep the local helper's existing size fallback for calls that do pass a size.
 - Use the existing background shutdown token to stop deferred cleanup only before it acquires `FileSessionOperation::Delete`; after acquisition, retain the existing unbounded owner join so cache/storage work finishes before close. Preserve the error through `cleanup_errors` so shutdown reports the skipped inode.
 - Do not retry per-inode flush for an inode explicitly marked as skipped while waiting for its Delete gate during shutdown; that flush would wait on the same gate. Keep general cleanup errors eligible for flush so unrelated dirty payloads and attrs remain durable.
 - Emit the local compaction completion event only for `Ok(())` from the join. Keep logging successful completion even when the worker completed within the timeout; the event describes completion, not only a timeout wait.
@@ -124,6 +129,17 @@ Latest review validation passed:
 - `cargo check -p studiofs-vfs`.
 - `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
 - `cargo fmt --all -- --check` and `git diff --check`.
+
+The latest review found that the production mount caller did not retry the bounded, retryable admission timeout, so shutdown could return before any durability drain. Mount teardown now retries only that timeout until admitted mutations finish; a focused CLI unit test covers the retry, and the existing VFS timeout test confirms each attempt remains bounded and retryable. The review also found an unreachable size dispatch in the attr-only setter; it was removed so the normal timer and deferred metadata path remain active.
+
+Latest review validation passed:
+
+- `cargo test -p studiofs mount_vfs_shutdown_retries_admission_timeout -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib shutdown_bounds_wait_for_admitted_mutations_and_can_retry -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib deferred_attr_only_commit_does_not_revert_written_size -- --nocapture` — 1 passed.
+- `cargo check -p studiofs`.
+- `cargo clippy -p studiofs -p studiofs-vfs --all-targets -- -D warnings`.
+- `cargo fmt --all` and `git diff --check`.
 
 The full VFS suite and native mounted acceptance were not run.
 

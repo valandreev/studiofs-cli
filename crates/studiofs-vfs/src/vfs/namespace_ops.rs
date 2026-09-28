@@ -1092,9 +1092,6 @@ impl StudioVfs {
         args: SetattrArgs,
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
-        if args.size.is_some() {
-            return self.setattr_with_handle(None, ino, args);
-        }
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
         let _operation = self.try_mutating_operation_admission()?;
         self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>())?;

@@ -1018,7 +1018,7 @@ fn block_on_mount_vfs_shutdown(
     upload_drain_timeout: Duration,
 ) -> (Runtime, anyhow::Result<()>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(vfs.shutdown(upload_drain_timeout))
+        retry_mount_vfs_shutdown(|| runtime.block_on(vfs.shutdown(upload_drain_timeout)))
     }));
     let result = match result {
         Ok(result) => result.map_err(|error| anyhow::anyhow!("mount VFS shutdown failed: {error}")),
@@ -1027,6 +1027,19 @@ fn block_on_mount_vfs_shutdown(
         )),
     };
     (runtime, result)
+}
+
+fn retry_mount_vfs_shutdown(
+    mut shutdown: impl FnMut() -> studiofs_vfs::VfsResult<()>,
+) -> studiofs_vfs::VfsResult<()> {
+    loop {
+        match shutdown() {
+            Err(error) if error.is_retryable_shutdown_admission_timeout() => {
+                warn!(error = %error, "VFS shutdown waiting for admitted mutations; retrying");
+            }
+            result => return result,
+        }
+    }
 }
 
 fn stop_mount_diagnostics_host(
@@ -3372,6 +3385,25 @@ mod tests {
         );
         RedbMetaEngine::read_format_info_readonly(meta_dir.join("demo.db"))
             .expect("clean shutdown leaves redb readable by read-only format probe");
+    }
+
+    #[test]
+    fn mount_vfs_shutdown_retries_admission_timeout() {
+        let mut attempts = 0;
+
+        let result = retry_mount_vfs_shutdown(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(studiofs_vfs::VfsError::Other(
+                    "timed out waiting for admitted VFS mutations before shutdown".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, 2);
     }
 
     #[test]

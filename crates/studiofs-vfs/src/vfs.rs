@@ -587,6 +587,20 @@ pub enum VfsError {
     Other(String),
 }
 
+const SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE: &str =
+    "timed out waiting for admitted VFS mutations before shutdown";
+
+impl VfsError {
+    /// Returns whether shutdown may be retried after admitted mutations finish.
+    pub fn is_retryable_shutdown_admission_timeout(&self) -> bool {
+        matches!(self, Self::Other(message) if message == SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE)
+    }
+
+    pub(crate) fn shutdown_admission_timeout() -> Self {
+        Self::Other(SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE.to_string())
+    }
+}
+
 /// Result type alias used by the VFS public API.
 pub type VfsResult<T> = Result<T, VfsError>;
 
