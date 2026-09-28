@@ -64,14 +64,19 @@ fn env_or_dotenv(key: &str, default: Option<&str>) -> Option<String> {
         .or_else(|| default.map(ToString::to_string))
 }
 
-fn load_test_env() -> Option<TestEnv> {
-    Some(TestEnv {
-        s3_endpoint: env_or_dotenv("STUDIOFS_S3_ENDPOINT", Some("http://127.0.0.1:9000"))?,
-        s3_bucket: env_or_dotenv("STUDIOFS_S3_BUCKET", Some("studiofs-test"))?,
-        s3_access_key: env_or_dotenv("STUDIOFS_S3_ACCESS_KEY", Some("studiofs"))?,
-        s3_secret_key: env_or_dotenv("STUDIOFS_S3_SECRET_KEY", Some("studiofs123"))?,
-        s3_region: env_or_dotenv("STUDIOFS_S3_REGION", Some("us-east-1"))?,
-    })
+fn load_test_env() -> TestEnv {
+    TestEnv {
+        s3_endpoint: env_or_dotenv("STUDIOFS_S3_ENDPOINT", Some("http://127.0.0.1:9000"))
+            .expect("resolve STUDIOFS_S3_ENDPOINT"),
+        s3_bucket: env_or_dotenv("STUDIOFS_S3_BUCKET", Some("studiofs-test"))
+            .expect("resolve STUDIOFS_S3_BUCKET"),
+        s3_access_key: env_or_dotenv("STUDIOFS_S3_ACCESS_KEY", Some("studiofs"))
+            .expect("resolve STUDIOFS_S3_ACCESS_KEY"),
+        s3_secret_key: env_or_dotenv("STUDIOFS_S3_SECRET_KEY", Some("studiofs123"))
+            .expect("resolve STUDIOFS_S3_SECRET_KEY"),
+        s3_region: env_or_dotenv("STUDIOFS_S3_REGION", Some("us-east-1"))
+            .expect("resolve STUDIOFS_S3_REGION"),
+    }
 }
 
 fn random_name(prefix: &str) -> String {
@@ -429,14 +434,9 @@ async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: 
 #[tokio::test]
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 async fn dump_load_restores_volume_and_discovery_reads_data() {
-    let Some(env) = load_test_env() else {
-        eprintln!("skipping: env not ready");
-        return;
-    };
-    let Some(raw_pg) = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None) else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN is not set");
-        return;
-    };
+    let env = load_test_env();
+    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
+        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
 
     let disk_name = random_name("dump-load-a");
     let home_a = studiofs_test_support::workspace_target_tempdir("home-a-");
@@ -509,14 +509,9 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
 #[tokio::test]
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes() {
-    let Some(env) = load_test_env() else {
-        eprintln!("skipping: env not ready");
-        return;
-    };
-    let Some(raw_pg) = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None) else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN is not set");
-        return;
-    };
+    let env = load_test_env();
+    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
+        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
 
     let target = random_name("dump-load-target");
     let extra1 = random_name("dump-load-extra1");

@@ -138,7 +138,7 @@ tasks:
       cleanup_services() {
         for container in "${postgres_container}" "${rustfs_container}"; do
           if [[ -n "${container}" ]]; then
-            docker rm --force "${container}" >/dev/null 2>&1 || true
+            docker rm --force -v "${container}" >/dev/null 2>&1 || true
           fi
         done
       }
@@ -151,7 +151,9 @@ tasks:
         local service="$2"
         local status=""
         for attempt in $(seq 1 90); do
-          status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container}")"
+          if ! status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container}" 2>/dev/null)"; then
+            status="inspect_failed"
+          fi
           case "${status}" in
             healthy)
               return 0
@@ -166,7 +168,7 @@ tasks:
         done
 
         docker logs "${container}" >&2 || true
-        echo "${service} service did not become healthy within 90 seconds" >&2
+        echo "${service} service did not become healthy within 90 seconds (last status: ${status})" >&2
         return 1
       }
 

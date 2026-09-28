@@ -77,9 +77,9 @@ cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --noca
 The automatic Linux gate in `.rwx/ci.yml` starts the repository-pinned
 `rustfs/rustfs:1.0.0-alpha.94` image on a loopback-only dynamic port, then checks
 service health before running tests. The DataStore tests create the disposable
-`studiofs-test` bucket. The gate passes fixed `studiofs` / `studiofs123`
-test-only credentials to RustFS through environment variable names, so the
-launch command does not echo their values.
+`studiofs-test` bucket before the later VFS and combined tests use it. The gate
+passes fixed `studiofs` / `studiofs123` test-only credentials to RustFS through
+environment variable names, so the launch command does not echo their values.
 Each selection is listed and checked for a nonzero count before execution, and
 all selected tests run serially.
 
@@ -103,6 +103,22 @@ by name in the same gate:
 - `destroy_full_removes_local_s3_and_postgres_state`
 - `dump_load_restores_volume_and_discovery_reads_data`
 - `dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes`
+
+For local runs, start RustFS and PostgreSQL and configure the `STUDIOFS_S3_*`
+and `STUDIOFS_TEST_PG_DSN` variables as described in
+[Local Setup](development.md#local-setup). Run the DataStore command first
+because it creates the bucket used by later commands:
+
+```bash
+cargo test -p studiofs-data --test integration_test -- --ignored --test-threads=1 --nocapture --skip https_endpoint_fixture_put_get_when_configured
+cargo test -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-vfs --test vfs_test large_file_partial_overwrite_reuploads_only_touched_extents -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test destroy_test destroy_fails_cleanly_with_incorrect_s3_permissions -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test destroy_test destroy_local_only_removes_local_state_and_keeps_remote -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test destroy_test destroy_full_removes_local_s3_and_postgres_state -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test dump_load_test dump_load_restores_volume_and_discovery_reads_data -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test dump_load_test dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes -- --ignored --exact --test-threads=1 --nocapture
+```
 
 The optional HTTPS S3 fixture is excluded because the disposable RustFS service
 is plain HTTP. Mounted FUSE/WinFSP smoke gates and the remaining ignored S3 tests

@@ -64,7 +64,7 @@ fn test_config() -> DataStoreConfig {
         bucket: test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test"),
         access_key: test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
         secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
-        region: "us-east-1".into(),
+        region: test_env_var("STUDIOFS_S3_REGION", "us-east-1"),
         volume_name: "integration-test".into(),
         data_prefix: "integration-test/objects/".into(),
         volume_uuid: "d34f3c2a-c3a4-4b01-b626-fb46de61118a".into(),
@@ -120,7 +120,9 @@ async fn ensure_bucket_for(cfg: &DataStoreConfig) {
         .build();
     let client = S3Client::from_conf(conf);
     let _ = client.create_bucket().bucket(&cfg.bucket).send().await;
-    let _ = op.write(".bucket-marker", Bytes::from_static(b"ok")).await;
+    op.write(".bucket-marker", Bytes::from_static(b"ok"))
+        .await
+        .expect("create or verify configured S3 test bucket");
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
