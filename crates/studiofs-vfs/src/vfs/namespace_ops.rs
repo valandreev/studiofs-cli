@@ -1156,7 +1156,7 @@ impl StudioVfs {
             }
             let defer_handle_growth_flush =
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
-            let updated = Self::run_sync_future(self.setattr_with_size_change(
+            let updated = self.run_sync_future(self.setattr_with_size_change(
                 ino,
                 args,
                 defer_handle_growth_flush,
@@ -2334,7 +2334,7 @@ impl StudioVfs {
     /// In ignored-path mode, this records a synthetic ignored entry so namespace
     /// behavior remains consistent while avoiding metadata mutations.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
-        Self::run_sync_future(self.link_inner(ino, new_parent, new_name))
+        self.run_sync_future(self.link_inner(ino, new_parent, new_name))
     }
 
     async fn link_inner(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
@@ -2716,13 +2716,14 @@ impl StudioVfs {
 
     /// Unlink the entry `name` from directory `parent`.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.unlink_inner(parent, name)).map(|_| ())
+        self.run_sync_future(self.unlink_inner(parent, name))
+            .map(|_| ())
     }
 
     /// Unlink the entry `name` and return the removed inode attributes when
     /// the entry came from durable metadata.
     pub fn unlink_with_attr(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
-        Self::run_sync_future(self.unlink_inner(parent, name))
+        self.run_sync_future(self.unlink_inner(parent, name))
     }
 
     async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
@@ -2790,12 +2791,12 @@ impl StudioVfs {
 
     /// Remove an empty directory `name` from directory `parent`.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.rmdir_inner(parent, name))
+        self.run_sync_future(self.rmdir_inner(parent, name))
     }
 
     /// Retry a cleanup-triggered directory removal while child callbacks catch up.
     pub fn rmdir_for_cleanup(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.rmdir_for_cleanup_inner(parent, name))
+        self.run_sync_future(self.rmdir_for_cleanup_inner(parent, name))
     }
 
     async fn rmdir_for_cleanup_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
@@ -2913,7 +2914,7 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
-        Self::run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
+        self.run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
     }
 
     async fn delete_source_tree_and_invalidate_trash_target(

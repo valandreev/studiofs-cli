@@ -2413,6 +2413,7 @@ enum ShutdownClaim {
 
 struct ShutdownState {
     shutdown_phase: Mutex<ShutdownPhase>,
+    mutating_operation_gate: tokio::sync::RwLock<()>,
     shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_final_drain_active: std::sync::atomic::AtomicBool,
     uploader_shutdown_requested: std::sync::atomic::AtomicBool,
@@ -2436,6 +2437,7 @@ impl ShutdownState {
     fn new() -> Self {
         Self {
             shutdown_phase: Mutex::new(ShutdownPhase::Running),
+            mutating_operation_gate: tokio::sync::RwLock::new(()),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_final_drain_active: std::sync::atomic::AtomicBool::new(false),
             uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),

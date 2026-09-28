@@ -2,9 +2,9 @@
 
 This ExecPlan is living and follows `.agent/PLANS.md`. Keep `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` current as the work proceeds.
 
-When this change is complete, a graceful VFS shutdown will wait for all retry and deferred-cleanup work that can retain the local metadata or cache stores. A clean shutdown will then allow the existing test VFS to reopen its redb metadata and cache immediately.
+When this change is complete, graceful VFS shutdown will stop admitting foreground mutation futures, wait for mutations already in progress, and then wait for all retry and deferred-cleanup work that can retain the local metadata or cache stores. A clean shutdown will then allow the existing test VFS to reopen its redb metadata and cache immediately.
 
-`StudioVfs::shutdown` in `crates/studiofs-vfs/src/vfs/upload_lifecycle.rs` first stops and joins background workers, then drains local dirty state and persists local metadata/cache. The final dirty drain can register more work after the first join. Epoch retry scheduling lives in `crates/studiofs-vfs/src/vfs/workers.rs`; deleted-inode cache cleanup lives in `crates/studiofs-vfs/src/vfs/deletion_cleanup.rs`. This change keeps those owners in `ShutdownState` (`crates/studiofs-vfs/src/vfs.rs`) and joins them before persistence/close.
+`StudioVfs::shutdown` in `crates/studiofs-vfs/src/vfs/upload_lifecycle.rs` first stops and joins background workers, then drains local dirty state and persists local metadata/cache. Both the final dirty drain and a foreground mutation already in progress can register more work after an earlier join. Epoch retry scheduling lives in `crates/studiofs-vfs/src/vfs/workers.rs`; deleted-inode cache cleanup lives in `crates/studiofs-vfs/src/vfs/deletion_cleanup.rs`. `ShutdownState` (`crates/studiofs-vfs/src/vfs.rs`) owns the mutation-admission gate and task handles so no admitted producer or tracked owner crosses persistence/close.
 
 ## Progress
 
@@ -15,12 +15,13 @@ When this change is complete, a graceful VFS shutdown will wait for all retry an
 - [x] Run focused regressions, VFS check and Clippy; inspect the final diff.
 - [x] Verify the shutdown review against current call paths; reap completed handles, preserve panic reporting, and simplify the duplicated wait loops.
 - [x] Verify the follow-up review; correct compaction completion logging, avoid polling active Tokio handles, and record the verified runtime/thread-join decisions.
+- [x] (2026-09-28 16:43Z) Close synchronous mutation admission before task draining and add a regression for cleanup registered by an already-admitted mutation.
 
 ## Milestones
 
 The first milestone adds a synchronized regression around the current shutdown owner. The regression schedules a delayed epoch retry, schedules deleted-inode cleanup through both available execution paths, shuts down, verifies no tracked storage work remains, and reopens the same local redb/cache fixture. It must fail before the ownership change because the retry and non-Tokio thread are not in shutdown state.
 
-The second milestone makes shutdown retain every relevant handle. Retry waits use the shutdown cancellation token and are registered with the existing task list. Tokio cleanup wrappers are tracked in a non-abortable list; `run_local_cache_io_blocking` awaits its blocking operation, so shutdown keeps the wrapper alive until that operation releases the cache. Cleanup started without a Tokio runtime keeps its OS thread handle and completion signal in shutdown state. Shutdown joins again after the final dirty drain, before uploader close and local persistence.
+The second milestone makes shutdown retain every relevant handle and producer. Retry waits use the shutdown cancellation token and are registered with the existing task list. A shared Tokio read/write gate lets synchronous mutation futures register cleanup while admitted; shutdown closes that gate after claiming ownership and waits for existing readers before draining tasks. Tokio cleanup wrappers are tracked in a non-abortable list; `run_local_cache_io_blocking` awaits its blocking operation, so shutdown keeps the wrapper alive until that operation releases the cache. Cleanup started without a Tokio runtime keeps its OS thread handle and completion signal in shutdown state. Shutdown joins again after the final dirty drain, before uploader close and local persistence.
 
 The final milestone runs the single regression, `cargo check -p studiofs-vfs`, and `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`, then checks formatting and the diff. A passing unit regression proves the local reopen boundary; it does not claim native mounted acceptance.
 
@@ -32,13 +33,14 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - The no-runtime cleanup path discards the `std::thread::JoinHandle`.
 - Reaping Tokio handles through `is_finished()` alone would discard completed panic results; a nonblocking poll keeps panic reporting while releasing completed handles.
 - `Vec::remove(0)` shifted remaining handles even though completion order is not observable, so shutdown can use `swap_remove(0)`.
+- A synchronous rename or truncate can be admitted before shutdown and register deferred cache cleanup after a task-list snapshot. The task-list loop cannot own a producer that has not registered yet, so shutdown needs an operation-admission barrier before its first drain.
 
 ## Decision Log
 
-- Keep the existing task tracker and shutdown ordering; add only the ownership needed for blocking and OS-thread cleanup.
+- Keep the existing task tracker and shutdown ordering; add only the ownership needed for blocking and OS-thread cleanup. This initial decision was superseded by the review follow-up below because task ownership alone does not cover producers still inside synchronous mutation futures.
 - Use the already-owned `background_shutdown_token` for retry cancellation so a late waiter observes shutdown.
 - Keep timeout cancellation for ordinary async workers. Blocking cleanup and native cleanup threads must remain owned and finish before local stores can be reopened.
-- Repeat the task drain after shutdown-generated dirty/namespace work; no task-admission framework is needed for this bounded VFS lifecycle fix.
+- Repeat the task drain after shutdown-generated dirty/namespace work so cleanup produced by the final local drain is joined.
 - Treat cleanup timeouts as a grace/warning threshold, not a release deadline: SFS-738's Linear risk notes prohibit detaching owners while they may retain local stores.
 - Keep cleanup thread creation under the shutdown task-list lock so a thread is published atomically with its registration; keep direct namespace cleanup on its verified Tokio-only call path.
 - Keep namespace batch cleanup on `Handle::current()`: its only direct caller is the async namespace drain, run either as a tracked Tokio task or by an async barrier.
@@ -46,10 +48,13 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - Keep the native cleanup `join()` after its completion signal; the signal follows the cleanup closure, and the synchronous join only reaps the native thread before releasing its tracked handle.
 - Do not prioritize the epoch retry `select!` with `biased;`: shutdown sets `shutdown_requested` before cancelling the token, and the timer branch checks that flag before queueing.
 - Skip moving native thread creation outside the shutdown-list lock because registration must stay atomic against the shutdown snapshot; skip the one-call `String` parameter style suggestion as cosmetic.
+- Close foreground mutation admission through one `tokio::sync::RwLock<()>`: `run_sync_future` takes a nonblocking read guard and checks `shutdown_requested`, while shutdown takes the write guard immediately after claiming ownership and holds it through persistence. This makes late registration impossible for admitted sync mutations and rejects new ones after shutdown starts without adding a separate counter/notification protocol.
 
 ## Outcomes & Retrospective
 
 Shutdown now cancels and joins epoch retries, waits for deferred Tokio cleanup and no-runtime cleanup threads, and repeats the task drain after the final local dirty flush. A regression confirmed the retry handle is absent before the fix; after the fix, both focused tests passed and the same local redb/cache fixture reopened with its written bytes intact.
+
+The shutdown follow-up also waits for already-admitted synchronous mutations before taking task-list snapshots. The new regression failed before the write-side admission barrier because shutdown completed while a mutation was held before cleanup registration; it passes with the barrier and confirms shutdown waits for the cleanup it registers.
 
 Review follow-up reaps completed Tokio and native thread handles as new work is registered, logs completed task/thread panics, checks every join result after abort, shares the `JoinHandle` timeout policy, factors the native-thread waiter, and replaces front-removal shifts with `swap_remove`. Review requests for a hard shutdown deadline, runtime-less cleanup fallback, spawn-before-registration, and one shared warning budget were rejected because they conflict with storage ownership, have no runtime caller, or add policy without a demonstrated need; the synthetic cleanup IDs cover task registration while the regression also writes and reads real local data across reopen.
 
@@ -74,6 +79,15 @@ Validation passed:
 
 The full VFS suite and native mounted acceptance were not run. No PR was requested.
 
+Follow-up review validation passed:
+
+- `cargo test -p studiofs-vfs --lib shutdown_ -- --nocapture` — 20 passed.
+- `cargo check -p studiofs-vfs`.
+- `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
+- `cargo fmt --all -- --check` and `git diff --check`.
+
 ## Revision Note
 
 Created on 2026-09-28 after verifying the issue's named spawn sites and shutdown sequence. The first regression run failed as expected: the tracker contained 0 retry handles instead of 1. Final focused regressions, check, Clippy and diff review passed; implementation stays within the VFS lifecycle and its focused regression.
+
+Revision note (2026-09-28): the shutdown task-ownership review identified a producer race outside the tracked task lists. Updated the plan to close synchronous mutation admission before draining; the new regression failed before that barrier and passed afterward.

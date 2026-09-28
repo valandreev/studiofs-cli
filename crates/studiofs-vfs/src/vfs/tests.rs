@@ -15552,6 +15552,103 @@ fn cancelled_shutdown_owner_can_be_retried() {
 }
 
 #[test]
+fn shutdown_waits_for_admitted_mutation_that_registers_cleanup() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "shutdown-mutation-cleanup-admission");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let (operation_started_tx, operation_started_rx) = tokio::sync::oneshot::channel();
+        let (finish_operation_tx, finish_operation_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_started_tx, cleanup_started_rx) = tokio::sync::oneshot::channel();
+        let (finish_cleanup_tx, finish_cleanup_rx) = tokio::sync::oneshot::channel();
+        let operation_vfs = Arc::clone(&vfs);
+        let cleanup_vfs = Arc::clone(&vfs);
+        let cleanup_runtime = rt.handle().clone();
+        let operation = tokio::task::spawn_blocking(move || {
+            operation_vfs.run_sync_future(async move {
+                operation_started_tx
+                    .send(())
+                    .expect("test operation receiver remains alive");
+                finish_operation_rx
+                    .await
+                    .expect("test operation is released");
+                cleanup_vfs.spawn_background_cleanup_task_on(&cleanup_runtime, async move {
+                    let _ = cleanup_started_tx.send(());
+                    let _ = finish_cleanup_rx.await;
+                });
+                Ok(())
+            })
+        });
+        operation_started_rx
+            .await
+            .expect("admitted operation starts before shutdown");
+
+        let shutdown_vfs = Arc::clone(&vfs);
+        let mut shutdown = tokio::spawn(async move { shutdown_vfs.shutdown(Duration::ZERO).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !vfs.shutdown_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must claim ownership");
+
+        let shutdown_finished_during_operation =
+            match tokio::time::timeout(Duration::from_millis(100), &mut shutdown).await {
+                Ok(result) => {
+                    result
+                        .expect("shutdown must not panic")
+                        .expect("shutdown must finish");
+                    true
+                }
+                Err(_) => false,
+            };
+        finish_operation_tx
+            .send(())
+            .expect("admitted operation receiver remains alive");
+        operation
+            .await
+            .expect("admitted operation must not panic")
+            .expect("admitted operation must finish");
+        cleanup_started_rx
+            .await
+            .expect("operation registers its deferred cleanup before returning");
+
+        let shutdown_waited_for_cleanup = if shutdown_finished_during_operation {
+            false
+        } else {
+            match tokio::time::timeout(Duration::from_millis(100), &mut shutdown).await {
+                Ok(result) => {
+                    result
+                        .expect("shutdown must not panic")
+                        .expect("shutdown must finish");
+                    false
+                }
+                Err(_) => true,
+            }
+        };
+        let _ = finish_cleanup_tx.send(());
+        if shutdown_waited_for_cleanup {
+            shutdown
+                .await
+                .expect("shutdown must not panic")
+                .expect("shutdown must finish after the admitted cleanup");
+        }
+
+        assert!(
+            !shutdown_finished_during_operation && shutdown_waited_for_cleanup,
+            "shutdown completed before an admitted mutation registered and finished cleanup"
+        );
+        assert!(
+            vfs.run_sync_future(std::future::ready(Ok::<(), VfsError>(())))
+                .is_err(),
+            "mutations must be rejected after shutdown starts"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");

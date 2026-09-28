@@ -719,6 +719,8 @@ impl StudioVfs {
                 ShutdownClaim::Completed(error) => return replay_shutdown_result(error),
             }
         };
+        let _mutating_operation_admission =
+            self.state.shutdown.mutating_operation_gate.write().await;
         let t0 = Instant::now();
         self.stop_coherence();
         let background_join_timeout = Duration::from_secs(2);

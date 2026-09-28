@@ -73,7 +73,20 @@ impl StudioVfs {
         Ok(self.sync_meta().list_xattrs(ino)?)
     }
 
-    pub(super) fn run_sync_future<T>(future: impl std::future::Future<Output = T>) -> T {
+    pub(super) fn run_sync_future<T>(
+        &self,
+        future: impl std::future::Future<Output = VfsResult<T>>,
+    ) -> VfsResult<T> {
+        let _operation = self
+            .state
+            .shutdown
+            .mutating_operation_gate
+            .try_read()
+            .map_err(|_| VfsError::Other("VFS is shutting down".to_string()))?;
+        if self.shutdown_requested() {
+            return Err(VfsError::Other("VFS is shutting down".to_string()));
+        }
+
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| handle.block_on(future))
         } else {
