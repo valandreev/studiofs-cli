@@ -14,6 +14,7 @@ When this change is complete, a graceful VFS shutdown will wait for all retry an
 - [x] Register retry work, preserve ownership of blocking/thread cleanup, and join work produced by the final dirty drain.
 - [x] Run focused regressions, VFS check and Clippy; inspect the final diff.
 - [x] Verify the shutdown review against current call paths; reap completed handles, preserve panic reporting, and simplify the duplicated wait loops.
+- [x] Verify the follow-up review; correct compaction completion logging, avoid polling active Tokio handles, and record the verified runtime/thread-join decisions.
 
 ## Milestones
 
@@ -40,12 +41,27 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - Repeat the task drain after shutdown-generated dirty/namespace work; no task-admission framework is needed for this bounded VFS lifecycle fix.
 - Treat cleanup timeouts as a grace/warning threshold, not a release deadline: SFS-738's Linear risk notes prohibit detaching owners while they may retain local stores.
 - Keep cleanup thread creation under the shutdown task-list lock so a thread is published atomically with its registration; keep direct namespace cleanup on its verified Tokio-only call path.
+- Keep namespace batch cleanup on `Handle::current()`: its only direct caller is the async namespace drain, run either as a tracked Tokio task or by an async barrier.
+- Keep deferred block eviction on `Handle::try_current()` without a thread fallback: its caller is truncate finalization inside `setattr_with_size_change`, which `setattr_with_handle` polls through `run_sync_future`.
+- Keep the native cleanup `join()` after its completion signal; the signal follows the cleanup closure, and the synchronous join only reaps the native thread before releasing its tracked handle.
+- Do not prioritize the epoch retry `select!` with `biased;`: shutdown sets `shutdown_requested` before cancelling the token, and the timer branch checks that flag before queueing.
+- Skip moving native thread creation outside the shutdown-list lock because registration must stay atomic against the shutdown snapshot; skip the one-call `String` parameter style suggestion as cosmetic.
 
 ## Outcomes & Retrospective
 
 Shutdown now cancels and joins epoch retries, waits for deferred Tokio cleanup and no-runtime cleanup threads, and repeats the task drain after the final local dirty flush. A regression confirmed the retry handle is absent before the fix; after the fix, both focused tests passed and the same local redb/cache fixture reopened with its written bytes intact.
 
 Review follow-up reaps completed Tokio and native thread handles as new work is registered, logs completed task/thread panics, checks every join result after abort, shares the `JoinHandle` timeout policy, factors the native-thread waiter, and replaces front-removal shifts with `swap_remove`. Review requests for a hard shutdown deadline, runtime-less cleanup fallback, spawn-before-registration, and one shared warning budget were rejected because they conflict with storage ownership, have no runtime caller, or add policy without a demonstrated need; the synthetic cleanup IDs cover task registration while the regression also writes and reads real local data across reopen.
+
+The second shutdown review found a real compaction-log ordering bug: the completion event ran from the timeout callback, before the worker joined, and was absent on normal completion. The event now follows the join, with tests for both normal and post-timeout completion. The same follow-up adds an `is_finished()` fast path before polling tracked Tokio handles, shares the three task-list RAII guards, and documents cleanup grace-timeout and native-thread join semantics. The two runtime-availability findings were rejected after tracing their callers: namespace cleanup is reached only inside the Tokio async drain, and deferred block eviction runs inside `setattr_with_size_change` polled by `run_sync_future`.
+
+Follow-up validation passed:
+
+- `cargo test -p studiofs-vfs --lib upload_lifecycle::tests -- --nocapture` — 19 passed.
+- `cargo test -p studiofs-vfs --lib shutdown_owns_epoch_retry_before_reopening_local_stores -- --nocapture` — 1 passed.
+- `cargo check -p studiofs-vfs`.
+- `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
+- `cargo fmt --all -- --check` and `git diff --check`.
 
 Validation passed:
 

@@ -6,6 +6,7 @@ use super::{
     BackgroundCleanupThreadTask, Ino, ShutdownClaim, ShutdownError, ShutdownPhase, StudioVfs,
     VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot, info, warn,
 };
+use crate::OrderedMutex;
 use futures::FutureExt as _;
 use std::future::Future;
 use std::sync::atomic::Ordering;
@@ -59,68 +60,21 @@ impl Drop for ShutdownOwnerGuard<'_> {
     }
 }
 
-struct BackgroundTaskJoinGuard<'a> {
-    state: &'a super::ShutdownState,
-    handles: Vec<JoinHandle<()>>,
+struct TaskJoinGuard<'a, T> {
+    target: &'a OrderedMutex<Vec<T>>,
+    handles: Vec<T>,
 }
 
-impl<'a> BackgroundTaskJoinGuard<'a> {
-    fn new(state: &'a super::ShutdownState, handles: Vec<JoinHandle<()>>) -> Self {
-        Self { state, handles }
+impl<'a, T> TaskJoinGuard<'a, T> {
+    fn new(target: &'a OrderedMutex<Vec<T>>, handles: Vec<T>) -> Self {
+        Self { target, handles }
     }
 }
 
-impl Drop for BackgroundTaskJoinGuard<'_> {
+impl<T> Drop for TaskJoinGuard<'_, T> {
     fn drop(&mut self) {
         if !self.handles.is_empty() {
-            self.state
-                .background_tasks
-                .lock()
-                .extend(std::mem::take(&mut self.handles));
-        }
-    }
-}
-
-struct BackgroundCleanupTaskJoinGuard<'a> {
-    state: &'a super::ShutdownState,
-    handles: Vec<JoinHandle<()>>,
-}
-
-impl<'a> BackgroundCleanupTaskJoinGuard<'a> {
-    fn new(state: &'a super::ShutdownState, handles: Vec<JoinHandle<()>>) -> Self {
-        Self { state, handles }
-    }
-}
-
-impl Drop for BackgroundCleanupTaskJoinGuard<'_> {
-    fn drop(&mut self) {
-        if !self.handles.is_empty() {
-            self.state
-                .background_cleanup_tasks
-                .lock()
-                .extend(std::mem::take(&mut self.handles));
-        }
-    }
-}
-
-struct BackgroundCleanupThreadJoinGuard<'a> {
-    state: &'a super::ShutdownState,
-    handles: Vec<BackgroundCleanupThreadTask>,
-}
-
-impl<'a> BackgroundCleanupThreadJoinGuard<'a> {
-    fn new(state: &'a super::ShutdownState, handles: Vec<BackgroundCleanupThreadTask>) -> Self {
-        Self { state, handles }
-    }
-}
-
-impl Drop for BackgroundCleanupThreadJoinGuard<'_> {
-    fn drop(&mut self) {
-        if !self.handles.is_empty() {
-            self.state
-                .background_cleanup_threads
-                .lock()
-                .extend(std::mem::take(&mut self.handles));
+            self.target.lock().extend(std::mem::take(&mut self.handles));
         }
     }
 }
@@ -293,15 +247,20 @@ impl StudioVfs {
         handles: &mut Vec<JoinHandle<()>>,
         task_name: &'static str,
     ) {
-        handles.retain_mut(|handle| match (&mut *handle).now_or_never() {
-            Some(Err(error)) => {
-                if !error.is_cancelled() {
-                    warn!(task = task_name, error = %error, "background task join failed");
-                }
-                false
+        handles.retain_mut(|handle| {
+            if !handle.is_finished() {
+                return true;
             }
-            Some(Ok(())) => false,
-            None => true,
+            match (&mut *handle).now_or_never() {
+                Some(Err(error)) => {
+                    if !error.is_cancelled() {
+                        warn!(task = task_name, error = %error, "background task join failed");
+                    }
+                    false
+                }
+                Some(Ok(())) => false,
+                None => true,
+            }
         });
     }
 
@@ -449,7 +408,7 @@ impl StudioVfs {
                 return;
             }
 
-            let mut task_guard = BackgroundTaskJoinGuard::new(&self.state.shutdown, handles);
+            let mut task_guard = TaskJoinGuard::new(&self.state.shutdown.background_tasks, handles);
             Self::join_background_task_handles(
                 &mut task_guard.handles,
                 timeout,
@@ -458,8 +417,10 @@ impl StudioVfs {
             )
             .await;
 
-            let mut cleanup_guard =
-                BackgroundCleanupTaskJoinGuard::new(&self.state.shutdown, cleanup_handles);
+            let mut cleanup_guard = TaskJoinGuard::new(
+                &self.state.shutdown.background_cleanup_tasks,
+                cleanup_handles,
+            );
             Self::join_background_task_handles(
                 &mut cleanup_guard.handles,
                 timeout,
@@ -468,8 +429,10 @@ impl StudioVfs {
             )
             .await;
 
-            let mut thread_guard =
-                BackgroundCleanupThreadJoinGuard::new(&self.state.shutdown, cleanup_threads);
+            let mut thread_guard = TaskJoinGuard::new(
+                &self.state.shutdown.background_cleanup_threads,
+                cleanup_threads,
+            );
             Self::join_background_cleanup_thread_handles(&mut thread_guard.handles, timeout).await;
         }
     }
@@ -478,6 +441,8 @@ impl StudioVfs {
         handles: &mut Vec<BackgroundCleanupThreadTask>,
         timeout: Duration,
     ) {
+        // This timeout is only the grace period before warning; shutdown must
+        // keep owning threads that may still retain the local cache.
         if tokio::time::timeout(timeout, Self::wait_for_cleanup_threads(handles))
             .await
             .is_err()
@@ -494,6 +459,9 @@ impl StudioVfs {
         while !handles.is_empty() {
             let _ = (&mut handles[0].completed).await;
             let task = handles.swap_remove(0);
+            // Joining can briefly block Tokio during thread teardown, but the
+            // signal follows cleanup(), so storage-owning work has ended.
+            // Keep the native handle tracked until thread teardown completes.
             if task.thread.join().is_err() {
                 warn!("deferred cleanup thread panicked during shutdown");
             }
@@ -540,13 +508,13 @@ impl StudioVfs {
                     timeout_ms = timeout.as_millis() as u64,
                     "local metadata compaction worker is still running during shutdown"
                 );
-                info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "local metadata compaction worker finished during shutdown"
-                );
             },
         )
         .await;
+        info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "local metadata compaction worker finished during shutdown"
+        );
         if let Err(error) = join_result
             && !error.is_cancelled()
         {
@@ -583,6 +551,9 @@ impl StudioVfs {
                     );
                 }
             } else {
+                // This timeout is only a grace period before warning. Cleanup
+                // tasks may still own redb or cache handles, so shutdown waits
+                // until those owners finish before releasing local stores.
                 warn!(
                     timeout_ms = timeout.as_millis() as u64,
                     "deferred cleanup tasks are still running during shutdown; waiting for completion"
@@ -967,8 +938,8 @@ mod tests {
     use tracing::instrument::WithSubscriber as _;
 
     use super::{
-        BackgroundTaskJoinGuard, JoinTimeoutPolicy, LocalCompactionTaskJoinGuard, ShutdownError,
-        ShutdownOwnerGuard, StudioVfs, UploaderTaskJoinGuard, finish_shutdown_result,
+        JoinTimeoutPolicy, LocalCompactionTaskJoinGuard, ShutdownError, ShutdownOwnerGuard,
+        StudioVfs, TaskJoinGuard, UploaderTaskJoinGuard, finish_shutdown_result,
         replay_shutdown_result, select_metadata_barrier_error, select_shutdown_result,
         shutdown_recoverable_on_restart,
     };
@@ -1258,7 +1229,7 @@ mod tests {
         let handle = tokio::spawn(future::pending::<()>());
 
         {
-            let _guard = BackgroundTaskJoinGuard::new(&state, vec![handle]);
+            let _guard = TaskJoinGuard::new(&state.background_tasks, vec![handle]);
         }
 
         let handle = state
@@ -1278,19 +1249,39 @@ mod tests {
             let _ = release_rx.await;
         });
         *state.local_metadata_compaction_task.lock() = Some(handle);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
 
-        let mut join = Box::pin(StudioVfs::join_local_metadata_compaction_task(
-            &state,
-            Duration::from_secs(2),
-        ));
+        let mut join = Box::pin(
+            StudioVfs::join_local_metadata_compaction_task(&state, Duration::from_secs(2))
+                .with_subscriber(tracing::Dispatch::new(subscriber)),
+        );
         assert!(
             tokio::time::timeout(Duration::ZERO, &mut join)
                 .await
                 .is_err()
         );
+        assert!(
+            !events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|(_, message)| message.contains("local metadata compaction worker finished")),
+            "completion must not be logged while the worker is still running"
+        );
 
         release_tx.send(()).expect("release compaction task");
         join.await;
+        assert!(
+            events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|(level, message)| *level == tracing::Level::INFO
+                    && message.contains("local metadata compaction worker finished")),
+            "normal completion must be logged after the worker joins"
+        );
         assert!(state.local_metadata_compaction_task.lock().is_none());
     }
 
@@ -1327,6 +1318,12 @@ mod tests {
                     .any(|(_, message)| message.contains("still running during shutdown")),
                 "timeout branch must emit its compaction-wait event"
             );
+            assert!(
+                !events.iter().any(|(_, message)| {
+                    message.contains("local metadata compaction worker finished")
+                }),
+                "timeout must not log completion before the worker finishes"
+            );
         }
         assert!(
             after_timeout.is_pending(),
@@ -1340,6 +1337,15 @@ mod tests {
         completed_rx
             .await
             .expect("compaction task must complete normally");
+        assert!(
+            events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|(level, message)| *level == tracing::Level::INFO
+                    && message.contains("local metadata compaction worker finished")),
+            "completion must be logged after the timed-out worker joins"
+        );
         assert!(state.local_metadata_compaction_task.lock().is_none());
     }
 
