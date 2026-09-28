@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_test_database_is_reachable_for_ci_gate() {
+    let dsn = pg_dsn().expect("PostgreSQL test gate requires a reachable STUDIOFS_TEST_PG_DSN");
+    let metadata_query = run_async(async move {
+        let (client, connection) = crate::connect_studiofs_postgres(&dsn).await?;
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let result = client
+            .query_one("SELECT 1", &[])
+            .await
+            .map(|row| row.get::<_, i32>(0))
+            .map_err(|error| {
+                crate::engine::MetaError::Storage(format!(
+                    "postgres metadata gate query failed: {}",
+                    pg_err(error)
+                ))
+            });
+        connection_task.abort();
+        let _ = connection_task.await;
+        result
+    });
+    assert_eq!(
+        metadata_query.unwrap_or_else(|error| {
+            panic!("PostgreSQL test gate could not query the StudioFS metadata database: {error}")
+        }),
+        1,
+        "PostgreSQL test gate returned an unexpected query result"
+    );
+}
+
+#[test]
 fn pg_pool_size_defaults_to_four() {
     let _env = set_test_env_value("STUDIOFS_PG_POOL_SIZE", None);
 
