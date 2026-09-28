@@ -13,6 +13,7 @@ When a selected SFS-772 test cannot reach its required service, the test process
 - [x] (2026-09-28 09:34Z) Make selected fixtures fail on missing or unreachable infrastructure; make DataStore bucket setup report a failed marker write.
 - [x] (2026-09-28 09:34Z) Harden service cleanup and health polling; read the DataStore region from its environment variable.
 - [x] (2026-09-28 09:34Z) Document local commands and bucket provisioning order; run focused validation and inspect the final diff.
+- [x] (2026-09-28 11:35Z) Apply review follow-up: configure non-default bucket regions, preserve sanitized CreateBucket error codes, and select each DataStore regression by exact name.
 
 ## Surprises & Discoveries
 
@@ -28,7 +29,7 @@ The review document's head SHA differs from the current branch head. Each action
 
 ## Outcomes & Retrospective
 
-The selected destroy and dump/load tests now fail on unavailable prerequisites instead of logging a skip and returning success. DataStore test setup validates the marker write and honors `STUDIOFS_S3_REGION`; CI removes anonymous container volumes and retries failed health inspection within its existing bounded wait. Local commands and the bucket creation order are documented. Formatting, focused check/clippy targets, test listing, YAML structure, and diff checks passed. Live service-backed execution remains unverified because Docker Desktop's named pipe denies access in this environment.
+The selected destroy and dump/load tests now fail on unavailable prerequisites instead of logging a skip and returning success. DataStore test setup validates the marker write and honors `STUDIOFS_S3_REGION`; non-default regions now reach `CreateBucket` as a location constraint, and failed provisioning reports the sanitized AWS service error code. CI and local commands select the five DataStore regressions by exact name. CI removes anonymous container volumes and retries failed health inspection within its existing bounded wait. The DataStore-first bucket setup remains documented. Formatting, focused check/clippy targets, test listing, YAML structure, and diff checks passed. Live service-backed execution remains unverified because Docker Desktop's named pipe denies access in this environment.
 
 ## Context and Orientation
 

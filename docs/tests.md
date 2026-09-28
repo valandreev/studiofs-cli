@@ -95,6 +95,10 @@ publication:
 - `committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen`
 - `large_file_partial_overwrite_reuploads_only_touched_extents`
 
+The CI gate selects each listed test by exact name and verifies every
+selection is nonzero, so adding another ignored test does not silently expand
+the gate.
+
 The five tests below require both S3 and PostgreSQL and are selected explicitly
 by name in the same gate:
 
@@ -106,11 +110,15 @@ by name in the same gate:
 
 For local runs, start RustFS and PostgreSQL and configure the `STUDIOFS_S3_*`
 and `STUDIOFS_TEST_PG_DSN` variables as described in
-[Local Setup](development.md#local-setup). Run the DataStore command first
-because it creates the bucket used by later commands:
+[Local Setup](development.md#local-setup). Run the DataStore commands first
+because their setup creates the bucket used by later commands:
 
 ```bash
-cargo test -p studiofs-data --test integration_test -- --ignored --test-threads=1 --nocapture --skip https_endpoint_fixture_put_get_when_configured
+cargo test -p studiofs-data --test integration_test put_and_get_object -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test put_and_get_by_key -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test object_exists_lifecycle -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test delete_object_idempotent -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test large_multi_object_write -- --ignored --exact --test-threads=1 --nocapture
 cargo test -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen -- --ignored --exact --test-threads=1 --nocapture
 cargo test -p studiofs-vfs --test vfs_test large_file_partial_overwrite_reuploads_only_touched_extents -- --ignored --exact --test-threads=1 --nocapture
 cargo test -p studiofs --test destroy_test destroy_fails_cleanly_with_incorrect_s3_permissions -- --ignored --exact --test-threads=1 --nocapture

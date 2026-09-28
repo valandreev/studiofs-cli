@@ -253,7 +253,11 @@ tasks:
       run_ignored_tests "studiofs-meta pg_engine" checkpoint_scalability false -p studiofs-meta pg_engine::tests:: --lib
       run_ignored_tests "studiofs CLI" "" false -p studiofs --bin studiofs cli::
 
-      run_ignored_tests "studiofs-data live S3 DataStore" https_endpoint_fixture_put_get_when_configured false -p studiofs-data --test integration_test
+      run_ignored_tests "studiofs-data S3 put/get object" "" true -p studiofs-data --test integration_test put_and_get_object
+      run_ignored_tests "studiofs-data S3 put/get by key" "" true -p studiofs-data --test integration_test put_and_get_by_key
+      run_ignored_tests "studiofs-data S3 object lifecycle" "" true -p studiofs-data --test integration_test object_exists_lifecycle
+      run_ignored_tests "studiofs-data S3 delete idempotency" "" true -p studiofs-data --test integration_test delete_object_idempotent
+      run_ignored_tests "studiofs-data S3 multi-object write" "" true -p studiofs-data --test integration_test large_multi_object_write
       run_ignored_tests "studiofs-vfs published cold-read payload" "" true -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen
       run_ignored_tests "studiofs-vfs partial-overwrite publication" "" true -p studiofs-vfs --test vfs_test large_file_partial_overwrite_reuploads_only_touched_extents
 
