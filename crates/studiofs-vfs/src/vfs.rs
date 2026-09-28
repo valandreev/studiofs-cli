@@ -2421,8 +2421,15 @@ struct ShutdownState {
     uploader_shutdown_token: CancellationToken,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
+    background_cleanup_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
+    background_cleanup_threads: OrderedMutex<Vec<BackgroundCleanupThreadTask>>,
     local_metadata_compaction_task: OrderedMutex<Option<JoinHandle<()>>>,
     uploader_task: OrderedMutex<Option<JoinHandle<()>>>,
+}
+
+pub(super) struct BackgroundCleanupThreadTask {
+    pub(super) thread: std::thread::JoinHandle<()>,
+    pub(super) completed: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl ShutdownState {
@@ -2437,6 +2444,8 @@ impl ShutdownState {
             uploader_shutdown_token: CancellationToken::new(),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
+            background_cleanup_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
+            background_cleanup_threads: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             local_metadata_compaction_task: OrderedMutex::new(None, LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }

@@ -174,7 +174,7 @@ impl StudioVfs {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        self.track_background_task(handle.spawn(async move {
+        self.spawn_background_cleanup_task_on(&handle, async move {
             let result = run_local_cache_io_blocking(move || {
                 local_payload_backend
                     .remove(object_id)
@@ -199,6 +199,6 @@ impl StudioVfs {
                     );
                 }
             }
-        }));
+        });
     }
 }

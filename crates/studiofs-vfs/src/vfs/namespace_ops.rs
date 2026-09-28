@@ -499,7 +499,9 @@ impl StudioVfs {
             let cleanup_vfs = Arc::clone(&vfs);
             // The drainer can be called from a write barrier that already owns this gate.
             // Let it return before cleanup waits for Delete, then retire state under that gate.
-            vfs.track_background_task(tokio::spawn(async move {
+            vfs.spawn_background_cleanup_task_on(
+                &tokio::runtime::Handle::current(),
+                async move {
                 for ino in cleanup_inodes {
                     let cleanup_result = async {
                         let _session = cleanup_vfs
@@ -527,7 +529,8 @@ impl StudioVfs {
                     cleanup_vfs.state.namespace.deferred.notify.notify_waiters();
                     cleanup_vfs.state.file_session.gc_if_idle(ino);
                 }
-            }));
+                },
+            );
         } else if !abandoned_file_inodes.is_empty() {
             error!(
                 inodes = ?abandoned_file_inodes,

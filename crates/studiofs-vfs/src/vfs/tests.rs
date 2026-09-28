@@ -2956,7 +2956,9 @@ impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
     }
 }
 
-fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+pub(super) fn reopen_existing_test_vfs(
+    tmp: &TempDir,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("reopen RedbMetaEngine"));
     let format_info = meta.get_format_info().expect("load format info");
