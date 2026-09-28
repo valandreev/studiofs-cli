@@ -25,6 +25,7 @@ workflows are manual-only while Windows work is primarily validated locally.
 | `cargo audit` ¹ | Auto (RWX Ubuntu quality) | — | — |
 | Workspace unit + compile tests | Auto (Ubuntu + Rocky) | Manual GitHub Action | Manual GitHub Action |
 | Local-first VFS fast checks | Auto (explicit Ubuntu step; covered by Rocky workspace run) | — | — |
+| PostgreSQL metadata + CLI regressions | Auto (RWX Ubuntu; PostgreSQL 18) | — | — |
 | Linux mount bridge | Manual RWX release gate (`studiofs-linux-fuse` ignored mounted tests) | — | — |
 | `studiofs-winfsp` unit tests | — | — | Manual GitHub Action |
 
@@ -33,8 +34,8 @@ workflows are manual-only while Windows work is primarily validated locally.
 | Check | Notes |
 |-------|-------|
 | Platform bridge smoke tests (mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]`. See [smoke workflow](#smoke-test-workflow) |
-| S3 / PostgreSQL integration tests | Require live RustFS + PostgreSQL; all marked `#[ignore]` |
-| Cross-client convergence tests | Require multi-process infra setup; all marked `#[ignore]` |
+| S3-backed integration tests | Require live RustFS; the PostgreSQL-only metadata and CLI gate does not cover them |
+| Mounted multi-client convergence tests | Require multi-process infrastructure and mounted filesystem setup |
 | Real mounted E2E smoke/full run | Manual RWX only via `.rwx/e2e.yml`; requires Docker plus `/dev/fuse` and uploads runner artifacts |
 
 <a name="footnote-audit"></a>
@@ -48,9 +49,10 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 - **Portable compile + clippy** — `cargo clippy` runs automatically in the RWX Ubuntu quality gate. Hosted macOS and Windows clippy runs are available as manual GitHub Actions. Linux compile coverage comes from RWX Ubuntu and Rocky workspace `cargo test` runs.
 - **Portable unit tests** — the workspace `cargo test` run on each platform. Covers all crates except the platform-specific backend crate, which has a dedicated step.
+- **PostgreSQL metadata and CLI regressions** — the RWX Ubuntu gate starts an ephemeral PostgreSQL 18 service and runs the ignored metadata `pg_engine` and CLI binary tests serially, excluding the SFS-720 scalability benchmark. It prints the selected count and Cargo's pass/failure totals; a missing service or zero-test selection fails the gate.
 - **Platform unit tests** — the named backend step in each platform lane (`studiofs-macfuse` on manual macOS, `studiofs-winfsp` on manual Windows). This is the primary signal for platform-specific code paths.
 - **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. These include both minimal lifecycle tests (session create/drop) and full I/O tests (mount → write → read → readdir → delete → unmount). Run via the `smoke.yml` workflow or manually on self-hosted runners with the full kernel driver available. Not a PR gate.
-- **Infra integration tests** — all `#[ignore]` tests requiring live S3 + PostgreSQL. Not a PR gate.
+- **Other infra integration tests** — S3-backed, mounted, and multi-process tests still need their respective services or platform support and remain outside this gate.
 
 ---
 

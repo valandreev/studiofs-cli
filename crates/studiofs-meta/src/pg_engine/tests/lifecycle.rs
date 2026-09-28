@@ -5690,6 +5690,28 @@ fn pg_background_checkpoint_coordinator_coalesces_two_clients_and_publishes_exac
         "background coordinator should publish a checkpoint"
     );
 
+    let retry_window = PgMetaEngine::default_checkpoint_retry_interval().max(Duration::from_secs(
+        super::super::checkpoint_coordinator::MAX_CHECKPOINT_RETRY_SECS,
+    ));
+    // Allow a full attempt: freshness read, lease claim, publish, and lease release.
+    let checkout_timeout = first.connect_timeout.max(second.connect_timeout);
+    let command_timeout = first.command_timeout.max(second.command_timeout);
+    let attempt_budget = checkout_timeout
+        .saturating_add(command_timeout)
+        .saturating_mul(4);
+    assert!(
+        wait_until(
+            retry_window
+                .saturating_add(attempt_budget)
+                .saturating_add(Duration::from_secs(5)),
+            || {
+                !first.checkpoint_freshness_diagnostics().refresh_needed
+                    && !second.checkpoint_freshness_diagnostics().refresh_needed
+            },
+        ),
+        "both checkpoint clients should observe the published checkpoint"
+    );
+
     first.prepare_for_close().expect("close first pg engine");
     second.prepare_for_close().expect("close second pg engine");
 
