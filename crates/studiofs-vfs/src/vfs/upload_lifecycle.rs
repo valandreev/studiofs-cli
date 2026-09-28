@@ -6,6 +6,7 @@ use super::{
     BackgroundCleanupThreadTask, Ino, ShutdownClaim, ShutdownError, ShutdownPhase, StudioVfs,
     VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot, info, warn,
 };
+use futures::FutureExt as _;
 use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -240,13 +241,22 @@ enum ShutdownWaitResult {
     Completed(Option<ShutdownError>),
 }
 
+#[derive(Clone, Copy)]
+enum JoinTimeoutPolicy {
+    Abort,
+    Wait,
+}
+
 impl StudioVfs {
     pub(super) fn track_background_task(&self, handle: JoinHandle<()>) {
-        self.state.shutdown.background_tasks.lock().push(handle);
+        let mut tasks = self.state.shutdown.background_tasks.lock();
+        Self::reap_finished_background_task_handles(&mut tasks, "background");
+        tasks.push(handle);
     }
 
     pub(super) fn spawn_background_task(&self, task: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self.state.shutdown.background_tasks.lock();
+        Self::reap_finished_background_task_handles(&mut tasks, "background");
         tasks.push(tokio::spawn(task));
     }
 
@@ -256,6 +266,7 @@ impl StudioVfs {
         task: impl Future<Output = ()> + Send + 'static,
     ) {
         let mut tasks = self.state.shutdown.background_cleanup_tasks.lock();
+        Self::reap_finished_background_task_handles(&mut tasks, "deferred cleanup");
         tasks.push(runtime.spawn(task));
     }
 
@@ -265,6 +276,7 @@ impl StudioVfs {
         cleanup: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<()> {
         let mut tasks = self.state.shutdown.background_cleanup_threads.lock();
+        Self::reap_finished_background_cleanup_threads(&mut tasks);
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         let thread = std::thread::Builder::new().name(name).spawn(move || {
             cleanup();
@@ -275,6 +287,36 @@ impl StudioVfs {
             completed: completed_rx,
         });
         Ok(())
+    }
+
+    fn reap_finished_background_task_handles(
+        handles: &mut Vec<JoinHandle<()>>,
+        task_name: &'static str,
+    ) {
+        handles.retain_mut(|handle| match (&mut *handle).now_or_never() {
+            Some(Err(error)) => {
+                if !error.is_cancelled() {
+                    warn!(task = task_name, error = %error, "background task join failed");
+                }
+                false
+            }
+            Some(Ok(())) => false,
+            None => true,
+        });
+    }
+
+    fn reap_finished_background_cleanup_threads(handles: &mut Vec<BackgroundCleanupThreadTask>) {
+        let mut index = 0;
+        while index < handles.len() {
+            if handles[index].thread.is_finished() {
+                let task = handles.swap_remove(index);
+                if task.thread.join().is_err() {
+                    warn!("deferred cleanup thread panicked");
+                }
+            } else {
+                index += 1;
+            }
+        }
     }
 
     pub(super) fn set_local_metadata_compaction_task(&self, handle: JoinHandle<()>) {
@@ -436,27 +478,46 @@ impl StudioVfs {
         handles: &mut Vec<BackgroundCleanupThreadTask>,
         timeout: Duration,
     ) {
-        let join = async {
-            while !handles.is_empty() {
-                let _ = (&mut handles[0].completed).await;
-                let task = handles.remove(0);
-                if task.thread.join().is_err() {
-                    warn!("deferred cleanup thread panicked during shutdown");
-                }
-            }
-        };
-        if tokio::time::timeout(timeout, join).await.is_err() {
+        if tokio::time::timeout(timeout, Self::wait_for_cleanup_threads(handles))
+            .await
+            .is_err()
+        {
             warn!(
                 timeout_ms = timeout.as_millis() as u64,
                 "deferred cleanup threads are still running during shutdown; waiting for completion"
             );
-            while !handles.is_empty() {
-                let _ = (&mut handles[0].completed).await;
-                let task = handles.remove(0);
-                if task.thread.join().is_err() {
-                    warn!("deferred cleanup thread panicked during shutdown");
-                }
+            Self::wait_for_cleanup_threads(handles).await;
+        }
+    }
+
+    async fn wait_for_cleanup_threads(handles: &mut Vec<BackgroundCleanupThreadTask>) {
+        while !handles.is_empty() {
+            let _ = (&mut handles[0].completed).await;
+            let task = handles.swap_remove(0);
+            if task.thread.join().is_err() {
+                warn!("deferred cleanup thread panicked during shutdown");
             }
+        }
+    }
+
+    async fn wait_for_join_handle(
+        handle: &mut JoinHandle<()>,
+        timeout: Option<Duration>,
+        timeout_policy: JoinTimeoutPolicy,
+        on_timeout: impl FnOnce(),
+    ) -> Result<(), tokio::task::JoinError> {
+        match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, &mut *handle).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if matches!(timeout_policy, JoinTimeoutPolicy::Abort) {
+                        handle.abort();
+                    }
+                    on_timeout();
+                    (&mut *handle).await
+                }
+            },
+            None => (&mut *handle).await,
         }
     }
 
@@ -467,33 +528,25 @@ impl StudioVfs {
         };
         let mut guard = LocalCompactionTaskJoinGuard::new(state, handle);
         let started = Instant::now();
-        let join_result = tokio::time::timeout(
-            timeout,
+        let join_result = Self::wait_for_join_handle(
             guard
                 .handle
                 .as_mut()
                 .expect("compaction task join guard retains its handle"),
-        )
-        .await;
-        let join_result = match join_result {
-            Ok(result) => result,
-            Err(_) => {
+            Some(timeout),
+            JoinTimeoutPolicy::Wait,
+            || {
                 warn!(
                     timeout_ms = timeout.as_millis() as u64,
                     "local metadata compaction worker is still running during shutdown"
                 );
-                let result = guard
-                    .handle
-                    .as_mut()
-                    .expect("compaction task join guard retains its handle")
-                    .await;
                 info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "local metadata compaction worker finished during shutdown"
                 );
-                result
-            }
-        };
+            },
+        )
+        .await;
         if let Err(error) = join_result
             && !error.is_cancelled()
         {
@@ -519,13 +572,10 @@ impl StudioVfs {
                     .iter()
                     .filter(|handle| !handle.is_finished())
                     .count();
-                while !handles.is_empty() {
-                    if !handles[0].is_finished() {
-                        handles[0].abort();
-                        let _ = (&mut handles[0]).await;
-                    }
-                    handles.remove(0);
+                for handle in handles.iter().filter(|handle| !handle.is_finished()) {
+                    handle.abort();
                 }
+                Self::wait_for_background_task_handles(handles, task_name).await;
                 if aborted > 0 {
                     warn!(
                         timeout_ms = timeout.as_millis() as u64,
@@ -547,12 +597,15 @@ impl StudioVfs {
         task_name: &'static str,
     ) {
         while !handles.is_empty() {
-            if let Err(error) = (&mut handles[0]).await
+            let join_result =
+                Self::wait_for_join_handle(&mut handles[0], None, JoinTimeoutPolicy::Wait, || {})
+                    .await;
+            if let Err(error) = join_result
                 && !error.is_cancelled()
             {
                 warn!(task = task_name, error = %error, "background task join failed");
             }
-            handles.remove(0);
+            handles.swap_remove(0);
         }
     }
 
@@ -562,26 +615,22 @@ impl StudioVfs {
             return;
         };
         let mut guard = UploaderTaskJoinGuard::new(&self.state.shutdown, handle);
-        let join_result = tokio::time::timeout(
-            timeout,
+        let join_result = Self::wait_for_join_handle(
             guard.handle.as_mut().expect("uploader handle is present"),
-        )
-        .await;
-        match join_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) if e.is_cancelled() => {}
-            Ok(Err(e)) => {
-                warn!(error = %e, "uploader task join failed");
-            }
-            Err(_) => {
-                let handle = guard.handle.as_mut().expect("uploader handle is present");
-                handle.abort();
-                let _ = handle.await;
+            Some(timeout),
+            JoinTimeoutPolicy::Abort,
+            || {
                 warn!(
                     timeout_ms = timeout.as_millis() as u64,
                     "uploader task did not stop in time, aborted"
                 );
-            }
+            },
+        )
+        .await;
+        if let Err(error) = join_result
+            && !error.is_cancelled()
+        {
+            warn!(error = %error, "uploader task join failed");
         }
         guard.handle.take();
     }
@@ -918,9 +967,10 @@ mod tests {
     use tracing::instrument::WithSubscriber as _;
 
     use super::{
-        BackgroundTaskJoinGuard, LocalCompactionTaskJoinGuard, ShutdownError, ShutdownOwnerGuard,
-        StudioVfs, UploaderTaskJoinGuard, finish_shutdown_result, replay_shutdown_result,
-        select_metadata_barrier_error, select_shutdown_result, shutdown_recoverable_on_restart,
+        BackgroundTaskJoinGuard, JoinTimeoutPolicy, LocalCompactionTaskJoinGuard, ShutdownError,
+        ShutdownOwnerGuard, StudioVfs, UploaderTaskJoinGuard, finish_shutdown_result,
+        replay_shutdown_result, select_metadata_barrier_error, select_shutdown_result,
+        shutdown_recoverable_on_restart,
     };
     use crate::vfs::{ShutdownState, VfsError};
     use studiofs_cache::local::LocalPayloadBackendError;
@@ -981,6 +1031,83 @@ mod tests {
         assert_eq!(started.elapsed(), timeout);
     }
 
+    #[tokio::test]
+    async fn finished_background_tasks_are_reaped_with_panics_reported() {
+        let completed = tokio::spawn(async {});
+        let panicked = tokio::spawn(async { panic!("expected reaped-task panic") });
+        let pending = tokio::spawn(future::pending());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !completed.is_finished() || !panicked.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished tasks should settle");
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
+        let mut handles = vec![completed, panicked, pending];
+        async {
+            StudioVfs::reap_finished_background_task_handles(&mut handles, "background");
+        }
+        .with_subscriber(tracing::Dispatch::new(subscriber))
+        .await;
+
+        assert_eq!(handles.len(), 1, "only the active handle remains");
+        assert!(
+            events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|(_, message)| message.contains("background task join failed"))
+        );
+        handles[0].abort();
+        let _ = (&mut handles[0]).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_join_reports_finished_panics_after_timeout() {
+        let pending = tokio::spawn(future::pending());
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel::<()>();
+        let (panic_ready_tx, panic_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let panicked = tokio::spawn(async move {
+            panic_rx.await.expect("release panic task");
+            let _ = panic_ready_tx.send(());
+            panic!("expected timeout-branch panic");
+        });
+        let mut handles = vec![pending, panicked];
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
+        let mut join = Box::pin(
+            StudioVfs::join_background_task_handles(
+                &mut handles,
+                Duration::from_millis(1),
+                true,
+                "background",
+            )
+            .with_subscriber(tracing::Dispatch::new(subscriber)),
+        );
+        let before_timeout =
+            future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        assert!(before_timeout.is_pending());
+
+        panic_tx.send(()).expect("release panic task");
+        panic_ready_rx.await.expect("panic task should be ready");
+        tokio::time::advance(Duration::from_millis(2)).await;
+        join.await;
+
+        assert!(
+            events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|(_, message)| message.contains("background task join failed"))
+        );
+        assert!(handles.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn deferred_cleanup_join_waits_past_timeout_without_aborting_task() {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1018,6 +1145,74 @@ mod tests {
         assert!(handles.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_thread_join_reaps_completed_threads_and_waits_past_timeout() {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel::<()>();
+        let completed_thread = std::thread::spawn(move || {
+            let _completed_tx = completed_tx;
+            panic!("expected cleanup-thread panic");
+        });
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (running_tx, running_rx) = tokio::sync::oneshot::channel::<()>();
+        let running_thread = std::thread::spawn(move || {
+            let _ = start_tx.send(());
+            let _ = release_rx.recv();
+            let _ = running_tx.send(());
+        });
+        start_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup thread should start");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !completed_thread.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first cleanup thread should exit");
+
+        let mut handles = vec![
+            crate::vfs::BackgroundCleanupThreadTask {
+                thread: completed_thread,
+                completed: completed_rx,
+            },
+            crate::vfs::BackgroundCleanupThreadTask {
+                thread: running_thread,
+                completed: running_rx,
+            },
+        ];
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CompactionJoinEvents(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            StudioVfs::reap_finished_background_cleanup_threads(&mut handles);
+        });
+        assert_eq!(handles.len(), 1, "the completed thread handle is reaped");
+        assert!(
+            events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .any(|(_, message)| message.contains("deferred cleanup thread panicked"))
+        );
+
+        let mut join = Box::pin(StudioVfs::join_background_cleanup_thread_handles(
+            &mut handles,
+            Duration::from_millis(1),
+        ));
+        let before_timeout =
+            future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        assert!(before_timeout.is_pending());
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let after_timeout =
+            future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx))).await;
+        assert!(after_timeout.is_pending());
+
+        release_tx.send(()).expect("release cleanup thread");
+        join.await;
+        assert!(handles.is_empty());
+    }
+
     #[tokio::test]
     async fn aborted_background_tasks_are_finished_before_join_returns() {
         let (sender, mut receiver) = tokio::sync::oneshot::channel::<()>();
@@ -1034,6 +1229,27 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_handle_waiter_aborts_when_timeout_policy_requests_it() {
+        let mut handle = tokio::spawn(future::pending::<()>());
+        let mut timed_out = false;
+
+        let result = StudioVfs::wait_for_join_handle(
+            &mut handle,
+            Some(Duration::ZERO),
+            JoinTimeoutPolicy::Abort,
+            || timed_out = true,
+        )
+        .await;
+
+        assert!(timed_out);
+        assert!(
+            result
+                .expect_err("the timed-out task must be aborted")
+                .is_cancelled()
+        );
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ When this change is complete, a graceful VFS shutdown will wait for all retry an
 - [x] Extend the regression to cover Tokio cleanup and the no-runtime cleanup thread.
 - [x] Register retry work, preserve ownership of blocking/thread cleanup, and join work produced by the final dirty drain.
 - [x] Run focused regressions, VFS check and Clippy; inspect the final diff.
+- [x] Verify the shutdown review against current call paths; reap completed handles, preserve panic reporting, and simplify the duplicated wait loops.
 
 ## Milestones
 
@@ -28,6 +29,8 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - The epoch retry uses `tokio::spawn` without registering its handle and waits on `Notify::notify_waiters`, which does not retain a permit for a future waiter created after notification.
 - The Tokio cleanup path currently tracks an async wrapper around `run_local_cache_io_blocking`; aborting that wrapper can drop the handle while its already-running blocking closure continues.
 - The no-runtime cleanup path discards the `std::thread::JoinHandle`.
+- Reaping Tokio handles through `is_finished()` alone would discard completed panic results; a nonblocking poll keeps panic reporting while releasing completed handles.
+- `Vec::remove(0)` shifted remaining handles even though completion order is not observable, so shutdown can use `swap_remove(0)`.
 
 ## Decision Log
 
@@ -35,10 +38,14 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - Use the already-owned `background_shutdown_token` for retry cancellation so a late waiter observes shutdown.
 - Keep timeout cancellation for ordinary async workers. Blocking cleanup and native cleanup threads must remain owned and finish before local stores can be reopened.
 - Repeat the task drain after shutdown-generated dirty/namespace work; no task-admission framework is needed for this bounded VFS lifecycle fix.
+- Treat cleanup timeouts as a grace/warning threshold, not a release deadline: SFS-738's Linear risk notes prohibit detaching owners while they may retain local stores.
+- Keep cleanup thread creation under the shutdown task-list lock so a thread is published atomically with its registration; keep direct namespace cleanup on its verified Tokio-only call path.
 
 ## Outcomes & Retrospective
 
 Shutdown now cancels and joins epoch retries, waits for deferred Tokio cleanup and no-runtime cleanup threads, and repeats the task drain after the final local dirty flush. A regression confirmed the retry handle is absent before the fix; after the fix, both focused tests passed and the same local redb/cache fixture reopened with its written bytes intact.
+
+Review follow-up reaps completed Tokio and native thread handles as new work is registered, logs completed task/thread panics, checks every join result after abort, shares the `JoinHandle` timeout policy, factors the native-thread waiter, and replaces front-removal shifts with `swap_remove`. Review requests for a hard shutdown deadline, runtime-less cleanup fallback, spawn-before-registration, and one shared warning budget were rejected because they conflict with storage ownership, have no runtime caller, or add policy without a demonstrated need; the synthetic cleanup IDs cover task registration while the regression also writes and reads real local data across reopen.
 
 Validation passed:
 
@@ -46,7 +53,8 @@ Validation passed:
 - `cargo test -p studiofs-vfs deferred_cleanup_join_waits_past_timeout_without_aborting_task --lib -- --nocapture` — 1 passed.
 - `cargo check -p studiofs-vfs`.
 - `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
-- `cargo fmt --all` and `git diff --check`.
+- `cargo test -p studiofs-vfs --lib upload_lifecycle::tests -- --nocapture` — 19 passed.
+- `cargo fmt --all -- --check` and `git diff --check` after the review follow-up.
 
 The full VFS suite and native mounted acceptance were not run. No PR was requested.
 
