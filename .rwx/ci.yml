@@ -125,7 +125,7 @@ tasks:
     env:
       RUSTFLAGS: "-Dwarnings"
 
-  - key: cargo-test-postgresql
+  - key: cargo-test-s3-and-postgresql
     use: [code, rust, linux-packages, cargo-fetch]
     docker: true
     agent:
@@ -134,14 +134,41 @@ tasks:
       set -euo pipefail
 
       postgres_container=""
-      cleanup_postgres() {
-        if [[ -n "${postgres_container}" ]]; then
-          docker rm --force "${postgres_container}" >/dev/null 2>&1 || true
-        fi
+      rustfs_container=""
+      cleanup_services() {
+        for container in "${postgres_container}" "${rustfs_container}"; do
+          if [[ -n "${container}" ]]; then
+            docker rm --force "${container}" >/dev/null 2>&1 || true
+          fi
+        done
       }
-      trap cleanup_postgres EXIT
+      trap cleanup_services EXIT
       trap 'exit 130' INT
       trap 'exit 143' TERM
+
+      wait_for_healthy_service() {
+        local container="$1"
+        local service="$2"
+        local status=""
+        for attempt in $(seq 1 90); do
+          status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container}")"
+          case "${status}" in
+            healthy)
+              return 0
+              ;;
+            unhealthy|exited|dead)
+              docker logs "${container}" >&2 || true
+              echo "${service} service failed health check: ${status}" >&2
+              return 1
+              ;;
+          esac
+          sleep 1
+        done
+
+        docker logs "${container}" >&2 || true
+        echo "${service} service did not become healthy within 90 seconds" >&2
+        return 1
+      }
 
       postgres_container="$(docker run --detach \
         --env POSTGRES_HOST_AUTH_METHOD=trust \
@@ -152,27 +179,22 @@ tasks:
         --health-retries 30 \
         postgres:18-alpine)"
 
-      postgres_status=""
-      for attempt in $(seq 1 60); do
-        postgres_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${postgres_container}")"
-        case "${postgres_status}" in
-          healthy)
-            break
-            ;;
-          unhealthy|exited|dead)
-            docker logs "${postgres_container}" >&2 || true
-            echo "PostgreSQL service failed health check: ${postgres_status}" >&2
-            exit 1
-            ;;
-        esac
-        sleep 1
-      done
+      rustfs_container="$(docker run --detach \
+        --env RUSTFS_ACCESS_KEY \
+        --env RUSTFS_SECRET_KEY \
+        --env RUSTFS_ADDRESS=:9000 \
+        --env RUSTFS_CONSOLE_ENABLE=true \
+        --publish 127.0.0.1::9000 \
+        --health-cmd 'curl -fsS http://localhost:9000/health >/dev/null && curl -fsS http://localhost:9001/health >/dev/null' \
+        --health-interval 2s \
+        --health-timeout 5s \
+        --health-retries 30 \
+        --health-start-period 10s \
+        rustfs/rustfs:1.0.0-alpha.94 \
+        --address :9000 --console-enable /data)"
 
-      if [[ "${postgres_status}" != "healthy" ]]; then
-        docker logs "${postgres_container}" >&2 || true
-        echo "PostgreSQL service did not become healthy within 60 seconds" >&2
-        exit 1
-      fi
+      wait_for_healthy_service "${postgres_container}" "PostgreSQL"
+      wait_for_healthy_service "${rustfs_container}" "RustFS"
 
       postgres_port="$(docker port "${postgres_container}" 5432/tcp | awk -F: 'NR == 1 { print $NF }')"
       if [[ ! "${postgres_port}" =~ ^[0-9]+$ ]]; then
@@ -180,17 +202,37 @@ tasks:
         exit 1
       fi
 
+      rustfs_port="$(docker port "${rustfs_container}" 9000/tcp | awk -F: 'NR == 1 { print $NF }')"
+      if [[ ! "${rustfs_port}" =~ ^[0-9]+$ ]]; then
+        echo "RustFS service did not publish a usable host port" >&2
+        exit 1
+      fi
+
       export STUDIOFS_TEST_PG_DSN="host=127.0.0.1 port=${postgres_port} user=postgres dbname=postgres sslmode=disable"
+      export STUDIOFS_S3_ENDPOINT="http://127.0.0.1:${rustfs_port}"
+      export STUDIOFS_S3_BUCKET="studiofs-test"
+      export STUDIOFS_S3_ACCESS_KEY="${RUSTFS_ACCESS_KEY}"
+      export STUDIOFS_S3_SECRET_KEY="${RUSTFS_SECRET_KEY}"
+      export STUDIOFS_S3_REGION="us-east-1"
+      export STUDIOFS_TEST_ONLINE_S3_ENDPOINT="${STUDIOFS_S3_ENDPOINT}"
+      export STUDIOFS_TEST_ONLINE_S3_BUCKET="${STUDIOFS_S3_BUCKET}"
+      export STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY="${STUDIOFS_S3_ACCESS_KEY}"
+      export STUDIOFS_TEST_ONLINE_S3_SECRET_KEY="${STUDIOFS_S3_SECRET_KEY}"
 
       run_ignored_tests() {
         local label="$1"
         local skip_filter="$2"
-        shift 2
+        local exact_match="$3"
+        shift 3
         local -a list_args=(--ignored --list)
         local -a run_args=(--ignored --test-threads=1 --nocapture)
         if [[ -n "${skip_filter}" ]]; then
           list_args+=(--skip "${skip_filter}")
           run_args+=(--skip "${skip_filter}")
+        fi
+        if [[ "${exact_match}" == "true" ]]; then
+          list_args+=(--exact)
+          run_args+=(--exact)
         fi
         local test_list
         local test_count
@@ -198,25 +240,39 @@ tasks:
         test_list="$(cargo test "$@" -- "${list_args[@]}")"
         test_count="$(awk '/: test$/ { count += 1 } END { print count + 0 }' <<< "${test_list}")"
         if [[ "${test_count}" -eq 0 ]]; then
-          echo "PostgreSQL test gate failed: ${label} matched zero ignored tests" >&2
+          echo "Service-backed test gate failed: ${label} matched zero ignored tests" >&2
           return 1
         fi
 
-        echo "PostgreSQL test gate selected ${test_count} ignored tests: ${label}"
+        echo "Service-backed test gate selected ${test_count} ignored tests: ${label}"
         cargo test "$@" -- "${run_args[@]}"
       }
 
-      run_ignored_tests "studiofs-meta pg_engine" checkpoint_scalability -p studiofs-meta pg_engine::tests:: --lib
-      run_ignored_tests "studiofs CLI" "" -p studiofs --bin studiofs cli::
+      run_ignored_tests "studiofs-meta pg_engine" checkpoint_scalability false -p studiofs-meta pg_engine::tests:: --lib
+      run_ignored_tests "studiofs CLI" "" false -p studiofs --bin studiofs cli::
+
+      run_ignored_tests "studiofs-data live S3 DataStore" https_endpoint_fixture_put_get_when_configured false -p studiofs-data --test integration_test
+      run_ignored_tests "studiofs-vfs published cold-read payload" "" true -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen
+      run_ignored_tests "studiofs-vfs partial-overwrite publication" "" true -p studiofs-vfs --test vfs_test large_file_partial_overwrite_reuploads_only_touched_extents
+
+      run_ignored_tests "studiofs destroy S3 + PostgreSQL" "" true -p studiofs --test destroy_test destroy_fails_cleanly_with_incorrect_s3_permissions
+      run_ignored_tests "studiofs destroy local-only S3 + PostgreSQL" "" true -p studiofs --test destroy_test destroy_local_only_removes_local_state_and_keeps_remote
+      run_ignored_tests "studiofs destroy full S3 + PostgreSQL" "" true -p studiofs --test destroy_test destroy_full_removes_local_s3_and_postgres_state
+      run_ignored_tests "studiofs dump/load S3 + PostgreSQL" "" true -p studiofs --test dump_load_test dump_load_restores_volume_and_discovery_reads_data
+      run_ignored_tests "studiofs dump/load snapshot-v2 S3 + PostgreSQL" "" true -p studiofs --test dump_load_test dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes
+
     env:
       RUSTFLAGS: "-Dwarnings"
+      # Disposable CI-only RustFS credentials; command output passes these by name only.
+      RUSTFS_ACCESS_KEY: studiofs
+      RUSTFS_SECRET_KEY: studiofs123
 
   - key: ubuntu-linux
     use:
       - quality
       - cargo-test-linux-workspace
       - cargo-test-local-first-offline-vfs-fast
-      - cargo-test-postgresql
+      - cargo-test-s3-and-postgresql
     run: echo "Ubuntu Linux checks passed"
 
   - key: rocky-linux
