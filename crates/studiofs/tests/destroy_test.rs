@@ -335,14 +335,15 @@ fn create_local_metadata_with_bad_s3_secret(
     meta.set_format_info(&format_info).expect("set format info");
 }
 
-fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
-    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)?;
+fn build_infra_fixture(prefix: &str) -> InfraFixture {
+    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
+        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
     let env = load_test_env();
 
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     let studio_dsn = rt
         .block_on(async { ensure_studiofs_database(&raw_pg).await })
-        .ok()?
+        .expect("connect to PostgreSQL test service")
         .metadata_dsn;
 
     ensure_pg_schema(&studio_dsn);
@@ -355,14 +356,10 @@ fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
 
     let store = make_datastore(env, &name);
     let marker_key = format!("{name}/objects/destroy-marker.txt");
-    if rt
-        .block_on(store.put_by_key(&marker_key, Bytes::from_static(b"marker")))
-        .is_err()
-    {
-        return None;
-    }
+    rt.block_on(store.put_by_key(&marker_key, Bytes::from_static(b"marker")))
+        .expect("write S3 destroy fixture marker");
 
-    Some(InfraFixture {
+    InfraFixture {
         name,
         home_dir,
         meta_dir,
@@ -377,7 +374,7 @@ fn build_infra_fixture(prefix: &str) -> Option<InfraFixture> {
             s3_secret_key: env.s3_secret_key.clone(),
             s3_region: env.s3_region.clone(),
         },
-    })
+    }
 }
 
 #[test]
@@ -591,10 +588,7 @@ fn destroy_local_only_rejects_corrupt_local_state_without_remote_services() {
 #[test]
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
-    let Some(fixture) = build_infra_fixture("destroy-bad-creds") else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
-        return;
-    };
+    let fixture = build_infra_fixture("destroy-bad-creds");
 
     create_local_metadata_with_bad_s3_secret(
         &fixture.meta_dir,
@@ -635,10 +629,7 @@ fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
 #[test]
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 fn destroy_local_only_removes_local_state_and_keeps_remote() {
-    let Some(fixture) = build_infra_fixture("destroy-local-only") else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
-        return;
-    };
+    let fixture = build_infra_fixture("destroy-local-only");
 
     create_local_metadata(
         &fixture.meta_dir,
@@ -682,10 +673,7 @@ fn destroy_local_only_removes_local_state_and_keeps_remote() {
 #[test]
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 fn destroy_full_removes_local_s3_and_postgres_state() {
-    let Some(fixture) = build_infra_fixture("destroy-full") else {
-        eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
-        return;
-    };
+    let fixture = build_infra_fixture("destroy-full");
 
     create_local_metadata(
         &fixture.meta_dir,

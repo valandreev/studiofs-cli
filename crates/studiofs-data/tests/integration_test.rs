@@ -64,7 +64,7 @@ fn test_config() -> DataStoreConfig {
         bucket: test_env_var("STUDIOFS_S3_BUCKET", "studiofs-test"),
         access_key: test_env_var("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
         secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
-        region: "us-east-1".into(),
+        region: test_env_var("STUDIOFS_S3_REGION", "us-east-1"),
         volume_name: "integration-test".into(),
         data_prefix: "integration-test/objects/".into(),
         volume_uuid: "d34f3c2a-c3a4-4b01-b626-fb46de61118a".into(),
@@ -83,9 +83,34 @@ async fn ensure_bucket() {
     ensure_bucket_for(&cfg).await;
 }
 
+#[test]
+fn bucket_creation_configuration_uses_non_default_region() {
+    assert!(bucket_creation_configuration("us-east-1").is_none());
+
+    let configuration = bucket_creation_configuration("eu-central-1")
+        .expect("non-default S3 regions require a location constraint");
+    assert_eq!(
+        configuration
+            .location_constraint()
+            .map(|location| location.as_str()),
+        Some("eu-central-1")
+    );
+}
+
+fn bucket_creation_configuration(
+    region: &str,
+) -> Option<aws_sdk_s3::types::CreateBucketConfiguration> {
+    (region != "us-east-1").then(|| {
+        aws_sdk_s3::types::CreateBucketConfiguration::builder()
+            .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::from(region))
+            .build()
+    })
+}
+
 async fn ensure_bucket_for(cfg: &DataStoreConfig) {
     use aws_sdk_s3::Client as S3Client;
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use opendal::{Operator, services::S3};
 
@@ -119,8 +144,25 @@ async fn ensure_bucket_for(cfg: &DataStoreConfig) {
         .force_path_style(true)
         .build();
     let client = S3Client::from_conf(conf);
-    let _ = client.create_bucket().bucket(&cfg.bucket).send().await;
-    let _ = op.write(".bucket-marker", Bytes::from_static(b"ok")).await;
+    let mut create_bucket = client.create_bucket().bucket(&cfg.bucket);
+    if let Some(configuration) = bucket_creation_configuration(&cfg.region) {
+        create_bucket = create_bucket.create_bucket_configuration(configuration);
+    }
+    let create_status = match create_bucket.send().await {
+        Ok(_) => "succeeded".to_owned(),
+        Err(error) => error
+            .as_service_error()
+            .and_then(|service_error| service_error.code())
+            .map_or_else(
+                || "failed without an S3 service error code".to_owned(),
+                |code| format!("failed with {code}"),
+            ),
+    };
+    if let Err(marker_error) = op.write(".bucket-marker", Bytes::from_static(b"ok")).await {
+        panic!(
+            "create or verify configured S3 test bucket failed (CreateBucket {create_status}; marker write failed: {marker_error})"
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────────

@@ -48,7 +48,8 @@ cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_supe
 
 1. Fast local/unit tests (default).
 2. PostgreSQL-only ignored metadata and CLI regressions, run automatically in RWX.
-3. Other ignored integration tests that need RustFS/S3, mounted filesystems, or multiple processes.
+3. Selected live S3 and combined S3/PostgreSQL regressions, run automatically in RWX.
+4. Other ignored integration tests that need RustFS/S3, mounted filesystems, or multiple processes.
 
 ### PostgreSQL CI gate
 
@@ -56,11 +57,11 @@ The automatic Linux gate in `.rwx/ci.yml` starts an ephemeral `postgres:18-alpin
 service and runs the ignored tests in `studiofs-meta`'s `pg_engine` module and
 the `studiofs` CLI binary, serially. It skips the SFS-720 scalability benchmark,
 which remains a separate [performance measurement](plans/sfs-720-validate-monolithic-bootstrap-checkpoint-scalability.md).
-The gate lists each selection before running it, prints the selected count and
-Cargo's pass/failure totals, and fails if the service is unhealthy or a
-selection matches zero tests. The service uses test-only trust authentication
-and contains no credentials. These tests do not need RustFS; S3-backed and
-mounted suites remain separate.
+It also runs the SFS-772 selections below in the same task, where RustFS and
+PostgreSQL are both available. The gate lists each selection before running it,
+prints the selected count and Cargo's pass/failure totals, and fails if a
+service is unhealthy or a selection matches zero tests. PostgreSQL uses
+test-only trust authentication.
 
 For local runs, the ignored test helpers load `STUDIOFS_TEST_PG_DSN` from the
 workspace `.env` file when it is not already set. On macOS, use the OrbStack
@@ -70,6 +71,66 @@ Docker context for the local PostgreSQL service.
 cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads=1 --nocapture --skip checkpoint_scalability
 cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --nocapture
 ```
+
+### SFS-772 Live S3 and Combined S3/PostgreSQL CI Gate
+
+The automatic Linux gate in `.rwx/ci.yml` starts the repository-pinned
+`rustfs/rustfs:1.0.0-alpha.94` image on a loopback-only dynamic port, then checks
+service health before running tests. The DataStore tests create the disposable
+`studiofs-test` bucket before the later VFS and combined tests use it. The gate
+passes fixed `studiofs` / `studiofs123` test-only credentials to RustFS through
+environment variable names, so the launch command does not echo their values.
+Each selection is listed and checked for a nonzero count before execution, and
+all selected tests run serially.
+
+The S3-only regression set covers DataStore upload/read/delete behavior and VFS
+published-payload retrieval after a cold reopen and partial-overwrite
+publication:
+
+- `put_and_get_object`
+- `put_and_get_by_key`
+- `object_exists_lifecycle`
+- `delete_object_idempotent`
+- `large_multi_object_write`
+- `committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen`
+- `large_file_partial_overwrite_reuploads_only_touched_extents`
+
+The CI gate selects each listed test by exact name and verifies every
+selection is nonzero, so adding another ignored test does not silently expand
+the gate.
+
+The five tests below require both S3 and PostgreSQL and are selected explicitly
+by name in the same gate:
+
+- `destroy_fails_cleanly_with_incorrect_s3_permissions`
+- `destroy_local_only_removes_local_state_and_keeps_remote`
+- `destroy_full_removes_local_s3_and_postgres_state`
+- `dump_load_restores_volume_and_discovery_reads_data`
+- `dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes`
+
+For local runs, start RustFS and PostgreSQL and configure the `STUDIOFS_S3_*`
+and `STUDIOFS_TEST_PG_DSN` variables as described in
+[Local Setup](development.md#local-setup). Run the DataStore commands first
+because their setup creates the bucket used by later commands:
+
+```bash
+cargo test -p studiofs-data --test integration_test put_and_get_object -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test put_and_get_by_key -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test object_exists_lifecycle -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test delete_object_idempotent -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-data --test integration_test large_multi_object_write -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs-vfs --test vfs_test large_file_partial_overwrite_reuploads_only_touched_extents -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test destroy_test destroy_fails_cleanly_with_incorrect_s3_permissions -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test destroy_test destroy_local_only_removes_local_state_and_keeps_remote -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test destroy_test destroy_full_removes_local_s3_and_postgres_state -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test dump_load_test dump_load_restores_volume_and_discovery_reads_data -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test dump_load_test dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes -- --ignored --exact --test-threads=1 --nocapture
+```
+
+The optional HTTPS S3 fixture is excluded because the disposable RustFS service
+is plain HTTP. Mounted FUSE/WinFSP smoke gates and the remaining ignored S3 tests
+stay separate.
 
 ### SFS-638 Shutdown and Upload-Idle Regressions
 
