@@ -2161,6 +2161,9 @@ impl StudioVfs {
             let dirty_attrs = self.state.namespace.dirty_attrs.lock();
             Self::append_unique_dirty_inodes(&mut ordered, &mut seen, dirty_attrs.keys().copied());
         }
+        // Flushing a failed abandoned cleanup could wait on the same blocked file-session gate.
+        let deferred = self.state.namespace.deferred.inner.lock();
+        ordered.retain(|ino| !deferred.cleanup_errors.contains_key(ino));
         ordered
     }
 

@@ -511,10 +511,12 @@ impl StudioVfs {
             },
         )
         .await;
-        info!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "local metadata compaction worker finished during shutdown"
-        );
+        if join_result.is_ok() {
+            info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "local metadata compaction worker finished during shutdown"
+            );
+        }
         if let Err(error) = join_result
             && !error.is_cancelled()
         {
@@ -1384,6 +1386,12 @@ mod tests {
                 .iter()
                 .any(|(level, _)| *level == tracing::Level::WARN),
             "cancellation must not emit a compaction warning"
+        );
+        assert!(
+            !events.iter().any(|(_, message)| {
+                message.contains("local metadata compaction worker finished")
+            }),
+            "cancellation must not emit the compaction completion event"
         );
     }
 

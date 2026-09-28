@@ -497,6 +497,7 @@ impl StudioVfs {
         if let Some(vfs) = cleanup_owner {
             let cleanup_inodes: Vec<_> = abandoned_file_inodes.into_iter().collect();
             let cleanup_vfs = Arc::clone(&vfs);
+            let shutdown_token = vfs.state.shutdown.background_shutdown_token.clone();
             // The drainer can be called from a write barrier that already owns this gate.
             // Let it return before cleanup waits for Delete, then retire state under that gate.
             vfs.spawn_background_cleanup_task_on(
@@ -504,11 +505,17 @@ impl StudioVfs {
                 async move {
                 for ino in cleanup_inodes {
                     let cleanup_result = async {
-                        let _session = cleanup_vfs
-                            .state
-                            .file_session
-                            .enter_op(ino, FileSessionOperation::Delete)
-                            .await;
+                        let _session = tokio::select! {
+                            _ = shutdown_token.cancelled() => {
+                                return Err(VfsError::Other(
+                                    "shutdown before acquiring Delete gate".to_string(),
+                                ));
+                            }
+                            session = cleanup_vfs
+                                .state
+                                .file_session
+                                .enter_op(ino, FileSessionOperation::Delete) => session,
+                        };
                         let cleanup = cleanup_vfs.collect_orphan_deleted_inode_cleanup(ino).await?;
                         cleanup_vfs
                             .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)

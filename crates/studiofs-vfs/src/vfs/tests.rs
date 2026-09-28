@@ -14687,6 +14687,74 @@ fn deferred_namespace_entry_conflict_does_not_degrade_mount() {
 }
 
 #[test]
+fn shutdown_cancels_deferred_cleanup_waiting_for_delete_gate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "shutdown-deferred-cleanup-delete-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let deferred = InodeAttr::new_file(9_100_007, ROOT_INO, 0, 0, 0o644);
+        let held_session = vfs
+            .state
+            .file_session
+            .enter_op(deferred.ino, FileSessionOperation::Write)
+            .await;
+        enqueue_deferred_namespace_create(&vfs, &deferred, b"cleanup-gate-conflict.txt");
+        meta.create_file_with_ino(
+            9_100_008,
+            ROOT_INO,
+            b"cleanup-gate-conflict.txt",
+            0,
+            0,
+            0o644,
+        )
+        .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        let conflict = tokio::time::timeout(
+            Duration::from_secs(1),
+            vfs.wait_for_deferred_namespace_metadata(deferred.ino),
+        )
+        .await
+        .expect("deferred namespace conflict should settle")
+        .expect_err("the deferred create should lose the name conflict");
+        assert!(conflict.to_string().contains("entry already exists"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !vfs.state.file_session.has_delete_inflight(deferred.ino) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred cleanup should queue Delete behind the held file-session gate");
+
+        let shutdown_result =
+            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+                .await
+                .expect("shutdown must not wait forever for the file-session gate");
+        drop(held_session);
+        let cleanup_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            vfs.wait_for_deferred_namespace_cleanup(deferred.ino),
+        )
+        .await
+        .expect("deferred cleanup should settle after shutdown")
+        .expect_err("shutdown should record cleanup skipped before the Delete gate");
+        assert!(
+            cleanup_error
+                .to_string()
+                .contains("shutdown before acquiring Delete")
+        );
+        let shutdown_error = shutdown_result.expect_err("shutdown must report the skipped cleanup");
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("shutdown before acquiring Delete")
+        );
+        assert_eq!(vfs.state.file_session.stats().queued_ops, 0);
+        assert!(!vfs.state.file_session.has_delete_inflight(deferred.ino));
+    });
+}
+
+#[test]
 fn deferred_namespace_entry_conflict_retries_nonconflicting_operations() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) =

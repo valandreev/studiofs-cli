@@ -16,6 +16,7 @@ When this change is complete, graceful VFS shutdown will stop admitting foregrou
 - [x] Verify the shutdown review against current call paths; reap completed handles, preserve panic reporting, and simplify the duplicated wait loops.
 - [x] Verify the follow-up review; correct compaction completion logging, avoid polling active Tokio handles, and record the verified runtime/thread-join decisions.
 - [x] (2026-09-28 16:43Z) Close synchronous mutation admission before task draining and add a regression for cleanup registered by an already-admitted mutation.
+- [x] (2026-09-28) Bound abandoned namespace cleanup's pre-storage Delete-gate wait by shutdown cancellation, make queued file-session accounting cancellation-safe, and log compaction completion only after successful joins.
 
 ## Milestones
 
@@ -34,6 +35,9 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - Reaping Tokio handles through `is_finished()` alone would discard completed panic results; a nonblocking poll keeps panic reporting while releasing completed handles.
 - `Vec::remove(0)` shifted remaining handles even though completion order is not observable, so shutdown can use `swap_remove(0)`.
 - A synchronous rename or truncate can be admitted before shutdown and register deferred cache cleanup after a task-list snapshot. The task-list loop cannot own a producer that has not registered yet, so shutdown needs an operation-admission barrier before its first drain.
+- Abandoned namespace cleanup can be non-abortable before it owns storage: `FileSessionState::enter_op(Delete)` may still be waiting on the inode gate. Cancel only that wait during shutdown, record the skipped cleanup through the existing error map, and keep cleanup non-abortable after the gate is acquired.
+- Cancelling `enter_op` while queued previously left its queued-operation and queued-delete counters incremented. A small queue guard now releases those counts on cancellation as well as successful gate acquisition.
+- A skipped cleanup inode also remained in the final dirty-inode list, which would reacquire the same blocked session gate during shutdown's flush phase. Exclude only inodes with recorded deferred-cleanup errors from that per-inode flush; shutdown still reports the error and persists the remaining local state.
 
 ## Decision Log
 
@@ -49,6 +53,9 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - Do not prioritize the epoch retry `select!` with `biased;`: shutdown sets `shutdown_requested` before cancelling the token, and the timer branch checks that flag before queueing.
 - Skip moving native thread creation outside the shutdown-list lock because registration must stay atomic against the shutdown snapshot; skip the one-call `String` parameter style suggestion as cosmetic.
 - Close foreground mutation admission through one `tokio::sync::RwLock<()>`: `run_sync_future` takes a nonblocking read guard and checks `shutdown_requested`, while shutdown takes the write guard immediately after claiming ownership and holds it through persistence. This makes late registration impossible for admitted sync mutations and rejects new ones after shutdown starts without adding a separate counter/notification protocol.
+- Use the existing background shutdown token to stop deferred cleanup only before it acquires `FileSessionOperation::Delete`; after acquisition, retain the existing unbounded owner join so cache/storage work finishes before close. Preserve the error through `cleanup_errors` so shutdown reports the skipped inode.
+- Do not retry per-inode flush for a recorded failed cleanup during shutdown: it would wait on the gate that caused cleanup to be skipped. Keep the cleanup error as the shutdown result and continue flushing unrelated dirty inodes.
+- Emit the local compaction completion event only for `Ok(())` from the join. Keep logging successful completion even when the worker completed within the timeout; the event describes completion, not only a timeout wait.
 
 ## Outcomes & Retrospective
 
@@ -85,6 +92,17 @@ Follow-up review validation passed:
 - `cargo check -p studiofs-vfs`.
 - `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
 - `cargo fmt --all -- --check` and `git diff --check`.
+
+The latest inline review follow-up adds a deterministic regression that holds the inode write gate through shutdown completion, then verifies the recorded cleanup error and cleared queue counters. A separate assertion ensures a cancelled compaction join does not emit the completion event.
+
+Latest validation passed:
+
+- `cargo test -p studiofs-vfs --lib shutdown_cancels_deferred_cleanup_waiting_for_delete_gate -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib deferred_namespace_entry_conflict_does_not_degrade_mount -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib local_compaction_join_ -- --nocapture` — 4 passed.
+- `cargo check -p studiofs-vfs`.
+- `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
+- `cargo fmt --all` and `git diff --check`.
 
 ## Revision Note
 
