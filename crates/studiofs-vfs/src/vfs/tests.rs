@@ -14446,6 +14446,50 @@ fn deferred_namespace_written_file_commits_locally_without_explicit_flush() {
 }
 
 #[test]
+fn attr_only_setattr_size_uses_regular_non_deferred_path() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-only-size-regular-path");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let created = vfs
+            .create(ROOT_INO, b"attr-only-size-regular-path.txt", 0, 0, 0o644)
+            .expect("create size setattr target");
+        let admitted_operations_before = vfs
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .admitted_operations;
+
+        let updated = vfs
+            .setattr_attr_only_deferred_metadata(
+                created.ino,
+                SetattrArgs {
+                    size: Some(8),
+                    ..SetattrArgs::default()
+                },
+                rt.handle(),
+            )
+            .expect("route size setattr through regular setter");
+
+        assert_eq!(updated.size, 8);
+        assert_eq!(meta.get_attr(created.ino).expect("load attr").size, 8);
+        assert_eq!(
+            vfs.state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .admitted_operations,
+            admitted_operations_before,
+            "size setattr must not enqueue a deferred SetAttr commit"
+        );
+    });
+}
+
+#[test]
 fn deferred_attr_only_commit_does_not_revert_written_size() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-attr-only-keeps-written-size");

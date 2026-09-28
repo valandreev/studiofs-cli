@@ -1055,9 +1055,6 @@ impl StudioVfs {
         ino: Ino,
         args: SetattrArgs,
     ) -> VfsResult<InodeAttr> {
-        if args.size.is_some() {
-            return self.setattr_with_handle(None, ino, args);
-        }
         if self.is_runtime_stats_file_ino(ino) {
             return Err(Self::runtime_stats_access_denied_error());
         }
@@ -1092,6 +1089,9 @@ impl StudioVfs {
         args: SetattrArgs,
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
+        if args.size.is_some() {
+            return self.setattr_with_handle(None, ino, args);
+        }
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
         let _operation = self.try_mutating_operation_admission()?;
         self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>())?;
