@@ -17,6 +17,7 @@ When this change is complete, graceful VFS shutdown will stop admitting foregrou
 - [x] Verify the follow-up review; correct compaction completion logging, avoid polling active Tokio handles, and record the verified runtime/thread-join decisions.
 - [x] (2026-09-28 16:43Z) Close synchronous mutation admission before task draining and add a regression for cleanup registered by an already-admitted mutation.
 - [x] (2026-09-28) Bound abandoned namespace cleanup's pre-storage Delete-gate wait by shutdown cancellation, make queued file-session accounting cancellation-safe, and log compaction completion only after successful joins.
+- [x] (2026-09-28) Apply the admission gate to every synchronous metadata mutator, bound shutdown's write-lock wait without cancelling retryable work, and filter only shutdown-skipped cleanup inodes from the final dirty drain.
 
 ## Milestones
 
@@ -37,7 +38,9 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - A synchronous rename or truncate can be admitted before shutdown and register deferred cache cleanup after a task-list snapshot. The task-list loop cannot own a producer that has not registered yet, so shutdown needs an operation-admission barrier before its first drain.
 - Abandoned namespace cleanup can be non-abortable before it owns storage: `FileSessionState::enter_op(Delete)` may still be waiting on the inode gate. Cancel only that wait during shutdown, record the skipped cleanup through the existing error map, and keep cleanup non-abortable after the gate is acquired.
 - Cancelling `enter_op` while queued previously left its queued-operation and queued-delete counters incremented. A small queue guard now releases those counts on cancellation as well as successful gate acquisition.
-- A skipped cleanup inode also remained in the final dirty-inode list, which would reacquire the same blocked session gate during shutdown's flush phase. Exclude only inodes with recorded deferred-cleanup errors from that per-inode flush; shutdown still reports the error and persists the remaining local state.
+- A skipped cleanup inode also remained in the final dirty-inode list, which would reacquire the same blocked session gate during shutdown's flush phase. Filtering all `cleanup_errors` also excluded unrelated earlier cleanup failures, so a dedicated shutdown-skipped set now controls that exclusion.
+- The admission read guard originally covered only `run_sync_future`; direct create, mkdir, symlink, setattr, xattr, and ACL mutators could still write during shutdown. A shared admission helper now covers those synchronous entry points, and deferred namespace registration does not recheck shutdown after an operation has already been admitted.
+- The shutdown write-side admission wait was unbounded and ran before token cancellation. It now uses the existing two-second join timeout and returns a retryable error before cancelling background cleanup if admitted mutations do not finish.
 
 ## Decision Log
 
@@ -52,9 +55,10 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 - Keep the native cleanup `join()` after its completion signal; the signal follows the cleanup closure, and the synchronous join only reaps the native thread before releasing its tracked handle.
 - Do not prioritize the epoch retry `select!` with `biased;`: shutdown sets `shutdown_requested` before cancelling the token, and the timer branch checks that flag before queueing.
 - Skip moving native thread creation outside the shutdown-list lock because registration must stay atomic against the shutdown snapshot; skip the one-call `String` parameter style suggestion as cosmetic.
-- Close foreground mutation admission through one `tokio::sync::RwLock<()>`: `run_sync_future` takes a nonblocking read guard and checks `shutdown_requested`, while shutdown takes the write guard immediately after claiming ownership and holds it through persistence. This makes late registration impossible for admitted sync mutations and rejects new ones after shutdown starts without adding a separate counter/notification protocol.
+- Close synchronous mutation admission through one `tokio::sync::RwLock<()>`: a shared helper takes a nonblocking read guard for direct metadata mutators and `run_sync_future`; shutdown takes the write guard after claiming ownership and holds it through persistence. An admitted operation can finish registration after shutdown is requested, while later operations are rejected.
+- Bound the write-side admission wait by the existing two-second background join timeout. If it expires, return before cancelling the background token so the aborted shutdown owner can be retried after the active mutation finishes.
 - Use the existing background shutdown token to stop deferred cleanup only before it acquires `FileSessionOperation::Delete`; after acquisition, retain the existing unbounded owner join so cache/storage work finishes before close. Preserve the error through `cleanup_errors` so shutdown reports the skipped inode.
-- Do not retry per-inode flush for a recorded failed cleanup during shutdown: it would wait on the gate that caused cleanup to be skipped. Keep the cleanup error as the shutdown result and continue flushing unrelated dirty inodes.
+- Do not retry per-inode flush for an inode explicitly marked as skipped while waiting for its Delete gate during shutdown; that flush would wait on the same gate. Keep general cleanup errors eligible for flush so unrelated dirty payloads and attrs remain durable.
 - Emit the local compaction completion event only for `Ok(())` from the join. Keep logging successful completion even when the worker completed within the timeout; the event describes completion, not only a timeout wait.
 
 ## Outcomes & Retrospective
@@ -62,6 +66,8 @@ The final milestone runs the single regression, `cargo check -p studiofs-vfs`, a
 Shutdown now cancels and joins epoch retries, waits for deferred Tokio cleanup and no-runtime cleanup threads, and repeats the task drain after the final local dirty flush. A regression confirmed the retry handle is absent before the fix; after the fix, both focused tests passed and the same local redb/cache fixture reopened with its written bytes intact.
 
 The shutdown follow-up also waits for already-admitted synchronous mutations before taking task-list snapshots. The new regression failed before the write-side admission barrier because shutdown completed while a mutation was held before cleanup registration; it passes with the barrier and confirms shutdown waits for the cleanup it registers.
+
+The latest review follow-up gates direct synchronous metadata mutators as well as `run_sync_future`. A deterministic deferred-create regression holds the inode reservation after admission, introduces a persisted name conflict behind a negative dentry, and confirms shutdown waits until that producer registers cleanup. Shutdown's admission wait now times out after two seconds before token cancellation, leaving the shutdown owner retryable. A dedicated marker narrows the dirty-inode exclusion to cleanup skipped by that shutdown cancellation; an unrelated prior cleanup error no longer suppresses writer and dirty-attr persistence.
 
 Review follow-up reaps completed Tokio and native thread handles as new work is registered, logs completed task/thread panics, checks every join result after abort, shares the `JoinHandle` timeout policy, factors the native-thread waiter, and replaces front-removal shifts with `swap_remove`. Review requests for a hard shutdown deadline, runtime-less cleanup fallback, spawn-before-registration, and one shared warning budget were rejected because they conflict with storage ownership, have no runtime caller, or add policy without a demonstrated need; the synthetic cleanup IDs cover task registration while the regression also writes and reads real local data across reopen.
 
@@ -104,8 +110,27 @@ Latest validation passed:
 - `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
 - `cargo fmt --all` and `git diff --check`.
 
+Latest review validation passed:
+
+- `cargo test -p studiofs-vfs --lib direct_namespace_mutations_obey_shutdown_admission_gate -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib shutdown_waits_for_deferred_create_admitted_before_cleanup_registration -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib shutdown_bounds_wait_for_admitted_mutations_and_can_retry -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib shutdown_flushes_dirty_attrs_with_prior_cleanup_errors -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib shutdown_cancels_deferred_cleanup_waiting_for_delete_gate -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib shutdown_waits_for_admitted_mutation_that_registers_cleanup -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib deferred_namespace_admission_stops_after_shutdown_requested -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib deferred_namespace_durable_mutations_wait_for_admitted_entries -- --nocapture` — 1 passed.
+- `cargo test -p studiofs-vfs --lib deferred_attr_only_commit_does_not_revert_written_size -- --nocapture` — 1 passed.
+- `cargo check -p studiofs-vfs`.
+- `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
+- `cargo fmt --all -- --check` and `git diff --check`.
+
+The full VFS suite and native mounted acceptance were not run.
+
 ## Revision Note
 
 Created on 2026-09-28 after verifying the issue's named spawn sites and shutdown sequence. The first regression run failed as expected: the tracker contained 0 retry handles instead of 1. Final focused regressions, check, Clippy and diff review passed; implementation stays within the VFS lifecycle and its focused regression.
 
 Revision note (2026-09-28): the shutdown task-ownership review identified a producer race outside the tracked task lists. Updated the plan to close synchronous mutation admission before draining; the new regression failed before that barrier and passed afterward.
+
+Revision note (2026-09-28): the follow-up review found uncovered synchronous metadata mutators, an unbounded gate wait, and overbroad filtering by `cleanup_errors`. Added shared admission coverage, a retryable two-second gate timeout, and a shutdown-specific skipped-cleanup set; focused tests, check, Clippy, formatting, and diff checks passed.

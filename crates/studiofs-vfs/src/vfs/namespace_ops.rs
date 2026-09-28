@@ -226,11 +226,6 @@ impl StudioVfs {
         inner: &DeferredNamespaceInner,
         op_bytes: usize,
     ) -> Option<VfsError> {
-        if self.shutdown_requested() {
-            return Some(VfsError::Other(
-                "VFS shutdown has stopped namespace admission".to_string(),
-            ));
-        }
         if self
             .state
             .namespace
@@ -507,6 +502,14 @@ impl StudioVfs {
                     let cleanup_result = async {
                         let _session = tokio::select! {
                             _ = shutdown_token.cancelled() => {
+                                cleanup_vfs
+                                    .state
+                                    .namespace
+                                    .deferred
+                                    .inner
+                                    .lock()
+                                    .shutdown_skipped_cleanup
+                                    .insert(ino);
                                 return Err(VfsError::Other(
                                     "shutdown before acquiring Delete gate".to_string(),
                                 ));
@@ -1089,7 +1092,11 @@ impl StudioVfs {
         args: SetattrArgs,
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
+        if args.size.is_some() {
+            return self.setattr_with_handle(None, ino, args);
+        }
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
+        let _operation = self.try_mutating_operation_admission()?;
         self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>())?;
         let attr = self.setattr_attr_only_deferred_local(ino, args.clone())?;
         self.enqueue_deferred_namespace_op(
@@ -1117,6 +1124,7 @@ impl StudioVfs {
         args: SetattrArgs,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
+        let operation = self.try_mutating_operation_admission()?;
         if self.is_runtime_stats_file_ino(ino) {
             return Err(Self::runtime_stats_access_denied_error());
         }
@@ -1163,11 +1171,10 @@ impl StudioVfs {
             }
             let defer_handle_growth_flush =
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
-            let updated = self.run_sync_future(self.setattr_with_size_change(
-                ino,
-                args,
-                defer_handle_growth_flush,
-            ))?;
+            let updated = self.run_sync_future_with_admission(
+                &operation,
+                self.setattr_with_size_change(ino, args, defer_handle_growth_flush),
+            )?;
             if let Some(handle) = fh {
                 self.handle_table.update_open_attr(handle, updated.clone());
             }
@@ -2448,6 +2455,7 @@ impl StudioVfs {
         mode: u16,
         request_eager_flush: bool,
     ) -> VfsResult<InodeAttr> {
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -2537,6 +2545,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Create);
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.ensure_no_deferred_namespace_error(parent)?;
@@ -2601,6 +2610,7 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Mkdir);
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -2641,6 +2651,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Mkdir);
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.ensure_no_deferred_namespace_error(parent)?;
@@ -2695,6 +2706,7 @@ impl StudioVfs {
         uid: u32,
         gid: u32,
     ) -> VfsResult<InodeAttr> {
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
