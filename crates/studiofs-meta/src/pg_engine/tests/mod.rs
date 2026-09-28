@@ -74,14 +74,22 @@ fn pg_test_database_is_reachable_for_ci_gate() {
             .query_one("SELECT 1", &[])
             .await
             .map(|row| row.get::<_, i32>(0))
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()));
+            .map_err(|error| {
+                crate::engine::MetaError::Storage(format!(
+                    "postgres metadata gate query failed: {}",
+                    pg_err(error)
+                ))
+            });
         connection_task.abort();
         let _ = connection_task.await;
         result
     });
-    assert!(
-        matches!(metadata_query, Ok(1)),
-        "PostgreSQL test gate must query the StudioFS metadata database"
+    assert_eq!(
+        metadata_query.unwrap_or_else(|error| {
+            panic!("PostgreSQL test gate could not query the StudioFS metadata database: {error}")
+        }),
+        1,
+        "PostgreSQL test gate returned an unexpected query result"
     );
 }
 
