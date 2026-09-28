@@ -35,6 +35,7 @@ impl StudioVfs {
 
     /// Set an extended attribute.
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
+        let _operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
@@ -51,6 +52,7 @@ impl StudioVfs {
 
     /// Remove an extended attribute.
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
+        let _operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
@@ -73,7 +75,35 @@ impl StudioVfs {
         Ok(self.sync_meta().list_xattrs(ino)?)
     }
 
-    pub(super) fn run_sync_future<T>(future: impl std::future::Future<Output = T>) -> T {
+    // Once this guard is held, the operation may finish even if shutdown starts.
+    pub(super) fn try_mutating_operation_admission(
+        &self,
+    ) -> VfsResult<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let operation = self
+            .state
+            .shutdown
+            .mutating_operation_gate
+            .try_read()
+            .map_err(|_| VfsError::Other("VFS is shutting down".to_string()))?;
+        if self.shutdown_requested() {
+            return Err(VfsError::Other("VFS is shutting down".to_string()));
+        }
+        Ok(operation)
+    }
+
+    pub(super) fn run_sync_future<T>(
+        &self,
+        future: impl std::future::Future<Output = VfsResult<T>>,
+    ) -> VfsResult<T> {
+        let operation = self.try_mutating_operation_admission()?;
+        self.run_sync_future_with_admission(&operation, future)
+    }
+
+    pub(super) fn run_sync_future_with_admission<T>(
+        &self,
+        _operation: &tokio::sync::RwLockReadGuard<'_, ()>,
+        future: impl std::future::Future<Output = VfsResult<T>>,
+    ) -> VfsResult<T> {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| handle.block_on(future))
         } else {
@@ -174,7 +204,7 @@ impl StudioVfs {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        self.track_background_task(handle.spawn(async move {
+        self.spawn_background_cleanup_task_on(&handle, async move {
             let result = run_local_cache_io_blocking(move || {
                 local_payload_backend
                     .remove(object_id)
@@ -199,6 +229,6 @@ impl StudioVfs {
                     );
                 }
             }
-        }));
+        });
     }
 }

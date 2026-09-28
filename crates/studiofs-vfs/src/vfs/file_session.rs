@@ -559,6 +559,32 @@ pub(super) struct FileSessionPermit {
     op: FileSessionOperation,
 }
 
+struct FileSessionQueueGuard<'a> {
+    session: &'a FileSessionEntry,
+    counters: &'a FileSessionCounters,
+    op: FileSessionOperation,
+}
+
+impl Drop for FileSessionQueueGuard<'_> {
+    fn drop(&mut self) {
+        self.session.queued_ops.fetch_sub(1, Ordering::Relaxed);
+        self.counters
+            .queued_ops
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+        if self.op == FileSessionOperation::Delete {
+            self.session
+                .queued_delete_ops
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+        }
+    }
+}
+
 impl Drop for FileSessionPermit {
     /// Releases lock guards and records the finish transition.
     fn drop(&mut self) {
@@ -706,6 +732,11 @@ impl FileSessionState {
             Ordering::Relaxed,
             |current| (global_queue_depth > current).then_some(global_queue_depth),
         );
+        let queued_op = FileSessionQueueGuard {
+            session: &session,
+            counters: &self.counters,
+            op,
+        };
 
         let wait_started = Instant::now();
         let finalize_guard = if op == FileSessionOperation::Finalize {
@@ -726,13 +757,7 @@ impl FileSessionState {
         } else {
             (None, Some(session.gate.clone().write_owned().await))
         };
-        session.queued_ops.fetch_sub(1, Ordering::Relaxed);
-        counters
-            .queued_ops
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            })
-            .ok();
+        drop(queued_op);
 
         let waited_ms = wait_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         if waited_ms > 0 {
@@ -746,14 +771,6 @@ impl FileSessionState {
         counters.note_transition();
         session.note_active_start(op);
         session.record_transition(op, "start");
-        if op == FileSessionOperation::Delete {
-            session
-                .queued_delete_ops
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
-        }
         FileSessionPermit {
             _finalize_gate: finalize_guard,
             _read_gate: read_guard,

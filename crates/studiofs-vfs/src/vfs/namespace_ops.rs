@@ -226,11 +226,6 @@ impl StudioVfs {
         inner: &DeferredNamespaceInner,
         op_bytes: usize,
     ) -> Option<VfsError> {
-        if self.shutdown_requested() {
-            return Some(VfsError::Other(
-                "VFS shutdown has stopped namespace admission".to_string(),
-            ));
-        }
         if self
             .state
             .namespace
@@ -497,16 +492,33 @@ impl StudioVfs {
         if let Some(vfs) = cleanup_owner {
             let cleanup_inodes: Vec<_> = abandoned_file_inodes.into_iter().collect();
             let cleanup_vfs = Arc::clone(&vfs);
+            let shutdown_token = vfs.state.shutdown.background_shutdown_token.clone();
             // The drainer can be called from a write barrier that already owns this gate.
             // Let it return before cleanup waits for Delete, then retire state under that gate.
-            vfs.track_background_task(tokio::spawn(async move {
+            vfs.spawn_background_cleanup_task_on(
+                &tokio::runtime::Handle::current(),
+                async move {
                 for ino in cleanup_inodes {
                     let cleanup_result = async {
-                        let _session = cleanup_vfs
-                            .state
-                            .file_session
-                            .enter_op(ino, FileSessionOperation::Delete)
-                            .await;
+                        let _session = tokio::select! {
+                            _ = shutdown_token.cancelled() => {
+                                cleanup_vfs
+                                    .state
+                                    .namespace
+                                    .deferred
+                                    .inner
+                                    .lock()
+                                    .shutdown_skipped_cleanup
+                                    .insert(ino);
+                                return Err(VfsError::Other(
+                                    "shutdown before acquiring Delete gate".to_string(),
+                                ));
+                            }
+                            session = cleanup_vfs
+                                .state
+                                .file_session
+                                .enter_op(ino, FileSessionOperation::Delete) => session,
+                        };
                         let cleanup = cleanup_vfs.collect_orphan_deleted_inode_cleanup(ino).await?;
                         cleanup_vfs
                             .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
@@ -527,7 +539,8 @@ impl StudioVfs {
                     cleanup_vfs.state.namespace.deferred.notify.notify_waiters();
                     cleanup_vfs.state.file_session.gc_if_idle(ino);
                 }
-            }));
+                },
+            );
         } else if !abandoned_file_inodes.is_empty() {
             error!(
                 inodes = ?abandoned_file_inodes,
@@ -1042,9 +1055,6 @@ impl StudioVfs {
         ino: Ino,
         args: SetattrArgs,
     ) -> VfsResult<InodeAttr> {
-        if args.size.is_some() {
-            return self.setattr_with_handle(None, ino, args);
-        }
         if self.is_runtime_stats_file_ino(ino) {
             return Err(Self::runtime_stats_access_denied_error());
         }
@@ -1079,7 +1089,11 @@ impl StudioVfs {
         args: SetattrArgs,
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
+        if args.size.is_some() {
+            return self.setattr_with_handle(None, ino, args);
+        }
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
+        let _operation = self.try_mutating_operation_admission()?;
         self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>())?;
         let attr = self.setattr_attr_only_deferred_local(ino, args.clone())?;
         self.enqueue_deferred_namespace_op(
@@ -1107,6 +1121,7 @@ impl StudioVfs {
         args: SetattrArgs,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
+        let operation = self.try_mutating_operation_admission()?;
         if self.is_runtime_stats_file_ino(ino) {
             return Err(Self::runtime_stats_access_denied_error());
         }
@@ -1153,11 +1168,10 @@ impl StudioVfs {
             }
             let defer_handle_growth_flush =
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
-            let updated = Self::run_sync_future(self.setattr_with_size_change(
-                ino,
-                args,
-                defer_handle_growth_flush,
-            ))?;
+            let updated = self.run_sync_future_with_admission(
+                &operation,
+                self.setattr_with_size_change(ino, args, defer_handle_growth_flush),
+            )?;
             if let Some(handle) = fh {
                 self.handle_table.update_open_attr(handle, updated.clone());
             }
@@ -2331,7 +2345,7 @@ impl StudioVfs {
     /// In ignored-path mode, this records a synthetic ignored entry so namespace
     /// behavior remains consistent while avoiding metadata mutations.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
-        Self::run_sync_future(self.link_inner(ino, new_parent, new_name))
+        self.run_sync_future(self.link_inner(ino, new_parent, new_name))
     }
 
     async fn link_inner(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
@@ -2438,6 +2452,7 @@ impl StudioVfs {
         mode: u16,
         request_eager_flush: bool,
     ) -> VfsResult<InodeAttr> {
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -2527,6 +2542,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Create);
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.ensure_no_deferred_namespace_error(parent)?;
@@ -2591,6 +2607,7 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Mkdir);
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -2631,6 +2648,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Mkdir);
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.ensure_no_deferred_namespace_error(parent)?;
@@ -2685,6 +2703,7 @@ impl StudioVfs {
         uid: u32,
         gid: u32,
     ) -> VfsResult<InodeAttr> {
+        let _operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -2713,13 +2732,14 @@ impl StudioVfs {
 
     /// Unlink the entry `name` from directory `parent`.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.unlink_inner(parent, name)).map(|_| ())
+        self.run_sync_future(self.unlink_inner(parent, name))
+            .map(|_| ())
     }
 
     /// Unlink the entry `name` and return the removed inode attributes when
     /// the entry came from durable metadata.
     pub fn unlink_with_attr(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
-        Self::run_sync_future(self.unlink_inner(parent, name))
+        self.run_sync_future(self.unlink_inner(parent, name))
     }
 
     async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
@@ -2787,12 +2807,12 @@ impl StudioVfs {
 
     /// Remove an empty directory `name` from directory `parent`.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.rmdir_inner(parent, name))
+        self.run_sync_future(self.rmdir_inner(parent, name))
     }
 
     /// Retry a cleanup-triggered directory removal while child callbacks catch up.
     pub fn rmdir_for_cleanup(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.rmdir_for_cleanup_inner(parent, name))
+        self.run_sync_future(self.rmdir_for_cleanup_inner(parent, name))
     }
 
     async fn rmdir_for_cleanup_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
@@ -2910,7 +2930,7 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
-        Self::run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
+        self.run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
     }
 
     async fn delete_source_tree_and_invalidate_trash_target(

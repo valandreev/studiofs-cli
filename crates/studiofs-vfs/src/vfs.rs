@@ -587,6 +587,20 @@ pub enum VfsError {
     Other(String),
 }
 
+const SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE: &str =
+    "timed out waiting for admitted VFS mutations before shutdown";
+
+impl VfsError {
+    /// Returns whether shutdown may be retried after admitted mutations finish.
+    pub fn is_retryable_shutdown_admission_timeout(&self) -> bool {
+        matches!(self, Self::Other(message) if message == SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE)
+    }
+
+    pub(crate) fn shutdown_admission_timeout() -> Self {
+        Self::Other(SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE.to_string())
+    }
+}
+
 /// Result type alias used by the VFS public API.
 pub type VfsResult<T> = Result<T, VfsError>;
 
@@ -2413,6 +2427,7 @@ enum ShutdownClaim {
 
 struct ShutdownState {
     shutdown_phase: Mutex<ShutdownPhase>,
+    mutating_operation_gate: tokio::sync::RwLock<()>,
     shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_final_drain_active: std::sync::atomic::AtomicBool,
     uploader_shutdown_requested: std::sync::atomic::AtomicBool,
@@ -2421,14 +2436,22 @@ struct ShutdownState {
     uploader_shutdown_token: CancellationToken,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
+    background_cleanup_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
+    background_cleanup_threads: OrderedMutex<Vec<BackgroundCleanupThreadTask>>,
     local_metadata_compaction_task: OrderedMutex<Option<JoinHandle<()>>>,
     uploader_task: OrderedMutex<Option<JoinHandle<()>>>,
+}
+
+pub(super) struct BackgroundCleanupThreadTask {
+    pub(super) thread: std::thread::JoinHandle<()>,
+    pub(super) completed: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl ShutdownState {
     fn new() -> Self {
         Self {
             shutdown_phase: Mutex::new(ShutdownPhase::Running),
+            mutating_operation_gate: tokio::sync::RwLock::new(()),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_final_drain_active: std::sync::atomic::AtomicBool::new(false),
             uploader_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
@@ -2437,6 +2460,8 @@ impl ShutdownState {
             uploader_shutdown_token: CancellationToken::new(),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
+            background_cleanup_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
+            background_cleanup_threads: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             local_metadata_compaction_task: OrderedMutex::new(None, LockTier::Shutdown),
             uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }

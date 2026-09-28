@@ -596,12 +596,13 @@ impl StudioVfs {
             return;
         }
         let vfs = self.clone();
-        tokio::spawn(async move {
+        let shutdown = self.state.shutdown.background_shutdown_token.clone();
+        self.spawn_background_task(async move {
             if vfs.shutdown_requested() {
                 return;
             }
             tokio::select! {
-                _ = vfs.state.shutdown.shutdown_notify.notified() => {}
+                _ = shutdown.cancelled() => {}
                 _ = tokio::time::sleep(delay) => {
                     if !vfs.shutdown_requested() {
                         vfs.queue_epoch_finalization(ino, content_epoch);
@@ -3073,5 +3074,74 @@ mod tests {
             epoch_finalization_retry_delay(&commit::EpochFinalizeStatus::Skipped, retry_base),
             None
         );
+    }
+
+    #[test]
+    fn shutdown_owns_epoch_retry_before_reopening_local_stores() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs-738-epoch-retry-shutdown");
+        let (rt, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&tmp, "sfs-738-retry");
+        let runtime_guard = rt.enter();
+
+        let ino = rt.block_on(async {
+            let attr = vfs
+                .create(ROOT_INO, b"shutdown-retry.bin", 0, 0, 0o644)
+                .expect("create test file");
+            vfs.write(attr.ino, 0, b"local data")
+                .await
+                .expect("write local data");
+
+            vfs.schedule_epoch_finalization_retry(attr.ino, 1, Duration::from_secs(60));
+            assert_eq!(
+                vfs.state.shutdown.background_tasks.lock().len(),
+                1,
+                "epoch retry must be owned by shutdown"
+            );
+            vfs.finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(
+                attr.ino + 1,
+                vec![101],
+            );
+            assert_eq!(vfs.state.shutdown.background_cleanup_tasks.lock().len(), 1);
+            attr.ino
+        });
+
+        drop(runtime_guard);
+        vfs.finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(ino + 2, vec![102]);
+        assert_eq!(
+            vfs.state.shutdown.background_cleanup_threads.lock().len(),
+            1
+        );
+        rt.block_on(async {
+            vfs.shutdown(Duration::ZERO)
+                .await
+                .expect("shutdown should join retries and cleanup before persisting local data");
+        });
+        assert!(vfs.state.shutdown.background_tasks.lock().is_empty());
+        assert!(
+            vfs.state
+                .shutdown
+                .background_cleanup_tasks
+                .lock()
+                .is_empty()
+        );
+        assert!(
+            vfs.state
+                .shutdown
+                .background_cleanup_threads
+                .lock()
+                .is_empty()
+        );
+        drop(vfs);
+        drop(meta);
+        drop(rt);
+
+        let (reopen_rt, reopened, _reopened_meta) =
+            super::super::tests::reopen_existing_test_vfs(&tmp);
+        reopen_rt.block_on(async {
+            let data = reopened
+                .read(ino, 0, b"local data".len() as u32)
+                .await
+                .expect("read after local metadata/cache reopen");
+            assert_eq!(data.as_ref(), b"local data");
+        });
     }
 }

@@ -2956,7 +2956,9 @@ impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
     }
 }
 
-fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+pub(super) fn reopen_existing_test_vfs(
+    tmp: &TempDir,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("reopen RedbMetaEngine"));
     let format_info = meta.get_format_info().expect("load format info");
@@ -14444,6 +14446,50 @@ fn deferred_namespace_written_file_commits_locally_without_explicit_flush() {
 }
 
 #[test]
+fn attr_only_setattr_size_uses_regular_non_deferred_path() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "attr-only-size-regular-path");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let created = vfs
+            .create(ROOT_INO, b"attr-only-size-regular-path.txt", 0, 0, 0o644)
+            .expect("create size setattr target");
+        let admitted_operations_before = vfs
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .admitted_operations;
+
+        let updated = vfs
+            .setattr_attr_only_deferred_metadata(
+                created.ino,
+                SetattrArgs {
+                    size: Some(8),
+                    ..SetattrArgs::default()
+                },
+                rt.handle(),
+            )
+            .expect("route size setattr through regular setter");
+
+        assert_eq!(updated.size, 8);
+        assert_eq!(meta.get_attr(created.ino).expect("load attr").size, 8);
+        assert_eq!(
+            vfs.state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .admitted_operations,
+            admitted_operations_before,
+            "size setattr must not enqueue a deferred SetAttr commit"
+        );
+    });
+}
+
+#[test]
 fn deferred_attr_only_commit_does_not_revert_written_size() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-attr-only-keeps-written-size");
@@ -14680,6 +14726,333 @@ fn deferred_namespace_entry_conflict_does_not_degrade_mount() {
                 .degraded
                 .load(AtomicOrdering::Acquire),
             "a concurrent namespace conflict must not degrade the mount"
+        );
+    });
+}
+
+#[test]
+fn shutdown_cancels_deferred_cleanup_waiting_for_delete_gate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "shutdown-deferred-cleanup-delete-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let deferred = InodeAttr::new_file(9_100_007, ROOT_INO, 0, 0, 0o644);
+        let held_session = vfs
+            .state
+            .file_session
+            .enter_op(deferred.ino, FileSessionOperation::Write)
+            .await;
+        enqueue_deferred_namespace_create(&vfs, &deferred, b"cleanup-gate-conflict.txt");
+        meta.create_file_with_ino(
+            9_100_008,
+            ROOT_INO,
+            b"cleanup-gate-conflict.txt",
+            0,
+            0,
+            0o644,
+        )
+        .expect("persist competing namespace entry");
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+
+        let conflict = tokio::time::timeout(
+            Duration::from_secs(1),
+            vfs.wait_for_deferred_namespace_metadata(deferred.ino),
+        )
+        .await
+        .expect("deferred namespace conflict should settle")
+        .expect_err("the deferred create should lose the name conflict");
+        assert!(conflict.to_string().contains("entry already exists"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !vfs.state.file_session.has_delete_inflight(deferred.ino) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred cleanup should queue Delete behind the held file-session gate");
+
+        let shutdown_result =
+            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+                .await
+                .expect("shutdown must not wait forever for the file-session gate");
+        drop(held_session);
+        let cleanup_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            vfs.wait_for_deferred_namespace_cleanup(deferred.ino),
+        )
+        .await
+        .expect("deferred cleanup should settle after shutdown")
+        .expect_err("shutdown should record cleanup skipped before the Delete gate");
+        assert!(
+            cleanup_error
+                .to_string()
+                .contains("shutdown before acquiring Delete")
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .shutdown_skipped_cleanup
+                .contains(&deferred.ino)
+        );
+        let shutdown_error = shutdown_result.expect_err("shutdown must report the skipped cleanup");
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("shutdown before acquiring Delete")
+        );
+        assert_eq!(vfs.state.file_session.stats().queued_ops, 0);
+        assert!(!vfs.state.file_session.has_delete_inflight(deferred.ino));
+    });
+}
+
+#[test]
+fn direct_namespace_mutations_obey_shutdown_admission_gate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "direct-mutation-shutdown-admission");
+    let _guard = rt.enter();
+    let existing = meta
+        .create_file_with_ino(9_100_010, ROOT_INO, b"existing.txt", 0, 0, 0o644)
+        .expect("persist setattr target");
+
+    rt.block_on(async {
+        fn expect_shutdown<T>(result: VfsResult<T>) {
+            assert!(matches!(
+                result,
+                Err(VfsError::Other(message)) if message == "VFS is shutting down"
+            ));
+        }
+
+        let _closed = vfs.state.shutdown.mutating_operation_gate.write().await;
+        expect_shutdown(vfs.create(ROOT_INO, b"sync-create.txt", 0, 0, 0o644));
+        expect_shutdown(vfs.create_with_deferred_metadata_admission(
+            ROOT_INO,
+            b"deferred-create.txt",
+            0,
+            0,
+            0o644,
+            rt.handle(),
+        ));
+        expect_shutdown(vfs.mkdir(ROOT_INO, b"sync-mkdir", 0, 0, 0o755));
+        expect_shutdown(vfs.mkdir_with_deferred_metadata_admission(
+            ROOT_INO,
+            b"deferred-mkdir",
+            0,
+            0,
+            0o755,
+            rt.handle(),
+        ));
+        expect_shutdown(vfs.symlink(ROOT_INO, b"symlink", b"target", 0, 0));
+        expect_shutdown(vfs.setattr_with_handle(
+            None,
+            existing.ino,
+            SetattrArgs {
+                mode: Some(0o600),
+                ..SetattrArgs::default()
+            },
+        ));
+        expect_shutdown(vfs.setattr_attr_only_deferred_metadata(
+            existing.ino,
+            SetattrArgs {
+                mode: Some(0o600),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        ));
+        expect_shutdown(vfs.set_xattr(existing.ino, b"user.test", b"value", 0));
+        expect_shutdown(vfs.remove_xattr(existing.ino, b"user.test"));
+        expect_shutdown(vfs.set_acl_rule(existing.ino, "test-principal", AccessLevel::ReadOnly));
+        expect_shutdown(vfs.remove_acl_rule(existing.ino, "test-principal"));
+        assert_eq!(
+            vfs.state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .admitted_operations,
+            0,
+            "rejected namespace calls must not enqueue work"
+        );
+    });
+}
+
+#[test]
+fn shutdown_waits_for_deferred_create_admitted_before_cleanup_registration() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "shutdown-deferred-create-admission");
+    let _guard = rt.enter();
+    let name = b"shutdown-create-race.txt";
+    assert!(
+        vfs.lookup(ROOT_INO, name).is_err(),
+        "prime a negative dentry"
+    );
+    meta.create_file_with_ino(9_100_013, ROOT_INO, name, 0, 0, 0o644)
+        .expect("persist the competing name without invalidating the VFS dentry cache");
+
+    rt.block_on(async {
+        let admitted_ino = 9_100_014;
+        vfs.state
+            .namespace
+            .deferred
+            .reserved_inos
+            .lock()
+            .push_front(admitted_ino);
+        let held_session = vfs
+            .state
+            .file_session
+            .enter_op(admitted_ino, FileSessionOperation::Write)
+            .await;
+        let held_reservations = vfs.state.namespace.deferred.reserved_inos.lock();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let operation_vfs = Arc::clone(&vfs);
+        let runtime = rt.handle().clone();
+        let operation = tokio::task::spawn_blocking(move || {
+            started_tx
+                .send(())
+                .expect("operation start receiver remains alive");
+            operation_vfs
+                .create_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o644, &runtime)
+        });
+        started_rx.await.expect("create worker should start");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if vfs
+                    .state
+                    .shutdown
+                    .mutating_operation_gate
+                    .try_write()
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred create should hold admission while blocked before registration");
+
+        let shutdown_vfs = Arc::clone(&vfs);
+        let shutdown = tokio::spawn(async move { shutdown_vfs.shutdown(Duration::ZERO).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !vfs.shutdown_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown should claim ownership");
+        assert!(
+            !vfs.state.shutdown.background_shutdown_token.is_cancelled(),
+            "shutdown must not pass the admitted producer's gate"
+        );
+
+        drop(held_reservations);
+        let created = tokio::time::timeout(Duration::from_secs(1), operation)
+            .await
+            .expect("admitted create should finish after releasing inode reservation")
+            .expect("create worker should not panic")
+            .expect("admitted create should register despite shutdown having started");
+        assert_eq!(created.ino, admitted_ino);
+
+        let shutdown_error = tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown should drain registered cleanup")
+            .expect("shutdown task should not panic")
+            .expect_err("the conflicting deferred create should report skipped cleanup");
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("shutdown before acquiring Delete")
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .shutdown_skipped_cleanup
+                .contains(&admitted_ino)
+        );
+        drop(held_session);
+    });
+}
+
+#[test]
+fn shutdown_bounds_wait_for_admitted_mutations_and_can_retry() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "shutdown-mutation-admission-timeout");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let admitted = vfs.state.shutdown.mutating_operation_gate.read().await;
+        let error = tokio::time::timeout(Duration::from_secs(4), vfs.shutdown(Duration::ZERO))
+            .await
+            .expect("shutdown must bound its admission wait")
+            .expect_err("shutdown must report an admission timeout");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for admitted VFS mutations")
+        );
+        assert!(
+            !vfs.state.shutdown.background_shutdown_token.is_cancelled(),
+            "retryable timeout must not cancel background cleanup"
+        );
+        assert!(matches!(
+            &*vfs.state.shutdown.shutdown_phase.lock(),
+            ShutdownPhase::Aborted
+        ));
+
+        drop(admitted);
+        vfs.shutdown(Duration::ZERO)
+            .await
+            .expect("shutdown should be retryable after admitted mutations finish");
+    });
+}
+
+#[test]
+fn shutdown_flushes_dirty_attrs_with_prior_cleanup_errors() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "shutdown-prior-cleanup-error-dirty-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let created = vfs
+            .create(ROOT_INO, b"dirty-attr.txt", 0, 0, 0o644)
+            .expect("create dirty attr target");
+        vfs.write(created.ino, 0, b"accepted payload")
+            .await
+            .expect("leave accepted payload in the writer stack");
+        let mut dirty_attr = vfs.getattr(created.ino).expect("load visible attrs");
+        dirty_attr.mode = 0o600;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(created.ino, dirty_attr);
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .cleanup_errors
+            .insert(created.ino, Arc::from("earlier cleanup failure"));
+
+        let error = vfs
+            .shutdown(Duration::ZERO)
+            .await
+            .expect_err("shutdown should report the retained cleanup error");
+        assert!(error.to_string().contains("earlier cleanup failure"));
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(created.ino),
+            "an unrelated cleanup error must not suppress pending writer persistence"
+        );
+        assert_eq!(
+            meta.get_attr(created.ino)
+                .expect("read attr after shutdown drain")
+                .mode,
+            0o600,
+            "unrelated cleanup errors must not suppress dirty attr persistence"
         );
     });
 }
@@ -15550,6 +15923,103 @@ fn cancelled_shutdown_owner_can_be_retried() {
 }
 
 #[test]
+fn shutdown_waits_for_admitted_mutation_that_registers_cleanup() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "shutdown-mutation-cleanup-admission");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let (operation_started_tx, operation_started_rx) = tokio::sync::oneshot::channel();
+        let (finish_operation_tx, finish_operation_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_started_tx, cleanup_started_rx) = tokio::sync::oneshot::channel();
+        let (finish_cleanup_tx, finish_cleanup_rx) = tokio::sync::oneshot::channel();
+        let operation_vfs = Arc::clone(&vfs);
+        let cleanup_vfs = Arc::clone(&vfs);
+        let cleanup_runtime = rt.handle().clone();
+        let operation = tokio::task::spawn_blocking(move || {
+            operation_vfs.run_sync_future(async move {
+                operation_started_tx
+                    .send(())
+                    .expect("test operation receiver remains alive");
+                finish_operation_rx
+                    .await
+                    .expect("test operation is released");
+                cleanup_vfs.spawn_background_cleanup_task_on(&cleanup_runtime, async move {
+                    let _ = cleanup_started_tx.send(());
+                    let _ = finish_cleanup_rx.await;
+                });
+                Ok(())
+            })
+        });
+        operation_started_rx
+            .await
+            .expect("admitted operation starts before shutdown");
+
+        let shutdown_vfs = Arc::clone(&vfs);
+        let mut shutdown = tokio::spawn(async move { shutdown_vfs.shutdown(Duration::ZERO).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !vfs.shutdown_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must claim ownership");
+
+        let shutdown_finished_during_operation =
+            match tokio::time::timeout(Duration::from_millis(100), &mut shutdown).await {
+                Ok(result) => {
+                    result
+                        .expect("shutdown must not panic")
+                        .expect("shutdown must finish");
+                    true
+                }
+                Err(_) => false,
+            };
+        finish_operation_tx
+            .send(())
+            .expect("admitted operation receiver remains alive");
+        operation
+            .await
+            .expect("admitted operation must not panic")
+            .expect("admitted operation must finish");
+        cleanup_started_rx
+            .await
+            .expect("operation registers its deferred cleanup before returning");
+
+        let shutdown_waited_for_cleanup = if shutdown_finished_during_operation {
+            false
+        } else {
+            match tokio::time::timeout(Duration::from_millis(100), &mut shutdown).await {
+                Ok(result) => {
+                    result
+                        .expect("shutdown must not panic")
+                        .expect("shutdown must finish");
+                    false
+                }
+                Err(_) => true,
+            }
+        };
+        let _ = finish_cleanup_tx.send(());
+        if shutdown_waited_for_cleanup {
+            shutdown
+                .await
+                .expect("shutdown must not panic")
+                .expect("shutdown must finish after the admitted cleanup");
+        }
+
+        assert!(
+            !shutdown_finished_during_operation && shutdown_waited_for_cleanup,
+            "shutdown completed before an admitted mutation registered and finished cleanup"
+        );
+        assert!(
+            vfs.run_sync_future(std::future::ready(Ok::<(), VfsError>(())))
+                .is_err(),
+            "mutations must be rejected after shutdown starts"
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");
@@ -15712,7 +16182,10 @@ fn deferred_namespace_admission_stops_after_shutdown_requested() {
             rt.handle(),
         )
         .expect_err("shutdown must stop shared deferred namespace admission");
-    assert!(matches!(error, VfsError::Other(message) if message.contains("shutdown")));
+    assert!(matches!(
+        error,
+        VfsError::Other(message) if message == "VFS is shutting down"
+    ));
     assert!(vfs.state.namespace.deferred.inner.lock().queue.is_empty());
 }
 

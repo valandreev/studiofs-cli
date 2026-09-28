@@ -295,7 +295,7 @@ impl StudioVfs {
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            self.track_background_task(handle.spawn(async move {
+            self.spawn_background_cleanup_task_on(&handle, async move {
                 if let Err(error) = run_local_cache_io_blocking(move || {
                     cleanup();
                     Ok(())
@@ -308,11 +308,14 @@ impl StudioVfs {
                         "deferred deleted inode cache eviction failed"
                     );
                 }
-            }));
+            });
         } else {
-            let _ = std::thread::Builder::new()
-                .name("studiofs-deleted-inode-cache-evict".to_string())
-                .spawn(cleanup);
+            if let Err(error) = self.spawn_background_cleanup_thread(
+                "studiofs-deleted-inode-cache-evict".to_string(),
+                cleanup,
+            ) {
+                warn!(ino, error = %error, "failed to start deleted inode cache cleanup thread");
+            }
         }
     }
 
