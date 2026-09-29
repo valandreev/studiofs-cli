@@ -362,9 +362,10 @@ fn finish_access_test(
         }
         std::panic::resume_unwind(panic);
     }
-    let mount_result = mount.expect("join mount worker");
     cleanup.expect("unmount and remove mount point");
-    mount_result.expect("native mount lifecycle");
+    mount
+        .expect("join mount worker")
+        .expect("native mount lifecycle");
 }
 
 #[test]
@@ -383,22 +384,26 @@ fn failed_mount_cleanup_preserves_initial_failure() {
 }
 
 #[test]
-fn lifecycle_failure_does_not_mask_cleanup_failure() {
-    let panic = std::panic::catch_unwind(|| {
-        finish_access_test(
-            Ok(()),
-            Ok(Err(std::io::Error::other("lifecycle failure"))),
-            Err(std::io::Error::other("cleanup failure")),
+fn mount_failure_does_not_mask_cleanup_failure() {
+    let worker = std::thread::spawn(|| -> std::io::Result<()> {
+        panic!("worker failure");
+    });
+    for mount in [
+        Ok(Err(std::io::Error::other("lifecycle failure"))),
+        worker.join(),
+    ] {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finish_access_test(Ok(()), mount, Err(std::io::Error::other("cleanup failure")));
+        }))
+        .expect_err("cleanup failure must propagate");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("expect panic message");
+        assert!(
+            message.contains("unmount and remove mount point"),
+            "{message}"
         );
-    })
-    .expect_err("cleanup failure must propagate");
-    let message = panic
-        .downcast_ref::<String>()
-        .expect("expect panic message");
-    assert!(
-        message.contains("unmount and remove mount point"),
-        "{message}"
-    );
+    }
 }
 
 fn supplementary_gid(groups: &[u32], gid: u32, read_only: bool) -> u32 {
