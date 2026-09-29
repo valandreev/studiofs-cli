@@ -120,6 +120,11 @@ impl OpenFlags {
         (self.0 & other.0) == other.0
     }
 
+    /// Returns true when these flags permit write access.
+    pub(super) const fn allows_write(self) -> bool {
+        self.contains(Self::WRONLY) || self.contains(Self::RDWR) || self.contains(Self::APPEND)
+    }
+
     /// Returns the union of this and another flag set.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -876,6 +881,8 @@ mod tests {
         assert!(f.contains(OpenFlags::RDWR));
         assert!(f.contains(OpenFlags::APPEND));
         assert!(!f.contains(OpenFlags::WRONLY));
+        assert!(f.allows_write());
+        assert!(!OpenFlags::RDONLY.allows_write());
 
         let f2 = f.union(OpenFlags::WRONLY);
         assert!(f2.contains(OpenFlags::WRONLY));

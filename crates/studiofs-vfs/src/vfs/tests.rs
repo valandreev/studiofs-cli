@@ -9622,6 +9622,7 @@ fn sustained_pre_drain_marks_deferred_materialization_reschedule_under_pressure(
             .expect("test should reserve deferred materialization gate");
 
         vfs.maybe_pre_drain_sustained_write_buffer(
+            fh,
             ino,
             seeded_len as u64,
             1,
@@ -9689,6 +9690,7 @@ fn sustained_pre_drain_schedules_without_pacing_when_dirty_runway_is_long() {
             .expect("test should reserve deferred materialization gate");
 
         vfs.maybe_pre_drain_sustained_write_buffer(
+            fh,
             ino,
             seeded_len as u64,
             1,
@@ -9925,6 +9927,117 @@ fn sfs740_sustained_write_state_survives_partial_close_and_restarts_after_reopen
 }
 
 #[test]
+fn sfs740_read_only_handle_write_does_not_change_live_writer_streak() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs740-read-only-write");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"sfs740-read-only.txt", 0, 0, 0o644)
+            .expect("create file");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open reader");
+        let initial = SustainedWriteState {
+            streak_start_ms: now_unix_millis().saturating_sub(100),
+            last_write_ms: now_unix_millis().saturating_sub(1),
+            last_end_offset: 64,
+        };
+        vfs.state
+            .sustained_write_streams
+            .lock()
+            .insert(attr.ino, initial);
+
+        let result = vfs
+            .write_fh_with_deferred_materialize(
+                reader,
+                attr.ino,
+                0,
+                b"invalid",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await;
+
+        assert!(result.is_err(), "a read-only handle must not write");
+        {
+            let streams = vfs.state.sustained_write_streams.lock();
+            let after = streams
+                .get(&attr.ino)
+                .expect("invalid handle must not remove live writer state");
+            assert_eq!(after.streak_start_ms, initial.streak_start_ms);
+            assert_eq!(after.last_write_ms, initial.last_write_ms);
+            assert_eq!(after.last_end_offset, initial.last_end_offset);
+        }
+
+        vfs.release_fh(reader).await.expect("release reader");
+        vfs.release_fh(writer).await.expect("release writer");
+    });
+}
+
+#[test]
+fn sfs740_read_only_final_close_does_not_take_sustained_tracker_lock() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs740-read-only-close");
+    let _guard = rt.enter();
+
+    let attr = vfs
+        .create(ROOT_INO, b"sfs740-read-only-close.txt", 0, 0, 0o644)
+        .expect("create file");
+    let reader = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("open reader");
+    let tracker = vfs.state.sustained_write_streams.lock();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let worker_vfs = Arc::clone(&vfs);
+    let runtime_handle = rt.handle().clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal close start");
+        let closed = runtime_handle.block_on(worker_vfs.release_fh(reader));
+        closed_tx.send(closed.is_ok()).expect("signal close result");
+    });
+
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("close worker should start");
+    let close_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while vfs.open_count(attr.ino) != 0 && std::time::Instant::now() < close_deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        vfs.open_count(attr.ino),
+        0,
+        "close worker should remove the handle before tracker retirement"
+    );
+    let completed_while_tracker_was_locked =
+        closed_rx.recv_timeout(std::time::Duration::from_secs(1));
+    let completed_before_unlock = completed_while_tracker_was_locked.is_ok();
+    drop(tracker);
+    let closed = match completed_while_tracker_was_locked {
+        Ok(closed) => closed,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => closed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("close worker should finish after tracker unlock"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("close worker disconnected before reporting its result")
+        }
+    };
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+
+    assert!(
+        completed_before_unlock,
+        "read-only final close must not wait for the sustained-write tracker"
+    );
+    assert!(closed, "read-only handle should close");
+}
+
+#[test]
 fn sfs740_closed_writer_does_not_resurrect_tracking_while_reader_is_open() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let config = VfsConfig {
@@ -9962,6 +10075,10 @@ fn sfs740_closed_writer_does_not_resurrect_tracking_while_reader_is_open() {
                 .contains_key(&attr.ino),
             "clean release should leave no stream state"
         );
+        vfs.state
+            .sustained_write_streams
+            .lock()
+            .insert(attr.ino, SustainedWriteState::default());
 
         let result = vfs
             .write_fh_with_deferred_materialize(

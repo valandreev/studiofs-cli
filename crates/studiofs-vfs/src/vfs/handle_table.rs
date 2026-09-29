@@ -43,12 +43,6 @@ impl HandleTable {
         }
     }
 
-    fn flags_allow_write(flags: OpenFlags) -> bool {
-        flags.contains(OpenFlags::WRONLY)
-            || flags.contains(OpenFlags::RDWR)
-            || flags.contains(OpenFlags::APPEND)
-    }
-
     /// Allocate a new file handle and register it.
     pub(super) fn open(
         &self,
@@ -64,7 +58,7 @@ impl HandleTable {
         handles.handles_by_inode.entry(ino).or_default().insert(fh);
         let counts_for_inode = handles.counts.entry(ino).or_default();
         counts_for_inode.open = counts_for_inode.open.saturating_add(1);
-        if Self::flags_allow_write(flags) {
+        if flags.allows_write() {
             counts_for_inode.write = counts_for_inode.write.saturating_add(1);
         }
         drop(handles);
@@ -151,7 +145,7 @@ impl HandleTable {
             .get_mut(&open_file.ino)
             .expect("inode must exist in counts if handle existed");
         counts_for_inode.open = counts_for_inode.open.saturating_sub(1);
-        if Self::flags_allow_write(open_file.flags) {
+        if open_file.flags.allows_write() {
             assert!(
                 counts_for_inode.write > 0,
                 "write-capable handle closed without write-open count"
