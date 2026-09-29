@@ -9792,7 +9792,7 @@ fn sfs740_sustained_write_streams_are_retired_after_last_handle() {
 }
 
 #[test]
-fn sfs740_sustained_write_state_survives_partial_close_and_restarts_after_reopen() {
+fn sfs740_sustained_write_state_survives_partial_close() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let config = VfsConfig {
         disable_background_slab_flush: true,
@@ -9899,6 +9899,53 @@ fn sfs740_sustained_write_state_survives_partial_close_and_restarts_after_reopen
                 .contains_key(&attr.ino),
             "last-handle release should retire the stream"
         );
+    });
+}
+
+#[test]
+fn sfs740_sustained_write_state_restarts_after_reopen() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let config = VfsConfig {
+        disable_background_slab_flush: true,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) = make_unstarted_test_vfs_with_config(&tmp, "sfs740-reopen", config);
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"sfs740-reopen.txt", 0, 0, 0o644)
+            .expect("create file");
+        let first = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open first writer");
+        vfs.write_fh_with_deferred_materialize(
+            first,
+            attr.ino,
+            0,
+            b"old",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write before close");
+
+        let stale_start_ms = now_unix_millis().saturating_sub(SUSTAINED_WRITE_DELAY_START_MS);
+        {
+            let mut streams = vfs.state.sustained_write_streams.lock();
+            let stream = streams
+                .get_mut(&attr.ino)
+                .expect("first write should create sustained-write state");
+            stream.streak_start_ms = stale_start_ms;
+            stream.last_write_ms = stale_start_ms;
+        }
+        vfs.release_fh(first).await.expect("release first writer");
+        assert!(
+            !vfs.state
+                .sustained_write_streams
+                .lock()
+                .contains_key(&attr.ino),
+            "final close should retire the previous streak"
+        );
 
         let reopened = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
@@ -9917,7 +9964,7 @@ fn sfs740_sustained_write_state_survives_partial_close_and_restarts_after_reopen
             let restarted = streams
                 .get(&attr.ino)
                 .expect("reopened write should create a fresh stream");
-            assert!(restarted.streak_start_ms > seeded_start_ms);
+            assert!(restarted.streak_start_ms > stale_start_ms);
             assert_eq!(restarted.streak_start_ms, restarted.last_write_ms);
         }
         vfs.release_fh(reopened)
@@ -10004,15 +10051,6 @@ fn sfs740_read_only_final_close_does_not_take_sustained_tracker_lock() {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(1))
         .expect("close worker should start");
-    let close_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while vfs.open_count(attr.ino) != 0 && std::time::Instant::now() < close_deadline {
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        vfs.open_count(attr.ino),
-        0,
-        "close worker should remove the handle before tracker retirement"
-    );
     let completed_while_tracker_was_locked =
         closed_rx.recv_timeout(std::time::Duration::from_secs(1));
     let completed_before_unlock = completed_while_tracker_was_locked.is_ok();
@@ -10033,6 +10071,11 @@ fn sfs740_read_only_final_close_does_not_take_sustained_tracker_lock() {
     assert!(
         completed_before_unlock,
         "read-only final close must not wait for the sustained-write tracker"
+    );
+    assert_eq!(
+        vfs.open_count(attr.ino),
+        0,
+        "completed close must have removed the handle"
     );
     assert!(closed, "read-only handle should close");
 }

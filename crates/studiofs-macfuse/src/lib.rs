@@ -2155,24 +2155,30 @@ mod tests {
 
     #[test]
     fn cache_policy_uses_direct_io_for_write_capable_handles() {
-        let read_only = super::adapter::macfuse_open_cache_policy(libc::O_RDONLY, false);
+        let read_only =
+            super::adapter::macfuse_open_cache_policy(studiofs_vfs::vfs::OpenFlags::RDONLY, false);
         assert!(!read_only.direct_io);
         assert!(read_only.keep_cache);
 
-        let write_only = super::adapter::macfuse_open_cache_policy(libc::O_WRONLY, false);
+        let write_only =
+            super::adapter::macfuse_open_cache_policy(studiofs_vfs::vfs::OpenFlags::WRONLY, false);
         assert!(write_only.direct_io);
         assert!(!write_only.keep_cache);
 
-        let read_write = super::adapter::macfuse_open_cache_policy(libc::O_RDWR, false);
+        let read_write =
+            super::adapter::macfuse_open_cache_policy(studiofs_vfs::vfs::OpenFlags::RDWR, false);
         assert!(read_write.direct_io);
         assert!(!read_write.keep_cache);
 
-        let append =
-            super::adapter::macfuse_open_cache_policy(libc::O_RDONLY | libc::O_APPEND, false);
+        let append = super::adapter::macfuse_open_cache_policy(
+            studiofs_vfs::vfs::OpenFlags::RDONLY | studiofs_vfs::vfs::OpenFlags::APPEND,
+            false,
+        );
         assert!(append.direct_io);
         assert!(!append.keep_cache);
 
-        let truncate = super::adapter::macfuse_open_cache_policy(libc::O_RDONLY, true);
+        let truncate =
+            super::adapter::macfuse_open_cache_policy(studiofs_vfs::vfs::OpenFlags::RDONLY, true);
         assert!(truncate.direct_io);
         assert!(!truncate.keep_cache);
     }

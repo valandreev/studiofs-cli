@@ -121,7 +121,7 @@ impl OpenFlags {
     }
 
     /// Returns true when these flags permit write access.
-    pub(super) const fn allows_write(self) -> bool {
+    pub const fn allows_write(self) -> bool {
         self.contains(Self::WRONLY) || self.contains(Self::RDWR) || self.contains(Self::APPEND)
     }
 

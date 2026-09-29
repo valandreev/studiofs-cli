@@ -1920,11 +1920,7 @@ impl SessionState {
             FileType::Symlink => return Err(libc::EINVAL),
         }
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        if self.read_only
-            && (trunc
-                || open_flags.contains(OpenFlags::WRONLY)
-                || open_flags.contains(OpenFlags::RDWR))
-        {
+        if self.read_only && (trunc || open_flags.allows_write()) {
             return Err(libc::EROFS);
         }
         let fh = self
@@ -2661,10 +2657,7 @@ fn linux_fuse_open_cache_policy_for(
     cache_policy: LinuxFuseCachePolicy,
 ) -> LinuxFuseOpenCachePolicy {
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-    let write_capable = trunc
-        || open_flags.contains(OpenFlags::WRONLY)
-        || open_flags.contains(OpenFlags::RDWR)
-        || flags & libc::O_APPEND != 0;
+    let write_capable = trunc || open_flags.allows_write();
     let generation = if write_capable {
         OpenCacheDecision {
             disposition: studiofs_vfs::vfs::OsCacheDisposition::Replace,
@@ -2688,10 +2681,7 @@ fn linux_fuse_open_cache_policy_for_decision(
     async_direct_io: bool,
 ) -> LinuxFuseOpenCachePolicy {
     let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-    let write_capable = trunc
-        || open_flags.contains(OpenFlags::WRONLY)
-        || open_flags.contains(OpenFlags::RDWR)
-        || flags & libc::O_APPEND != 0;
+    let write_capable = trunc || open_flags.allows_write();
     let decision = decide_open_cache(
         cache_policy,
         write_capable,

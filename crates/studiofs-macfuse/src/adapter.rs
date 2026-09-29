@@ -29,7 +29,7 @@ use studiofs_vfs::vfs::{
     OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason,
 };
 use studiofs_vfs::{
-    KernelInvalidator, LocalSyncPolicy, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
+    KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
     VfsMacFuseOpenCacheDecision, VfsResult,
 };
 use sysinfo::{MemoryRefreshKind, System};
@@ -1241,7 +1241,7 @@ impl StudioVfsAdapter {
 
     fn open_created_attr(&self, attr: &InodeAttr, flags: i32) -> Result<OpenReply, i32> {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        let flag_policy = macfuse_open_cache_policy(flags, trunc);
+        let flag_policy = macfuse_open_cache_policy(open_flags, trunc);
         let open = self.open_with_result(
             attr.ino,
             flag_policy,
@@ -1281,14 +1281,11 @@ impl StudioVfsAdapter {
     /// Open an existing file.
     pub(crate) fn open(&self, ino: u64, flags: i32) -> Result<OpenReply, i32> {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        if self.read_only && posix_open_requests_write(flags, trunc) {
+        if self.read_only && (open_flags.allows_write() || trunc) {
             return Err(libc::EROFS);
         }
         if self.vfs.is_runtime_stats_file_ino(ino) {
-            if posix_open_requests_write(flags, trunc)
-                || open_flags.contains(studiofs_vfs::OpenFlags::WRONLY)
-                || open_flags.contains(studiofs_vfs::OpenFlags::RDWR)
-            {
+            if open_flags.allows_write() || trunc {
                 return Err(libc::EROFS);
             }
             let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
@@ -1296,7 +1293,7 @@ impl StudioVfsAdapter {
             self.runtime_stats_handles.lock().insert(fh, bytes);
             return Ok(OpenReply::new(fh).with_direct_io(true));
         }
-        let flag_policy = macfuse_open_cache_policy(flags, trunc);
+        let flag_policy = macfuse_open_cache_policy(open_flags, trunc);
         self.open_with_result(ino, flag_policy, self.vfs.open_file(ino, open_flags, trunc))
             .inspect(|_| self.shared.kernel_inode_liveness.ensure_observed(ino))
     }
@@ -2579,17 +2576,9 @@ fn push_or_finish(
     }
 }
 
-fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
-    let access_mode = flags & libc::O_ACCMODE;
-    trunc
-        || access_mode == libc::O_WRONLY
-        || access_mode == libc::O_RDWR
-        || flags & libc::O_APPEND != 0
-}
-
 /// Translate POSIX/macFUSE open flags into the per-handle cache-retention policy.
-pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenCachePolicy {
-    let write_capable = posix_open_requests_write(flags, trunc);
+pub(crate) fn macfuse_open_cache_policy(flags: OpenFlags, trunc: bool) -> MacFuseOpenCachePolicy {
+    let write_capable = flags.allows_write() || trunc;
     MacFuseOpenCachePolicy {
         // Keep write buffers out of macFUSE's corruptible UBC copy path.
         direct_io: write_capable,

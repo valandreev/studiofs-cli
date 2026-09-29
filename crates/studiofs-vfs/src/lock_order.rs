@@ -17,8 +17,11 @@
 //! When nesting the sustained-write tracker with `HandleTable`, acquire the
 //! tracker mutex before reading handle counts. Do not acquire the tracker from
 //! a `HandleTable::close_with` callback, which runs under the table lock.
-//! The release path may read the count before taking the tracker as a fast
-//! path; it drops that table read lock, then rechecks while holding the tracker.
+//! Release uses the remaining-write count returned by `close_with` to skip the
+//! tracker while another writer remains, then rechecks under the tracker after
+//! a zero count because a writer may reopen. These auxiliary locks are not
+//! registered with `LockTier` or validated by `LockOrderGuard`; their ordering
+//! is enforced by the call structure above.
 //!
 //! # Usage
 //!

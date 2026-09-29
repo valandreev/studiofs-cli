@@ -335,7 +335,7 @@ impl StudioVfs {
             .dirty_bytes_for_inode(ino)
             .saturating_add(len);
         let mut streams = self.state.sustained_write_streams.lock();
-        if self.enforce_mutating_handle_access(fh, ino).is_err() {
+        if !self.handle_table.is_valid_writer_for_inode(fh, ino) {
             if self.handle_table.write_open_count(ino) == 0 {
                 streams.remove(&ino);
             }
@@ -723,7 +723,7 @@ impl StudioVfs {
     where
         F: FnOnce(&OpenFile, u32),
     {
-        let Some((open_file, remaining)) =
+        let Some((open_file, remaining, remaining_write)) =
             self.handle_table.close_with(fh, |open_file, remaining| {
                 self.state.writer_stack.mark_closed(open_file.fh);
                 before_handle_close(open_file, remaining);
@@ -732,10 +732,9 @@ impl StudioVfs {
             debug!("release_fh: unknown fh={}", fh);
             return None;
         };
-        if open_file.flags.allows_write() && self.handle_table.write_open_count(open_file.ino) == 0
-        {
-            // Skip the tracker lock while another writer remains. Recheck after
-            // acquiring it because a writer may reopen between these checks.
+        if open_file.flags.allows_write() && remaining_write == 0 {
+            // The close snapshot skips the tracker while a writer remains.
+            // Recheck because a writer may reopen before this lock is acquired.
             let mut streams = self.state.sustained_write_streams.lock();
             if self.handle_table.write_open_count(open_file.ino) == 0 {
                 streams.remove(&open_file.ino);
