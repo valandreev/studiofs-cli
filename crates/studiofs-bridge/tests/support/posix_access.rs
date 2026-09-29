@@ -263,13 +263,11 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
             // SAFETY: same live path.
             assert_eq!(unsafe { libc::access(path.as_ptr(), libc::F_OK) }, 0);
             // SAFETY: same live path.
+            let write_result = unsafe { libc::access(path.as_ptr(), libc::W_OK) };
+            let write_error = (write_result != 0).then(std::io::Error::last_os_error);
+            assert_eq!(write_result, -1, "read-only mount must deny W_OK");
             assert_eq!(
-                unsafe { libc::access(path.as_ptr(), libc::W_OK) },
-                -1,
-                "read-only mount must deny W_OK"
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
+                write_error.expect("failed W_OK errno").raw_os_error(),
                 Some(libc::EROFS)
             );
             return;
@@ -364,10 +362,9 @@ fn finish_access_test(
         }
         std::panic::resume_unwind(panic);
     }
-    mount
-        .expect("join mount worker")
-        .expect("native mount lifecycle");
+    let mount_result = mount.expect("join mount worker");
     cleanup.expect("unmount and remove mount point");
+    mount_result.expect("native mount lifecycle");
 }
 
 #[test]
@@ -383,6 +380,25 @@ fn failed_mount_cleanup_preserves_initial_failure() {
     });
     let panic = result.expect_err("initial failure must propagate");
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"initial mount failure"));
+}
+
+#[test]
+fn lifecycle_failure_does_not_mask_cleanup_failure() {
+    let panic = std::panic::catch_unwind(|| {
+        finish_access_test(
+            Ok(()),
+            Ok(Err(std::io::Error::other("lifecycle failure"))),
+            Err(std::io::Error::other("cleanup failure")),
+        );
+    })
+    .expect_err("cleanup failure must propagate");
+    let message = panic
+        .downcast_ref::<String>()
+        .expect("expect panic message");
+    assert!(
+        message.contains("unmount and remove mount point"),
+        "{message}"
+    );
 }
 
 fn supplementary_gid(groups: &[u32], gid: u32, read_only: bool) -> u32 {

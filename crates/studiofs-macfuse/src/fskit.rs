@@ -1917,6 +1917,7 @@ impl FsKitDispatcher {
         // default_permissions keeps access checks in the native kernel, which
         // has the complete caller credentials. Reject unexpected wire requests;
         // ENOSYS would permanently grant access on FUSE implementations.
+        warn!("unexpected macFUSE FSKit ACCESS with default_permissions; denying access");
         let _ = request.reply_error(libc::EACCES);
     }
 
