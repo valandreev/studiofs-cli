@@ -100,3 +100,26 @@ These debug-build timings characterize this local redb fixture, including journa
 Use existing MetaEvent, RemoteReplayExecution, RedbMetaEngine, and standard-library HashMap, HashSet, and BTreeSet. No new dependencies or public APIs are needed. Both acknowledgement entry points delegate to the same prefix matcher; publication continues to return ProjectedRemoteBatch.
 
 Initial revision: record the verified root cause and incremental strategy before production edits. Completion revision: record red/green counts, borrowed projection, exact complexity limits, and final local/live-service verification.
+
+## Review follow-up (2026-09-30)
+
+Reviewed `docs/code-reviews/2026-09-30-sfs-762-bound-self-echo-prefix-projection.md` against commit `7280cbe7` and current source. The graph index predates the implementation, so changed symbols were verified directly.
+
+- Findings 1 and 2: confirmed redundant struct copies. Visibility now uses a shared projectability predicate; already normalized regular attrs remain borrowed. The allocation claim is incorrect: `InodeAttr` has scalar fields and `Cow::Owned` does not inherently allocate. New regressions measured 65 versus 1 normalization copies and 2 versus 0 respectively before/after.
+- Finding 3: confirmed duplicate current-index visibility work; skip that index in dependency revisits. The suggested duplicate previous-index case does not occur: `AddEntry` does not change projection state. A distinct-inode regression failed before correction and passes afterward.
+- Finding 4: rejected the proposed guards. Earlier `RemoveAttr` dependencies must survive until later inode context arrives, even when `states` is initially empty. The new `self_batch_late_context_revisits_earlier_remove_attr` fixture agrees with canonical batch projection. Nonregular attrs are also contextually filtered by inode; restricting dependencies requires an additional invariant, not just an event-kind guard.
+- Finding 5: skipped speculative capacity sizing. Local event count does not bound useful unique-key cardinality tightly; the proposed heuristic overreserves for local-only backlogs and early matches without measured benefit.
+- Finding 6: added fixture-specific explanations for the unchanged 8x ceilings. Adjusted the cancellation trigger to the reduced scan cost so cancellation still occurs during the reveal dependency loop.
+
+TDD: the focused `self_batch_` selection first ran 13 tests with three expected failures, then passed all 13. An initial abbreviated `--exact` filter selected zero tests and is excluded from evidence. Final deterministic projection-work counts for both late/missing matches: 2,052 at backlog 1,024; 4,100 at 2,048; 16,388 at 8,192. Counts changed because visibility no longer calls transformation.
+
+Validation commands/results:
+
+- `cargo test -p studiofs-meta --lib pg_engine::tests::remote_apply::`: 85 passed, 44 ignored.
+- `cargo test -p studiofs-meta --lib replication_backlog`: 62 passed, 1 ignored.
+- `cargo test -p studiofs-meta --test pg_engine_test_layout`: 3 passed.
+- `cargo check -p studiofs-meta`: passed.
+- `cargo clippy -p studiofs-meta --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+Live PostgreSQL and mounted E2E were not rerun for this review follow-up; previous implementation evidence remains separate. No commit or external issue update is part of this follow-up.

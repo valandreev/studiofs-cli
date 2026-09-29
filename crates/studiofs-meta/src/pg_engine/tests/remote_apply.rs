@@ -1138,6 +1138,99 @@ fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
 }
 
 #[test]
+fn self_batch_visibility_does_not_normalize_attrs() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_OWNED;
+    let mut attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    attr.size = 8;
+    attr.committed_size = 4;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    let local = vec![MetaEvent::SetAttr { attr }; 64];
+    let remote = [MetaEvent::RemoveAttr { ino: ROOT_INO }];
+    LOCAL_PROJECTION_OWNED.with(|copies| copies.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, None).unwrap(),
+        None
+    );
+    // Only the first prefix has the batch's cardinality and needs normalization.
+    assert_eq!(LOCAL_PROJECTION_OWNED.with(std::cell::Cell::get), 1);
+}
+
+#[test]
+fn self_batch_matching_borrows_already_normalized_attrs() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_OWNED;
+    let mut attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    attr.size = 4;
+    attr.committed_size = 4;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    let event = MetaEvent::SetAttr { attr };
+    LOCAL_PROJECTION_OWNED.with(|copies| copies.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            std::slice::from_ref(&event),
+            std::slice::from_ref(&event),
+            None
+        )
+        .unwrap(),
+        Some(1)
+    );
+    assert_eq!(LOCAL_PROJECTION_OWNED.with(std::cell::Cell::get), 0);
+}
+
+#[test]
+fn self_batch_context_transition_checks_current_event_once() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let mut local = (0..64)
+        .map(|index| {
+            let mut attr = InodeAttr::new_file(ROOT_INO + 10 + index, ROOT_INO, 0, 0, 0o644);
+            attr.size = 8;
+            attr.content_epoch = 1;
+            attr.upload_state = UploadState::Uploading;
+            MetaEvent::SetAttr { attr }
+        })
+        .collect::<Vec<_>>();
+    let echo = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"echo".to_vec(),
+    };
+    local.push(echo.clone());
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &[echo], None).unwrap(),
+        Some(local.len())
+    );
+    // One observation and visibility check per input, plus projection/comparison.
+    assert!(LOCAL_PROJECTION_WORK.with(std::cell::Cell::get) <= 2 * local.len() + 2);
+}
+
+#[test]
+fn self_batch_late_context_revisits_earlier_remove_attr() {
+    let ino = ROOT_INO + 10;
+    let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    attr.size = 8;
+    attr.content_epoch = 1;
+    attr.upload_state = UploadState::Uploading;
+    let echo = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"echo".to_vec(),
+    };
+    let local = [
+        MetaEvent::RemoveAttr { ino },
+        MetaEvent::SetAttr { attr },
+        echo.clone(),
+    ];
+    assert_eq!(
+        RemoteApplyCoordinator::project_local_batch(&local).events,
+        vec![echo.clone()]
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &[echo], None).unwrap(),
+        Some(3)
+    );
+}
+
+#[test]
 fn self_batch_prefix_matching_bounds_work_for_long_late_and_missing_matches() {
     use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
 
@@ -1190,6 +1283,9 @@ fn self_batch_prefix_matching_bounds_work_for_long_late_and_missing_matches() {
                 expected.is_some(),
                 started.elapsed().as_micros()
             );
+            // Two visits per local-only event (context + visibility), then
+            // projection/comparison for the echo; 8x leaves fixed overhead room
+            // while rejecting repeated growing-prefix scans.
             assert!(
                 work <= 8 * (backlog as usize + 1),
                 "repeated prefix work: {work}"
@@ -1353,6 +1449,8 @@ fn self_batch_prefix_matching_bounds_context_revisits_and_observes_cancellation(
         Some(backlog + 1)
     );
     let work = LOCAL_PROJECTION_WORK.with(std::cell::Cell::get);
+    // Context/visibility scan, one reveal revisit per earlier attr, and
+    // projection/comparison per visible attr: below eight visits per input.
     assert!(
         work <= 8 * local.len(),
         "revisited growing hidden prefix: {work}"
@@ -1361,7 +1459,7 @@ fn self_batch_prefix_matching_bounds_context_revisits_and_observes_cancellation(
     // Cancel after the last input event, while its context change is revealing
     // earlier attrs. No new input remains to trigger an outer-loop check.
     LOCAL_PROJECTION_WORK.with(|work| work.set(0));
-    let cancellation_work = 3 * backlog + backlog / 2;
+    let cancellation_work = 2 * backlog + backlog / 2;
     let cancelled = || LOCAL_PROJECTION_WORK.with(|work| work.get() > cancellation_work);
     let execution =
         RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);

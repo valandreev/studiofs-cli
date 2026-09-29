@@ -13,6 +13,7 @@ const REPLAY_LOCK_WAIT_SLICE: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static LOCAL_PROJECTION_OWNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static LOCAL_PROJECTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -151,15 +152,28 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .collect()
     }
 
+    fn remote_event_is_projectable(event: &MetaEvent) -> bool {
+        !matches!(
+            event,
+            MetaEvent::SetRegularFileOverlaySlices { .. }
+                | MetaEvent::RemoveRegularFileGraph { .. }
+                | MetaEvent::AddPendingDeletion { .. }
+                | MetaEvent::RemovePendingDeletion { .. }
+        )
+    }
+
     fn project_remote_event(event: &MetaEvent) -> Option<Cow<'_, MetaEvent>> {
         #[cfg(test)]
         LOCAL_PROJECTION_WORK.with(|work| work.set(work.get() + 1));
+        if !Self::remote_event_is_projectable(event) {
+            return None;
+        }
         match event {
-            MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::RemoveRegularFileGraph { .. }
-            | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. } => None,
-            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+            MetaEvent::SetAttr { attr }
+                if attr.kind == FileType::RegularFile && attr.size != attr.committed_size =>
+            {
+                #[cfg(test)]
+                LOCAL_PROJECTION_OWNED.with(|copies| copies.set(copies.get() + 1));
                 let mut remote_attr = attr.clone();
                 remote_attr.size = remote_attr.committed_size;
                 Some(Cow::Owned(MetaEvent::SetAttr { attr: remote_attr }))
@@ -1900,6 +1914,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
             // state flips at most four times; old prefixes are never reprojected.
             if let Some(indices) = changed_ino.and_then(|ino| dependencies.get(&ino)) {
                 for &dependent in indices {
+                    // The current event was already checked above.
+                    if dependent == index {
+                        continue;
+                    }
                     if let Some(execution) = execution {
                         execution.check()?;
                     }
@@ -1944,7 +1962,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         visible: &mut BTreeSet<usize>,
     ) -> bool {
         if Self::local_event_is_contextually_visible(events, index, hidden)
-            && Self::project_remote_event(&events[index]).is_some()
+            && Self::remote_event_is_projectable(&events[index])
         {
             visible.insert(index)
         } else {
