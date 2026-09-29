@@ -3,8 +3,9 @@ mod worker;
 pub(super) use worker::UploadLifecycleWorker;
 
 use super::{
-    BackgroundCleanupThreadTask, Ino, ShutdownClaim, ShutdownError, ShutdownPhase, StudioVfs,
-    VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot, info, warn,
+    BackgroundCleanupThreadTask, Ino, MetadataSyncOutcome, ShutdownClaim, ShutdownError,
+    ShutdownPhase, StudioVfs, VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot,
+    info, warn,
 };
 use crate::OrderedMutex;
 use futures::FutureExt as _;
@@ -142,6 +143,10 @@ fn finish_shutdown_result(
     shutdown_owner: ShutdownOwnerGuard<'_>,
     shutdown_result: VfsResult<()>,
 ) -> VfsResult<()> {
+    let shutdown_result = shutdown_result.map_err(|error| match error {
+        VfsError::Join(error) => VfsError::ShutdownJoin(error.to_string()),
+        error => error,
+    });
     let shutdown_error = shutdown_result
         .as_ref()
         .err()
@@ -710,6 +715,21 @@ impl StudioVfs {
 
     /// Graceful shutdown: drain accepted local state, stop the cached-store
     /// upload queue, cancel uploader tasks, then persist upload state.
+    ///
+    /// If the local metadata barrier exceeds its configured timeout, shutdown
+    /// returns a terminal error but does not cancel the running blocking sync.
+    /// After any shutdown error, call
+    /// [`join_pending_metadata_sync`](Self::join_pending_metadata_sync) before
+    /// dropping this VFS if the process needs to reopen the same database.
+    /// Dropping the VFS without joining leaves the task detached until it finishes;
+    /// subsequent calls to `shutdown` replay the terminal error.
+    ///
+    /// # Errors
+    /// Returns the first shutdown failure. A prior local-dirty drain, metadata
+    /// close, overlay barrier, or overlay-health error takes precedence over a
+    /// later metadata timeout; the sync may still be running even when that
+    /// earlier error is returned. Before reopening the same database after any
+    /// shutdown error, call [`join_pending_metadata_sync`](Self::join_pending_metadata_sync).
     pub async fn shutdown(&self, upload_drain_timeout: Duration) -> VfsResult<()> {
         let shutdown_owner = loop {
             match self.state.shutdown.claim() {
@@ -844,10 +864,12 @@ impl StudioVfs {
         let meta = self.sync_meta();
         let overlay_barrier_error = self.wait_for_volatile_overlay_batches().await.err();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
-        let metadata_flush_result =
-            super::run_sync_with_timeout(metadata_flush_timeout, move || {
-                meta.sync_local_metadata().map_err(VfsError::Meta)
-            });
+        let metadata_flush_result = super::run_metadata_sync_with_timeout(
+            metadata_flush_timeout,
+            &self.state.shutdown.metadata_sync_task,
+            move || meta.sync_local_metadata().map_err(VfsError::Meta),
+        )
+        .await;
         let overlay_health_error = self.ensure_volatile_overlay_metadata_healthy().err();
         let mut metadata_barrier_error = select_metadata_barrier_error(
             local_dirty_drain_error,
@@ -856,25 +878,22 @@ impl StudioVfs {
             overlay_health_error,
         );
         let metadata_flush_outcome = match metadata_flush_result {
-            Ok(Some(()))
+            Ok(MetadataSyncOutcome::Completed)
                 if deferred_namespace_error.is_none() && metadata_barrier_error.is_none() =>
             {
                 "success"
             }
-            Ok(Some(())) => {
+            Ok(MetadataSyncOutcome::Completed) => {
                 warn!("VFS shutdown: local metadata drain failed before the final barrier");
                 "failed"
             }
-            Ok(None) => {
+            Ok(MetadataSyncOutcome::TimedOut) => {
                 warn!(
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
-                    "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
+                    "VFS shutdown: local metadata flush timed out; local durability barrier remains incomplete"
                 );
                 metadata_barrier_error.get_or_insert_with(|| {
-                    VfsError::Other(format!(
-                        "metadata durability barrier timed out after {} ms",
-                        metadata_flush_timeout.as_millis()
-                    ))
+                    VfsError::shutdown_metadata_timeout(metadata_flush_timeout)
                 });
                 "timeout"
             }
@@ -936,6 +955,19 @@ impl StudioVfs {
         );
         shutdown_result
     }
+
+    /// Wait for and join a local metadata sync that outlived shutdown's timeout.
+    ///
+    /// Call after [`shutdown`](Self::shutdown) returns and before dropping this
+    /// VFS if the process must reopen the same redb database. Returns immediately
+    /// when no sync remains. The wait has no deadline; dropping this future
+    /// preserves the handle so the caller may retry.
+    ///
+    /// # Errors
+    /// Returns a metadata sync error or a task join error.
+    pub async fn join_pending_metadata_sync(&self) -> VfsResult<()> {
+        super::join_pending_metadata_sync_task(&self.state.shutdown.metadata_sync_task).await
+    }
 }
 
 #[cfg(test)]
@@ -951,7 +983,7 @@ mod tests {
         replay_shutdown_result, select_metadata_barrier_error, select_shutdown_result,
         shutdown_recoverable_on_restart,
     };
-    use crate::vfs::{ShutdownState, VfsError};
+    use crate::vfs::{ShutdownClaim, ShutdownState, VfsError};
     use studiofs_cache::local::LocalPayloadBackendError;
     use studiofs_data::store::DataError;
     use studiofs_meta::MetaError;
@@ -1493,6 +1525,34 @@ mod tests {
 
         assert!(matches!(owner, Err(VfsError::Data(_))));
         assert!(matches!(waiter, Err(VfsError::Data(_))));
+    }
+
+    #[tokio::test]
+    async fn shutdown_replay_preserves_join_error_category_for_owner_and_waiter() {
+        let state = ShutdownState::new();
+        let task = tokio::spawn(future::pending::<()>());
+        task.abort();
+        let join_error = task
+            .await
+            .expect_err("aborted task must report join failure");
+        let expected = join_error.to_string();
+        let owner = finish_shutdown_result(
+            ShutdownOwnerGuard::new(&state),
+            Err(VfsError::Join(join_error)),
+        );
+        let ShutdownClaim::Completed(stored_error) = state.claim() else {
+            panic!("shutdown result must be cached")
+        };
+        let waiter = replay_shutdown_result(stored_error);
+
+        let Err(VfsError::ShutdownJoin(owner_error)) = owner else {
+            panic!("shutdown owner should receive the stable join error category")
+        };
+        let Err(VfsError::ShutdownJoin(waiter_error)) = waiter else {
+            panic!("shutdown waiter should receive the stable join error category")
+        };
+        assert_eq!(owner_error, expected);
+        assert_eq!(waiter_error, expected);
     }
 
     #[test]

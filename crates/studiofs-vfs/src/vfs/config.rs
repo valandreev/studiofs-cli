@@ -366,7 +366,13 @@ pub struct VfsConfig {
     pub fetch_prefetch_acquire_wait_ms: u64,
     /// Time to wait for remote visibility before publishing a base graph.
     pub publish_visibility_timeout_secs: u64,
-    /// Metadata flush timeout during shutdown.
+    /// Maximum wait for the local metadata durability barrier during shutdown.
+    ///
+    /// Expiry fails shutdown but does not cancel an already-running blocking
+    /// sync. After shutdown returns, call
+    /// [`crate::vfs::StudioVfs::join_pending_metadata_sync`] before dropping the
+    /// VFS if this process needs to reopen the same database; otherwise the
+    /// detached task may keep redb locked until it finishes.
     pub shutdown_metadata_flush_timeout_secs: u64,
     /// QoS slots for accept operations.
     pub qos_accept_slots: usize,
@@ -520,7 +526,7 @@ pub struct VfsConfigRaw {
     pub fetch_prefetch_acquire_wait_ms: Option<u64>,
     /// Optional override for publish visibility timeout seconds.
     pub publish_visibility_timeout_secs: Option<u64>,
-    /// Optional override for shutdown metadata flush timeout seconds.
+    /// Optional override for [`VfsConfig::shutdown_metadata_flush_timeout_secs`].
     pub shutdown_metadata_flush_timeout_secs: Option<u64>,
     /// Optional override for QoS accept slots.
     pub qos_accept_slots: Option<usize>,

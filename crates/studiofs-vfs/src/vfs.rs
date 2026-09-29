@@ -522,6 +522,10 @@ pub enum VfsError {
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 
+    /// A task join failure normalized so terminal shutdown results can be replayed.
+    #[error("shutdown task join error: {0}")]
+    ShutdownJoin(String),
+
     /// Object-layer failure while decoding or writing payload objects.
     #[error("object error: {0}")]
     Object(#[from] studiofs_data::object::ObjectError),
@@ -582,6 +586,10 @@ pub enum VfsError {
     #[error("upload stage error: {0}")]
     UploadStage(#[from] UploadStageStoreError),
 
+    /// The local metadata durability barrier exceeded its shutdown deadline.
+    #[error("metadata durability barrier timed out after {0} ms")]
+    ShutdownMetadataTimeout(u128),
+
     /// Generic fallback VFS error.
     #[error("{0}")]
     Other(String),
@@ -596,8 +604,21 @@ impl VfsError {
         matches!(self, Self::Other(message) if message == SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE)
     }
 
+    /// Returns whether the selected shutdown error is a metadata barrier timeout.
+    ///
+    /// An earlier shutdown error can take precedence while the timed-out sync
+    /// remains pending, so this does not indicate whether a sync still needs to
+    /// be joined. After any shutdown error, join before reopening the database.
+    pub fn is_shutdown_metadata_timeout(&self) -> bool {
+        matches!(self, Self::ShutdownMetadataTimeout(_))
+    }
+
     pub(crate) fn shutdown_admission_timeout() -> Self {
         Self::Other(SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE.to_string())
+    }
+
+    pub(crate) fn shutdown_metadata_timeout(timeout: Duration) -> Self {
+        Self::ShutdownMetadataTimeout(timeout.as_millis())
     }
 }
 
@@ -1470,45 +1491,52 @@ impl AttrReadCache {
     }
 }
 
-fn run_sync_with_timeout<T: Send + 'static>(
-    timeout: Duration,
-    operation: impl FnOnce() -> VfsResult<T> + Send + 'static,
-) -> VfsResult<Option<T>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let handle = std::thread::spawn(move || {
-        let result = operation();
-        let _ = tx.send(result);
-    });
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataSyncOutcome {
+    Completed,
+    TimedOut,
+}
 
-    match rx.recv_timeout(timeout) {
+async fn run_metadata_sync_with_timeout(
+    timeout: Duration,
+    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
+    operation: impl FnOnce() -> VfsResult<()> + Send + 'static,
+) -> VfsResult<MetadataSyncOutcome> {
+    let mut task = task.lock().await;
+
+    // A shutdown timeout is terminal; only a cancelled waiter retries in production.
+    // Direct helper tests also retry after timeout; all reuse this sync, never a competing barrier.
+    let handle = task.get_or_insert_with(|| tokio::task::spawn_blocking(operation));
+
+    // Keep the task in shutdown state across both deadlines and cancellation.
+    match tokio::time::timeout(timeout, handle).await {
         Ok(result) => {
-            // Result received — thread has (almost certainly) finished; join to
-            // guarantee its captured `Arc`s are fully dropped before we return.
-            let _ = handle.join();
-            result.map(Some)
+            task.take();
+            result
+                .map_err(VfsError::Join)?
+                .map(|()| MetadataSyncOutcome::Completed)
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // The operation is still running.  We must NOT abandon the thread
-            // because it holds `Arc<dyn VfsMeta>` (and transitively
-            // `Arc<redb::Database>`).  If the process exits before that Arc
-            // drops, `Database::drop()` never runs and redb is left in an
-            // unclean state.  Wait with a generous secondary cap so the
-            // database is properly closed even when PG network I/O is slow.
+        Err(_) => {
             warn!(
                 timeout_ms = timeout.as_millis() as u64,
-                "run_sync_with_timeout: primary timeout reached, \
-                 waiting for thread to finish so redb closes cleanly"
+                "local metadata sync exceeded shutdown deadline; retaining its owner until completion"
             );
-            let _ = handle.join();
-            Ok(None)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = handle.join();
-            Err(VfsError::Other(
-                "timed operation thread disconnected".to_string(),
-            ))
+            Ok(MetadataSyncOutcome::TimedOut)
         }
     }
+}
+
+async fn join_pending_metadata_sync_task(
+    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
+) -> VfsResult<()> {
+    // Holding the lock through `.await` keeps the only handle in shared state if this waiter drops.
+    let mut task = task.lock().await;
+    let Some(handle) = task.as_mut() else {
+        return Ok(());
+    };
+    let result = handle.await;
+    task.take();
+    result.map_err(|error| VfsError::ShutdownJoin(error.to_string()))?
 }
 
 // =============================================================================
@@ -2277,6 +2305,8 @@ pub(crate) enum ShutdownError {
         kind: io::ErrorKind,
         message: String,
     },
+    Join(String),
+    MetadataTimeout(u128),
     BlockNotFound(Ino, u32),
     WouldBlock,
     RemoteContentPending,
@@ -2321,6 +2351,9 @@ impl ShutdownError {
                 kind: error.kind(),
                 message: error.to_string(),
             },
+            VfsError::Join(error) => Self::Join(error.to_string()),
+            VfsError::ShutdownJoin(message) => Self::Join(message.clone()),
+            VfsError::ShutdownMetadataTimeout(timeout_ms) => Self::MetadataTimeout(*timeout_ms),
             VfsError::BlockNotFound(ino, block) => Self::BlockNotFound(*ino, *block),
             VfsError::WouldBlock => Self::WouldBlock,
             VfsError::RemoteContentPending => Self::RemoteContentPending,
@@ -2372,6 +2405,8 @@ impl ShutdownError {
             Self::Meta(error) => VfsError::Meta(error),
             Self::Data(message) => VfsError::Data(DataError::Storage(message)),
             Self::Io { kind, message } => VfsError::Io(io::Error::new(kind, message)),
+            Self::Join(message) => VfsError::ShutdownJoin(message),
+            Self::MetadataTimeout(timeout_ms) => VfsError::ShutdownMetadataTimeout(timeout_ms),
             Self::BlockNotFound(ino, block) => VfsError::BlockNotFound(ino, block),
             Self::WouldBlock => VfsError::WouldBlock,
             Self::RemoteContentPending => VfsError::RemoteContentPending,
@@ -2434,6 +2469,9 @@ struct ShutdownState {
     shutdown_notify: tokio::sync::Notify,
     background_shutdown_token: CancellationToken,
     uploader_shutdown_token: CancellationToken,
+    // The async lock guards a JoinHandle across `.await`; keep it through timeout
+    // or waiter cancellation so the same redb sync remains owned and joinable.
+    metadata_sync_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
     background_cleanup_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
@@ -2458,6 +2496,7 @@ impl ShutdownState {
             shutdown_notify: tokio::sync::Notify::new(),
             background_shutdown_token: CancellationToken::new(),
             uploader_shutdown_token: CancellationToken::new(),
+            metadata_sync_task: tokio::sync::Mutex::new(None),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             background_cleanup_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
