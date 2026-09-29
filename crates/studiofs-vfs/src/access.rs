@@ -394,7 +394,7 @@ impl HandleAccessState {
 fn initial_class(flags: OpenFlags) -> AccessClass {
     if flags.write_access_requested() && flags.contains(OpenFlags::APPEND) {
         AccessClass::SequentialWriter
-    } else if flags.write_access_requested() {
+    } else if flags.contains(OpenFlags::WRONLY) {
         AccessClass::RandomWriter
     } else {
         AccessClass::RandomInteractiveRead
@@ -477,6 +477,13 @@ mod tests {
     #[test]
     fn read_only_append_handle_starts_as_a_reader() {
         let state = HandleAccessState::new(14, OpenFlags::RDONLY | OpenFlags::APPEND);
+
+        assert_eq!(state.current_class(), AccessClass::RandomInteractiveRead);
+    }
+
+    #[test]
+    fn read_write_handle_without_append_keeps_its_initial_read_class() {
+        let state = HandleAccessState::new(15, OpenFlags::RDWR);
 
         assert_eq!(state.current_class(), AccessClass::RandomInteractiveRead);
     }

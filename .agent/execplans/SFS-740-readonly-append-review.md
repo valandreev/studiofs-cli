@@ -24,6 +24,8 @@ remain rejected on read-only mounts.
   accounting, and read-only mount rejection.
 - [x] (2026-09-29) Run focused crate tests, formatting, Clippy, and diff checks; record
   platform-gated validation limits.
+- [x] (2026-09-29) Preserve the existing initial `RDWR` access-class behavior
+  after review identified the broader branch change.
 
 ## Surprises & Discoveries
 
@@ -58,6 +60,12 @@ The shared flag contract now treats explicit `RDONLY` as dominant over
 shorthand. VFS writer counts, access classification, overlays, hard-lock
 checks, and all three platform read-only gates follow the same rule. Linux
 tests now pin `EROFS` for write-only, read-write, and truncating opens.
+
+A follow-up review caught that using `write_access_requested()` for the
+non-append classifier branch also changed `RDWR` handles from their established
+initial `RandomInteractiveRead` class to `RandomWriter`. The branch now remains
+limited to `WRONLY`; a regression test first reproduced the change and then
+passed after the correction.
 
 Focused VFS and WinFSP tests, VFS and WinFSP Clippy, formatting, and
 `git diff --check` passed. Linux-target compilation could not reach project
@@ -156,3 +164,5 @@ are required.
 2026-09-29: Completed the review follow-up by aligning `RDONLY | APPEND` with
 read-only access across VFS and adapter gates, adding focused regression
 coverage, and recording the unavailable native Linux/macOS validation.
+2026-09-29: Kept non-append `RDWR` handles on their original initial access
+class after adding a regression for the review-discovered behavior change.
