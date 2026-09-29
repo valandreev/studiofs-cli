@@ -30,55 +30,50 @@ impl MetaNamespace for RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let current_inodes = txn
-            .open_table(INODES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let base_inodes = txn
-            .open_table(BASE_INODES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let inode_tombstones = txn
-            .open_table(INODE_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let inode_lifecycle = txn
-            .open_table(INODE_LIFECYCLE_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let base_regular_file = txn
-            .open_table(REGULAR_FILE_BASE_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let remote_filter_enabled =
-            Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-        let key = encode_dentry_key(parent, name);
-        let entry = Self::lookup_merged_from_opened_tables(
-            &base,
-            &current,
-            &tombstones,
-            parent,
-            name,
-            &overlay_dentries,
-        )?;
+        let (entry, is_overlay) =
+            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
         let visible = match entry {
             Some(entry)
-                if !remote_filter_enabled
-                    || overlay_dentries.contains(&key)
-                    || Self::remote_namespace_entry_visible_from_opened_tables(
-                        &base_inodes,
-                        &current_inodes,
-                        &inode_tombstones,
-                        &inode_lifecycle,
-                        &base_regular_file,
-                        &entry,
-                    )? =>
+                if is_overlay
+                    || entry.kind != FileType::RegularFile
+                    || !Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)? =>
             {
                 Some(entry)
             }
-            _ => None,
+            Some(entry) => {
+                #[cfg(test)]
+                super::tests::VISIBILITY_TABLE_OPENS.with(|count| count.set(count.get() + 5));
+                let current_inodes = txn
+                    .open_table(INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let base_inodes = txn
+                    .open_table(BASE_INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let inode_tombstones = txn
+                    .open_table(INODE_TOMBSTONES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let inode_lifecycle = txn
+                    .open_table(INODE_LIFECYCLE_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let base_regular_file = txn
+                    .open_table(REGULAR_FILE_BASE_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                Self::remote_namespace_entry_visible_from_opened_tables(
+                    &base_inodes,
+                    &current_inodes,
+                    &inode_tombstones,
+                    &inode_lifecycle,
+                    &base_regular_file,
+                    &entry,
+                )?
+                .then_some(entry)
+            }
+            None => None,
         };
 
-        visible.ok_or(MetaError::EntryNotFound {
+        visible.ok_or_else(|| MetaError::EntryNotFound {
             parent,
-            name: String::from_utf8_lossy(name).to_string(),
+            name: String::from_utf8_lossy(name).into_owned(),
         })
     }
 

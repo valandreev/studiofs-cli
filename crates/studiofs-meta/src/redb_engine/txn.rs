@@ -13,6 +13,8 @@ impl RedbMetaEngine {
     pub(super) fn remote_namespace_visibility_filter_enabled_in_read_txn(
         txn: &redb::ReadTransaction,
     ) -> MetaResult<bool> {
+        #[cfg(test)]
+        super::tests::VISIBILITY_SETTINGS_READS.with(|count| count.set(count.get() + 1));
         let settings = txn
             .open_table(SETTINGS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -25,6 +27,8 @@ impl RedbMetaEngine {
     pub(super) fn remote_namespace_visibility_filter_enabled_in_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<bool> {
+        #[cfg(test)]
+        super::tests::VISIBILITY_SETTINGS_READS.with(|count| count.set(count.get() + 1));
         let settings = txn
             .open_table(SETTINGS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -107,12 +111,31 @@ impl RedbMetaEngine {
             .map(|value| value.is_some())
     }
 
-    fn names_equal_case_insensitive(left: &[u8], right: &[u8], right_lower: &str) -> bool {
+    fn names_equal_case_insensitive(
+        left: &[u8],
+        right: &[u8],
+        right_lower: &mut Option<String>,
+    ) -> bool {
         if left.eq_ignore_ascii_case(right) {
             return true;
         }
 
-        String::from_utf8_lossy(left).to_lowercase() == right_lower
+        if left.is_ascii() && right.is_ascii() {
+            return false;
+        }
+
+        let right_lower = right_lower.get_or_insert_with(|| {
+            #[cfg(test)]
+            super::tests::QUERY_NAME_LOWERINGS.with(|count| count.set(count.get() + 1));
+            String::from_utf8_lossy(right).to_lowercase()
+        });
+        if left.is_ascii() {
+            return left.eq_ignore_ascii_case(right_lower.as_bytes());
+        }
+
+        #[cfg(test)]
+        super::tests::UNICODE_NAME_LOWERINGS.with(|count| count.set(count.get() + 1));
+        String::from_utf8_lossy(left).to_lowercase() == right_lower.as_str()
     }
 
     pub(super) fn lookup_in_opened_dentry_table<T>(
@@ -129,7 +152,7 @@ impl RedbMetaEngine {
             return decode(entry.value()).map(Some);
         }
 
-        let name_lower = String::from_utf8_lossy(name).to_lowercase();
+        let mut name_lower = None;
         let prefix = dentry_prefix(parent);
         let range_end = prefix_successor(&prefix);
         let iter = match range_end.as_ref() {
@@ -145,7 +168,7 @@ impl RedbMetaEngine {
             if decoded_parent != parent {
                 break;
             }
-            if Self::names_equal_case_insensitive(stored_name, name, &name_lower) {
+            if Self::names_equal_case_insensitive(stored_name, name, &mut name_lower) {
                 return decode(v.value()).map(Some);
             }
         }
@@ -197,6 +220,8 @@ impl RedbMetaEngine {
         TBase: ReadableTable<&'static [u8], &'static [u8]>,
         TTombstones: ReadableTable<&'static [u8], u8>,
     {
+        #[cfg(test)]
+        super::tests::OVERLAY_DENTRY_SCANS.with(|count| count.set(count.get() + 1));
         let mut overlay = HashSet::new();
 
         for row in current
@@ -227,37 +252,99 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
+    // The boolean records exact-key local authority for remote visibility filtering.
+    fn lookup_merged_exact_key_from_opened_tables<TBase, TCurrent, TTombstones>(
+        base: &TBase,
+        current: &TCurrent,
+        tombstones: &TTombstones,
+        key: &[u8],
+    ) -> MetaResult<(Option<DirEntryValue>, bool)>
+    where
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+        TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
+        TTombstones: ReadableTable<&'static [u8], u8>,
+    {
+        if tombstones
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some()
+        {
+            return Ok((None, true));
+        }
+
+        let current_value = current
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_value = base
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(value) = current_value.as_ref()
+            && base_value
+                .as_ref()
+                .is_none_or(|base| base.value() != value.value())
+        {
+            return Ok((Some(decode(value.value())?), true));
+        }
+        if let Some(value) = base_value {
+            return Ok((Some(decode(value.value())?), false));
+        }
+
+        Ok((None, false))
+    }
+
     pub(super) fn lookup_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
         current: &TCurrent,
         tombstones: &TTombstones,
         parent: Ino,
         name: &[u8],
-        overlay_dentries: &HashSet<Vec<u8>>,
-    ) -> MetaResult<Option<DirEntryValue>>
+    ) -> MetaResult<(Option<DirEntryValue>, bool)>
     where
         TBase: ReadableTable<&'static [u8], &'static [u8]>,
         TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
         TTombstones: ReadableTable<&'static [u8], u8>,
     {
         let key = encode_dentry_key(parent, name);
-        if tombstones
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .is_some()
-        {
-            return Ok(None);
+        let exact =
+            Self::lookup_merged_exact_key_from_opened_tables(base, current, tombstones, &key)?;
+        if exact.0.is_some() || exact.1 {
+            return Ok(exact);
         }
 
-        if overlay_dentries.contains(&key) {
-            return Self::lookup_in_opened_dentry_table(current, parent, name);
+        let mut name_lower = None;
+        let prefix = dentry_prefix(parent);
+        let end = prefix_successor(&prefix);
+        let current_rows = match end.as_ref() {
+            Some(end) => current.range(prefix.as_slice()..end.as_ref()),
+            None => current.range(prefix.as_slice()..),
         }
-
-        if let Some(entry) = Self::lookup_in_opened_dentry_table(base, parent, name)? {
-            return Ok(Some(entry));
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_rows = match end.as_ref() {
+            Some(end) => base.range(prefix.as_slice()..end.as_ref()),
+            None => base.range(prefix.as_slice()..),
         }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        Self::lookup_in_opened_dentry_table(current, parent, name)
+        // Resolve each candidate by its stored key so tombstones, equality, and
+        // local authority follow the same rules as an exact lookup.
+        for row in current_rows.chain(base_rows) {
+            let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (stored_parent, stored_name) = decode_dentry_key(key.value())?;
+            if stored_parent == parent
+                && Self::names_equal_case_insensitive(stored_name, name, &mut name_lower)
+            {
+                let resolved = Self::lookup_merged_exact_key_from_opened_tables(
+                    base,
+                    current,
+                    tombstones,
+                    key.value(),
+                )?;
+                if resolved.0.is_some() {
+                    return Ok(resolved);
+                }
+            }
+        }
+        Ok((None, false))
     }
 
     pub(super) fn regular_file_has_published_base_from_opened_table<T>(
@@ -596,20 +683,19 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-        let key = encode_dentry_key(parent, name);
-        let entry = Self::lookup_merged_from_opened_tables(
-            &base,
-            &current,
-            &tombstones,
-            parent,
-            name,
-            &overlay_dentries,
-        )?;
-        if !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)? {
-            return Ok(entry);
+        let (entry, is_overlay) =
+            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        if is_overlay
+            || entry.kind != FileType::RegularFile
+            || !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)?
+        {
+            return Ok(Some(entry));
         }
+        #[cfg(test)]
+        super::tests::VISIBILITY_TABLE_OPENS.with(|count| count.set(count.get() + 5));
         let current_inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -625,22 +711,15 @@ impl RedbMetaEngine {
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(match entry {
-            Some(entry)
-                if overlay_dentries.contains(&key)
-                    || Self::remote_namespace_entry_visible_from_opened_tables(
-                        &base_inodes,
-                        &current_inodes,
-                        &inode_tombstones,
-                        &inode_lifecycle,
-                        &base_regular_file,
-                        &entry,
-                    )? =>
-            {
-                Some(entry)
-            }
-            _ => None,
-        })
+        Ok(Self::remote_namespace_entry_visible_from_opened_tables(
+            &base_inodes,
+            &current_inodes,
+            &inode_tombstones,
+            &inode_lifecycle,
+            &base_regular_file,
+            &entry,
+        )?
+        .then_some(entry))
     }
 
     pub(crate) fn get_attr_merged_in_write_txn(
