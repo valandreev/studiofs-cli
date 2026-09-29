@@ -567,7 +567,7 @@ impl SessionConfig {
             "-oauto_cache".to_owned(),
             format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"),
             format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"),
-            "-odefer_permissions".to_owned(),
+            "-odefault_permissions".to_owned(),
             "-osparse".to_owned(),
         ]
     }

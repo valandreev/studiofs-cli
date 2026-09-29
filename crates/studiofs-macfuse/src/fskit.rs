@@ -243,13 +243,6 @@ struct FuseOpenIn {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct FuseAccessIn {
-    mask: u32,
-    padding: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
 struct FuseOpenOut {
     fh: u64,
     open_flags: u32,
@@ -1022,7 +1015,7 @@ fn mount_options(volume_name: &str) -> io::Result<CString> {
         ));
     }
     CString::new(format!(
-        "volname={volume_name},local,novncache,auto_cache,iosize={},max_read={},defer_permissions,sparse",
+        "volname={volume_name},local,novncache,auto_cache,iosize={},max_read={},default_permissions,sparse",
         low_level::MACOS_FUSE_IOSIZE_BYTES,
         low_level::MACOS_FUSE_IOSIZE_BYTES,
     ))
@@ -1917,22 +1910,10 @@ impl FsKitDispatcher {
     }
 
     fn access(&self, request: FsKitRequest) {
-        let input = match request.operation::<FuseAccessIn>(size_of::<FuseInHeader>()) {
-            Ok(input) => input,
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-                return;
-            }
-        };
-        match self
-            .adapter
-            .access(request.header().nodeid, input.mask as i32)
-        {
-            Ok(()) => self.empty_success(request),
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-            }
-        }
+        // default_permissions keeps access checks in the native kernel, which
+        // has the complete caller credentials. Reject unexpected wire requests;
+        // ENOSYS would permanently grant access on FUSE implementations.
+        let _ = request.reply_error(libc::EACCES);
     }
 
     fn setattr(&self, request: FsKitRequest) {
@@ -3154,23 +3135,6 @@ mod tests {
     }
 
     #[test]
-    fn access_request_preserves_its_requested_mask() {
-        assert_eq!(size_of::<FuseAccessIn>(), size_of::<u64>());
-
-        let mut bytes = vec![0_u8; size_of::<FuseInHeader>()];
-        bytes.extend_from_slice(&(libc::W_OK as u32).to_ne_bytes());
-        bytes.extend_from_slice(&0_u32.to_ne_bytes());
-        let len = u32::try_from(bytes.len()).expect("access body length");
-        bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
-
-        let body = parse_message_body(bytes).expect("parse access body");
-        let input = read_copy::<FuseAccessIn>(&body.bytes, size_of::<FuseInHeader>())
-            .expect("parse access input");
-
-        assert_eq!(input.mask, libc::W_OK as u32);
-    }
-
-    #[test]
     fn eof_read_uses_the_regular_success_reply_path() {
         assert!(!read_reply_uses_transport_buffer(&[], 4096));
         assert!(read_reply_uses_transport_buffer(&[], 0));
@@ -3211,6 +3175,16 @@ mod tests {
         assert!(options.contains("local"));
         assert!(options.contains("novncache"));
         assert!(options.contains("volname=StudioFS"));
+        assert!(
+            options
+                .split(',')
+                .any(|option| option == "default_permissions")
+        );
+        assert!(
+            !options
+                .split(',')
+                .any(|option| option == "defer_permissions")
+        );
     }
 
     #[test]

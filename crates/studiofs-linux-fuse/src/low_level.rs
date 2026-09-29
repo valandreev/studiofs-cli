@@ -647,6 +647,8 @@ fn argv_strings_for_cache_policy(
         "-o".to_owned(),
         "auto_unmount".to_owned(),
         "-o".to_owned(),
+        "default_permissions".to_owned(),
+        "-o".to_owned(),
         format!("max_read={LINUX_FUSE_MAX_READ_SIZE}"),
     ]
 }
@@ -1535,22 +1537,6 @@ pub extern "C" fn studiofs_linux_fuse_statfs(req: *mut raw::FuseReq, _ino: raw::
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn studiofs_linux_fuse_access(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    mask: c_int,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    match state.access(ino, mask) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn studiofs_linux_fuse_setxattr(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
@@ -2402,28 +2388,6 @@ impl SessionState {
             .statfs()
             .map(statfs_to_statvfs)
             .map_err(|error| vfs_err_to_errno(&error))
-    }
-
-    fn access(&self, ino: u64, mask: c_int) -> Result<(), i32> {
-        let attr = self.getattr_attr(ino)?;
-        if mask == libc::F_OK {
-            return Ok(());
-        }
-        if self.read_only && mask & libc::W_OK != 0 {
-            return Err(libc::EROFS);
-        }
-        let mode = attr.mode;
-        let readable = mode & 0o444 != 0;
-        let writable = mode & 0o222 != 0;
-        let executable = mode & 0o111 != 0 || attr.kind == FileType::Directory;
-        if (mask & libc::R_OK == 0 || readable)
-            && (mask & libc::W_OK == 0 || writable)
-            && (mask & libc::X_OK == 0 || executable)
-        {
-            Ok(())
-        } else {
-            Err(libc::EACCES)
-        }
     }
 
     fn attr_to_stat(&self, attr: &InodeAttr) -> stat {
@@ -3414,6 +3378,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
         assert!(args.iter().any(|arg| arg == "subtype=studiofs"));
         assert!(args.iter().any(|arg| arg == "auto_unmount"));
+        assert!(args.iter().any(|arg| arg == "default_permissions"));
         assert_eq!(
             args.iter()
                 .filter(|arg| arg.as_str() == "max_read=4194304")

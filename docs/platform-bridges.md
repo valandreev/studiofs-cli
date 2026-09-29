@@ -315,7 +315,7 @@ Current Linux callbacks:
 | `release` | close handle admission, wait its write watermark, then `release_fh_with_deferred_last_handle_barrier()` |
 | `forget` | decrement successful entry/create lookup references |
 | `statfs` | `statfs()` |
-| `access` | `getattr()` + POSIX mode check |
+| `access(2)` | Native kernel permission check (`default_permissions`); no userspace access callback |
 | `opendir` | `getattr()` directory check |
 | `readdir` | `readdir_with_attrs()` |
 | `releasedir` | success reply |
@@ -404,7 +404,7 @@ coherent. The mount does not pass the global `direct_io`, `nolocalcaches`, or
 `auto_cache` options; data and attribute coherence instead use per-handle
 `keep_cache` decisions plus scoped low-level inode invalidations. The mount also
 passes
-`iosize=4194304`, `max_read=4194304`, and `defer_permissions`; the 4 MiB
+`iosize=4194304`, `max_read=4194304`, and `default_permissions`; the 4 MiB
 geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
 large sequential media callbacks into smaller requests. StudioFS does not pass
 `noappledouble`: macFUSE handles that option before userspace and can hide
@@ -518,3 +518,23 @@ as capability-gated operations: unsupported, permission-denied, or WinFSP
 `ERROR_GEN_FAILURE` symlink-create responses after the bounded mount-readiness
 retry are recorded as explicit scenario skips, while supported operations must
 converge through public mountpoint reads and metadata calls.
+
+### POSIX caller permissions
+
+Linux libfuse3, legacy macFUSE and the experimental FSKit mount use
+`default_permissions`. The native kernel selects owner, primary or
+supplementary group, or other mode bits using the caller's credentials and
+the attributes returned by StudioFS. Directory search requires execute
+permission; owner/group checks do not fall through to a more permissive
+class. Root and capability behavior follow the native platform. Existing
+legacy uid/gid zero translation to the mount user remains in effect.
+FSKit rejects unexpected userspace access requests with `EACCES`.
+
+Native acceptance is a shared 14-row access(2) table, run as a non-root
+caller with at least one supplementary group:
+
+    cargo test -p studiofs-macfuse --test posix_access -- --ignored --nocapture
+    cargo test -p studiofs-linux-fuse --test posix_access -- --ignored --nocapture
+
+Run each command on its native platform with the FUSE driver available.
+An ignored or zero-test result does not prove the permission contract.

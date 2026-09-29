@@ -448,7 +448,8 @@ mod tests {
                 .any(|arg| arg == &format!("-omax_read={expected_geometry}"))
         );
         assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
-        assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
+        assert!(mount_args.iter().any(|arg| arg == "-odefault_permissions"));
+        assert!(!mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(!args.iter().any(|arg| arg == "-f"));
         assert!(!args.iter().any(|arg| arg == "-oro"));
         assert!(!args.iter().any(|arg| arg == "ro"));
@@ -2759,40 +2760,6 @@ mod tests {
         adapter.forget(attr.ino, 1);
 
         assert!(!adapter.file_flags_contains_for_test(attr.ino));
-    }
-
-    #[test]
-    fn adapter_access_honors_requested_mask_and_read_only_policy() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-access-mask")
-                .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
-        let attr = vfs
-            .create(root, b"read-only", 501, 20, 0o444)
-            .expect("create read-only file");
-        let no_search_dir = vfs
-            .mkdir(root, b"no-search", 501, 20, 0o644)
-            .expect("create directory without search permission");
-        let runtime_handle = fixture.runtime().handle().clone();
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(Arc::clone(&vfs), runtime_handle.clone());
-
-        assert_eq!(adapter.access(attr.ino, libc::F_OK), Ok(()));
-        assert_eq!(adapter.access(attr.ino, libc::R_OK), Ok(()));
-        assert_eq!(adapter.access(attr.ino, libc::W_OK), Err(libc::EACCES));
-        assert_eq!(adapter.access(attr.ino, libc::X_OK), Err(libc::EACCES));
-        assert_eq!(
-            adapter.access(no_search_dir.ino, libc::X_OK),
-            Err(libc::EACCES)
-        );
-
-        let read_only_adapter =
-            super::adapter::StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, true);
-        assert_eq!(
-            read_only_adapter.access(attr.ino, libc::W_OK),
-            Err(libc::EROFS)
-        );
     }
 
     #[test]
