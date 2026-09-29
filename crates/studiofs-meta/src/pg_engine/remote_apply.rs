@@ -5,10 +5,32 @@ use crate::redb_engine::layout::{encode_acl_rule_key, encode_dentry_key, encode_
 use crate::redb_engine::{RedbMetaEngine, RedbWriteTransaction};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
 use crate::types::*;
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 const REPLAY_LOCK_WAIT_SLICE: Duration = Duration::from_millis(10);
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static LOCAL_PROJECTION_TREE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static LOCAL_PROJECTION_OWNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static LOCAL_PROJECTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Default)]
+struct RegularFileProjectionState {
+    committed: bool,
+    unready: bool,
+    empty_draft: bool,
+    published: bool,
+}
+
+impl RegularFileProjectionState {
+    fn hidden(&self) -> bool {
+        !self.published && (self.empty_draft || (!self.committed && self.unready))
+    }
+}
 
 #[derive(Clone, Default)]
 pub(super) struct OverlayConflictSets {
@@ -127,21 +149,37 @@ impl<'a> RemoteApplyCoordinator<'a> {
         events
             .iter()
             .filter_map(Self::project_remote_event)
+            .map(Cow::into_owned)
             .collect()
     }
 
-    fn project_remote_event(event: &MetaEvent) -> Option<MetaEvent> {
-        match event {
+    fn remote_event_is_projectable(event: &MetaEvent) -> bool {
+        !matches!(
+            event,
             MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::RemoveRegularFileGraph { .. }
-            | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. } => None,
-            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                | MetaEvent::RemoveRegularFileGraph { .. }
+                | MetaEvent::AddPendingDeletion { .. }
+                | MetaEvent::RemovePendingDeletion { .. }
+        )
+    }
+
+    fn project_remote_event(event: &MetaEvent) -> Option<Cow<'_, MetaEvent>> {
+        #[cfg(test)]
+        LOCAL_PROJECTION_WORK.with(|work| work.set(work.get() + 1));
+        if !Self::remote_event_is_projectable(event) {
+            return None;
+        }
+        match event {
+            MetaEvent::SetAttr { attr }
+                if attr.kind == FileType::RegularFile && attr.size != attr.committed_size =>
+            {
+                #[cfg(test)]
+                LOCAL_PROJECTION_OWNED.with(|copies| copies.set(copies.get() + 1));
                 let mut remote_attr = attr.clone();
                 remote_attr.size = remote_attr.committed_size;
-                Some(MetaEvent::SetAttr { attr: remote_attr })
+                Some(Cow::Owned(MetaEvent::SetAttr { attr: remote_attr }))
             }
-            _ => Some(event.clone()),
+            _ => Some(Cow::Borrowed(event)),
         }
     }
 
@@ -160,10 +198,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
         events: &[MetaEvent],
         source_event_indices: Option<&mut Vec<usize>>,
     ) -> ProjectedRemoteBatch {
-        let remote_events = Self::project_local_events(events, source_event_indices);
+        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
+        let remote_events =
+            Self::project_local_events(events, &hidden_regular_inodes, source_event_indices);
         let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
         let needs_eager_flush = Self::local_events_need_eager_flush(&remote_events);
-        let needs_local_replay = Self::local_events_need_serving_replay(events);
+        let needs_local_replay =
+            Self::local_events_need_serving_replay(events, &hidden_regular_inodes);
         let overlay = Self::overlay_conflicts_for_events(&remote_events);
         ProjectedRemoteBatch {
             events: remote_events,
@@ -175,63 +216,63 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     fn hidden_regular_inodes_for_local_events(events: &[MetaEvent]) -> HashSet<Ino> {
-        let committed_regular_inodes = events
-            .iter()
-            .filter_map(|event| match event {
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile && attr.committed_content_epoch > 0 =>
-                {
-                    Some(attr.ino)
-                }
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        let mut hidden_regular_inodes = HashSet::new();
-        let mut published_regular_inodes = HashSet::new();
+        let mut states = HashMap::new();
+        let mut hidden = HashSet::new();
         for event in events {
-            match event {
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && !committed_regular_inodes.contains(&attr.ino)
-                        && !Self::regular_file_attr_is_ready_for_serving(attr) =>
-                {
-                    hidden_regular_inodes.insert(attr.ino);
-                }
-                MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => {
-                    hidden_regular_inodes.insert(attr.ino);
-                }
-                MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices }
-                    if !committed_regular_inodes.contains(ino)
-                        && chunk_slices.iter().any(|(_, slices)| {
-                            slices
-                                .iter()
-                                .any(|slice| slice.payload_state != PayloadRefState::Published)
-                        }) =>
-                {
-                    hidden_regular_inodes.insert(*ino);
-                }
-                MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices }
-                    if chunk_slices.is_empty()
-                        || chunk_slices.iter().any(|(_, slices)| {
-                            slices.iter().any(|slice| {
-                                slice.payload_state == PayloadRefState::Published
-                                    && slice.payload.is_some()
-                            })
-                        }) =>
-                {
-                    published_regular_inodes.insert(*ino);
-                }
-                _ => {}
-            }
+            Self::observe_local_projection_event(&mut states, &mut hidden, event);
         }
-        for ino in published_regular_inodes {
-            hidden_regular_inodes.remove(&ino);
-        }
-        hidden_regular_inodes
+        hidden
     }
 
-    fn local_events_need_serving_replay(events: &[MetaEvent]) -> bool {
-        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
+    fn observe_local_projection_event(
+        states: &mut HashMap<Ino, RegularFileProjectionState>,
+        hidden: &mut HashSet<Ino>,
+        event: &MetaEvent,
+    ) -> Option<Ino> {
+        #[cfg(test)]
+        LOCAL_PROJECTION_WORK.with(|work| work.set(work.get() + 1));
+        let (ino, is_hidden) = match event {
+            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                let state = states.entry(attr.ino).or_default();
+                state.committed |= attr.committed_content_epoch > 0;
+                state.unready |= !Self::regular_file_attr_is_ready_for_serving(attr);
+                state.empty_draft |= attr.is_unpublished_empty_draft();
+                (attr.ino, state.hidden())
+            }
+            MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                let state = states.entry(*ino).or_default();
+                state.unready |= chunk_slices.iter().any(|(_, slices)| {
+                    slices
+                        .iter()
+                        .any(|slice| slice.payload_state != PayloadRefState::Published)
+                });
+                (*ino, state.hidden())
+            }
+            MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
+                let state = states.entry(*ino).or_default();
+                state.published |= chunk_slices.is_empty()
+                    || chunk_slices.iter().any(|(_, slices)| {
+                        slices.iter().any(|slice| {
+                            slice.payload_state == PayloadRefState::Published
+                                && slice.payload.is_some()
+                        })
+                    });
+                (*ino, state.hidden())
+            }
+            _ => return None,
+        };
+        let changed = if is_hidden {
+            hidden.insert(ino)
+        } else {
+            hidden.remove(&ino)
+        };
+        changed.then_some(ino)
+    }
+
+    fn local_events_need_serving_replay(
+        events: &[MetaEvent],
+        hidden_regular_inodes: &HashSet<Ino>,
+    ) -> bool {
         let deleted_hidden_regular_inodes = events
             .iter()
             .filter_map(|event| match event {
@@ -260,63 +301,48 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
     fn project_local_events(
         events: &[MetaEvent],
+        hidden_regular_inodes: &HashSet<Ino>,
         mut source_event_indices: Option<&mut Vec<usize>>,
     ) -> Vec<MetaEvent> {
-        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
-        let hidden_regular_parent_attr_indices = events
-            .windows(2)
-            .enumerate()
-            .filter_map(|(index, pair)| match pair {
-                [
-                    MetaEvent::SetAttr { attr },
-                    MetaEvent::AddEntry { parent, entry, .. },
-                ] if attr.ino == *parent
-                    && entry.kind == FileType::RegularFile
-                    && hidden_regular_inodes.contains(&entry.ino) =>
-                {
-                    Some(index)
-                }
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        let hidden_zero_regular_add_inodes = events
-            .iter()
-            .filter_map(|event| match event {
-                MetaEvent::SetAttr { attr }
-                    if hidden_regular_inodes.contains(&attr.ino)
-                        && attr.is_unpublished_empty_draft() =>
-                {
-                    Some(attr.ino)
-                }
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
         let mut out = Vec::with_capacity(events.len());
         for (index, event) in events.iter().enumerate() {
-            match event {
-                MetaEvent::AddEntry { entry, .. }
-                    if entry.kind == FileType::RegularFile
-                        && hidden_regular_inodes.contains(&entry.ino) => {}
-                MetaEvent::SetAttr { attr }
-                    if hidden_regular_inodes.contains(&attr.ino)
-                        || (hidden_zero_regular_add_inodes.contains(&attr.ino)
-                            && attr.is_unpublished_empty_draft()) => {}
-                MetaEvent::SetAttr { .. }
-                    if hidden_regular_parent_attr_indices.contains(&index) => {}
-                MetaEvent::RemoveAttr { ino } if hidden_regular_inodes.contains(ino) => {}
-                _ => {
-                    if let Some(event) = Self::project_remote_event(event) {
-                        if let Some(source_event_indices) = source_event_indices.as_mut() {
-                            source_event_indices.push(index);
-                        }
-                        out.push(event);
-                    }
+            if Self::remote_event_is_projectable(event)
+                && Self::local_event_is_contextually_visible(events, index, hidden_regular_inodes)
+                && let Some(event) = Self::project_remote_event(event)
+            {
+                if let Some(source_event_indices) = source_event_indices.as_mut() {
+                    source_event_indices.push(index);
                 }
+                out.push(event.into_owned());
             }
         }
         out
     }
 
+    fn local_event_is_contextually_visible(
+        events: &[MetaEvent],
+        index: usize,
+        hidden: &HashSet<Ino>,
+    ) -> bool {
+        #[cfg(test)]
+        LOCAL_PROJECTION_WORK.with(|work| work.set(work.get() + 1));
+        match &events[index] {
+            MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
+                !hidden.contains(&entry.ino)
+            }
+            MetaEvent::RemoveAttr { ino } => !hidden.contains(ino),
+            MetaEvent::SetAttr { attr } => {
+                !hidden.contains(&attr.ino)
+                    && !matches!(events.get(index + 1),
+                        Some(MetaEvent::AddEntry { parent, entry, .. })
+                            if attr.ino == *parent && entry.kind == FileType::RegularFile
+                                && hidden.contains(&entry.ino))
+            }
+            _ => true,
+        }
+    }
+
+    // Publication passes projected events; local-only variants remain non-eager.
     fn local_events_need_eager_flush(events: &[MetaEvent]) -> bool {
         events.iter().any(|event| match event {
             MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => false,
@@ -1815,18 +1841,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         let local_events = self.local.read_events_range(start, end)?;
-        for consumed_events in 1..=local_events.len() {
-            let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
-            if projected_prefix.events.len() != batch_events.len() {
-                continue;
-            }
-            if projected_prefix.events.iter().eq(batch_events.iter()) {
-                let next_seq = start.max(1).saturating_add(consumed_events as u64);
-                return Ok(Some(next_seq));
-            }
-        }
-
-        Ok(None)
+        Ok(
+            Self::matching_local_prefix(&local_events, batch_events, None)?
+                .map(|consumed| start.max(1).saturating_add(consumed as u64)),
+        )
     }
 
     fn acknowledge_local_prefix_from_self_batch_in_txn(
@@ -1849,23 +1867,125 @@ impl<'a> RemoteApplyCoordinator<'a> {
             RedbMetaEngine::read_events_range_in_write_txn_with_check(txn, start, end, || {
                 execution.map_or(Ok(()), RemoteReplayExecution::check)
             })?;
-        if local_events.len() < batch_events.len() {
+        Ok(
+            Self::matching_local_prefix(&local_events, batch_events, execution)?
+                .map(|consumed| start.max(1).saturating_add(consumed as u64)),
+        )
+    }
+
+    pub(super) fn matching_local_prefix(
+        local_events: &[MetaEvent],
+        batch_events: &[MetaEvent],
+        execution: Option<&RemoteReplayExecution<'_>>,
+    ) -> MetaResult<Option<usize>> {
+        if batch_events.is_empty() || local_events.len() < batch_events.len() {
             return Ok(None);
         }
-        for consumed_events in batch_events.len()..=local_events.len() {
+        let mut states = HashMap::new();
+        let mut hidden = HashSet::new();
+        let mut dependencies: HashMap<Ino, Vec<usize>> = HashMap::new();
+        let mut visible = BTreeSet::new();
+        for (index, event) in local_events.iter().enumerate() {
             if let Some(execution) = execution {
                 execution.check()?;
             }
-            let projected_prefix = Self::project_local_batch(&local_events[..consumed_events]);
-            if projected_prefix.events.len() != batch_events.len() {
+            let dependent_ino = match event {
+                MetaEvent::SetAttr { attr } => Some(attr.ino),
+                MetaEvent::RemoveAttr { ino } => Some(*ino),
+                MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
+                    Some(entry.ino)
+                }
+                _ => None,
+            };
+            if let Some(ino) = dependent_ino {
+                dependencies.entry(ino).or_default().push(index);
+            }
+            let parent_index = match (index.checked_sub(1), event) {
+                (Some(previous), MetaEvent::AddEntry { parent, entry, .. })
+                    if entry.kind == FileType::RegularFile =>
+                {
+                    let updates_parent = matches!(
+                        &local_events[previous],
+                        MetaEvent::SetAttr { attr } if attr.ino == *parent
+                    );
+                    if updates_parent {
+                        dependencies.entry(entry.ino).or_default().push(previous);
+                        Some(previous)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let changed_ino = Self::observe_local_projection_event(&mut states, &mut hidden, event);
+            let prefix = &local_events[..=index];
+            let mut changed =
+                Self::update_prefix_event_visibility(prefix, index, &hidden, &mut visible);
+            if let Some(previous) = parent_index {
+                changed |=
+                    Self::update_prefix_event_visibility(prefix, previous, &hidden, &mut visible);
+            }
+            // Each monotonic context fact arrives once, so an inode's hidden
+            // state flips at most four times; old prefixes are never reprojected.
+            if let Some(indices) = changed_ino.and_then(|ino| dependencies.get(&ino)) {
+                for &dependent in indices {
+                    // The current event was already checked above.
+                    if dependent == index {
+                        continue;
+                    }
+                    if let Some(execution) = execution {
+                        execution.check()?;
+                    }
+                    changed |= Self::update_prefix_event_visibility(
+                        prefix,
+                        dependent,
+                        &hidden,
+                        &mut visible,
+                    );
+                }
+            }
+            if !changed || visible.len() != batch_events.len() {
                 continue;
             }
-            if projected_prefix.events.iter().eq(batch_events.iter()) {
-                let next_seq = start.max(1).saturating_add(consumed_events as u64);
-                return Ok(Some(next_seq));
+            // ponytail: exact comparisons are bounded by the producer's response
+            // byte cap; use a sequence index if that cap stops being practical.
+            let mut matches = true;
+            for (&source_index, remote_event) in visible.iter().zip(batch_events) {
+                if let Some(execution) = execution {
+                    execution.check()?;
+                }
+                #[cfg(test)]
+                LOCAL_PROJECTION_WORK.with(|work| work.set(work.get() + 1));
+                if Self::project_remote_event(&local_events[source_index]).as_deref()
+                    != Some(remote_event)
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                return Ok(Some(index + 1));
             }
         }
         Ok(None)
+    }
+
+    fn update_prefix_event_visibility(
+        events: &[MetaEvent],
+        index: usize,
+        hidden: &HashSet<Ino>,
+        visible: &mut BTreeSet<usize>,
+    ) -> bool {
+        if !Self::remote_event_is_projectable(&events[index]) {
+            return false;
+        }
+        #[cfg(test)]
+        LOCAL_PROJECTION_TREE_WORK.with(|work| work.set(work.get() + 1));
+        if Self::local_event_is_contextually_visible(events, index, hidden) {
+            visible.insert(index)
+        } else {
+            visible.remove(&index)
+        }
     }
 
     pub(super) fn effective_replay_overlay(

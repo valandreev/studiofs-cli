@@ -1138,6 +1138,513 @@ fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
 }
 
 #[test]
+fn self_batch_local_only_events_skip_visibility_tree() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_TREE_WORK;
+    let visible = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"visible".to_vec(),
+    };
+    let mut local = vec![visible.clone()];
+    local.extend((0..64).map(|object_id| MetaEvent::RemovePendingDeletion { object_id }));
+    let remote = [visible, MetaEvent::RemoveAttr { ino: ROOT_INO }];
+    LOCAL_PROJECTION_TREE_WORK.with(|work| work.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, None).unwrap(),
+        None
+    );
+    assert_eq!(LOCAL_PROJECTION_TREE_WORK.with(std::cell::Cell::get), 1);
+}
+
+#[test]
+fn publication_local_only_events_skip_contextual_visibility() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let events = (0..64)
+        .map(|object_id| MetaEvent::RemovePendingDeletion { object_id })
+        .collect::<Vec<_>>();
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    let batch = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(batch.events.is_empty());
+    assert!(!batch.needs_local_replay);
+    assert_eq!(
+        LOCAL_PROJECTION_WORK.with(std::cell::Cell::get),
+        events.len()
+    );
+}
+
+#[test]
+fn self_batch_nonregular_attr_retains_late_inode_context_dependency() {
+    let ino = ROOT_INO + 10;
+    let echo = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"echo".to_vec(),
+    };
+    let local = [
+        MetaEvent::SetAttr {
+            attr: InodeAttr::new_dir(ino, ROOT_INO, 0, 0, 0o755),
+        },
+        MetaEvent::SetRegularFileOverlaySlices {
+            ino,
+            chunk_slices: fixture_payload_slices(
+                0,
+                Some(&PayloadRef::new_partial(1, 8)),
+                PayloadRefState::LocalOnly,
+            )
+            .unwrap(),
+        },
+        echo.clone(),
+    ];
+    assert_eq!(
+        RemoteApplyCoordinator::project_local_batch(&local).events,
+        vec![echo.clone()]
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &[echo], None).unwrap(),
+        Some(3)
+    );
+}
+
+#[test]
+fn publication_projection_computes_inode_context_once() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let events = vec![
+        MetaEvent::RemoveEntry {
+            parent: ROOT_INO,
+            name: b"removed".to_vec()
+        };
+        64
+    ];
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    let mut sources = Vec::new();
+    let batch =
+        RemoteApplyCoordinator::project_local_batch_with_event_sources(&events, &mut sources);
+    assert_eq!(batch.events, events);
+    assert_eq!(sources, (0..events.len()).collect::<Vec<_>>());
+    assert!(!batch.needs_local_replay);
+    // One context scan, one visibility scan, and one projection per event.
+    assert_eq!(
+        LOCAL_PROJECTION_WORK.with(std::cell::Cell::get),
+        3 * events.len()
+    );
+}
+
+#[test]
+fn self_batch_local_only_events_skip_contextual_visibility() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let events = (0..64)
+        .map(|object_id| MetaEvent::RemovePendingDeletion { object_id })
+        .collect::<Vec<_>>();
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            &events,
+            &[MetaEvent::RemoveAttr { ino: ROOT_INO }],
+            None
+        )
+        .unwrap(),
+        None
+    );
+    // Context observation is necessary; contextual visibility is not.
+    assert_eq!(
+        LOCAL_PROJECTION_WORK.with(std::cell::Cell::get),
+        events.len()
+    );
+}
+
+#[test]
+fn self_batch_publish_reveals_all_hardlink_dentries() {
+    let ino = ROOT_INO + 10;
+    let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    attr.size = 8;
+    attr.content_epoch = 1;
+    attr.upload_state = UploadState::Uploading;
+    let first = MetaEvent::AddEntry {
+        parent: ROOT_INO,
+        name: b"first".to_vec(),
+        entry: DirEntryValue {
+            ino,
+            kind: FileType::RegularFile,
+        },
+    };
+    let second = MetaEvent::AddEntry {
+        parent: ROOT_INO + 1,
+        name: b"second".to_vec(),
+        entry: DirEntryValue {
+            ino,
+            kind: FileType::RegularFile,
+        },
+    };
+    let publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino,
+        chunk_slices: Vec::new(),
+    };
+    let mut normalized = attr.clone();
+    normalized.size = normalized.committed_size;
+    let local = [
+        MetaEvent::SetAttr { attr },
+        first.clone(),
+        second.clone(),
+        publish.clone(),
+    ];
+    let remote = [
+        MetaEvent::SetAttr { attr: normalized },
+        first,
+        second,
+        publish,
+    ];
+    assert!(
+        RemoteApplyCoordinator::project_local_batch(&local[..3])
+            .events
+            .is_empty()
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::project_local_batch(&local).events,
+        remote
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, None).unwrap(),
+        Some(4)
+    );
+    // A single-link echo must not retire a prefix containing both links.
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote[..2], None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn self_batch_visibility_does_not_normalize_attrs() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_OWNED;
+    let mut attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    attr.size = 8;
+    attr.committed_size = 4;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    let local = vec![MetaEvent::SetAttr { attr }; 64];
+    let remote = [MetaEvent::RemoveAttr { ino: ROOT_INO }];
+    LOCAL_PROJECTION_OWNED.with(|copies| copies.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, None).unwrap(),
+        None
+    );
+    // Only the first prefix has the batch's cardinality and needs normalization.
+    assert_eq!(LOCAL_PROJECTION_OWNED.with(std::cell::Cell::get), 1);
+}
+
+#[test]
+fn self_batch_matching_borrows_already_normalized_attrs() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_OWNED;
+    let mut attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    attr.size = 4;
+    attr.committed_size = 4;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    let event = MetaEvent::SetAttr { attr };
+    LOCAL_PROJECTION_OWNED.with(|copies| copies.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            std::slice::from_ref(&event),
+            std::slice::from_ref(&event),
+            None
+        )
+        .unwrap(),
+        Some(1)
+    );
+    assert_eq!(LOCAL_PROJECTION_OWNED.with(std::cell::Cell::get), 0);
+}
+
+#[test]
+fn self_batch_context_transition_checks_current_event_once() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let mut local = (0..64)
+        .map(|index| {
+            let mut attr = InodeAttr::new_file(ROOT_INO + 10 + index, ROOT_INO, 0, 0, 0o644);
+            attr.size = 8;
+            attr.content_epoch = 1;
+            attr.upload_state = UploadState::Uploading;
+            MetaEvent::SetAttr { attr }
+        })
+        .collect::<Vec<_>>();
+    let echo = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"echo".to_vec(),
+    };
+    local.push(echo.clone());
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &[echo], None).unwrap(),
+        Some(local.len())
+    );
+    // One observation and visibility check per input, plus projection/comparison.
+    assert!(LOCAL_PROJECTION_WORK.with(std::cell::Cell::get) <= 2 * local.len() + 2);
+}
+
+#[test]
+fn self_batch_late_context_revisits_earlier_remove_attr() {
+    let ino = ROOT_INO + 10;
+    let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    attr.size = 8;
+    attr.content_epoch = 1;
+    attr.upload_state = UploadState::Uploading;
+    let echo = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"echo".to_vec(),
+    };
+    let local = [
+        MetaEvent::RemoveAttr { ino },
+        MetaEvent::SetAttr { attr },
+        echo.clone(),
+    ];
+    assert_eq!(
+        RemoteApplyCoordinator::project_local_batch(&local).events,
+        vec![echo.clone()]
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &[echo], None).unwrap(),
+        Some(3)
+    );
+}
+
+#[test]
+fn self_batch_prefix_matching_bounds_work_for_long_late_and_missing_matches() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+
+    for backlog in [1024, 2048, 8192] {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let deletions = (1..=backlog).map(|id| (id, 0)).collect::<Vec<_>>();
+        pg.local.add_pending_deletions(&deletions).unwrap();
+        pg.local
+            .set_xattr(ROOT_INO, b"user.echo", b"match", 0)
+            .unwrap();
+        let end = pg.local.get_counter("nextEventSeq").unwrap();
+        let coordinator = RemoteApplyCoordinator::new(&pg.local);
+        let txn = pg.local.begin_write_txn().unwrap();
+        for (value, expected) in [(b"match".as_slice(), Some(end)), (b"absent", None)] {
+            let echo = vec![MetaEvent::SetXattr {
+                ino: ROOT_INO,
+                name: b"user.echo".to_vec(),
+                value: value.to_vec(),
+                flags: 0,
+            }];
+            LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+            let started = Instant::now();
+            assert_eq!(
+                coordinator
+                    .apply_decoded_batches_in_txn(
+                        &txn,
+                        vec![DecodedReplayBatch {
+                            batch_version: 1,
+                            events: echo,
+                            is_self_batch: true
+                        }],
+                        None,
+                        RemoteReplayApplyContext {
+                            last_seq: 0,
+                            current_namespace_version: 0,
+                            flushed_event_seq: start,
+                            next_event_seq: end,
+                            initial_overlay: OverlayConflictSets::default(),
+                        },
+                        None,
+                    )
+                    .unwrap()
+                    .flushed_event_seq,
+                expected,
+            );
+            let work = LOCAL_PROJECTION_WORK.with(std::cell::Cell::get);
+            eprintln!(
+                "backlog={backlog} match={} projection_work={work} replay_us={}",
+                expected.is_some(),
+                started.elapsed().as_micros()
+            );
+            // One context visit per local-only event, then visibility and
+            // projection/comparison for the echo; 8x leaves fixed overhead room
+            // while rejecting repeated growing-prefix scans.
+            assert!(
+                work <= 8 * (backlog as usize + 1),
+                "repeated prefix work: {work}"
+            );
+        }
+        txn.abort().unwrap();
+    }
+}
+
+#[test]
+fn self_batch_prefix_matching_preserves_context_changes_and_earliest_match() {
+    let ino = ROOT_INO + 10;
+    let parent = MetaEvent::SetAttr {
+        attr: InodeAttr::new_dir(ROOT_INO, ROOT_INO, 0, 0, 0o755),
+    };
+    let entry = MetaEvent::AddEntry {
+        parent: ROOT_INO,
+        name: b"draft".to_vec(),
+        entry: DirEntryValue {
+            ino,
+            kind: FileType::RegularFile,
+        },
+    };
+    let mut unready = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    unready.size = 8;
+    unready.content_epoch = 1;
+    unready.upload_state = UploadState::Uploading;
+    let mut committed = unready.clone();
+    committed.committed_size = 4;
+    committed.committed_content_epoch = 1;
+    let empty_draft = MetaEvent::SetAttr {
+        attr: InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644),
+    };
+    let publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino,
+        chunk_slices: vec![],
+    };
+    let local = vec![
+        parent.clone(),
+        entry.clone(),
+        MetaEvent::SetAttr {
+            attr: unready.clone(),
+        },
+        MetaEvent::SetAttr {
+            attr: committed.clone(),
+        },
+        empty_draft.clone(),
+        publish.clone(),
+        MetaEvent::RemoveAttr { ino },
+        MetaEvent::AddPendingDeletion {
+            object_id: 1,
+            timestamp: 0,
+        },
+    ];
+    // Hand-derived remote attrs retain committed sizes, even when a later
+    // context transition reveals an older local attr.
+    unready.size = 0;
+    committed.size = 4;
+    let revealed = vec![
+        parent.clone(),
+        entry.clone(),
+        MetaEvent::SetAttr { attr: unready },
+        MetaEvent::SetAttr { attr: committed },
+    ];
+    let mut published = revealed.clone();
+    published.extend([empty_draft, publish]);
+    let mut removed = published.clone();
+    removed.push(MetaEvent::RemoveAttr { ino });
+    for (batch, expected) in [
+        (vec![parent.clone()], Some(1)),
+        (vec![parent, entry], Some(2)),
+        (revealed, Some(4)),
+        (published.clone(), Some(6)),
+        (removed, Some(7)),
+        (vec![MetaEvent::RemoveAttr { ino }], None),
+        (vec![], None),
+    ] {
+        assert_eq!(
+            RemoteApplyCoordinator::matching_local_prefix(&local, &batch, None).unwrap(),
+            expected
+        );
+    }
+    assert!(
+        RemoteApplyCoordinator::project_local_batch(&local[..3])
+            .events
+            .is_empty()
+    );
+    assert!(
+        RemoteApplyCoordinator::project_local_batch(&local[..5])
+            .events
+            .is_empty()
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::project_local_batch(&local[..6]).events,
+        published
+    );
+}
+
+#[test]
+fn self_batch_prefix_matching_hides_namespace_from_overlay_evidence() {
+    let ino = ROOT_INO + 10;
+    let removal = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"draft".to_vec(),
+    };
+    let local = vec![
+        MetaEvent::SetAttr {
+            attr: InodeAttr::new_dir(ROOT_INO, ROOT_INO, 0, 0, 0o755),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"draft".to_vec(),
+            entry: DirEntryValue {
+                ino,
+                kind: FileType::RegularFile,
+            },
+        },
+        MetaEvent::SetRegularFileOverlaySlices {
+            ino,
+            chunk_slices: fixture_payload_slices(
+                0,
+                Some(&PayloadRef::new_partial(1, 8)),
+                PayloadRefState::LocalOnly,
+            )
+            .unwrap(),
+        },
+        removal.clone(),
+    ];
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &[removal], None).unwrap(),
+        Some(4)
+    );
+}
+
+#[test]
+fn self_batch_prefix_matching_bounds_context_revisits_and_observes_cancellation() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+
+    let ino = ROOT_INO + 10;
+    let mut unready = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    unready.size = 8;
+    unready.content_epoch = 1;
+    unready.upload_state = UploadState::Uploading;
+    let mut committed = unready.clone();
+    committed.committed_size = 4;
+    committed.committed_content_epoch = 1;
+    let mut normalized = unready.clone();
+    normalized.size = 0;
+    let mut normalized_committed = committed.clone();
+    normalized_committed.size = 4;
+    let backlog = 2048;
+    let mut local = vec![MetaEvent::SetAttr { attr: unready }; backlog];
+    local.push(MetaEvent::SetAttr { attr: committed });
+    let mut remote = vec![MetaEvent::SetAttr { attr: normalized }; backlog];
+    remote.push(MetaEvent::SetAttr {
+        attr: normalized_committed,
+    });
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, None).unwrap(),
+        Some(backlog + 1)
+    );
+    let work = LOCAL_PROJECTION_WORK.with(std::cell::Cell::get);
+    // Context/visibility scan, one reveal revisit per earlier attr, and
+    // projection/comparison per visible attr: below eight visits per input.
+    assert!(
+        work <= 8 * local.len(),
+        "revisited growing hidden prefix: {work}"
+    );
+
+    // Cancel after the last input event, while its context change is revealing
+    // earlier attrs. No new input remains to trigger an outer-loop check.
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    let cancellation_work = 2 * backlog + backlog / 2;
+    let cancelled = || LOCAL_PROJECTION_WORK.with(|work| work.get() > cancellation_work);
+    let execution =
+        RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
+    assert!(matches!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, Some(&execution)),
+        Err(MetaError::CatchUpCancelled)
+    ));
+    assert!(LOCAL_PROJECTION_WORK.with(|work| work.get()) <= cancellation_work + 2);
+}
+
+#[test]
 fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
