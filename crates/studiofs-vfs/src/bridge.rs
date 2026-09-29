@@ -67,6 +67,8 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
         VfsError::Io(io_error) => classify_io_error(io_error.kind()),
         VfsError::Join(_) | VfsError::ShutdownJoin(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
+        // Terminal local durability failure; do not expose it as a retryable timeout.
+        VfsError::ShutdownMetadataTimeout(_) => BridgeVfsErrorKind::GenericFailure,
         VfsError::Object(_) | VfsError::BlockNotFound(_, _) => BridgeVfsErrorKind::DataCorruption,
         VfsError::MetadataPersistenceDegraded => BridgeVfsErrorKind::MetadataPersistenceDegraded,
         VfsError::LocalPayload(local_error) => classify_local_payload_error(local_error),
