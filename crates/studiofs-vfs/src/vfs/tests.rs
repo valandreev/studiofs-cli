@@ -18,7 +18,7 @@ use studiofs_meta::schema::{
 };
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaGc, MetaNamespace,
-    RedbMetaEngine,
+    MetaReplication, RedbMetaEngine,
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -9132,6 +9132,10 @@ fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
     });
     drop(vfs);
     drop(meta);
+    let db_path = tmp.path().join("meta.redb");
+    let reopened_meta = RedbMetaEngine::open(&db_path)
+        .expect("clean shutdown should release redb before runtime teardown");
+    drop(reopened_meta);
     drop(rt);
 
     let (_reopen_rt, reopened, _reopened_meta) = reopen_existing_test_vfs(&tmp);
@@ -10448,36 +10452,216 @@ fn foreground_throughput_is_zero_without_samples() {
     assert_eq!(throughput, 0.0);
 }
 
-#[test]
-fn test_run_sync_with_timeout_returns_result_before_deadline() {
-    let result = run_sync_with_timeout(Duration::from_millis(100), || Ok::<_, VfsError>(7))
+#[tokio::test]
+async fn test_run_sync_with_timeout_returns_result_before_deadline() {
+    let task = tokio::sync::Mutex::new(None);
+    let result = run_sync_with_timeout(Duration::from_secs(1), &task, || Ok::<_, VfsError>(7))
+        .await
         .expect("operation should succeed");
     assert_eq!(result, Some(7));
 }
 
-#[test]
-fn test_run_sync_with_timeout_returns_none_on_timeout() {
-    let finished = Arc::new(AtomicBool::new(false));
-    let finished_clone = finished.clone();
-    let t0 = std::time::Instant::now();
-    let result = run_sync_with_timeout(Duration::from_millis(10), move || {
-        std::thread::sleep(Duration::from_millis(100));
-        finished_clone.store(true, AtomicOrdering::Release);
+#[tokio::test(flavor = "current_thread")]
+async fn test_run_sync_with_timeout_keeps_executor_responsive() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sibling = tokio::spawn(async move {
+        started_rx.await.expect("sync operation starts");
+        release_tx.send(()).is_ok()
+    });
+
+    let task = tokio::sync::Mutex::new(None);
+    run_sync_with_timeout(Duration::ZERO, &task, move || {
+        let _ = started_tx.send(());
+        // The watchdog makes the regression fail instead of hanging the test runtime.
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
         Ok::<_, VfsError>(())
     })
-    .expect("timeout helper should not fail");
+    .await
+    .expect("sync operation should not fail");
 
-    // The primary timeout should report None (timed out).
-    assert_eq!(result, None);
-    // The thread is joined to ensure clean Arc release, so the operation
-    // finishes by the time we return.
     assert!(
-        finished.load(AtomicOrdering::Acquire),
-        "thread should have been joined after timeout"
+        sibling.await.expect("sibling task finishes"),
+        "another Tokio task must release the stalled sync before its watchdog expires"
+    );
+}
+
+#[tokio::test]
+async fn test_run_sync_with_timeout_returns_none_on_timeout() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let task = Arc::new(tokio::sync::Mutex::new(None));
+    let timeout_task = Arc::clone(&task);
+    let timeout = tokio::spawn(async move {
+        run_sync_with_timeout(Duration::from_millis(100), &timeout_task, move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test releases metadata sync before its watchdog");
+            Ok::<_, VfsError>(())
+        })
+        .await
+    });
+    started_rx
+        .await
+        .expect("metadata task starts before its deadline");
+    let result = timeout
+        .await
+        .expect("timeout task should not panic")
+        .expect("timeout helper should not fail");
+
+    assert_eq!(result, None);
+    assert!(
+        task.lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()),
+        "timed-out metadata task remains owned until its operation completes"
+    );
+    release_tx
+        .send(())
+        .expect("stalled metadata task remains alive");
+
+    assert_eq!(
+        run_sync_with_timeout(Duration::from_secs(1), &task, || {
+            panic!("retry must join the original sync task")
+        })
+        .await
+        .expect("completed operation should join successfully"),
+        Some(())
+    );
+}
+
+#[tokio::test]
+async fn test_run_sync_with_timeout_retains_task_if_waiter_is_cancelled() {
+    let task = Arc::new(tokio::sync::Mutex::new(None));
+    let waiter_task = Arc::clone(&task);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let waiter_starts = Arc::clone(&starts);
+    let waiter = tokio::spawn(async move {
+        run_sync_with_timeout(Duration::from_secs(30), &waiter_task, move || {
+            waiter_starts.fetch_add(1, AtomicOrdering::AcqRel);
+            let _ = started_tx.send(());
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test releases metadata sync before its watchdog");
+            Ok::<_, VfsError>(())
+        })
+        .await
+    });
+
+    started_rx
+        .await
+        .expect("metadata task starts before the waiter is cancelled");
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("waiter must be cancelled")
+            .is_cancelled()
     );
     assert!(
-        t0.elapsed() >= Duration::from_millis(100),
-        "run_sync_with_timeout should wait for thread join"
+        task.lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()),
+        "cancelling the waiter must not discard the running sync handle"
+    );
+
+    release_tx.send(()).expect("metadata task remains alive");
+    assert_eq!(
+        run_sync_with_timeout(Duration::from_secs(1), &task, || {
+            panic!("retry must join the original sync task")
+        })
+        .await
+        .expect("original metadata task should join successfully"),
+        Some(())
+    );
+    assert_eq!(starts.load(AtomicOrdering::Acquire), 1);
+}
+
+#[test]
+fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let config = VfsConfig {
+        shutdown_metadata_flush_timeout_secs: 1,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "shutdown-metadata-sync-timeout", config);
+    let _guard = rt.enter();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let sync_meta = Arc::clone(&meta);
+    let metadata_task = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
+        release_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shutdown test releases stalled metadata sync");
+        let result = sync_meta.sync_local_metadata().map_err(VfsError::Meta);
+        let _ = finished_tx.send(());
+        result
+    });
+
+    rt.block_on(async {
+        started_rx
+            .await
+            .expect("controlled metadata sync has started");
+        *vfs.state.shutdown.metadata_sync_task.lock().await = Some(metadata_task);
+    });
+
+    let error = rt
+        .block_on(tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.shutdown(Duration::ZERO),
+        ))
+        .expect("metadata shutdown must honor its configured deadline")
+        .expect_err("a stalled local metadata barrier must fail shutdown");
+    assert!(
+        error
+            .to_string()
+            .contains("metadata durability barrier timed out after 1000 ms")
+    );
+
+    let shutdown = vfs
+        .zeroio_runtime_snapshot()
+        .last_graceful_shutdown
+        .expect("timed-out shutdown outcome is recorded");
+    assert_eq!(shutdown.metadata_flush_outcome, "timeout");
+    assert!(!shutdown.recoverable_on_restart);
+    let task_is_owned = rt.block_on(async {
+        vfs.state
+            .shutdown
+            .metadata_sync_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    });
+    assert!(
+        task_is_owned,
+        "timed-out sync remains owned until its redb operation finishes"
+    );
+
+    let repeated_error = rt
+        .block_on(vfs.shutdown(Duration::ZERO))
+        .expect_err("timeout remains the terminal shutdown result");
+    assert_eq!(repeated_error.to_string(), error.to_string());
+
+    release_tx.send(()).expect("metadata task remains alive");
+    rt.block_on(finished_rx)
+        .expect("metadata sync finishes after the test releases it");
+    assert_eq!(
+        rt.block_on(run_sync_with_timeout(
+            Duration::from_secs(1),
+            &vfs.state.shutdown.metadata_sync_task,
+            || panic!("waiting must join the original metadata sync"),
+        ))
+        .expect("original metadata task should join successfully"),
+        Some(())
     );
 }
 

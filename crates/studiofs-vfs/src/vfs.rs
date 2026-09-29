@@ -1470,43 +1470,26 @@ impl AttrReadCache {
     }
 }
 
-fn run_sync_with_timeout<T: Send + 'static>(
+async fn run_sync_with_timeout<T: Send + 'static>(
     timeout: Duration,
+    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<T>>>>,
     operation: impl FnOnce() -> VfsResult<T> + Send + 'static,
 ) -> VfsResult<Option<T>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let handle = std::thread::spawn(move || {
-        let result = operation();
-        let _ = tx.send(result);
-    });
+    let mut task = task.lock().await;
+    let handle = task.get_or_insert_with(|| tokio::task::spawn_blocking(operation));
 
-    match rx.recv_timeout(timeout) {
+    // Keep the task in shutdown state across both deadlines and cancellation.
+    match tokio::time::timeout(timeout, handle).await {
         Ok(result) => {
-            // Result received — thread has (almost certainly) finished; join to
-            // guarantee its captured `Arc`s are fully dropped before we return.
-            let _ = handle.join();
-            result.map(Some)
+            task.take();
+            result.map_err(VfsError::Join)?.map(Some)
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // The operation is still running.  We must NOT abandon the thread
-            // because it holds `Arc<dyn VfsMeta>` (and transitively
-            // `Arc<redb::Database>`).  If the process exits before that Arc
-            // drops, `Database::drop()` never runs and redb is left in an
-            // unclean state.  Wait with a generous secondary cap so the
-            // database is properly closed even when PG network I/O is slow.
+        Err(_) => {
             warn!(
                 timeout_ms = timeout.as_millis() as u64,
-                "run_sync_with_timeout: primary timeout reached, \
-                 waiting for thread to finish so redb closes cleanly"
+                "run_sync_with_timeout: metadata task exceeded shutdown deadline; retaining its owner until completion"
             );
-            let _ = handle.join();
             Ok(None)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = handle.join();
-            Err(VfsError::Other(
-                "timed operation thread disconnected".to_string(),
-            ))
         }
     }
 }
@@ -2434,6 +2417,7 @@ struct ShutdownState {
     shutdown_notify: tokio::sync::Notify,
     background_shutdown_token: CancellationToken,
     uploader_shutdown_token: CancellationToken,
+    metadata_sync_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
     background_cleanup_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
@@ -2458,6 +2442,7 @@ impl ShutdownState {
             shutdown_notify: tokio::sync::Notify::new(),
             background_shutdown_token: CancellationToken::new(),
             uploader_shutdown_token: CancellationToken::new(),
+            metadata_sync_task: tokio::sync::Mutex::new(None),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
             background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
             background_cleanup_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
