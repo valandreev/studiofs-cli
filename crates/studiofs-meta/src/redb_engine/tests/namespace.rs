@@ -299,6 +299,7 @@ fn test_readdir_merged_in_write_txn_matches_read_readdir() {
 }
 
 thread_local! {
+    pub(super) static VISIBILITY_TABLE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static OVERLAY_DENTRY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -436,7 +437,7 @@ fn merged_dentry_point_lookups_preserve_overlay_and_visibility_semantics() {
 }
 
 #[test]
-fn merged_dentry_point_lookups_preserve_case_insensitive_base_fallback() {
+fn merged_dentry_point_lookups_preserve_case_insensitive_local_authority() {
     let engine = temp_engine();
     let txn = engine.begin_write_txn().unwrap();
     let key = encode_dentry_key(ROOT_INO, b"MiXeD");
@@ -451,8 +452,8 @@ fn merged_dentry_point_lookups_preserve_case_insensitive_base_fallback() {
             .insert(key.as_slice(), value.as_slice())
             .unwrap();
     }
-    // The existing fallback searches base first when the requested exact key is absent.
-    for (name, expected) in [(b"MiXeD".as_slice(), 88), (b"mixed".as_slice(), 77)] {
+    // Local replacements retain authority regardless of the requested casing.
+    for (name, expected) in [(b"MiXeD".as_slice(), 88), (b"mixed".as_slice(), 88)] {
         assert_eq!(
             RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, name)
                 .unwrap()
@@ -463,5 +464,162 @@ fn merged_dentry_point_lookups_preserve_case_insensitive_base_fallback() {
     }
     txn.commit().unwrap();
     assert_eq!(engine.lookup(ROOT_INO, b"MiXeD").unwrap().ino, 88);
-    assert_eq!(engine.lookup(ROOT_INO, b"mixed").unwrap().ino, 77);
+    assert_eq!(engine.lookup(ROOT_INO, b"mixed").unwrap().ino, 88);
+}
+
+#[test]
+fn merged_dentry_case_insensitive_lookup_respects_tombstones_and_visibility() {
+    for (current_ino, tombstone, filter, expected) in [
+        (None, true, false, None),
+        (Some(88), true, false, None),
+        (Some(88), false, true, Some(88)),
+        (Some(77), false, true, None),
+    ] {
+        let engine = temp_engine();
+        engine
+            .set_remote_namespace_visibility_filter(filter)
+            .unwrap();
+        let txn = engine.begin_write_txn().unwrap();
+        let key = encode_dentry_key(ROOT_INO, b"MiXeD");
+        for (definition, ino) in [
+            (BASE_DENTRIES_TABLE, Some(77)),
+            (DENTRIES_TABLE, current_ino),
+        ] {
+            if let Some(ino) = ino {
+                let value = encode(&DirEntryValue {
+                    ino,
+                    kind: FileType::RegularFile,
+                })
+                .unwrap();
+                txn.open_table(definition)
+                    .unwrap()
+                    .insert(key.as_slice(), value.as_slice())
+                    .unwrap();
+            }
+        }
+        if tombstone {
+            txn.open_table(DENTRY_TOMBSTONES_TABLE)
+                .unwrap()
+                .insert(key.as_slice(), 1)
+                .unwrap();
+        }
+        for name in [b"MiXeD".as_slice(), b"mixed".as_slice()] {
+            assert_eq!(
+                RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, name)
+                    .unwrap()
+                    .map(|entry| entry.ino),
+                expected
+            );
+        }
+        txn.commit().unwrap();
+        for name in [b"MiXeD".as_slice(), b"mixed".as_slice()] {
+            match expected {
+                Some(ino) => assert_eq!(engine.lookup(ROOT_INO, name).unwrap().ino, ino),
+                None => assert!(matches!(
+                    engine.lookup(ROOT_INO, name),
+                    Err(MetaError::EntryNotFound { .. })
+                )),
+            }
+        }
+    }
+}
+
+#[test]
+fn merged_dentry_case_insensitive_current_only_entry_stays_locally_visible() {
+    let engine = temp_engine();
+    engine.set_remote_namespace_visibility_filter(true).unwrap();
+    let attr = engine
+        .create_file(ROOT_INO, b"LoCaL", 1000, 1000, 0o644)
+        .unwrap();
+    let read_txn = engine.begin_read_txn().unwrap();
+    let base = read_txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+    let current = read_txn.open_table(DENTRIES_TABLE).unwrap();
+    let tombstones = read_txn.open_table(DENTRY_TOMBSTONES_TABLE).unwrap();
+    let (_, is_overlay) = RedbMetaEngine::lookup_merged_from_opened_tables(
+        &base,
+        &current,
+        &tombstones,
+        ROOT_INO,
+        b"local",
+    )
+    .unwrap();
+    assert!(
+        is_overlay,
+        "resolved local name must retain its authority flag"
+    );
+    assert_eq!(engine.lookup(ROOT_INO, b"local").unwrap().ino, attr.ino);
+    let txn = engine.begin_write_txn().unwrap();
+    assert_eq!(
+        RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, b"local")
+            .unwrap()
+            .unwrap()
+            .ino,
+        attr.ino
+    );
+    txn.abort().unwrap();
+}
+
+#[test]
+fn merged_dentry_local_and_missing_lookups_skip_visibility_tables() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"local", 1000, 1000, 0o644)
+        .unwrap();
+    engine.set_remote_namespace_visibility_filter(true).unwrap();
+    VISIBILITY_TABLE_OPENS.set(0);
+    assert_eq!(engine.lookup(ROOT_INO, b"local").unwrap().ino, attr.ino);
+    assert!(matches!(
+        engine.lookup(ROOT_INO, b"missing"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(
+        VISIBILITY_TABLE_OPENS.get(),
+        0,
+        "read lookup opened unused tables"
+    );
+    let txn = engine.begin_write_txn().unwrap();
+    assert_eq!(
+        RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, b"local")
+            .unwrap()
+            .unwrap()
+            .ino,
+        attr.ino
+    );
+    assert!(
+        RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, b"missing")
+            .unwrap()
+            .is_none()
+    );
+    txn.abort().unwrap();
+    assert_eq!(
+        VISIBILITY_TABLE_OPENS.get(),
+        0,
+        "write lookup opened unused tables"
+    );
+    // Equal rows need the visibility tables; verify that the counter sees this path.
+    let txn = engine.begin_write_txn().unwrap();
+    let key = encode_dentry_key(ROOT_INO, b"local");
+    let value = encode(&DirEntryValue {
+        ino: attr.ino,
+        kind: FileType::RegularFile,
+    })
+    .unwrap();
+    txn.open_table(BASE_DENTRIES_TABLE)
+        .unwrap()
+        .insert(key.as_slice(), value.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+    VISIBILITY_TABLE_OPENS.set(0);
+    assert_eq!(engine.lookup(ROOT_INO, b"local").unwrap().ino, attr.ino);
+    assert_eq!(VISIBILITY_TABLE_OPENS.get(), 5);
+    let txn = engine.begin_write_txn().unwrap();
+    assert_eq!(
+        RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, b"local")
+            .unwrap()
+            .unwrap()
+            .ino,
+        attr.ino
+    );
+    txn.abort().unwrap();
+    assert_eq!(VISIBILITY_TABLE_OPENS.get(), 10);
 }
