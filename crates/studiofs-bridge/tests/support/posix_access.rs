@@ -6,6 +6,26 @@ use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
 #[test]
 #[ignore = "requires a native FUSE mount and a non-root caller with supplementary groups"]
 fn mounted_access_selects_the_callers_permission_class() {
+    run_access_checks(false, false);
+}
+
+#[test]
+#[ignore = "requires a native FUSE mount"]
+fn mounted_read_only_access_rejects_write() {
+    run_access_checks(true, false);
+}
+
+#[cfg(target_os = "macos")]
+mod mfmount_acceptance {
+    #[cfg(feature = "fskit-mount-sanity")]
+    #[test]
+    #[ignore = "requires the native MFMount backend"]
+    fn mounted_mfmount_access_selects_the_callers_permission_class() {
+        super::run_access_checks(false, true);
+    }
+}
+
+fn run_access_checks(read_only: bool, mfmount: bool) {
     // SAFETY: These credential queries have no pointer arguments.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     assert_ne!(uid, 0, "root bypasses ordinary permission classes");
@@ -21,16 +41,43 @@ fn mounted_access_selects_the_callers_permission_class() {
         .iter()
         .find(|&&group| group != gid && group != 0)
         .expect("native acceptance requires a supplementary group");
-    let foreign_uid = uid + 1;
+    let foreign_uid = unrelated_uid(uid);
     let foreign_gid = (1..65535)
         .find(|&group| group != gid && !groups.contains(&group))
         .expect("find unrelated group");
     let cases = [
         (
+            "supplementary-no-fallthrough",
+            foreign_uid,
+            supplementary,
+            0o004,
+            false,
+            libc::R_OK,
+            false,
+        ),
+        (
+            "owner-write",
+            uid,
+            foreign_gid,
+            0o200,
+            false,
+            libc::W_OK,
+            true,
+        ),
+        (
+            "group-write",
+            foreign_uid,
+            gid,
+            0o020,
+            false,
+            libc::W_OK,
+            true,
+        ),
+        (
             "owner-read",
             uid,
             foreign_gid,
-            0o400,
+            if read_only { 0o600 } else { 0o400 },
             false,
             libc::R_OK,
             true,
@@ -151,10 +198,7 @@ fn mounted_access_selects_the_callers_permission_class() {
                 .expect("create access file");
         }
     }
-    let mount_point = std::env::current_dir()
-        .expect("current directory")
-        .join("target")
-        .join(format!("native-posix-access-{}", std::process::id()));
+    let mount_point = native_mount_point();
     std::fs::create_dir_all(&mount_point).expect("create mount point");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     #[cfg(target_os = "macos")]
@@ -166,6 +210,7 @@ fn mounted_access_selects_the_callers_permission_class() {
         &mount_point,
         "POSIX Access",
     )
+    .with_read_only(read_only)
     .with_signal_handling(studiofs_macfuse::SignalHandling::Disabled)
     .with_unmount_signal(signal.clone())
     .with_mount_ready_callback(move || {
@@ -177,13 +222,21 @@ fn mounted_access_selects_the_callers_permission_class() {
         fixture.runtime().handle().clone(),
         &mount_point,
         "posix-access",
-        false,
+        read_only,
     )
     .with_mount_ready_callback(move || {
         ready_tx.send(()).expect("report ready mount");
     });
     #[cfg(target_os = "macos")]
-    let worker = std::thread::spawn(move || studiofs_macfuse::mount_with_request(request));
+    let worker = std::thread::spawn(move || {
+        if mfmount {
+            studiofs_macfuse::mount_with_fskit_request(request)
+        } else {
+            studiofs_macfuse::mount_with_request(request)
+        }
+    });
+    #[cfg(target_os = "linux")]
+    let _ = mfmount;
     #[cfg(target_os = "linux")]
     let worker = std::thread::spawn(move || studiofs_linux_fuse::mount_with_request(request));
     let result = std::panic::catch_unwind(|| {
@@ -197,6 +250,25 @@ fn mounted_access_selects_the_callers_permission_class() {
                 "mounted lookup did not become ready"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if read_only {
+            let path =
+                CString::new(mount_point.join("owner-read").as_os_str().as_bytes()).expect("path");
+            // SAFETY: path is a live NUL-terminated string for each synchronous call.
+            assert_eq!(unsafe { libc::access(path.as_ptr(), libc::R_OK) }, 0);
+            // SAFETY: same live path.
+            assert_eq!(unsafe { libc::access(path.as_ptr(), libc::F_OK) }, 0);
+            // SAFETY: same live path.
+            assert_eq!(
+                unsafe { libc::access(path.as_ptr(), libc::W_OK) },
+                -1,
+                "read-only mount must deny W_OK"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EROFS)
+            );
+            return;
         }
         for &(name, _, _, _, _, mask, allowed) in &cases {
             let path = CString::new(mount_point.join(name).as_os_str().as_bytes()).expect("path");
@@ -214,33 +286,92 @@ fn mounted_access_selects_the_callers_permission_class() {
     });
     #[cfg(target_os = "macos")]
     signal.request_unmount();
+    #[cfg(target_os = "macos")]
+    let unmount_result = Ok(());
     #[cfg(target_os = "linux")]
-    assert!(
-        std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg(&mount_point)
-            .status()
-            .expect("unmount")
-            .success()
-    );
-    worker
-        .join()
-        .expect("join mount worker")
-        .expect("native mount lifecycle");
+    let unmount_result = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mount_point)
+        .status()
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("fusermount3 unmount failed"))
+            }
+        });
+    // Always join before interpreting unmount errors, including failed startup.
+    let mount_result = worker.join();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
+    let directory_result = loop {
         match std::fs::remove_dir(&mount_point) {
-            Ok(()) => break,
+            Ok(()) => break Ok(()),
             Err(error)
                 if error.raw_os_error() == Some(libc::EBUSY)
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => panic!("remove mount point: {error}"),
+            Err(error) => break Err(error),
         }
+    };
+    finish_access_test(result, mount_result, unmount_result.and(directory_result));
+}
+
+fn unrelated_uid(uid: u32) -> u32 {
+    if uid == 1 { 2 } else { 1 }
+}
+
+fn native_mount_point() -> std::path::PathBuf {
+    studiofs_test_support::workspace_target_temp_path("native-posix-access-")
+}
+
+#[test]
+fn unrelated_uid_is_nonzero_and_different_at_boundaries() {
+    for uid in [1, 501, u32::MAX] {
+        let other = unrelated_uid(uid);
+        assert_ne!(other, uid);
+        assert_ne!(other, 0);
     }
-    if let Err(panic) = result {
+}
+
+#[test]
+fn native_mount_point_is_under_workspace_target() {
+    let reference = studiofs_test_support::workspace_target_temp_path("reference-");
+    assert_eq!(native_mount_point().parent(), reference.parent());
+}
+
+fn finish_access_test(
+    probe: std::thread::Result<()>,
+    mount: std::thread::Result<std::io::Result<()>>,
+    cleanup: std::io::Result<()>,
+) {
+    if let Err(panic) = probe {
+        if let Ok(Err(error)) = &mount {
+            eprintln!("mount worker failed: {error}");
+        }
+        if let Err(error) = cleanup {
+            eprintln!("mount cleanup failed: {error}");
+        }
         std::panic::resume_unwind(panic);
     }
+    mount
+        .expect("join mount worker")
+        .expect("native mount lifecycle");
+    cleanup.expect("unmount and remove mount point");
+}
+
+#[test]
+fn failed_mount_cleanup_preserves_initial_failure() {
+    let result = std::panic::catch_unwind(|| {
+        let probe = std::panic::catch_unwind(|| panic!("initial mount failure"));
+        let worker = std::thread::spawn(|| Err(std::io::Error::other("startup failure")));
+        finish_access_test(
+            probe,
+            worker.join(),
+            Err(std::io::Error::other("not mounted")),
+        );
+    });
+    let panic = result.expect_err("initial failure must propagate");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"initial mount failure"));
 }

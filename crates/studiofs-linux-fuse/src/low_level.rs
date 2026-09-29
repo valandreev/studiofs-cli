@@ -630,8 +630,12 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
             || args.win_attrs.is_some())
 }
 
-fn argv_strings(volume_name: &str) -> Vec<String> {
-    argv_strings_for_cache_policy(volume_name, linux_fuse_cache_policy_from_env())
+fn argv_strings(volume_name: &str, read_only: bool) -> Vec<String> {
+    let mut args = argv_strings_for_cache_policy(volume_name, linux_fuse_cache_policy_from_env());
+    if read_only {
+        args.extend(["-o".to_owned(), "ro".to_owned()]);
+    }
+    args
 }
 
 fn argv_strings_for_cache_policy(
@@ -732,7 +736,7 @@ impl Session {
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
+        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), state.read_only))?;
         let mut state = Box::new(state);
         let userdata = (&mut *state as *mut SessionState).cast::<c_void>();
         // SAFETY: the C shim expands libfuse's versioned session constructor.
@@ -820,7 +824,7 @@ impl Session {
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref()))?;
+        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), false))?;
         // SAFETY: the C shim returns a static ops table. Userdata is null for
         // this lifecycle-only smoke; init supports null userdata and every
         // request callback rejects a missing SessionState before dereferencing.
@@ -3372,7 +3376,7 @@ mod tests {
 
     #[test]
     fn argv_uses_system_libfuse_mount_options() {
-        let args = super::argv_strings("demo");
+        let args = super::argv_strings("demo", false);
 
         assert!(args.iter().any(|arg| arg == "studiofs-linux-fuse"));
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
@@ -3392,9 +3396,23 @@ mod tests {
     }
 
     #[test]
+    fn read_only_mount_arguments_enable_native_read_only_policy() {
+        assert!(
+            super::argv_strings("demo", true)
+                .iter()
+                .any(|arg| arg == "ro")
+        );
+        assert!(
+            !super::argv_strings("demo", false)
+                .iter()
+                .any(|arg| arg == "ro")
+        );
+    }
+
+    #[test]
     fn generated_argv_is_accepted_by_low_level_session_parser() {
-        let mut args =
-            super::OwnedFuseArgs::new(super::argv_strings("demo")).expect("build FUSE arguments");
+        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false))
+            .expect("build FUSE arguments");
         // SAFETY: the C shim returns a static empty ops table and this test
         // destroys the resulting session before the stack-owned arguments drop.
         let session = unsafe {
@@ -3745,7 +3763,8 @@ mod tests {
 
     #[test]
     fn owned_fuse_args_are_null_terminated_without_counting_sentinel() {
-        let args = super::OwnedFuseArgs::new(super::argv_strings("demo")).expect("build args");
+        let args =
+            super::OwnedFuseArgs::new(super::argv_strings("demo", false)).expect("build args");
 
         assert_eq!(args.raw.argc as usize, args._strings.len());
         assert!(args._argv.last().is_some_and(|arg| arg.is_null()));
