@@ -725,7 +725,11 @@ impl StudioVfs {
     /// subsequent calls to `shutdown` replay the terminal error.
     ///
     /// # Errors
-    /// Returns the first shutdown failure, including a metadata timeout.
+    /// Returns the first shutdown failure. A prior local-dirty drain, metadata
+    /// close, overlay barrier, or overlay-health error takes precedence over a
+    /// later metadata timeout; the sync may still be running even when that
+    /// earlier error is returned. Before reopening the same database after any
+    /// shutdown error, call [`join_pending_metadata_sync`](Self::join_pending_metadata_sync).
     pub async fn shutdown(&self, upload_drain_timeout: Duration) -> VfsResult<()> {
         let shutdown_owner = loop {
             match self.state.shutdown.claim() {

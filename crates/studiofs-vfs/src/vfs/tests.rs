@@ -10619,7 +10619,7 @@ fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
     let metadata_task = tokio::task::spawn_blocking(move || {
         let _ = started_tx.send(());
         release_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .expect("shutdown test releases stalled metadata sync");
         sync_meta.sync_local_metadata().map_err(VfsError::Meta)
     });
@@ -10665,7 +10665,10 @@ fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
     let repeated_error = rt
         .block_on(vfs.shutdown(Duration::ZERO))
         .expect_err("timeout remains the terminal shutdown result");
-    assert!(repeated_error.is_shutdown_metadata_timeout());
+    assert!(matches!(
+        &repeated_error,
+        VfsError::ShutdownMetadataTimeout(1_000)
+    ));
 
     let metadata_task =
         rt.block_on(async { vfs.state.shutdown.metadata_sync_task.lock().await.take() });
@@ -10713,16 +10716,64 @@ fn join_pending_metadata_sync_releases_redb_before_vfs_drop() {
             futures::poll!(join.as_mut()).is_pending(),
             "join waits while the retained metadata sync is still blocked"
         );
+        drop(join);
+        assert!(
+            vfs.state
+                .shutdown
+                .metadata_sync_task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|task| !task.is_finished()),
+            "cancelling the waiter must preserve the blocked task handle"
+        );
+
+        let mut retry = Box::pin(vfs.join_pending_metadata_sync());
+        assert!(
+            futures::poll!(retry.as_mut()).is_pending(),
+            "a later waiter must still join the original metadata sync"
+        );
         release_tx
             .send(())
             .expect("metadata sync remains blocked until released");
-        join.await
+        retry
+            .await
             .expect("pending metadata sync should join successfully");
+        vfs.join_pending_metadata_sync()
+            .await
+            .expect("joining with no pending task should be a no-op");
     });
     assert!(rt.block_on(async { vfs.state.shutdown.metadata_sync_task.lock().await.is_none() }));
     drop(vfs);
     drop(meta);
     drop(RedbMetaEngine::open(&db_path).expect("redb should reopen after pending sync is joined"));
+}
+
+#[test]
+fn join_pending_metadata_sync_preserves_metadata_and_join_errors() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "join-pending-metadata-sync-errors");
+
+    rt.block_on(async {
+        *vfs.state.shutdown.metadata_sync_task.lock().await = Some(tokio::spawn(async {
+            Err::<(), VfsError>(VfsError::Meta(studiofs_meta::MetaError::LifecycleFatal))
+        }));
+        assert!(matches!(
+            vfs.join_pending_metadata_sync().await,
+            Err(VfsError::Meta(studiofs_meta::MetaError::LifecycleFatal))
+        ));
+
+        let task = tokio::spawn(std::future::pending::<VfsResult<()>>());
+        task.abort();
+        *vfs.state.shutdown.metadata_sync_task.lock().await = Some(task);
+        assert!(matches!(
+            vfs.join_pending_metadata_sync().await,
+            Err(VfsError::ShutdownJoin(_))
+        ));
+        vfs.join_pending_metadata_sync()
+            .await
+            .expect("joining with no pending task should be a no-op");
+    });
 }
 
 #[test]

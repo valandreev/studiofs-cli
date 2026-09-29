@@ -523,7 +523,7 @@ pub enum VfsError {
     Join(#[from] tokio::task::JoinError),
 
     /// A task join failure normalized so terminal shutdown results can be replayed.
-    #[error("task join error: {0}")]
+    #[error("shutdown task join error: {0}")]
     ShutdownJoin(String),
 
     /// Object-layer failure while decoding or writing payload objects.
@@ -604,7 +604,11 @@ impl VfsError {
         matches!(self, Self::Other(message) if message == SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE)
     }
 
-    /// Returns whether shutdown failed because its local metadata barrier timed out.
+    /// Returns whether the selected shutdown error is a metadata barrier timeout.
+    ///
+    /// An earlier shutdown error can take precedence while the timed-out sync
+    /// remains pending, so this does not indicate whether a sync still needs to
+    /// be joined. After any shutdown error, join before reopening the database.
     pub fn is_shutdown_metadata_timeout(&self) -> bool {
         matches!(self, Self::ShutdownMetadataTimeout(_))
     }

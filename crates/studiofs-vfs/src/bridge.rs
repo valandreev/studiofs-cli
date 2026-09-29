@@ -67,7 +67,6 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
         VfsError::Io(io_error) => classify_io_error(io_error.kind()),
         VfsError::Join(_) | VfsError::ShutdownJoin(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
-        VfsError::ShutdownMetadataTimeout(_) => BridgeVfsErrorKind::TimedOut,
         VfsError::Object(_) | VfsError::BlockNotFound(_, _) => BridgeVfsErrorKind::DataCorruption,
         VfsError::MetadataPersistenceDegraded => BridgeVfsErrorKind::MetadataPersistenceDegraded,
         VfsError::LocalPayload(local_error) => classify_local_payload_error(local_error),
@@ -355,6 +354,19 @@ mod tests {
         assert_eq!(
             classify_vfs_error(&join),
             BridgeVfsErrorKind::CriticalRuntimeFailure
+        );
+
+        let shutdown_join = crate::VfsError::ShutdownJoin("task cancelled".into());
+        assert_ne!(join.to_string(), shutdown_join.to_string());
+        assert_eq!(
+            classify_vfs_error(&shutdown_join),
+            BridgeVfsErrorKind::CriticalRuntimeFailure
+        );
+
+        let shutdown_metadata_timeout = crate::VfsError::ShutdownMetadataTimeout(1_000);
+        assert_eq!(
+            classify_vfs_error(&shutdown_metadata_timeout),
+            BridgeVfsErrorKind::GenericFailure
         );
 
         let local_permission_denied = crate::VfsError::LocalPayload(LocalPayloadBackendError::Io(
