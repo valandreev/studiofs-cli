@@ -453,4 +453,16 @@ mod tests {
         ht.close(handle.fh).expect("append handle should close");
         assert_eq!(ht.write_open_count(10), 0);
     }
+
+    #[test]
+    fn read_only_append_handle_is_not_counted_as_a_writer() {
+        let ht = HandleTable::new();
+        let handle = ht.open(10, OpenFlags::RDONLY | OpenFlags::APPEND, None, true);
+
+        assert_eq!(ht.write_open_count(10), 0);
+        assert!(!ht.is_valid_writer_for_inode(handle.fh, 10));
+        ht.close(handle.fh)
+            .expect("read-only append handle should close");
+        assert_eq!(ht.write_open_count(10), 0);
+    }
 }

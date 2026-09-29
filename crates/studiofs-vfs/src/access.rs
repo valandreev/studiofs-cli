@@ -331,7 +331,8 @@ impl HandleAccessState {
         let (first_block, last_block, span_blocks) = block_span(offset, len, cfg.block_size_u64());
         self.prepare_for_operation(AccessOperation::Write);
 
-        let append_like = self.flags.contains(OpenFlags::APPEND)
+        let append_like = (self.flags.write_access_requested()
+            && self.flags.contains(OpenFlags::APPEND))
             || self
                 .last_last_block
                 .is_some_and(|prev_last| first_block <= prev_last.saturating_add(1))
@@ -391,9 +392,9 @@ impl HandleAccessState {
 }
 
 fn initial_class(flags: OpenFlags) -> AccessClass {
-    if flags.contains(OpenFlags::APPEND) {
+    if flags.write_access_requested() && flags.contains(OpenFlags::APPEND) {
         AccessClass::SequentialWriter
-    } else if flags.contains(OpenFlags::WRONLY) {
+    } else if flags.write_access_requested() {
         AccessClass::RandomWriter
     } else {
         AccessClass::RandomInteractiveRead
@@ -471,6 +472,13 @@ mod tests {
         assert!(random.policy.prefetch_enabled);
         assert!(random.policy.cache_promotion_on_read);
         assert!(random.policy.readahead_max_width > random.policy.readahead_base_width);
+    }
+
+    #[test]
+    fn read_only_append_handle_starts_as_a_reader() {
+        let state = HandleAccessState::new(14, OpenFlags::RDONLY | OpenFlags::APPEND);
+
+        assert_eq!(state.current_class(), AccessClass::RandomInteractiveRead);
     }
 
     #[test]

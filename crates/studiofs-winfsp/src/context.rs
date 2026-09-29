@@ -1879,7 +1879,7 @@ impl FileSystemContext for StudioFsContext {
         let open_flags = open_flags_from_access(granted_access, create_options);
         let raw_create_options = current_winfsp_create_options(create_options);
         let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
-        if self.read_only && (open_flags.allows_write() || trunc) {
+        if self.read_only && (open_flags.write_access_requested() || trunc) {
             return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
         }
         if maybe_hide_platform_root_path(&self.vfs, file_name)? {
@@ -3295,6 +3295,33 @@ mod tests {
         );
 
         <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+    }
+
+    #[test]
+    fn read_only_context_rejects_write_data_and_append_data_opens() {
+        let (_tmp, vfs, mut ctx, _queue) = make_test_context("read-only-write-access");
+        ctx.read_only = true;
+        vfs.create(ROOT_INO, b"read-only.txt", 0, 0, 0o644)
+            .expect("create file");
+
+        let path = U16CString::from_str(r"\read-only.txt").expect("u16 path");
+        for access in [FILE_WRITE_DATA_ACCESS, FILE_APPEND_DATA_ACCESS] {
+            let mut file_info = empty_open_file_info();
+            let status = match <StudioFsContext as FileSystemContext>::open(
+                &ctx,
+                path.as_ucstr(),
+                0,
+                access,
+                &mut file_info,
+            ) {
+                Ok(handle) => {
+                    <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+                    panic!("read-only context accepted write access {access:#x}");
+                }
+                Err(error) => error.to_ntstatus(),
+            };
+            assert_eq!(status, STATUS_ACCESS_DENIED.0);
+        }
     }
 
     #[test]

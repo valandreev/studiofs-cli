@@ -7554,7 +7554,7 @@ impl StudioVfs {
     }
 
     fn write_access_requested(flags: OpenFlags, trunc: bool) -> bool {
-        trunc || flags.allows_write()
+        trunc || flags.write_access_requested()
     }
 
     fn active_open_overlay_required(flags: OpenFlags, trunc: bool) -> bool {

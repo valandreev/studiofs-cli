@@ -2023,7 +2023,7 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let writer = adapter
-            .open(attr.ino, libc::O_RDONLY | libc::O_APPEND)
+            .open(attr.ino, libc::O_WRONLY | libc::O_APPEND)
             .expect("open append handle through macFUSE adapter");
 
         fixture
@@ -2141,6 +2141,13 @@ mod tests {
             true,
         );
 
+        let append_reader = adapter
+            .open(attr.ino, libc::O_RDONLY | libc::O_APPEND)
+            .expect("O_APPEND must not turn read-only access into a write open");
+        adapter
+            .release(attr.ino, append_reader.file_handle())
+            .expect("release read-only append handle");
+
         assert_eq!(
             adapter.open(attr.ino, libc::O_WRONLY).unwrap_err(),
             libc::EROFS
@@ -2171,11 +2178,18 @@ mod tests {
         assert!(!read_write.keep_cache);
 
         let append = super::adapter::macfuse_open_cache_policy(
-            studiofs_vfs::vfs::OpenFlags::RDONLY | studiofs_vfs::vfs::OpenFlags::APPEND,
+            studiofs_vfs::vfs::OpenFlags::WRONLY | studiofs_vfs::vfs::OpenFlags::APPEND,
             false,
         );
         assert!(append.direct_io);
         assert!(!append.keep_cache);
+
+        let read_only_append = super::adapter::macfuse_open_cache_policy(
+            studiofs_vfs::vfs::OpenFlags::RDONLY | studiofs_vfs::vfs::OpenFlags::APPEND,
+            false,
+        );
+        assert!(!read_only_append.direct_io);
+        assert!(read_only_append.keep_cache);
 
         let truncate =
             super::adapter::macfuse_open_cache_policy(studiofs_vfs::vfs::OpenFlags::RDONLY, true);

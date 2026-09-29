@@ -120,9 +120,19 @@ impl OpenFlags {
         (self.0 & other.0) == other.0
     }
 
+    /// Returns whether these flags request write access.
+    ///
+    /// Read-only access takes precedence over `APPEND`; bare `APPEND` remains
+    /// the VFS's internal append-writer shorthand.
+    pub const fn write_access_requested(self) -> bool {
+        self.contains(Self::WRONLY)
+            || self.contains(Self::RDWR)
+            || (self.contains(Self::APPEND) && !self.contains(Self::RDONLY))
+    }
+
     /// Returns true when these flags permit write access.
     pub const fn allows_write(self) -> bool {
-        self.contains(Self::WRONLY) || self.contains(Self::RDWR) || self.contains(Self::APPEND)
+        self.write_access_requested()
     }
 
     /// Returns the union of this and another flag set.
@@ -883,6 +893,15 @@ mod tests {
         assert!(!f.contains(OpenFlags::WRONLY));
         assert!(f.allows_write());
         assert!(!OpenFlags::RDONLY.allows_write());
+        assert!(OpenFlags::APPEND.allows_write());
+        assert!(OpenFlags::WRONLY.write_access_requested());
+        assert!(OpenFlags::RDWR.write_access_requested());
+        assert!(OpenFlags::APPEND.write_access_requested());
+        assert!(
+            !(OpenFlags::RDONLY | OpenFlags::APPEND).allows_write(),
+            "read-only access must not become writable because of O_APPEND"
+        );
+        assert!(!(OpenFlags::RDONLY | OpenFlags::APPEND).write_access_requested());
 
         let f2 = f.union(OpenFlags::WRONLY);
         assert!(f2.contains(OpenFlags::WRONLY));

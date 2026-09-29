@@ -1920,9 +1920,7 @@ impl SessionState {
             FileType::Symlink => return Err(libc::EINVAL),
         }
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        let write_access =
-            open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR);
-        if self.read_only && (trunc || write_access) {
+        if self.read_only && (trunc || open_flags.write_access_requested()) {
             return Err(libc::EROFS);
         }
         let fh = self
@@ -4841,6 +4839,31 @@ mod tests {
             .expect("O_APPEND does not make a read-only open writable");
         let release = state.release(open.fh);
         finish_regular_release_with(&state, Some(open.fh), release, |_| {});
+    }
+
+    #[test]
+    fn read_only_mount_rejects_write_and_truncate_open_modes() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-only-open")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            true,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"read-only-open.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_TRUNC] {
+            assert_eq!(
+                state.open_with_flags(attr.ino, flags).unwrap_err(),
+                libc::EROFS,
+                "read-only mount must reject open flags {flags:#x}"
+            );
+        }
     }
 
     #[test]

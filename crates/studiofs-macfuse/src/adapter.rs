@@ -1281,11 +1281,11 @@ impl StudioVfsAdapter {
     /// Open an existing file.
     pub(crate) fn open(&self, ino: u64, flags: i32) -> Result<OpenReply, i32> {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        if self.read_only && (open_flags.allows_write() || trunc) {
+        if self.read_only && (open_flags.write_access_requested() || trunc) {
             return Err(libc::EROFS);
         }
         if self.vfs.is_runtime_stats_file_ino(ino) {
-            if open_flags.allows_write() || trunc {
+            if open_flags.write_access_requested() || trunc {
                 return Err(libc::EROFS);
             }
             let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);

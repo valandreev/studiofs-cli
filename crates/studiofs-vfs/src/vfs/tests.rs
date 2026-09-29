@@ -10714,10 +10714,32 @@ fn active_open_overlay_tracks_only_mutating_handles() {
         OpenFlags::RDWR,
         false
     ));
-    assert!(StudioVfs::active_open_overlay_required(
+    assert!(!StudioVfs::active_open_overlay_required(
         OpenFlags::RDONLY | OpenFlags::APPEND,
         false
     ));
+    assert!(StudioVfs::active_open_overlay_required(
+        OpenFlags::WRONLY | OpenFlags::APPEND,
+        false
+    ));
+}
+
+#[test]
+fn read_only_append_open_does_not_register_a_writer() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "read-only-append-open");
+    let _guard = rt.enter();
+    let attr = vfs
+        .create(ROOT_INO, b"read-only-append.txt", 0, 0, 0o644)
+        .expect("create file");
+
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY | OpenFlags::APPEND, false)
+        .expect("open with read-only access and ignored append modifier");
+
+    assert_eq!(vfs.handle_table.write_open_count(attr.ino), 0);
+    assert!(!vfs.handle_table.has_active_open_overlay(attr.ino));
+    rt.block_on(vfs.release_fh(fh)).expect("release reader");
 }
 
 #[test]
@@ -21830,7 +21852,7 @@ fn foreign_exclusive_lock(ino: Ino) -> FileLockLease {
 #[test]
 fn foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-open");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-open");
     let attr = vfs
         .create(ROOT_INO, b"foreign-lock-open.txt", 0, 0, 0o644)
         .expect("create file");
@@ -21847,6 +21869,15 @@ fn foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open() {
         .expect("read-only open should still succeed under a foreign hard lock");
     let open_file = vfs.get_open_file(fh).expect("tracked open file");
     assert_eq!(open_file.flags.bits(), OpenFlags::RDONLY.bits());
+
+    let append_reader = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY | OpenFlags::APPEND, false)
+        .expect("O_APPEND must not turn a read-only open into a conflicting writer");
+    assert_eq!(vfs.handle_table.write_open_count(attr.ino), 0);
+    rt.block_on(vfs.release_fh(append_reader))
+        .expect("release read-only append handle");
+    rt.block_on(vfs.release_fh(fh))
+        .expect("release read-only handle");
 }
 
 #[test]
