@@ -450,6 +450,12 @@ mod tests {
         assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(mount_args.iter().any(|arg| arg == "-odefault_permissions"));
         assert!(mount_args.iter().any(|arg| arg == "-ordonly"));
+        assert!(
+            !super::low_level::SessionConfig::new("/Volumes/Test", "Test")
+                .mount_argv_strings()
+                .iter()
+                .any(|arg| arg == "-ordonly")
+        );
         assert!(!mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(!args.iter().any(|arg| arg == "-f"));
         assert!(!args.iter().any(|arg| arg == "-oro"));

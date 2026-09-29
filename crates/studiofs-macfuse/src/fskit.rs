@@ -777,7 +777,7 @@ fn handle_mount_ready(
 }
 
 impl FsKitSession {
-    fn mount(mount_point: &Path, volume_name: &str) -> io::Result<Self> {
+    fn mount(mount_point: &Path, volume_name: &str, read_only: bool) -> io::Result<Self> {
         if !mount_point.starts_with(Path::new("/Volumes")) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -786,7 +786,7 @@ impl FsKitSession {
         }
         let mount_point = CString::new(mount_point.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount point contains NUL"))?;
-        let options = mount_options(volume_name)?;
+        let options = mount_options(volume_name, read_only)?;
         // SAFETY: MFChannelCreate returns an owned channel or NULL.
         let channel = NonNull::new(unsafe { MFChannelCreate() }).ok_or_else(|| {
             io::Error::other(format!(
@@ -1007,19 +1007,23 @@ impl Drop for FsKitSession {
     }
 }
 
-fn mount_options(volume_name: &str) -> io::Result<CString> {
+fn mount_options(volume_name: &str, read_only: bool) -> io::Result<CString> {
     if volume_name.contains(',') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "volume name cannot contain a comma for MFMount options",
         ));
     }
-    CString::new(format!(
+    let mut options = format!(
         "volname={volume_name},local,novncache,auto_cache,iosize={},max_read={},default_permissions,sparse",
         low_level::MACOS_FUSE_IOSIZE_BYTES,
         low_level::MACOS_FUSE_IOSIZE_BYTES,
-    ))
-    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "volume name contains NUL"))
+    );
+    if read_only {
+        options.push_str(",rdonly");
+    }
+    CString::new(options)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "volume name contains NUL"))
 }
 
 fn mount_result_error(result: i32) -> io::Error {
@@ -2488,7 +2492,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
     if !crate::CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
         crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     }
-    let mut session = FsKitSession::mount(&mount_point, &volume_name)?;
+    let mut session = FsKitSession::mount(&mount_point, &volume_name, read_only)?;
     let callback_state = Arc::new(CallbackState::new(
         Arc::clone(&vfs),
         runtime_handle.clone(),
@@ -3170,7 +3174,7 @@ mod tests {
 
     #[test]
     fn mount_options_keep_the_fskit_fallback_explicit() {
-        let options = mount_options("StudioFS").expect("valid options");
+        let options = mount_options("StudioFS", false).expect("valid options");
         let options = options.to_str().expect("ASCII options");
         assert!(options.contains("local"));
         assert!(options.contains("novncache"));
@@ -3188,6 +3192,21 @@ mod tests {
     }
 
     #[test]
+    fn mfmount_options_preserve_read_only_policy() {
+        for read_only in [false, true] {
+            let options = mount_options("StudioFS", read_only).expect("options");
+            assert_eq!(
+                options
+                    .to_str()
+                    .expect("ASCII")
+                    .split(',')
+                    .any(|option| option == "rdonly"),
+                read_only
+            );
+        }
+    }
+
+    #[test]
     fn fskit_open_reply_preserves_cache_flags() {
         let cached = low_level::OpenReply::new(1).with_keep_cache(true);
         let direct = low_level::OpenReply::new(2).with_direct_io(true);
@@ -3202,7 +3221,7 @@ mod tests {
 
     #[test]
     fn fskit_mount_preflight_rejects_paths_outside_volumes() {
-        let result = FsKitSession::mount(Path::new("/tmp/studiofs-fskit-test"), "StudioFS");
+        let result = FsKitSession::mount(Path::new("/tmp/studiofs-fskit-test"), "StudioFS", false);
 
         let error = match result {
             Ok(_) => panic!("FSKit must reject a non-/Volumes path before FFI"),
@@ -3213,8 +3232,8 @@ mod tests {
 
     #[test]
     fn fskit_mount_options_reject_ambiguous_volume_names() {
-        assert!(mount_options("Studio,FS").is_err());
-        assert!(mount_options("Studio\0FS").is_err());
+        assert!(mount_options("Studio,FS", false).is_err());
+        assert!(mount_options("Studio\0FS", false).is_err());
     }
 
     #[test]

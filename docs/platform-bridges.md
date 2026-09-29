@@ -552,3 +552,7 @@ The MFMount path has an opt-in native permission test:
 
 This check requires successful native MFMount/provider startup; a startup
 failure is not evidence about permission decisions.
+
+MFMount/experimental FSKit receives the same read-only policy through
+`rdonly` in its mount options. Native MFMount acceptance remains gated on
+successful provider/channel startup; option tests alone do not prove access(2).

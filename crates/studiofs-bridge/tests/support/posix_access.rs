@@ -23,6 +23,13 @@ mod mfmount_acceptance {
     fn mounted_mfmount_access_selects_the_callers_permission_class() {
         super::run_access_checks(false, true);
     }
+
+    #[cfg(feature = "fskit-mount-sanity")]
+    #[test]
+    #[ignore = "requires the native MFMount backend"]
+    fn mounted_mfmount_read_only_access_rejects_write() {
+        super::run_access_checks(true, true);
+    }
 }
 
 fn run_access_checks(read_only: bool, mfmount: bool) {
@@ -37,10 +44,7 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
     let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
     assert!(count >= 0, "read supplementary groups");
     groups.truncate(count as usize);
-    let supplementary = *groups
-        .iter()
-        .find(|&&group| group != gid && group != 0)
-        .expect("native acceptance requires a supplementary group");
+    let supplementary = supplementary_gid(&groups, gid, read_only);
     let foreign_uid = unrelated_uid(uid);
     let foreign_gid = (1..65535)
         .find(|&group| group != gid && !groups.contains(&group))
@@ -274,10 +278,15 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
             let path = CString::new(mount_point.join(name).as_os_str().as_bytes()).expect("path");
             // SAFETY: path is a live NUL-terminated string for this synchronous call.
             let result = unsafe { libc::access(path.as_ptr(), mask) };
-            assert_eq!(result == 0, allowed, "{name}: access returned {result}");
+            let error = (result != 0).then(std::io::Error::last_os_error);
+            assert_eq!(
+                result == 0,
+                allowed,
+                "{name}: access returned {result}, error: {error:?}"
+            );
             if !allowed {
                 assert_eq!(
-                    std::io::Error::last_os_error().raw_os_error(),
+                    error.expect("failed access errno").raw_os_error(),
                     Some(libc::EACCES),
                     "{name}"
                 );
@@ -374,4 +383,34 @@ fn failed_mount_cleanup_preserves_initial_failure() {
     });
     let panic = result.expect_err("initial failure must propagate");
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"initial mount failure"));
+}
+
+fn supplementary_gid(groups: &[u32], gid: u32, read_only: bool) -> u32 {
+    if read_only {
+        return gid;
+    }
+    *groups
+        .iter()
+        .find(|&&group| group != gid && group != 0)
+        .expect("native acceptance requires a supplementary group")
+}
+
+#[test]
+fn read_only_acceptance_does_not_require_supplementary_groups() {
+    assert_eq!(supplementary_gid(&[], 20, true), 20);
+}
+
+#[test]
+fn worker_panic_preserves_initial_probe_failure() {
+    let result = std::panic::catch_unwind(|| {
+        let probe = std::panic::catch_unwind(|| panic!("initial probe failure"));
+        let worker = std::thread::spawn(|| -> std::io::Result<()> {
+            panic!("worker root cause");
+        });
+        finish_access_test(probe, worker.join(), Ok(()));
+    });
+    assert_eq!(
+        result.expect_err("probe must fail").downcast_ref::<&str>(),
+        Some(&"initial probe failure")
+    );
 }
