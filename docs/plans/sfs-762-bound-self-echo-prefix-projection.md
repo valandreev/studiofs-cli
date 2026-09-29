@@ -123,3 +123,17 @@ Validation commands/results:
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
 
 Live PostgreSQL and mounted E2E were not rerun for this review follow-up; previous implementation evidence remains separate. No commit or external issue update is part of this follow-up.
+
+## Updated review follow-up (after ca745723)
+
+The replaced review covers `7280cbe7` and `ca745723`; prior findings above refer to the earlier report.
+
+- Finding 1 confirmed: share the already computed hidden-inode set across publication projection and serving-replay detection, preserving source indices and flags. The new publication work regression failed at 256 visits for 64 events, then passed at 192.
+- Finding 2 deferred: per-inode vectors do allocate, but no allocation/latency measurements justify a custom intrusive list. One event index can depend on both its own inode and the next regular dentry's inode (parent SetAttr adjacency), so one `prev_dependent[index]` link cannot represent all dependency edges safely without extra nodes/structure. Existing linear storage remains.
+- Finding 3 confirmed: projectability now short-circuits contextual visibility for local-only events. The new regression failed at 128 visits for 64 events, then passed at 64.
+- Finding 4: documented that eager-flush detection receives projected events; retained exhaustive non-eager local-only arms.
+- Finding 5: added a passing two-directory hardlink regression. Both dentries remain hidden before publication, both reveal together, and a partial single-link echo cannot advance the watermark.
+
+The report's `O(B)` exact-comparison claim is incorrect. Visibility cardinality can equal B multiple times as inode context hides/reveals events. Complexity remains `O(N log N + M * B)` for M comparison attempts (at most a constant multiple of N), with additional payload comparison cost. Event-index/state storage is O(N); borrowed comparisons avoid cloning unchanged payloads but do not eliminate map/vector/tree allocations.
+
+Verification: `cargo test -p studiofs-meta --lib pg_engine::tests::remote_apply::` passed 88 tests (44 ignored); `cargo test -p studiofs-meta --lib replication_backlog` passed 62 (1 ignored); `cargo test -p studiofs-meta --test pg_engine_test_layout` passed 3. `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, formatting and diff checks passed. PostgreSQL and mounted E2E were not rerun. No commit or external update was made.

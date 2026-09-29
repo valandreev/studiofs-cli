@@ -197,10 +197,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
         events: &[MetaEvent],
         source_event_indices: Option<&mut Vec<usize>>,
     ) -> ProjectedRemoteBatch {
-        let remote_events = Self::project_local_events(events, source_event_indices);
+        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
+        let remote_events =
+            Self::project_local_events(events, &hidden_regular_inodes, source_event_indices);
         let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
         let needs_eager_flush = Self::local_events_need_eager_flush(&remote_events);
-        let needs_local_replay = Self::local_events_need_serving_replay(events);
+        let needs_local_replay =
+            Self::local_events_need_serving_replay(events, &hidden_regular_inodes);
         let overlay = Self::overlay_conflicts_for_events(&remote_events);
         ProjectedRemoteBatch {
             events: remote_events,
@@ -265,8 +268,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         changed.then_some(ino)
     }
 
-    fn local_events_need_serving_replay(events: &[MetaEvent]) -> bool {
-        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
+    fn local_events_need_serving_replay(
+        events: &[MetaEvent],
+        hidden_regular_inodes: &HashSet<Ino>,
+    ) -> bool {
         let deleted_hidden_regular_inodes = events
             .iter()
             .filter_map(|event| match event {
@@ -295,12 +300,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
     fn project_local_events(
         events: &[MetaEvent],
+        hidden_regular_inodes: &HashSet<Ino>,
         mut source_event_indices: Option<&mut Vec<usize>>,
     ) -> Vec<MetaEvent> {
-        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
         let mut out = Vec::with_capacity(events.len());
         for (index, event) in events.iter().enumerate() {
-            if Self::local_event_is_contextually_visible(events, index, &hidden_regular_inodes)
+            if Self::local_event_is_contextually_visible(events, index, hidden_regular_inodes)
                 && let Some(event) = Self::project_remote_event(event)
             {
                 if let Some(source_event_indices) = source_event_indices.as_mut() {
@@ -335,6 +340,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
     }
 
+    // Publication passes projected events; local-only variants remain non-eager.
     fn local_events_need_eager_flush(events: &[MetaEvent]) -> bool {
         events.iter().any(|event| match event {
             MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => false,
@@ -1961,8 +1967,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
         hidden: &HashSet<Ino>,
         visible: &mut BTreeSet<usize>,
     ) -> bool {
-        if Self::local_event_is_contextually_visible(events, index, hidden)
-            && Self::remote_event_is_projectable(&events[index])
+        if Self::remote_event_is_projectable(&events[index])
+            && Self::local_event_is_contextually_visible(events, index, hidden)
         {
             visible.insert(index)
         } else {

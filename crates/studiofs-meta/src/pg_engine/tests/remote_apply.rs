@@ -1138,6 +1138,114 @@ fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
 }
 
 #[test]
+fn publication_projection_computes_inode_context_once() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let events = vec![
+        MetaEvent::RemoveEntry {
+            parent: ROOT_INO,
+            name: b"removed".to_vec()
+        };
+        64
+    ];
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    let mut sources = Vec::new();
+    let batch =
+        RemoteApplyCoordinator::project_local_batch_with_event_sources(&events, &mut sources);
+    assert_eq!(batch.events, events);
+    assert_eq!(sources, (0..events.len()).collect::<Vec<_>>());
+    assert!(!batch.needs_local_replay);
+    // One context scan, one visibility scan, and one projection per event.
+    assert_eq!(
+        LOCAL_PROJECTION_WORK.with(std::cell::Cell::get),
+        3 * events.len()
+    );
+}
+
+#[test]
+fn self_batch_local_only_events_skip_contextual_visibility() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let events = (0..64)
+        .map(|object_id| MetaEvent::RemovePendingDeletion { object_id })
+        .collect::<Vec<_>>();
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            &events,
+            &[MetaEvent::RemoveAttr { ino: ROOT_INO }],
+            None
+        )
+        .unwrap(),
+        None
+    );
+    // Context observation is necessary; contextual visibility is not.
+    assert_eq!(
+        LOCAL_PROJECTION_WORK.with(std::cell::Cell::get),
+        events.len()
+    );
+}
+
+#[test]
+fn self_batch_publish_reveals_all_hardlink_dentries() {
+    let ino = ROOT_INO + 10;
+    let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    attr.size = 8;
+    attr.content_epoch = 1;
+    attr.upload_state = UploadState::Uploading;
+    let first = MetaEvent::AddEntry {
+        parent: ROOT_INO,
+        name: b"first".to_vec(),
+        entry: DirEntryValue {
+            ino,
+            kind: FileType::RegularFile,
+        },
+    };
+    let second = MetaEvent::AddEntry {
+        parent: ROOT_INO + 1,
+        name: b"second".to_vec(),
+        entry: DirEntryValue {
+            ino,
+            kind: FileType::RegularFile,
+        },
+    };
+    let publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino,
+        chunk_slices: Vec::new(),
+    };
+    let mut normalized = attr.clone();
+    normalized.size = normalized.committed_size;
+    let local = [
+        MetaEvent::SetAttr { attr },
+        first.clone(),
+        second.clone(),
+        publish.clone(),
+    ];
+    let remote = [
+        MetaEvent::SetAttr { attr: normalized },
+        first,
+        second,
+        publish,
+    ];
+    assert!(
+        RemoteApplyCoordinator::project_local_batch(&local[..3])
+            .events
+            .is_empty()
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::project_local_batch(&local).events,
+        remote
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, None).unwrap(),
+        Some(4)
+    );
+    // A single-link echo must not retire a prefix containing both links.
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote[..2], None).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn self_batch_visibility_does_not_normalize_attrs() {
     use crate::pg_engine::remote_apply::LOCAL_PROJECTION_OWNED;
     let mut attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
@@ -1283,7 +1391,7 @@ fn self_batch_prefix_matching_bounds_work_for_long_late_and_missing_matches() {
                 expected.is_some(),
                 started.elapsed().as_micros()
             );
-            // Two visits per local-only event (context + visibility), then
+            // One context visit per local-only event, then visibility and
             // projection/comparison for the echo; 8x leaves fixed overhead room
             // while rejecting repeated growing-prefix scans.
             assert!(
