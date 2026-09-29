@@ -34,7 +34,7 @@ Compare only when the visible sequence changes and its count equals the received
 
 The repeated-prefix loop is removed from both acknowledgement paths. Publication and matching share the same monotonic hidden-inode facts, adjacency predicate, and regular attr normalization. Four new regressions cover long late/missing matches, all four visibility transitions, overlay-only hiding, earliest acknowledgement, and cancellation during a large dependency reveal. A read-only subagent review found no semantic mismatch against the original projector.
 
-Final local checks passed: 81 apply tests (44 infrastructure tests ignored in this selection), 62 backlog/restoration tests (one infrastructure test ignored), and three structural layout checks. Four specifically selected PostgreSQL tests ran against the configured live service and passed; the full ignored suite was not run. `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, formatting, and diff checks passed. The implementation and review follow-ups are committed across four commits and open in [PR 726](https://github.com/valandreev/studiofs-cli/pull/726). An English evidence comment was posted to SFS-762 and the issue moved to In Review.
+Final local checks passed: 81 apply tests (44 infrastructure tests ignored in this selection), 62 backlog/restoration tests (one infrastructure test ignored), and three structural layout checks. Four specifically selected PostgreSQL tests ran against the configured live service and passed; the full ignored suite was not run. `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, formatting, and diff checks passed. The implementation and review follow-ups are committed and open in [PR 726](https://github.com/valandreev/studiofs-cli/pull/726). An English evidence comment was posted to SFS-762 and the issue moved to In Review.
 
 ## Context and Orientation
 
@@ -150,4 +150,4 @@ Verification: remote_apply module 91 passed, 44 ignored; cargo check and Clippy 
 
 ## PR 726 review repair
 
-Addressed the three attached review comments: moved the parent-attribute adjacency check out of the match guard to respect max_width = 100, removed the unavailable review-artifact reference while retaining inline summaries, and updated delivery status to the four committed implementation revisions and PR 726. The adjacency dependency behavior is unchanged.
+Addressed the three attached review comments: moved the parent-attribute adjacency check out of the match guard to respect max_width = 100, removed the unavailable review-artifact reference while retaining inline summaries, and updated delivery status to the committed implementation and review revisions in PR 726. The adjacency dependency behavior is unchanged.
