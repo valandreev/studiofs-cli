@@ -10465,13 +10465,17 @@ async fn test_run_sync_with_timeout_returns_result_before_deadline() {
 async fn test_run_sync_with_timeout_keeps_executor_responsive() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (release_sibling_tx, release_sibling_rx) = tokio::sync::oneshot::channel();
     let sibling = tokio::spawn(async move {
         started_rx.await.expect("sync operation starts");
+        release_sibling_rx
+            .await
+            .expect("test allows sibling to release the sync");
         release_tx.send(()).is_ok()
     });
 
     let task = tokio::sync::Mutex::new(None);
-    run_sync_with_timeout(Duration::ZERO, &task, move || {
+    let result = run_sync_with_timeout(Duration::ZERO, &task, move || {
         let _ = started_tx.send(());
         // The watchdog makes the regression fail instead of hanging the test runtime.
         let _ = release_rx.recv_timeout(Duration::from_secs(2));
@@ -10479,11 +10483,24 @@ async fn test_run_sync_with_timeout_keeps_executor_responsive() {
     })
     .await
     .expect("sync operation should not fail");
+    assert_eq!(result, None);
+    release_sibling_tx
+        .send(())
+        .expect("shutdown deadline should return before the release");
 
     assert!(
         sibling.await.expect("sibling task finishes"),
         "another Tokio task must release the stalled sync before its watchdog expires"
     );
+    assert_eq!(
+        run_sync_with_timeout(Duration::from_secs(1), &task, || {
+            panic!("retry must join the original sync task")
+        })
+        .await
+        .expect("sync operation should join successfully"),
+        Some(())
+    );
+    assert!(task.lock().await.is_none());
 }
 
 #[tokio::test]
@@ -10530,6 +10547,7 @@ async fn test_run_sync_with_timeout_returns_none_on_timeout() {
         .expect("completed operation should join successfully"),
         Some(())
     );
+    assert!(task.lock().await.is_none());
 }
 
 #[tokio::test]
@@ -10579,12 +10597,14 @@ async fn test_run_sync_with_timeout_retains_task_if_waiter_is_cancelled() {
         .expect("original metadata task should join successfully"),
         Some(())
     );
+    assert!(task.lock().await.is_none());
     assert_eq!(starts.load(AtomicOrdering::Acquire), 1);
 }
 
 #[test]
 fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = tmp.path().join("meta.redb");
     let config = VfsConfig {
         shutdown_metadata_flush_timeout_secs: 1,
         ..VfsConfig::default()
@@ -10594,16 +10614,13 @@ fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
     let _guard = rt.enter();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
     let sync_meta = Arc::clone(&meta);
     let metadata_task = tokio::task::spawn_blocking(move || {
         let _ = started_tx.send(());
         release_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("shutdown test releases stalled metadata sync");
-        let result = sync_meta.sync_local_metadata().map_err(VfsError::Meta);
-        let _ = finished_tx.send(());
-        result
+        sync_meta.sync_local_metadata().map_err(VfsError::Meta)
     });
 
     rt.block_on(async {
@@ -10651,18 +10668,23 @@ fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
         .expect_err("timeout remains the terminal shutdown result");
     assert_eq!(repeated_error.to_string(), error.to_string());
 
-    release_tx.send(()).expect("metadata task remains alive");
-    rt.block_on(finished_rx)
-        .expect("metadata sync finishes after the test releases it");
-    assert_eq!(
-        rt.block_on(run_sync_with_timeout(
-            Duration::from_secs(1),
-            &vfs.state.shutdown.metadata_sync_task,
-            || panic!("waiting must join the original metadata sync"),
-        ))
-        .expect("original metadata task should join successfully"),
-        Some(())
+    let metadata_task =
+        rt.block_on(async { vfs.state.shutdown.metadata_sync_task.lock().await.take() });
+    let metadata_task = metadata_task.expect("shutdown retains the in-flight metadata task");
+    drop(vfs);
+    drop(meta);
+    assert!(
+        RedbMetaEngine::open(&db_path).is_err(),
+        "in-flight metadata task must keep redb locked after VFS owners drop"
     );
+
+    release_tx.send(()).expect("metadata task remains alive");
+    rt.block_on(metadata_task)
+        .expect("metadata sync task should not panic")
+        .expect("metadata sync should complete after release");
+    let reopened_meta = RedbMetaEngine::open(&db_path)
+        .expect("redb should reopen immediately after task completion");
+    drop(reopened_meta);
 }
 
 #[test]
