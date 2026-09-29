@@ -71,9 +71,9 @@ impl MetaNamespace for RedbMetaEngine {
             None => None,
         };
 
-        visible.ok_or(MetaError::EntryNotFound {
+        visible.ok_or_else(|| MetaError::EntryNotFound {
             parent,
-            name: String::from_utf8_lossy(name).to_string(),
+            name: String::from_utf8_lossy(name).into_owned(),
         })
     }
 

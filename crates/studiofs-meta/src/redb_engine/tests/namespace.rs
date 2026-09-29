@@ -299,6 +299,7 @@ fn test_readdir_merged_in_write_txn_matches_read_readdir() {
 }
 
 thread_local! {
+    pub(super) static QUERY_NAME_LOWERINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static VISIBILITY_SETTINGS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static UNICODE_NAME_LOWERINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static VISIBILITY_TABLE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -725,6 +726,17 @@ fn ascii_name_mismatches_skip_unicode_lowering_without_changing_unicode_matches(
     assert_eq!(engine.lookup(ROOT_INO, b"ENTRY-9999").unwrap().ino, 77);
     assert_eq!(UNICODE_NAME_LOWERINGS.get(), 0);
 
+    UNICODE_NAME_LOWERINGS.set(0);
+    assert!(matches!(
+        engine.lookup(ROOT_INO, "отсутствует".as_bytes()),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(
+        UNICODE_NAME_LOWERINGS.get(),
+        0,
+        "non-ASCII queries must not lower ASCII candidates"
+    );
+
     let txn = engine.begin_write_txn().unwrap();
     for name in ["K", "İ"] {
         let key = encode_dentry_key(ROOT_INO, name.as_bytes());
@@ -740,4 +752,44 @@ fn ascii_name_mismatches_skip_unicode_lowering_without_changing_unicode_matches(
         77
     );
     assert!(UNICODE_NAME_LOWERINGS.get() > 0);
+}
+
+#[test]
+fn unicode_query_lowercase_matches_ascii_stored_name() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"K", 1000, 1000, 0o644)
+        .unwrap();
+    UNICODE_NAME_LOWERINGS.set(0);
+    assert_eq!(
+        engine.lookup(ROOT_INO, "K".as_bytes()).unwrap().ino,
+        attr.ino
+    );
+    assert_eq!(UNICODE_NAME_LOWERINGS.get(), 0);
+}
+
+#[test]
+fn case_insensitive_fallback_lowers_query_only_when_needed() {
+    let engine = temp_engine();
+    QUERY_NAME_LOWERINGS.set(0);
+    assert!(matches!(
+        engine.lookup(ROOT_INO, "пусто".as_bytes()),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(QUERY_NAME_LOWERINGS.get(), 0);
+    engine
+        .create_file(ROOT_INO, b"ASCII", 1000, 1000, 0o644)
+        .unwrap();
+    QUERY_NAME_LOWERINGS.set(0);
+    assert!(engine.lookup(ROOT_INO, b"ascii").is_ok());
+    assert!(matches!(
+        engine.lookup(ROOT_INO, b"missing"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(QUERY_NAME_LOWERINGS.get(), 0);
+    assert!(matches!(
+        engine.lookup(ROOT_INO, "нет".as_bytes()),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(QUERY_NAME_LOWERINGS.get(), 1);
 }

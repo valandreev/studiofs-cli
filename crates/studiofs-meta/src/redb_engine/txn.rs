@@ -111,7 +111,11 @@ impl RedbMetaEngine {
             .map(|value| value.is_some())
     }
 
-    fn names_equal_case_insensitive(left: &[u8], right: &[u8], right_lower: &str) -> bool {
+    fn names_equal_case_insensitive(
+        left: &[u8],
+        right: &[u8],
+        right_lower: &mut Option<String>,
+    ) -> bool {
         if left.eq_ignore_ascii_case(right) {
             return true;
         }
@@ -120,9 +124,18 @@ impl RedbMetaEngine {
             return false;
         }
 
+        let right_lower = right_lower.get_or_insert_with(|| {
+            #[cfg(test)]
+            super::tests::QUERY_NAME_LOWERINGS.with(|count| count.set(count.get() + 1));
+            String::from_utf8_lossy(right).to_lowercase()
+        });
+        if left.is_ascii() {
+            return left.eq_ignore_ascii_case(right_lower.as_bytes());
+        }
+
         #[cfg(test)]
         super::tests::UNICODE_NAME_LOWERINGS.with(|count| count.set(count.get() + 1));
-        String::from_utf8_lossy(left).to_lowercase() == right_lower
+        String::from_utf8_lossy(left).to_lowercase() == right_lower.as_str()
     }
 
     pub(super) fn lookup_in_opened_dentry_table<T>(
@@ -139,7 +152,7 @@ impl RedbMetaEngine {
             return decode(entry.value()).map(Some);
         }
 
-        let name_lower = String::from_utf8_lossy(name).to_lowercase();
+        let mut name_lower = None;
         let prefix = dentry_prefix(parent);
         let range_end = prefix_successor(&prefix);
         let iter = match range_end.as_ref() {
@@ -155,7 +168,7 @@ impl RedbMetaEngine {
             if decoded_parent != parent {
                 break;
             }
-            if Self::names_equal_case_insensitive(stored_name, name, &name_lower) {
+            if Self::names_equal_case_insensitive(stored_name, name, &mut name_lower) {
                 return decode(v.value()).map(Some);
             }
         }
@@ -298,7 +311,7 @@ impl RedbMetaEngine {
             return Ok(exact);
         }
 
-        let name_lower = String::from_utf8_lossy(name).to_lowercase();
+        let mut name_lower = None;
         let prefix = dentry_prefix(parent);
         let end = prefix_successor(&prefix);
         let current_rows = match end.as_ref() {
@@ -318,7 +331,7 @@ impl RedbMetaEngine {
             let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let (stored_parent, stored_name) = decode_dentry_key(key.value())?;
             if stored_parent == parent
-                && Self::names_equal_case_insensitive(stored_name, name, &name_lower)
+                && Self::names_equal_case_insensitive(stored_name, name, &mut name_lower)
             {
                 let resolved = Self::lookup_merged_exact_key_from_opened_tables(
                     base,
@@ -672,14 +685,14 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let (entry, is_overlay) =
             Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
-        if entry.is_none()
-            || is_overlay
-            || entry
-                .as_ref()
-                .is_some_and(|entry| entry.kind != FileType::RegularFile)
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        if is_overlay
+            || entry.kind != FileType::RegularFile
             || !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)?
         {
-            return Ok(entry);
+            return Ok(Some(entry));
         }
         #[cfg(test)]
         super::tests::VISIBILITY_TABLE_OPENS.with(|count| count.set(count.get() + 5));
@@ -698,21 +711,15 @@ impl RedbMetaEngine {
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(match entry {
-            Some(entry)
-                if Self::remote_namespace_entry_visible_from_opened_tables(
-                    &base_inodes,
-                    &current_inodes,
-                    &inode_tombstones,
-                    &inode_lifecycle,
-                    &base_regular_file,
-                    &entry,
-                )? =>
-            {
-                Some(entry)
-            }
-            _ => None,
-        })
+        Ok(Self::remote_namespace_entry_visible_from_opened_tables(
+            &base_inodes,
+            &current_inodes,
+            &inode_tombstones,
+            &inode_lifecycle,
+            &base_regular_file,
+            &entry,
+        )?
+        .then_some(entry))
     }
 
     pub(crate) fn get_attr_merged_in_write_txn(
