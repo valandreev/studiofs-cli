@@ -9734,6 +9734,248 @@ fn sustained_write_window_resets_after_idle_or_seek() {
 }
 
 #[test]
+fn sfs740_sustained_write_streams_are_retired_after_last_handle() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let config = VfsConfig {
+        disable_background_slab_flush: true,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) = make_unstarted_test_vfs_with_config(&tmp, "sfs740-retire-many", config);
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        for index in 0..64 {
+            let name = format!("sfs740-{index}.txt");
+            let attr = vfs
+                .create(ROOT_INO, name.as_bytes(), 0, 0, 0o644)
+                .expect("create file");
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open writer");
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                attr.ino,
+                0,
+                b"write",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("write through open handle");
+            assert!(
+                vfs.state
+                    .sustained_write_streams
+                    .lock()
+                    .contains_key(&attr.ino),
+                "opportunistic write should start tracking this inode"
+            );
+
+            if index % 2 == 0 {
+                vfs.release_fh(fh).await.expect("release writer");
+            } else {
+                let outcome = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
+                assert!(outcome.closed_last_handle);
+            }
+
+            assert!(
+                !vfs.state
+                    .sustained_write_streams
+                    .lock()
+                    .contains_key(&attr.ino),
+                "last-handle release should retire the inode's sustained-write state"
+            );
+        }
+
+        assert!(vfs.state.sustained_write_streams.lock().is_empty());
+    });
+}
+
+#[test]
+fn sfs740_sustained_write_state_survives_partial_close_and_restarts_after_reopen() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let config = VfsConfig {
+        disable_background_slab_flush: true,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) = make_unstarted_test_vfs_with_config(&tmp, "sfs740-live-stream", config);
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"sfs740-live.txt", 0, 0, 0o644)
+            .expect("create file");
+        let first = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open first writer");
+        let second = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open second writer");
+        let chunk = b"data";
+
+        vfs.write_fh_with_deferred_materialize(
+            first,
+            attr.ino,
+            0,
+            chunk,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write before partial close");
+
+        let seeded_start_ms = now_unix_millis().saturating_sub(SUSTAINED_WRITE_DELAY_START_MS);
+        {
+            let mut streams = vfs.state.sustained_write_streams.lock();
+            let stream = streams
+                .get_mut(&attr.ino)
+                .expect("first write should create sustained-write state");
+            stream.streak_start_ms = seeded_start_ms;
+            stream.last_write_ms = now_unix_millis().saturating_sub(1);
+            stream.last_end_offset = chunk.len() as u64;
+        }
+
+        vfs.release_fh(first)
+            .await
+            .expect("release one of two handles");
+        assert_eq!(
+            vfs.state
+                .sustained_write_streams
+                .lock()
+                .get(&attr.ino)
+                .expect("non-final close must retain the live inode's stream")
+                .streak_start_ms,
+            seeded_start_ms
+        );
+
+        for offset in [chunk.len() as u64, (2 * chunk.len()) as u64] {
+            vfs.write_fh_with_deferred_materialize(
+                second,
+                attr.ino,
+                offset,
+                chunk,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("continue sequential write stream");
+            let streams = vfs.state.sustained_write_streams.lock();
+            let stream = streams
+                .get(&attr.ino)
+                .expect("live inode's stream should remain tracked");
+            assert_eq!(stream.streak_start_ms, seeded_start_ms);
+            assert_eq!(stream.last_end_offset, offset + chunk.len() as u64);
+        }
+
+        let sustained_decision = {
+            let mut streams = vfs.state.sustained_write_streams.lock();
+            let stream = streams
+                .get_mut(&attr.ino)
+                .expect("live inode's stream should remain tracked");
+            let offset = stream.last_end_offset;
+            let now_ms = stream.last_write_ms.max(
+                stream
+                    .streak_start_ms
+                    .saturating_add(SUSTAINED_WRITE_DELAY_START_MS),
+            );
+            stream.observe(
+                now_ms,
+                offset,
+                1,
+                vfs.write_eager_flush_drain_chunk_bytes,
+                vfs.write_eager_flush_drain_chunk_bytes.saturating_add(1),
+            )
+        };
+        assert!(
+            sustained_decision,
+            "the retained streak should remain eligible"
+        );
+
+        vfs.release_fh(second)
+            .await
+            .expect("release final live handle");
+        assert!(
+            !vfs.state
+                .sustained_write_streams
+                .lock()
+                .contains_key(&attr.ino),
+            "last-handle release should retire the stream"
+        );
+
+        let reopened = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("reopen writer");
+        vfs.write_fh_with_deferred_materialize(
+            reopened,
+            attr.ino,
+            0,
+            b"new",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write after reopen");
+        {
+            let streams = vfs.state.sustained_write_streams.lock();
+            let restarted = streams
+                .get(&attr.ino)
+                .expect("reopened write should create a fresh stream");
+            assert!(restarted.streak_start_ms > seeded_start_ms);
+            assert_eq!(restarted.streak_start_ms, restarted.last_write_ms);
+        }
+        vfs.release_fh(reopened)
+            .await
+            .expect("release reopened writer");
+    });
+}
+
+#[test]
+fn sfs740_closed_handle_write_does_not_resurrect_sustained_tracking() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let config = VfsConfig {
+        disable_background_slab_flush: true,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "sfs740-closed-handle", config);
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"sfs740-closed.txt", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.release_fh(fh).await.expect("release clean writer");
+        assert!(
+            !vfs.state
+                .sustained_write_streams
+                .lock()
+                .contains_key(&attr.ino),
+            "clean release should leave no stream state"
+        );
+
+        let result = vfs
+            .write_fh_with_deferred_materialize(
+                fh,
+                attr.ino,
+                0,
+                b"late write",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "writes through a closed handle should fail"
+        );
+        assert!(
+            !vfs.state
+                .sustained_write_streams
+                .lock()
+                .contains_key(&attr.ino),
+            "a write using a closed handle must not resurrect retired state"
+        );
+    });
+}
+
+#[test]
 fn write_admission_governor_throttles_on_short_runway_before_limit() {
     let mut governor = WriteAdmissionGovernor::default();
 
