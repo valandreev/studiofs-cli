@@ -299,6 +299,8 @@ fn test_readdir_merged_in_write_txn_matches_read_readdir() {
 }
 
 thread_local! {
+    pub(super) static VISIBILITY_SETTINGS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static UNICODE_NAME_LOWERINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static VISIBILITY_TABLE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static OVERLAY_DENTRY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -622,4 +624,120 @@ fn merged_dentry_local_and_missing_lookups_skip_visibility_tables() {
     );
     txn.abort().unwrap();
     assert_eq!(VISIBILITY_TABLE_OPENS.get(), 10);
+}
+
+#[test]
+fn merged_dentry_visibility_skips_settings_and_inode_tables_when_unneeded() {
+    let engine = temp_engine();
+    engine.set_remote_namespace_visibility_filter(true).unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    for (name, kind, in_base) in [
+        (b"directory".as_slice(), FileType::Directory, true),
+        (b"symlink".as_slice(), FileType::Symlink, true),
+        (b"local".as_slice(), FileType::RegularFile, false),
+        (b"remote".as_slice(), FileType::RegularFile, true),
+    ] {
+        let key = encode_dentry_key(ROOT_INO, name);
+        let value = encode(&DirEntryValue { ino: 77, kind }).unwrap();
+        let definition = if in_base {
+            BASE_DENTRIES_TABLE
+        } else {
+            DENTRIES_TABLE
+        };
+        txn.open_table(definition)
+            .unwrap()
+            .insert(key.as_slice(), value.as_slice())
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    for (name, expected, settings, tables) in [
+        (b"directory".as_slice(), Some(77), 0, 0),
+        (b"symlink".as_slice(), Some(77), 0, 0),
+        (b"local".as_slice(), Some(77), 0, 0),
+        (b"missing".as_slice(), None, 0, 0),
+        // A base regular file requires the filter and visibility tables (no attr means hidden).
+        (b"remote".as_slice(), None, 1, 5),
+    ] {
+        VISIBILITY_SETTINGS_READS.set(0);
+        VISIBILITY_TABLE_OPENS.set(0);
+        match expected {
+            Some(ino) => assert_eq!(engine.lookup(ROOT_INO, name).unwrap().ino, ino),
+            None => assert!(matches!(
+                engine.lookup(ROOT_INO, name),
+                Err(MetaError::EntryNotFound { .. })
+            )),
+        }
+        assert_eq!(
+            VISIBILITY_SETTINGS_READS.get(),
+            settings,
+            "read settings: {name:?}"
+        );
+        assert_eq!(
+            VISIBILITY_TABLE_OPENS.get(),
+            tables,
+            "read visibility: {name:?}"
+        );
+        VISIBILITY_SETTINGS_READS.set(0);
+        VISIBILITY_TABLE_OPENS.set(0);
+        let txn = engine.begin_write_txn().unwrap();
+        assert_eq!(
+            RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, name)
+                .unwrap()
+                .map(|entry| entry.ino),
+            expected
+        );
+        txn.abort().unwrap();
+        assert_eq!(
+            VISIBILITY_SETTINGS_READS.get(),
+            settings,
+            "write settings: {name:?}"
+        );
+        assert_eq!(
+            VISIBILITY_TABLE_OPENS.get(),
+            tables,
+            "write visibility: {name:?}"
+        );
+    }
+}
+
+#[test]
+fn ascii_name_mismatches_skip_unicode_lowering_without_changing_unicode_matches() {
+    let engine = temp_engine();
+    let value = encode(&DirEntryValue {
+        ino: 77,
+        kind: FileType::Directory,
+    })
+    .unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut current = txn.open_table(DENTRIES_TABLE).unwrap();
+        for index in 0..10_000 {
+            let key = encode_dentry_key(ROOT_INO, format!("entry-{index}").as_bytes());
+            current.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    UNICODE_NAME_LOWERINGS.set(0);
+    assert!(matches!(
+        engine.lookup(ROOT_INO, b"missing"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(engine.lookup(ROOT_INO, b"ENTRY-9999").unwrap().ino, 77);
+    assert_eq!(UNICODE_NAME_LOWERINGS.get(), 0);
+
+    let txn = engine.begin_write_txn().unwrap();
+    for name in ["K", "İ"] {
+        let key = encode_dentry_key(ROOT_INO, name.as_bytes());
+        txn.open_table(DENTRIES_TABLE)
+            .unwrap()
+            .insert(key.as_slice(), value.as_slice())
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    assert_eq!(engine.lookup(ROOT_INO, b"k").unwrap().ino, 77);
+    assert_eq!(
+        engine.lookup(ROOT_INO, "i\u{307}".as_bytes()).unwrap().ino,
+        77
+    );
+    assert!(UNICODE_NAME_LOWERINGS.get() > 0);
 }

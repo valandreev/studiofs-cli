@@ -13,6 +13,8 @@ impl RedbMetaEngine {
     pub(super) fn remote_namespace_visibility_filter_enabled_in_read_txn(
         txn: &redb::ReadTransaction,
     ) -> MetaResult<bool> {
+        #[cfg(test)]
+        super::tests::VISIBILITY_SETTINGS_READS.with(|count| count.set(count.get() + 1));
         let settings = txn
             .open_table(SETTINGS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -25,6 +27,8 @@ impl RedbMetaEngine {
     pub(super) fn remote_namespace_visibility_filter_enabled_in_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<bool> {
+        #[cfg(test)]
+        super::tests::VISIBILITY_SETTINGS_READS.with(|count| count.set(count.get() + 1));
         let settings = txn
             .open_table(SETTINGS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -112,6 +116,12 @@ impl RedbMetaEngine {
             return true;
         }
 
+        if left.is_ascii() && right.is_ascii() {
+            return false;
+        }
+
+        #[cfg(test)]
+        super::tests::UNICODE_NAME_LOWERINGS.with(|count| count.set(count.get() + 1));
         String::from_utf8_lossy(left).to_lowercase() == right_lower
     }
 
@@ -664,6 +674,9 @@ impl RedbMetaEngine {
             Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
         if entry.is_none()
             || is_overlay
+            || entry
+                .as_ref()
+                .is_some_and(|entry| entry.kind != FileType::RegularFile)
             || !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)?
         {
             return Ok(entry);

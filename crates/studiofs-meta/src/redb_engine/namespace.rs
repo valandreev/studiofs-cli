@@ -30,12 +30,16 @@ impl MetaNamespace for RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let remote_filter_enabled =
-            Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)?;
         let (entry, is_overlay) =
             Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
         let visible = match entry {
-            Some(entry) if !remote_filter_enabled || is_overlay => Some(entry),
+            Some(entry)
+                if is_overlay
+                    || entry.kind != FileType::RegularFile
+                    || !Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)? =>
+            {
+                Some(entry)
+            }
             Some(entry) => {
                 #[cfg(test)]
                 super::tests::VISIBILITY_TABLE_OPENS.with(|count| count.set(count.get() + 5));
