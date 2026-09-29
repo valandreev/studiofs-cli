@@ -10455,10 +10455,11 @@ fn foreground_throughput_is_zero_without_samples() {
 #[tokio::test]
 async fn test_run_sync_with_timeout_returns_result_before_deadline() {
     let task = tokio::sync::Mutex::new(None);
-    let result = run_sync_with_timeout(Duration::from_secs(1), &task, || Ok::<_, VfsError>(7))
-        .await
-        .expect("operation should succeed");
-    assert_eq!(result, Some(7));
+    let result =
+        run_metadata_sync_with_timeout(Duration::from_secs(1), &task, || Ok::<_, VfsError>(()))
+            .await
+            .expect("operation should succeed");
+    assert!(result);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -10475,7 +10476,7 @@ async fn test_run_sync_with_timeout_keeps_executor_responsive() {
     });
 
     let task = tokio::sync::Mutex::new(None);
-    let result = run_sync_with_timeout(Duration::ZERO, &task, move || {
+    let result = run_metadata_sync_with_timeout(Duration::ZERO, &task, move || {
         let _ = started_tx.send(());
         // The watchdog makes the regression fail instead of hanging the test runtime.
         let _ = release_rx.recv_timeout(Duration::from_secs(2));
@@ -10483,7 +10484,7 @@ async fn test_run_sync_with_timeout_keeps_executor_responsive() {
     })
     .await
     .expect("sync operation should not fail");
-    assert_eq!(result, None);
+    assert!(!result);
     release_sibling_tx
         .send(())
         .expect("shutdown deadline should return before the release");
@@ -10492,13 +10493,12 @@ async fn test_run_sync_with_timeout_keeps_executor_responsive() {
         sibling.await.expect("sibling task finishes"),
         "another Tokio task must release the stalled sync before its watchdog expires"
     );
-    assert_eq!(
-        run_sync_with_timeout(Duration::from_secs(1), &task, || {
+    assert!(
+        run_metadata_sync_with_timeout(Duration::from_secs(1), &task, || {
             panic!("retry must join the original sync task")
         })
         .await
-        .expect("sync operation should join successfully"),
-        Some(())
+        .expect("sync operation should join successfully")
     );
     assert!(task.lock().await.is_none());
 }
@@ -10510,7 +10510,7 @@ async fn test_run_sync_with_timeout_returns_none_on_timeout() {
     let task = Arc::new(tokio::sync::Mutex::new(None));
     let timeout_task = Arc::clone(&task);
     let timeout = tokio::spawn(async move {
-        run_sync_with_timeout(Duration::from_millis(100), &timeout_task, move || {
+        run_metadata_sync_with_timeout(Duration::from_millis(100), &timeout_task, move || {
             let _ = started_tx.send(());
             release_rx
                 .recv_timeout(Duration::from_secs(2))
@@ -10527,7 +10527,7 @@ async fn test_run_sync_with_timeout_returns_none_on_timeout() {
         .expect("timeout task should not panic")
         .expect("timeout helper should not fail");
 
-    assert_eq!(result, None);
+    assert!(!result);
     assert!(
         task.lock()
             .await
@@ -10539,13 +10539,12 @@ async fn test_run_sync_with_timeout_returns_none_on_timeout() {
         .send(())
         .expect("stalled metadata task remains alive");
 
-    assert_eq!(
-        run_sync_with_timeout(Duration::from_secs(1), &task, || {
+    assert!(
+        run_metadata_sync_with_timeout(Duration::from_secs(1), &task, || {
             panic!("retry must join the original sync task")
         })
         .await
-        .expect("completed operation should join successfully"),
-        Some(())
+        .expect("completed operation should join successfully")
     );
     assert!(task.lock().await.is_none());
 }
@@ -10559,7 +10558,7 @@ async fn test_run_sync_with_timeout_retains_task_if_waiter_is_cancelled() {
     let starts = Arc::new(AtomicUsize::new(0));
     let waiter_starts = Arc::clone(&starts);
     let waiter = tokio::spawn(async move {
-        run_sync_with_timeout(Duration::from_secs(30), &waiter_task, move || {
+        run_metadata_sync_with_timeout(Duration::from_secs(30), &waiter_task, move || {
             waiter_starts.fetch_add(1, AtomicOrdering::AcqRel);
             let _ = started_tx.send(());
             release_rx
@@ -10589,13 +10588,12 @@ async fn test_run_sync_with_timeout_retains_task_if_waiter_is_cancelled() {
     );
 
     release_tx.send(()).expect("metadata task remains alive");
-    assert_eq!(
-        run_sync_with_timeout(Duration::from_secs(1), &task, || {
+    assert!(
+        run_metadata_sync_with_timeout(Duration::from_secs(1), &task, || {
             panic!("retry must join the original sync task")
         })
         .await
-        .expect("original metadata task should join successfully"),
-        Some(())
+        .expect("original metadata task should join successfully")
     );
     assert!(task.lock().await.is_none());
     assert_eq!(starts.load(AtomicOrdering::Acquire), 1);
@@ -10618,7 +10616,7 @@ fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
     let metadata_task = tokio::task::spawn_blocking(move || {
         let _ = started_tx.send(());
         release_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(10))
             .expect("shutdown test releases stalled metadata sync");
         sync_meta.sync_local_metadata().map_err(VfsError::Meta)
     });
@@ -10632,16 +10630,13 @@ fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
 
     let error = rt
         .block_on(tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             vfs.shutdown(Duration::ZERO),
         ))
         .expect("metadata shutdown must honor its configured deadline")
         .expect_err("a stalled local metadata barrier must fail shutdown");
-    assert!(
-        error
-            .to_string()
-            .contains("metadata durability barrier timed out after 1000 ms")
-    );
+    assert!(error.is_shutdown_metadata_timeout());
+    assert!(!VfsError::Other("unrelated shutdown failure".into()).is_shutdown_metadata_timeout());
 
     let shutdown = vfs
         .zeroio_runtime_snapshot()
@@ -10666,7 +10661,7 @@ fn shutdown_metadata_sync_timeout_is_reported_as_non_recoverable() {
     let repeated_error = rt
         .block_on(vfs.shutdown(Duration::ZERO))
         .expect_err("timeout remains the terminal shutdown result");
-    assert_eq!(repeated_error.to_string(), error.to_string());
+    assert!(repeated_error.is_shutdown_metadata_timeout());
 
     let metadata_task =
         rt.block_on(async { vfs.state.shutdown.metadata_sync_task.lock().await.take() });

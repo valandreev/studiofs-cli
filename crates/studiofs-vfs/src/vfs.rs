@@ -589,6 +589,7 @@ pub enum VfsError {
 
 const SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE: &str =
     "timed out waiting for admitted VFS mutations before shutdown";
+const SHUTDOWN_METADATA_TIMEOUT_PREFIX: &str = "metadata durability barrier timed out after ";
 
 impl VfsError {
     /// Returns whether shutdown may be retried after admitted mutations finish.
@@ -596,8 +597,26 @@ impl VfsError {
         matches!(self, Self::Other(message) if message == SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE)
     }
 
+    /// Returns whether shutdown failed because its local metadata barrier timed out.
+    pub fn is_shutdown_metadata_timeout(&self) -> bool {
+        let Self::Other(message) = self else {
+            return false;
+        };
+        message
+            .strip_prefix(SHUTDOWN_METADATA_TIMEOUT_PREFIX)
+            .and_then(|message| message.strip_suffix(" ms"))
+            .is_some_and(|timeout_ms| timeout_ms.parse::<u128>().is_ok())
+    }
+
     pub(crate) fn shutdown_admission_timeout() -> Self {
         Self::Other(SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE.to_string())
+    }
+
+    pub(crate) fn shutdown_metadata_timeout(timeout: Duration) -> Self {
+        Self::Other(format!(
+            "{SHUTDOWN_METADATA_TIMEOUT_PREFIX}{} ms",
+            timeout.as_millis()
+        ))
     }
 }
 
@@ -1470,26 +1489,29 @@ impl AttrReadCache {
     }
 }
 
-async fn run_sync_with_timeout<T: Send + 'static>(
+async fn run_metadata_sync_with_timeout(
     timeout: Duration,
-    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<T>>>>,
-    operation: impl FnOnce() -> VfsResult<T> + Send + 'static,
-) -> VfsResult<Option<T>> {
+    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
+    operation: impl FnOnce() -> VfsResult<()> + Send + 'static,
+) -> VfsResult<bool> {
     let mut task = task.lock().await;
+
+    // Reuse the original sync after timeout/cancellation; this retry's closure
+    // is dropped instead of starting a competing redb durability barrier.
     let handle = task.get_or_insert_with(|| tokio::task::spawn_blocking(operation));
 
     // Keep the task in shutdown state across both deadlines and cancellation.
     match tokio::time::timeout(timeout, handle).await {
         Ok(result) => {
             task.take();
-            result.map_err(VfsError::Join)?.map(Some)
+            result.map_err(VfsError::Join)?.map(|()| true)
         }
         Err(_) => {
             warn!(
                 timeout_ms = timeout.as_millis() as u64,
-                "run_sync_with_timeout: metadata task exceeded shutdown deadline; retaining its owner until completion"
+                "local metadata sync exceeded shutdown deadline; retaining its owner until completion"
             );
-            Ok(None)
+            Ok(false)
         }
     }
 }
@@ -2417,6 +2439,8 @@ struct ShutdownState {
     shutdown_notify: tokio::sync::Notify,
     background_shutdown_token: CancellationToken,
     uploader_shutdown_token: CancellationToken,
+    // The async lock guards a JoinHandle across `.await`; keep it through timeout
+    // or waiter cancellation so the same redb sync remains owned and joinable.
     metadata_sync_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
     background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,

@@ -710,6 +710,12 @@ impl StudioVfs {
 
     /// Graceful shutdown: drain accepted local state, stop the cached-store
     /// upload queue, cancel uploader tasks, then persist upload state.
+    ///
+    /// If the local metadata barrier exceeds its configured timeout, shutdown
+    /// returns a terminal error but does not cancel the running blocking sync.
+    /// That task may keep redb locked after this VFS is dropped. A caller that
+    /// needs to reopen the same database must terminate this process first;
+    /// subsequent calls to `shutdown` replay the terminal error.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) -> VfsResult<()> {
         let shutdown_owner = loop {
             match self.state.shutdown.claim() {
@@ -844,7 +850,7 @@ impl StudioVfs {
         let meta = self.sync_meta();
         let overlay_barrier_error = self.wait_for_volatile_overlay_batches().await.err();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
-        let metadata_flush_result = super::run_sync_with_timeout(
+        let metadata_flush_result = super::run_metadata_sync_with_timeout(
             metadata_flush_timeout,
             &self.state.shutdown.metadata_sync_task,
             move || meta.sync_local_metadata().map_err(VfsError::Meta),
@@ -858,25 +864,20 @@ impl StudioVfs {
             overlay_health_error,
         );
         let metadata_flush_outcome = match metadata_flush_result {
-            Ok(Some(()))
-                if deferred_namespace_error.is_none() && metadata_barrier_error.is_none() =>
-            {
+            Ok(true) if deferred_namespace_error.is_none() && metadata_barrier_error.is_none() => {
                 "success"
             }
-            Ok(Some(())) => {
+            Ok(true) => {
                 warn!("VFS shutdown: local metadata drain failed before the final barrier");
                 "failed"
             }
-            Ok(None) => {
+            Ok(false) => {
                 warn!(
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
-                    "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
+                    "VFS shutdown: local metadata flush timed out; local durability barrier remains incomplete"
                 );
                 metadata_barrier_error.get_or_insert_with(|| {
-                    VfsError::Other(format!(
-                        "metadata durability barrier timed out after {} ms",
-                        metadata_flush_timeout.as_millis()
-                    ))
+                    VfsError::shutdown_metadata_timeout(metadata_flush_timeout)
                 });
                 "timeout"
             }
