@@ -933,10 +933,12 @@ fn note_critical_vfs_error(error: &studiofs_vfs::VfsError) {
     if matches!(
         classify_vfs_error(error),
         BridgeVfsErrorKind::CriticalRuntimeFailure
-    ) && let studiofs_vfs::VfsError::Join(join_err) = error
-    {
+    ) && matches!(
+        error,
+        studiofs_vfs::VfsError::Join(_) | studiofs_vfs::VfsError::ShutdownJoin(_)
+    ) {
         error!(
-            error = %join_err,
+            error = %error,
             "critical runtime failure (JoinError), requesting emergency unmount"
         );
         crate::request_shutdown();

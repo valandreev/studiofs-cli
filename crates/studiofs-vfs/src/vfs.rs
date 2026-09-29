@@ -522,6 +522,10 @@ pub enum VfsError {
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 
+    /// A task join failure normalized so terminal shutdown results can be replayed.
+    #[error("task join error: {0}")]
+    ShutdownJoin(String),
+
     /// Object-layer failure while decoding or writing payload objects.
     #[error("object error: {0}")]
     Object(#[from] studiofs_data::object::ObjectError),
@@ -582,6 +586,10 @@ pub enum VfsError {
     #[error("upload stage error: {0}")]
     UploadStage(#[from] UploadStageStoreError),
 
+    /// The local metadata durability barrier exceeded its shutdown deadline.
+    #[error("metadata durability barrier timed out after {0} ms")]
+    ShutdownMetadataTimeout(u128),
+
     /// Generic fallback VFS error.
     #[error("{0}")]
     Other(String),
@@ -589,7 +597,6 @@ pub enum VfsError {
 
 const SHUTDOWN_ADMISSION_TIMEOUT_MESSAGE: &str =
     "timed out waiting for admitted VFS mutations before shutdown";
-const SHUTDOWN_METADATA_TIMEOUT_PREFIX: &str = "metadata durability barrier timed out after ";
 
 impl VfsError {
     /// Returns whether shutdown may be retried after admitted mutations finish.
@@ -599,13 +606,7 @@ impl VfsError {
 
     /// Returns whether shutdown failed because its local metadata barrier timed out.
     pub fn is_shutdown_metadata_timeout(&self) -> bool {
-        let Self::Other(message) = self else {
-            return false;
-        };
-        message
-            .strip_prefix(SHUTDOWN_METADATA_TIMEOUT_PREFIX)
-            .and_then(|message| message.strip_suffix(" ms"))
-            .is_some_and(|timeout_ms| timeout_ms.parse::<u128>().is_ok())
+        matches!(self, Self::ShutdownMetadataTimeout(_))
     }
 
     pub(crate) fn shutdown_admission_timeout() -> Self {
@@ -613,10 +614,7 @@ impl VfsError {
     }
 
     pub(crate) fn shutdown_metadata_timeout(timeout: Duration) -> Self {
-        Self::Other(format!(
-            "{SHUTDOWN_METADATA_TIMEOUT_PREFIX}{} ms",
-            timeout.as_millis()
-        ))
+        Self::ShutdownMetadataTimeout(timeout.as_millis())
     }
 }
 
@@ -1489,31 +1487,52 @@ impl AttrReadCache {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataSyncOutcome {
+    Completed,
+    TimedOut,
+}
+
 async fn run_metadata_sync_with_timeout(
     timeout: Duration,
     task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
     operation: impl FnOnce() -> VfsResult<()> + Send + 'static,
-) -> VfsResult<bool> {
+) -> VfsResult<MetadataSyncOutcome> {
     let mut task = task.lock().await;
 
-    // Reuse the original sync after timeout/cancellation; this retry's closure
-    // is dropped instead of starting a competing redb durability barrier.
+    // A shutdown timeout is terminal; only a cancelled waiter retries in production.
+    // Direct helper tests also retry after timeout; all reuse this sync, never a competing barrier.
     let handle = task.get_or_insert_with(|| tokio::task::spawn_blocking(operation));
 
     // Keep the task in shutdown state across both deadlines and cancellation.
     match tokio::time::timeout(timeout, handle).await {
         Ok(result) => {
             task.take();
-            result.map_err(VfsError::Join)?.map(|()| true)
+            result
+                .map_err(VfsError::Join)?
+                .map(|()| MetadataSyncOutcome::Completed)
         }
         Err(_) => {
             warn!(
                 timeout_ms = timeout.as_millis() as u64,
                 "local metadata sync exceeded shutdown deadline; retaining its owner until completion"
             );
-            Ok(false)
+            Ok(MetadataSyncOutcome::TimedOut)
         }
     }
+}
+
+async fn join_pending_metadata_sync_task(
+    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<VfsResult<()>>>>,
+) -> VfsResult<()> {
+    // Holding the lock through `.await` keeps the only handle in shared state if this waiter drops.
+    let mut task = task.lock().await;
+    let Some(handle) = task.as_mut() else {
+        return Ok(());
+    };
+    let result = handle.await;
+    task.take();
+    result.map_err(|error| VfsError::ShutdownJoin(error.to_string()))?
 }
 
 // =============================================================================
@@ -2282,6 +2301,8 @@ pub(crate) enum ShutdownError {
         kind: io::ErrorKind,
         message: String,
     },
+    Join(String),
+    MetadataTimeout(u128),
     BlockNotFound(Ino, u32),
     WouldBlock,
     RemoteContentPending,
@@ -2326,6 +2347,9 @@ impl ShutdownError {
                 kind: error.kind(),
                 message: error.to_string(),
             },
+            VfsError::Join(error) => Self::Join(error.to_string()),
+            VfsError::ShutdownJoin(message) => Self::Join(message.clone()),
+            VfsError::ShutdownMetadataTimeout(timeout_ms) => Self::MetadataTimeout(*timeout_ms),
             VfsError::BlockNotFound(ino, block) => Self::BlockNotFound(*ino, *block),
             VfsError::WouldBlock => Self::WouldBlock,
             VfsError::RemoteContentPending => Self::RemoteContentPending,
@@ -2377,6 +2401,8 @@ impl ShutdownError {
             Self::Meta(error) => VfsError::Meta(error),
             Self::Data(message) => VfsError::Data(DataError::Storage(message)),
             Self::Io { kind, message } => VfsError::Io(io::Error::new(kind, message)),
+            Self::Join(message) => VfsError::ShutdownJoin(message),
+            Self::MetadataTimeout(timeout_ms) => VfsError::ShutdownMetadataTimeout(timeout_ms),
             Self::BlockNotFound(ino, block) => VfsError::BlockNotFound(ino, block),
             Self::WouldBlock => VfsError::WouldBlock,
             Self::RemoteContentPending => VfsError::RemoteContentPending,

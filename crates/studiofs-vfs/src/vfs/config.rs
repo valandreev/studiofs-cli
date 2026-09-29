@@ -369,8 +369,10 @@ pub struct VfsConfig {
     /// Maximum wait for the local metadata durability barrier during shutdown.
     ///
     /// Expiry fails shutdown but does not cancel an already-running blocking
-    /// sync. That task may keep redb locked after the VFS is dropped, so opening
-    /// the same database again requires process teardown first.
+    /// sync. After shutdown returns, call
+    /// [`crate::vfs::StudioVfs::join_pending_metadata_sync`] before dropping the
+    /// VFS if this process needs to reopen the same database; otherwise the
+    /// detached task may keep redb locked until it finishes.
     pub shutdown_metadata_flush_timeout_secs: u64,
     /// QoS slots for accept operations.
     pub qos_accept_slots: usize,

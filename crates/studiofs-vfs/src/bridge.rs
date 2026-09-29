@@ -66,7 +66,8 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     match error {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
         VfsError::Io(io_error) => classify_io_error(io_error.kind()),
-        VfsError::Join(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
+        VfsError::Join(_) | VfsError::ShutdownJoin(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
+        VfsError::ShutdownMetadataTimeout(_) => BridgeVfsErrorKind::TimedOut,
         VfsError::Object(_) | VfsError::BlockNotFound(_, _) => BridgeVfsErrorKind::DataCorruption,
         VfsError::MetadataPersistenceDegraded => BridgeVfsErrorKind::MetadataPersistenceDegraded,
         VfsError::LocalPayload(local_error) => classify_local_payload_error(local_error),
