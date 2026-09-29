@@ -549,17 +549,15 @@ impl SessionConfig {
     /// Build owned argv strings for libfuse.
     pub fn argv_strings(&self) -> Vec<String> {
         let args = vec!["studiofs-macfuse".to_owned()];
-        let _ = self.read_only;
         // `run_in_foreground` is runner policy. The macFUSE 2.x low-level
-        // session constructor rejects `-f`. macFUSE 5.2.0 also rejects `ro`
-        // for low-level sessions, so read-only behavior is enforced by the
-        // StudioFS callback adapter rather than a kernel mount option.
+        // session constructor rejects `-f` and mount-only options such as `ro`.
+        // Read-only policy belongs in mount_argv_strings, not session arguments.
         args
     }
 
     /// Build owned argv strings for the macFUSE mount channel.
     pub fn mount_argv_strings(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "studiofs-macfuse".to_owned(),
             format!("-ovolname={}", self.volume_name),
             "-olocal".to_owned(),
@@ -567,9 +565,13 @@ impl SessionConfig {
             "-oauto_cache".to_owned(),
             format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"),
             format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"),
-            "-odefer_permissions".to_owned(),
+            "-odefault_permissions".to_owned(),
             "-osparse".to_owned(),
-        ]
+        ];
+        if self.read_only {
+            args.push("-ordonly".to_owned());
+        }
+        args
     }
 
     fn mount_point_cstring(&self) -> io::Result<CString> {

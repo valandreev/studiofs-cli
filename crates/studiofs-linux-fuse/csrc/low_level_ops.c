@@ -53,7 +53,6 @@ extern void studiofs_linux_fuse_opendir(fuse_req_t req, fuse_ino_t ino, struct f
 extern void studiofs_linux_fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_statfs(fuse_req_t req, fuse_ino_t ino);
-extern void studiofs_linux_fuse_access(fuse_req_t req, fuse_ino_t ino, int mask);
 extern void studiofs_linux_fuse_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags);
 extern void studiofs_linux_fuse_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size);
 extern void studiofs_linux_fuse_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size);
@@ -85,7 +84,6 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .readdir = studiofs_linux_fuse_readdir,
     .releasedir = studiofs_linux_fuse_releasedir,
     .statfs = studiofs_linux_fuse_statfs,
-    .access = studiofs_linux_fuse_access,
     .setxattr = studiofs_linux_fuse_setxattr,
     .getxattr = studiofs_linux_fuse_getxattr,
     .listxattr = studiofs_linux_fuse_listxattr,
@@ -265,7 +263,7 @@ int studiofs_linux_fuse_file_info_flags(const struct fuse_file_info *info) {
 
 int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->lookup && ops->getattr && ops->setattr && ops->opendir &&
-           ops->readdir && ops->releasedir && ops->statfs && ops->access;
+           ops->readdir && ops->releasedir && ops->statfs && ops->access == NULL;
 }
 
 int studiofs_linux_fuse_low_level_ops_has_forget_callback(const struct fuse_lowlevel_ops *ops) {

@@ -243,13 +243,6 @@ struct FuseOpenIn {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct FuseAccessIn {
-    mask: u32,
-    padding: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
 struct FuseOpenOut {
     fh: u64,
     open_flags: u32,
@@ -784,7 +777,7 @@ fn handle_mount_ready(
 }
 
 impl FsKitSession {
-    fn mount(mount_point: &Path, volume_name: &str) -> io::Result<Self> {
+    fn mount(mount_point: &Path, volume_name: &str, read_only: bool) -> io::Result<Self> {
         if !mount_point.starts_with(Path::new("/Volumes")) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -793,7 +786,7 @@ impl FsKitSession {
         }
         let mount_point = CString::new(mount_point.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount point contains NUL"))?;
-        let options = mount_options(volume_name)?;
+        let options = mount_options(volume_name, read_only)?;
         // SAFETY: MFChannelCreate returns an owned channel or NULL.
         let channel = NonNull::new(unsafe { MFChannelCreate() }).ok_or_else(|| {
             io::Error::other(format!(
@@ -1014,19 +1007,23 @@ impl Drop for FsKitSession {
     }
 }
 
-fn mount_options(volume_name: &str) -> io::Result<CString> {
+fn mount_options(volume_name: &str, read_only: bool) -> io::Result<CString> {
     if volume_name.contains(',') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "volume name cannot contain a comma for MFMount options",
         ));
     }
-    CString::new(format!(
-        "volname={volume_name},local,novncache,auto_cache,iosize={},max_read={},defer_permissions,sparse",
+    let mut options = format!(
+        "volname={volume_name},local,novncache,auto_cache,iosize={},max_read={},default_permissions,sparse",
         low_level::MACOS_FUSE_IOSIZE_BYTES,
         low_level::MACOS_FUSE_IOSIZE_BYTES,
-    ))
-    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "volume name contains NUL"))
+    );
+    if read_only {
+        options.push_str(",rdonly");
+    }
+    CString::new(options)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "volume name contains NUL"))
 }
 
 fn mount_result_error(result: i32) -> io::Error {
@@ -1917,22 +1914,11 @@ impl FsKitDispatcher {
     }
 
     fn access(&self, request: FsKitRequest) {
-        let input = match request.operation::<FuseAccessIn>(size_of::<FuseInHeader>()) {
-            Ok(input) => input,
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-                return;
-            }
-        };
-        match self
-            .adapter
-            .access(request.header().nodeid, input.mask as i32)
-        {
-            Ok(()) => self.empty_success(request),
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-            }
-        }
+        // default_permissions keeps access checks in the native kernel, which
+        // has the complete caller credentials. Reject unexpected wire requests;
+        // ENOSYS would permanently grant access on FUSE implementations.
+        warn!("unexpected macFUSE FSKit ACCESS with default_permissions; denying access");
+        let _ = request.reply_error(libc::EACCES);
     }
 
     fn setattr(&self, request: FsKitRequest) {
@@ -2507,7 +2493,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
     if !crate::CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
         crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     }
-    let mut session = FsKitSession::mount(&mount_point, &volume_name)?;
+    let mut session = FsKitSession::mount(&mount_point, &volume_name, read_only)?;
     let callback_state = Arc::new(CallbackState::new(
         Arc::clone(&vfs),
         runtime_handle.clone(),
@@ -3154,23 +3140,6 @@ mod tests {
     }
 
     #[test]
-    fn access_request_preserves_its_requested_mask() {
-        assert_eq!(size_of::<FuseAccessIn>(), size_of::<u64>());
-
-        let mut bytes = vec![0_u8; size_of::<FuseInHeader>()];
-        bytes.extend_from_slice(&(libc::W_OK as u32).to_ne_bytes());
-        bytes.extend_from_slice(&0_u32.to_ne_bytes());
-        let len = u32::try_from(bytes.len()).expect("access body length");
-        bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
-
-        let body = parse_message_body(bytes).expect("parse access body");
-        let input = read_copy::<FuseAccessIn>(&body.bytes, size_of::<FuseInHeader>())
-            .expect("parse access input");
-
-        assert_eq!(input.mask, libc::W_OK as u32);
-    }
-
-    #[test]
     fn eof_read_uses_the_regular_success_reply_path() {
         assert!(!read_reply_uses_transport_buffer(&[], 4096));
         assert!(read_reply_uses_transport_buffer(&[], 0));
@@ -3206,11 +3175,36 @@ mod tests {
 
     #[test]
     fn mount_options_keep_the_fskit_fallback_explicit() {
-        let options = mount_options("StudioFS").expect("valid options");
+        let options = mount_options("StudioFS", false).expect("valid options");
         let options = options.to_str().expect("ASCII options");
         assert!(options.contains("local"));
         assert!(options.contains("novncache"));
         assert!(options.contains("volname=StudioFS"));
+        assert!(
+            options
+                .split(',')
+                .any(|option| option == "default_permissions")
+        );
+        assert!(
+            !options
+                .split(',')
+                .any(|option| option == "defer_permissions")
+        );
+    }
+
+    #[test]
+    fn mfmount_options_preserve_read_only_policy() {
+        for read_only in [false, true] {
+            let options = mount_options("StudioFS", read_only).expect("options");
+            assert_eq!(
+                options
+                    .to_str()
+                    .expect("ASCII")
+                    .split(',')
+                    .any(|option| option == "rdonly"),
+                read_only
+            );
+        }
     }
 
     #[test]
@@ -3228,7 +3222,7 @@ mod tests {
 
     #[test]
     fn fskit_mount_preflight_rejects_paths_outside_volumes() {
-        let result = FsKitSession::mount(Path::new("/tmp/studiofs-fskit-test"), "StudioFS");
+        let result = FsKitSession::mount(Path::new("/tmp/studiofs-fskit-test"), "StudioFS", false);
 
         let error = match result {
             Ok(_) => panic!("FSKit must reject a non-/Volumes path before FFI"),
@@ -3239,8 +3233,8 @@ mod tests {
 
     #[test]
     fn fskit_mount_options_reject_ambiguous_volume_names() {
-        assert!(mount_options("Studio,FS").is_err());
-        assert!(mount_options("Studio\0FS").is_err());
+        assert!(mount_options("Studio,FS", false).is_err());
+        assert!(mount_options("Studio\0FS", false).is_err());
     }
 
     #[test]
