@@ -10085,27 +10085,30 @@ fn sfs740_read_only_final_close_does_not_take_sustained_tracker_lock() {
         .open_file(attr.ino, OpenFlags::RDONLY, false)
         .expect("open reader");
     let tracker = vfs.state.sustained_write_streams.lock();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (closed_tx, closed_rx) = std::sync::mpsc::channel();
     let worker_vfs = Arc::clone(&vfs);
     let runtime_handle = rt.handle().clone();
     let worker = std::thread::spawn(move || {
-        started_tx.send(()).expect("signal close start");
         let closed = runtime_handle.block_on(worker_vfs.release_fh(reader));
         closed_tx.send(closed.is_ok()).expect("signal close result");
     });
 
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("close worker should start");
-    let completed_while_tracker_was_locked =
-        closed_rx.recv_timeout(std::time::Duration::from_secs(1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while vfs.open_count(attr.ino) != 0 && std::time::Instant::now() < deadline {
+        thread::yield_now();
+    }
+    let handle_removed_before_deadline = vfs.open_count(attr.ino) == 0;
+    let completed_while_tracker_was_locked = if handle_removed_before_deadline {
+        closed_rx.recv_timeout(Duration::from_secs(5))
+    } else {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    };
     let completed_before_unlock = completed_while_tracker_was_locked.is_ok();
     drop(tracker);
     let closed = match completed_while_tracker_was_locked {
         Ok(closed) => closed,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => closed_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(5))
             .expect("close worker should finish after tracker unlock"),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             panic!("close worker disconnected before reporting its result")
@@ -10116,8 +10119,12 @@ fn sfs740_read_only_final_close_does_not_take_sustained_tracker_lock() {
     }
 
     assert!(
+        handle_removed_before_deadline,
+        "close worker should remove the handle within the bounded wait"
+    );
+    assert!(
         completed_before_unlock,
-        "read-only final close must not wait for the sustained-write tracker"
+        "read-only final close must not wait for the sustained-write tracker after removing the handle"
     );
     assert_eq!(
         vfs.open_count(attr.ino),

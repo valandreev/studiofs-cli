@@ -1920,7 +1920,9 @@ impl SessionState {
             FileType::Symlink => return Err(libc::EINVAL),
         }
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        if self.read_only && (trunc || open_flags.allows_write()) {
+        let write_access =
+            open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR);
+        if self.read_only && (trunc || write_access) {
             return Err(libc::EROFS);
         }
         let fh = self
@@ -4816,6 +4818,29 @@ mod tests {
             state.write(1, std::ptr::null(), 0, 0, std::ptr::null()),
             Err(libc::EROFS)
         );
+    }
+
+    #[test]
+    fn read_only_mount_allows_read_only_append_open() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-read-only-append")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            true,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"read-only-append.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let open = state
+            .open_with_flags(attr.ino, libc::O_RDONLY | libc::O_APPEND)
+            .expect("O_APPEND does not make a read-only open writable");
+        let release = state.release(open.fh);
+        finish_regular_release_with(&state, Some(open.fh), release, |_| {});
     }
 
     #[test]
