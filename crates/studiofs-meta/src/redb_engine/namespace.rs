@@ -47,21 +47,12 @@ impl MetaNamespace for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let remote_filter_enabled =
             Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-        let key = encode_dentry_key(parent, name);
-        let entry = Self::lookup_merged_from_opened_tables(
-            &base,
-            &current,
-            &tombstones,
-            parent,
-            name,
-            &overlay_dentries,
-        )?;
+        let (entry, is_overlay) =
+            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
         let visible = match entry {
             Some(entry)
                 if !remote_filter_enabled
-                    || overlay_dentries.contains(&key)
+                    || is_overlay
                     || Self::remote_namespace_entry_visible_from_opened_tables(
                         &base_inodes,
                         &current_inodes,

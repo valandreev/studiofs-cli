@@ -197,6 +197,8 @@ impl RedbMetaEngine {
         TBase: ReadableTable<&'static [u8], &'static [u8]>,
         TTombstones: ReadableTable<&'static [u8], u8>,
     {
+        #[cfg(test)]
+        super::tests::OVERLAY_DENTRY_SCANS.with(|count| count.set(count.get() + 1));
         let mut overlay = HashSet::new();
 
         for row in current
@@ -227,14 +229,14 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
+    // The boolean records exact-key local authority for remote visibility filtering.
     pub(super) fn lookup_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
         current: &TCurrent,
         tombstones: &TTombstones,
         parent: Ino,
         name: &[u8],
-        overlay_dentries: &HashSet<Vec<u8>>,
-    ) -> MetaResult<Option<DirEntryValue>>
+    ) -> MetaResult<(Option<DirEntryValue>, bool)>
     where
         TBase: ReadableTable<&'static [u8], &'static [u8]>,
         TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
@@ -246,18 +248,34 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .is_some()
         {
-            return Ok(None);
+            return Ok((None, true));
         }
 
-        if overlay_dentries.contains(&key) {
-            return Self::lookup_in_opened_dentry_table(current, parent, name);
+        let current_value = current
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_value = base
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(value) = current_value.as_ref()
+            && base_value
+                .as_ref()
+                .is_none_or(|base| base.value() != value.value())
+        {
+            return Ok((Some(decode(value.value())?), true));
+        }
+        if let Some(value) = base_value {
+            return Ok((Some(decode(value.value())?), false));
         }
 
+        // Preserve the existing case-insensitive, parent-scoped fallback on exact misses.
         if let Some(entry) = Self::lookup_in_opened_dentry_table(base, parent, name)? {
-            return Ok(Some(entry));
+            return Ok((Some(entry), false));
         }
-
-        Self::lookup_in_opened_dentry_table(current, parent, name)
+        Ok((
+            Self::lookup_in_opened_dentry_table(current, parent, name)?,
+            false,
+        ))
     }
 
     pub(super) fn regular_file_has_published_base_from_opened_table<T>(
@@ -596,17 +614,8 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-        let key = encode_dentry_key(parent, name);
-        let entry = Self::lookup_merged_from_opened_tables(
-            &base,
-            &current,
-            &tombstones,
-            parent,
-            name,
-            &overlay_dentries,
-        )?;
+        let (entry, is_overlay) =
+            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
         if !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)? {
             return Ok(entry);
         }
@@ -627,7 +636,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(match entry {
             Some(entry)
-                if overlay_dentries.contains(&key)
+                if is_overlay
                     || Self::remote_namespace_entry_visible_from_opened_tables(
                         &base_inodes,
                         &current_inodes,

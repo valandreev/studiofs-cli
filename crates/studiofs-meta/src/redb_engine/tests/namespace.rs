@@ -297,3 +297,171 @@ fn test_readdir_merged_in_write_txn_matches_read_readdir() {
 
     assert_eq!(merged, expected);
 }
+
+thread_local! {
+    pub(super) static OVERLAY_DENTRY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn merged_dentry_point_lookups_and_create_batch_do_not_scan_large_volume() {
+    let engine = temp_engine();
+    let target = engine
+        .create_file(ROOT_INO, b"target", 1000, 1000, 0o644)
+        .unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut table = txn.open_table(DENTRIES_TABLE).unwrap();
+        let value = encode(&DirEntryValue {
+            ino: target.ino,
+            kind: FileType::RegularFile,
+        })
+        .unwrap();
+        for parent in 10_000..20_000 {
+            let key = encode_dentry_key(parent, b"unrelated");
+            table.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Prove the counter observes the expensive operation before testing its absence.
+    OVERLAY_DENTRY_SCANS.set(0);
+    assert_eq!(engine.local_overlay_dentries().unwrap().len(), 10_001);
+    assert_eq!(OVERLAY_DENTRY_SCANS.get(), 1);
+    OVERLAY_DENTRY_SCANS.set(0);
+    assert_eq!(engine.lookup(ROOT_INO, b"target").unwrap().ino, target.ino);
+    assert_eq!(
+        OVERLAY_DENTRY_SCANS.get(),
+        0,
+        "read lookup scanned the volume"
+    );
+
+    let txn = engine.begin_write_txn().unwrap();
+    assert_eq!(
+        RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, b"target")
+            .unwrap()
+            .unwrap()
+            .ino,
+        target.ino
+    );
+    txn.abort().unwrap();
+    assert_eq!(
+        OVERLAY_DENTRY_SCANS.get(),
+        0,
+        "write lookup scanned the volume"
+    );
+
+    let mutations: Vec<_> = (0..32)
+        .map(|index| NamespaceMutation::CreateFile {
+            ino: 30_000 + index,
+            parent: ROOT_INO,
+            name: format!("batch-{index}").into_bytes(),
+            uid: 1000,
+            gid: 1000,
+            mode: 0o644,
+        })
+        .collect();
+    assert_eq!(
+        engine.apply_namespace_mutations(&mutations).unwrap().len(),
+        32
+    );
+    assert_eq!(
+        OVERLAY_DENTRY_SCANS.get(),
+        0,
+        "create batch scanned the volume"
+    );
+    assert_eq!(engine.lookup(ROOT_INO, b"batch-31").unwrap().ino, 30_031);
+}
+
+#[test]
+fn merged_dentry_point_lookups_preserve_overlay_and_visibility_semantics() {
+    // Equal rows must use remote visibility; differing current rows retain local authority.
+    for filter in [false, true] {
+        for (name, base_ino, current_ino, tombstone, expected) in [
+            (b"base-only".as_slice(), Some(77), None, false, Some(77)),
+            (b"current-only".as_slice(), None, Some(88), false, Some(88)),
+            (b"different".as_slice(), Some(77), Some(88), false, Some(88)),
+            (b"equal".as_slice(), Some(77), Some(77), false, Some(77)),
+            (b"deleted".as_slice(), Some(77), Some(88), true, None),
+            (b"missing".as_slice(), None, None, false, None),
+        ] {
+            let engine = temp_engine();
+            engine
+                .set_remote_namespace_visibility_filter(filter)
+                .unwrap();
+            let txn = engine.begin_write_txn().unwrap();
+            let key = encode_dentry_key(ROOT_INO, name);
+            for (definition, ino) in [
+                (BASE_DENTRIES_TABLE, base_ino),
+                (DENTRIES_TABLE, current_ino),
+            ] {
+                if let Some(ino) = ino {
+                    let value = encode(&DirEntryValue {
+                        ino,
+                        kind: FileType::RegularFile,
+                    })
+                    .unwrap();
+                    txn.open_table(definition)
+                        .unwrap()
+                        .insert(key.as_slice(), value.as_slice())
+                        .unwrap();
+                }
+            }
+            if tombstone {
+                txn.open_table(DENTRY_TOMBSTONES_TABLE)
+                    .unwrap()
+                    .insert(key.as_slice(), 1)
+                    .unwrap();
+            }
+            // No inode row means equal/base-only entries are hidden by the remote filter.
+            let expected = if filter && (current_ino == base_ino || current_ino.is_none()) {
+                None
+            } else {
+                expected
+            };
+            assert_eq!(
+                RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, name)
+                    .unwrap()
+                    .map(|entry| entry.ino),
+                expected,
+                "write: {name:?}, filter={filter}"
+            );
+            txn.commit().unwrap();
+            let read = engine.lookup(ROOT_INO, name);
+            match expected {
+                Some(ino) => assert_eq!(read.unwrap().ino, ino),
+                None => assert!(matches!(read, Err(MetaError::EntryNotFound { .. }))),
+            }
+        }
+    }
+}
+
+#[test]
+fn merged_dentry_point_lookups_preserve_case_insensitive_base_fallback() {
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    let key = encode_dentry_key(ROOT_INO, b"MiXeD");
+    for (definition, ino) in [(BASE_DENTRIES_TABLE, 77), (DENTRIES_TABLE, 88)] {
+        let value = encode(&DirEntryValue {
+            ino,
+            kind: FileType::Directory,
+        })
+        .unwrap();
+        txn.open_table(definition)
+            .unwrap()
+            .insert(key.as_slice(), value.as_slice())
+            .unwrap();
+    }
+    // The existing fallback searches base first when the requested exact key is absent.
+    for (name, expected) in [(b"MiXeD".as_slice(), 88), (b"mixed".as_slice(), 77)] {
+        assert_eq!(
+            RedbMetaEngine::lookup_merged_in_write_txn(&txn, ROOT_INO, name)
+                .unwrap()
+                .unwrap()
+                .ino,
+            expected
+        );
+    }
+    txn.commit().unwrap();
+    assert_eq!(engine.lookup(ROOT_INO, b"MiXeD").unwrap().ino, 88);
+    assert_eq!(engine.lookup(ROOT_INO, b"mixed").unwrap().ino, 77);
+}
