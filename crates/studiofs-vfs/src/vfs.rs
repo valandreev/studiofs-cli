@@ -9887,8 +9887,7 @@ impl StudioVfs {
         if let Some(ignored_attr) = self.ignored_entry_attr(ino) {
             let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
             let open_file =
-                self.handle_table
-                    .open(ino, flags, Some(ignored_attr), active_open_overlay);
+                self.open_file_handle(ino, flags, Some(ignored_attr), active_open_overlay);
             let fh = open_file.fh;
             open_file.set_read_ahead_owner(read_ahead_owner);
             self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
@@ -9929,7 +9928,7 @@ impl StudioVfs {
         }
 
         let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
-        let open_file = self.handle_table.open(
+        let open_file = self.open_file_handle(
             ino,
             flags,
             Some(read_context.attr.clone()),
@@ -9964,6 +9963,32 @@ impl StudioVfs {
         }
 
         Ok(fh)
+    }
+
+    fn open_file_handle(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        open_attr: Option<InodeAttr>,
+        active_open_overlay: bool,
+    ) -> OpenFile {
+        if !flags.allows_write() {
+            return self
+                .handle_table
+                .open(ino, flags, open_attr, active_open_overlay);
+        }
+
+        let mut streams = self.state.sustained_write_streams.lock();
+        let (open_file, starts_writer_epoch) = self.handle_table.open_with_writer_transition(
+            ino,
+            flags,
+            open_attr,
+            active_open_overlay,
+        );
+        if starts_writer_epoch {
+            streams.remove(&ino);
+        }
+        open_file
     }
     // =========================================================================
     // Background Tasks

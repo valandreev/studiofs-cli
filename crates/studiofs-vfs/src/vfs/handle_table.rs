@@ -51,6 +51,18 @@ impl HandleTable {
         open_attr: Option<InodeAttr>,
         active_open_overlay: bool,
     ) -> OpenFile {
+        self.open_with_writer_transition(ino, flags, open_attr, active_open_overlay)
+            .0
+    }
+
+    /// Open a handle and report whether it starts a new writer epoch.
+    pub(super) fn open_with_writer_transition(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        open_attr: Option<InodeAttr>,
+        active_open_overlay: bool,
+    ) -> (OpenFile, bool) {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
         let mut handles = self.handles.write();
@@ -58,11 +70,12 @@ impl HandleTable {
         handles.handles_by_inode.entry(ino).or_default().insert(fh);
         let counts_for_inode = handles.counts.entry(ino).or_default();
         counts_for_inode.open = counts_for_inode.open.saturating_add(1);
+        let starts_writer_epoch = flags.allows_write() && counts_for_inode.write == 0;
         if flags.allows_write() {
             counts_for_inode.write = counts_for_inode.write.saturating_add(1);
         }
         drop(handles);
-        open_file
+        (open_file, starts_writer_epoch)
     }
 
     /// Look up an open file handle.

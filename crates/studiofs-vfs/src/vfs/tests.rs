@@ -9974,6 +9974,53 @@ fn sfs740_sustained_write_state_restarts_after_reopen() {
 }
 
 #[test]
+fn sfs740_first_writer_after_zero_count_starts_a_fresh_streak() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs740-first-writer-epoch");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"sfs740-first-writer.txt", 0, 0, 0o644)
+            .expect("create file");
+        let stale_start_ms = now_unix_millis().saturating_sub(SUSTAINED_WRITE_DELAY_START_MS);
+        vfs.state.sustained_write_streams.lock().insert(
+            attr.ino,
+            SustainedWriteState {
+                streak_start_ms: stale_start_ms,
+                last_write_ms: stale_start_ms,
+                last_end_offset: 0,
+            },
+        );
+
+        let reopened = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open first writer after zero-count window");
+        vfs.write_fh_with_deferred_materialize(
+            reopened,
+            attr.ino,
+            0,
+            b"new",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write from the new writer epoch");
+
+        {
+            let streams = vfs.state.sustained_write_streams.lock();
+            let restarted = streams
+                .get(&attr.ino)
+                .expect("new write should create sustained-write state");
+            assert!(restarted.streak_start_ms > stale_start_ms);
+            assert_eq!(restarted.streak_start_ms, restarted.last_write_ms);
+        }
+        vfs.release_fh(reopened)
+            .await
+            .expect("release reopened writer");
+    });
+}
+
+#[test]
 fn sfs740_read_only_handle_write_does_not_change_live_writer_streak() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs740-read-only-write");

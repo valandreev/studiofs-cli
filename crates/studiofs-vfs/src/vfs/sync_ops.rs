@@ -734,7 +734,8 @@ impl StudioVfs {
         };
         if open_file.flags.allows_write() && remaining_write == 0 {
             // The close snapshot skips the tracker while a writer remains.
-            // Recheck because a writer may reopen before this lock is acquired.
+            // Recheck because a writer may reopen before this lock is acquired;
+            // its first-writer transition clears the old streak under this lock.
             let mut streams = self.state.sustained_write_streams.lock();
             if self.handle_table.write_open_count(open_file.ino) == 0 {
                 streams.remove(&open_file.ino);

@@ -15,13 +15,16 @@
 //! 8.  `MetricsState` — metrics (rarely needs locking)
 //!
 //! When nesting the sustained-write tracker with `HandleTable`, acquire the
-//! tracker mutex before reading handle counts. Do not acquire the tracker from
-//! a `HandleTable::close_with` callback, which runs under the table lock.
+//! tracker mutex before reading or mutating the handle table. Writer opens use
+//! the tracker around the table's zero-to-one writer transition. Do not acquire
+//! the tracker from a `HandleTable::close_with` callback, which runs under the
+//! table lock.
 //! Release uses the remaining-write count returned by `close_with` to skip the
 //! tracker while another writer remains, then rechecks under the tracker after
-//! a zero count because a writer may reopen. These auxiliary locks are not
-//! registered with `LockTier` or validated by `LockOrderGuard`; their ordering
-//! is enforced by the call structure above.
+//! a zero count because a writer may reopen. That reopen clears the old streak
+//! as it registers the first writer. These auxiliary locks are not registered
+//! with `LockTier` or validated by `LockOrderGuard`; their ordering is enforced
+//! by the call structure above.
 //!
 //! # Usage
 //!
