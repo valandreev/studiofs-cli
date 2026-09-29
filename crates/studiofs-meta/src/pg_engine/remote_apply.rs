@@ -1902,11 +1902,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
             let parent_index = match (index.checked_sub(1), event) {
                 (Some(previous), MetaEvent::AddEntry { parent, entry, .. })
-                    if entry.kind == FileType::RegularFile
-                        && matches!(&local_events[previous], MetaEvent::SetAttr { attr } if attr.ino == *parent) =>
+                    if entry.kind == FileType::RegularFile =>
                 {
-                    dependencies.entry(entry.ino).or_default().push(previous);
-                    Some(previous)
+                    let updates_parent = matches!(
+                        &local_events[previous],
+                        MetaEvent::SetAttr { attr } if attr.ino == *parent
+                    );
+                    if updates_parent {
+                        dependencies.entry(entry.ino).or_default().push(previous);
+                        Some(previous)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };

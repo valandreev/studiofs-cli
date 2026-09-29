@@ -34,7 +34,7 @@ Compare only when the visible sequence changes and its count equals the received
 
 The repeated-prefix loop is removed from both acknowledgement paths. Publication and matching share the same monotonic hidden-inode facts, adjacency predicate, and regular attr normalization. Four new regressions cover long late/missing matches, all four visibility transitions, overlay-only hiding, earliest acknowledgement, and cancellation during a large dependency reveal. A read-only subagent review found no semantic mismatch against the original projector.
 
-Final local checks passed: 81 apply tests (44 infrastructure tests ignored in this selection), 62 backlog/restoration tests (one infrastructure test ignored), and three structural layout checks. Four specifically selected PostgreSQL tests ran against the configured live service and passed; the full ignored suite was not run. `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, formatting, and diff checks passed. Work remains uncommitted on the existing task branch; there is no PR. An English evidence comment was posted to SFS-762 and the issue moved to In Review.
+Final local checks passed: 81 apply tests (44 infrastructure tests ignored in this selection), 62 backlog/restoration tests (one infrastructure test ignored), and three structural layout checks. Four specifically selected PostgreSQL tests ran against the configured live service and passed; the full ignored suite was not run. `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, formatting, and diff checks passed. The implementation and review follow-ups are committed across four commits and open in [PR 726](https://github.com/valandreev/studiofs-cli/pull/726). An English evidence comment was posted to SFS-762 and the issue moved to In Review.
 
 ## Context and Orientation
 
@@ -103,7 +103,7 @@ Initial revision: record the verified root cause and incremental strategy before
 
 ## Review follow-up (2026-09-30)
 
-Reviewed `docs/code-reviews/2026-09-30-sfs-762-bound-self-echo-prefix-projection.md` against commit `7280cbe7` and current source. The graph index predates the implementation, so changed symbols were verified directly.
+Reviewed the initial SFS-762 projection report against commit `7280cbe7` and current source; the complete finding summaries and dispositions are recorded below. The graph index predates the implementation, so changed symbols were verified directly.
 
 - Findings 1 and 2: confirmed redundant struct copies. Visibility now uses a shared projectability predicate; already normalized regular attrs remain borrowed. The allocation claim is incorrect: `InodeAttr` has scalar fields and `Cow::Owned` does not inherently allocate. New regressions measured 65 versus 1 normalization copies and 2 versus 0 respectively before/after.
 - Finding 3: confirmed duplicate current-index visibility work; skip that index in dependency revisits. The suggested duplicate previous-index case does not occur: `AddEntry` does not change projection state. A distinct-inode regression failed before correction and passes afterward.
@@ -147,3 +147,7 @@ Verification: `cargo test -p studiofs-meta --lib pg_engine::tests::remote_apply:
 - Finding 5 clarified: the original n*b bound was a valid worst-case bound; the decision log now also names m comparison attempts consistently with the retrospective.
 
 Verification: remote_apply module 91 passed, 44 ignored; cargo check and Clippy --all-targets -D warnings passed. Formatting and diff checks passed. PostgreSQL and mounted E2E were not rerun. No commit or external update was made.
+
+## PR 726 review repair
+
+Addressed the three attached review comments: moved the parent-attribute adjacency check out of the match guard to respect max_width = 100, removed the unavailable review-artifact reference while retaining inline summaries, and updated delivery status to the four committed implementation revisions and PR 726. The adjacency dependency behavior is unchanged.
