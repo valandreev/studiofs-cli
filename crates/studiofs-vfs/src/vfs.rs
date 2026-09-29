@@ -7554,20 +7554,11 @@ impl StudioVfs {
     }
 
     fn write_access_requested(flags: OpenFlags, trunc: bool) -> bool {
-        trunc
-            || flags.contains(OpenFlags::WRONLY)
-            || flags.contains(OpenFlags::RDWR)
-            || flags.contains(OpenFlags::APPEND)
+        trunc || flags.write_access_requested()
     }
 
     fn active_open_overlay_required(flags: OpenFlags, trunc: bool) -> bool {
         Self::write_access_requested(flags, trunc)
-    }
-
-    fn open_flags_allow_write(flags: OpenFlags) -> bool {
-        flags.contains(OpenFlags::WRONLY)
-            || flags.contains(OpenFlags::RDWR)
-            || flags.contains(OpenFlags::APPEND)
     }
 
     fn metadata_sync_status(&self) -> PgSyncStatus {
@@ -7706,7 +7697,7 @@ impl StudioVfs {
         if open_file.ino != ino {
             return Err(denied());
         }
-        if Self::open_flags_allow_write(open_file.flags) {
+        if open_file.flags.allows_write() {
             return Ok(open_file);
         }
         Err(denied())
@@ -9896,8 +9887,7 @@ impl StudioVfs {
         if let Some(ignored_attr) = self.ignored_entry_attr(ino) {
             let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
             let open_file =
-                self.handle_table
-                    .open(ino, flags, Some(ignored_attr), active_open_overlay);
+                self.open_file_handle(ino, flags, Some(ignored_attr), active_open_overlay);
             let fh = open_file.fh;
             open_file.set_read_ahead_owner(read_ahead_owner);
             self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
@@ -9938,7 +9928,7 @@ impl StudioVfs {
         }
 
         let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
-        let open_file = self.handle_table.open(
+        let open_file = self.open_file_handle(
             ino,
             flags,
             Some(read_context.attr.clone()),
@@ -9973,6 +9963,32 @@ impl StudioVfs {
         }
 
         Ok(fh)
+    }
+
+    fn open_file_handle(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        open_attr: Option<InodeAttr>,
+        active_open_overlay: bool,
+    ) -> OpenFile {
+        if !flags.allows_write() {
+            return self
+                .handle_table
+                .open(ino, flags, open_attr, active_open_overlay);
+        }
+
+        let mut streams = self.state.sustained_write_streams.lock();
+        let (open_file, starts_writer_epoch) = self.handle_table.open_with_writer_transition(
+            ino,
+            flags,
+            open_attr,
+            active_open_overlay,
+        );
+        if starts_writer_epoch {
+            streams.remove(&ino);
+        }
+        open_file
     }
     // =========================================================================
     // Background Tasks

@@ -369,13 +369,9 @@ fn create_disposition_from_create_options(create_options: u32) -> u32 {
     create_options >> CREATE_DISPOSITION_SHIFT
 }
 
-fn open_flags_allow_write(open_flags: OpenFlags) -> bool {
-    open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR)
-}
-
 fn should_truncate_existing_file_on_open(create_options: u32, open_flags: OpenFlags) -> bool {
     let disposition = create_disposition_from_create_options(create_options);
-    open_flags_allow_write(open_flags)
+    open_flags.allows_write()
         && matches!(
             disposition,
             FILE_OVERWRITE_DISPOSITION | FILE_OVERWRITE_IF_DISPOSITION
@@ -447,11 +443,11 @@ fn should_disable_winfsp_file_cache(
         != 0
         || (file_attributes & FILE_FLAG_NO_BUFFERING_ATTRIBUTE) != 0;
     let requested_uncached =
-        no_buffering_requested || (open_flags_allow_write(open_flags) && write_through_requested);
+        no_buffering_requested || (open_flags.allows_write() && write_through_requested);
     // A read-write handle can still be the writer used by copy tools (for
     // example Total Commander). Keep WinFSP cache writeback out of every
     // write-capable handle so lazy writes cannot arrive after close.
-    open_flags_allow_write(open_flags) || truncates_on_open || requested_uncached
+    open_flags.allows_write() || truncates_on_open || requested_uncached
 }
 
 fn read_ahead_owner_for_winfsp_handle() -> ReadAheadOwner {
@@ -1266,7 +1262,7 @@ impl StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> Option<u32> {
-        if handle.is_dir || !open_flags_allow_write(handle.open_flags) {
+        if handle.is_dir || !handle.open_flags.allows_write() {
             return None;
         }
         let range = *self.handle_zero_fill_ranges.lock().get(&handle.fh)?;
@@ -1883,7 +1879,7 @@ impl FileSystemContext for StudioFsContext {
         let open_flags = open_flags_from_access(granted_access, create_options);
         let raw_create_options = current_winfsp_create_options(create_options);
         let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
-        if self.read_only && (open_flags_allow_write(open_flags) || trunc) {
+        if self.read_only && (open_flags.write_access_requested() || trunc) {
             return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
         }
         if maybe_hide_platform_root_path(&self.vfs, file_name)? {
@@ -3299,6 +3295,33 @@ mod tests {
         );
 
         <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+    }
+
+    #[test]
+    fn read_only_context_rejects_write_data_and_append_data_opens() {
+        let (_tmp, vfs, mut ctx, _queue) = make_test_context("read-only-write-access");
+        ctx.read_only = true;
+        vfs.create(ROOT_INO, b"read-only.txt", 0, 0, 0o644)
+            .expect("create file");
+
+        let path = U16CString::from_str(r"\read-only.txt").expect("u16 path");
+        for access in [FILE_WRITE_DATA_ACCESS, FILE_APPEND_DATA_ACCESS] {
+            let mut file_info = empty_open_file_info();
+            let status = match <StudioFsContext as FileSystemContext>::open(
+                &ctx,
+                path.as_ucstr(),
+                0,
+                access,
+                &mut file_info,
+            ) {
+                Ok(handle) => {
+                    <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+                    panic!("read-only context accepted write access {access:#x}");
+                }
+                Err(error) => error.to_ntstatus(),
+            };
+            assert_eq!(status, STATUS_ACCESS_DENIED.0);
+        }
     }
 
     #[test]

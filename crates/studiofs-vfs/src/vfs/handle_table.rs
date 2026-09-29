@@ -43,12 +43,6 @@ impl HandleTable {
         }
     }
 
-    fn flags_allow_write(flags: OpenFlags) -> bool {
-        flags.contains(OpenFlags::WRONLY)
-            || flags.contains(OpenFlags::RDWR)
-            || flags.contains(OpenFlags::APPEND)
-    }
-
     /// Allocate a new file handle and register it.
     pub(super) fn open(
         &self,
@@ -57,6 +51,18 @@ impl HandleTable {
         open_attr: Option<InodeAttr>,
         active_open_overlay: bool,
     ) -> OpenFile {
+        self.open_with_writer_transition(ino, flags, open_attr, active_open_overlay)
+            .0
+    }
+
+    /// Open a handle and report whether it starts a new writer epoch.
+    pub(super) fn open_with_writer_transition(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        open_attr: Option<InodeAttr>,
+        active_open_overlay: bool,
+    ) -> (OpenFile, bool) {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
         let mut handles = self.handles.write();
@@ -64,11 +70,12 @@ impl HandleTable {
         handles.handles_by_inode.entry(ino).or_default().insert(fh);
         let counts_for_inode = handles.counts.entry(ino).or_default();
         counts_for_inode.open = counts_for_inode.open.saturating_add(1);
-        if Self::flags_allow_write(flags) {
+        let starts_writer_epoch = flags.allows_write() && counts_for_inode.write == 0;
+        if flags.allows_write() {
             counts_for_inode.write = counts_for_inode.write.saturating_add(1);
         }
         drop(handles);
-        open_file
+        (open_file, starts_writer_epoch)
     }
 
     /// Look up an open file handle.
@@ -119,11 +126,12 @@ impl HandleTable {
     #[cfg(test)]
     pub(super) fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
         self.close_with(fh, |_, _| {})
+            .map(|(open_file, remaining, _)| (open_file, remaining))
     }
 
     /// Close a file handle, invoking `before_remove` while the table lock still
     /// makes the handle and its last-handle status visible.
-    pub(super) fn close_with<F>(&self, fh: u64, before_remove: F) -> Option<(OpenFile, u32)>
+    pub(super) fn close_with<F>(&self, fh: u64, before_remove: F) -> Option<(OpenFile, u32, u32)>
     where
         F: FnOnce(&OpenFile, u32),
     {
@@ -151,18 +159,19 @@ impl HandleTable {
             .get_mut(&open_file.ino)
             .expect("inode must exist in counts if handle existed");
         counts_for_inode.open = counts_for_inode.open.saturating_sub(1);
-        if Self::flags_allow_write(open_file.flags) {
+        if open_file.flags.allows_write() {
             assert!(
                 counts_for_inode.write > 0,
                 "write-capable handle closed without write-open count"
             );
             counts_for_inode.write = counts_for_inode.write.saturating_sub(1);
         }
+        let remaining_write = counts_for_inode.write;
         debug_assert_eq!(counts_for_inode.open, remaining);
         if counts_for_inode.open == 0 {
             handles.counts.remove(&open_file.ino);
         }
-        Some((open_file, remaining))
+        Some((open_file, remaining, remaining_write))
     }
 
     /// Get the number of open handles for an inode.
@@ -183,6 +192,14 @@ impl HandleTable {
             .get(&ino)
             .map(|counts| counts.write)
             .unwrap_or(0)
+    }
+
+    pub(super) fn is_valid_writer_for_inode(&self, fh: u64, ino: Ino) -> bool {
+        self.handles
+            .read()
+            .handles
+            .get(&fh)
+            .is_some_and(|open_file| open_file.ino == ino && open_file.flags.allows_write())
     }
 
     /// Returns true when an inode still has a mutating handle whose local view
@@ -281,6 +298,35 @@ mod tests {
 
         assert!(closed.is_some());
         assert!(ht.get(opened.fh).is_none());
+    }
+
+    #[test]
+    fn writer_lookup_and_close_count_follow_active_writer_handles() {
+        let ht = HandleTable::new();
+        let first = ht.open(42, OpenFlags::RDWR, None, false);
+        let second = ht.open(42, OpenFlags::WRONLY, None, false);
+        let reader = ht.open(42, OpenFlags::RDONLY, None, false);
+
+        assert!(ht.is_valid_writer_for_inode(first.fh, 42));
+        assert!(!ht.is_valid_writer_for_inode(reader.fh, 42));
+        assert!(!ht.is_valid_writer_for_inode(first.fh, 43));
+        assert!(!ht.is_valid_writer_for_inode(u64::MAX, 42));
+
+        let (_, remaining_open, remaining_write) = ht
+            .close_with(first.fh, |_, _| {})
+            .expect("first writer must close");
+        assert_eq!((remaining_open, remaining_write), (2, 1));
+
+        let (_, remaining_open, remaining_write) = ht
+            .close_with(second.fh, |_, _| {})
+            .expect("second writer must close");
+        assert_eq!((remaining_open, remaining_write), (1, 0));
+        assert!(!ht.is_valid_writer_for_inode(first.fh, 42));
+
+        let (_, remaining_open, remaining_write) = ht
+            .close_with(reader.fh, |_, _| {})
+            .expect("reader must close");
+        assert_eq!((remaining_open, remaining_write), (0, 0));
     }
 
     #[test]
@@ -405,6 +451,18 @@ mod tests {
 
         assert_eq!(ht.write_open_count(10), 1);
         ht.close(handle.fh).expect("append handle should close");
+        assert_eq!(ht.write_open_count(10), 0);
+    }
+
+    #[test]
+    fn read_only_append_handle_is_not_counted_as_a_writer() {
+        let ht = HandleTable::new();
+        let handle = ht.open(10, OpenFlags::RDONLY | OpenFlags::APPEND, None, true);
+
+        assert_eq!(ht.write_open_count(10), 0);
+        assert!(!ht.is_valid_writer_for_inode(handle.fh, 10));
+        ht.close(handle.fh)
+            .expect("read-only append handle should close");
         assert_eq!(ht.write_open_count(10), 0);
     }
 }

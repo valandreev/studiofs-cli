@@ -319,7 +319,13 @@ impl StudioVfs {
         (entry, guard)
     }
 
-    fn observe_sustained_write_admission(&self, ino: Ino, offset: u64, len: usize) -> bool {
+    fn observe_sustained_write_admission(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        len: usize,
+    ) -> bool {
         if len == 0 {
             return false;
         }
@@ -329,6 +335,12 @@ impl StudioVfs {
             .dirty_bytes_for_inode(ino)
             .saturating_add(len);
         let mut streams = self.state.sustained_write_streams.lock();
+        if !self.handle_table.is_valid_writer_for_inode(fh, ino) {
+            if self.handle_table.write_open_count(ino) == 0 {
+                streams.remove(&ino);
+            }
+            return false;
+        }
         streams.entry(ino).or_default().observe(
             now_unix_millis(),
             offset,
@@ -340,6 +352,7 @@ impl StudioVfs {
 
     pub(super) fn maybe_pre_drain_sustained_write_buffer(
         self: &Arc<Self>,
+        fh: u64,
         ino: Ino,
         offset: u64,
         len: usize,
@@ -348,7 +361,7 @@ impl StudioVfs {
         if !local_sync_policy.is_opportunistic() || len == 0 {
             return;
         }
-        if !self.observe_sustained_write_admission(ino, offset, len) {
+        if !self.observe_sustained_write_admission(fh, ino, offset, len) {
             return;
         }
         // Sustained-stream detection is a pre-drain signal only. Adaptive
@@ -710,7 +723,7 @@ impl StudioVfs {
     where
         F: FnOnce(&OpenFile, u32),
     {
-        let Some((open_file, remaining)) =
+        let Some((open_file, remaining, remaining_write)) =
             self.handle_table.close_with(fh, |open_file, remaining| {
                 self.state.writer_stack.mark_closed(open_file.fh);
                 before_handle_close(open_file, remaining);
@@ -719,6 +732,15 @@ impl StudioVfs {
             debug!("release_fh: unknown fh={}", fh);
             return None;
         };
+        if open_file.flags.allows_write() && remaining_write == 0 {
+            // The close snapshot skips the tracker while a writer remains.
+            // Recheck because a writer may reopen before this lock is acquired;
+            // its first-writer transition clears the old streak under this lock.
+            let mut streams = self.state.sustained_write_streams.lock();
+            if self.handle_table.write_open_count(open_file.ino) == 0 {
+                streams.remove(&open_file.ino);
+            }
+        }
         let (os_cache_writer_lease, os_cache_foreground_read_lease) =
             open_file.take_os_cache_release_lifetimes();
         let ino = open_file.ino;
@@ -805,7 +827,7 @@ impl StudioVfs {
             return LastHandleReleaseAction::Clean;
         }
 
-        let sticky_error_policy = if Self::open_flags_allow_write(context.open_file.flags) {
+        let sticky_error_policy = if context.open_file.flags.allows_write() {
             StickyErrorPolicy::Report
         } else {
             StickyErrorPolicy::Ignore
@@ -980,7 +1002,7 @@ impl StudioVfs {
                     .state
                     .deferred_materialize_inflight
                     .contains(open_file.ino);
-            let write_capable = Self::open_flags_allow_write(open_file.flags);
+            let write_capable = open_file.flags.allows_write();
             if remaining == 0 || (write_capable && local_state_pending) {
                 deferred_release_ino = Some(open_file.ino);
                 deferred_release_barrier =
@@ -1804,7 +1826,13 @@ impl StudioVfs {
         }
         if local_sync_policy.is_opportunistic() {
             let pre_drain_started = Instant::now();
-            self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy);
+            self.maybe_pre_drain_sustained_write_buffer(
+                fh,
+                ino,
+                offset,
+                data.len(),
+                local_sync_policy,
+            );
             self.record_vfs_write_pre_drain(pre_drain_started.elapsed());
             let admission_throttle_started = Instant::now();
             self.maybe_throttle_write_admission(data.len()).await;
