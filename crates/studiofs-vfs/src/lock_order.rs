@@ -14,6 +14,10 @@
 //! 7.  `FileLockState` — file locks
 //! 8.  `MetricsState` — metrics (rarely needs locking)
 //!
+//! When nesting the sustained-write tracker with `HandleTable`, acquire the
+//! tracker mutex before reading handle counts. Do not acquire the tracker from
+//! a `HandleTable::close_with` callback, which runs under the table lock.
+//!
 //! # Usage
 //!
 //! ```rust,ignore

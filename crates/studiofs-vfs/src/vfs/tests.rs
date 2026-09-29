@@ -9925,7 +9925,7 @@ fn sfs740_sustained_write_state_survives_partial_close_and_restarts_after_reopen
 }
 
 #[test]
-fn sfs740_closed_handle_write_does_not_resurrect_sustained_tracking() {
+fn sfs740_closed_writer_does_not_resurrect_tracking_while_reader_is_open() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let config = VfsConfig {
         disable_background_slab_flush: true,
@@ -9942,7 +9942,19 @@ fn sfs740_closed_handle_write_does_not_resurrect_sustained_tracking() {
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
             .expect("open writer");
-        vfs.release_fh(fh).await.expect("release clean writer");
+        let reader = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open reader");
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            attr.ino,
+            0,
+            b"write",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write through live handle");
+        vfs.release_fh(fh).await.expect("release writer");
         assert!(
             !vfs.state
                 .sustained_write_streams
@@ -9972,6 +9984,7 @@ fn sfs740_closed_handle_write_does_not_resurrect_sustained_tracking() {
                 .contains_key(&attr.ino),
             "a write using a closed handle must not resurrect retired state"
         );
+        vfs.release_fh(reader).await.expect("release reader");
     });
 }
 

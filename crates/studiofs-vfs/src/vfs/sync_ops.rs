@@ -329,7 +329,7 @@ impl StudioVfs {
             .dirty_bytes_for_inode(ino)
             .saturating_add(len);
         let mut streams = self.state.sustained_write_streams.lock();
-        if self.handle_table.open_count(ino) == 0 {
+        if self.handle_table.write_open_count(ino) == 0 {
             return false;
         }
         streams.entry(ino).or_default().observe(
@@ -722,11 +722,14 @@ impl StudioVfs {
             debug!("release_fh: unknown fh={}", fh);
             return None;
         };
-        if remaining == 0 {
+        if remaining == 0
+            || (Self::open_flags_allow_write(open_file.flags)
+                && self.handle_table.write_open_count(open_file.ino) == 0)
+        {
             // Match admission's streams -> handle table lock order. A reopen
             // may already have started a live stream since close_with returned.
             let mut streams = self.state.sustained_write_streams.lock();
-            if self.handle_table.open_count(open_file.ino) == 0 {
+            if self.handle_table.write_open_count(open_file.ino) == 0 {
                 streams.remove(&open_file.ino);
             }
         }
