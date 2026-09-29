@@ -1138,6 +1138,72 @@ fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
 }
 
 #[test]
+fn self_batch_local_only_events_skip_visibility_tree() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_TREE_WORK;
+    let visible = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"visible".to_vec(),
+    };
+    let mut local = vec![visible.clone()];
+    local.extend((0..64).map(|object_id| MetaEvent::RemovePendingDeletion { object_id }));
+    let remote = [visible, MetaEvent::RemoveAttr { ino: ROOT_INO }];
+    LOCAL_PROJECTION_TREE_WORK.with(|work| work.set(0));
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &remote, None).unwrap(),
+        None
+    );
+    assert_eq!(LOCAL_PROJECTION_TREE_WORK.with(std::cell::Cell::get), 1);
+}
+
+#[test]
+fn publication_local_only_events_skip_contextual_visibility() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    let events = (0..64)
+        .map(|object_id| MetaEvent::RemovePendingDeletion { object_id })
+        .collect::<Vec<_>>();
+    LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+    let batch = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(batch.events.is_empty());
+    assert!(!batch.needs_local_replay);
+    assert_eq!(
+        LOCAL_PROJECTION_WORK.with(std::cell::Cell::get),
+        events.len()
+    );
+}
+
+#[test]
+fn self_batch_nonregular_attr_retains_late_inode_context_dependency() {
+    let ino = ROOT_INO + 10;
+    let echo = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"echo".to_vec(),
+    };
+    let local = [
+        MetaEvent::SetAttr {
+            attr: InodeAttr::new_dir(ino, ROOT_INO, 0, 0, 0o755),
+        },
+        MetaEvent::SetRegularFileOverlaySlices {
+            ino,
+            chunk_slices: fixture_payload_slices(
+                0,
+                Some(&PayloadRef::new_partial(1, 8)),
+                PayloadRefState::LocalOnly,
+            )
+            .unwrap(),
+        },
+        echo.clone(),
+    ];
+    assert_eq!(
+        RemoteApplyCoordinator::project_local_batch(&local).events,
+        vec![echo.clone()]
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&local, &[echo], None).unwrap(),
+        Some(3)
+    );
+}
+
+#[test]
 fn publication_projection_computes_inode_context_once() {
     use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
     let events = vec![

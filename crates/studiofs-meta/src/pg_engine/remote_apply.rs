@@ -13,6 +13,7 @@ const REPLAY_LOCK_WAIT_SLICE: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static LOCAL_PROJECTION_TREE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static LOCAL_PROJECTION_OWNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static LOCAL_PROJECTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -305,7 +306,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
     ) -> Vec<MetaEvent> {
         let mut out = Vec::with_capacity(events.len());
         for (index, event) in events.iter().enumerate() {
-            if Self::local_event_is_contextually_visible(events, index, hidden_regular_inodes)
+            if Self::remote_event_is_projectable(event)
+                && Self::local_event_is_contextually_visible(events, index, hidden_regular_inodes)
                 && let Some(event) = Self::project_remote_event(event)
             {
                 if let Some(source_event_indices) = source_event_indices.as_mut() {
@@ -1967,9 +1969,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
         hidden: &HashSet<Ino>,
         visible: &mut BTreeSet<usize>,
     ) -> bool {
-        if Self::remote_event_is_projectable(&events[index])
-            && Self::local_event_is_contextually_visible(events, index, hidden)
-        {
+        if !Self::remote_event_is_projectable(&events[index]) {
+            return false;
+        }
+        #[cfg(test)]
+        LOCAL_PROJECTION_TREE_WORK.with(|work| work.set(work.get() + 1));
+        if Self::local_event_is_contextually_visible(events, index, hidden) {
             visible.insert(index)
         } else {
             visible.remove(&index)
