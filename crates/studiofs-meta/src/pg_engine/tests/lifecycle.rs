@@ -2534,6 +2534,128 @@ fn prepare_for_close_obeys_deadline_while_waiting_for_worker_start_lock() {
         matches!(result, Err(MetaError::Timeout(_))),
         "start-lock contention should return the bounded close timeout"
     );
+    assert!(
+        engine
+            .background_workers
+            .poll_shutdown_ref()
+            .load(Ordering::Acquire),
+        "timed-out close must still request worker shutdown"
+    );
+    assert!(
+        engine
+            .background_workers
+            .metadata_notify_cancel()
+            .is_cancelled()
+    );
+    assert!(
+        engine
+            .background_workers
+            .lock_notify_cancel()
+            .is_cancelled()
+    );
+}
+
+#[test]
+fn close_timeout_retains_worker_registered_after_stop() {
+    let (dir, engine) = temp_pg_engine_for_unit();
+    let engine = Arc::new(engine);
+    let start_guard = engine
+        .lock_worker_start_lock
+        .lock()
+        .expect("worker start lock");
+    let local = Arc::clone(&engine.local);
+    let (worker_started_tx, worker_started_rx) = std::sync::mpsc::channel();
+    let (worker_release_tx, worker_release_rx) = std::sync::mpsc::channel();
+    let (worker_finished_tx, worker_finished_rx) = std::sync::mpsc::channel();
+    let incoming_handle = std::thread::spawn(move || {
+        let _ = worker_started_tx.send(());
+        let _ = worker_release_rx.recv();
+        drop(local);
+        let _ = worker_finished_tx.send(());
+    });
+    worker_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("incoming worker should start");
+
+    let (close_result_tx, close_result_rx) = std::sync::mpsc::channel();
+    let closing_engine = Arc::clone(&engine);
+    let close_thread = std::thread::spawn(move || {
+        let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
+        let _ = close_result_tx.send(closing_engine.prepare_for_close());
+    });
+    let close_result_while_locked = close_result_rx.recv_timeout(Duration::from_secs(1));
+    let close_completed_while_locked = close_result_while_locked.is_ok();
+    let mut incoming_handle = Some(incoming_handle);
+    let mut install_result = None;
+    let mut manager_owns_incoming_handle = false;
+    let mut start_guard = Some(start_guard);
+    if close_completed_while_locked {
+        install_result = Some(engine.background_workers.install_handle(
+            PgBackgroundWorker::MetadataNotify,
+            incoming_handle.take().unwrap(),
+        ));
+        manager_owns_incoming_handle = engine
+            .background_workers
+            .handle_status(PgBackgroundWorker::MetadataNotify)
+            .0;
+    }
+
+    let first_close_result = match close_result_while_locked {
+        Ok(result) => result,
+        Err(_) => {
+            drop(start_guard.take());
+            close_result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("close should finish after releasing the start lock")
+        }
+    };
+    close_thread.join().expect("join timed out close thread");
+
+    drop(start_guard.take());
+    drop(incoming_handle.take());
+    let stop_requested = engine
+        .background_workers
+        .poll_shutdown_ref()
+        .load(Ordering::Acquire);
+    let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
+    let retry_result = engine.prepare_for_close();
+    let retry_timed_out = matches!(retry_result, Err(MetaError::Timeout(_)));
+
+    let _ = worker_release_tx.send(());
+    worker_finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("incoming worker should release its redb owner");
+    let final_close_result = engine.prepare_for_close();
+    drop(start_guard);
+    drop(engine);
+    let reopened = RedbMetaEngine::open(dir.path().join("meta.redb"));
+
+    assert!(
+        close_completed_while_locked,
+        "close should time out under the held start lock"
+    );
+    assert!(matches!(first_close_result, Err(MetaError::Timeout(_))));
+    assert!(
+        stop_requested,
+        "timed-out close should request worker shutdown"
+    );
+    assert!(
+        matches!(install_result, Some(Err(MetaError::Storage(_)))),
+        "registration after stop should return the closing error"
+    );
+    assert!(
+        manager_owns_incoming_handle,
+        "the worker manager should retain the rejected handle until close can join it"
+    );
+    assert!(
+        retry_timed_out,
+        "close retry should retain the live worker handle"
+    );
+    final_close_result.expect("final close should join the released incoming worker");
+    assert!(
+        reopened.is_ok(),
+        "redb should reopen after the incoming worker exits"
+    );
 }
 
 #[test]

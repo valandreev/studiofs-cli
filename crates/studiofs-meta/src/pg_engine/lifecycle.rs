@@ -192,8 +192,17 @@ impl PgBackgroundWorkers {
             || self.poll_shutdown_ref().load(Ordering::Acquire)
         {
             self.signal_stop();
-            drop(state);
-            reap_worker_handles(vec![(worker, handle)]);
+            if !state.shutdown_complete
+                && !state.shutdown_in_progress
+                && worker_slot(&state, worker).is_none()
+            {
+                // Startup can finish after close times out on its start lock.
+                // Retain that handle so a retry must join it before succeeding.
+                *worker_slot_mut(&mut state, worker) = Some(handle);
+            } else {
+                drop(state);
+                reap_worker_handles(vec![(worker, handle)]);
+            }
             return Err(MetaError::Storage(
                 "pg background workers are closing or already shut down".to_string(),
             ));

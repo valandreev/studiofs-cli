@@ -262,6 +262,7 @@ impl MetaReplication for PgMetaEngine {
             match self.lock_worker_start_lock.try_lock() {
                 Ok(guard) => break guard,
                 Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.background_workers.signal_stop();
                     return Err(MetaError::Storage(
                         "pg background worker start state poisoned".to_string(),
                     ));
@@ -269,6 +270,7 @@ impl MetaReplication for PgMetaEngine {
                 Err(std::sync::TryLockError::WouldBlock) => {
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining.is_zero() {
+                        self.background_workers.signal_stop();
                         return Err(MetaError::Timeout(
                             "pg worker registration or close is still in progress; worker ownership and metadata storage remain active".to_string(),
                         ));

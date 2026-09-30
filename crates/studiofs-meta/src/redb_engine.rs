@@ -163,6 +163,7 @@ struct CheckedCheckpointWriter<'a, F> {
     bytes: &'a mut Vec<u8>,
     check: &'a F,
     error: Option<MetaError>,
+    next_check_at: usize,
 }
 
 pub(super) fn serialize_with_check<T: serde::Serialize>(
@@ -175,6 +176,7 @@ pub(super) fn serialize_with_check<T: serde::Serialize>(
         bytes: &mut bytes,
         check,
         error: None,
+        next_check_at: 0,
     };
     let serialization_error = postcard::to_io(value, &mut writer)
         .err()
@@ -197,13 +199,15 @@ where
         const CHECK_INTERVAL: usize = 64 * 1024;
 
         for chunk in buffer.chunks(CHECK_INTERVAL) {
-            // Postcard also writes individual bytes; check on byte intervals.
-            let until_check = CHECK_INTERVAL - self.bytes.len() % CHECK_INTERVAL;
-            if (until_check == CHECK_INTERVAL || chunk.len() >= until_check)
-                && let Err(error) = (self.check)()
+            // Check before the next chunk would exceed the byte budget.
+            if self.bytes.len() >= self.next_check_at
+                || chunk.len() > self.next_check_at - self.bytes.len()
             {
-                self.error = Some(error);
-                return Err(std::io::Error::other("serving checkpoint export cancelled"));
+                if let Err(error) = (self.check)() {
+                    self.error = Some(error);
+                    return Err(std::io::Error::other("serving checkpoint export cancelled"));
+                }
+                self.next_check_at = self.bytes.len().saturating_add(CHECK_INTERVAL);
             }
             self.bytes.extend_from_slice(chunk);
         }

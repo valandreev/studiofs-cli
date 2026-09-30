@@ -420,6 +420,7 @@ fn checkpoint_writer_preserves_cancellation_during_large_serialization() {
         bytes: &mut bytes,
         check: &cancel_on_second_chunk,
         error: None,
+        next_check_at: 0,
     };
     let large_value = vec![0; 128 * 1024];
     assert!(std::io::Write::write_all(&mut writer, &large_value).is_err());
@@ -431,11 +432,57 @@ fn checkpoint_writer_preserves_cancellation_during_large_serialization() {
     assert!(std::io::Write::write_all(&mut writer, &[0]).is_err());
 
     writer.bytes.clear();
+    writer.next_check_at = 0;
     checks.store(0, std::sync::atomic::Ordering::Relaxed);
     for _ in 0..1024 {
         std::io::Write::write_all(&mut writer, &[0]).expect("write individual postcard byte");
     }
     assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn checkpoint_writer_checks_once_per_byte_interval() {
+    let checks = std::cell::Cell::new(0);
+    let check = || {
+        checks.set(checks.get() + 1);
+        Ok(())
+    };
+    let mut bytes = Vec::new();
+    let mut writer = CheckedCheckpointWriter {
+        bytes: &mut bytes,
+        check: &check,
+        error: None,
+        next_check_at: 0,
+    };
+    for _ in 0..=64 * 1024 {
+        std::io::Write::write_all(&mut writer, &[0]).expect("write postcard byte");
+    }
+    assert_eq!(checks.get(), 2, "initial check and one interval check");
+}
+
+#[test]
+fn checkpoint_writer_checks_before_mixed_writes_exceed_interval() {
+    let checks = std::cell::Cell::new(0);
+    let check = || {
+        checks.set(checks.get() + 1);
+        if checks.get() >= 3 {
+            Err(MetaError::WorkerShutdownCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    let mut bytes = Vec::new();
+    let mut writer = CheckedCheckpointWriter {
+        bytes: &mut bytes,
+        check: &check,
+        error: None,
+        next_check_at: 0,
+    };
+    std::io::Write::write_all(&mut writer, &[0]).expect("write initial byte");
+    std::io::Write::write_all(&mut writer, &vec![0; 64 * 1024]).expect("write full interval");
+    assert!(std::io::Write::write_all(&mut writer, &[0]).is_err());
+    assert_eq!(writer.bytes.len(), 64 * 1024 + 1);
+    assert!(matches!(writer.error, Some(MetaError::WorkerShutdownCancelled)));
 }
 
 #[test]
