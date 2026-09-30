@@ -18,18 +18,32 @@ impl StorageBackend for RemoveFaultBackend {
         self.inner.read(offset, out)?;
         if out.first() == Some(&2) {
             self.last_branch_read.store(offset, Ordering::SeqCst);
-            if self
-                .corrupt_read_at
-                .compare_exchange(offset, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
+            if self.corrupt_read_at.load(Ordering::SeqCst) == offset {
                 // redb 4.3 branch layout: 8-byte header, per-child 16-byte
                 // checksums, then 8-byte pointers. Give child 0 an invalid
                 // page order, as in redb's corrupted_btree_descent regression.
                 // Only the read buffer changes; stored bytes remain intact.
-                let num_keys = usize::from(u16::from_le_bytes([out[2], out[3]]));
+                let header = out.get(2..4).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "redb branch header is truncated",
+                    )
+                })?;
+                let num_keys = usize::from(u16::from_le_bytes([header[0], header[1]]));
                 let first_child = 8 + 16 * (num_keys + 1);
-                out[first_child + 7] |= 0xF8;
+                let target = out.get_mut(first_child + 7).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "redb branch child pointer is outside the read buffer",
+                    )
+                })?;
+                if self
+                    .corrupt_read_at
+                    .compare_exchange(offset, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    *target |= 0xF8;
+                }
             }
         }
         Ok(())
@@ -45,6 +59,27 @@ impl StorageBackend for RemoveFaultBackend {
 
     fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         self.inner.write(offset, data)
+    }
+}
+
+#[test]
+fn removal_fault_rejects_invalid_branch_layout() {
+    for bytes in [
+        &[2, 0, 0][..],
+        &[2, 0, 0, 0, 0, 0, 0, 0][..],
+        &[2, 0, 0xFF, 0xFF, 0, 0, 0, 0][..],
+    ] {
+        let backend = RemoveFaultBackend::default();
+        let offset = 8;
+        backend.set_len(offset + bytes.len() as u64).unwrap();
+        backend.write(offset, bytes).unwrap();
+        backend.corrupt_read_at.store(offset, Ordering::SeqCst);
+        let mut out = vec![0; bytes.len()];
+
+        let error = backend.read(offset, &mut out).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.corrupt_read_at.load(Ordering::SeqCst), offset);
     }
 }
 
@@ -73,6 +108,7 @@ fn table_removal_error_aborts_metadata_write_transaction() {
 
     // Discover the symlink branch from an actual lookup, so the fault cannot
     // land in open_table's metadata lookup or in an unrelated table.
+    // redb 4.3 lookup and removal of this first key follow the same branch.
     let read = db.begin_read().unwrap();
     assert_eq!(
         read.open_table(SYMLINKS_TABLE)
@@ -123,7 +159,37 @@ fn table_removal_error_aborts_metadata_write_transaction() {
             .value(),
         b"original-target"
     );
-    assert!(matches!(result, Err(MetaError::Storage(_))), "{result:?}");
+    assert!(
+        matches!(&result, Err(MetaError::Storage(message))
+            if message.contains("has order greater than the maximum")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn dentry_removal_tolerates_an_absent_reverse_index() {
+    let engine = temp_engine();
+    let key = encode_dentry_key(ROOT_INO, b"missing-index");
+    let entry = encode(&DirEntryValue {
+        ino: 999,
+        kind: FileType::RegularFile,
+    })
+    .unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(DENTRIES_TABLE)
+        .unwrap()
+        .insert(key.as_slice(), entry.as_slice())
+        .unwrap();
+    // Seed only the primary row; removing the missing index must be a no-op.
+    for _ in 0..2 {
+        RedbMetaEngine::remove_dentry_overlay_in_txn(&txn, ROOT_INO, b"missing-index").unwrap();
+    }
+    txn.commit().unwrap();
+
+    assert!(matches!(
+        engine.lookup(ROOT_INO, b"missing-index"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
 }
 
 #[test]
