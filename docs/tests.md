@@ -796,6 +796,18 @@ volume. The validation workload is:
 `.github/workflows/payload-read-regression.yml` automatically runs on PRs that
 touch `crates/studiofs-cache/**`, `crates/studiofs-test-support/**`, `Cargo.toml`,
 `Cargo.lock`, or the workflow itself. It also supports `workflow_dispatch`.
+The hosted Windows job runs the read-advice regression and cache crate Clippy:
+
+```powershell
+cargo test -p studiofs-cache --lib runtime::file_payload_store::tests::windows_read_advice_does_not_read_large_payload_on_executor -- --exact --nocapture
+cargo clippy -p studiofs-cache --all-targets -- -D warnings
+```
+
+The Windows regression calls advice on a current-thread Tokio runtime for a
+64 MiB payload. It checks that advice neither reads through a cached handle nor
+opens a new payload handle. It needs no WinFSP installation or live mount;
+native mounted read validation remains a separate smoke check.
+
 The hosted macOS job runs only these two focused checks:
 
 ```sh
