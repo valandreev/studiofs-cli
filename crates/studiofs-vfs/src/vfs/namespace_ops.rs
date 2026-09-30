@@ -2882,6 +2882,7 @@ impl StudioVfs {
         let removed = meta.lookup(parent, name).ok().map(|entry| entry.ino);
         let mut retry_attempts: u16 = 0;
         let mut settle_attempts: u16 = 0;
+        let mut rechecked_after_skipped_heal = false;
         loop {
             let rmdir_result = if let Some(removed_ino) = removed {
                 // A child unlink/rmdir takes the target directory's Delete
@@ -2925,8 +2926,11 @@ impl StudioVfs {
                         // A skipped heal may mean the child already vanished.
                         // Recheck once without waiting; repeated heal failures
                         // must not consume the in-flight delete settle window.
-                        if retry_attempts == 0 && observed_missing_child && settle_attempts == 0 {
-                            settle_attempts = 1;
+                        if retry_attempts == 0
+                            && observed_missing_child
+                            && !rechecked_after_skipped_heal
+                        {
+                            rechecked_after_skipped_heal = true;
                             continue;
                         }
                         // A child delete can finish between the failed
@@ -3303,6 +3307,7 @@ mod tests {
     use studiofs_meta::schema::ROOT_INO;
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
 
+    #[must_use = "bind this guard so the snapshot hook remains armed for the test scope"]
     struct DanglingSnapshotHookGuard;
 
     impl DanglingSnapshotHookGuard {
@@ -3331,6 +3336,72 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn rmdir_skipped_heal_preserves_later_delete_settle_budget() {
+        use std::cell::RefCell;
+        use std::future::Future;
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-settle-budget-");
+        let (_fixture_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-settle-budget");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let parent = meta.create_dir(ROOT_INO, b"parent", 0, 0, 0o755).unwrap();
+        let child = meta.create_file(parent.ino, b"child", 0, 0, 0o644).unwrap();
+        let delete_gate = Rc::new(RefCell::new(None));
+        let hook_gate = delete_gate.clone();
+        let hook_vfs = vfs.clone();
+        let hook_meta = meta.clone();
+        let _hook = DanglingSnapshotHookGuard::arm(Box::new(move || {
+            hook_meta.remove_entry(parent.ino, b"child").unwrap();
+            hook_meta.remove_attr(child.ino).unwrap();
+            let replacement = hook_meta
+                .create_file(parent.ino, b"child", 0, 0, 0o644)
+                .unwrap();
+            RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let mut enter = std::pin::pin!(
+                        hook_vfs
+                            .state
+                            .file_session
+                            .enter_op(replacement.ino, FileSessionOperation::Delete)
+                    );
+                    let mut cx = Context::from_waker(Waker::noop());
+                    let Poll::Ready(gate) = enter.as_mut().poll(&mut cx) else {
+                        panic!("replacement delete gate must be uncontended");
+                    };
+                    *hook_gate.borrow_mut() = Some(gate);
+                }));
+            });
+        }));
+
+        rt.block_on(async {
+            let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"parent"));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(removal.as_mut().poll(&mut cx), Poll::Pending));
+            assert!(
+                delete_gate.borrow().is_some(),
+                "rmdir reached the later delete barrier"
+            );
+            drop(delete_gate.borrow_mut().take());
+            let started = tokio::time::Instant::now();
+            assert!(matches!(
+                removal.await,
+                Err(VfsError::Meta(MetaError::DirNotEmpty(ino))) if ino == parent.ino
+            ));
+            assert_eq!(
+                started.elapsed(),
+                RMDIR_INFLIGHT_RETRY_DELAY * u32::from(RMDIR_SETTLE_RETRY_ATTEMPTS),
+                "the immediate recheck must not consume a settle wait"
+            );
+        });
+        assert!(meta.lookup(parent.ino, b"child").is_ok());
     }
 
     #[test]

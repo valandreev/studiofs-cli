@@ -35,6 +35,9 @@ by name should return the entry actually deleted by its write transaction.
 - [x] (2026-10-01) Verify the next three live PR threads against clean head `64628f05`; reproduce repeated skipped-heal waiting and armed-hook leakage during unwinding.
 - [x] (2026-10-01) Allow one immediate skipped-heal recheck, add stable-live-child latency coverage, and scope the snapshot hook with a test-only Drop guard.
 - [x] (2026-10-01) Finish focused follow-up validation and prepare the next PR repair commit.
+- [x] (2026-10-01) Verify the next two live threads against clean head `ff33e814` and reproduce the lost settle wait with paused Tokio time.
+- [x] (2026-10-01) Separate immediate recheck state from settle accounting and mark the test-only hook guard must-use; regression and compiler contract checks pass.
+- [x] (2026-10-01) Finish accounting-review validation and prepare the next PR repair commit.
 
 ## Surprises & Discoveries
 
@@ -407,6 +410,52 @@ passed. Final source inspection confirms the fast-return guard is present and
 the only production change is the single immediate recheck for skipped healing.
 Only namespace_ops.rs and this living plan changed. PostgreSQL, mounted E2E,
 and Windows gates were not run; no native acceptance is inferred.
+
+### Final PR 731 accounting review
+
+The additional three comments were repaired and published as `ff33e814`. The
+next request attaches two current unresolved threads, and both the clean
+checkout and live PR head match that commit.
+
+The immediate skipped-heal recheck used the settle counter as a flag. A later
+observed child delete therefore inherited only 79 timer waits. Use a dedicated
+`rechecked_after_skipped_heal` bool so `settle_attempts` counts only settle waits.
+The immediate continue itself emits no debug event, but the old counter offset
+also made subsequent wait logs start at two. Keep the one-recheck bound and the
+full 80-attempt settle budget independent.
+
+The real-redb regression replaces a snapshotted child, then holds a replacement
+child Delete permit on the next snapshot. It polls until rmdir reaches that
+barrier, releases the permit without deleting the live child, and drives rmdir
+under a paused current-thread Tokio runtime. Before the fix, virtual elapsed
+time was 1.975 seconds (79 waits) instead of 2 seconds (80 waits). After the bool
+fix it is exactly 2 seconds. The fixture's separate multi-thread runtime stays
+owned outside the async block; no wall-clock coordination sleep is used.
+
+Mark `DanglingSnapshotHookGuard` with a reason-bearing `#[must_use]` annotation.
+An isolated rustc fixture extracted from the actual guard compiled an unbound
+arm call before the annotation; the annotated current source rejects that call
+under `-D unused_must_use`. Existing bindings retain the guard until scope exit.
+The review's claim that current race regressions would silently pass without the
+hook is incorrect: the disappearing-child test starts with a live child and
+expects successful removal, while the repeated-skip test requires two hook
+calls. The annotation is still a useful narrow diagnostic for accidental discard.
+
+Run the same focused VFS module/rmdir filters and package check/Clippy commands
+listed above with warnings denied, followed by formatting and diff checks.
+Retain current evidence under `target/sfs-759-pr731-accounting-*.log` and
+`target/sfs-759-pr731-guard-*.log`. After validation, publish to the existing PR
+branch and reply in the two original threads with the fixes and factual scope.
+
+Accounting-review validation passed: the namespace-ops module ran 7 tests with
+`--test-threads=1`, and the rmdir filter ran 11 tests. Four tests occur in both
+filters, giving 14 distinct passing tests. VFS package check, all-targets Clippy
+with `-D warnings`, formatting, and diff checks passed. The fresh isolated guard
+extraction also produced the required unused-must-use diagnostic. Independent
+source reviews found no actionable issue in retry accounting, hook/permit
+ownership, or runtime drop order. Only namespace_ops.rs and this living plan
+changed. PostgreSQL, native mounted E2E, and Windows checks remain unrun for
+this repair.
 
 ## Interfaces and Dependencies
 
