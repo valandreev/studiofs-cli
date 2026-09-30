@@ -1,7 +1,9 @@
 # Preserve replacement entries during namespace repair
 
 This ExecPlan is maintained under `.agent/PLANS.md`. It covers the verified
-findings in `docs/code-reviews/2026-09-30-sfs-759-concurrent-namespace-races.md`.
+findings in `docs/code-reviews/2026-09-30-sfs-759-concurrent-namespace-races.md`
+and the follow-up review
+`docs/code-reviews/2026-10-01-sfs-759-atomic-namespace-repair-review.md`.
 
 ## Purpose / Big Picture
 
@@ -20,6 +22,10 @@ by name should return the entry actually deleted by its write transaction.
 - [x] (2026-10-01) Update repair callers and preserve replacement visibility in VFS caches.
 - [x] (2026-10-01) Move the test marker to test support and own race-test threads on failure.
 - [x] (2026-10-01) Run focused tests, affected-package check/Clippy, formatting, and diff checks.
+- [x] (2026-10-01) Verify all six follow-up claims against committed HEAD `10f91bff` and current caller contracts.
+- [x] (2026-10-01) Observe RED and fix first-lookup replacement resolution and retained-directory counting.
+- [x] (2026-10-01) Observe RED for skipped-heal stale state and add a live-inode preservation guard.
+- [x] (2026-10-01) Finish follow-up focused tests, check/Clippy, formatting, and final diff review.
 
 ## Surprises & Discoveries
 
@@ -72,10 +78,12 @@ Skipped VFS healing evicts the stale dentry observation without negative caching
 or clearing another inode's state. Test-only synchronization uses scoped threads
 and tolerates a disconnected receiver. No dependency was added.
 
-Focused tests, affected-package check/Clippy, and final hygiene checks passed.
-Changes remain uncommitted. The user's existing `10f71a9e`
-commit and the supplied review document are preserved. Commits, pushes, and
-external ticket updates are outside this review follow-up unless requested.
+The first review's focused tests, affected-package check/Clippy, and hygiene
+checks passed. The user subsequently committed that implementation as
+`10f91bff`. The new review started with a clean tree on that commit. Follow-up
+changes are uncommitted and their final verification passed. Existing
+commits and supplied review documents are preserved. Commits, pushes, and
+external ticket updates remain outside the review work unless requested.
 
 ## Context and Orientation
 
@@ -183,6 +191,77 @@ identity, dropped test receiver, and retained-parent cleanup before their fixes.
 Live PostgreSQL/service and native mounted tests were not run; the local results
 do not imply that coverage.
 
+### Follow-up review decisions and milestones
+
+For finding 1, a stale positive cache observation cannot justify ENOENT for an
+operation that began after a healthy replacement existed. The strengthened
+`stale_positive_lookup_does_not_delete_or_hide_replacement_entry` test failed
+on the first lookup with `EntryNotFound`, then passed after removing that cached
+branch's immediate return. It now reaches the existing local metadata lookup,
+including its access checks and observation-token cache admission.
+
+Finding 2 correctly observes that a changed child may be deferred during this
+repair invocation. It does not establish a permanent leak. `run` rescans and
+reports remaining issues for a fresh repair pass. Removing the processed marker
+would authorize destructive cleanup from the original orphan report after the
+child binding changed; that report's link count may now be stale. Retain the
+conservative skip. Concurrent online orphan reclamation would require fresh,
+atomic reachability validation rather than deleting this marker.
+
+Finding 3's missing-parent error is not produced by the current backends:
+Redb `readdir` enumerates dentry tables without validating the parent attribute;
+Pg `readdir` forwards to it. The CLI opens its local database exclusively with
+`background_poll: false`, completes PostgreSQL sync before scanning, and invokes
+repair synchronously. A concurrent writer during repair is outside that CLI
+lifecycle. If repair were exposed online, raw `remove_attr` would indeed lack an
+atomic empty-directory guard; the proposed extra `readdir` would leave the same
+check/delete gap. Do not introduce a partial guard or a speculative new public
+capability for unsupported online fsck. The previously recorded recursive
+directory-name race also remains outside this raw dentry repair scope.
+
+For finding 4, retain the existing summary field but feed it an actual count.
+`repair_orphan_directory` now receives the counter through its existing callers
+and increments it when retained children keep a directory alive. The real-engine
+hardlink fixture failed with count 0 versus expected 1 and passed after this
+increment. It still exercises the full repair and checks preserved bindings.
+
+Finding 5 is confirmed for callers that diagnose missing attributes directly;
+the cached-getattr path already clears stale state in `ReadMetadataResolver`.
+The private healing regression failed because dirty state for the missing old
+inode survived a conditional miss. Clear only `expected_ino` after a successful
+matched removal, or after direct metadata confirms it absent on a skipped or
+failed removal. Preserve the replacement's state and a still-live expected inode.
+This fresh check matters because access enforcement can synthesize
+`InodeNotFound` for `AccessLevel::NoAccess`; the review's unconditional cleanup
+would erase valid local state. A second real-engine fixture covers a live inode
+renamed to another binding and requires its state to survive.
+
+Finding 6 is cosmetic. `DirEntryValue` contains two scalar fields; cloning it
+does not allocate. Adding a public `Copy` contract has no demonstrated behavior
+or performance benefit for this issue, so leave the type unchanged.
+
+From `/Volumes/Storage/dev/studiofs`, rerun focused follow-up tests with
+`RUSTFLAGS='-D warnings'`: `cargo test -p studiofs-vfs --lib
+vfs::namespace_ops::tests::`, `cargo test -p studiofs-vfs --lib
+stale_positive_lookup_does_not_delete_or_hide_replacement_entry`,
+`cargo test -p studiofs-vfs --lib dangling`, `cargo test -p studiofs-vfs --lib
+getattr_unchecked`, and `cargo test -p studiofs --bin studiofs cli::fsck::tests`.
+Check and lint the changed packages with `cargo check -p studiofs-vfs -p studiofs`
+and `cargo clippy -p studiofs-vfs -p studiofs --all-targets -- -D warnings`, then
+run `cargo fmt --all -- --check` and `git diff --check`. Focused command evidence
+is retained as `target/sfs-759-followup-*.log`.
+
+Final follow-up results: the healing module ran 2 tests, first-lookup regression
+1, dangling namespace filter 5, getattr filter 3, and fsck module 5: 16 distinct
+focused tests passed. Check and all-targets Clippy for `studiofs-vfs` and
+`studiofs` passed with warnings denied. Formatting and diff checks passed.
+Independent final reviews found no introduced regression and confirmed the
+current-backend and CLI-lifecycle evidence for finding 3. The initial fsck RED
+command used the old name after the test was renamed and selected zero tests;
+it was discarded, and the exact renamed test produced the recorded count
+failure before the increment. Service-backed PostgreSQL and mounted E2E gates
+were not run for this follow-up; no native or remote proof is inferred.
+
 ## Interfaces and Dependencies
 
 No dependency is added. The required capability is implemented by RedbMetaEngine,
@@ -192,3 +271,8 @@ channels and scoped threads provide deterministic, owned test synchronization.
 
 Plan created after verification showed that the actual repair observation
 predates the original method-local comparison.
+
+Plan extended on 2026-10-01 for the second review: retain same-call replacement
+visibility, count skipped directories, and reclaim confirmed stale VFS state
+without discarding live inode state. Scope decisions avoid treating the external
+review's unsupported online-fsck assumptions as new product requirements.

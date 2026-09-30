@@ -1777,9 +1777,11 @@ fn stale_positive_lookup_does_not_delete_or_hide_replacement_entry() {
         .create_file(ROOT_INO, name, 0, 0, 0o644)
         .expect("create replacement binding");
 
-    assert!(
-        vfs.lookup(ROOT_INO, name).is_err(),
-        "lookup should discard the stale cached inode"
+    assert_eq!(
+        vfs.lookup(ROOT_INO, name)
+            .expect("lookup should resolve the replacement after discarding the stale cache")
+            .ino,
+        replacement.ino
     );
     assert_eq!(
         meta.lookup(ROOT_INO, name)

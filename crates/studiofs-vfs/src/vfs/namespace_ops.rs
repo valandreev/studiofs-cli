@@ -1890,11 +1890,20 @@ impl StudioVfs {
         };
 
         let was_removed = removed.is_some();
-        if let Some(removed) = removed {
-            self.clear_pending_payloads_for_inode(removed.ino);
-            self.clear_inode_incarnation(removed.ino);
-            self.state.namespace.dirty_attrs.lock().remove(&removed.ino);
-            self.invalidate_attr_read_cache([removed.ino]);
+        if was_removed
+            || matches!(
+                self.sync_meta().get_attr(expected_ino),
+                Err(MetaError::InodeNotFound(_))
+            )
+        {
+            self.clear_pending_payloads_for_inode(expected_ino);
+            self.clear_inode_incarnation(expected_ino);
+            self.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .remove(&expected_ino);
+            self.invalidate_attr_read_cache([expected_ino]);
         }
 
         self.dentry_cache_invalidate(parent, name);
@@ -1956,7 +1965,6 @@ impl StudioVfs {
                         }
                         Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                             self.heal_orphaned_dentry(parent, name, child_ino);
-                            return Err(Self::ignored_entry_not_found(parent, name));
                         }
                         Err(err) => return Err(err),
                     }
@@ -3264,5 +3272,262 @@ impl StudioVfs {
             "VFS rename completed"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::local_dirty::PendingPayload;
+    use super::super::tests::make_unstarted_test_vfs;
+    use super::*;
+    use bytes::BytesMut;
+    use studiofs_meta::schema::ROOT_INO;
+    use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
+
+    #[test]
+    fn healing_replaced_dentry_clears_missing_inode_state_only() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("heal-runtime-state-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "heal-runtime-state-replacement");
+        let name = b"replaced-dangling-entry";
+        let missing = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create original entry");
+        let cached_missing = vfs
+            .getattr_unchecked(missing.ino)
+            .expect("cache original attrs");
+        let mut stale_dirty_attr = cached_missing.clone();
+        stale_dirty_attr.size = 5;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(missing.ino, stale_dirty_attr.clone());
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (missing.ino, 0),
+            PendingPayload {
+                data: BytesMut::from(&b"stale"[..]),
+                dirty: true,
+                reserved_object_id: None,
+                persisted_len: None,
+            },
+        );
+        vfs.state
+            .local_dirty
+            .pending_payload_indexes
+            .lock()
+            .entry(missing.ino)
+            .or_default()
+            .insert(0);
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        vfs.refresh_inode_incarnation_state_from_attr(missing.ino, &stale_dirty_attr);
+
+        meta.remove_entry(ROOT_INO, name)
+            .expect("remove original binding");
+        meta.remove_attr(missing.ino)
+            .expect("remove original inode");
+        let replacement = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create replacement binding");
+        assert!(matches!(
+            meta.get_attr(missing.ino),
+            Err(MetaError::InodeNotFound(found)) if found == missing.ino
+        ));
+
+        let cached_replacement = vfs
+            .getattr_unchecked(replacement.ino)
+            .expect("cache replacement attrs");
+        let mut replacement_dirty_attr = cached_replacement.clone();
+        replacement_dirty_attr.size = 4;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(replacement.ino, replacement_dirty_attr.clone());
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (replacement.ino, 0),
+            PendingPayload {
+                data: BytesMut::from(&b"keep"[..]),
+                dirty: true,
+                reserved_object_id: None,
+                persisted_len: None,
+            },
+        );
+        vfs.state
+            .local_dirty
+            .pending_payload_indexes
+            .lock()
+            .entry(replacement.ino)
+            .or_default()
+            .insert(0);
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+        vfs.refresh_inode_incarnation_state_from_attr(replacement.ino, &replacement_dirty_attr);
+
+        assert!(
+            !vfs.heal_orphaned_dentry(ROOT_INO, name, missing.ino),
+            "conditional repair must not report removing the replacement"
+        );
+
+        assert!(
+            !vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&missing.ino)
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(missing.ino)
+        );
+        assert!(
+            !vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .contains_key(&(missing.ino, 0))
+        );
+        assert!(
+            !vfs.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .contains_key(&missing.ino)
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&replacement.ino)
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(replacement.ino)
+        );
+        assert!(
+            vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .contains_key(&(replacement.ino, 0))
+        );
+        assert!(
+            vfs.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .contains_key(&replacement.ino)
+        );
+        assert_eq!(
+            meta.lookup(ROOT_INO, name)
+                .expect("replacement binding")
+                .ino,
+            replacement.ino
+        );
+    }
+
+    #[test]
+    fn healing_changed_dentry_preserves_runtime_state_for_live_expected_inode() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("heal-live-state-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "heal-live-state-moved-inode");
+        let name = b"moved-dangling-entry";
+        let moved_name = b"moved-live-inode";
+        let live = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create original entry");
+        let cached_attr = vfs
+            .getattr_unchecked(live.ino)
+            .expect("cache original attrs");
+        let mut dirty_attr = cached_attr.clone();
+        dirty_attr.size = 4;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(live.ino, dirty_attr.clone());
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (live.ino, 0),
+            PendingPayload {
+                data: BytesMut::from(&b"live"[..]),
+                dirty: true,
+                reserved_object_id: None,
+                persisted_len: None,
+            },
+        );
+        vfs.state
+            .local_dirty
+            .pending_payload_indexes
+            .lock()
+            .entry(live.ino)
+            .or_default()
+            .insert(0);
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+        vfs.refresh_inode_incarnation_state_from_attr(live.ino, &dirty_attr);
+
+        meta.rename_atomic(ROOT_INO, name, ROOT_INO, moved_name)
+            .expect("move expected inode to a live binding");
+        let replacement = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create replacement at original name");
+
+        assert!(
+            !vfs.heal_orphaned_dentry(ROOT_INO, name, live.ino),
+            "conditional repair must not remove the replacement"
+        );
+
+        assert!(
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&live.ino)
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(live.ino)
+        );
+        assert!(
+            vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .contains_key(&(live.ino, 0))
+        );
+        assert!(
+            vfs.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .contains_key(&live.ino)
+        );
+        assert_eq!(
+            meta.lookup(ROOT_INO, moved_name)
+                .expect("moved live binding")
+                .ino,
+            live.ino
+        );
+        assert_eq!(
+            meta.lookup(ROOT_INO, name)
+                .expect("replacement binding")
+                .ino,
+            replacement.ino
+        );
     }
 }

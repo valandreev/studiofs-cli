@@ -362,6 +362,7 @@ fn repair_orphan_directory(
     removed_orphans: &mut usize,
     orphan_blocks_pending_gc: &mut usize,
     skipped_hardlink_orphans: &mut usize,
+    skipped_dir_orphans: &mut usize,
     processed: &mut HashSet<u64>,
 ) -> FsckResult<()> {
     if !processed.insert(ino) {
@@ -389,6 +390,7 @@ fn repair_orphan_directory(
                     removed_orphans,
                     orphan_blocks_pending_gc,
                     skipped_hardlink_orphans,
+                    skipped_dir_orphans,
                     processed,
                 )?;
                 match meta.rmdir(ino, &entry_name) {
@@ -444,6 +446,7 @@ fn repair_orphan_directory(
     }
 
     if has_unremoved_entries && !meta.readdir(ino)?.is_empty() {
+        *skipped_dir_orphans += 1;
         return Ok(());
     }
 
@@ -486,7 +489,7 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     }
 
     let mut removed_orphans = 0usize;
-    let skipped_dir_orphans = 0usize;
+    let mut skipped_dir_orphans = 0usize;
     let mut skipped_hardlink_orphans = 0usize;
     let mut orphan_blocks_pending_gc = 0usize;
     let mut processed_orphans = HashSet::new();
@@ -502,6 +505,7 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
                 &mut removed_orphans,
                 &mut orphan_blocks_pending_gc,
                 &mut skipped_hardlink_orphans,
+                &mut skipped_dir_orphans,
                 &mut processed_orphans,
             )?;
             continue;
@@ -710,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_preserves_orphan_directory_with_skipped_hardlink_child() {
+    fn repair_counts_and_preserves_orphan_directory_with_skipped_hardlink_child() {
         let engine = temp_engine();
         let orphan_dir = engine
             .create_dir(ROOT_INO, b"orphan", 1000, 1000, 0o755)
@@ -725,9 +729,29 @@ mod tests {
             .remove_entry(ROOT_INO, b"orphan")
             .expect("detach orphan directory");
 
-        let report = collect_report(&*engine).expect("collect orphan report");
-        repair(&*engine, &report).expect("repair orphan directory");
+        let mut removed_orphans = 0;
+        let mut orphan_blocks_pending_gc = 0;
+        let mut skipped_hardlink_orphans = 0;
+        let mut skipped_dir_orphans = 0;
+        let mut processed = HashSet::new();
+        repair_orphan_directory(
+            &*engine,
+            orphan_dir.ino,
+            &mut removed_orphans,
+            &mut orphan_blocks_pending_gc,
+            &mut skipped_hardlink_orphans,
+            &mut skipped_dir_orphans,
+            &mut processed,
+        )
+        .expect("repair orphan directory");
 
+        assert_eq!(skipped_dir_orphans, 1);
+        assert_eq!(skipped_hardlink_orphans, 1);
+        assert_eq!(removed_orphans, 0);
+        assert_eq!(orphan_blocks_pending_gc, 0);
+
+        let report = collect_report(&*engine).expect("collect retained orphan report");
+        repair(&*engine, &report).expect("repair retained orphan directory");
         assert!(engine.get_attr(orphan_dir.ino).is_ok());
         assert_eq!(
             engine
