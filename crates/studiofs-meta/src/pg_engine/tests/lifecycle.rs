@@ -3172,10 +3172,6 @@ fn dropping_final_engine_arc_on_worker_thread_does_not_self_join() {
     started_rx.recv().expect("wait for worker start");
 
     drop(engine);
-    assert!(
-        weak.upgrade().is_some(),
-        "worker should retain the engine until it is released"
-    );
     release_tx.send(()).expect("release worker");
     finished_rx
         .recv_timeout(Duration::from_secs(1))

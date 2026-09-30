@@ -431,6 +431,7 @@ fn checkpoint_writer_preserves_cancellation_during_large_serialization() {
     ));
     assert!(std::io::Write::write_all(&mut writer, &[0]).is_err());
 
+    writer.error = None;
     writer.bytes.clear();
     writer.next_check_at = 0;
     checks.store(0, std::sync::atomic::Ordering::Relaxed);
