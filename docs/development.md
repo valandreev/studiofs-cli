@@ -85,7 +85,10 @@ process.
 Linux verification is defined in RWX (`.rwx/ci.yml`) and is manual-only; it
 does not run automatically on PRs. GitHub Actions (`.github/workflows/rust.yml`)
 remains responsible for hosted macOS and Windows verification that RWX does
-not currently provide, and those workflows are also manual-only.
+not currently provide; its broad platform jobs are also manual-only. The focused
+GitHub Actions workflow `.github/workflows/payload-read-regression.yml` runs
+automatically on PRs touching the cache crate, test-support crate, workspace
+manifest/lockfile, or that workflow, and also supports manual dispatch.
 
 | Job | Runner | Purpose |
 |-----|--------|---------|
@@ -94,6 +97,7 @@ not currently provide, and those workflows are also manual-only.
 | **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; mounted libfuse3 release validation is required on Rocky 9.4+ |
 | **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
+| **Payload read regression** | `macos-latest` | Automatic focused concurrency regression and public unbuffered-read API test; commands in [tests.md](tests.md#payload-read-regression-gate) |
 
 macOS and Windows jobs include named steps for backend-specific crates so
 regressions in `studiofs-macfuse` or `studiofs-winfsp` are immediately
