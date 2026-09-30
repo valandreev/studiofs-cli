@@ -256,10 +256,28 @@ impl MetaReplication for PgMetaEngine {
 
     fn prepare_for_close(&self) -> MetaResult<()> {
         self.local.seal_relaxed_durability_for_close();
-        let _start_guard = self.lock_worker_start_lock.lock().map_err(|_| {
-            MetaError::Storage("pg background worker start state poisoned".to_string())
-        })?;
         let join_timeout = Self::default_prepare_for_close_join_timeout();
-        self.background_workers.shutdown(join_timeout)
+        let deadline = std::time::Instant::now() + join_timeout;
+        let _start_guard = loop {
+            match self.lock_worker_start_lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(MetaError::Storage(
+                        "pg background worker start state poisoned".to_string(),
+                    ));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(MetaError::Timeout(
+                            "pg worker registration or close is still in progress; worker ownership and metadata storage remain active".to_string(),
+                        ));
+                    }
+                    std::thread::park_timeout(remaining.min(std::time::Duration::from_millis(5)));
+                }
+            }
+        };
+        self.background_workers
+            .shutdown(deadline.saturating_duration_since(std::time::Instant::now()))
     }
 }

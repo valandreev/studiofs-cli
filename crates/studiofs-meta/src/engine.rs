@@ -1903,9 +1903,10 @@ pub trait MetaReplication: Send + Sync {
     /// Return the estimated size of remote metadata in bytes, if applicable.
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;
 
-    /// Prepare the engine for close: stop background threads and release
-    /// resources so that `Database::drop()` can run cleanly before process
-    /// exit. Default is a no-op (standalone redb needs no preparation).
+    /// Stop and join background workers before dropping the engine's storage.
+    /// A timeout retains unfinished worker ownership; it does not establish
+    /// that storage can reopen. Callers may retry close after workers exit.
+    /// Default is a no-op (standalone redb needs no preparation).
     fn prepare_for_close(&self) -> MetaResult<()> {
         Ok(())
     }

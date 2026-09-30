@@ -28,6 +28,14 @@ impl RedbMetaEngine {
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
     ) -> MetaResult<BTreeMap<Ino, BTreeMap<ChunkId, RegularFileChunkState>>> {
+        Self::regular_file_chunk_states_from_txn_with_check(txn, table_def, &|| Ok(()))
+    }
+
+    pub(super) fn regular_file_chunk_states_from_txn_with_check(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        check: &impl Fn() -> MetaResult<()>,
+    ) -> MetaResult<BTreeMap<Ino, BTreeMap<ChunkId, RegularFileChunkState>>> {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -36,6 +44,7 @@ impl RedbMetaEngine {
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
+            check()?;
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let (ino, chunk_id) = decode_regular_file_chunk_key(key.value())?;
             let chunk_state: RegularFileChunkState = decode(value.value())?;
@@ -361,20 +370,25 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn regular_file_snapshot_rows_from_txn<TState, F>(
+    pub(super) fn regular_file_snapshot_rows_from_txn_with_check<TState, F>(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         wrap_state: F,
+        check: &impl Fn() -> MetaResult<()>,
     ) -> MetaResult<Vec<(u64, Vec<u8>)>>
     where
         TState: serde::Serialize,
         F: Fn(BTreeMap<ChunkId, RegularFileChunkState>) -> TState,
     {
-        let states = Self::regular_file_chunk_states_from_txn(txn, table_def)?;
+        let states = Self::regular_file_chunk_states_from_txn_with_check(txn, table_def, check)?;
         let mut snapshot_rows = Vec::with_capacity(states.len());
         for (ino, chunks) in states {
+            check()?;
             let state = wrap_state(chunks);
-            snapshot_rows.push((ino, encode(&state)?));
+            snapshot_rows.push((
+                ino,
+                serialize_with_check(&state, check, "regular-file snapshot row")?,
+            ));
         }
         Ok(snapshot_rows)
     }

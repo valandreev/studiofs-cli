@@ -28,6 +28,17 @@ impl RedbMetaEngine {
         txn: &ReadTransaction,
         include_local_dentry_mutations: bool,
     ) -> MetaResult<RedbSnapshot> {
+        Self::export_snapshot_from_read_txn_with_check(txn, include_local_dentry_mutations, &|| {
+            Ok(())
+        })
+    }
+
+    pub(super) fn export_snapshot_from_read_txn_with_check(
+        txn: &ReadTransaction,
+        include_local_dentry_mutations: bool,
+        check: &impl Fn() -> MetaResult<()>,
+    ) -> MetaResult<RedbSnapshot> {
+        check()?;
         let mut snapshot = RedbSnapshot::default();
 
         {
@@ -38,6 +49,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 snapshot
                     .settings
@@ -52,6 +64,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 snapshot.counters.push((k.value().to_string(), v.value()));
             }
@@ -64,6 +77,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 snapshot.inodes.push((k.value(), v.value().to_vec()));
             }
@@ -76,6 +90,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 snapshot
                     .dentries
@@ -89,6 +104,7 @@ impl RedbMetaEngine {
                         .iter()
                         .map_err(|error| MetaError::Storage(error.to_string()))?
                     {
+                        check()?;
                         let (key, state) =
                             row.map_err(|error| MetaError::Storage(error.to_string()))?;
                         snapshot
@@ -101,17 +117,19 @@ impl RedbMetaEngine {
             }
         }
         {
-            snapshot.regular_file_overlay = Self::regular_file_snapshot_rows_from_txn(
+            snapshot.regular_file_overlay = Self::regular_file_snapshot_rows_from_txn_with_check(
                 txn,
                 REGULAR_FILE_OVERLAY_TABLE,
                 |chunks| RegularFileOverlayState { chunks },
+                check,
             )?;
         }
         {
-            snapshot.regular_file_base = Self::regular_file_snapshot_rows_from_txn(
+            snapshot.regular_file_base = Self::regular_file_snapshot_rows_from_txn_with_check(
                 txn,
                 REGULAR_FILE_BASE_TABLE,
                 |chunks| RegularFileBaseState { chunks },
+                check,
             )?;
         }
         {
@@ -122,6 +140,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 snapshot.pending_deletions.push((k.value(), v.value()));
             }
@@ -138,6 +157,7 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut merged = std::collections::BTreeMap::<u64, Vec<u8>>::new();
             for row in base.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.insert(k.value(), v.value().to_vec());
             }
@@ -145,6 +165,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, _v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.remove(&k.value());
             }
@@ -152,6 +173,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.insert(k.value(), v.value().to_vec());
             }
@@ -169,6 +191,7 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut merged = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
             for row in base.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 let key = k.value().to_vec();
                 let decoded = decode_xattr_value_from_storage(xattr_name_from_key(&key), v.value());
@@ -178,6 +201,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, _v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.remove(k.value());
             }
@@ -185,6 +209,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 let key = k.value().to_vec();
                 let decoded = decode_xattr_value_from_storage(xattr_name_from_key(&key), v.value());
@@ -204,6 +229,7 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut merged = std::collections::BTreeMap::<Vec<u8>, u8>::new();
             for row in base.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.insert(k.value().to_vec(), v.value());
             }
@@ -211,6 +237,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, _v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.remove(k.value());
             }
@@ -218,6 +245,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 merged.insert(k.value().to_vec(), v.value());
             }
@@ -231,6 +259,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
+                check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 snapshot.event_log.push((k.value(), v.value().to_vec()));
             }

@@ -348,6 +348,97 @@ fn serving_checkpoint_read_snapshot_exports_only_the_captured_state() {
 }
 
 #[test]
+fn serving_checkpoint_export_checks_cancellation_during_row_scans() {
+    let engine = temp_engine();
+    for index in 0..8 {
+        engine
+            .create_dir(
+                ROOT_INO,
+                format!("checkpoint-cancel-{index}").as_bytes(),
+                0,
+                0,
+                0o755,
+            )
+            .expect("create checkpoint row");
+    }
+    let file = engine
+        .create_file(ROOT_INO, b"checkpoint-published.bin", 0, 0, 0o644)
+        .expect("create published regular file");
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(90_001, 4096))
+        .expect("stage regular-file payload");
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 0, 90_001)
+            .expect("mark payload uploaded")
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
+            .expect("publish regular-file payload")
+    );
+    let snapshot = engine
+        .begin_serving_checkpoint_snapshot()
+        .expect("capture checkpoint snapshot");
+    let expected = snapshot
+        .export_serving_checkpoint_bytes()
+        .expect("export checkpoint without cancellation");
+    assert_eq!(
+        snapshot
+            .export_serving_checkpoint_bytes_with_check(&|| Ok(()))
+            .expect("export checkpoint with active checker"),
+        expected,
+        "checked serialization must preserve the existing checkpoint bytes"
+    );
+
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let cancel_during_scan = || {
+        if checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+            Err(MetaError::CatchUpCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    assert!(matches!(
+        snapshot.export_serving_checkpoint_bytes_with_check(&cancel_during_scan),
+        Err(MetaError::CatchUpCancelled)
+    ));
+}
+
+#[test]
+fn checkpoint_writer_preserves_cancellation_during_large_serialization() {
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let cancel_on_second_chunk = || {
+        if checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
+            Err(MetaError::CatchUpCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    let mut bytes = Vec::new();
+    let mut writer = CheckedCheckpointWriter {
+        bytes: &mut bytes,
+        check: &cancel_on_second_chunk,
+        error: None,
+    };
+    let large_value = vec![0; 128 * 1024];
+    assert!(std::io::Write::write_all(&mut writer, &large_value).is_err());
+    assert_eq!(writer.bytes.len(), 64 * 1024);
+    assert!(matches!(
+        writer.error.take(),
+        Some(MetaError::CatchUpCancelled)
+    ));
+    assert!(std::io::Write::write_all(&mut writer, &[0]).is_err());
+
+    writer.bytes.clear();
+    checks.store(0, std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..1024 {
+        std::io::Write::write_all(&mut writer, &[0]).expect("write individual postcard byte");
+    }
+    assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
 fn remote_snapshot_hides_root_empty_regular_file_draft() {
     let engine = temp_engine();
     engine

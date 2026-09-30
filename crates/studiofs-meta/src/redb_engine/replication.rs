@@ -567,15 +567,32 @@ impl RedbMetaEngine {
     }
 
     fn export_remote_snapshot_from_read_txn(txn: &ReadTransaction) -> MetaResult<RedbSnapshot> {
-        let mut snapshot = Self::export_snapshot_from_read_txn(txn, false)?;
+        Self::export_remote_snapshot_from_read_txn_with_check(txn, &|| Ok(()))
+    }
+
+    fn export_remote_snapshot_from_read_txn_with_check(
+        txn: &ReadTransaction,
+        check: &impl Fn() -> MetaResult<()>,
+    ) -> MetaResult<RedbSnapshot> {
+        check()?;
+        let mut snapshot = Self::export_snapshot_from_read_txn_with_check(txn, false, check)?;
         let mut published_regular_inodes = HashSet::new();
         for (ino, bytes) in &snapshot.regular_file_base {
+            check()?;
             let regular: RegularFileBaseState = decode(bytes)?;
-            if regular.chunks.values().any(|chunk| {
-                chunk.slices.values().any(|slice| {
-                    slice.payload_state == PayloadRefState::Published && slice.payload.is_some()
-                })
-            }) {
+            let mut has_published_slice = false;
+            'chunks: for chunk in regular.chunks.values() {
+                check()?;
+                for slice in chunk.slices.values() {
+                    check()?;
+                    if slice.payload_state == PayloadRefState::Published && slice.payload.is_some()
+                    {
+                        has_published_slice = true;
+                        break 'chunks;
+                    }
+                }
+            }
+            if has_published_slice {
                 published_regular_inodes.insert(*ino);
             }
         }
@@ -583,6 +600,7 @@ impl RedbMetaEngine {
         let mut projected_inodes = Vec::with_capacity(snapshot.inodes.len());
         let mut hidden_regular_inodes = HashSet::new();
         for (ino, bytes) in snapshot.inodes.drain(..) {
+            check()?;
             let mut attr: InodeAttr = decode(&bytes)?;
             if attr.kind == FileType::RegularFile {
                 let lifecycle = Self::get_inode_lifecycle_from_read_txn(txn, ino)?;
@@ -600,28 +618,42 @@ impl RedbMetaEngine {
             projected_inodes.push((ino, encode(&attr)?));
         }
         snapshot.inodes = projected_inodes;
-        snapshot.dentries = snapshot
-            .dentries
-            .drain(..)
-            .filter_map(|(key, bytes)| {
-                decode::<DirEntryValue>(&bytes)
-                    .ok()
-                    .filter(|entry| !hidden_regular_inodes.contains(&entry.ino))
-                    .map(|_| (key, bytes))
-            })
-            .collect();
-        snapshot
-            .regular_file_overlay
-            .retain(|(ino, _)| !hidden_regular_inodes.contains(ino));
-        snapshot
-            .regular_file_base
-            .retain(|(ino, _)| !hidden_regular_inodes.contains(ino));
+        let mut dentries = Vec::with_capacity(snapshot.dentries.len());
+        for (key, bytes) in snapshot.dentries.drain(..) {
+            check()?;
+            if decode::<DirEntryValue>(&bytes)
+                .ok()
+                .is_some_and(|entry| !hidden_regular_inodes.contains(&entry.ino))
+            {
+                dentries.push((key, bytes));
+            }
+        }
+        snapshot.dentries = dentries;
+        let mut regular_file_overlay = Vec::with_capacity(snapshot.regular_file_overlay.len());
+        for (ino, bytes) in snapshot.regular_file_overlay.drain(..) {
+            check()?;
+            if !hidden_regular_inodes.contains(&ino) {
+                regular_file_overlay.push((ino, bytes));
+            }
+        }
+        snapshot.regular_file_overlay = regular_file_overlay;
+        let mut regular_file_base = Vec::with_capacity(snapshot.regular_file_base.len());
+        for (ino, bytes) in snapshot.regular_file_base.drain(..) {
+            check()?;
+            if !hidden_regular_inodes.contains(&ino) {
+                regular_file_base.push((ino, bytes));
+            }
+        }
+        snapshot.regular_file_base = regular_file_base;
 
         let mut referenced_objects = BTreeMap::new();
         for (_, bytes) in &snapshot.regular_file_base {
+            check()?;
             let regular: RegularFileBaseState = decode(bytes)?;
             for chunk in regular.chunks.values() {
+                check()?;
                 for slice in chunk.slices.values() {
+                    check()?;
                     if let Some(block) = slice.payload.as_ref() {
                         referenced_objects
                             .entry(block.object_id)
@@ -630,16 +662,29 @@ impl RedbMetaEngine {
                 }
             }
         }
-        let committed_used_space = referenced_objects
-            .values()
-            .fold(0_u64, |acc, len| acc.saturating_add(*len));
+        let mut committed_used_space = 0_u64;
+        for len in referenced_objects.values() {
+            check()?;
+            committed_used_space = committed_used_space.saturating_add(*len);
+        }
 
-        snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
+        let mut regular_file_overlay = Vec::with_capacity(snapshot.regular_file_base.len());
+        for (ino, bytes) in &snapshot.regular_file_base {
+            check()?;
+            regular_file_overlay.push((*ino, bytes.clone()));
+        }
+        snapshot.regular_file_overlay = regular_file_overlay;
         snapshot.event_log.clear();
-        snapshot.counters.retain(|(name, _)| {
-            name.as_str() != crate::schema::counters::NEXT_EVENT_SEQ
-                && !crate::pg_engine::is_local_pg_snapshot_state_counter(name)
-        });
+        let mut counters = Vec::with_capacity(snapshot.counters.len());
+        for (name, value) in snapshot.counters.drain(..) {
+            check()?;
+            if name.as_str() != crate::schema::counters::NEXT_EVENT_SEQ
+                && !crate::pg_engine::is_local_pg_snapshot_state_counter(&name)
+            {
+                counters.push((name, value));
+            }
+        }
+        snapshot.counters = counters;
         if let Some((_, value)) = snapshot
             .counters
             .iter_mut()
@@ -658,7 +703,15 @@ impl RedbMetaEngine {
     pub(super) fn export_serving_checkpoint_from_read_txn(
         txn: &ReadTransaction,
     ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
-        let snapshot = Self::export_remote_snapshot_from_read_txn(txn)?;
+        Self::export_serving_checkpoint_from_read_txn_with_check(txn, &|| Ok(()))
+    }
+
+    pub(super) fn export_serving_checkpoint_from_read_txn_with_check(
+        txn: &ReadTransaction,
+        check: &impl Fn() -> MetaResult<()>,
+    ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
+        check()?;
+        let snapshot = Self::export_remote_snapshot_from_read_txn_with_check(txn, check)?;
         Ok(crate::snapshot::ServingCheckpoint {
             inodes: snapshot.inodes,
             dentries: snapshot.dentries,

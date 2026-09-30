@@ -135,11 +135,87 @@ impl ServingCheckpointReadSnapshot {
         })
     }
 
+    /// Serialize this checkpoint while periodically checking for cancellation.
+    pub(crate) fn export_serving_checkpoint_bytes_with_check(
+        &self,
+        check: &impl Fn() -> MetaResult<()>,
+    ) -> MetaResult<Vec<u8>> {
+        let checkpoint = self.export_serving_checkpoint_with_check(check)?;
+        serialize_with_check(&checkpoint, check, "serving checkpoint")
+    }
+
     /// Export the serving checkpoint visible in this snapshot.
     pub(crate) fn export_serving_checkpoint(
         &self,
     ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
         RedbMetaEngine::export_serving_checkpoint_from_read_txn(&self.transaction)
+    }
+
+    pub(crate) fn export_serving_checkpoint_with_check(
+        &self,
+        check: &impl Fn() -> MetaResult<()>,
+    ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
+        RedbMetaEngine::export_serving_checkpoint_from_read_txn_with_check(&self.transaction, check)
+    }
+}
+
+struct CheckedCheckpointWriter<'a, F> {
+    bytes: &'a mut Vec<u8>,
+    check: &'a F,
+    error: Option<MetaError>,
+}
+
+pub(super) fn serialize_with_check<T: serde::Serialize>(
+    value: &T,
+    check: &impl Fn() -> MetaResult<()>,
+    context: &str,
+) -> MetaResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut writer = CheckedCheckpointWriter {
+        bytes: &mut bytes,
+        check,
+        error: None,
+    };
+    let serialization_error = postcard::to_io(value, &mut writer)
+        .err()
+        .map(|error| format!("{context} encode failed: {error}"));
+    if let Some(error) = writer.error.take() {
+        return Err(error);
+    }
+    if let Some(error) = serialization_error {
+        return Err(MetaError::Serialization(error));
+    }
+    check()?;
+    Ok(bytes)
+}
+
+impl<F> std::io::Write for CheckedCheckpointWriter<'_, F>
+where
+    F: Fn() -> MetaResult<()>,
+{
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        const CHECK_INTERVAL: usize = 64 * 1024;
+
+        for chunk in buffer.chunks(CHECK_INTERVAL) {
+            // Postcard also writes individual bytes; check on byte intervals.
+            let until_check = CHECK_INTERVAL - self.bytes.len() % CHECK_INTERVAL;
+            if (until_check == CHECK_INTERVAL || chunk.len() >= until_check)
+                && let Err(error) = (self.check)()
+            {
+                self.error = Some(error);
+                return Err(std::io::Error::other("serving checkpoint export cancelled"));
+            }
+            self.bytes.extend_from_slice(chunk);
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Err(error) = (self.check)() {
+            self.error = Some(error);
+            return Err(std::io::Error::other("serving checkpoint export cancelled"));
+        }
+        Ok(())
     }
 }
 

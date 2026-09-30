@@ -41,6 +41,33 @@ The contract therefore separates three independently observable concerns:
 
 No caller may infer one of these states from another.
 
+## Worker Close and Storage Ownership
+
+`MetaReplication::prepare_for_close` signals cooperative cancellation and waits
+for registered PostgreSQL workers under one join deadline. Success means every
+registered worker has been joined. After dropping the engine and any other
+local owners, the same redb database can reopen immediately.
+
+A close timeout returns `MetaError::Timeout` naming unfinished ownership. The
+engine retains unfinished handles and a later close retries their joins;
+timeout never means storage has been released. Concurrent close callers have
+their own bounded wait for the active close. Terminal worker-panic errors
+remain visible on repeated close even after all handles have been joined.
+
+Remote checkpoint client futures respond to the shared shutdown token. This
+does not undo a remote statement PostgreSQL has already executed. Foreground
+remote transactions retain their existing command timeout behavior. Checkpoint
+lock waits and local export, projection, encoding, and hashing check shutdown
+and the configured command timeout cooperatively. Cancellation may leave a
+checkpoint lease to expire; its fencing token still protects publication.
+
+Early engine destruction and failed worker registration transfer retained
+handles to a cleanup thread that joins them through exit. Destruction from the
+worker holding the final engine reference must not self-join. This cleanup
+preserves resource ownership; it does not claim an explicit close succeeded.
+If cleanup-thread creation fails, cleanup retains its remaining worker handles
+for process lifetime with a diagnostic; it cannot block Drop on their joins.
+
 ## Core Vocabulary
 
 | Term | Meaning |
