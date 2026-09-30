@@ -177,18 +177,41 @@ impl PgBackgroundWorkers {
         worker: PgBackgroundWorker,
         handle: std::thread::JoinHandle<()>,
     ) -> MetaResult<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg background worker state poisoned".to_string()))?;
-        if state.shutdown_complete {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.signal_stop();
+                reap_worker_handles(vec![(worker, handle)]);
+                return Err(MetaError::Storage(
+                    "pg background worker state poisoned".to_string(),
+                ));
+            }
+        };
+        if state.shutdown_complete
+            || state.shutdown_in_progress
+            || self.poll_shutdown_ref().load(Ordering::Acquire)
+        {
             self.signal_stop();
+            if !state.shutdown_complete
+                && !state.shutdown_in_progress
+                && worker_slot(&state, worker).is_none()
+            {
+                // Startup can finish after close times out on its start lock.
+                // Retain that handle so a retry must join it before succeeding.
+                *worker_slot_mut(&mut state, worker) = Some(handle);
+            } else {
+                drop(state);
+                reap_worker_handles(vec![(worker, handle)]);
+            }
             return Err(MetaError::Storage(
-                "pg background workers are already shut down".to_string(),
+                "pg background workers are closing or already shut down".to_string(),
             ));
         }
         let slot = worker_slot_mut(&mut state, worker);
         if slot.is_some() {
+            self.signal_stop();
+            drop(state);
+            reap_worker_handles(vec![(worker, handle)]);
             return Err(MetaError::Storage(format!(
                 "pg background worker handle already installed: {}",
                 worker_name(worker)
@@ -225,16 +248,26 @@ impl PgBackgroundWorkers {
     }
 
     pub(super) fn shutdown(&self, timeout: Duration) -> MetaResult<()> {
+        let deadline = Instant::now() + timeout;
         let handles = {
-            let mut state = self.state.lock().map_err(|_| {
-                MetaError::Storage("pg background worker state poisoned".to_string())
-            })?;
-            if state.shutdown_complete {
-                while state.shutdown_in_progress {
-                    state = self.state_changed.wait(state).map_err(|_| {
-                        MetaError::Storage("pg background worker state poisoned".to_string())
-                    })?;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.shutdown_in_progress {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(MetaError::Timeout(
+                        "pg background worker shutdown is still in progress; worker handles remain owned and metadata storage stays open".to_string(),
+                    ));
                 }
+                let (next_state, _) = self
+                    .state_changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next_state;
+            }
+            if state.shutdown_complete {
                 return match &state.shutdown_error {
                     Some(error) => Err(error.clone()),
                     None => Ok(()),
@@ -242,50 +275,47 @@ impl PgBackgroundWorkers {
             }
 
             self.signal_stop();
-            state.shutdown_complete = true;
             state.shutdown_in_progress = true;
-            [
-                (PgBackgroundWorker::Poll, state.poll_handle.take()),
-                (
-                    PgBackgroundWorker::Checkpoint,
-                    state.checkpoint_handle.take(),
-                ),
-                (
-                    PgBackgroundWorker::MetadataNotify,
-                    state.metadata_notify_handle.take(),
-                ),
-                (
-                    PgBackgroundWorker::LockNotify,
-                    state.lock_notify_handle.take(),
-                ),
-                (
-                    PgBackgroundWorker::LockRenew,
-                    state.lock_renew_handle.take(),
-                ),
-            ]
+            take_all_handles(&mut state)
         };
 
-        let deadline = Instant::now() + timeout;
-        let mut first_error = None;
+        let mut join_error = None;
+        let mut timeout_error = None;
         for (worker, handle) in handles {
-            let result =
-                handle.and_then(|handle| join_worker_until(handle, deadline, worker).err());
-            if first_error.is_none() {
-                first_error = result;
+            match join_worker_until(handle, deadline, worker) {
+                WorkerJoinResult::Joined(result) => {
+                    if let Err(error) = result {
+                        join_error.get_or_insert(error);
+                    }
+                }
+                WorkerJoinResult::TimedOut(handle, error) => {
+                    timeout_error.get_or_insert(error);
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    debug_assert!(worker_slot(&state, worker).is_none());
+                    *worker_slot_mut(&mut state, worker) = Some(handle);
+                }
             }
         }
 
         let mut state = self
             .state
             .lock()
-            .map_err(|_| MetaError::Storage("pg background worker state poisoned".to_string()))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.shutdown_in_progress = false;
-        state.shutdown_error = first_error.clone();
+        state.shutdown_complete = !has_handles(&state);
+        if let Some(error) = join_error {
+            state.shutdown_error.get_or_insert(error);
+        }
         self.state_changed.notify_all();
-        drop(state);
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if let Some(error) = timeout_error {
+            Err(error)
+        } else if let Some(error) = &state.shutdown_error {
+            Err(error.clone())
+        } else {
+            Ok(())
         }
     }
 }
@@ -293,6 +323,13 @@ impl PgBackgroundWorkers {
 impl Drop for PgBackgroundWorkers {
     fn drop(&mut self) {
         self.signal_stop();
+        let handles = match self.state.get_mut() {
+            Ok(state) => take_all_handles(state),
+            Err(poisoned) => take_all_handles(poisoned.into_inner()),
+        };
+        if !handles.is_empty() {
+            reap_worker_handles(handles);
+        }
     }
 }
 
@@ -332,34 +369,100 @@ fn worker_name(worker: PgBackgroundWorker) -> &'static str {
     }
 }
 
+enum WorkerJoinResult {
+    Joined(MetaResult<()>),
+    TimedOut(std::thread::JoinHandle<()>, MetaError),
+}
+
 fn join_worker_until(
     handle: std::thread::JoinHandle<()>,
     deadline: Instant,
     worker: PgBackgroundWorker,
-) -> MetaResult<()> {
+) -> WorkerJoinResult {
     while !handle.is_finished() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let worker_label = worker_name(worker);
-            if matches!(worker, PgBackgroundWorker::Checkpoint) {
-                warn!(
-                    worker = worker_label,
-                    "pg checkpoint thread exceeded shutdown join timeout; joining before releasing the metadata engine"
-                );
-                return join_worker(handle, worker_label);
-            }
             warn!(
                 worker = worker_label,
                 "pg background thread did not stop before shutdown join timeout"
             );
-            return Err(MetaError::Storage(format!(
-                "pg {worker_label} background thread did not stop before shutdown join timeout"
-            )));
+            return WorkerJoinResult::TimedOut(
+                handle,
+                MetaError::Timeout(format!(
+                    "pg {worker_label} background thread did not stop before shutdown join timeout; its handle remains owned and metadata storage stays open"
+                )),
+            );
         }
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 
-    join_worker(handle, worker_name(worker))
+    WorkerJoinResult::Joined(join_worker(handle, worker_name(worker)))
+}
+
+fn has_handles(state: &PgBackgroundWorkerState) -> bool {
+    state.poll_handle.is_some()
+        || state.checkpoint_handle.is_some()
+        || state.metadata_notify_handle.is_some()
+        || state.lock_notify_handle.is_some()
+        || state.lock_renew_handle.is_some()
+}
+
+fn take_all_handles(
+    state: &mut PgBackgroundWorkerState,
+) -> Vec<(PgBackgroundWorker, std::thread::JoinHandle<()>)> {
+    [
+        (PgBackgroundWorker::Poll, state.poll_handle.take()),
+        (
+            PgBackgroundWorker::Checkpoint,
+            state.checkpoint_handle.take(),
+        ),
+        (
+            PgBackgroundWorker::MetadataNotify,
+            state.metadata_notify_handle.take(),
+        ),
+        (
+            PgBackgroundWorker::LockNotify,
+            state.lock_notify_handle.take(),
+        ),
+        (
+            PgBackgroundWorker::LockRenew,
+            state.lock_renew_handle.take(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(worker, handle)| handle.map(|handle| (worker, handle)))
+    .collect()
+}
+
+fn reap_worker_handles(handles: Vec<(PgBackgroundWorker, std::thread::JoinHandle<()>)>) {
+    let payload = Arc::new(Mutex::new(Some(handles)));
+    let reaper_payload = payload.clone();
+    match std::thread::Builder::new()
+        .name("pg-worker-reaper".into())
+        .spawn(move || {
+            let handles = reaper_payload
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_default();
+            for (worker, handle) in handles {
+                let _ = join_worker(handle, worker_name(worker));
+            }
+        }) {
+        Ok(_) => {}
+        Err(error) => {
+            warn!(%error, "could not start pg worker cleanup thread; retaining worker handles for process lifetime");
+            let handles = payload
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_default();
+            // ponytail: resource exhaustion retains handles for process lifetime;
+            // a prestarted cleanup service would allow joins without spawning here.
+            let _ = Box::leak(Box::new(handles));
+        }
+    }
 }
 
 fn join_worker(handle: std::thread::JoinHandle<()>, worker: &'static str) -> MetaResult<()> {

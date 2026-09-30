@@ -4,7 +4,7 @@ use crate::engine::{MetaError, MetaResult};
 use crate::redb_engine::ServingCheckpointReadSnapshot;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -164,6 +164,7 @@ impl PgMetaEngine {
                             engine.checkpoint_coordinator_state.request();
                             retry_pending = true;
                         }
+                        Err(MetaError::WorkerShutdownCancelled) => break,
                         Err(error) => {
                             warn!(
                                 error = %error,
@@ -184,9 +185,12 @@ impl PgMetaEngine {
     }
 
     pub(super) fn run_checkpoint_refresh_once(&self, lease_duration: Duration) -> MetaResult<bool> {
-        let _single_flight = self.checkpoint_single_flight.lock().map_err(|_| {
-            MetaError::Storage("pg checkpoint single-flight lock poisoned".to_string())
-        })?;
+        let _cancellation = super::runtime::WorkerRemoteCancellationScope::enter();
+        let _single_flight = self.lock_checkpoint_step(
+            &self.checkpoint_single_flight,
+            Instant::now() + self.command_timeout,
+            "single-flight",
+        )?;
         self.ensure_remote_format_validated()?;
         let Some(cut) = self.capture_checkpoint_source_cut()? else {
             return Ok(!self.checkpoint_freshness_diagnostics().refresh_needed);
@@ -202,7 +206,12 @@ impl PgMetaEngine {
         };
 
         let result = self.build_and_publish_checkpoint(&owner, lease, cut);
-        if let Err(error) = self.release_checkpoint_lease(&owner, lease) {
+        if !self
+            .background_workers
+            .poll_shutdown_ref()
+            .load(Ordering::Acquire)
+            && let Err(error) = self.release_checkpoint_lease(&owner, lease)
+        {
             warn!(
                 error = %error,
                 volume_id = self.volume_id,
@@ -230,6 +239,9 @@ impl PgMetaEngine {
     ) -> MetaResult<bool> {
         let total_started = Instant::now();
         let build_started = Instant::now();
+        let deadline = build_started + self.command_timeout;
+        let check = || self.check_checkpoint_step(deadline);
+        check()?;
         let CheckpointSourceCut {
             version,
             event_seq,
@@ -245,9 +257,15 @@ impl PgMetaEngine {
         let format_info = serde_json::to_vec(&format_info).map_err(|error| {
             MetaError::Serialization(format!("format info encode failed: {error}"))
         })?;
-        let payload = snapshot.export_serving_checkpoint_bytes()?;
+        let payload = snapshot.export_serving_checkpoint_bytes_with_check(&check)?;
         drop(snapshot);
-        let checkpoint_sha256: [u8; 32] = Sha256::digest(&payload).into();
+        let mut hash = Sha256::new();
+        for chunk in payload.chunks(64 * 1024) {
+            check()?;
+            hash.update(chunk);
+        }
+        let checkpoint_sha256: [u8; 32] = hash.finalize().into();
+        check()?;
 
         let checkpoint = BuiltCheckpoint {
             metadata_format_version,
@@ -290,10 +308,8 @@ impl PgMetaEngine {
     pub(super) fn capture_checkpoint_source_cut(&self) -> MetaResult<Option<CheckpointSourceCut>> {
         let local_version_before = self.local_version.load(Ordering::Acquire);
         let freshness = self.read_remote_checkpoint_freshness()?;
-        let _guard = self
-            .replication_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        let deadline = Instant::now() + self.command_timeout;
+        let _guard = self.lock_checkpoint_step(&self.replication_lock, deadline, "replication")?;
         let local_version = self.local_version.load(Ordering::Acquire);
         let Some(local_version) =
             checkpoint_source_version_if_stable(local_version_before, local_version)
@@ -339,10 +355,11 @@ impl PgMetaEngine {
         &self,
         snapshot: &ServingCheckpointReadSnapshot,
     ) -> MetaResult<Option<u64>> {
-        let pending_state = self
-            .pending_state
-            .lock()
-            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let pending_state = self.lock_checkpoint_step(
+            &self.pending_state,
+            Instant::now() + self.command_timeout,
+            "pending state",
+        )?;
         let next_event_seq = snapshot.get_counter("nextEventSeq")?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::Acquire);
         Ok(checkpoint_source_event_seq_if_clean(
@@ -351,6 +368,46 @@ impl PgMetaEngine {
             flushed_event_seq,
             self.inflight_replication_ops.load(Ordering::Acquire),
         ))
+    }
+
+    fn check_checkpoint_step(&self, deadline: Instant) -> MetaResult<()> {
+        if self
+            .background_workers
+            .poll_shutdown_ref()
+            .load(Ordering::Acquire)
+        {
+            return Err(MetaError::WorkerShutdownCancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(MetaError::Timeout(
+                "postgres local checkpoint step exceeded command timeout".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn lock_checkpoint_step<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        deadline: Instant,
+        name: &str,
+    ) -> MetaResult<MutexGuard<'a, T>> {
+        loop {
+            self.check_checkpoint_step(deadline)?;
+            match mutex.try_lock() {
+                Ok(guard) => {
+                    self.check_checkpoint_step(deadline)?;
+                    return Ok(guard);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(MetaError::Storage(format!("pg {name} lock poisoned")));
+                }
+                Err(TryLockError::WouldBlock) => std::thread::park_timeout(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+            }
+        }
     }
 
     pub(super) fn try_claim_checkpoint_lease(
@@ -583,6 +640,70 @@ fn should_wait_for_checkpoint_wakeup(wakeup_set: bool, retry_pending: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_local_shutdown_is_classified_as_cancelled() {
+        let (_dir, engine) = crate::pg_engine::tests::temp_pg_engine_for_unit();
+        engine.background_workers.signal_stop();
+
+        let error = engine
+            .check_checkpoint_step(Instant::now() + Duration::from_secs(1))
+            .expect_err("shutdown must cancel local checkpoint work");
+        assert_eq!(
+            crate::engine::PgSyncFailure::from_error(&error),
+            crate::engine::PgSyncFailure::Cancelled
+        );
+    }
+
+    #[test]
+    fn checkpoint_local_lock_wait_respects_deadline() {
+        let (_dir, engine) = crate::pg_engine::tests::temp_pg_engine_for_unit();
+        let _held = engine
+            .replication_lock
+            .lock()
+            .expect("hold replication lock");
+        let result = engine.lock_checkpoint_step(
+            &engine.replication_lock,
+            Instant::now() + Duration::from_millis(10),
+            "replication",
+        );
+        assert!(matches!(result, Err(MetaError::Timeout(_))));
+    }
+
+    #[test]
+    fn prepare_for_close_cancels_checkpoint_waiting_for_single_flight() {
+        let (_dir, engine) = crate::pg_engine::tests::temp_pg_engine_for_unit();
+        let engine = Arc::new(engine);
+        let flight = engine
+            .checkpoint_single_flight
+            .lock()
+            .expect("hold checkpoint flight");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_engine = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal checkpoint start");
+            let _ = worker_engine.run_checkpoint_refresh_once(Duration::from_secs(60));
+        });
+        engine
+            .background_workers
+            .install_handle(super::super::PgBackgroundWorker::Checkpoint, handle)
+            .expect("install checkpoint");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("checkpoint should start");
+        let result = engine
+            .background_workers
+            .shutdown(Duration::from_millis(200));
+        drop(flight);
+        engine
+            .background_workers
+            .shutdown(Duration::from_secs(1))
+            .expect("finish checkpoint cleanup");
+        assert!(
+            result.is_ok(),
+            "close must cancel a checkpoint blocked on single-flight: {result:?}"
+        );
+    }
 
     #[test]
     fn checkpoint_source_cut_requires_matching_freshness_coordinates() {

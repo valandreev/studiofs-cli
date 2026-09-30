@@ -1,6 +1,7 @@
 use super::{PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
 use crate::pg_transport::{classify_postgres_error, connect_studiofs_postgres};
+use std::cell::Cell;
 use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
@@ -18,6 +19,25 @@ const TOKIO_MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
 
 type RuntimeJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(super) type PgClientFuture<'a, T> = Pin<Box<dyn Future<Output = MetaResult<T>> + Send + 'a>>;
+
+thread_local! {
+    static WORKER_REMOTE_CANCELLATION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restrict shutdown cancellation to remote work performed by a worker step.
+pub(super) struct WorkerRemoteCancellationScope(bool);
+
+impl WorkerRemoteCancellationScope {
+    pub(super) fn enter() -> Self {
+        Self(WORKER_REMOTE_CANCELLATION.replace(true))
+    }
+}
+
+impl Drop for WorkerRemoteCancellationScope {
+    fn drop(&mut self) {
+        WORKER_REMOTE_CANCELLATION.set(self.0);
+    }
+}
 
 enum RuntimeMessage {
     Run(RuntimeJob),
@@ -509,6 +529,20 @@ impl PgMetaEngine {
         T: Send + 'static,
         F: Future<Output = MetaResult<T>> + Send + 'static,
     {
+        // Foreground transactions keep their existing command timeout behavior.
+        let cancel = WORKER_REMOTE_CANCELLATION
+            .get()
+            .then(|| self.background_workers.metadata_notify_cancel());
+        let fut = async move {
+            let Some(cancel) = cancel else {
+                return fut.await;
+            };
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(MetaError::WorkerShutdownCancelled),
+                result = fut => result,
+            }
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             return match handle.runtime_flavor() {
                 RuntimeFlavor::MultiThread => {
@@ -531,6 +565,80 @@ mod tests {
     use std::sync::Arc;
     use std::thread::ThreadId;
     use std::time::Duration;
+
+    #[test]
+    fn prepare_for_close_cancels_inflight_remote_step() {
+        let (_dir, engine) = temp_pg_engine_for_unit();
+        let engine = Arc::new(engine);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_engine = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            let _scope = super::WorkerRemoteCancellationScope::enter();
+            let result = worker_engine.run_async(async move {
+                started_tx.send(()).expect("signal pending remote step");
+                let _ = release_rx.await;
+                Ok(())
+            });
+            result_tx.send(result).expect("send remote step result");
+        });
+        engine
+            .background_workers
+            .install_handle(crate::pg_engine::PgBackgroundWorker::Checkpoint, handle)
+            .expect("install pending checkpoint worker");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote step should start");
+
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closing_engine = Arc::clone(&engine);
+        let closer = std::thread::spawn(move || {
+            closed_tx
+                .send(
+                    closing_engine
+                        .background_workers
+                        .shutdown(Duration::from_millis(200)),
+                )
+                .expect("send close result");
+        });
+        let close_result = closed_rx.recv_timeout(Duration::from_secs(1));
+        // Release the controlled future even on the old unconditional-join path.
+        let _ = release_tx.send(());
+        let close_result = close_result.unwrap_or_else(|_| {
+            closed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("released close should finish")
+        });
+        closer.join().expect("join close caller");
+        engine
+            .background_workers
+            .shutdown(Duration::from_secs(1))
+            .expect("finish worker cleanup");
+        let remote_result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote result");
+        assert!(
+            close_result.is_ok(),
+            "cancellation should stop the pending worker: {close_result:?}"
+        );
+        assert!(
+            matches!(remote_result, Err(MetaError::WorkerShutdownCancelled)),
+            "the pending remote step must be cancelled before release"
+        );
+    }
+
+    #[test]
+    fn worker_shutdown_does_not_cancel_foreground_remote_operations() {
+        let (_dir, engine) = temp_pg_engine_for_unit();
+        engine.background_workers.signal_stop();
+        assert_eq!(
+            engine
+                .run_async(async { Ok(7) })
+                .expect("foreground result"),
+            7
+        );
+    }
 
     #[test]
     fn run_async_reuses_current_thread_fallback_runtime_thread() {
