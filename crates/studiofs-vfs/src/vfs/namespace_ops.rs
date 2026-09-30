@@ -32,6 +32,11 @@ const DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES: usize = 1024 * 1024;
 const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
 const RMDIR_INFLIGHT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const RMDIR_CLEANUP_RETRY_ATTEMPTS: u16 = 200;
+#[cfg(test)]
+std::thread_local! {
+    static RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(not(target_os = "macos"))]
 fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
@@ -1858,17 +1863,25 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn heal_orphaned_dentry(&self, parent: Ino, name: &[u8], ino_hint: Option<Ino>) {
-        match self.sync_meta().remove_entry(parent, name) {
-            Ok(removed) => {
+    fn heal_orphaned_dentry(&self, parent: Ino, name: &[u8], expected_ino: Ino) -> bool {
+        let removed = match self
+            .sync_meta()
+            .remove_entry_if_matches(parent, name, expected_ino)
+        {
+            Ok(Some(removed)) => {
                 debug!(
                     parent,
                     removed_ino = removed.ino,
                     "healed orphaned dentry after inode-not-found"
                 );
+                Some(removed)
             }
-            Err(MetaError::EntryNotFound { .. }) => {
-                debug!(parent, "orphaned dentry already absent during heal");
+            Ok(None) => {
+                debug!(
+                    parent,
+                    "orphaned dentry changed or was already absent during heal"
+                );
+                None
             }
             Err(err) => {
                 warn!(
@@ -1877,18 +1890,30 @@ impl StudioVfs {
                     error = %err,
                     "failed to heal orphaned dentry after inode-not-found"
                 );
+                None
             }
+        };
+
+        let was_removed = removed.is_some();
+        if was_removed
+            || matches!(
+                self.sync_meta().get_attr(expected_ino),
+                Err(MetaError::InodeNotFound(_))
+            )
+        {
+            self.clear_pending_payloads_for_inode(expected_ino);
+            self.clear_inode_incarnation(expected_ino);
+            self.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .remove(&expected_ino);
+            self.invalidate_attr_read_cache([expected_ino]);
         }
 
-        if let Some(ino) = ino_hint {
-            self.clear_pending_payloads_for_inode(ino);
-            self.clear_inode_incarnation(ino);
-            self.state.namespace.dirty_attrs.lock().remove(&ino);
-            self.invalidate_attr_read_cache([ino]);
-        }
-
+        self.dentry_cache_invalidate(parent, name);
         self.bump_namespace_for_parents([parent]);
-        self.dentry_cache_insert_negative(parent, name);
+        was_removed
     }
 
     /// Heal a directory entry whose name still exists in metadata but whose inode vanished.
@@ -1909,8 +1934,7 @@ impl StudioVfs {
         match self.sync_meta().get_attr(entry.ino) {
             Ok(_) => Ok(false),
             Err(MetaError::InodeNotFound(_)) => {
-                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
-                Ok(true)
+                Ok(self.heal_orphaned_dentry(parent, name, entry.ino))
             }
             Err(err) => Err(VfsError::Meta(err)),
         }
@@ -1945,9 +1969,7 @@ impl StudioVfs {
                             return Ok(attr);
                         }
                         Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                            self.dentry_cache_invalidate(parent, name);
-                            self.heal_orphaned_dentry(parent, name, Some(child_ino));
-                            return Err(Self::ignored_entry_not_found(parent, name));
+                            self.heal_orphaned_dentry(parent, name, child_ino);
                         }
                         Err(err) => return Err(err),
                     }
@@ -1992,7 +2014,7 @@ impl StudioVfs {
         );
         if let Err(err) = self.enforce_access(entry.ino, AccessLevel::ReadOnly) {
             if matches!(err, VfsError::Meta(MetaError::InodeNotFound(_))) {
-                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
+                self.heal_orphaned_dentry(parent, name, entry.ino);
                 return Err(Self::ignored_entry_not_found(parent, name));
             }
             return Err(err);
@@ -2000,7 +2022,7 @@ impl StudioVfs {
         match self.getattr_unchecked(entry.ino) {
             Ok(attr) => Ok(attr),
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
+                self.heal_orphaned_dentry(parent, name, entry.ino);
                 Err(Self::ignored_entry_not_found(parent, name))
             }
             Err(err) => Err(err),
@@ -2219,11 +2241,16 @@ impl StudioVfs {
             .collect())
     }
 
-    fn heal_dangling_directory_children(&self, dir_ino: Ino) -> VfsResult<(usize, Vec<Ino>)> {
+    fn heal_dangling_directory_children(&self, dir_ino: Ino) -> VfsResult<(usize, Vec<Ino>, bool)> {
         let meta = self.sync_meta();
         let entries = meta.readdir(dir_ino)?;
         if entries.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), false));
+        }
+        #[cfg(test)]
+        if let Some(hook) = RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|hook| hook.borrow_mut().take())
+        {
+            hook();
         }
 
         let inflight_delete_inos = entries
@@ -2246,14 +2273,17 @@ impl StudioVfs {
         }
 
         let mut healed = 0;
+        let mut observed_missing_child = false;
         for entry in entries {
             if live_inos.contains(&entry.ino) {
                 continue;
             }
-            self.heal_orphaned_dentry(dir_ino, &entry.name, Some(entry.ino));
-            healed += 1;
+            observed_missing_child = true;
+            if self.heal_orphaned_dentry(dir_ino, &entry.name, entry.ino) {
+                healed += 1;
+            }
         }
-        Ok((healed, inflight_delete_inos))
+        Ok((healed, inflight_delete_inos, observed_missing_child))
     }
 
     fn resolve_unlink_target(
@@ -2279,7 +2309,7 @@ impl StudioVfs {
         let attr = match meta.unlink_open_handle(parent, name) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
-                self.heal_orphaned_dentry(parent, name, Some(target.ino));
+                self.heal_orphaned_dentry(parent, name, target.ino);
                 return Ok(None);
             }
             Err(MetaError::IsADirectory(_)) => {
@@ -2314,7 +2344,7 @@ impl StudioVfs {
         let attr = match meta.unlink(parent, name) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
-                self.heal_orphaned_dentry(parent, name, Some(target.ino));
+                self.heal_orphaned_dentry(parent, name, target.ino);
                 return Ok(None);
             }
             Err(err) => return Err(VfsError::Meta(err)),
@@ -2852,6 +2882,7 @@ impl StudioVfs {
         let removed = meta.lookup(parent, name).ok().map(|entry| entry.ino);
         let mut retry_attempts: u16 = 0;
         let mut settle_attempts: u16 = 0;
+        let mut rechecked_after_skipped_heal = false;
         loop {
             let rmdir_result = if let Some(removed_ino) = removed {
                 // A child unlink/rmdir takes the target directory's Delete
@@ -2873,7 +2904,7 @@ impl StudioVfs {
                     let Some(removed_ino) = removed else {
                         return Err(VfsError::Meta(err));
                     };
-                    let (healed, child_delete_inos) =
+                    let (healed, child_delete_inos, observed_missing_child) =
                         self.heal_dangling_directory_children(removed_ino)?;
                     if healed > 0 {
                         debug!(ino = removed_ino, healed, "rmdir healed dangling children");
@@ -2892,6 +2923,16 @@ impl StudioVfs {
                             .await;
                         continue;
                     } else {
+                        // A skipped heal may mean the child already vanished.
+                        // Recheck once without waiting; repeated heal failures
+                        // must not consume the in-flight delete settle window.
+                        if retry_attempts == 0
+                            && observed_missing_child
+                            && !rechecked_after_skipped_heal
+                        {
+                            rechecked_after_skipped_heal = true;
+                            continue;
+                        }
                         // A child delete can finish between the failed
                         // rmdir transaction and this check. Give the local
                         // metadata view a short settling window before
@@ -3254,5 +3295,456 @@ impl StudioVfs {
             "VFS rename completed"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::local_dirty::PendingPayload;
+    use super::super::tests::make_unstarted_test_vfs;
+    use super::*;
+    use bytes::BytesMut;
+    use studiofs_meta::schema::ROOT_INO;
+    use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
+
+    #[must_use = "bind this guard so the snapshot hook remains armed for the test scope"]
+    struct DanglingSnapshotHookGuard;
+
+    impl DanglingSnapshotHookGuard {
+        fn arm(hook: Box<dyn FnOnce()>) -> Self {
+            RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                assert!(slot.borrow().is_none(), "snapshot hook already armed");
+                *slot.borrow_mut() = Some(hook);
+            });
+            Self
+        }
+    }
+
+    impl Drop for DanglingSnapshotHookGuard {
+        fn drop(&mut self) {
+            RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    #[test]
+    fn dangling_snapshot_hook_is_cleared_during_unwind() {
+        let result = std::panic::catch_unwind(|| {
+            let _hook = DanglingSnapshotHookGuard::arm(Box::new(|| {}));
+            panic!("fail before the snapshot hook runs");
+        });
+        assert!(result.is_err());
+        assert!(RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn rmdir_skipped_heal_preserves_later_delete_settle_budget() {
+        use std::cell::RefCell;
+        use std::future::Future;
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-settle-budget-");
+        let (_fixture_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-settle-budget");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let parent = meta.create_dir(ROOT_INO, b"parent", 0, 0, 0o755).unwrap();
+        let child = meta.create_file(parent.ino, b"child", 0, 0, 0o644).unwrap();
+        let delete_gate = Rc::new(RefCell::new(None));
+        let hook_gate = delete_gate.clone();
+        let hook_vfs = vfs.clone();
+        let hook_meta = meta.clone();
+        let _hook = DanglingSnapshotHookGuard::arm(Box::new(move || {
+            hook_meta.remove_entry(parent.ino, b"child").unwrap();
+            hook_meta.remove_attr(child.ino).unwrap();
+            let replacement = hook_meta
+                .create_file(parent.ino, b"child", 0, 0, 0o644)
+                .unwrap();
+            RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let mut enter = std::pin::pin!(
+                        hook_vfs
+                            .state
+                            .file_session
+                            .enter_op(replacement.ino, FileSessionOperation::Delete)
+                    );
+                    let mut cx = Context::from_waker(Waker::noop());
+                    let Poll::Ready(gate) = enter.as_mut().poll(&mut cx) else {
+                        panic!("replacement delete gate must be uncontended");
+                    };
+                    *hook_gate.borrow_mut() = Some(gate);
+                }));
+            });
+        }));
+
+        rt.block_on(async {
+            let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"parent"));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(removal.as_mut().poll(&mut cx), Poll::Pending));
+            assert!(
+                delete_gate.borrow().is_some(),
+                "rmdir reached the later delete barrier"
+            );
+            drop(delete_gate.borrow_mut().take());
+            let started = tokio::time::Instant::now();
+            assert!(matches!(
+                removal.await,
+                Err(VfsError::Meta(MetaError::DirNotEmpty(ino))) if ino == parent.ino
+            ));
+            assert_eq!(
+                started.elapsed(),
+                RMDIR_INFLIGHT_RETRY_DELAY * u32::from(RMDIR_SETTLE_RETRY_ATTEMPTS),
+                "the immediate recheck must not consume a settle wait"
+            );
+        });
+        assert!(meta.lookup(parent.ino, b"child").is_ok());
+    }
+
+    #[test]
+    fn rmdir_with_live_child_returns_not_empty_without_waiting() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-live-child-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-live-child");
+        let parent = meta.create_dir(ROOT_INO, b"parent", 0, 0, 0o755).unwrap();
+        meta.create_file(parent.ino, b"child", 0, 0, 0o644).unwrap();
+        let _runtime = rt.enter();
+        let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"parent"));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            removal.as_mut().poll(&mut cx),
+            Poll::Ready(Err(VfsError::Meta(MetaError::DirNotEmpty(ino)))) if ino == parent.ino
+        ));
+        assert!(meta.lookup(parent.ino, b"child").is_ok());
+    }
+
+    #[test]
+    fn rmdir_bounds_retries_when_dangling_child_keeps_changing() {
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        fn changing_child_hook(
+            meta: Arc<studiofs_meta::RedbMetaEngine>,
+            parent: Ino,
+            attempts: Rc<Cell<usize>>,
+        ) -> Box<dyn FnOnce()> {
+            Box::new(move || {
+                let mut entry = meta.remove_entry(parent, b"child").unwrap();
+                entry.ino += 1;
+                meta.add_entry(parent, b"child", &entry).unwrap();
+                attempts.set(attempts.get() + 1);
+                RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(changing_child_hook(meta, parent, attempts));
+                });
+            })
+        }
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-skipped-heal-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-skipped-heal");
+        let parent = meta.create_dir(ROOT_INO, b"parent", 0, 0, 0o755).unwrap();
+        let child = meta.create_file(parent.ino, b"child", 0, 0, 0o644).unwrap();
+        meta.remove_attr(child.ino).unwrap();
+        let attempts = Rc::new(Cell::new(0));
+        let _hook = DanglingSnapshotHookGuard::arm(changing_child_hook(
+            meta.clone(),
+            parent.ino,
+            attempts.clone(),
+        ));
+        let _runtime = rt.enter();
+        let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"parent"));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            removal.as_mut().poll(&mut cx),
+            Poll::Ready(Err(VfsError::Meta(MetaError::DirNotEmpty(ino)))) if ino == parent.ino
+        ));
+        assert_eq!(
+            attempts.get(),
+            2,
+            "allow only one retry after a skipped heal"
+        );
+        assert!(meta.lookup(parent.ino, b"child").is_ok());
+    }
+
+    #[test]
+    fn healing_replaced_dentry_clears_missing_inode_state_only() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("heal-runtime-state-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "heal-runtime-state-replacement");
+        let name = b"replaced-dangling-entry";
+        let missing = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create original entry");
+        let cached_missing = vfs
+            .getattr_unchecked(missing.ino)
+            .expect("cache original attrs");
+        let mut stale_dirty_attr = cached_missing.clone();
+        stale_dirty_attr.size = 5;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(missing.ino, stale_dirty_attr.clone());
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (missing.ino, 0),
+            PendingPayload {
+                data: BytesMut::from(&b"stale"[..]),
+                dirty: true,
+                reserved_object_id: None,
+                persisted_len: None,
+            },
+        );
+        vfs.state
+            .local_dirty
+            .pending_payload_indexes
+            .lock()
+            .entry(missing.ino)
+            .or_default()
+            .insert(0);
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        vfs.refresh_inode_incarnation_state_from_attr(missing.ino, &stale_dirty_attr);
+
+        meta.remove_entry(ROOT_INO, name)
+            .expect("remove original binding");
+        meta.remove_attr(missing.ino)
+            .expect("remove original inode");
+        let replacement = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create replacement binding");
+        assert!(matches!(
+            meta.get_attr(missing.ino),
+            Err(MetaError::InodeNotFound(found)) if found == missing.ino
+        ));
+
+        let cached_replacement = vfs
+            .getattr_unchecked(replacement.ino)
+            .expect("cache replacement attrs");
+        let mut replacement_dirty_attr = cached_replacement.clone();
+        replacement_dirty_attr.size = 4;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(replacement.ino, replacement_dirty_attr.clone());
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (replacement.ino, 0),
+            PendingPayload {
+                data: BytesMut::from(&b"keep"[..]),
+                dirty: true,
+                reserved_object_id: None,
+                persisted_len: None,
+            },
+        );
+        vfs.state
+            .local_dirty
+            .pending_payload_indexes
+            .lock()
+            .entry(replacement.ino)
+            .or_default()
+            .insert(0);
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+        vfs.refresh_inode_incarnation_state_from_attr(replacement.ino, &replacement_dirty_attr);
+
+        assert!(
+            !vfs.heal_orphaned_dentry(ROOT_INO, name, missing.ino),
+            "conditional repair must not report removing the replacement"
+        );
+
+        assert!(
+            !vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&missing.ino)
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(missing.ino)
+        );
+        assert!(
+            !vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .contains_key(&(missing.ino, 0))
+        );
+        assert!(
+            !vfs.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .contains_key(&missing.ino)
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&replacement.ino)
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(replacement.ino)
+        );
+        assert!(
+            vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .contains_key(&(replacement.ino, 0))
+        );
+        assert!(
+            vfs.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .contains_key(&replacement.ino)
+        );
+        assert_eq!(
+            meta.lookup(ROOT_INO, name)
+                .expect("replacement binding")
+                .ino,
+            replacement.ino
+        );
+    }
+
+    #[test]
+    fn healing_changed_dentry_preserves_runtime_state_for_live_expected_inode() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("heal-live-state-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "heal-live-state-moved-inode");
+        let name = b"moved-dangling-entry";
+        let moved_name = b"moved-live-inode";
+        let live = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create original entry");
+        let cached_attr = vfs
+            .getattr_unchecked(live.ino)
+            .expect("cache original attrs");
+        let mut dirty_attr = cached_attr.clone();
+        dirty_attr.size = 4;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(live.ino, dirty_attr.clone());
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (live.ino, 0),
+            PendingPayload {
+                data: BytesMut::from(&b"live"[..]),
+                dirty: true,
+                reserved_object_id: None,
+                persisted_len: None,
+            },
+        );
+        vfs.state
+            .local_dirty
+            .pending_payload_indexes
+            .lock()
+            .entry(live.ino)
+            .or_default()
+            .insert(0);
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+        vfs.refresh_inode_incarnation_state_from_attr(live.ino, &dirty_attr);
+
+        meta.rename_atomic(ROOT_INO, name, ROOT_INO, moved_name)
+            .expect("move expected inode to a live binding");
+        let replacement = meta
+            .create_file(ROOT_INO, name, 0, 0, 0o644)
+            .expect("create replacement at original name");
+
+        assert!(
+            !vfs.heal_orphaned_dentry(ROOT_INO, name, live.ino),
+            "conditional repair must not remove the replacement"
+        );
+
+        assert!(
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&live.ino)
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(live.ino)
+        );
+        assert!(
+            vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .contains_key(&(live.ino, 0))
+        );
+        assert!(
+            vfs.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .contains_key(&live.ino)
+        );
+        assert_eq!(
+            meta.lookup(ROOT_INO, moved_name)
+                .expect("moved live binding")
+                .ino,
+            live.ino
+        );
+        assert_eq!(
+            meta.lookup(ROOT_INO, name)
+                .expect("replacement binding")
+                .ino,
+            replacement.ino
+        );
+    }
+
+    #[test]
+    fn rmdir_retries_when_snapshotted_child_disappears_before_repair() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-scan-race-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-scan-race");
+        let parent = meta
+            .create_dir(ROOT_INO, b"parent", 0, 0, 0o755)
+            .expect("create parent directory");
+        let child = meta
+            .create_file(parent.ino, b"child", 0, 0, 0o644)
+            .expect("create child file");
+        let hook_meta = meta.clone();
+        let _hook = DanglingSnapshotHookGuard::arm(Box::new(move || {
+            hook_meta
+                .remove_entry(parent.ino, b"child")
+                .expect("remove snapshotted child binding");
+            hook_meta
+                .remove_attr(child.ino)
+                .expect("remove snapshotted child inode");
+        }));
+
+        rt.block_on(vfs.rmdir_inner(ROOT_INO, b"parent"))
+            .expect("rmdir should retry after the snapshotted child disappears");
+        assert!(RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| slot.borrow().is_none()));
+        assert!(matches!(
+            meta.get_attr(parent.ino),
+            Err(MetaError::InodeNotFound(found)) if found == parent.ino
+        ));
     }
 }

@@ -165,6 +165,15 @@ where
     fn remove_entry(&self, parent: Ino, _name: &[u8]) -> MetaResult<DirEntryValue> {
         Err(read_only_error(parent))
     }
+
+    fn remove_entry_if_matches(
+        &self,
+        parent: Ino,
+        _name: &[u8],
+        _expected_ino: Ino,
+    ) -> MetaResult<Option<DirEntryValue>> {
+        Err(read_only_error(parent))
+    }
 }
 
 impl<M> MetaFsOps for ReadOnlyMetaEngine<M>
@@ -640,6 +649,24 @@ where
 mod tests {
     use super::*;
     use crate::redb_engine::RedbMetaEngine;
+
+    #[test]
+    fn read_only_meta_rejects_conditional_namespace_removal() {
+        let dir = studiofs_test_support::workspace_target_tempdir("read-only-namespace-");
+        let inner = Arc::new(RedbMetaEngine::open(dir.path().join("meta.redb")).unwrap());
+        let entry = DirEntryValue {
+            ino: 42,
+            kind: FileType::RegularFile,
+        };
+        inner.add_entry(ROOT_INO, b"entry", &entry).unwrap();
+        let read_only = ReadOnlyMetaEngine::new(Arc::clone(&inner));
+
+        assert!(matches!(
+            read_only.remove_entry_if_matches(ROOT_INO, b"entry", 42),
+            Err(MetaError::AccessDenied { .. })
+        ));
+        assert_eq!(inner.lookup(ROOT_INO, b"entry").unwrap(), entry);
+    }
 
     #[test]
     fn pg_sync_status_preserves_lifecycle_and_forces_read_only_authority() {

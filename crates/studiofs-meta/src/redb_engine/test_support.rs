@@ -1,6 +1,10 @@
 use super::*;
 use std::ops::Deref;
 
+thread_local! {
+    pub(super) static WRITE_TXN_ATTEMPT: RefCell<Option<std::sync::mpsc::Sender<()>>> = const { RefCell::new(None) };
+}
+
 pub(super) struct TestEngine {
     engine: RedbMetaEngine,
     _dir: tempfile::TempDir,

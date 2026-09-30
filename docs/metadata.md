@@ -33,6 +33,15 @@ depend on narrower contracts instead of a single god-object surface. Capability
 traits are opt-in per backend (`impl MetaNamespace for ...`, etc.), so incomplete
 backend contracts fail at compile time.
 
+Raw namespace insertion and removal check their preconditions in the mutation's
+write transaction. `remove_entry` removes the current binding by name and returns
+the entry actually deleted. Repairs use `remove_entry_if_matches` with the inode
+observed before diagnosis: it returns `Some(removed)` on a match and `None` when
+the name is absent or refers to another inode, without changing the namespace or
+appending an event. Ordinary skipped healing must invalidate cached dentry
+observations rather than cache the name as absent. Hidden platform-root entries
+remain deliberately negative-cached.
+
 ## Contract/Core Test Harness
 
 `studiofs_meta::contract_harness` provides the fast local Contract/Core test

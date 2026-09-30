@@ -1760,6 +1760,44 @@ fn semantic_invalidation_rejects_lookup_observations_from_before_commit() {
 }
 
 #[test]
+fn stale_positive_lookup_does_not_delete_or_hide_replacement_entry() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("namespace-heal-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "namespace-heal-replacement");
+    let name = b"replaced-after-stale-cache";
+    let stale = meta
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create original entry");
+    vfs.dentry_cache_insert_positive(ROOT_INO, name, stale.ino);
+
+    meta.remove_entry(ROOT_INO, name)
+        .expect("remove original binding");
+    meta.remove_attr(stale.ino).expect("remove original inode");
+    vfs.invalidate_attr_read_cache([stale.ino]);
+    let replacement = meta
+        .create_file(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create replacement binding");
+
+    assert_eq!(
+        vfs.lookup(ROOT_INO, name)
+            .expect("lookup should resolve the replacement after discarding the stale cache")
+            .ino,
+        replacement.ino
+    );
+    assert_eq!(
+        meta.lookup(ROOT_INO, name)
+            .expect("healing should preserve the replacement binding")
+            .ino,
+        replacement.ino
+    );
+    assert_eq!(
+        vfs.lookup(ROOT_INO, name)
+            .expect("replacement should remain resolvable after stale-cache healing")
+            .ino,
+        replacement.ino
+    );
+}
+
+#[test]
 fn semantic_invalidation_preserves_active_writer_until_release() {
     use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
     let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");

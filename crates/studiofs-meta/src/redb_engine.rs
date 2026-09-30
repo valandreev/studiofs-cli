@@ -791,6 +791,12 @@ impl RedbMetaEngine {
     }
 
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
+        #[cfg(test)]
+        test_support::WRITE_TXN_ATTEMPT.with(|sender| {
+            if let Some(sender) = sender.borrow_mut().take() {
+                let _ = sender.send(());
+            }
+        });
         let write_txn_guard = self
             .write_txn_lock
             .lock()

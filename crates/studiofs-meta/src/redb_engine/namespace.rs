@@ -1,6 +1,34 @@
 use super::*;
 
 impl RedbMetaEngine {
+    fn remove_namespace_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Option<Ino>,
+    ) -> MetaResult<Option<DirEntryValue>> {
+        let txn = self.begin_write_txn()?;
+        let Some(entry) = Self::lookup_merged_in_write_txn(&txn, parent, name)? else {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
+            return Ok(None);
+        };
+        if expected_ino.is_some_and(|ino| ino != entry.ino) {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
+            return Ok(None);
+        }
+        Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
+        Self::append_event_in_txn(
+            &txn,
+            &crate::events::MetaEvent::RemoveEntry {
+                parent,
+                name: name.to_vec(),
+            },
+        )?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(Some(entry))
+    }
+
     /// Returns dentry keys whose local state differs from the last imported base view.
     pub fn local_overlay_dentries(&self) -> MetaResult<HashSet<Vec<u8>>> {
         let txn = self.begin_read_txn()?;
@@ -139,14 +167,15 @@ impl MetaNamespace for RedbMetaEngine {
     }
 
     fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
-        if self.lookup(parent, name).is_ok() {
+        let txn = self.begin_write_txn()?;
+        if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
             return Err(MetaError::EntryExists {
                 parent,
-                name: String::from_utf8_lossy(name).to_string(),
+                name: String::from_utf8_lossy(name).into_owned(),
             });
         }
 
-        let txn = self.begin_write_txn()?;
         {
             Self::set_dentry_overlay_in_txn(&txn, parent, name, entry)?;
 
@@ -165,21 +194,19 @@ impl MetaNamespace for RedbMetaEngine {
     }
 
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
-        let entry_val = self.lookup(parent, name)?;
-        let txn = self.begin_write_txn()?;
-        {
-            Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
+        self.remove_namespace_entry(parent, name, None)?
+            .ok_or_else(|| MetaError::EntryNotFound {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            })
+    }
 
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RemoveEntry {
-                    parent,
-                    name: name.to_vec(),
-                },
-            )?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(entry_val)
+    fn remove_entry_if_matches(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Ino,
+    ) -> MetaResult<Option<DirEntryValue>> {
+        self.remove_namespace_entry(parent, name, Some(expected_ino))
     }
 }

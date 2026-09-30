@@ -7,7 +7,7 @@ use std::path::Path;
 use clap::Args;
 use studiofs_meta::engine::UndoLogKind;
 use studiofs_meta::{
-    FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
+    DirEntry, FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
     open_meta_engine_with_options,
 };
 use thiserror::Error;
@@ -356,27 +356,36 @@ fn remove_orphan_file(
     Ok(())
 }
 
+fn orphan_directory_entries(
+    ino: u64,
+    entries: Result<Vec<DirEntry>, MetaError>,
+) -> FsckResult<Option<Vec<DirEntry>>> {
+    match entries {
+        Ok(entries) => Ok(Some(entries)),
+        Err(MetaError::InodeNotFound(_)) => Ok(None),
+        Err(err) => Err(FsckError::Message(format!(
+            "readdir failed for orphan dir {ino}: {err}"
+        ))),
+    }
+}
+
 fn repair_orphan_directory(
     meta: &dyn MetaEngine,
     ino: u64,
     removed_orphans: &mut usize,
     orphan_blocks_pending_gc: &mut usize,
     skipped_hardlink_orphans: &mut usize,
+    skipped_dir_orphans: &mut usize,
     processed: &mut HashSet<u64>,
 ) -> FsckResult<()> {
     if !processed.insert(ino) {
         return Ok(());
     }
 
-    let entries = match meta.readdir(ino) {
-        Ok(entries) => entries,
-        Err(MetaError::InodeNotFound(_)) => return Ok(()),
-        Err(err) => {
-            return Err(FsckError::Message(format!(
-                "readdir failed for orphan dir {ino}: {err}"
-            )));
-        }
+    let Some(entries) = orphan_directory_entries(ino, meta.readdir(ino))? else {
+        return Ok(());
     };
+    let mut has_unremoved_entries = false;
     for entry in entries {
         let entry_ino = entry.ino;
         let entry_name = entry.name;
@@ -388,6 +397,7 @@ fn repair_orphan_directory(
                     removed_orphans,
                     orphan_blocks_pending_gc,
                     skipped_hardlink_orphans,
+                    skipped_dir_orphans,
                     processed,
                 )?;
                 match meta.rmdir(ino, &entry_name) {
@@ -397,7 +407,7 @@ fn repair_orphan_directory(
                     Err(MetaError::InodeNotFound(_)) => {
                         *removed_orphans += 1;
                     }
-                    Err(MetaError::DirNotEmpty(_)) => {}
+                    Err(MetaError::DirNotEmpty(_)) => has_unremoved_entries = true,
                     Err(err) => {
                         return Err(FsckError::Message(format!(
                             "failed to remove orphan dir entry parent={ino} child={entry_ino}: {err}"
@@ -417,16 +427,21 @@ fn repair_orphan_directory(
                 };
                 if attr.as_ref().is_some_and(|attr| attr.nlink > 1) {
                     *skipped_hardlink_orphans += 1;
+                    has_unremoved_entries = true;
                     continue;
                 }
 
-                match meta.remove_entry(ino, &entry_name) {
-                    Ok(_) | Err(MetaError::EntryNotFound { .. }) => {}
-                    Err(err) => {
-                        return Err(FsckError::Message(format!(
+                let removed = meta
+                    .remove_entry_if_matches(ino, &entry_name, entry_ino)
+                    .map_err(|err| {
+                        FsckError::Message(format!(
                             "failed to remove orphan child entry parent={ino} child={entry_ino}: {err}"
-                        )));
-                    }
+                        ))
+                    })?;
+                if removed.is_none() {
+                    has_unremoved_entries = true;
+                    processed.insert(entry_ino);
+                    continue;
                 }
 
                 if attr.is_some() {
@@ -434,6 +449,16 @@ fn repair_orphan_directory(
                 }
                 processed.insert(entry_ino);
             }
+        }
+    }
+
+    if has_unremoved_entries {
+        let Some(entries) = orphan_directory_entries(ino, meta.readdir(ino))? else {
+            return Ok(());
+        };
+        if !entries.is_empty() {
+            *skipped_dir_orphans += 1;
+            return Ok(());
         }
     }
 
@@ -458,14 +483,14 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     }
 
     let mut removed_dangling = 0usize;
-    let mut dangling_already_gone = 0usize;
+    let mut dangling_changed_or_gone = 0usize;
     let dangling = &report.dangling;
     let orphan_inodes = &report.orphan_inodes;
 
     for d in dangling {
-        match meta.remove_entry(d.parent, &d.name) {
-            Ok(_) => removed_dangling += 1,
-            Err(MetaError::EntryNotFound { .. }) => dangling_already_gone += 1,
+        match meta.remove_entry_if_matches(d.parent, &d.name, d.ino) {
+            Ok(Some(_)) => removed_dangling += 1,
+            Ok(None) => dangling_changed_or_gone += 1,
             Err(err) => {
                 return Err(FsckError::Message(format!(
                     "failed to remove dangling dentry parent={} ino={}: {err}",
@@ -476,7 +501,7 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     }
 
     let mut removed_orphans = 0usize;
-    let skipped_dir_orphans = 0usize;
+    let mut skipped_dir_orphans = 0usize;
     let mut skipped_hardlink_orphans = 0usize;
     let mut orphan_blocks_pending_gc = 0usize;
     let mut processed_orphans = HashSet::new();
@@ -492,6 +517,7 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
                 &mut removed_orphans,
                 &mut orphan_blocks_pending_gc,
                 &mut skipped_hardlink_orphans,
+                &mut skipped_dir_orphans,
                 &mut processed_orphans,
             )?;
             continue;
@@ -533,7 +559,10 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     println!("Repair summary:");
     println!("  replayed undo parents: {}", replayed.len());
     println!("  dangling entries removed: {}", removed_dangling);
-    println!("  dangling already gone: {}", dangling_already_gone);
+    println!(
+        "  dangling entries changed or gone: {}",
+        dangling_changed_or_gone
+    );
     println!("  orphan inodes removed: {}", removed_orphans);
     println!("  orphan blocks pending gc: {}", orphan_blocks_pending_gc);
     println!("  orphan dirs skipped: {}", skipped_dir_orphans);
@@ -613,7 +642,7 @@ where
 mod tests {
     use super::*;
     use std::ops::Deref;
-    use studiofs_meta::engine::MetaFsOps;
+    use studiofs_meta::engine::{MetaFsOps, MetaInodes};
     use studiofs_meta::{MetaNamespace, RedbMetaEngine};
 
     struct TestEngine {
@@ -635,6 +664,25 @@ mod tests {
         let engine = RedbMetaEngine::open(&path).expect("open redb");
         engine.init_root(1000, 1000).expect("init root");
         TestEngine { engine, _dir: dir }
+    }
+
+    #[test]
+    fn orphan_directory_readdir_error_keeps_inode_context() {
+        let error =
+            match orphan_directory_entries(42, Err(MetaError::Storage("read failed".into()))) {
+                Err(FsckError::Message(error)) => error,
+                other => panic!("expected contextual fsck error, got {other:?}"),
+            };
+
+        assert_eq!(
+            error,
+            "readdir failed for orphan dir 42: storage error: read failed"
+        );
+        assert!(
+            orphan_directory_entries(42, Err(MetaError::InodeNotFound(42)))
+                .expect("missing orphan directory is benign")
+                .is_none()
+        );
     }
 
     #[test]
@@ -662,6 +710,94 @@ mod tests {
         let post = collect_report(&*engine).expect("collect post-repair report");
         assert!(post.orphan_inodes.is_empty());
         assert!(post.nlink_mismatches.is_empty());
+    }
+
+    #[test]
+    fn repair_preserves_replacement_for_stale_dangling_report() {
+        let engine = temp_engine();
+        let dangling = engine
+            .create_file(ROOT_INO, b"entry", 1000, 1000, 0o644)
+            .expect("create original entry");
+        engine
+            .remove_attr(dangling.ino)
+            .expect("remove original inode");
+
+        let report = collect_report(&*engine).expect("collect dangling report");
+        assert_eq!(report.dangling.len(), 1);
+        assert_eq!(report.dangling[0].ino, dangling.ino);
+
+        engine
+            .remove_entry(ROOT_INO, b"entry")
+            .expect("remove stale binding");
+        let replacement = engine
+            .create_file(ROOT_INO, b"entry", 1000, 1000, 0o644)
+            .expect("create healthy replacement");
+
+        repair(&*engine, &report).expect("repair stale report");
+
+        assert_eq!(
+            engine
+                .lookup(ROOT_INO, b"entry")
+                .expect("replacement binding")
+                .ino,
+            replacement.ino
+        );
+    }
+
+    #[test]
+    fn repair_counts_and_preserves_orphan_directory_with_skipped_hardlink_child() {
+        let engine = temp_engine();
+        let orphan_dir = engine
+            .create_dir(ROOT_INO, b"orphan", 1000, 1000, 0o755)
+            .expect("create orphan directory");
+        let child = engine
+            .create_file(orphan_dir.ino, b"shared", 1000, 1000, 0o644)
+            .expect("create child file");
+        engine
+            .link(child.ino, ROOT_INO, b"live-link")
+            .expect("create live hardlink");
+        engine
+            .remove_entry(ROOT_INO, b"orphan")
+            .expect("detach orphan directory");
+
+        let mut removed_orphans = 0;
+        let mut orphan_blocks_pending_gc = 0;
+        let mut skipped_hardlink_orphans = 0;
+        let mut skipped_dir_orphans = 0;
+        let mut processed = HashSet::new();
+        repair_orphan_directory(
+            &*engine,
+            orphan_dir.ino,
+            &mut removed_orphans,
+            &mut orphan_blocks_pending_gc,
+            &mut skipped_hardlink_orphans,
+            &mut skipped_dir_orphans,
+            &mut processed,
+        )
+        .expect("repair orphan directory");
+
+        assert_eq!(skipped_dir_orphans, 1);
+        assert_eq!(skipped_hardlink_orphans, 1);
+        assert_eq!(removed_orphans, 0);
+        assert_eq!(orphan_blocks_pending_gc, 0);
+
+        let report = collect_report(&*engine).expect("collect retained orphan report");
+        repair(&*engine, &report).expect("repair retained orphan directory");
+        assert!(engine.get_attr(orphan_dir.ino).is_ok());
+        assert_eq!(
+            engine
+                .lookup(orphan_dir.ino, b"shared")
+                .expect("preserved child binding")
+                .ino,
+            child.ino
+        );
+        assert_eq!(
+            engine
+                .lookup(ROOT_INO, b"live-link")
+                .expect("live hardlink")
+                .ino,
+            child.ino
+        );
     }
 
     #[test]

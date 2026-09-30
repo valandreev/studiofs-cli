@@ -358,6 +358,14 @@ impl<M: ?Sized + MetaNamespace> MetaNamespace for RuntimeMetaHandle<M> {
         ) -> MetaResult<()>
     );
     forward_method!(fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>);
+    forward_method!(
+        fn remove_entry_if_matches(
+            &self,
+            parent: Ino,
+            name: &[u8],
+            expected_ino: Ino,
+        ) -> MetaResult<Option<DirEntryValue>>
+    );
 }
 
 impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
