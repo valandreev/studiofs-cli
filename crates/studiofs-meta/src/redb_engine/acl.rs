@@ -15,7 +15,7 @@ impl MetaAcl for RedbMetaEngine {
             let mut tombstones = txn
                 .open_table(ACL_RULE_TOMBSTONES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = tombstones.remove(key.as_slice());
+            tombstones.remove(key.as_slice())?;
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::SetAclRule {
@@ -37,7 +37,7 @@ impl MetaAcl for RedbMetaEngine {
             let mut rules = txn
                 .open_table(ACL_RULES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = rules.remove(key.as_slice());
+            rules.remove(key.as_slice())?;
             let mut tombstones = txn
                 .open_table(ACL_RULE_TOMBSTONES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;

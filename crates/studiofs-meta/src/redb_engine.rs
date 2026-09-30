@@ -30,6 +30,12 @@ use self::layout::*;
 
 mod fs_ops;
 
+impl From<redb::StorageError> for MetaError {
+    fn from(error: redb::StorageError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
 static VOLATILE_DURABILITY_WARN: Once = Once::new();
 const REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS: u64 = 1_000;
 // ponytail: page scans still block new writes; cache for five seconds and move sampling off-read-path if measured scans remain costly.

@@ -997,7 +997,7 @@ impl RedbMetaEngine {
                     let mut symlinks = txn
                         .open_table(BASE_SYMLINKS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = symlinks.remove(*ino);
+                    symlinks.remove(*ino)?;
                     drop(symlinks);
 
                     let mut xattrs = txn
@@ -1018,7 +1018,7 @@ impl RedbMetaEngine {
                             .collect()
                     };
                     for key in keys_to_remove {
-                        let _ = xattrs.remove(key.as_slice());
+                        xattrs.remove(key.as_slice())?;
                     }
 
                     Self::clear_regular_file_graph_in_txn(txn, *ino)?;
@@ -1073,7 +1073,7 @@ impl RedbMetaEngine {
                         .open_table(BASE_XATTRS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let key = encode_xattr_key(*ino, name);
-                    let _ = table.remove(key.as_slice());
+                    table.remove(key.as_slice())?;
                 }
                 crate::events::MetaEvent::SetAclRule {
                     ino,
@@ -1093,7 +1093,7 @@ impl RedbMetaEngine {
                         .open_table(BASE_ACL_RULES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let key = encode_acl_rule_key(*ino, principal);
-                    let _ = table.remove(key.as_slice());
+                    table.remove(key.as_slice())?;
                 }
                 crate::events::MetaEvent::AddPendingDeletion {
                     object_id,
@@ -1110,7 +1110,7 @@ impl RedbMetaEngine {
                     let mut table = txn
                         .open_table(PENDING_DELETIONS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = table.remove(*object_id);
+                    table.remove(*object_id)?;
                 }
             }
         }
@@ -1178,12 +1178,12 @@ impl RedbMetaEngine {
                     let mut table = txn
                         .open_table(BASE_INODES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = table.remove(*ino);
+                    table.remove(*ino)?;
 
                     let mut symlinks = txn
                         .open_table(BASE_SYMLINKS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = symlinks.remove(*ino);
+                    symlinks.remove(*ino)?;
                     drop(symlinks);
 
                     let mut xattrs = txn
@@ -1204,7 +1204,7 @@ impl RedbMetaEngine {
                             .collect()
                     };
                     for key in keys_to_remove {
-                        let _ = xattrs.remove(key.as_slice());
+                        xattrs.remove(key.as_slice())?;
                     }
 
                     let mut acl = txn
@@ -1225,7 +1225,7 @@ impl RedbMetaEngine {
                             .collect()
                     };
                     for key in keys_to_remove {
-                        let _ = acl.remove(key.as_slice());
+                        acl.remove(key.as_slice())?;
                     }
                 }
                 crate::events::MetaEvent::AddEntry {
@@ -1286,7 +1286,7 @@ impl RedbMetaEngine {
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
-                        let _ = inodes.remove(*ino);
+                        inodes.remove(*ino)?;
                     }
                     if let Some(attr) = moved_dir_attr.as_ref() {
                         let data = encode(attr)?;
@@ -1331,7 +1331,7 @@ impl RedbMetaEngine {
                         .open_table(BASE_XATTRS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let key = encode_xattr_key(*ino, name);
-                    let _ = table.remove(key.as_slice());
+                    table.remove(key.as_slice())?;
                 }
                 crate::events::MetaEvent::SetAclRule {
                     ino,
@@ -1351,7 +1351,7 @@ impl RedbMetaEngine {
                         .open_table(BASE_ACL_RULES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let key = encode_acl_rule_key(*ino, principal);
-                    let _ = table.remove(key.as_slice());
+                    table.remove(key.as_slice())?;
                 }
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                     for (chunk_id, slices) in chunk_slices {
@@ -1530,7 +1530,7 @@ impl RedbMetaEngine {
                             .collect()
                     };
                     for key in acl_rule_keys {
-                        let _ = acl_rules.remove(key.as_slice());
+                        acl_rules.remove(key.as_slice())?;
                     }
                     Self::clear_regular_file_graph_in_txn(txn, *ino)?;
                     Self::clear_regular_file_serving_overlay_in_txn(txn, *ino)?;
@@ -1605,7 +1605,7 @@ impl RedbMetaEngine {
                         .open_table(ACL_RULE_TOMBSTONES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let key = encode_acl_rule_key(*ino, principal);
-                    let _ = tombstones.remove(key.as_slice());
+                    tombstones.remove(key.as_slice())?;
                     rules
                         .insert(key.as_slice(), *access_level as u8)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1618,7 +1618,7 @@ impl RedbMetaEngine {
                         .open_table(ACL_RULE_TOMBSTONES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let key = encode_acl_rule_key(*ino, principal);
-                    let _ = rules.remove(key.as_slice());
+                    rules.remove(key.as_slice())?;
                     tombstones
                         .insert(key.as_slice(), 1)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
