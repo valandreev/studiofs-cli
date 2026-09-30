@@ -38,14 +38,13 @@ impl UnbufferedWriteBuffer {
     }
 }
 
-#[cfg(windows)]
 #[derive(Debug, Default)]
 /// Scratch buffer used to build aligned reads for unbuffered payload I/O.
 pub struct UnbufferedReadBuffer {
+    #[cfg(windows)]
     backing: Vec<u8>,
 }
 
-#[cfg(windows)]
 impl UnbufferedReadBuffer {
     /// Create an empty scratch buffer for unbuffered payload reads.
     pub fn new() -> Self {
@@ -180,7 +179,6 @@ pub fn write_all_unbuffered_with_buffer(
 }
 
 /// Read up to `buf.len()` bytes from an unbuffered payload file.
-#[cfg(windows)]
 pub fn read_unbuffered_with_buffer(
     file: &File,
     buf: &mut [u8],
@@ -476,6 +474,17 @@ fn write_all_unbuffered_impl(
 
     let aligned = scratch.aligned_copy(buf, alignment);
     write_all(file, aligned)
+}
+
+#[cfg(not(windows))]
+fn read_unbuffered_impl(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    _scratch: &mut UnbufferedReadBuffer,
+    _alignment: usize,
+) -> io::Result<usize> {
+    pread(file, buf, offset)
 }
 
 #[cfg(windows)]

@@ -1,0 +1,30 @@
+name: Payload read regression
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/payload-read-regression.yml'
+      - 'crates/studiofs-cache/**'
+      - 'crates/studiofs-test-support/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-payload-read:
+    name: macOS payload read regression
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Concurrent unbuffered reads
+        run: cargo test -p studiofs-cache --lib runtime::file_payload_store::tests::unbuffered_reads_through_clones_overlap_at_platform_read -- --exact --nocapture
+      - name: Public unbuffered read API
+        run: cargo test -p studiofs-cache --test payload_platform_api -- --nocapture
