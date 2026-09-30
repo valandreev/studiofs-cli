@@ -62,6 +62,252 @@ impl StorageBackend for RemoveFaultBackend {
     }
 }
 
+fn removal_fault_engine(backend: &RemoveFaultBackend) -> RedbMetaEngine {
+    let db = Database::builder()
+        .set_cache_size(0)
+        .create_with_backend(backend.clone())
+        .unwrap();
+    RedbMetaEngine {
+        db: Some(Arc::new(RwLock::new(db))),
+        read_only_db: None,
+        metadata_path: PathBuf::new(),
+        local_storage_compaction: Mutex::default(),
+        local_event_log_prune: Mutex::default(),
+        local_storage_page_stats: Mutex::default(),
+        local_storage_page_stats_refresh: Mutex::default(),
+        write_metrics: Arc::new(MetadataWriteMetrics::default()),
+        relaxed_durability: None,
+        write_txn_lock: Arc::new(Mutex::new(())),
+        invalidation_journal: Mutex::default(),
+        invalidation_notify: Arc::new(tokio::sync::Notify::new()),
+        allocator_state_write_hook: Mutex::new(None),
+    }
+}
+
+fn acl_removal_fault_fixture(
+    fault_table: TableDefinition<&[u8], u8>,
+) -> (RedbMetaEngine, RemoveFaultBackend, Vec<u8>) {
+    let backend = RemoveFaultBackend::default();
+    let engine = removal_fault_engine(&backend);
+    let key = encode_acl_rule_key(ROOT_INO, "principal-0000");
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let root = encode(&InodeAttr::new_dir(ROOT_INO, ROOT_INO, 0, 0, 0o755)).unwrap();
+        txn.open_table(INODES_TABLE)
+            .unwrap()
+            .insert(ROOT_INO, root.as_slice())
+            .unwrap();
+        txn.open_table(BASE_INODES_TABLE).unwrap();
+        txn.open_table(INODE_TOMBSTONES_TABLE).unwrap();
+        txn.open_table(INODE_LIFECYCLE_TABLE).unwrap();
+        txn.open_table(SETTINGS_TABLE).unwrap();
+        txn.open_table(EVENT_LOG_TABLE).unwrap();
+        txn.open_table(ACL_RULE_TOMBSTONES_TABLE).unwrap();
+        txn.open_table(ACL_RULES_TABLE)
+            .unwrap()
+            .insert(key.as_slice(), AccessLevel::ReadOnly as u8)
+            .unwrap();
+        let mut table = txn.open_table(fault_table).unwrap();
+        for index in 0..1024 {
+            let key = encode_acl_rule_key(ROOT_INO, &format!("principal-{index:04}"));
+            table
+                .insert(key.as_slice(), AccessLevel::ReadOnly as u8)
+                .unwrap();
+        }
+        txn.open_table(COUNTERS_TABLE)
+            .unwrap()
+            .insert(counters::NEXT_EVENT_SEQ, 7)
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    let read = engine.begin_read_txn().unwrap();
+    assert!(
+        read.open_table(fault_table)
+            .unwrap()
+            .get(key.as_slice())
+            .unwrap()
+            .is_some()
+    );
+    drop(read);
+    let branch = backend.last_branch_read.load(Ordering::SeqCst);
+    assert_ne!(branch, 0, "fixture must have an ACL branch page");
+    backend.corrupt_read_at.store(branch, Ordering::SeqCst);
+    (engine, backend, key)
+}
+
+#[test]
+fn replica_removal_error_aborts_prior_metadata_writes() {
+    let backend = RemoveFaultBackend::default();
+    let engine = removal_fault_engine(&backend);
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut pending = txn.open_table(PENDING_DELETIONS_TABLE).unwrap();
+        for object_id in 0..1024 {
+            pending.insert(object_id, 7).unwrap();
+        }
+        txn.open_table(COUNTERS_TABLE)
+            .unwrap()
+            .insert("replica-removal-regression", 7)
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    let read = engine.begin_read_txn().unwrap();
+    assert_eq!(
+        read.open_table(PENDING_DELETIONS_TABLE)
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .unwrap()
+            .value(),
+        7
+    );
+    drop(read);
+    let branch = backend.last_branch_read.load(Ordering::SeqCst);
+    assert_ne!(
+        branch, 0,
+        "fixture must have a pending-deletion branch page"
+    );
+
+    let result = (|| -> MetaResult<()> {
+        let txn = engine.begin_write_txn()?;
+        RedbMetaEngine::update_counter_in_txn(&txn, "replica-removal-regression", |value| {
+            value + 1
+        })?;
+        backend.corrupt_read_at.store(branch, Ordering::SeqCst);
+        RedbMetaEngine::apply_replica_aux_state_in_txn(
+            &txn,
+            &[MetaEvent::RemovePendingDeletion { object_id: 0 }],
+        )?;
+        txn.commit()
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(())
+    })();
+
+    assert_eq!(backend.corrupt_read_at.load(Ordering::SeqCst), u64::MAX);
+    drop(engine);
+    let reopened = Database::builder().create_with_backend(backend).unwrap();
+    let read = reopened.begin_read().unwrap();
+    assert_eq!(
+        read.open_table(COUNTERS_TABLE)
+            .unwrap()
+            .get("replica-removal-regression")
+            .unwrap()
+            .unwrap()
+            .value(),
+        7,
+        "failed replica removal must roll back prior metadata writes"
+    );
+    assert_eq!(
+        read.open_table(PENDING_DELETIONS_TABLE)
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .unwrap()
+            .value(),
+        7
+    );
+    assert!(
+        matches!(&result, Err(MetaError::Storage(message)) if message.contains("has order greater than the maximum")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn acl_rule_removal_error_aborts_tombstone_and_event_writes() {
+    let (engine, backend, key) = acl_removal_fault_fixture(ACL_RULES_TABLE);
+
+    let result = engine.remove_acl_rule(ROOT_INO, "principal-0000");
+
+    assert_eq!(backend.corrupt_read_at.load(Ordering::SeqCst), u64::MAX);
+    drop(engine);
+    let reopened = Database::builder().create_with_backend(backend).unwrap();
+    let read = reopened.begin_read().unwrap();
+    assert_eq!(
+        read.open_table(COUNTERS_TABLE)
+            .unwrap()
+            .get(counters::NEXT_EVENT_SEQ)
+            .unwrap()
+            .unwrap()
+            .value(),
+        7
+    );
+    assert!(
+        read.open_table(EVENT_LOG_TABLE)
+            .unwrap()
+            .get(7)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read.open_table(ACL_RULE_TOMBSTONES_TABLE)
+            .unwrap()
+            .get(key.as_slice())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        read.open_table(ACL_RULES_TABLE)
+            .unwrap()
+            .get(key.as_slice())
+            .unwrap()
+            .unwrap()
+            .value(),
+        AccessLevel::ReadOnly as u8
+    );
+    assert!(
+        matches!(&result, Err(MetaError::Storage(message)) if message.contains("has order greater than the maximum")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn acl_tombstone_removal_error_rolls_back_rule_update() {
+    let (engine, backend, key) = acl_removal_fault_fixture(ACL_RULE_TOMBSTONES_TABLE);
+
+    let result = engine.set_acl_rule(ROOT_INO, "principal-0000", AccessLevel::ReadWrite);
+
+    assert_eq!(backend.corrupt_read_at.load(Ordering::SeqCst), u64::MAX);
+    drop(engine);
+    let reopened = Database::builder().create_with_backend(backend).unwrap();
+    let read = reopened.begin_read().unwrap();
+    assert_eq!(
+        read.open_table(COUNTERS_TABLE)
+            .unwrap()
+            .get(counters::NEXT_EVENT_SEQ)
+            .unwrap()
+            .unwrap()
+            .value(),
+        7
+    );
+    assert!(
+        read.open_table(EVENT_LOG_TABLE)
+            .unwrap()
+            .get(7)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read.open_table(ACL_RULE_TOMBSTONES_TABLE)
+            .unwrap()
+            .get(key.as_slice())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        read.open_table(ACL_RULES_TABLE)
+            .unwrap()
+            .get(key.as_slice())
+            .unwrap()
+            .unwrap()
+            .value(),
+        AccessLevel::ReadOnly as u8
+    );
+    assert!(
+        matches!(&result, Err(MetaError::Storage(message)) if message.contains("has order greater than the maximum")),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn removal_fault_rejects_invalid_branch_layout() {
     for bytes in [
@@ -78,8 +324,12 @@ fn removal_fault_rejects_invalid_branch_layout() {
 
         let error = backend.read(offset, &mut out).unwrap_err();
 
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(backend.corrupt_read_at.load(Ordering::SeqCst), offset);
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{bytes:?}");
+        assert_eq!(
+            backend.corrupt_read_at.load(Ordering::SeqCst),
+            offset,
+            "{bytes:?}"
+        );
     }
 }
 
@@ -196,6 +446,18 @@ fn dentry_removal_tolerates_an_absent_reverse_index() {
 fn table_removals_of_absent_keys_remain_idempotent() {
     let engine = temp_engine();
     let txn = engine.begin_write_txn().unwrap();
+    let replica_removals = [
+        MetaEvent::RemoveAttr { ino: 999 },
+        MetaEvent::RemoveXattr {
+            ino: 999,
+            name: b"user.absent".to_vec(),
+        },
+        MetaEvent::RemoveAclRule {
+            ino: 999,
+            principal: "absent".to_string(),
+        },
+        MetaEvent::RemovePendingDeletion { object_id: 999 },
+    ];
     for _ in 0..2 {
         RedbMetaEngine::set_remote_namespace_visibility_filter_in_txn(&txn, false).unwrap();
         RedbMetaEngine::remove_inode_overlay_in_txn(&txn, 999).unwrap();
@@ -207,8 +469,19 @@ fn table_removals_of_absent_keys_remain_idempotent() {
         RedbMetaEngine::remove_symlink_mirror_in_txn(&txn, 999).unwrap();
         RedbMetaEngine::remove_xattr_overlay_in_txn(&txn, 999, b"user.absent").unwrap();
         RedbMetaEngine::remove_xattr_mirror_in_txn(&txn, 999, b"user.absent").unwrap();
+        RedbMetaEngine::apply_replica_aux_state_in_txn(&txn, &replica_removals).unwrap();
+        RedbMetaEngine::apply_replica_events_to_base_in_txn(
+            &txn,
+            &replica_removals,
+            &HashSet::new(),
+        )
+        .unwrap();
+        RedbMetaEngine::apply_replica_serving_state_in_txn(&txn, &replica_removals, false).unwrap();
     }
     txn.commit().unwrap();
+    for _ in 0..2 {
+        engine.remove_acl_rule(999, "absent").unwrap();
+    }
     assert!(engine.get_attr(ROOT_INO).is_ok());
     assert!(matches!(
         engine.lookup(ROOT_INO, b"absent"),
