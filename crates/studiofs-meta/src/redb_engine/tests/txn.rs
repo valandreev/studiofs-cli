@@ -2,6 +2,9 @@ use super::*;
 use redb::StorageBackend;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// redb 4.3 branch-page discriminant from tree_store/btree_base.rs.
+const BRANCH_PAGE_TYPE: u8 = 2;
+
 #[derive(Clone, Debug, Default)]
 struct RemoveFaultBackend {
     inner: Arc<redb::backends::InMemoryBackend>,
@@ -16,7 +19,7 @@ impl StorageBackend for RemoveFaultBackend {
 
     fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
         self.inner.read(offset, out)?;
-        if out.first() == Some(&2) {
+        if out.first() == Some(&BRANCH_PAGE_TYPE) {
             self.last_branch_read.store(offset, Ordering::SeqCst);
             if self.corrupt_read_at.load(Ordering::SeqCst) == offset {
                 // redb 4.3 branch layout: 8-byte header, per-child 16-byte
@@ -309,11 +312,40 @@ fn acl_tombstone_removal_error_rolls_back_rule_update() {
 }
 
 #[test]
+fn removal_fault_corrupts_only_first_child_order_once() {
+    let backend = RemoveFaultBackend::default();
+    let offset = 8;
+    // redb 4.3 branch: one key, two child checksums and pointers, then key data.
+    let mut stored = [0; 61];
+    stored[0] = BRANCH_PAGE_TYPE;
+    stored[2] = 1;
+    stored[56..60].copy_from_slice(&61_u32.to_le_bytes());
+    stored[60] = b'a';
+    backend.set_len(offset + stored.len() as u64).unwrap();
+    backend.write(offset, &stored).unwrap();
+    backend.corrupt_read_at.store(offset, Ordering::SeqCst);
+    let mut out = [0; 61];
+
+    backend.read(offset, &mut out).unwrap();
+
+    let mut expected = stored;
+    expected[47] = 0xF8; // High byte of child 0's page number.
+    assert_eq!(out, expected);
+    assert_eq!(backend.corrupt_read_at.load(Ordering::SeqCst), u64::MAX);
+
+    backend.read(offset, &mut out).unwrap();
+    assert_eq!(
+        out, stored,
+        "injection must be one-shot and preserve stored bytes"
+    );
+}
+
+#[test]
 fn removal_fault_rejects_invalid_branch_layout() {
     for bytes in [
-        &[2, 0, 0][..],
-        &[2, 0, 0, 0, 0, 0, 0, 0][..],
-        &[2, 0, 0xFF, 0xFF, 0, 0, 0, 0][..],
+        &[BRANCH_PAGE_TYPE, 0, 0][..],
+        &[BRANCH_PAGE_TYPE, 0, 0, 0, 0, 0, 0, 0][..],
+        &[BRANCH_PAGE_TYPE, 0, 0xFF, 0xFF, 0, 0, 0, 0][..],
     ] {
         let backend = RemoveFaultBackend::default();
         let offset = 8;
