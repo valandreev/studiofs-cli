@@ -2922,14 +2922,19 @@ impl StudioVfs {
                             .await;
                         continue;
                     } else {
+                        // A skipped heal may mean the child already vanished.
+                        // Recheck once without waiting; repeated heal failures
+                        // must not consume the in-flight delete settle window.
+                        if retry_attempts == 0 && observed_missing_child && settle_attempts == 0 {
+                            settle_attempts = 1;
+                            continue;
+                        }
                         // A child delete can finish between the failed
                         // rmdir transaction and this check. Give the local
                         // metadata view a short settling window before
                         // returning ENOTEMPTY; a first, ordinary rmdir with
                         // no observed child mutation remains immediate.
-                        if (retry_attempts == 0 && !observed_missing_child)
-                            || settle_attempts >= RMDIR_SETTLE_RETRY_ATTEMPTS
-                        {
+                        if retry_attempts == 0 || settle_attempts >= RMDIR_SETTLE_RETRY_ATTEMPTS {
                             return Err(VfsError::Meta(err));
                         }
                         settle_attempts += 1;
@@ -3298,6 +3303,104 @@ mod tests {
     use studiofs_meta::schema::ROOT_INO;
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
 
+    struct DanglingSnapshotHookGuard;
+
+    impl DanglingSnapshotHookGuard {
+        fn arm(hook: Box<dyn FnOnce()>) -> Self {
+            RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                assert!(slot.borrow().is_none(), "snapshot hook already armed");
+                *slot.borrow_mut() = Some(hook);
+            });
+            Self
+        }
+    }
+
+    impl Drop for DanglingSnapshotHookGuard {
+        fn drop(&mut self) {
+            RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    #[test]
+    fn dangling_snapshot_hook_is_cleared_during_unwind() {
+        let result = std::panic::catch_unwind(|| {
+            let _hook = DanglingSnapshotHookGuard::arm(Box::new(|| {}));
+            panic!("fail before the snapshot hook runs");
+        });
+        assert!(result.is_err());
+        assert!(RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn rmdir_with_live_child_returns_not_empty_without_waiting() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-live-child-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-live-child");
+        let parent = meta.create_dir(ROOT_INO, b"parent", 0, 0, 0o755).unwrap();
+        meta.create_file(parent.ino, b"child", 0, 0, 0o644).unwrap();
+        let _runtime = rt.enter();
+        let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"parent"));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            removal.as_mut().poll(&mut cx),
+            Poll::Ready(Err(VfsError::Meta(MetaError::DirNotEmpty(ino)))) if ino == parent.ino
+        ));
+        assert!(meta.lookup(parent.ino, b"child").is_ok());
+    }
+
+    #[test]
+    fn rmdir_bounds_retries_when_dangling_child_keeps_changing() {
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        fn changing_child_hook(
+            meta: Arc<studiofs_meta::RedbMetaEngine>,
+            parent: Ino,
+            attempts: Rc<Cell<usize>>,
+        ) -> Box<dyn FnOnce()> {
+            Box::new(move || {
+                let mut entry = meta.remove_entry(parent, b"child").unwrap();
+                entry.ino += 1;
+                meta.add_entry(parent, b"child", &entry).unwrap();
+                attempts.set(attempts.get() + 1);
+                RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(changing_child_hook(meta, parent, attempts));
+                });
+            })
+        }
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-skipped-heal-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-skipped-heal");
+        let parent = meta.create_dir(ROOT_INO, b"parent", 0, 0, 0o755).unwrap();
+        let child = meta.create_file(parent.ino, b"child", 0, 0, 0o644).unwrap();
+        meta.remove_attr(child.ino).unwrap();
+        let attempts = Rc::new(Cell::new(0));
+        let _hook = DanglingSnapshotHookGuard::arm(changing_child_hook(
+            meta.clone(),
+            parent.ino,
+            attempts.clone(),
+        ));
+        let _runtime = rt.enter();
+        let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"parent"));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            removal.as_mut().poll(&mut cx),
+            Poll::Ready(Err(VfsError::Meta(MetaError::DirNotEmpty(ino)))) if ino == parent.ino
+        ));
+        assert_eq!(
+            attempts.get(),
+            2,
+            "allow only one retry after a skipped heal"
+        );
+        assert!(meta.lookup(parent.ino, b"child").is_ok());
+    }
+
     #[test]
     fn healing_replaced_dentry_clears_missing_inode_state_only() {
         let tmp = studiofs_test_support::workspace_target_tempdir("heal-runtime-state-");
@@ -3556,16 +3659,14 @@ mod tests {
             .create_file(parent.ino, b"child", 0, 0, 0o644)
             .expect("create child file");
         let hook_meta = meta.clone();
-        RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
-                hook_meta
-                    .remove_entry(parent.ino, b"child")
-                    .expect("remove snapshotted child binding");
-                hook_meta
-                    .remove_attr(child.ino)
-                    .expect("remove snapshotted child inode");
-            }));
-        });
+        let _hook = DanglingSnapshotHookGuard::arm(Box::new(move || {
+            hook_meta
+                .remove_entry(parent.ino, b"child")
+                .expect("remove snapshotted child binding");
+            hook_meta
+                .remove_attr(child.ino)
+                .expect("remove snapshotted child inode");
+        }));
 
         rt.block_on(vfs.rmdir_inner(ROOT_INO, b"parent"))
             .expect("rmdir should retry after the snapshotted child disappears");

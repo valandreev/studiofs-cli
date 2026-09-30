@@ -32,6 +32,9 @@ by name should return the entry actually deleted by its write transaction.
 - [x] (2026-10-01) Reproduce spurious rmdir ENOTEMPTY and repair it through the existing bounded settle window; the exact regression is GREEN.
 - [x] (2026-10-01) Preserve orphan-directory context at both fsck readdir sites; the diagnostic regression and all six fsck tests pass.
 - [x] (2026-10-01) Run PR repair validation, inspect the final diff, and prepare the verified changes for delivery to PR 731.
+- [x] (2026-10-01) Verify the next three live PR threads against clean head `64628f05`; reproduce repeated skipped-heal waiting and armed-hook leakage during unwinding.
+- [x] (2026-10-01) Allow one immediate skipped-heal recheck, add stable-live-child latency coverage, and scope the snapshot hook with a test-only Drop guard.
+- [x] (2026-10-01) Finish focused follow-up validation and prepare the next PR repair commit.
 
 ## Surprises & Discoveries
 
@@ -332,7 +335,7 @@ redb namespace tests, affected VFS rmdir/healing tests and fsck tests. Finish wi
 `target/sfs-759-pr731-*.log`. After all checks pass, update the PR branch and
 reply in the four original inline threads with concrete behavior and validation.
 
-Current PR repair validation, all with `RUSTFLAGS='-D warnings'` for Cargo
+First PR repair validation, all with `RUSTFLAGS='-D warnings'` for Cargo
 test/check/Clippy commands:
 
 - `cargo test -p studiofs-meta --lib redb_engine::tests`: 308 passed, 1 ignored.
@@ -348,6 +351,62 @@ fsck changes. GitHub still reported the selected baseline head `5da0de1e`
 before publication. The worktree contains only the six intended task files.
 No PostgreSQL service-backed, native mount, or Windows gate was run for this
 PR repair; local test and compile evidence does not imply those gates passed.
+
+### Additional PR 731 review: skipped-heal latency and hook lifetime
+
+The first repair was published as `64628f05`, and all four original threads
+were answered and resolved. The next request attaches three current threads;
+the clean checkout and live PR head both match `64628f05`.
+
+Repeated skipped healing could consume all 80 timer waits even without an
+observed in-flight delete. Keep the existing settle window for observed delete
+operations, but allow only one immediate metadata recheck for an observed
+missing child when no delete was observed. A second unsuccessful heal returns
+ENOTEMPTY without sleeping. Reuse the existing attempt counter; no new timer,
+configuration, or dependency is required.
+
+The real-redb regression repeatedly changes a dangling binding after each
+snapshot so conditional removal always skips. Before the fix the first future
+poll returned Pending at the timer; afterward it returns ENOTEMPTY after exactly
+two snapshots. This proves the shared no-progress retry boundary, which also
+handles a healing storage error; it does not inject a backend storage error.
+The previous disappearing-child regression continues to prove successful
+removal after the immediate recheck.
+
+A live-child regression polls rmdir once under its runtime and requires a ready
+ENOTEMPTY result with the child retained. This asserts no async wait directly,
+without an elapsed-time threshold. Current behavior already satisfies that
+contract; this review adds missing coverage rather than changes live-child
+semantics.
+
+The live-child test also failed under an intentional mutation that removed the
+first-attempt return guard. That mutation was restored before final validation;
+this is test-sensitivity evidence, not a claim that live-child behavior was
+already broken on the selected head.
+
+Use a small test-only guard for snapshot-hook ownership. Its Drop clears any
+unconsumed or rearmed hook. A catch_unwind regression failed before that Drop
+implementation and passes afterward. This verifies cleanup on the same thread
+directly, without depending on a claim that libtest reuses worker threads under
+`--test-threads=1`.
+
+Run `RUSTFLAGS='-D warnings' cargo test -p studiofs-vfs --lib
+vfs::namespace_ops::tests:: -- --test-threads=1` and
+`RUSTFLAGS='-D warnings' cargo test -p studiofs-vfs --lib rmdir`, followed by
+`RUSTFLAGS='-D warnings' cargo check -p studiofs-vfs` and
+`RUSTFLAGS='-D warnings' cargo clippy -p studiofs-vfs --all-targets -- -D warnings`.
+Finish with formatting and diff checks. Retain evidence as
+`target/sfs-759-pr731-*.log` and reply in the three original threads after the
+verified commit is published to the existing branch.
+
+Final follow-up results: the namespace-ops module passed 6 tests with
+`--test-threads=1`, and the rmdir filter passed 10 tests; three tests appear in
+both commands, so these are 13 distinct passing tests. VFS package check and
+all-targets Clippy passed with warnings denied. Formatting and diff checks
+passed. Final source inspection confirms the fast-return guard is present and
+the only production change is the single immediate recheck for skipped healing.
+Only namespace_ops.rs and this living plan changed. PostgreSQL, mounted E2E,
+and Windows gates were not run; no native acceptance is inferred.
 
 ## Interfaces and Dependencies
 
