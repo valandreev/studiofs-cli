@@ -95,6 +95,7 @@ pub struct FilePayloadStore {
 struct PayloadStoreSharedState {
     read_handles: ReadHandleCache,
     buffered_read_fallback_handles: ReadHandleCache,
+    #[cfg(windows)]
     unbuffered_read_scratch: Mutex<platform::UnbufferedReadBuffer>,
     pending_grouped_sync: PendingGroupedSync,
     #[cfg(test)]
@@ -155,6 +156,7 @@ impl FilePayloadStore {
             shared: Arc::new(PayloadStoreSharedState {
                 read_handles: ReadHandleCache::new(read_fd_family_capacity),
                 buffered_read_fallback_handles: ReadHandleCache::new(read_fd_family_capacity),
+                #[cfg(windows)]
                 unbuffered_read_scratch: Mutex::new(platform::UnbufferedReadBuffer::new()),
                 pending_grouped_sync: PendingGroupedSync::default(),
                 #[cfg(test)]
@@ -1098,8 +1100,14 @@ impl FilePayloadStore {
             .unbuffered_read_attempts
             .fetch_add(1, Ordering::Relaxed);
 
-        let mut scratch = self.shared.unbuffered_read_scratch.lock();
-        match platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment) {
+        #[cfg(windows)]
+        let result = {
+            let mut scratch = self.shared.unbuffered_read_scratch.lock();
+            platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment)
+        };
+        #[cfg(not(windows))]
+        let result = platform::pread(file, out, start);
+        match result {
             Ok(read) => {
                 #[cfg(test)]
                 self.shared
@@ -1843,6 +1851,60 @@ mod tests {
             assert_eq!(reads.unbuffered_read_attempts, 0);
             assert_eq!(reads.unbuffered_read_fallbacks, 1);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unbuffered_reads_through_clones_overlap_at_platform_read() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_modes(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::Buffered,
+            LocalPayloadReadMode::Unbuffered,
+        )
+        .unwrap();
+        store.put(4300, b"abcdef").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let mut releases = Vec::new();
+            let mut readers = Vec::new();
+            for offset in [0, 3] {
+                let store = store.clone();
+                let entered = entered_tx.clone();
+                let (release_tx, release_rx) = mpsc::channel();
+                releases.push(release_tx);
+                readers.push(scope.spawn(move || {
+                    platform::PREAD_TEST_GATE.with(|gate| {
+                        *gate.borrow_mut() = Some((entered, release_rx));
+                    });
+                    let mut out = [0; 3];
+                    assert_eq!(store.read_into(4300, offset, &mut out), Some(3));
+                    assert_eq!(&out, if offset == 0 { b"abc" } else { b"def" });
+                }));
+            }
+            let first = entered_rx.recv_timeout(Duration::from_secs(5));
+            let second = entered_rx.recv_timeout(Duration::from_secs(5));
+            // Release and join even on failure, so serialization cannot hang the test.
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            assert!(
+                first.is_ok() && second.is_ok(),
+                "both reads must enter pread before either returns"
+            );
+        });
+        let reads = store.read_mode_snapshot();
+        assert_eq!(reads.unbuffered_read_successes, 2);
+        assert_eq!(reads.unbuffered_read_fallbacks, 0);
     }
 
     #[test]
