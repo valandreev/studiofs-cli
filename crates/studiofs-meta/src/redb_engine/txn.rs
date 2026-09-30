@@ -1,5 +1,11 @@
 use super::*;
 
+impl From<redb::StorageError> for MetaError {
+    fn from(error: redb::StorageError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
 impl RedbMetaEngine {
     /// Enable or disable filtering that hides remote-only namespace rows locally.
     pub fn set_remote_namespace_visibility_filter(&self, enabled: bool) -> MetaResult<()> {
@@ -54,9 +60,7 @@ impl RedbMetaEngine {
                 )
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         } else {
-            settings
-                .remove(REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            settings.remove(REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING)?;
         }
         Ok(())
     }
@@ -1090,9 +1094,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(attr.ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(attr.ino)?;
         drop(tombstones);
 
         let data = encode(attr)?;
@@ -1112,9 +1114,7 @@ impl RedbMetaEngine {
         let mut inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        inodes
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        inodes.remove(ino)?;
         drop(inodes);
 
         let has_base = txn
@@ -1132,9 +1132,7 @@ impl RedbMetaEngine {
                 .insert(ino, 1)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         } else {
-            tombstones
-                .remove(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones.remove(ino)?;
         }
         Ok(())
     }
@@ -1158,9 +1156,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(key.as_slice())?;
         drop(tombstones);
 
         let data = encode(entry)?;
@@ -1190,9 +1186,7 @@ impl RedbMetaEngine {
         let mut dentries = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        dentries
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        dentries.remove(key.as_slice())?;
         drop(dentries);
 
         let has_base = txn
@@ -1210,9 +1204,7 @@ impl RedbMetaEngine {
                 .insert(key.as_slice(), 1)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         } else {
-            tombstones
-                .remove(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones.remove(key.as_slice())?;
         }
         Ok(())
     }
@@ -1224,9 +1216,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(attr.ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(attr.ino)?;
         drop(tombstones);
 
         let data = encode(attr)?;
@@ -1246,17 +1236,13 @@ impl RedbMetaEngine {
         let mut inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        inodes
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        inodes.remove(ino)?;
         drop(inodes);
 
         let mut tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(ino)?;
         Ok(())
     }
 
@@ -1279,9 +1265,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(key.as_slice())?;
         drop(tombstones);
 
         let data = encode(entry)?;
@@ -1311,17 +1295,13 @@ impl RedbMetaEngine {
         let mut dentries = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        dentries
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        dentries.remove(key.as_slice())?;
         drop(dentries);
 
         let mut tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(key.as_slice())?;
         Ok(())
     }
 
@@ -1367,9 +1347,7 @@ impl RedbMetaEngine {
         let mut dentries = txn
             .open_table(BASE_DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        dentries
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        dentries.remove(key.as_slice())?;
         Ok(())
     }
 
@@ -1432,9 +1410,7 @@ impl RedbMetaEngine {
         let mut index = txn
             .open_table(index_table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        index
-            .remove(index_key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        index.remove(index_key.as_slice())?;
         Ok(())
     }
 
@@ -1446,9 +1422,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(SYMLINK_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(ino)?;
         drop(tombstones);
 
         let mut symlinks = txn
@@ -1467,17 +1441,13 @@ impl RedbMetaEngine {
         let mut symlinks = txn
             .open_table(SYMLINKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        symlinks
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        symlinks.remove(ino)?;
         drop(symlinks);
 
         let mut tombstones = txn
             .open_table(SYMLINK_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(ino)?;
         Ok(())
     }
 
@@ -1491,9 +1461,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(XATTR_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(key.as_slice())?;
         drop(tombstones);
 
         Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
@@ -1509,17 +1477,13 @@ impl RedbMetaEngine {
         let mut xattrs = txn
             .open_table(XATTRS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        xattrs
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        xattrs.remove(key.as_slice())?;
         drop(xattrs);
 
         let mut tombstones = txn
             .open_table(XATTR_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(key.as_slice())?;
         Ok(())
     }
 
@@ -1531,9 +1495,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(SYMLINK_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(ino)?;
         drop(tombstones);
 
         let mut symlinks = txn
@@ -1552,9 +1514,7 @@ impl RedbMetaEngine {
         let mut symlinks = txn
             .open_table(SYMLINKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        symlinks
-            .remove(ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        symlinks.remove(ino)?;
         drop(symlinks);
 
         let has_base = txn
@@ -1572,9 +1532,7 @@ impl RedbMetaEngine {
                 .insert(ino, 1)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         } else {
-            tombstones
-                .remove(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones.remove(ino)?;
         }
         Ok(())
     }
@@ -1589,9 +1547,7 @@ impl RedbMetaEngine {
         let mut tombstones = txn
             .open_table(XATTR_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        tombstones.remove(key.as_slice())?;
         drop(tombstones);
 
         Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
@@ -1607,9 +1563,7 @@ impl RedbMetaEngine {
         let mut xattrs = txn
             .open_table(XATTRS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        xattrs
-            .remove(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        xattrs.remove(key.as_slice())?;
         drop(xattrs);
 
         let has_base = txn
@@ -1627,9 +1581,7 @@ impl RedbMetaEngine {
                 .insert(key.as_slice(), 1)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         } else {
-            tombstones
-                .remove(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones.remove(key.as_slice())?;
         }
         Ok(())
     }
@@ -1841,9 +1793,7 @@ impl RedbMetaEngine {
                 .open_table(ACL_RULES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for key in &acl_keys {
-                table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                table.remove(key.as_slice())?;
             }
             drop(table);
         }
