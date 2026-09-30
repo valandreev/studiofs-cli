@@ -252,16 +252,11 @@ impl PgBackgroundWorkers {
                         "pg background worker shutdown is still in progress; worker handles remain owned and metadata storage stays open".to_string(),
                     ));
                 }
-                let (next_state, wait) = self
+                let (next_state, _) = self
                     .state_changed
                     .wait_timeout(state, remaining)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state = next_state;
-                if wait.timed_out() && state.shutdown_in_progress {
-                    return Err(MetaError::Timeout(
-                        "pg background worker shutdown is still in progress; worker handles remain owned and metadata storage stays open".to_string(),
-                    ));
-                }
             }
             if state.shutdown_complete {
                 return match &state.shutdown_error {

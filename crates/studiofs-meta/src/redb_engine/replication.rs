@@ -580,20 +580,16 @@ impl RedbMetaEngine {
         for (ino, bytes) in &snapshot.regular_file_base {
             check()?;
             let regular: RegularFileBaseState = decode(bytes)?;
-            let mut has_published_slice = false;
             'chunks: for chunk in regular.chunks.values() {
                 check()?;
                 for slice in chunk.slices.values() {
                     check()?;
                     if slice.payload_state == PayloadRefState::Published && slice.payload.is_some()
                     {
-                        has_published_slice = true;
+                        published_regular_inodes.insert(*ino);
                         break 'chunks;
                     }
                 }
-            }
-            if has_published_slice {
-                published_regular_inodes.insert(*ino);
             }
         }
 
@@ -629,14 +625,6 @@ impl RedbMetaEngine {
             }
         }
         snapshot.dentries = dentries;
-        let mut regular_file_overlay = Vec::with_capacity(snapshot.regular_file_overlay.len());
-        for (ino, bytes) in snapshot.regular_file_overlay.drain(..) {
-            check()?;
-            if !hidden_regular_inodes.contains(&ino) {
-                regular_file_overlay.push((ino, bytes));
-            }
-        }
-        snapshot.regular_file_overlay = regular_file_overlay;
         let mut regular_file_base = Vec::with_capacity(snapshot.regular_file_base.len());
         for (ino, bytes) in snapshot.regular_file_base.drain(..) {
             check()?;
