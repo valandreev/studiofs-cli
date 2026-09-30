@@ -1,0 +1,194 @@
+# Preserve replacement entries during namespace repair
+
+This ExecPlan is maintained under `.agent/PLANS.md`. It covers the verified
+findings in `docs/code-reviews/2026-09-30-sfs-759-concurrent-namespace-races.md`.
+
+## Purpose / Big Picture
+
+Raw dentry repair must remove only the inode binding it diagnosed as broken. A healthy
+replacement can arrive after a VFS cache observation, an fsck scan, or startup
+enumeration. Passing that earlier inode identity to one atomic metadata
+operation prevents repair from deleting the replacement. Ordinary raw removal
+by name should return the entry actually deleted by its write transaction.
+
+## Progress
+
+- [x] (2026-10-01) Read the review, current source, contracts, and caller paths.
+- [x] (2026-10-01) Confirm the longer repair race is outside the original internal comparison.
+- [x] (2026-10-01) Observe failing real-engine regressions for fsck and VFS stale observations.
+- [x] (2026-10-01) Add the atomic conditional metadata API and forward it through existing wrappers.
+- [x] (2026-10-01) Update repair callers and preserve replacement visibility in VFS caches.
+- [x] (2026-10-01) Move the test marker to test support and own race-test threads on failure.
+- [x] (2026-10-01) Run focused tests, affected-package check/Clippy, formatting, and diff checks.
+
+## Surprises & Discoveries
+
+The original fix compared two reads inside `remove_entry`, while actual repair
+callers already hold an older inode identity. All seven VFS healing call sites
+supply an inode hint, including a cached positive lookup that has no file type.
+Fsck's dangling report stores the inode, and startup cleanup enumerates entries
+for one known inode. An inode expectation therefore fits every real caller.
+
+The reviewed `expect` is compiled only under `cfg(test)` and its marker is
+thread-local. It cannot panic in a production binary or contaminate another
+test thread's marker. Receiver disconnection and unwinding thread ownership
+are still worth correcting within test support.
+
+Fsck can skip a child because its binding changed or because it has a live
+hardlink. Removing the orphan parent afterward would leave the retained child
+under a missing directory inode. A focused hardlink regression reproduced that
+existing parent-cleanup defect; retain a populated parent when child deletion
+was skipped. This also handles an existing `DirNotEmpty` result from recursive
+directory repair.
+
+The separate fsck directory-child branch uses name-based `MetaFsOps::rmdir`
+after enumeration. Its scanner expectation race predates this change and is
+outside SFS-759's raw `MetaNamespace` scope. This plan does not claim that all
+recursive fsck repair is safe against concurrent writers.
+
+## Decision Log
+
+Use a required `MetaNamespace::remove_entry_if_matches(parent, name,
+expected_ino) -> MetaResult<Option<DirEntryValue>>`. `Some` reports the matched
+entry removed; `None` reports a skipped absent or changed binding. This result
+does not claim that the slot is empty and needs no new error variant. All
+checks, deletion, and event append share one write transaction. No default
+read-then-delete implementation is permitted on the trait.
+
+Keep `remove_entry` as an atomic removal by current name, using one lookup and
+returning the actual deleted value. Repair uses the new conditional operation.
+The old internal stale-read regression must be replaced by coverage of the
+explicit expected-inode contract and actual returned raw-removal identity.
+
+Reuse one small transaction helper for the two removal modes. Preserve base,
+overlay, tombstone, visibility, event, and invalidation behavior. Do not change
+the safe mounted `NamespaceDeleteTxn` mutation path or remote publication.
+
+## Outcomes & Retrospective
+
+All repair callers of raw namespace removal now pass their diagnosed inode.
+Ordinary raw removal uses one write lookup and returns the current entry.
+Skipped VFS healing evicts the stale dentry observation without negative caching
+or clearing another inode's state. Test-only synchronization uses scoped threads
+and tolerates a disconnected receiver. No dependency was added.
+
+Focused tests, affected-package check/Clippy, and final hygiene checks passed.
+Changes remain uncommitted. The user's existing `10f71a9e`
+commit and the supplied review document are preserved. Commits, pushes, and
+external ticket updates are outside this review follow-up unless requested.
+
+## Context and Orientation
+
+`crates/studiofs-meta/src/engine.rs` defines the metadata capability. The redb
+implementation is `redb_engine/namespace.rs`; PostgreSQL and read-only wrappers
+are `pg_engine/local_traits.rs` and `read_only.rs`. The VFS runtime wrapper in
+`crates/studiofs-vfs/src/runtime.rs` forwards the capability. VFS repair lives
+in `vfs/namespace_ops.rs` and `vfs/startup_replay.rs`; CLI scan repair lives in
+`crates/studiofs/src/cli/fsck.rs`.
+
+The expected inode is the identity observed before diagnosis. A write
+transaction serializes namespace checks and mutation. A skipped operation
+must preserve the replacement and append no deletion event.
+
+## Plan of Work
+
+First add real-engine tests that replace the diagnosed name before repair and
+watch them fail on HEAD `10f71a9e`. Implement the capability and existing
+wrappers, then update each actual repair caller. Check VFS cache visibility:
+a skipped repair cannot insert a negative cache entry for a live replacement.
+Finally isolate the transaction-attempt marker in test support and use scoped
+threads with the held transaction inside the scope closure so unwinding drops
+the lock before automatic thread joining.
+
+## Concrete Steps
+
+Work from `/Volumes/Storage/dev/studiofs`. Use `RUSTFLAGS='-D warnings'` for
+focused tests and compile checks. Run the fsck regression with
+`cargo test -p studiofs --bin studiofs repair_preserves_replacement_for_stale_dangling_report`.
+Run the VFS regression under
+`cargo test -p studiofs-vfs --lib stale_positive_lookup_does_not_delete_or_hide_replacement_entry`.
+Then run local redb tests, focused fsck/VFS repair tests, and
+`cargo check -p studiofs-meta -p studiofs-vfs -p studiofs` followed by
+`cargo clippy -p studiofs-meta -p studiofs-vfs -p studiofs --all-targets -- -D warnings`.
+Finish with `cargo fmt --all -- --check` and `git diff --check`.
+
+## Validation and Acceptance
+
+The old diagnosed inode must never authorize deletion of a new inode at the
+same name, whether replacement occurs before repair starts or while repair
+waits for the writer. The replacement remains resolvable through VFS caches.
+Missing and changed conditional deletions return `None` with no event;
+matching removal returns the actual removed entry and preserves base tombstones.
+Raw removal returns the current entry from its write transaction. Test-marker
+receiver cancellation does not panic. Every reported test filter must execute
+nonzero tests. Live PostgreSQL and mounted drivers are separate coverage and
+will not be implied by local tests.
+
+## Idempotence and Recovery
+
+Fixtures use isolated directories under `target/`. Test and check commands can
+be rerun safely. Preserve the user's existing committed work and review
+document. Do not reset history or remove unrelated changes.
+
+## Artifacts and Notes
+
+Retain red and green command output under `target/sfs-759-*.log`. Record exact
+results and the disposition of each review claim here at completion.
+
+### Review disposition
+
+1. **Incomplete repair race protection: confirmed and fixed.** Real fsck scan
+   and stale positive VFS cache regressions deleted the replacement on HEAD.
+   Caller-supplied inode expectations close the observed gap. Metadata coverage
+   also checks replacement while conditional removal waits for the writer.
+2. **Duplicate merged lookup: confirmed and removed.** Both removal modes use
+   a single merged lookup in the write transaction. The claimed HIGH performance
+   severity is unmeasured; raw repair removal is not the mounted `unlink` path.
+3. **Misleading missing-entry result: confirmed and fixed.** Conditional
+   `None` means absent or changed; fsck reports "changed or gone". No new error
+   variant is needed. Raw removal reports `EntryNotFound` only for absence.
+4. **Cow allocation: confirmed and fixed.** `into_owned()` reuses an owned
+   lossy conversion on the existing insertion error path.
+5. **Test hook panic/coupling: partly confirmed and fixed.** Dropping the
+   receiver reproduced a test-only panic; the send is now best effort and the
+   marker lives in `test_support`. The production panic and cross-thread marker
+   contamination claims are disproven by `cfg(test)` and thread-local storage.
+   Test-hook overhead was not measured and does not justify more machinery.
+6. **Detached race-test worker on panic: confirmed and fixed.** Scoped threads
+   own workers; the held writer transaction is inside the scope closure so it
+   drops on unwind before automatic joining.
+
+### Validation evidence
+
+All following Cargo tests/checks use `RUSTFLAGS='-D warnings'`.
+
+| Command after `cargo` | Result | Retained log under `target/` |
+| --- | --- | --- |
+| `test -p studiofs-meta --lib redb_engine::tests` | 307 passed, 1 ignored | `sfs-759-review-redb-tests.log` |
+| `test -p studiofs-meta --lib read_only_meta_rejects_conditional_namespace_removal` | 1 passed | `sfs-759-read-only.log` |
+| `test -p studiofs --bin studiofs cli::fsck::tests` | 5 passed | `sfs-759-fsck-green.log` |
+| `test -p studiofs-vfs --lib stale_positive_lookup_does_not_delete_or_hide_replacement_entry` | 1 passed | `sfs-759-vfs-green.log` |
+| `test -p studiofs-vfs --lib dangling` | 5 passed | `sfs-759-vfs-dangling.log` |
+| `test -p studiofs-vfs --lib startup_replay` | 31 passed | `sfs-759-vfs-startup-replay.log` |
+| `check -p studiofs-meta -p studiofs-vfs -p studiofs` | passed | `sfs-759-review-check.log` |
+| `clippy -p studiofs-meta -p studiofs-vfs -p studiofs --all-targets -- -D warnings` | passed | `sfs-759-review-clippy.log` |
+
+`cargo fmt --all -- --check` and `git diff --check` passed. Final read-only
+review found no introduced regression. Clippy's first attempt found one needless
+borrow in the new read-only fixture; the fixture was corrected and the complete
+affected-package Clippy command passed on retry.
+
+RED was observed for stale fsck repair, stale VFS healing, raw returned-entry
+identity, dropped test receiver, and retained-parent cleanup before their fixes.
+Live PostgreSQL/service and native mounted tests were not run; the local results
+do not imply that coverage.
+
+## Interfaces and Dependencies
+
+No dependency is added. The required capability is implemented by RedbMetaEngine,
+PgMetaEngine, ReadOnlyMetaEngine, and RuntimeMetaHandle. The existing merged
+write lookup remains the authority for namespace visibility. Standard-library
+channels and scoped threads provide deterministic, owned test synchronization.
+
+Plan created after verification showed that the actual repair observation
+predates the original method-local comparison.

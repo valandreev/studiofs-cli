@@ -477,7 +477,9 @@ impl<'a> StartupReplayCoordinator<'a> {
                 }
             };
             for entry in entries.into_iter().filter(|entry| entry.ino == *ino) {
-                if let Err(error) = meta.remove_entry(attr.parent, &entry.name) {
+                if let Err(error) =
+                    meta.remove_entry_if_matches(attr.parent, &entry.name, entry.ino)
+                {
                     warn!(
                         ino,
                         parent = attr.parent,

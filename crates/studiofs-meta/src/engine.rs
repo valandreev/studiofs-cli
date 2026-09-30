@@ -1404,6 +1404,18 @@ pub trait MetaNamespace: Send + Sync {
 
     /// Remove a directory entry by name. Returns the removed entry.
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
+
+    /// Atomically remove a directory entry only if it still refers to `expected_ino`.
+    ///
+    /// Returns the removed entry, or `None` if the name is absent or has a different
+    /// inode. A skipped removal changes neither the namespace nor its event log.
+    /// Repair callers must pass the inode they observed before diagnosing the entry.
+    fn remove_entry_if_matches(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Ino,
+    ) -> MetaResult<Option<DirEntryValue>>;
 }
 
 /// High-level filesystem operations built on top of namespace and inode primitives.

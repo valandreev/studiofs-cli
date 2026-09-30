@@ -792,9 +792,9 @@ impl RedbMetaEngine {
 
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
         #[cfg(test)]
-        tests::WRITE_TXN_ATTEMPT.with(|sender| {
+        test_support::WRITE_TXN_ATTEMPT.with(|sender| {
             if let Some(sender) = sender.borrow_mut().take() {
-                sender.send(()).expect("write transaction attempt receiver");
+                let _ = sender.send(());
             }
         });
         let write_txn_guard = self

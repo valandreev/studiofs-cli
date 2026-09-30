@@ -208,8 +208,15 @@ fn test_remove_entry_base_only_creates_local_tombstone() {
     assert!(engine.local_overlay_dentries().unwrap().contains(&key));
 }
 
-thread_local! {
-    pub(super) static WRITE_TXN_ATTEMPT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+#[test]
+fn test_write_transaction_attempt_receiver_can_be_dropped() {
+    let engine = temp_engine();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    WRITE_TXN_ATTEMPT.with(|marker| *marker.borrow_mut() = Some(sender));
+    drop(receiver);
+
+    let txn = engine.begin_write_txn().unwrap();
+    txn.abort().unwrap();
 }
 
 #[test]
@@ -217,36 +224,36 @@ fn test_add_entry_rechecks_name_after_concurrent_insert() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let engine = Arc::new(temp_engine());
+    let engine = temp_engine();
     let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
     let concurrent = DirEntryValue {
         ino: 42,
         kind: FileType::RegularFile,
     };
-    let txn = engine.begin_write_txn().unwrap();
-    let worker_engine = Arc::clone(&engine);
-    let (attempt_tx, attempt_rx) = mpsc::channel();
-    let (result_tx, result_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        WRITE_TXN_ATTEMPT.with(|sender| *sender.borrow_mut() = Some(attempt_tx));
-        result_tx
-            .send(worker_engine.add_entry(
-                ROOT_INO,
-                b"concurrent",
-                &DirEntryValue {
-                    ino: 43,
-                    kind: FileType::RegularFile,
-                },
-            ))
+    let result = thread::scope(|scope| {
+        let txn = engine.begin_write_txn().unwrap();
+        let worker_engine = &engine;
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        scope.spawn(move || {
+            WRITE_TXN_ATTEMPT.with(|sender| *sender.borrow_mut() = Some(attempt_tx));
+            result_tx
+                .send(worker_engine.add_entry(
+                    ROOT_INO,
+                    b"concurrent",
+                    &DirEntryValue {
+                        ino: 43,
+                        kind: FileType::RegularFile,
+                    },
+                ))
+                .unwrap();
+        });
+        attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &concurrent)
             .unwrap();
+        txn.commit().unwrap();
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
     });
-    // The old implementation has already checked absence before this attempt.
-    attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &concurrent)
-        .unwrap();
-    txn.commit().unwrap();
-    let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    worker.join().unwrap();
 
     assert!(matches!(result, Err(MetaError::EntryExists { .. })), "{result:?}");
     assert_eq!(engine.lookup(ROOT_INO, b"concurrent").unwrap(), concurrent);
@@ -254,7 +261,7 @@ fn test_add_entry_rechecks_name_after_concurrent_insert() {
 }
 
 #[test]
-fn test_remove_entry_preserves_concurrent_replacement() {
+fn test_remove_entry_returns_current_entry_after_concurrent_replacement() {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -272,31 +279,88 @@ fn test_remove_entry_preserves_concurrent_replacement() {
             kind: FileType::Directory,
         },
     ] {
-        let engine = Arc::new(temp_engine());
+        let engine = temp_engine();
         engine.add_entry(ROOT_INO, b"concurrent", &original).unwrap();
         let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+        let result = thread::scope(|scope| {
+            let txn = engine.begin_write_txn().unwrap();
+            let worker_engine = &engine;
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            scope.spawn(move || {
+                WRITE_TXN_ATTEMPT.with(|sender| *sender.borrow_mut() = Some(attempt_tx));
+                result_tx
+                    .send(worker_engine.remove_entry(ROOT_INO, b"concurrent"))
+                    .unwrap();
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &replacement)
+                .unwrap();
+            txn.commit().unwrap();
+            result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        });
+
+        assert_eq!(result.unwrap(), replacement);
+        assert!(matches!(engine.lookup(ROOT_INO, b"concurrent"), Err(MetaError::EntryNotFound { .. })));
+        assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event + 1);
+    }
+}
+
+#[test]
+fn test_remove_entry_if_matches_preserves_replacement_before_call() {
+    let engine = temp_engine();
+    let replacement = DirEntryValue { ino: 43, kind: FileType::RegularFile };
+    engine.add_entry(ROOT_INO, b"replaced", &replacement).unwrap();
+    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+
+    assert!(engine.remove_entry_if_matches(ROOT_INO, b"replaced", 42).unwrap().is_none());
+    assert_eq!(engine.lookup(ROOT_INO, b"replaced").unwrap(), replacement);
+    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
+}
+
+#[test]
+fn test_remove_entry_if_matches_preserves_concurrent_replacement() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = temp_engine();
+    engine.add_entry(ROOT_INO, b"concurrent", &DirEntryValue { ino: 42, kind: FileType::RegularFile }).unwrap();
+    let replacement = DirEntryValue { ino: 43, kind: FileType::RegularFile };
+    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let result = thread::scope(|scope| {
         let txn = engine.begin_write_txn().unwrap();
-        let worker_engine = Arc::clone(&engine);
+        let worker_engine = &engine;
         let (attempt_tx, attempt_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
+        scope.spawn(move || {
             WRITE_TXN_ATTEMPT.with(|sender| *sender.borrow_mut() = Some(attempt_tx));
-            result_tx
-                .send(worker_engine.remove_entry(ROOT_INO, b"concurrent"))
-                .unwrap();
+            result_tx.send(worker_engine.remove_entry_if_matches(ROOT_INO, b"concurrent", 42)).unwrap();
         });
-        // remove_entry has observed the original and is about to wait for this writer.
         attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &replacement)
-            .unwrap();
+        RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &replacement).unwrap();
         txn.commit().unwrap();
-        let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        worker.join().unwrap();
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    });
 
-        assert!(matches!(result, Err(MetaError::EntryNotFound { .. })), "{result:?}");
-        assert_eq!(engine.lookup(ROOT_INO, b"concurrent").unwrap(), replacement);
-        assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
-    }
+    assert!(result.unwrap().is_none());
+    assert_eq!(engine.lookup(ROOT_INO, b"concurrent").unwrap(), replacement);
+    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
+}
+
+#[test]
+fn test_remove_entry_if_matches_removes_base_entry_and_skips_absence() {
+    let source = temp_engine();
+    let file = source.create_file(ROOT_INO, b"remote", 1000, 1000, 0o644).unwrap();
+    mark_empty_file_published(&source, file.ino);
+    let engine = temp_engine();
+    engine.import_snapshot(&source.export_snapshot().unwrap()).unwrap();
+    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+
+    let removed = engine.remove_entry_if_matches(ROOT_INO, b"remote", file.ino).unwrap().unwrap();
+    assert_eq!(removed.ino, file.ino);
+    assert!(engine.local_overlay_dentries().unwrap().contains(&encode_dentry_key(ROOT_INO, b"remote")));
+    assert!(engine.remove_entry_if_matches(ROOT_INO, b"remote", file.ino).unwrap().is_none());
+    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event + 1);
 }
 
 #[test]

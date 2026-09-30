@@ -1858,17 +1858,25 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn heal_orphaned_dentry(&self, parent: Ino, name: &[u8], ino_hint: Option<Ino>) {
-        match self.sync_meta().remove_entry(parent, name) {
-            Ok(removed) => {
+    fn heal_orphaned_dentry(&self, parent: Ino, name: &[u8], expected_ino: Ino) -> bool {
+        let removed = match self
+            .sync_meta()
+            .remove_entry_if_matches(parent, name, expected_ino)
+        {
+            Ok(Some(removed)) => {
                 debug!(
                     parent,
                     removed_ino = removed.ino,
                     "healed orphaned dentry after inode-not-found"
                 );
+                Some(removed)
             }
-            Err(MetaError::EntryNotFound { .. }) => {
-                debug!(parent, "orphaned dentry already absent during heal");
+            Ok(None) => {
+                debug!(
+                    parent,
+                    "orphaned dentry changed or was already absent during heal"
+                );
+                None
             }
             Err(err) => {
                 warn!(
@@ -1877,18 +1885,21 @@ impl StudioVfs {
                     error = %err,
                     "failed to heal orphaned dentry after inode-not-found"
                 );
+                None
             }
+        };
+
+        let was_removed = removed.is_some();
+        if let Some(removed) = removed {
+            self.clear_pending_payloads_for_inode(removed.ino);
+            self.clear_inode_incarnation(removed.ino);
+            self.state.namespace.dirty_attrs.lock().remove(&removed.ino);
+            self.invalidate_attr_read_cache([removed.ino]);
         }
 
-        if let Some(ino) = ino_hint {
-            self.clear_pending_payloads_for_inode(ino);
-            self.clear_inode_incarnation(ino);
-            self.state.namespace.dirty_attrs.lock().remove(&ino);
-            self.invalidate_attr_read_cache([ino]);
-        }
-
+        self.dentry_cache_invalidate(parent, name);
         self.bump_namespace_for_parents([parent]);
-        self.dentry_cache_insert_negative(parent, name);
+        was_removed
     }
 
     /// Heal a directory entry whose name still exists in metadata but whose inode vanished.
@@ -1909,8 +1920,7 @@ impl StudioVfs {
         match self.sync_meta().get_attr(entry.ino) {
             Ok(_) => Ok(false),
             Err(MetaError::InodeNotFound(_)) => {
-                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
-                Ok(true)
+                Ok(self.heal_orphaned_dentry(parent, name, entry.ino))
             }
             Err(err) => Err(VfsError::Meta(err)),
         }
@@ -1945,8 +1955,7 @@ impl StudioVfs {
                             return Ok(attr);
                         }
                         Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                            self.dentry_cache_invalidate(parent, name);
-                            self.heal_orphaned_dentry(parent, name, Some(child_ino));
+                            self.heal_orphaned_dentry(parent, name, child_ino);
                             return Err(Self::ignored_entry_not_found(parent, name));
                         }
                         Err(err) => return Err(err),
@@ -1992,7 +2001,7 @@ impl StudioVfs {
         );
         if let Err(err) = self.enforce_access(entry.ino, AccessLevel::ReadOnly) {
             if matches!(err, VfsError::Meta(MetaError::InodeNotFound(_))) {
-                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
+                self.heal_orphaned_dentry(parent, name, entry.ino);
                 return Err(Self::ignored_entry_not_found(parent, name));
             }
             return Err(err);
@@ -2000,7 +2009,7 @@ impl StudioVfs {
         match self.getattr_unchecked(entry.ino) {
             Ok(attr) => Ok(attr),
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
+                self.heal_orphaned_dentry(parent, name, entry.ino);
                 Err(Self::ignored_entry_not_found(parent, name))
             }
             Err(err) => Err(err),
@@ -2250,8 +2259,9 @@ impl StudioVfs {
             if live_inos.contains(&entry.ino) {
                 continue;
             }
-            self.heal_orphaned_dentry(dir_ino, &entry.name, Some(entry.ino));
-            healed += 1;
+            if self.heal_orphaned_dentry(dir_ino, &entry.name, entry.ino) {
+                healed += 1;
+            }
         }
         Ok((healed, inflight_delete_inos))
     }
@@ -2279,7 +2289,7 @@ impl StudioVfs {
         let attr = match meta.unlink_open_handle(parent, name) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
-                self.heal_orphaned_dentry(parent, name, Some(target.ino));
+                self.heal_orphaned_dentry(parent, name, target.ino);
                 return Ok(None);
             }
             Err(MetaError::IsADirectory(_)) => {
@@ -2314,7 +2324,7 @@ impl StudioVfs {
         let attr = match meta.unlink(parent, name) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
-                self.heal_orphaned_dentry(parent, name, Some(target.ino));
+                self.heal_orphaned_dentry(parent, name, target.ino);
                 return Ok(None);
             }
             Err(err) => return Err(VfsError::Meta(err)),

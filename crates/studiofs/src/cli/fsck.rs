@@ -377,6 +377,7 @@ fn repair_orphan_directory(
             )));
         }
     };
+    let mut has_unremoved_entries = false;
     for entry in entries {
         let entry_ino = entry.ino;
         let entry_name = entry.name;
@@ -397,7 +398,7 @@ fn repair_orphan_directory(
                     Err(MetaError::InodeNotFound(_)) => {
                         *removed_orphans += 1;
                     }
-                    Err(MetaError::DirNotEmpty(_)) => {}
+                    Err(MetaError::DirNotEmpty(_)) => has_unremoved_entries = true,
                     Err(err) => {
                         return Err(FsckError::Message(format!(
                             "failed to remove orphan dir entry parent={ino} child={entry_ino}: {err}"
@@ -417,16 +418,21 @@ fn repair_orphan_directory(
                 };
                 if attr.as_ref().is_some_and(|attr| attr.nlink > 1) {
                     *skipped_hardlink_orphans += 1;
+                    has_unremoved_entries = true;
                     continue;
                 }
 
-                match meta.remove_entry(ino, &entry_name) {
-                    Ok(_) | Err(MetaError::EntryNotFound { .. }) => {}
-                    Err(err) => {
-                        return Err(FsckError::Message(format!(
+                let removed = meta
+                    .remove_entry_if_matches(ino, &entry_name, entry_ino)
+                    .map_err(|err| {
+                        FsckError::Message(format!(
                             "failed to remove orphan child entry parent={ino} child={entry_ino}: {err}"
-                        )));
-                    }
+                        ))
+                    })?;
+                if removed.is_none() {
+                    has_unremoved_entries = true;
+                    processed.insert(entry_ino);
+                    continue;
                 }
 
                 if attr.is_some() {
@@ -435,6 +441,10 @@ fn repair_orphan_directory(
                 processed.insert(entry_ino);
             }
         }
+    }
+
+    if has_unremoved_entries && !meta.readdir(ino)?.is_empty() {
+        return Ok(());
     }
 
     match meta.remove_attr(ino) {
@@ -458,14 +468,14 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     }
 
     let mut removed_dangling = 0usize;
-    let mut dangling_already_gone = 0usize;
+    let mut dangling_changed_or_gone = 0usize;
     let dangling = &report.dangling;
     let orphan_inodes = &report.orphan_inodes;
 
     for d in dangling {
-        match meta.remove_entry(d.parent, &d.name) {
-            Ok(_) => removed_dangling += 1,
-            Err(MetaError::EntryNotFound { .. }) => dangling_already_gone += 1,
+        match meta.remove_entry_if_matches(d.parent, &d.name, d.ino) {
+            Ok(Some(_)) => removed_dangling += 1,
+            Ok(None) => dangling_changed_or_gone += 1,
             Err(err) => {
                 return Err(FsckError::Message(format!(
                     "failed to remove dangling dentry parent={} ino={}: {err}",
@@ -533,7 +543,10 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     println!("Repair summary:");
     println!("  replayed undo parents: {}", replayed.len());
     println!("  dangling entries removed: {}", removed_dangling);
-    println!("  dangling already gone: {}", dangling_already_gone);
+    println!(
+        "  dangling entries changed or gone: {}",
+        dangling_changed_or_gone
+    );
     println!("  orphan inodes removed: {}", removed_orphans);
     println!("  orphan blocks pending gc: {}", orphan_blocks_pending_gc);
     println!("  orphan dirs skipped: {}", skipped_dir_orphans);
@@ -613,7 +626,7 @@ where
 mod tests {
     use super::*;
     use std::ops::Deref;
-    use studiofs_meta::engine::MetaFsOps;
+    use studiofs_meta::engine::{MetaFsOps, MetaInodes};
     use studiofs_meta::{MetaNamespace, RedbMetaEngine};
 
     struct TestEngine {
@@ -662,6 +675,74 @@ mod tests {
         let post = collect_report(&*engine).expect("collect post-repair report");
         assert!(post.orphan_inodes.is_empty());
         assert!(post.nlink_mismatches.is_empty());
+    }
+
+    #[test]
+    fn repair_preserves_replacement_for_stale_dangling_report() {
+        let engine = temp_engine();
+        let dangling = engine
+            .create_file(ROOT_INO, b"entry", 1000, 1000, 0o644)
+            .expect("create original entry");
+        engine
+            .remove_attr(dangling.ino)
+            .expect("remove original inode");
+
+        let report = collect_report(&*engine).expect("collect dangling report");
+        assert_eq!(report.dangling.len(), 1);
+        assert_eq!(report.dangling[0].ino, dangling.ino);
+
+        engine
+            .remove_entry(ROOT_INO, b"entry")
+            .expect("remove stale binding");
+        let replacement = engine
+            .create_file(ROOT_INO, b"entry", 1000, 1000, 0o644)
+            .expect("create healthy replacement");
+
+        repair(&*engine, &report).expect("repair stale report");
+
+        assert_eq!(
+            engine
+                .lookup(ROOT_INO, b"entry")
+                .expect("replacement binding")
+                .ino,
+            replacement.ino
+        );
+    }
+
+    #[test]
+    fn repair_preserves_orphan_directory_with_skipped_hardlink_child() {
+        let engine = temp_engine();
+        let orphan_dir = engine
+            .create_dir(ROOT_INO, b"orphan", 1000, 1000, 0o755)
+            .expect("create orphan directory");
+        let child = engine
+            .create_file(orphan_dir.ino, b"shared", 1000, 1000, 0o644)
+            .expect("create child file");
+        engine
+            .link(child.ino, ROOT_INO, b"live-link")
+            .expect("create live hardlink");
+        engine
+            .remove_entry(ROOT_INO, b"orphan")
+            .expect("detach orphan directory");
+
+        let report = collect_report(&*engine).expect("collect orphan report");
+        repair(&*engine, &report).expect("repair orphan directory");
+
+        assert!(engine.get_attr(orphan_dir.ino).is_ok());
+        assert_eq!(
+            engine
+                .lookup(orphan_dir.ino, b"shared")
+                .expect("preserved child binding")
+                .ino,
+            child.ino
+        );
+        assert_eq!(
+            engine
+                .lookup(ROOT_INO, b"live-link")
+                .expect("live hardlink")
+                .ino,
+            child.ino
+        );
     }
 
     #[test]

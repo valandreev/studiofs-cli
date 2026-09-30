@@ -92,6 +92,15 @@ impl MetaNamespace for PgMetaEngine {
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
         self.mutate(|local| local.remove_entry(parent, name))
     }
+
+    fn remove_entry_if_matches(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Ino,
+    ) -> MetaResult<Option<DirEntryValue>> {
+        self.mutate(|local| local.remove_entry_if_matches(parent, name, expected_ino))
+    }
 }
 
 impl MetaFsOps for PgMetaEngine {
