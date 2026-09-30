@@ -1873,29 +1873,25 @@ mod tests {
 
         std::thread::scope(|scope| {
             let mut releases = Vec::new();
-            let mut readers = Vec::new();
             for offset in [0, 3] {
                 let store = store.clone();
                 let entered = entered_tx.clone();
                 let (release_tx, release_rx) = mpsc::channel();
                 releases.push(release_tx);
-                readers.push(scope.spawn(move || {
+                scope.spawn(move || {
                     platform::PREAD_TEST_GATE.with(|gate| {
                         *gate.borrow_mut() = Some((entered, release_rx));
                     });
                     let mut out = [0; 3];
                     assert_eq!(store.read_into(4300, offset, &mut out), Some(3));
                     assert_eq!(&out, if offset == 0 { b"abc" } else { b"def" });
-                }));
+                });
             }
             let first = entered_rx.recv_timeout(Duration::from_secs(5));
             let second = entered_rx.recv_timeout(Duration::from_secs(5));
-            // Release and join even on failure, so serialization cannot hang the test.
+            // Release even on failure; the scope joins all readers.
             for release in releases {
                 release.send(()).unwrap();
-            }
-            for reader in readers {
-                reader.join().unwrap();
             }
             assert!(
                 first.is_ok() && second.is_ok(),
