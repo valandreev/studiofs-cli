@@ -1891,7 +1891,7 @@ mod tests {
             let second = entered_rx.recv_timeout(Duration::from_secs(5));
             // Release even on failure; the scope joins all readers.
             for release in releases {
-                release.send(()).unwrap();
+                let _ = release.send(());
             }
             assert!(
                 first.is_ok() && second.is_ok(),
