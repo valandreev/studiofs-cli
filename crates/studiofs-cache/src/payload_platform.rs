@@ -6,7 +6,8 @@ use std::path::Path;
 
 #[cfg(all(test, target_os = "macos"))]
 std::thread_local! {
-    /// Per-thread gates keep unrelated payload tests independent.
+    /// Holds clone-backed reads at the platform boundary for the concurrency regression.
+    /// Per-thread storage keeps unrelated payload tests independent.
     pub(crate) static PREAD_TEST_GATE: std::cell::RefCell<Option<(
         std::sync::mpsc::Sender<()>,
         std::sync::mpsc::Receiver<()>,
@@ -69,10 +70,13 @@ pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(all(test, target_os = "macos"))]
     PREAD_TEST_GATE.with(|gate| {
         if let Some((entered, release)) = gate.borrow_mut().take() {
-            entered.send(()).unwrap();
+            entered
+                .send(())
+                .expect("concurrent-read entry channel must remain open");
+            // Allow both 5-second entry waits to finish before the gate expires.
             release
                 .recv_timeout(std::time::Duration::from_secs(15))
-                .unwrap();
+                .expect("concurrent-read coordinator must release the platform read");
         }
     });
     let mut total = 0;

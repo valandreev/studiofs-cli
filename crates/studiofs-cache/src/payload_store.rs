@@ -249,7 +249,7 @@ impl FilePayloadStore {
             }
 
             let file = self.cached_read_handle(object_id, &path).ok()?;
-            match self.try_read_into_unbuffered(file.as_ref(), &path, start, out) {
+            match self.try_read_into_unbuffered(file.as_ref(), alignment, start, out) {
                 Ok(Some(read)) => return Some(read),
                 Ok(None) => {
                     return self.read_into_buffered_fallback(
@@ -1085,11 +1085,10 @@ impl FilePayloadStore {
     fn try_read_into_unbuffered(
         &self,
         file: &File,
-        path: &Path,
+        alignment: usize,
         start: u64,
         out: &mut [u8],
     ) -> io::Result<Option<usize>> {
-        let alignment = platform::unbuffered_read_alignment_for_path(path);
         if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
             return Ok(None);
         }
@@ -1853,6 +1852,7 @@ mod tests {
         }
     }
 
+    // macOS enables F_NOCACHE; other non-Windows platforms use buffered fallback.
     #[cfg(target_os = "macos")]
     #[test]
     fn unbuffered_reads_through_clones_overlap_at_platform_read() {
