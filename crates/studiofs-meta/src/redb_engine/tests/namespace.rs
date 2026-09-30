@@ -208,6 +208,97 @@ fn test_remove_entry_base_only_creates_local_tombstone() {
     assert!(engine.local_overlay_dentries().unwrap().contains(&key));
 }
 
+thread_local! {
+    pub(super) static WRITE_TXN_ATTEMPT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[test]
+fn test_add_entry_rechecks_name_after_concurrent_insert() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let engine = Arc::new(temp_engine());
+    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let concurrent = DirEntryValue {
+        ino: 42,
+        kind: FileType::RegularFile,
+    };
+    let txn = engine.begin_write_txn().unwrap();
+    let worker_engine = Arc::clone(&engine);
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        WRITE_TXN_ATTEMPT.with(|sender| *sender.borrow_mut() = Some(attempt_tx));
+        result_tx
+            .send(worker_engine.add_entry(
+                ROOT_INO,
+                b"concurrent",
+                &DirEntryValue {
+                    ino: 43,
+                    kind: FileType::RegularFile,
+                },
+            ))
+            .unwrap();
+    });
+    // The old implementation has already checked absence before this attempt.
+    attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &concurrent)
+        .unwrap();
+    txn.commit().unwrap();
+    let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
+
+    assert!(matches!(result, Err(MetaError::EntryExists { .. })), "{result:?}");
+    assert_eq!(engine.lookup(ROOT_INO, b"concurrent").unwrap(), concurrent);
+    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
+}
+
+#[test]
+fn test_remove_entry_preserves_concurrent_replacement() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let original = DirEntryValue {
+        ino: 42,
+        kind: FileType::RegularFile,
+    };
+    for replacement in [
+        DirEntryValue {
+            ino: 43,
+            kind: FileType::RegularFile,
+        },
+        DirEntryValue {
+            ino: 42,
+            kind: FileType::Directory,
+        },
+    ] {
+        let engine = Arc::new(temp_engine());
+        engine.add_entry(ROOT_INO, b"concurrent", &original).unwrap();
+        let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+        let txn = engine.begin_write_txn().unwrap();
+        let worker_engine = Arc::clone(&engine);
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            WRITE_TXN_ATTEMPT.with(|sender| *sender.borrow_mut() = Some(attempt_tx));
+            result_tx
+                .send(worker_engine.remove_entry(ROOT_INO, b"concurrent"))
+                .unwrap();
+        });
+        // remove_entry has observed the original and is about to wait for this writer.
+        attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &replacement)
+            .unwrap();
+        txn.commit().unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+
+        assert!(matches!(result, Err(MetaError::EntryNotFound { .. })), "{result:?}");
+        assert_eq!(engine.lookup(ROOT_INO, b"concurrent").unwrap(), replacement);
+        assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
+    }
+}
+
 #[test]
 fn test_lookup_merged_in_write_txn_matches_read_lookup() {
     let source = temp_engine();
