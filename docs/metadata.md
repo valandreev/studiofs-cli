@@ -38,8 +38,9 @@ write transaction. `remove_entry` removes the current binding by name and return
 the entry actually deleted. Repairs use `remove_entry_if_matches` with the inode
 observed before diagnosis: it returns `Some(removed)` on a match and `None` when
 the name is absent or refers to another inode, without changing the namespace or
-appending an event. A skipped repair must invalidate cached observations rather
-than cache the name as absent.
+appending an event. Ordinary skipped healing must invalidate cached dentry
+observations rather than cache the name as absent. Hidden platform-root entries
+remain deliberately negative-cached.
 
 ## Contract/Core Test Harness
 

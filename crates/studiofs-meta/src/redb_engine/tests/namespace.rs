@@ -190,6 +190,50 @@ fn test_add_entry_rejects_name_visible_from_base() {
 }
 
 #[test]
+fn test_rejected_namespace_mutations_record_aborted_write_metrics() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 42,
+        kind: FileType::RegularFile,
+    };
+    engine.add_entry(ROOT_INO, b"existing", &entry).unwrap();
+
+    let before = engine.metadata_write_observability().mutation.calls;
+    assert!(matches!(
+        engine.add_entry(ROOT_INO, b"existing", &entry),
+        Err(MetaError::EntryExists { .. })
+    ));
+    assert_eq!(
+        engine.metadata_write_observability().mutation.calls - before,
+        1
+    );
+
+    let before = engine.metadata_write_observability().mutation.calls;
+    assert_eq!(
+        engine
+            .remove_entry_if_matches(ROOT_INO, b"missing", entry.ino)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        engine.metadata_write_observability().mutation.calls - before,
+        1
+    );
+
+    let before = engine.metadata_write_observability().mutation.calls;
+    assert_eq!(
+        engine
+            .remove_entry_if_matches(ROOT_INO, b"existing", entry.ino + 1)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        engine.metadata_write_observability().mutation.calls - before,
+        1
+    );
+}
+
+#[test]
 fn test_remove_entry_base_only_creates_local_tombstone() {
     let source = temp_engine();
     let file = source

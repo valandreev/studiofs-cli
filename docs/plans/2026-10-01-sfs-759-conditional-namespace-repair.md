@@ -26,6 +26,12 @@ by name should return the entry actually deleted by its write transaction.
 - [x] (2026-10-01) Observe RED and fix first-lookup replacement resolution and retained-directory counting.
 - [x] (2026-10-01) Observe RED for skipped-heal stale state and add a live-inode preservation guard.
 - [x] (2026-10-01) Finish follow-up focused tests, check/Clippy, formatting, and final diff review.
+- [x] (2026-10-01) Locate PR 731 checkout, verify clean HEAD `5da0de1e` matches GitHub, and read all four attached unresolved threads.
+- [x] (2026-10-01) Confirm metric undercount RED and explicitly abort all three ordinary skipped namespace mutations.
+- [x] (2026-10-01) Scope the negative-cache rule to ordinary healing and preserve the hidden platform-root policy.
+- [x] (2026-10-01) Reproduce spurious rmdir ENOTEMPTY and repair it through the existing bounded settle window; the exact regression is GREEN.
+- [x] (2026-10-01) Preserve orphan-directory context at both fsck readdir sites; the diagnostic regression and all six fsck tests pass.
+- [x] (2026-10-01) Run PR repair validation, inspect the final diff, and prepare the verified changes for delivery to PR 731.
 
 ## Surprises & Discoveries
 
@@ -81,9 +87,16 @@ and tolerates a disconnected receiver. No dependency was added.
 The first review's focused tests, affected-package check/Clippy, and hygiene
 checks passed. The user subsequently committed that implementation as
 `10f91bff`. The new review started with a clean tree on that commit. Follow-up
-changes are uncommitted and their final verification passed. Existing
-commits and supplied review documents are preserved. Commits, pushes, and
-external ticket updates remain outside the review work unless requested.
+changes passed final verification and were later committed by the user as
+`5da0de1e`. Existing commits and supplied review documents are preserved.
+
+The user committed the second review changes as `5da0de1e` and now requests
+repair of PR 731's four attached outstanding comments. The selected checkout
+and live PR head match that commit. All four PR comments are confirmed and
+addressed by the narrow changes described below. Current validation passed;
+earlier review validation above is historical evidence. Publish the verified
+repair commit to the existing PR branch and record thread-delivery evidence
+under `target/` without changing the earlier commits.
 
 ## Context and Orientation
 
@@ -262,6 +275,80 @@ it was discarded, and the exact renamed test produced the recorded count
 failure before the increment. Service-backed PostgreSQL and mounted E2E gates
 were not run for this follow-up; no native or remote proof is inferred.
 
+### PR 731 repair decisions and milestones
+
+The selected repository is `github.com/valandreev/studiofs-cli`, PR 731,
+`feature/sfs-759-make-raw-redb-namespace-add-and-remove-atomic-with-their` into
+`main`. Live GitHub review-thread inspection found the four attached comments
+unresolved and current. GitHub CLI PR commands explicitly use `--repo`; API
+commands, which do not accept that flag, use explicit owner/repository endpoints
+or GraphQL variables. Preserve existing commits and stage only this task's files.
+
+Comment 1 is confirmed: dropping a skipped `RedbWriteTransaction` releases its
+guards but does not record mutation latency. Use the existing explicit abort
+convention for absent conditional removal, mismatching conditional removal,
+and duplicate insertion. The real-engine metric regression failed with zero
+mutation samples versus one; after explicit aborts all three assertions pass.
+Do not introduce a global Drop accounting change or alter commit metrics.
+
+Comment 2 describes a reachable mounted VFS boundary. A dangling-child snapshot
+can become absent before the conditional heal, after the failed emptiness
+transaction released its namespace barrier. Preserve matched-removal accounting
+but let observed dead children request the existing bounded retry/settle path.
+Use deterministic test synchronization at that snapshot boundary, real redb
+mutations, and no scheduling sleep as race proof. A stable live replacement
+must still cause ENOTEMPTY, and failed healing must not introduce an unbounded
+retry loop.
+
+The regression removes the snapshotted binding and inode before the attribute
+batch using a one-shot test-only hook. It failed with `DirNotEmpty(2)` and now
+passes. The healing result reports observed missing children separately from
+actual removals; that observation enables the existing settle branch, whose
+80-attempt cap remains unchanged. A later live replacement observation again
+takes the immediate ENOTEMPTY branch.
+
+Comment 3 concerns storage-error diagnostics, unlike the earlier disproven
+claim that current backends return parent `InodeNotFound` from `readdir`.
+Use one small mapper at both orphan-directory readdir sites so actual errors
+include the directory inode and an absent-directory result remains benign.
+Exercise the pure error conversion directly; do not invent a parent-missing
+behavior in the real backend or build a whole metadata mock.
+
+The diagnostic test failed with a raw `FsckError::Meta(Storage(...))` before the
+mapper supplied `readdir failed for orphan dir 42` context. It now passes along
+with the existing five fsck tests. Missing-directory conversion is also covered
+directly without claiming a current backend produces it.
+
+Comment 4 is confirmed documentation overreach. Ordinary skipped healing
+invalidates cached dentry observations. The root platform-trash policy hides
+those names and intentionally inserts a negative entry even if no repair occurs.
+Document that exception without changing the product's hidden-root behavior.
+
+Run each focused regression with `RUSTFLAGS='-D warnings'`, followed by local
+redb namespace tests, affected VFS rmdir/healing tests and fsck tests. Finish with
+`cargo check -p studiofs-meta -p studiofs-vfs -p studiofs`,
+`cargo clippy -p studiofs-meta -p studiofs-vfs -p studiofs --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check`. Retain evidence under
+`target/sfs-759-pr731-*.log`. After all checks pass, update the PR branch and
+reply in the four original inline threads with concrete behavior and validation.
+
+Current PR repair validation, all with `RUSTFLAGS='-D warnings'` for Cargo
+test/check/Clippy commands:
+
+- `cargo test -p studiofs-meta --lib redb_engine::tests`: 308 passed, 1 ignored.
+- `cargo test -p studiofs-vfs --lib rmdir`: 8 passed, including the new race regression.
+- `cargo test -p studiofs-vfs --lib dangling`: 5 passed, including hidden root-trash policy; one test also appears in the rmdir filter.
+- `cargo test -p studiofs --bin studiofs cli::fsck::tests`: 6 passed.
+- The metric and rmdir regressions each ran alone and passed after their recorded RED failures.
+- Affected-package `cargo check` and all-targets Clippy with `-D warnings` passed.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+Independent final reviews found no actionable issue in the metadata, VFS, or
+fsck changes. GitHub still reported the selected baseline head `5da0de1e`
+before publication. The worktree contains only the six intended task files.
+No PostgreSQL service-backed, native mount, or Windows gate was run for this
+PR repair; local test and compile evidence does not imply those gates passed.
+
 ## Interfaces and Dependencies
 
 No dependency is added. The required capability is implemented by RedbMetaEngine,
@@ -276,3 +363,6 @@ Plan extended on 2026-10-01 for the second review: retain same-call replacement
 visibility, count skipped directories, and reclaim confirmed stale VFS state
 without discarding live inode state. Scope decisions avoid treating the external
 review's unsupported online-fsck assumptions as new product requirements.
+
+Plan extended for PR 731 on 2026-10-01 to track the four live attached threads,
+their targeted regression evidence, and delivery of the reviewed fixes.

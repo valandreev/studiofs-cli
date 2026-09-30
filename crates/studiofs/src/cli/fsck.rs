@@ -7,7 +7,7 @@ use std::path::Path;
 use clap::Args;
 use studiofs_meta::engine::UndoLogKind;
 use studiofs_meta::{
-    FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
+    DirEntry, FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
     open_meta_engine_with_options,
 };
 use thiserror::Error;
@@ -356,6 +356,19 @@ fn remove_orphan_file(
     Ok(())
 }
 
+fn orphan_directory_entries(
+    ino: u64,
+    entries: Result<Vec<DirEntry>, MetaError>,
+) -> FsckResult<Option<Vec<DirEntry>>> {
+    match entries {
+        Ok(entries) => Ok(Some(entries)),
+        Err(MetaError::InodeNotFound(_)) => Ok(None),
+        Err(err) => Err(FsckError::Message(format!(
+            "readdir failed for orphan dir {ino}: {err}"
+        ))),
+    }
+}
+
 fn repair_orphan_directory(
     meta: &dyn MetaEngine,
     ino: u64,
@@ -369,14 +382,8 @@ fn repair_orphan_directory(
         return Ok(());
     }
 
-    let entries = match meta.readdir(ino) {
-        Ok(entries) => entries,
-        Err(MetaError::InodeNotFound(_)) => return Ok(()),
-        Err(err) => {
-            return Err(FsckError::Message(format!(
-                "readdir failed for orphan dir {ino}: {err}"
-            )));
-        }
+    let Some(entries) = orphan_directory_entries(ino, meta.readdir(ino))? else {
+        return Ok(());
     };
     let mut has_unremoved_entries = false;
     for entry in entries {
@@ -445,9 +452,14 @@ fn repair_orphan_directory(
         }
     }
 
-    if has_unremoved_entries && !meta.readdir(ino)?.is_empty() {
-        *skipped_dir_orphans += 1;
-        return Ok(());
+    if has_unremoved_entries {
+        let Some(entries) = orphan_directory_entries(ino, meta.readdir(ino))? else {
+            return Ok(());
+        };
+        if !entries.is_empty() {
+            *skipped_dir_orphans += 1;
+            return Ok(());
+        }
     }
 
     match meta.remove_attr(ino) {
@@ -652,6 +664,25 @@ mod tests {
         let engine = RedbMetaEngine::open(&path).expect("open redb");
         engine.init_root(1000, 1000).expect("init root");
         TestEngine { engine, _dir: dir }
+    }
+
+    #[test]
+    fn orphan_directory_readdir_error_keeps_inode_context() {
+        let error =
+            match orphan_directory_entries(42, Err(MetaError::Storage("read failed".into()))) {
+                Err(FsckError::Message(error)) => error,
+                other => panic!("expected contextual fsck error, got {other:?}"),
+            };
+
+        assert_eq!(
+            error,
+            "readdir failed for orphan dir 42: storage error: read failed"
+        );
+        assert!(
+            orphan_directory_entries(42, Err(MetaError::InodeNotFound(42)))
+                .expect("missing orphan directory is benign")
+                .is_none()
+        );
     }
 
     #[test]

@@ -9,9 +9,11 @@ impl RedbMetaEngine {
     ) -> MetaResult<Option<DirEntryValue>> {
         let txn = self.begin_write_txn()?;
         let Some(entry) = Self::lookup_merged_in_write_txn(&txn, parent, name)? else {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
             return Ok(None);
         };
         if expected_ino.is_some_and(|ino| ino != entry.ino) {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
             return Ok(None);
         }
         Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
@@ -167,6 +169,7 @@ impl MetaNamespace for RedbMetaEngine {
     fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
         if Self::lookup_merged_in_write_txn(&txn, parent, name)?.is_some() {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
             return Err(MetaError::EntryExists {
                 parent,
                 name: String::from_utf8_lossy(name).into_owned(),

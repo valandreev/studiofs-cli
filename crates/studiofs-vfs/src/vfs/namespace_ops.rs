@@ -32,6 +32,11 @@ const DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES: usize = 1024 * 1024;
 const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
 const RMDIR_INFLIGHT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const RMDIR_CLEANUP_RETRY_ATTEMPTS: u16 = 200;
+#[cfg(test)]
+std::thread_local! {
+    static RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(not(target_os = "macos"))]
 fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
@@ -2236,11 +2241,16 @@ impl StudioVfs {
             .collect())
     }
 
-    fn heal_dangling_directory_children(&self, dir_ino: Ino) -> VfsResult<(usize, Vec<Ino>)> {
+    fn heal_dangling_directory_children(&self, dir_ino: Ino) -> VfsResult<(usize, Vec<Ino>, bool)> {
         let meta = self.sync_meta();
         let entries = meta.readdir(dir_ino)?;
         if entries.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), false));
+        }
+        #[cfg(test)]
+        if let Some(hook) = RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|hook| hook.borrow_mut().take())
+        {
+            hook();
         }
 
         let inflight_delete_inos = entries
@@ -2263,15 +2273,17 @@ impl StudioVfs {
         }
 
         let mut healed = 0;
+        let mut observed_missing_child = false;
         for entry in entries {
             if live_inos.contains(&entry.ino) {
                 continue;
             }
+            observed_missing_child = true;
             if self.heal_orphaned_dentry(dir_ino, &entry.name, entry.ino) {
                 healed += 1;
             }
         }
-        Ok((healed, inflight_delete_inos))
+        Ok((healed, inflight_delete_inos, observed_missing_child))
     }
 
     fn resolve_unlink_target(
@@ -2891,7 +2903,7 @@ impl StudioVfs {
                     let Some(removed_ino) = removed else {
                         return Err(VfsError::Meta(err));
                     };
-                    let (healed, child_delete_inos) =
+                    let (healed, child_delete_inos, observed_missing_child) =
                         self.heal_dangling_directory_children(removed_ino)?;
                     if healed > 0 {
                         debug!(ino = removed_ino, healed, "rmdir healed dangling children");
@@ -2915,7 +2927,9 @@ impl StudioVfs {
                         // metadata view a short settling window before
                         // returning ENOTEMPTY; a first, ordinary rmdir with
                         // no observed child mutation remains immediate.
-                        if retry_attempts == 0 || settle_attempts >= RMDIR_SETTLE_RETRY_ATTEMPTS {
+                        if (retry_attempts == 0 && !observed_missing_child)
+                            || settle_attempts >= RMDIR_SETTLE_RETRY_ATTEMPTS
+                        {
                             return Err(VfsError::Meta(err));
                         }
                         settle_attempts += 1;
@@ -3529,5 +3543,36 @@ mod tests {
                 .ino,
             replacement.ino
         );
+    }
+
+    #[test]
+    fn rmdir_retries_when_snapshotted_child_disappears_before_repair() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-scan-race-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-scan-race");
+        let parent = meta
+            .create_dir(ROOT_INO, b"parent", 0, 0, 0o755)
+            .expect("create parent directory");
+        let child = meta
+            .create_file(parent.ino, b"child", 0, 0, 0o644)
+            .expect("create child file");
+        let hook_meta = meta.clone();
+        RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                hook_meta
+                    .remove_entry(parent.ino, b"child")
+                    .expect("remove snapshotted child binding");
+                hook_meta
+                    .remove_attr(child.ino)
+                    .expect("remove snapshotted child inode");
+            }));
+        });
+
+        rt.block_on(vfs.rmdir_inner(ROOT_INO, b"parent"))
+            .expect("rmdir should retry after the snapshotted child disappears");
+        assert!(RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| slot.borrow().is_none()));
+        assert!(matches!(
+            meta.get_attr(parent.ino),
+            Err(MetaError::InodeNotFound(found)) if found == parent.ino
+        ));
     }
 }
