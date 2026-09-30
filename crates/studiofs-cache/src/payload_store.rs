@@ -1099,13 +1099,13 @@ impl FilePayloadStore {
             .unbuffered_read_attempts
             .fetch_add(1, Ordering::Relaxed);
 
-        #[cfg(windows)]
         let result = {
+            #[cfg(windows)]
             let mut scratch = self.shared.unbuffered_read_scratch.lock();
+            #[cfg(not(windows))]
+            let mut scratch = platform::UnbufferedReadBuffer::new();
             platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment)
         };
-        #[cfg(not(windows))]
-        let result = platform::pread(file, out, start);
         match result {
             Ok(read) => {
                 #[cfg(test)]
