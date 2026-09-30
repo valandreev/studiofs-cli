@@ -791,6 +791,24 @@ volume. The validation workload is:
 5. Repeat ordinary write/read and cold-read smoke checks after the run to verify
    the writeback and cold-read paths did not regress.
 
+### Payload read regression gate
+
+`.github/workflows/payload-read-regression.yml` automatically runs on PRs that
+touch `crates/studiofs-cache/**`, `crates/studiofs-test-support/**`, `Cargo.toml`,
+`Cargo.lock`, or the workflow itself. It also supports `workflow_dispatch`.
+The hosted macOS job runs only these two focused checks:
+
+```sh
+cargo test -p studiofs-cache --lib runtime::file_payload_store::tests::unbuffered_reads_through_clones_overlap_at_platform_read -- --exact --nocapture
+cargo test -p studiofs-cache --test payload_platform_api -- --nocapture
+```
+
+The overlap regression is macOS-only: it verifies two clone-backed reads enter
+the platform read boundary before either returns. This is its only automatic
+gate. The manually dispatched `rust.yml` macOS workspace tests also include it;
+Windows and Linux do not execute this macOS-specific regression. The downstream
+API test checks the public unbuffered-read interface and returned bytes.
+
 ### CI smoke workflow
 
 Smoke tests also run in the separate `.github/workflows/smoke.yml` workflow:

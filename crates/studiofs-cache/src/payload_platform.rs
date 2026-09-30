@@ -4,6 +4,16 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+#[cfg(all(test, target_os = "macos"))]
+std::thread_local! {
+    /// Holds clone-backed reads at the platform boundary for the concurrency regression.
+    /// Per-thread storage keeps unrelated payload tests independent.
+    pub(crate) static PREAD_TEST_GATE: std::cell::RefCell<Option<(
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(windows)]
 const WINDOWS_UNBUFFERED_WRITE_ALIGNMENT: usize = 4096;
 #[cfg(windows)]
@@ -56,6 +66,18 @@ pub fn open_read_only_unbuffered(path: &Path) -> io::Result<File> {
 ///
 /// Returns the number of bytes read, or `0` at EOF.
 pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(all(test, target_os = "macos"))]
+    PREAD_TEST_GATE.with(|gate| {
+        if let Some((entered, release)) = gate.borrow_mut().take() {
+            entered
+                .send(())
+                .expect("concurrent-read entry channel must remain open");
+            // Allow both 5-second entry waits to finish before the gate expires.
+            release
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("concurrent-read coordinator must release the platform read");
+        }
+    });
     let mut total = 0;
     while total < buf.len() {
         let total_offset = u64::try_from(total)
