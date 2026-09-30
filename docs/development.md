@@ -97,7 +97,7 @@ manifest/lockfile, or that workflow, and also supports manual dispatch.
 | **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; mounted libfuse3 release validation is required on Rocky 9.4+ |
 | **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
-| **Payload read regression** | `macos-latest` | Automatic focused concurrency regression and public unbuffered-read API test; commands in [tests.md](tests.md#payload-read-regression-gate) |
+| **Payload read regression** | `windows-latest`, `macos-latest` | Automatic Windows read-advice regression and cache Clippy; macOS concurrency regression and public unbuffered-read API test; commands in [tests.md](tests.md#payload-read-regression-gate) |
 
 macOS and Windows jobs include named steps for backend-specific crates so
 regressions in `studiofs-macfuse` or `studiofs-winfsp` are immediately

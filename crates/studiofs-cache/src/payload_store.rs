@@ -34,8 +34,6 @@ const READ_FD_CACHE_FAMILIES: usize = 2;
 const READ_FD_CACHE_RESERVED_MIN: usize = 256;
 const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
-#[cfg(windows)]
-const WINDOWS_ADVISE_WARMUP_CHUNK: usize = 256 * 1024;
 const FAST_BATCH_STAGING_MAX_CONCURRENCY: usize = 4;
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -304,8 +302,9 @@ impl FilePayloadStore {
     /// Hints that the payload for `object_id` will be read soon.
     ///
     /// On supported platforms, this may warm OS caches to reduce subsequent read latency.
+    /// Windows advice is a no-op and does not open or read the payload.
     pub fn advise_will_need(&self, object_id: u64) {
-        if self.read_mode == LocalPayloadReadMode::Unbuffered {
+        if cfg!(windows) || self.read_mode == LocalPayloadReadMode::Unbuffered {
             return;
         }
         let path = self.layout.payload_object_path(object_id);
@@ -326,36 +325,6 @@ impl FilePayloadStore {
                 error = ?error,
                 "local payload runtime payload advise_will_need failed"
             );
-        }
-        #[cfg(windows)]
-        self.warm_windows_read_cache(object_id, file.as_ref(), &path, len);
-    }
-
-    #[cfg(windows)]
-    fn warm_windows_read_cache(&self, object_id: u64, file: &File, path: &Path, len: u64) {
-        let mut scratch = vec![0_u8; WINDOWS_ADVISE_WARMUP_CHUNK];
-        let mut offset = 0_u64;
-        while offset < len {
-            let remaining = len.saturating_sub(offset);
-            let chunk_len = usize::try_from(remaining)
-                .unwrap_or(usize::MAX)
-                .min(scratch.len());
-            match platform::pread(file, &mut scratch[..chunk_len], offset) {
-                Ok(0) => break,
-                Ok(read) => {
-                    offset = offset.saturating_add(read as u64);
-                }
-                Err(error) => {
-                    warn!(
-                        object_id,
-                        path = %path.display(),
-                        offset,
-                        error = ?error,
-                        "local payload runtime payload Windows read-cache warmup failed"
-                    );
-                    break;
-                }
-            }
         }
     }
 
@@ -1850,6 +1819,49 @@ mod tests {
             assert_eq!(reads.unbuffered_read_attempts, 0);
             assert_eq!(reads.unbuffered_read_fallbacks, 1);
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_read_advice_does_not_read_large_payload_on_executor() {
+        use std::io::Seek;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_modes(
+            layout.clone(),
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::Buffered,
+            LocalPayloadReadMode::Buffered,
+        )
+        .unwrap();
+        store.put(748, b"payload").unwrap();
+        let path = layout.payload_object_path(748);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let file = store.cached_read_handle(748, &path).unwrap();
+        let mut cursor = file.as_ref();
+        assert_eq!(cursor.stream_position().unwrap(), 0);
+
+        store.advise_will_need(748);
+
+        // Windows seek_read moves the cursor to the end of each actual read.
+        assert_eq!(
+            cursor.stream_position().unwrap(),
+            0,
+            "read advice must not synchronously read payload bytes on the executor"
+        );
+        store.invalidate_cached_read_handle(748);
+        store.advise_will_need(748);
+        assert_eq!(
+            store.read_handle_stats().misses,
+            1,
+            "advice must not open a payload"
+        );
     }
 
     // macOS enables F_NOCACHE; other non-Windows platforms use buffered fallback.

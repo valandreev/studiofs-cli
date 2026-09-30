@@ -14,6 +14,22 @@ permissions:
   contents: read
 
 jobs:
+  windows-read-advice:
+    name: Windows payload read advice regression
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Read advice performs no payload I/O
+        run: cargo test -p studiofs-cache --lib runtime::file_payload_store::tests::windows_read_advice_does_not_read_large_payload_on_executor -- --exact --nocapture
+      - name: Cache crate Clippy
+        run: cargo clippy -p studiofs-cache --all-targets -- -D warnings
+
   macos-payload-read:
     name: macOS payload read regression
     runs-on: macos-latest
