@@ -164,6 +164,7 @@ impl PgMetaEngine {
                             engine.checkpoint_coordinator_state.request();
                             retry_pending = true;
                         }
+                        Err(MetaError::WorkerShutdownCancelled) => break,
                         Err(error) => {
                             warn!(
                                 error = %error,
@@ -375,9 +376,7 @@ impl PgMetaEngine {
             .poll_shutdown_ref()
             .load(Ordering::Acquire)
         {
-            return Err(MetaError::Storage(
-                "postgres checkpoint cancelled during metadata close".to_string(),
-            ));
+            return Err(MetaError::WorkerShutdownCancelled);
         }
         if Instant::now() >= deadline {
             return Err(MetaError::Timeout(
@@ -641,6 +640,20 @@ fn should_wait_for_checkpoint_wakeup(wakeup_set: bool, retry_pending: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_local_shutdown_is_classified_as_cancelled() {
+        let (_dir, engine) = crate::pg_engine::tests::temp_pg_engine_for_unit();
+        engine.background_workers.signal_stop();
+
+        let error = engine
+            .check_checkpoint_step(Instant::now() + Duration::from_secs(1))
+            .expect_err("shutdown must cancel local checkpoint work");
+        assert_eq!(
+            crate::engine::PgSyncFailure::from_error(&error),
+            crate::engine::PgSyncFailure::Cancelled
+        );
+    }
 
     #[test]
     fn checkpoint_local_lock_wait_respects_deadline() {

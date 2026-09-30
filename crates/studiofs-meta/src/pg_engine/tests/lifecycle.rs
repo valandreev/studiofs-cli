@@ -337,6 +337,49 @@ fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
 }
 
 #[test]
+fn checkpoint_worker_shutdown_cancellation_preserves_remote_validation() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .metadata_source_connected
+        .store(false, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_transport_unavailable
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine.background_workers.signal_stop();
+
+    let result = {
+        let _scope = super::super::runtime::WorkerRemoteCancellationScope::enter();
+        engine.run_async(std::future::pending::<MetaResult<()>>())
+    };
+    let _ = engine.record_remote_operation_result(result);
+
+    let diagnostics = engine.pg_sync_diagnostics();
+    assert_eq!(diagnostics.last_sync_error, Some(PgSyncFailure::Cancelled));
+    assert!(
+        engine
+            .remote_format_validated
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(
+        engine
+            .remote_identity_validated
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(!diagnostics.source_connected);
+    assert!(
+        engine
+            .remote_transport_unavailable
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+}
+
+#[test]
 fn pg_sync_success_clears_rebootstrap_requirement() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine.record_pg_sync_failure(&MetaError::ReplayGap {

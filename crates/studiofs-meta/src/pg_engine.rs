@@ -1378,6 +1378,11 @@ impl PgMetaEngine {
     }
 
     fn record_remote_operation_result<T>(&self, result: MetaResult<T>) -> MetaResult<T> {
+        // Cancellation supplies no new evidence about remote reachability or identity.
+        if let Err(error @ MetaError::WorkerShutdownCancelled) = &result {
+            self.record_pg_sync_failure(error);
+            return result;
+        }
         self.record_metadata_source_result(&result);
         match &result {
             Ok(_) => self

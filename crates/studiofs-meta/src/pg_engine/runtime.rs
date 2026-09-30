@@ -539,9 +539,7 @@ impl PgMetaEngine {
             };
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => Err(MetaError::Storage(
-                    "postgres operation cancelled during metadata close".to_string(),
-                )),
+                () = cancel.cancelled() => Err(MetaError::WorkerShutdownCancelled),
                 result = fut => result,
             }
         };
@@ -625,7 +623,7 @@ mod tests {
             "cancellation should stop the pending worker: {close_result:?}"
         );
         assert!(
-            remote_result.is_err(),
+            matches!(remote_result, Err(MetaError::WorkerShutdownCancelled)),
             "the pending remote step must be cancelled before release"
         );
     }

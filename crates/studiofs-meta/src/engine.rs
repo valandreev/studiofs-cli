@@ -334,6 +334,10 @@ pub enum MetaError {
     #[error("postgres metadata catch-up cancelled")]
     CatchUpCancelled,
 
+    /// A background worker operation was cancelled during metadata close.
+    #[error("postgres worker operation cancelled during metadata close")]
+    WorkerShutdownCancelled,
+
     /// A local replay page exceeded its deadline before its transaction was committed.
     #[error("postgres metadata catch-up deadline exceeded")]
     CatchUpDeadlineExceeded,
@@ -801,7 +805,7 @@ pub enum PgSyncFailure {
     RemoteUnavailable,
     /// A bounded synchronization operation exceeded its deadline.
     Timeout,
-    /// A catch-up page was cancelled before its transaction was committed.
+    /// A catch-up page or background worker operation was cancelled.
     Cancelled,
     /// The local cursor fell behind the retained remote event history.
     ReplayGap {
@@ -868,7 +872,7 @@ impl PgSyncFailure {
             MetaError::RemoteUnavailable(_) => Self::RemoteUnavailable,
             MetaError::Timeout(_) => Self::Timeout,
             MetaError::CatchUpDeadlineExceeded => Self::Timeout,
-            MetaError::CatchUpCancelled => Self::Cancelled,
+            MetaError::CatchUpCancelled | MetaError::WorkerShutdownCancelled => Self::Cancelled,
             MetaError::ReplayGap {
                 local_version,
                 first_available_version,

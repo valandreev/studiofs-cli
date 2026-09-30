@@ -61,6 +61,12 @@ lock waits and local export, projection, encoding, and hashing check shutdown
 and the configured command timeout cooperatively. Cancellation may leave a
 checkpoint lease to expire; its fencing token still protects publication.
 
+Planned worker shutdown returns `MetaError::WorkerShutdownCancelled`. Remote
+operation diagnostics classify it as `PgSyncFailure::Cancelled` and preserve
+remote identity/format validation and prior reachability observations; it is
+not a storage or reachability fault.
+`CatchUpCancelled` retains its separate replay-page cancellation contract.
+
 Early engine destruction and failed worker registration transfer retained
 handles to a cleanup thread that joins them through exit. Destruction from the
 worker holding the final engine reference must not self-join. This cleanup
