@@ -74,13 +74,13 @@ cache-specific `CachePolicy` hooks.
 
 On backend startup, reconciliation runs before serving reads/writes:
 
-1. Default (`lightweight`) mode replays single and batch put intents, removing
-   final payload files only when the put never reached the index. It also
+1. Default (`lightweight`) mode replays single/batch put and removal intents,
+   removing final payload files only when their index row is absent. It also
    removes orphan temp files under `tmp/**` and prunes dirty/uploading index rows that
    point to missing payload files. Indexed payloads and their upload-stage
    hardlinks survive regardless of upload lifecycle state.
 2. Lightweight mode removes unindexed final payloads only at paths named by
-   put intents. Optional full sweep
+   put or removal intents. Optional full sweep
    (`STUDIOFS_LOCAL_PAYLOAD_STARTUP_RECONCILE_MODE=full`) additionally removes
    stale index rows and scans for orphan payload files, including historical
    orphans without a put intent.
@@ -122,6 +122,20 @@ and intent; startup uses the index to preserve committed data and remove
 unindexed outputs. Failed intent creation removes uncommitted staged files.
 The startup report counts final orphan files removed by intent replay in both
 Lightweight and Full modes, and the repair log includes resolved intent count.
+
+Single removal, batch removal and eviction persist a final-path intent before
+removing index rows. Intent creation failure leaves the index, files and runtime
+pins intact. Index errors leave files and runtime pins untouched and retain the
+intent: a redb commit error may arrive after the index changes became durable.
+Startup checks actual index ownership before removing any file.
+After successful index removal, unlink errors propagate to
+the caller and retain the intent; the index no longer advertises those payloads.
+Batch cleanup attempts every unlink and returns the first error. NotFound is
+idempotent, including for a never-created payload shard. Durable mode syncs the
+intent before index removal and each touched payload directory before retiring
+it; Fast mode adds no sync barriers. Failed directory barriers also retain the
+intent. Callers can retry removal immediately, and lightweight startup retires
+outstanding markers while preserving any payload that has since been reindexed.
 
 Recovery is deliberately bounded by the local durability boundary. Bytes that
 only lived in writer memory before `flush`, `fsync`, close/release, or another
