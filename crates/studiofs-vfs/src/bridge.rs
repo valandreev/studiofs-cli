@@ -333,6 +333,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn payload_store_io_conversion_preserves_bridge_error_kinds() {
+        for (kind, expected) in [
+            (ErrorKind::Other, BridgeVfsErrorKind::GenericFailure),
+            (
+                ErrorKind::PermissionDenied,
+                BridgeVfsErrorKind::PermissionDenied,
+            ),
+            (ErrorKind::StorageFull, BridgeVfsErrorKind::StorageFull),
+        ] {
+            let backend_error =
+                LocalPayloadBackendError::from(studiofs_cache::runtime::FilePayloadStoreError::Io(
+                    std::io::Error::new(kind, "payload operation context"),
+                ));
+            assert!(
+                backend_error
+                    .to_string()
+                    .contains("payload operation context")
+            );
+            let error = crate::VfsError::LocalPayload(backend_error);
+            assert_eq!(classify_vfs_error(&error), expected);
+            let mut source: &(dyn std::error::Error + 'static) = &error;
+            while source.downcast_ref::<std::io::Error>().is_none() {
+                source = source.source().expect("I/O source must survive conversion");
+            }
+            assert_eq!(
+                source.downcast_ref::<std::io::Error>().unwrap().kind(),
+                kind
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn storage_full_native_windows_errors_are_classified() {

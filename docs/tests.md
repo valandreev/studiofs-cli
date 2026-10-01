@@ -261,6 +261,50 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-753 Single-put Crash Recovery
+
+The cache regression stops the real single-put path after payload file commit
+and before index commit, then reopens the backend in default Lightweight mode.
+It checks three crash/restart cycles in both Durable and Fast modes, removes
+the incomplete puts, and preserves indexed files and pending uploads. The
+startup intent regression also preserves pending/in-flight upload-stage links.
+Interrupted intent-marker creation is covered by temporary-marker cleanup.
+These checks need no services or live mount:
+
+```powershell
+cargo test -p studiofs-cache --lib sfs753_single_put_crash_recovery_is_lightweight_and_repeatable -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_failed_index_put_clears_intent_after_payload_rollback -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_failed_index_batch_clears_intent_after_payload_rollback -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_failed_repeat_put_preserves_indexed_pending_payload -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_failed_payload_removal_retains_intent_and_reports_error -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_failed_intent_write_removes_uncommitted_staged_payloads -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_directory_barrier_failure_retains_indexed_payload_and_intent -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_concurrent_same_id_put_rollback_keeps_indexed_payload -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_payload_mutation_batch_gates_are_unique_and_allow_other_stripes -- --nocapture
+cargo test -p studiofs-cache --lib startup_reconcile_batch_intent_preserves_payloads_that_reached_index -- --nocapture
+cargo test -p studiofs-cache --lib startup_reconcile_lightweight_removes_incomplete_intent_temp_files -- --nocapture
+cargo test -p studiofs-cache --lib startup_reconcile_lightweight_resolves_incomplete_batch_payload_intent -- --nocapture
+cargo test -p studiofs-cache --lib startup_reconcile_full_removes_orphan_payload_files -- --nocapture
+cargo test -p studiofs-cache --lib materialize_inflight_completion_saturates_at_zero -- --nocapture
+cargo test -p studiofs-cache --lib blocking_task_guards_retire_active_counts_on_drop -- --nocapture
+cargo test -p studiofs-vfs --lib payload_store_io_conversion_preserves_bridge_error_kinds -- --nocapture
+```
+
+The crash regression selects Lightweight explicitly, so an externally configured
+Full startup mode cannot turn its recovery assertions into a global sweep.
+The rollback checks cover single and batch index errors, indexed pending
+payload preservation, Durable deletion barriers, and retained intents when
+payload removal fails. Additional checks cover staged-file cleanup when intent
+creation fails, typed permission errors and retained indexed bytes after a
+directory-barrier failure, and conflicting single/batch same-ID retries at the
+rollback boundary. Recovery accounting includes intent orphans and historical
+orphans once each, and repeat recovery is clean.
+The VFS conversion check pins generic I/O, permission and disk-full categories
+while retaining the underlying I/O source and its operation context.
+
+Fast-mode coverage demonstrates process interruption recovery with surviving
+OS-cached files; it does not establish power-loss durability.
+
 ## Contract/Core Harness
 
 Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,

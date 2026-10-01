@@ -74,16 +74,54 @@ cache-specific `CachePolicy` hooks.
 
 On backend startup, reconciliation runs before serving reads/writes:
 
-1. Default (`lightweight`) mode removes orphan temp files under `tmp/**`
-   and prunes dirty/uploading index rows that point to missing payload files.
-2. Optional full sweep (`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`)
-   additionally removes stale index rows and orphan payload files.
+1. Default (`lightweight`) mode replays single and batch put intents, removing
+   final payload files only when the put never reached the index. It also
+   removes orphan temp files under `tmp/**` and prunes dirty/uploading index rows that
+   point to missing payload files. Indexed payloads and their upload-stage
+   hardlinks survive regardless of upload lifecycle state.
+2. Lightweight mode removes unindexed final payloads only at paths named by
+   put intents. Optional full sweep
+   (`STUDIOFS_LOCAL_PAYLOAD_STARTUP_RECONCILE_MODE=full`) additionally removes
+   stale index rows and scans for orphan payload files, including historical
+   orphans without a put intent.
 3. VFS startup replay scans local metadata and durable local payload state,
    restores upload-stage links for live unpublished objects, and rebuilds the
    runtime pending-upload queue.
 
 Reconciliation is scoped to the runtime root and does not mutate unrelated
 files under `<cache-root>`.
+Fast cache mode retains its existing no-fsync guarantees.
+
+The put-intent directory is created once when the payload store opens and must
+remain present while the backend is open; Durable mode syncs its parent before
+writes begin. On the successful same-device path, a
+Durable put syncs the payload temp file and the intent temp file, with three
+directory barriers for the intent, source temp, and destination payload
+directories. The `durable_mode_keeps_per_put_sync_barriers` regression measures these barrier
+calls; on Windows, directory barriers are intentionally no-ops. Fast mode writes
+the intent without adding file or directory syncs. A failed index commit retires
+its intent only after confirming payload removal; a Durable single-put rollback
+adds a fourth directory barrier to persist deletion first. Batch rollback adds
+one barrier per distinct touched payload shard, including when another unlink
+fails; any error retains the intent. These operation counts do not establish mounted
+throughput or wall-clock cost.
+
+Single and batch index failures share this rollback path. Payloads with an
+existing index row are retained; only unindexed outputs are removed. Failed
+index checks, payload removal, or directory barriers retain the intent for
+startup recovery and produce a rollback warning. Object IDs identify immutable
+content: retrying or rehydrating the same bytes may reuse an ID, while changed
+content requires a fresh ID.
+Runtime mutation gates serialize conflicting puts, rollback, deletion and
+upload/pin transitions. Batches acquire unique gates in stable order, budget
+admission precedes publication gates, and eviction rechecks eligibility while
+holding the gate. The fixed 64 gates bound memory; colliding IDs may serialize.
+
+Single and batch store errors after payload rename retain the committed files
+and intent; startup uses the index to preserve committed data and remove
+unindexed outputs. Failed intent creation removes uncommitted staged files.
+The startup report counts final orphan files removed by intent replay in both
+Lightweight and Full modes, and the repair log includes resolved intent count.
 
 Recovery is deliberately bounded by the local durability boundary. Bytes that
 only lived in writer memory before `flush`, `fsync`, close/release, or another

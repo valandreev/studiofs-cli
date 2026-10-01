@@ -80,9 +80,14 @@ On backend startup, reconciliation runs before normal reads and writes.
 
 Default startup mode (`lightweight`):
 
-1. Remove orphan temp files from `tmp/**`.
-2. Scan dirty/uploading index rows and prune rows whose payload files are
+1. Replay single and batch put intents: remove final payload files only when
+   the put never reached the index, and retain payloads that already have an
+   index row.
+2. Remove orphan temp files from `tmp/**`.
+3. Scan dirty/uploading index rows and prune rows whose payload files are
    missing.
+4. Leave historical payload files without an index row or put intent for the
+   optional full sweep to find.
 
 Optional full sweep mode (`full`), enabled via
 `STUDIOFS_LOCAL_PAYLOAD_STARTUP_RECONCILE_MODE=full`:
@@ -94,6 +99,7 @@ Optional full sweep mode (`full`), enabled via
 Safety rules:
 - Reconciliation is scoped to runtime files under `<cache-root>/**`.
 - Reconciliation must not mutate unrelated files under `<cache-root>`.
+- Fast cache mode retains its existing no-fsync guarantees.
 - Any unrecoverable reconciliation failure aborts backend startup rather than
   proceeding with ambiguous state.
 - Writer bytes accepted only in process memory before a local durability
@@ -110,6 +116,10 @@ Safety rules:
   metadata publish/finalization path resumes. Delete-before-publish tombstones
   keep unpublished versions local and defer cleanup of already uploaded
   objects.
+- Lightweight intent replay preserves indexed payloads in every lifecycle
+  state, including downloaded payloads and pending or in-flight uploads, along
+  with their upload-stage hardlinks. Full mode is required to find historical
+  orphan payload files that have no durable put intent.
 - Startup status surfaces replay and cleanup explicitly through the zero-IO
   diagnostics snapshot: `replayed_bytes`, `queued_uploads`,
   `discarded_memory_only_bytes`, `orphan_dirty_payloads_removed`, and
