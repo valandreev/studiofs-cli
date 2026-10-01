@@ -1,5 +1,3 @@
-//! Integration coverage for the public unbuffered payload read API.
-
 use studiofs_cache::runtime::platform::{
     UnbufferedReadBuffer, open_read_only_unbuffered, read_unbuffered_with_buffer,
     unbuffered_read_alignment_for_path,
