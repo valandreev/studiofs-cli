@@ -788,7 +788,12 @@ mod tests {
 
     #[test]
     fn event_decoders_reject_invalid_slice_ranges_in_both_wire_formats() {
-        for (start, end) in [(0, 0), (2, 1), (0, crate::schema::DEFAULT_CHUNK_SIZE + 1)] {
+        for (start, end, valid) in [
+            (3, 4, true),
+            (0, 0, false),
+            (2, 1, false),
+            (0, crate::schema::DEFAULT_CHUNK_SIZE + 1, false),
+        ] {
             for (is_base, legacy_ordinal) in [(false, 6_u32), (true, 7_u32)] {
                 let chunk_slices = vec![(
                     ChunkId(3),
@@ -802,23 +807,53 @@ mod tests {
                 let event = if is_base {
                     MetaEvent::PublishRegularFileBaseSlices {
                         ino: 20,
-                        chunk_slices: chunk_slices.clone(),
+                        chunk_slices,
                     }
                 } else {
                     MetaEvent::SetRegularFileOverlaySlices {
                         ino: 20,
-                        chunk_slices: chunk_slices.clone(),
+                        chunk_slices,
                     }
                 };
-                let versioned = encode_event(&event).expect("encode versioned event");
-                let legacy = postcard::to_stdvec(&(legacy_ordinal, (20_u64, chunk_slices)))
-                    .expect("encode legacy event");
+                // Historical bytes bypass today's validating SliceRange serializer.
+                let raw_chunks = vec![(
+                    ChunkId(3),
+                    vec![(
+                        SliceId(4),
+                        SliceOrder(5),
+                        (start, end),
+                        Some(PayloadRef::new_partial(8, 1)),
+                        crate::schema::PayloadRefState::LocalOnly,
+                    )],
+                )];
+                let tag = if is_base {
+                    TAG_PUBLISH_REGULAR_FILE_BASE_SLICES
+                } else {
+                    TAG_SET_REGULAR_FILE_OVERLAY_SLICES
+                };
+                let versioned = encode_event_envelope(tag, &(20_u64, &raw_chunks))
+                    .expect("historical envelope");
+                let legacy = postcard::to_stdvec(&(legacy_ordinal, (20_u64, &raw_chunks)))
+                    .expect("historical legacy event");
+                if valid {
+                    assert_eq!(encode_event(&event).unwrap(), versioned);
+                } else {
+                    assert!(matches!(
+                        encode_event(&event),
+                        Err(MetaError::Serialization(_))
+                    ));
+                }
 
                 for bytes in [&versioned, &legacy] {
-                    assert!(
-                        matches!(decode_event(bytes), Err(MetaError::Serialization(_))),
-                        "invalid range [{start}, {end}) must fail as persisted corruption"
-                    );
+                    if valid {
+                        let decoded = decode_event(bytes).expect("decode valid slice event");
+                        assert_eq!(format!("{decoded:?}"), format!("{event:?}"));
+                    } else {
+                        assert!(
+                            matches!(decode_event(bytes), Err(MetaError::Serialization(_))),
+                            "invalid range [{start}, {end}) must fail as persisted corruption"
+                        );
+                    }
                 }
             }
         }

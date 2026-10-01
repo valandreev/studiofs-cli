@@ -444,6 +444,48 @@ fn pg_foreign_event_batch_rejects_mixed_client_identities() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_foreign_event_decode_error_identifies_the_event_log_row() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-foreign-event-decode-error");
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let connection_task = tokio::spawn(connection);
+        let payload = [0xff_u8, 0x00];
+        client
+            .execute(
+                "INSERT INTO event_log \
+                 (vol, batch_version, event_type, event_payload, client_id) \
+                 VALUES ($1, 1, 'remove_attr', $2, 'remote-client')",
+                &[&volume.volume_id, &&payload[..]],
+            )
+            .await
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+
+        let page =
+            PgMetaEngine::query_foreign_event_page(&client, volume.volume_id, 0, 1, 8, 1_000)
+                .await?;
+        let seq_id: i64 = page.rows[0].get("seq_id");
+        let error = super::RemoteApplyCoordinator::decode_foreign_batch(&page.rows, 0, "local")
+            .expect_err("corrupt event payload must fail closed");
+        assert!(matches!(&error, crate::engine::MetaError::Serialization(_)));
+        let message = error.to_string();
+        assert!(message.contains(&format!("seq_id={seq_id}")), "{message}");
+        assert!(message.contains("batch_version=1"), "{message}");
+        assert!(message.contains("event_type=remove_attr"), "{message}");
+        assert!(!message.contains("remote-client"), "{message}");
+
+        connection_task.abort();
+        let _ = connection_task.await;
+        Ok::<(), crate::engine::MetaError>(())
+    })
+    .expect("foreign event decode error must identify its row");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_producer_splits_projected_batch_before_assigning_versions() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let _bytes = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "128");

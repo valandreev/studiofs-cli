@@ -1351,6 +1351,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     "postgres event_log batch contains mixed client identities".to_string(),
                 ));
             }
+            let seq_id: i64 = rows[idx].try_get("seq_id").map_err(|error| {
+                MetaError::Storage(format!(
+                    "postgres foreign event seq_id decode failed: {error}"
+                ))
+            })?;
             let event_type: &str = rows[idx].try_get("event_type").map_err(|error| {
                 MetaError::Storage(format!(
                     "postgres foreign event event_type decode failed: {error}"
@@ -1361,7 +1366,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     "postgres foreign event event_payload decode failed: {error}"
                 ))
             })?;
-            let event = decode_event_with_type(event_type, payload)?;
+            let event = decode_event_with_type(event_type, payload).map_err(|error| {
+                MetaError::Serialization(format!(
+                    "postgres event_log decode failed (seq_id={seq_id}, batch_version={row_batch_version}, event_type={event_type}): {error}"
+                ))
+            })?;
             batch_events.push(event);
             idx += 1;
         }

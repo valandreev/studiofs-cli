@@ -1659,8 +1659,127 @@ fn test_backfill_pending_regular_file_recovery_preserves_existing_record() {
 }
 
 #[test]
-fn invalid_persisted_slice_ranges_fail_after_redb_reopen() {
+fn flush_rejects_invalid_slice_ranges_without_committing() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"invalid-slice-flush.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut changed_attr = attr.clone();
+    changed_attr.size = 4096;
+    changed_attr.content_epoch += 1;
+    let before = engine.begin_read_txn().unwrap();
+    let counters = before.open_table(COUNTERS_TABLE).unwrap();
+    let next_event_seq = counters.get("nextEventSeq").unwrap().unwrap().value();
+
     for (start, end) in [(0, 0), (2, 1), (0, DEFAULT_CHUNK_SIZE + 1)] {
+        let slices = vec![SliceRecord::new(
+            SliceId::default(),
+            SliceOrder::default(),
+            SliceRange { start, end },
+            PayloadRef::new_partial(3001, 1),
+        )];
+        let error = engine
+            .flush_regular_file_overlay_slices_with_attr(
+                attr.ino,
+                &[
+                    (
+                        ChunkId(0),
+                        vec![SliceRecord::tombstone(
+                            SliceId::default(),
+                            SliceOrder::default(),
+                            SliceRange::new(3, 4).unwrap(),
+                        )],
+                    ),
+                    (ChunkId(1), slices),
+                ],
+                Some(&changed_attr),
+            )
+            .expect_err("invalid range must fail before committing metadata");
+        assert!(matches!(error, MetaError::Serialization(_)), "{error}");
+        assert_eq!(engine.get_attr(attr.ino).unwrap(), attr);
+        let after = engine.begin_read_txn().unwrap();
+        assert!(
+            !RedbMetaEngine::has_regular_file_chunk_rows_in_read_txn(
+                &after,
+                REGULAR_FILE_OVERLAY_TABLE,
+                attr.ino,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            after
+                .open_table(COUNTERS_TABLE)
+                .unwrap()
+                .get("nextEventSeq")
+                .unwrap()
+                .unwrap()
+                .value(),
+            next_event_seq,
+        );
+        assert!(
+            after
+                .open_table(EVENT_LOG_TABLE)
+                .unwrap()
+                .get(next_event_seq)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn replica_apply_rejects_invalid_slice_ranges_without_committing() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"invalid-slice-apply.bin", 1000, 1000, 0o644)
+        .unwrap();
+    for (start, end) in [(0, 0), (2, 1), (0, DEFAULT_CHUNK_SIZE + 1)] {
+        let event = MetaEvent::PublishRegularFileBaseSlices {
+            ino: attr.ino,
+            chunk_slices: vec![
+                (
+                    ChunkId(0),
+                    vec![SliceRecord::tombstone(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange::new(3, 4).unwrap(),
+                    )],
+                ),
+                (
+                    ChunkId(1),
+                    vec![SliceRecord::new(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange { start, end },
+                        PayloadRef::new_partial(3001, 1),
+                    )],
+                ),
+            ],
+        };
+        let error = engine
+            .apply_replica_events_to_base(std::slice::from_ref(&event))
+            .expect_err("invalid range must fail before committing replica metadata");
+        assert!(matches!(error, MetaError::Serialization(_)), "{error}");
+        let txn = engine.begin_read_txn().unwrap();
+        assert!(
+            !RedbMetaEngine::has_regular_file_chunk_rows_in_read_txn(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                attr.ino,
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn invalid_persisted_slice_ranges_fail_after_redb_reopen() {
+    for (start, end, valid) in [
+        (0, 1, true),
+        (0, 0, false),
+        (2, 1, false),
+        (0, DEFAULT_CHUNK_SIZE + 1, false),
+    ] {
         for table_def in [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE] {
             let dir = studiofs_test_support::workspace_target_tempdir("invalid-slice-range-");
             let path = dir.path().join("meta.redb");
@@ -1671,14 +1790,34 @@ fn invalid_persisted_slice_ranges_fail_after_redb_reopen() {
                     .set_format_info(&test_format_info("invalid-slice-range"))
                     .unwrap();
 
-                let mut chunk = RegularFileChunkState::default();
-                chunk.insert_slice(SliceRecord::new(
+                // Historical field order bypasses today's validating range serializer.
+                let slices = BTreeMap::from([(
                     SliceId(1),
-                    SliceOrder(1),
-                    SliceRange { start, end },
-                    PayloadRef::new_partial(3001, 1),
-                ));
-                let bytes = encode(&chunk).unwrap();
+                    (
+                        SliceId(1),
+                        SliceOrder(1),
+                        (start, end),
+                        Some(PayloadRef::new_partial(3001, 1)),
+                        PayloadRefState::LocalOnly,
+                    ),
+                )]);
+                let bytes = encode(&(
+                    SliceId::default(),
+                    SliceOrder::default(),
+                    slices,
+                    ChunkFragmentationCounters::default(),
+                ))
+                .unwrap();
+                if valid {
+                    let mut chunk = RegularFileChunkState::default();
+                    chunk.insert_slice(SliceRecord::new(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange::new(start, end).unwrap(),
+                        PayloadRef::new_partial(3001, 1),
+                    ));
+                    assert_eq!(encode(&chunk).unwrap(), bytes);
+                }
                 let key = encode_regular_file_chunk_key(42, ChunkId(0));
                 let txn = engine.begin_write_txn().unwrap();
                 txn.open_table(table_def)
@@ -1689,9 +1828,15 @@ fn invalid_persisted_slice_ranges_fail_after_redb_reopen() {
             }
 
             let reopened = RedbMetaEngine::open(&path).unwrap();
-            let error = reopened
-                .lookup_regular_file_slices(42, 0, 1)
-                .expect_err("invalid persisted range must fail before read planning");
+            let result = reopened.lookup_regular_file_slices(42, 0, 1);
+            if valid {
+                assert!(
+                    result.is_ok(),
+                    "valid historical row must remain readable: {result:?}"
+                );
+                continue;
+            }
+            let error = result.expect_err("invalid persisted range must fail before read planning");
             assert!(
                 matches!(error, MetaError::Serialization(_)),
                 "invalid range [{start}, {end}) should be a typed corruption error: {error}"

@@ -667,15 +667,35 @@ pub struct SliceOrder(pub u64);
 /// Chunk-relative byte range for one slice.
 ///
 /// Ranges are half-open: `[start, end)`. Use [`Self::new`] to validate bounds;
-/// deserialization rejects empty, reversed, and out-of-chunk ranges.
-/// Construction and deserialization both use the fixed [`DEFAULT_CHUNK_SIZE`].
+/// serialization and deserialization reject empty, reversed, and out-of-chunk ranges.
+/// Construction and persistence both use the fixed [`DEFAULT_CHUNK_SIZE`].
 /// Public fields still permit unchecked in-memory construction and mutation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SliceRange {
     /// Inclusive chunk-relative start offset.
     pub start: u32,
     /// Exclusive chunk-relative end offset.
     pub end: u32,
+}
+
+impl Serialize for SliceRange {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        if Self::new(self.start, self.end).is_none() {
+            return Err(serde::ser::Error::custom(format_args!(
+                "invalid slice range [{}, {}): expected start < end <= {DEFAULT_CHUNK_SIZE}",
+                self.start, self.end
+            )));
+        }
+        let mut fields = serializer.serialize_struct("SliceRange", 2)?;
+        fields.serialize_field("start", &self.start)?;
+        fields.serialize_field("end", &self.end)?;
+        fields.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for SliceRange {
@@ -1989,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_range_deserialization_rejects_invalid_bounds() {
+    fn slice_range_serde_rejects_invalid_bounds() {
         for (start, end) in [
             (0, 0),
             (5, 5),
@@ -2002,6 +2022,9 @@ mod tests {
             (u32::MAX - 1, u32::MAX),
             (u32::MAX, u32::MAX),
         ] {
+            let range = SliceRange { start, end };
+            assert!(serde_json::to_string(&range).is_err());
+            assert!(postcard::to_stdvec(&range).is_err());
             let json = format!("{{\"start\":{start},\"end\":{end}}}");
             let error = serde_json::from_str::<SliceRange>(&json)
                 .expect_err("invalid JSON range must be rejected");

@@ -258,6 +258,15 @@ committed locally must never be replayed in a way that loses later local
 authority. A newly published event after the frozen target belongs to a later
 sync operation; the current operation must not chase a moving remote head.
 
+An event row that cannot be decoded fails the fetched page before apply, so the
+local replay cursor remains unchanged. Unchanged retained history will fail again;
+a cursor below the pruning floor follows normal rebootstrap handling.
+Diagnostics identify the row's `seq_id`, `batch_version`, and `event_type`
+without including the payload or client identity. Recovering from such corruption
+requires an explicit operator decision about repairing authoritative history or
+selecting a known-valid checkpoint. Replay must not skip or quarantine the row
+while advancing the contiguous cursor.
+
 The implementation may schedule later bounded catch-up attempts, but it must
 not turn those attempts into an unbounded mount-start wait. Every retry has a
 typed failure outcome and an observable next-resume position.
