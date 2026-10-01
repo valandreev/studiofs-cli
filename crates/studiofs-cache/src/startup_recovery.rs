@@ -91,6 +91,7 @@ pub enum LocalPayloadStartupReconcileError {
 /// Reconcile startup state for the current local payload object runtime.
 ///
 /// `Lightweight` mode:
+/// - replay put intents, removing final payloads only when no index row exists;
 /// - delete orphan temp files under `tmp/**`;
 /// - prune dirty/uploading index entries that reference missing payload files.
 ///
@@ -122,7 +123,8 @@ pub fn reconcile_startup_state(
             .saturating_add(additional_temp_files_removed)
             .saturating_add(batch_recovery.temp_files_removed),
         stale_index_entries_removed,
-        orphan_payload_files_removed,
+        orphan_payload_files_removed: orphan_payload_files_removed
+            .saturating_add(batch_recovery.orphan_payload_files_removed),
         batch_intents_resolved: batch_recovery.intents_resolved,
     })
 }
@@ -131,6 +133,7 @@ pub fn reconcile_startup_state(
 struct BatchIntentRecoveryReport {
     intents_resolved: u64,
     temp_files_removed: u64,
+    orphan_payload_files_removed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -169,8 +172,10 @@ fn recover_batch_payload_intents(
         for object in &intent.objects {
             if index.get_entry(object.object_id)?.is_none()
                 && let Some(final_path) = &object.final_path
+                && remove_file_if_present(final_path)?
             {
-                let _ = remove_file_if_present(final_path)?;
+                report.orphan_payload_files_removed =
+                    report.orphan_payload_files_removed.saturating_add(1);
             }
             if let Some(temp_path) = &object.temp
                 && remove_file_if_present(temp_path)?
@@ -599,9 +604,15 @@ mod tests {
 
         assert_eq!(report.batch_intents_resolved, 1);
         assert_eq!(report.temp_files_removed, 1);
+        assert_eq!(report.orphan_payload_files_removed, 1);
         assert!(!committed_payload_path.exists());
         assert!(!staged_temp_path.exists());
         assert!(!intent_dir.join("batch-0000000000000001.intent").exists());
+        assert!(
+            reconcile_startup_state(&layout, &index, LocalPayloadStartupReconcileMode::Full)
+                .unwrap()
+                .is_clean()
+        );
     }
 
     #[test]
@@ -874,16 +885,24 @@ mod tests {
             .with_file_name("0000000000000009-legacy.tmp");
         std::fs::create_dir_all(legacy_tmp_path.parent().unwrap()).unwrap();
         std::fs::write(&legacy_tmp_path, b"legacy-tmp").unwrap();
+        let _incomplete_put = payload_store.put_with_intent(10, b"intent orphan").unwrap();
 
         let report =
             reconcile_startup_state(&layout, &index, LocalPayloadStartupReconcileMode::Full)
                 .unwrap();
 
         assert_eq!(report.temp_files_removed, 1);
-        assert_eq!(report.orphan_payload_files_removed, 1);
+        assert_eq!(report.orphan_payload_files_removed, 2);
+        assert_eq!(report.batch_intents_resolved, 1);
         assert!(!payload_store.payload_exists(8).unwrap());
+        assert!(!payload_store.payload_exists(10).unwrap());
         assert!(!legacy_tmp_path.exists());
         assert!(payload_store.payload_exists(7).unwrap());
+        assert!(
+            reconcile_startup_state(&layout, &index, LocalPayloadStartupReconcileMode::Full)
+                .unwrap()
+                .is_clean()
+        );
     }
 
     #[test]

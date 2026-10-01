@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use tracing::{debug, warn};
 
 use crate::local::{
@@ -21,6 +21,8 @@ use crate::local::{
     LocalPayloadObjectStats, LocalPayloadOrigin, LocalPayloadPut, LocalPayloadStorageStats,
     LocalPayloadUploadState,
 };
+
+const PAYLOAD_MUTATION_STRIPES: usize = 64;
 
 /// Cache index (redb) backing store for the local payload runtime.
 #[path = "payload_index.rs"]
@@ -282,6 +284,7 @@ pub struct LocalPayloadBackendRuntime {
     payload_store: FilePayloadStore,
     budget_governor: CacheBudgetGovernor,
     eviction_pass_lock: Mutex<()>,
+    payload_mutation_gates: [Mutex<()>; PAYLOAD_MUTATION_STRIPES],
     runtime_pinned: Mutex<HashMap<u64, usize>>,
     eviction_scan_skipped_non_evictable: AtomicU64,
     pending_access_touches: Mutex<PendingAccessTouches>,
@@ -295,6 +298,15 @@ pub struct LocalPayloadBackendRuntime {
     low_space_wait_started: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     stop_next_put_before_index: AtomicBool,
+    #[cfg(test)]
+    rollback_after_absence: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    payload_gate_probe: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
 }
 
 struct DirtyValidationGuard<'a> {
@@ -413,6 +425,7 @@ impl LocalPayloadBackendRuntime {
         if !startup_reconcile_report.is_clean() {
             warn!(
                 mode = ?startup_reconcile_mode,
+                batch_intents_resolved = startup_reconcile_report.batch_intents_resolved,
                 temp_files_removed = startup_reconcile_report.temp_files_removed,
                 stale_index_entries_removed = startup_reconcile_report.stale_index_entries_removed,
                 orphan_payload_files_removed =
@@ -430,6 +443,7 @@ impl LocalPayloadBackendRuntime {
                 .map(CacheBudgetGovernor::bounded)
                 .unwrap_or_else(CacheBudgetGovernor::unbounded),
             eviction_pass_lock: Mutex::new(()),
+            payload_mutation_gates: std::array::from_fn(|_| Mutex::new(())),
             runtime_pinned: Mutex::new(HashMap::new()),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
             pending_access_touches: Mutex::new(PendingAccessTouches::new()),
@@ -447,7 +461,32 @@ impl LocalPayloadBackendRuntime {
             low_space_wait_started: Mutex::new(None),
             #[cfg(test)]
             stop_next_put_before_index: AtomicBool::new(false),
+            #[cfg(test)]
+            rollback_after_absence: Mutex::new(None),
+            #[cfg(test)]
+            payload_gate_probe: Mutex::new(None),
         })
+    }
+
+    fn lock_payload_mutations(&self, object_ids: &[u64]) -> Vec<MutexGuard<'_, ()>> {
+        // ponytail: 64 stripes can serialize collisions; increase the count if contention is measured.
+        let mut stripes = object_ids
+            .iter()
+            .map(|object_id| *object_id as usize % PAYLOAD_MUTATION_STRIPES)
+            .collect::<Vec<_>>();
+        stripes.sort_unstable();
+        stripes.dedup();
+        #[cfg(test)]
+        if let Some(probe) = self.payload_gate_probe.lock().take() {
+            let blocked = stripes
+                .iter()
+                .any(|stripe| self.payload_mutation_gates[*stripe].try_lock().is_none());
+            let _ = probe.send(blocked);
+        }
+        stripes
+            .into_iter()
+            .map(|stripe| self.payload_mutation_gates[stripe].lock())
+            .collect()
     }
 
     fn rollback_failed_index_put(
@@ -456,6 +495,7 @@ impl LocalPayloadBackendRuntime {
         commit: file_payload_store::PayloadBatchCommit,
     ) -> Result<(), LocalPayloadBackendError> {
         let mut unindexed = Vec::new();
+        // An indexed immutable ID remains authoritative when a retry fails.
         for &object_id in object_ids {
             if self
                 .index
@@ -466,9 +506,16 @@ impl LocalPayloadBackendRuntime {
                 unindexed.push(object_id);
             }
         }
+        #[cfg(test)]
+        if !unindexed.is_empty()
+            && let Some((checked, resume)) = self.rollback_after_absence.lock().take()
+        {
+            let _ = checked.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(5));
+        }
         self.payload_store
             .rollback_batch(&unindexed, commit)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
+            .map_err(LocalPayloadBackendError::from)
     }
 
     fn has_index_entry(&self, object_id: u64) -> bool {
@@ -501,6 +548,10 @@ impl LocalPayloadBackendRuntime {
     }
 
     fn remove_orphaned_index_entry(&self, object_id: u64, operation: &'static str) {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
+        if !self.payload_missing(object_id, operation) {
+            return;
+        }
         warn!(
             object_id,
             operation,
@@ -553,27 +604,63 @@ impl LocalPayloadBackendRuntime {
         if object_ids.is_empty() {
             return;
         }
+        let _mutations = self.lock_payload_mutations(object_ids);
+        let still_orphaned = object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| self.payload_missing(*object_id, operation))
+            .collect::<Vec<_>>();
+        if still_orphaned.is_empty() {
+            return;
+        }
         warn!(
             operation,
-            orphan_count = object_ids.len(),
+            orphan_count = still_orphaned.len(),
             "local payload runtime pruning stale index entries that no longer have payload files"
         );
-        if let Err(error) = self.index.remove_batch(object_ids) {
+        if let Err(error) = self.index.remove_batch(&still_orphaned) {
             warn!(
                 operation,
-                orphan_count = object_ids.len(),
+                orphan_count = still_orphaned.len(),
                 error = ?error,
                 "local payload runtime batch prune of stale index entries failed"
             );
         } else {
-            self.forget_access_touches(object_ids);
+            self.forget_access_touches(&still_orphaned);
         }
     }
 
     fn remove_batch_internal(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
+        let _mutations = self.lock_payload_mutations(object_ids);
         self.index.remove_batch(object_ids)?;
+        self.forget_runtime_pins(object_ids);
         self.forget_access_touches(object_ids);
         self.payload_store.remove_batch(object_ids);
+        self.note_storage_state_change();
+        Ok(())
+    }
+
+    fn evict_batch_internal(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
+        let _mutations = self.lock_payload_mutations(object_ids);
+        let eligible = object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| {
+                !self.is_runtime_pinned(*object_id)
+                    && self
+                        .index
+                        .get_entry(*object_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|entry| entry.evictable)
+            })
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return Ok(());
+        }
+        self.index.remove_batch(&eligible)?;
+        self.forget_access_touches(&eligible);
+        self.payload_store.remove_batch(&eligible);
         self.note_storage_state_change();
         Ok(())
     }
@@ -794,7 +881,7 @@ impl LocalPayloadBackendRuntime {
                 batch.push(candidate.object_id);
                 estimated_current = estimated_current.saturating_sub(candidate.payload_len);
                 if batch.len() >= EVICTION_DELETE_BATCH_SIZE {
-                    self.remove_batch_internal(&batch)
+                    self.evict_batch_internal(&batch)
                         .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
                     batch.clear();
                 }
@@ -813,7 +900,7 @@ impl LocalPayloadBackendRuntime {
                 );
             }
             if !batch.is_empty() {
-                self.remove_batch_internal(&batch)
+                self.evict_batch_internal(&batch)
                     .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
                 batch.clear();
             }
@@ -940,6 +1027,15 @@ impl LocalPayloadBackendRuntime {
     }
 }
 
+impl From<file_payload_store::FilePayloadStoreError> for LocalPayloadBackendError {
+    fn from(error: file_payload_store::FilePayloadStoreError) -> Self {
+        match error {
+            file_payload_store::FilePayloadStoreError::Io(error) => Self::Io(error),
+            other => Self::Other(Box::new(other)),
+        }
+    }
+}
+
 impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1023,10 +1119,12 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(());
         }
 
+        let _mutation = self.lock_payload_mutations(&[object_id]);
+
         let payload_commit = self
             .payload_store
             .put_with_intent(object_id, data)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+            .map_err(LocalPayloadBackendError::from)?;
 
         // Leave the real file/index crash boundary intact for startup recovery tests.
         #[cfg(test)]
@@ -1183,16 +1281,18 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(());
         }
 
+        let written_object_ids = persisted_entries
+            .iter()
+            .map(|entry| entry.object_id)
+            .collect::<Vec<_>>();
+        let _mutations = self.lock_payload_mutations(&written_object_ids);
+
         let batch_commit = self
             .payload_store
             .put_batch(&persisted_entries)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+            .map_err(LocalPayloadBackendError::from)?;
 
         if let Err(error) = self.index.upsert_many(&updates) {
-            let written_object_ids: Vec<u64> = persisted_entries
-                .iter()
-                .map(|entry| entry.object_id)
-                .collect();
             if let Err(rollback_error) =
                 self.rollback_failed_index_put(&written_object_ids, batch_commit)
             {
@@ -1215,7 +1315,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         self.flush_access_touches(true, "sync_data");
         self.payload_store
             .sync_data()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
+            .map_err(LocalPayloadBackendError::from)
     }
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
@@ -1245,18 +1345,21 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn mark_uploading(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .mark_uploading(object_id)
             .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
     }
 
     fn mark_upload_failed(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .mark_upload_failed(object_id)
             .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
     }
 
     fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .mark_uploaded(object_id)
             .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
@@ -1265,12 +1368,14 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn pin(&self, object_id: u64) {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
         let mut runtime_pinned = self.runtime_pinned.lock();
         let count = runtime_pinned.entry(object_id).or_default();
         *count = count.saturating_add(1);
     }
 
     fn unpin(&self, object_id: u64) {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
         let mut runtime_pinned = self.runtime_pinned.lock();
         let std::collections::hash_map::Entry::Occupied(mut entry) =
             runtime_pinned.entry(object_id)
@@ -1288,6 +1393,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         if object_ids.is_empty() {
             return;
         }
+        let _mutations = self.lock_payload_mutations(object_ids);
         let mut runtime_pinned = self.runtime_pinned.lock();
         for object_id in object_ids {
             let count = runtime_pinned.entry(*object_id).or_default();
@@ -1299,6 +1405,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         if object_ids.is_empty() {
             return;
         }
+        let _mutations = self.lock_payload_mutations(object_ids);
         let mut runtime_pinned = self.runtime_pinned.lock();
         for object_id in object_ids {
             let std::collections::hash_map::Entry::Occupied(mut entry) =
@@ -1315,6 +1422,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn remove(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .remove(object_id)
             .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
@@ -1331,7 +1439,6 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         }
         self.remove_batch_internal(object_ids)
             .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
-        self.forget_runtime_pins(object_ids);
         Ok(())
     }
 
@@ -2131,6 +2238,229 @@ mod tests {
                 assert!(!layout.payload_object_path(2).exists());
             }
         }
+    }
+
+    #[test]
+    fn sfs753_concurrent_same_id_put_rollback_keeps_indexed_payload() {
+        use std::sync::Arc;
+        use std::sync::mpsc::sync_channel;
+
+        for first_is_batch in [false, true] {
+            for second_is_batch in [false, true] {
+                let temp = studiofs_test_support::workspace_target_tempdir("test-");
+                let layout = LocalPayloadLayout::from_cache_root(temp.path());
+                create_v3_marker(&layout);
+                let backend = Arc::new(
+                    LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                        LocalPayloadBackendConfig {
+                            cache_root: temp.path().to_path_buf(),
+                            volume_uuid: [0x79; 16],
+                        },
+                        None,
+                        LocalPayloadSyncMode::Fast,
+                    )
+                    .unwrap(),
+                );
+                let (checked_tx, checked_rx) = sync_channel(1);
+                let (resume_tx, resume_rx) = sync_channel(1);
+                *backend.rollback_after_absence.lock() = Some((checked_tx, resume_rx));
+                backend.fail_next_index_write_for_test();
+
+                let first_backend = Arc::clone(&backend);
+                let first = std::thread::spawn(move || {
+                    if first_is_batch {
+                        first_backend.put_batch(&[
+                            LocalPayloadPut {
+                                object_id: 1,
+                                data: Bytes::from_static(b"same"),
+                                evictable: false,
+                            },
+                            LocalPayloadPut {
+                                object_id: 2,
+                                data: Bytes::from_static(b"rolled back"),
+                                evictable: false,
+                            },
+                        ])
+                    } else {
+                        first_backend.put(1, b"same", false)
+                    }
+                });
+                checked_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("first put did not reach rollback after its absent-index check");
+
+                let (gate_probe_tx, gate_probe_rx) = sync_channel(1);
+                *backend.payload_gate_probe.lock() = Some(gate_probe_tx);
+                let (second_done_tx, second_done_rx) = sync_channel(1);
+                let second_backend = Arc::clone(&backend);
+                let second = std::thread::spawn(move || {
+                    let result = if second_is_batch {
+                        second_backend.put_batch(&[LocalPayloadPut {
+                            object_id: 1,
+                            data: Bytes::from_static(b"same"),
+                            evictable: false,
+                        }])
+                    } else {
+                        second_backend.put(1, b"same", false)
+                    };
+                    let _ = second_done_tx.send(result);
+                });
+                let first_holds_gate = gate_probe_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("second put did not attempt its mutation gate");
+                if !first_holds_gate {
+                    let baseline_result = second_done_rx.recv_timeout(Duration::from_secs(5));
+                    let completed_before_release = baseline_result.is_ok();
+                    let _ = resume_tx.send(());
+                    let first_result = first.join().expect("first put thread panicked");
+                    let second_result = match baseline_result {
+                        Ok(result) => result,
+                        Err(_) => second_done_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("second put did not finish after releasing rollback"),
+                    };
+                    second.join().expect("second put thread panicked");
+                    assert!(first_result.is_err());
+                    assert!(
+                        completed_before_release,
+                        "ungated second put did not publish before rollback"
+                    );
+                    assert!(second_result.is_ok());
+                } else {
+                    let _ = resume_tx.send(());
+                    assert!(first.join().expect("first put thread panicked").is_err());
+                    assert!(
+                        second_done_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("gated second put did not finish after rollback")
+                            .is_ok()
+                    );
+                    second.join().expect("second put thread panicked");
+                }
+
+                assert_eq!(backend.get_for_upload(1).unwrap().as_ref(), b"same");
+                assert!(backend.index.get_entry(1).unwrap().is_some());
+                assert!(layout.payload_object_path(1).exists());
+                drop(backend);
+            }
+        }
+    }
+
+    #[test]
+    fn sfs753_directory_barrier_failure_retains_indexed_payload_and_intent() {
+        for batch in [false, true] {
+            let temp = studiofs_test_support::workspace_target_tempdir("test-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let config = LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x7a; 16],
+            };
+            let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                config.clone(),
+                None,
+                LocalPayloadSyncMode::Durable,
+            )
+            .unwrap();
+            backend.put(1, b"pending", false).unwrap();
+            backend
+                .payload_store
+                .fail_next_directory_sync_for_test(&layout.tmp_dir);
+
+            let error = if batch {
+                backend.put_batch(&[
+                    LocalPayloadPut {
+                        object_id: 1,
+                        data: Bytes::from_static(b"pending"),
+                        evictable: false,
+                    },
+                    LocalPayloadPut {
+                        object_id: 2,
+                        data: Bytes::from_static(b"new"),
+                        evictable: false,
+                    },
+                ])
+            } else {
+                backend.put(1, b"pending", false)
+            }
+            .expect_err("injected directory barrier must fail the retry");
+            assert!(matches!(
+                error,
+                LocalPayloadBackendError::Io(ref source)
+                    if source.kind() == io::ErrorKind::PermissionDenied
+            ));
+            assert!(backend.index.get_entry(1).unwrap().is_some());
+            assert!(layout.payload_object_path(1).exists());
+            assert!(
+                std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                    .unwrap()
+                    .next()
+                    .is_some(),
+                "directory barrier failure must retain the recovery intent"
+            );
+            drop(backend);
+
+            let reopened = LocalPayloadBackendRuntime::open_with_reconcile_mode(
+                config,
+                None,
+                LocalPayloadSyncMode::Durable,
+                LocalPayloadWriteMode::Buffered,
+                LocalPayloadStartupReconcileMode::Lightweight,
+            )
+            .unwrap();
+            assert_eq!(reopened.get_for_upload(1).unwrap().as_ref(), b"pending");
+            assert!(reopened.index.get_entry(1).unwrap().is_some());
+            assert!(!layout.payload_object_path(2).exists());
+            assert!(
+                std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn sfs753_payload_mutation_batch_gates_are_unique_and_allow_other_stripes() {
+        use std::sync::Arc;
+        use std::sync::mpsc::sync_channel;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = Arc::new(
+            LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x7b; 16],
+                },
+                None,
+                LocalPayloadSyncMode::Fast,
+            )
+            .unwrap(),
+        );
+
+        let batch_gates = backend.lock_payload_mutations(&[2, 1, 2]);
+        assert_eq!(
+            batch_gates.len(),
+            2,
+            "duplicate stripe locks are deduplicated"
+        );
+        let (done_tx, done_rx) = sync_channel(1);
+        let other_backend = Arc::clone(&backend);
+        let unrelated = std::thread::spawn(move || {
+            let result = other_backend.put(3, b"independent", false);
+            let _ = done_tx.send(result);
+        });
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("unrelated stripe was blocked by another object's gates")
+                .is_ok()
+        );
+        unrelated.join().expect("unrelated put thread panicked");
+        drop(batch_gates);
+        assert_eq!(backend.get_for_upload(3).unwrap().as_ref(), b"independent");
     }
 
     #[test]

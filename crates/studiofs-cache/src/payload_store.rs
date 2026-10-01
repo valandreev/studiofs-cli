@@ -100,6 +100,8 @@ struct PayloadStoreSharedState {
     write_counters: PayloadWriteCounters,
     #[cfg(test)]
     read_counters: PayloadReadCounters,
+    #[cfg(test)]
+    fail_directory_sync: Mutex<Option<PathBuf>>,
     barrier_counters: SyncBarrierCounters,
 }
 
@@ -166,6 +168,8 @@ impl FilePayloadStore {
                 write_counters: PayloadWriteCounters::default(),
                 #[cfg(test)]
                 read_counters: PayloadReadCounters::default(),
+                #[cfg(test)]
+                fail_directory_sync: Mutex::new(None),
                 barrier_counters: SyncBarrierCounters::default(),
             }),
         })
@@ -383,11 +387,8 @@ impl FilePayloadStore {
             payload_dir: payload_dir.to_path_buf(),
             temp_path,
         };
-        let intent_path = self.write_batch_payload_intent(
-            "committing",
-            std::slice::from_ref(&staged),
-            durable_sync,
-        )?;
+        let intent_path =
+            self.write_batch_payload_intent(std::slice::from_ref(&staged), durable_sync)?;
         self.commit_staged_batch_payload(&staged, durable_sync)?;
         self.invalidate_cached_read_handle(object_id);
         if durable_sync {
@@ -437,31 +438,23 @@ impl FilePayloadStore {
         }
         let staged = self.stage_batch_payloads(&prepared, durable_sync)?;
 
-        let mut renamed_object_ids = Vec::with_capacity(staged.len());
         let mut synced_dirs = HashSet::new();
-        let intent = self.write_batch_payload_intent("committing", &staged, durable_sync)?;
+        let intent = self.write_batch_payload_intent(&staged, durable_sync)?;
         for idx in 0..staged.len() {
             let staged_entry = &staged[idx];
             if let Err(error) = self.commit_staged_batch_payload(staged_entry, durable_sync) {
                 self.cleanup_staged_batch_payloads(&staged[idx + 1..]);
-                self.remove_batch(&renamed_object_ids);
+                // The intent lets startup preserve indexed files and remove orphan outputs.
                 return Err(error);
             }
-            renamed_object_ids.push(staged_entry.entry.object_id);
             self.invalidate_cached_read_handle(staged_entry.entry.object_id);
             synced_dirs.insert(staged_entry.payload_dir.clone());
         }
 
         if durable_sync {
-            if let Err(error) = self.sync_directory_put_barrier(&self.layout.tmp_dir) {
-                self.remove_batch(&renamed_object_ids);
-                return Err(error);
-            }
+            self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
             for dir in synced_dirs {
-                if let Err(error) = self.sync_directory_put_barrier(&dir) {
-                    self.remove_batch(&renamed_object_ids);
-                    return Err(error);
-                }
+                self.sync_directory_put_barrier(&dir)?;
             }
         } else {
             for staged_entry in &staged {
@@ -825,7 +818,6 @@ impl FilePayloadStore {
 
     fn write_batch_payload_intent(
         &self,
-        phase: &str,
         staged: &[StagedBatchPayload<'_>],
         durable_sync: bool,
     ) -> Result<PathBuf, FilePayloadStoreError> {
@@ -835,22 +827,22 @@ impl FilePayloadStore {
             next_batch_intent_token(),
             LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION
         ));
-        self.write_batch_payload_intent_phase(&path, phase, staged, durable_sync)?;
+        if let Err(error) = self.write_batch_payload_intent_file(&path, staged, durable_sync) {
+            self.cleanup_staged_batch_payloads(staged);
+            return Err(error);
+        }
         Ok(path)
     }
 
-    fn write_batch_payload_intent_phase(
+    fn write_batch_payload_intent_file(
         &self,
         path: &Path,
-        phase: &str,
         staged: &[StagedBatchPayload<'_>],
         durable_sync: bool,
     ) -> Result<(), FilePayloadStoreError> {
         let mut content = String::new();
-        content.push_str("version=1\n");
-        content.push_str("phase=");
-        content.push_str(phase);
-        content.push('\n');
+        // Retain the v1 phase header for compatibility; recovery uses index presence.
+        content.push_str("version=1\nphase=committing\n");
         for entry in staged {
             content.push_str("object=");
             content.push_str(&entry.entry.object_id.to_string());
@@ -872,17 +864,25 @@ impl FilePayloadStore {
             ))
         })?;
         let temp_path = parent.join(format!("{}.tmp", next_batch_intent_token()));
-        let mut temp_file = File::create(&temp_path)?;
-        platform::write_all(&mut temp_file, content.as_bytes())?;
-        if durable_sync {
-            platform::sync_data(&temp_file)?;
+        let result = (|| {
+            let mut temp_file = File::create(&temp_path)?;
+            platform::write_all(&mut temp_file, content.as_bytes())?;
+            if durable_sync {
+                platform::sync_data(&temp_file)?;
+            }
+            drop(temp_file);
+            platform::rename_atomic(&temp_path, path)?;
+            if durable_sync && let Err(error) = self.sync_directory_put_barrier(parent) {
+                // Payload rename has not started, so this marker owns no final output.
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temp_path);
         }
-        drop(temp_file);
-        platform::rename_atomic(&temp_path, path)?;
-        if durable_sync {
-            self.sync_directory_put_barrier(parent)?;
-        }
-        Ok(())
+        result
     }
 
     fn intent_relative_path(&self, path: &Path) -> Result<String, FilePayloadStoreError> {
@@ -1301,12 +1301,29 @@ impl FilePayloadStore {
     }
 
     fn sync_directory_put_barrier(&self, dir: &Path) -> Result<(), FilePayloadStoreError> {
+        #[cfg(test)]
+        {
+            let mut failure = self.shared.fail_directory_sync.lock();
+            if failure.as_deref() == Some(dir) {
+                failure.take();
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected directory sync failure",
+                )
+                .into());
+            }
+        }
         platform::sync_directory(dir)?;
         self.shared
             .barrier_counters
             .per_put_dir_sync_calls
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_directory_sync_for_test(&self, dir: &Path) {
+        *self.shared.fail_directory_sync.lock() = Some(dir.to_path_buf());
     }
 
     fn sync_directory_grouped_barrier(&self, dir: &Path) -> Result<(), FilePayloadStoreError> {
@@ -2143,6 +2160,81 @@ mod tests {
 
         assert_eq!(attempts, 2);
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn sfs753_failed_intent_write_removes_uncommitted_staged_payloads() {
+        for (sync_mode, fail_intent_barrier) in [
+            (LocalPayloadSyncMode::Durable, false),
+            (LocalPayloadSyncMode::Durable, true),
+            (LocalPayloadSyncMode::Fast, false),
+        ] {
+            for batch in [false, true] {
+                let temp = studiofs_test_support::workspace_target_tempdir("test-");
+                let layout = LocalPayloadLayout::from_cache_root(temp.path());
+                let store =
+                    FilePayloadStore::open_with_sync_mode(layout.clone(), sync_mode).unwrap();
+                store.put(1, b"kept").unwrap();
+                let intent_dir = layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+                if fail_intent_barrier {
+                    store.fail_next_directory_sync_for_test(&intent_dir);
+                } else {
+                    std::fs::remove_dir(&intent_dir).unwrap();
+                    std::fs::write(&intent_dir, b"blocked directory").unwrap();
+                }
+                let entries = [
+                    PayloadBatchEntry {
+                        object_id: 80,
+                        data: b"new",
+                    },
+                    PayloadBatchEntry {
+                        object_id: 81,
+                        data: b"new",
+                    },
+                ];
+                assert!(
+                    if batch {
+                        store.put_batch(&entries).map(PayloadBatchCommit::complete)
+                    } else {
+                        store.put(80, b"new")
+                    }
+                    .is_err()
+                );
+                for entry in &entries {
+                    assert!(!layout.payload_object_path(entry.object_id).exists());
+                }
+                let mut dirs = vec![layout.tmp_dir.clone()];
+                dirs.extend(entries.iter().map(|entry| {
+                    layout
+                        .payload_object_path(entry.object_id)
+                        .parent()
+                        .unwrap()
+                        .to_path_buf()
+                }));
+                for dir in dirs {
+                    if !dir.exists() {
+                        continue;
+                    }
+                    assert!(
+                        std::fs::read_dir(dir).unwrap().all(|entry| {
+                            !entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".tmp")
+                        }),
+                        "failed intent write leaked staged payload bytes"
+                    );
+                }
+                if fail_intent_barrier {
+                    assert!(
+                        std::fs::read_dir(&intent_dir).unwrap().next().is_none(),
+                        "failed intent barrier left an unowned marker before payload rename"
+                    );
+                }
+                assert_eq!(store.get(1).unwrap().as_ref(), b"kept");
+            }
+        }
     }
 
     #[test]

@@ -109,6 +109,16 @@ index checks, payload removal, or directory barriers retain the intent for
 startup recovery and produce a rollback warning. Object IDs identify immutable
 content: retrying or rehydrating the same bytes may reuse an ID, while changed
 content requires a fresh ID.
+Runtime mutation gates serialize conflicting puts, rollback, deletion and
+upload/pin transitions. Batches acquire unique gates in stable order, budget
+admission precedes publication gates, and eviction rechecks eligibility while
+holding the gate. The fixed 64 gates bound memory; colliding IDs may serialize.
+
+Single and batch store errors after payload rename retain the committed files
+and intent; startup uses the index to preserve committed data and remove
+unindexed outputs. Failed intent creation removes uncommitted staged files.
+The startup report counts final orphan files removed by intent replay in both
+Lightweight and Full modes, and the repair log includes resolved intent count.
 
 Recovery is deliberately bounded by the local durability boundary. Bytes that
 only lived in writer memory before `flush`, `fsync`, close/release, or another
