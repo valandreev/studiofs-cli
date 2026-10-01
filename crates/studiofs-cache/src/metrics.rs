@@ -136,11 +136,19 @@ impl MaterializeBatchStats {
 
     /// Mark completion of one materialization in-flight operation.
     pub fn leave_inflight(&self) {
-        let _ = self
-            .inflight_batches
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if v > 0 { Some(v - 1) } else { Some(0) }
-            });
+        let mut current = self.inflight_batches.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.inflight_batches.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Snapshot current materialization statistics.
@@ -399,12 +407,19 @@ impl Drop for BlockingTaskExecutionGuard<'_> {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
         self.stats.execution_histogram.observe_ns(elapsed_ns);
 
-        let _ = self
-            .stats
-            .active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                if v > 0 { Some(v - 1) } else { Some(0) }
-            });
+        let mut current = self.stats.active.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.stats.active.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -476,5 +491,33 @@ fn empty_blocking_task_metrics() -> BlockingTaskMetricsSnapshot {
     BlockingTaskMetricsSnapshot {
         total: empty_blocking_task_stats(),
         by_kind: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialize_inflight_completion_saturates_at_zero() {
+        let stats = MaterializeBatchStats::default();
+        stats.enter_inflight();
+        stats.leave_inflight();
+        stats.leave_inflight();
+        assert_eq!(stats.snapshot().inflight_batches, 0);
+        assert_eq!(stats.snapshot().inflight_batches_peak, 1);
+    }
+
+    #[test]
+    fn blocking_task_guards_retire_active_counts_on_drop() {
+        let stats = BlockingTaskStats::default();
+        let first = stats.record_start(Duration::ZERO);
+        let second = stats.record_start(Duration::ZERO);
+        drop(first);
+        assert_eq!(stats.snapshot().active, 1);
+        drop(second);
+        assert_eq!(stats.snapshot().active, 0);
+        assert_eq!(stats.snapshot().completed, 2);
+        assert_eq!(stats.snapshot().active_peak, 2);
     }
 }

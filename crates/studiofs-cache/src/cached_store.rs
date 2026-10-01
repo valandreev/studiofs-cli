@@ -174,9 +174,14 @@ fn saturating_u64_from_usize(value: usize) -> u64 {
 }
 
 fn subtract_saturating(value: &AtomicU64, amount: u64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(amount))
-    });
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(amount);
+        match value.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

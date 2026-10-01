@@ -273,8 +273,11 @@ These checks need no services or live mount:
 
 ```powershell
 cargo test -p studiofs-cache --lib sfs753_single_put_crash_recovery_is_lightweight_and_repeatable -- --nocapture
+cargo test -p studiofs-cache --lib sfs753_failed_index_put_clears_intent_after_payload_rollback -- --nocapture
 cargo test -p studiofs-cache --lib startup_reconcile_batch_intent_preserves_payloads_that_reached_index -- --nocapture
 cargo test -p studiofs-cache --lib startup_reconcile_lightweight_removes_incomplete_intent_temp_files -- --nocapture
+cargo test -p studiofs-cache --lib materialize_inflight_completion_saturates_at_zero -- --nocapture
+cargo test -p studiofs-cache --lib blocking_task_guards_retire_active_counts_on_drop -- --nocapture
 ```
 
 Fast-mode coverage demonstrates process interruption recovery with surviving

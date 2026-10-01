@@ -139,6 +139,11 @@ impl FilePayloadStore {
     ) -> Result<Self, FilePayloadStoreError> {
         std::fs::create_dir_all(&layout.payload_objects_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
+        std::fs::create_dir_all(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))?;
+        if matches!(sync_mode, LocalPayloadSyncMode::Durable) {
+            // Persist the intent directory before any payload can be committed.
+            platform::sync_directory(&layout.tmp_dir)?;
+        }
         let read_fd_family_capacity = read_fd_cache_capacity();
         let total_read_fd_capacity = read_fd_family_capacity * READ_FD_CACHE_FAMILIES;
         debug!(
@@ -350,8 +355,8 @@ impl FilePayloadStore {
 
     /// Persists `data` as the payload for `object_id`.
     pub fn put(&self, object_id: u64, data: &[u8]) -> Result<(), FilePayloadStoreError> {
-        self.put_with_intent(object_id, data)?.complete();
-        Ok(())
+        self.put_with_intent(object_id, data)
+            .map(PayloadBatchCommit::complete)
     }
 
     /// Keeps the payload intent until the caller commits the corresponding index row.
@@ -372,42 +377,20 @@ impl FilePayloadStore {
 
         let temp_path =
             self.write_temp_payload_file(&self.layout.tmp_dir, object_id, data, durable_sync)?;
+        let staged = StagedBatchPayload {
+            entry: PayloadBatchEntry { object_id, data },
+            payload_path: payload_path.clone(),
+            payload_dir: payload_dir.to_path_buf(),
+            temp_path,
+        };
         let intent_path = self.write_batch_payload_intent(
             "committing",
-            &[StagedBatchPayload {
-                entry: PayloadBatchEntry { object_id, data },
-                payload_path: payload_path.clone(),
-                payload_dir: payload_dir.to_path_buf(),
-                temp_path: temp_path.clone(),
-            }],
+            std::slice::from_ref(&staged),
             durable_sync,
         )?;
-        match platform::rename_atomic(&temp_path, &payload_path) {
-            Ok(()) => {}
-            Err(error) if platform::is_cross_device_link_error(&error) => {
-                let _ = std::fs::remove_file(&temp_path);
-                // Keep rename atomic even with unusual split-mount layouts by
-                // staging in the destination directory.
-                let payload_local_temp = self.write_temp_payload_file(
-                    payload_dir,
-                    object_id,
-                    data,
-                    matches!(self.sync_mode, LocalPayloadSyncMode::Durable),
-                )?;
-                if let Err(rename_error) =
-                    platform::rename_atomic(&payload_local_temp, &payload_path)
-                {
-                    let _ = std::fs::remove_file(&payload_local_temp);
-                    return Err(FilePayloadStoreError::Io(rename_error));
-                }
-            }
-            Err(error) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(FilePayloadStoreError::Io(error));
-            }
-        }
+        self.commit_staged_batch_payload(&staged, durable_sync)?;
         self.invalidate_cached_read_handle(object_id);
-        if matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
+        if durable_sync {
             self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
             self.sync_directory_put_barrier(payload_dir)?;
         } else {
@@ -816,10 +799,6 @@ impl FilePayloadStore {
         durable_sync: bool,
     ) -> Result<PathBuf, FilePayloadStoreError> {
         let intent_dir = self.layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
-        std::fs::create_dir_all(&intent_dir)?;
-        if durable_sync {
-            self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
-        }
         let path = intent_dir.join(format!(
             "batch-{}.{}",
             next_batch_intent_token(),
@@ -2148,12 +2127,14 @@ mod tests {
             stats.per_put_file_sync_calls >= 1,
             "durable mode should sync temp payload bytes before rename"
         );
-        assert!(
-            stats.per_put_dir_sync_calls >= 2,
-            "durable mode should sync tmp + payload directories per put"
+        assert_eq!(
+            stats.per_put_dir_sync_calls, 3,
+            "durable puts need intent + tmp + payload directory barriers"
         );
         assert_eq!(stats.pending_grouped_file_syncs, 0);
         assert_eq!(stats.pending_grouped_dir_syncs, 0);
+        store.put(7002, b"second payload").unwrap();
+        assert_eq!(store.sync_barrier_snapshot().per_put_dir_sync_calls, 6);
     }
 
     #[test]

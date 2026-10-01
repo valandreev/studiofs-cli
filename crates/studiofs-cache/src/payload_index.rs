@@ -275,6 +275,8 @@ impl CacheIndex {
 
     /// Insert or update a single entry, updating accounting counters atomically.
     pub fn upsert(&self, mut update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         update = normalize_upsert(update);
 
         let txn = self.db.begin_write().map_err(storage_error)?;

@@ -92,6 +92,16 @@ Reconciliation is scoped to the runtime root and does not mutate unrelated
 files under `<cache-root>`.
 Fast cache mode retains its existing no-fsync guarantees.
 
+The put-intent directory is created once when the payload store opens; Durable
+mode syncs its parent before writes begin. On the normal same-device path, each
+Durable put syncs the payload temp file and the intent temp file, with three
+directory barriers for the intent, source temp, and destination payload
+directories. The focused
+`durable_mode_keeps_per_put_sync_barriers` regression measures these barrier
+calls; on Windows, directory barriers are intentionally no-ops. Fast mode writes
+the intent without adding file or directory syncs. These operation counts do
+not establish mounted throughput or wall-clock cost.
+
 Recovery is deliberately bounded by the local durability boundary. Bytes that
 only lived in writer memory before `flush`, `fsync`, close/release, or another
 local-sync barrier may be discarded by a crash. Bytes already staged into the
