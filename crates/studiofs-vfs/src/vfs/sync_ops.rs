@@ -1,3 +1,4 @@
+use super::writer_stack::WriterStackError;
 use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino, InodeAttr,
@@ -18,6 +19,12 @@ use std::time::{Duration, Instant};
 use studiofs_meta::types::block_index_from_offset;
 
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
+
+impl From<WriterStackError> for VfsError {
+    fn from(error: WriterStackError) -> Self {
+        Self::Io(std::io::Error::other(error))
+    }
+}
 
 enum VfsWritePayload<'a> {
     Borrowed(&'a [u8]),
@@ -2125,7 +2132,7 @@ impl StudioVfs {
                         }
                     }
                 }
-                return Err(VfsError::Io(std::io::Error::other(error)));
+                return Err(error.into());
             }
         };
         {
@@ -2280,11 +2287,7 @@ impl StudioVfs {
     ///
     /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
-        let object_count = self
-            .state
-            .writer_stack
-            .prepare_finish_inode(ino)
-            .map_err(|err| VfsError::Io(std::io::Error::other(err)))?;
+        let object_count = self.state.writer_stack.prepare_finish_inode(ino)?;
         if object_count == 0 {
             return Ok(0);
         }
@@ -2294,8 +2297,7 @@ impl StudioVfs {
         let finished = self
             .state
             .writer_stack
-            .finish_prepared_inode(ino, first_object_id)
-            .map_err(|err| VfsError::Io(std::io::Error::other(err)))?;
+            .finish_prepared_inode(ino, first_object_id)?;
         if finished.is_empty() {
             return Ok(0);
         }
@@ -2321,8 +2323,7 @@ impl StudioVfs {
         let object_count = self
             .state
             .writer_stack
-            .prepare_finish_inode_if_idle(ino, min_idle)
-            .map_err(|err| VfsError::Io(std::io::Error::other(err)))?;
+            .prepare_finish_inode_if_idle(ino, min_idle)?;
         if object_count == 0 {
             return Ok(0);
         }
@@ -2332,8 +2333,7 @@ impl StudioVfs {
         let finished = self
             .state
             .writer_stack
-            .finish_prepared_inode(ino, first_object_id)
-            .map_err(|err| VfsError::Io(std::io::Error::other(err)))?;
+            .finish_prepared_inode(ino, first_object_id)?;
         if finished.is_empty() {
             return Ok(0);
         }
@@ -2358,8 +2358,7 @@ impl StudioVfs {
         let object_count = self
             .state
             .writer_stack
-            .completed_block_count_for_inode(ino)
-            .map_err(|err| VfsError::Io(std::io::Error::other(err)))?;
+            .completed_block_count_for_inode(ino)?;
         if object_count == 0 {
             return Ok(0);
         }
@@ -2367,11 +2366,11 @@ impl StudioVfs {
         let first_object_id = self
             .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;
-        let finished = self
-            .state
-            .writer_stack
-            .flush_completed_blocks_for_inode(ino, first_object_id, object_count as usize)
-            .map_err(|err| VfsError::Io(std::io::Error::other(err)))?;
+        let finished = self.state.writer_stack.flush_completed_blocks_for_inode(
+            ino,
+            first_object_id,
+            object_count as usize,
+        )?;
         if finished.is_empty() {
             return Ok(0);
         }

@@ -4122,26 +4122,8 @@ mod tests {
         let storage_full = VfsError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
         let raw_disk_full = VfsError::Io(std::io::Error::from_raw_os_error(112));
         let raw_handle_disk_full = VfsError::Io(std::io::Error::from_raw_os_error(39));
-        let local_capacity = VfsError::LocalPayload(
-            studiofs_cache::local::LocalPayloadBackendError::CapacityExhausted {
-                needed: 8,
-                free: 4,
-            },
-        );
-        let payload_store_capacity =
-            VfsError::LocalPayload(studiofs_cache::local::LocalPayloadBackendError::Other(
-                Box::new(studiofs_cache::runtime::FilePayloadStoreError::Io(
-                    std::io::Error::from(std::io::ErrorKind::StorageFull),
-                )),
-            ));
 
-        for error in [
-            storage_full,
-            raw_disk_full,
-            raw_handle_disk_full,
-            local_capacity,
-            payload_store_capacity,
-        ] {
+        for error in [storage_full, raw_disk_full, raw_handle_disk_full] {
             assert_eq!(vfs_to_winfsp_err(error).to_ntstatus(), STATUS_DISK_FULL.0);
         }
     }

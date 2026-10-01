@@ -88,21 +88,15 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
 }
 
 fn has_storage_full_source(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut source = Some(error);
-    while let Some(error) = source {
-        if error
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        error
             .downcast_ref::<std::io::Error>()
             .is_some_and(|error| error.kind() == ErrorKind::StorageFull)
             || matches!(
                 error.downcast_ref::<LocalPayloadBackendError>(),
                 Some(LocalPayloadBackendError::CapacityExhausted { .. })
             )
-        {
-            return true;
-        }
-        source = error.source();
-    }
-    false
+    })
 }
 
 fn classify_local_payload_error(error: &LocalPayloadBackendError) -> BridgeVfsErrorKind {

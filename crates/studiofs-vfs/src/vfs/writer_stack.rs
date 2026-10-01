@@ -188,8 +188,12 @@ struct FileWriter {
     chunks: BTreeMap<ChunkId, ChunkWriter>,
     dirty_bytes: usize,
     last_write: Instant,
-    sticky_error: Option<String>,
-    sticky_error_source: Option<Arc<CachedStoreWriterError>>,
+    sticky_error: Option<StickyError>,
+}
+
+struct StickyError {
+    message: String,
+    source: Option<Arc<CachedStoreWriterError>>,
 }
 
 #[derive(Default)]
@@ -326,16 +330,15 @@ impl MountedWriterStack {
                     dirty_bytes: 0,
                     last_write: Instant::now(),
                     sticky_error: None,
-                    sticky_error_source: None,
                 }))
             }))
         };
         let mut file = file.lock();
-        if let Some(message) = file.sticky_error.clone() {
+        if let Some(sticky_error) = &file.sticky_error {
             return Err(WriterStackError::Sticky {
                 ino: spec.ino,
-                message,
-                source: file.sticky_error_source.clone(),
+                message: sticky_error.message.clone(),
+                source: sticky_error.source.clone(),
             });
         }
         if file.next_object_id < spec.first_object_id {
@@ -1129,13 +1132,14 @@ impl MountedWriterStack {
                     dirty_bytes: 0,
                     last_write: Instant::now(),
                     sticky_error: None,
-                    sticky_error_source: None,
                 }))
             }))
         };
         let mut file = file.lock();
-        file.sticky_error = Some(message.into());
-        file.sticky_error_source = None;
+        file.sticky_error = Some(StickyError {
+            message: message.into(),
+            source: None,
+        });
     }
 
     pub(super) fn total_dirty_bytes(&self) -> usize {
@@ -1207,7 +1211,6 @@ impl MountedWriterStack {
             });
             if !has_pending_materialization {
                 file.sticky_error = None;
-                file.sticky_error_source = None;
             }
         }
         self.remove_file_if_clean_and_closed(ino);
@@ -1225,8 +1228,10 @@ impl MountedWriterStack {
         };
         if let Some(file) = file {
             let mut file = file.lock();
-            file.sticky_error = Some(message.into());
-            file.sticky_error_source = source;
+            file.sticky_error = Some(StickyError {
+                message: message.into(),
+                source,
+            });
         }
     }
 
@@ -2316,16 +2321,11 @@ mod tests {
     }
 
     fn error_chain_has_capacity_exhausted(error: &(dyn std::error::Error + 'static)) -> bool {
-        let mut current = Some(error);
-        while let Some(error) = current {
-            if matches!(
+        std::iter::successors(Some(error), |error| error.source()).any(|error| {
+            matches!(
                 error.downcast_ref::<LocalPayloadBackendError>(),
                 Some(LocalPayloadBackendError::CapacityExhausted { .. })
-            ) {
-                return true;
-            }
-            current = error.source();
-        }
-        false
+            )
+        })
     }
 }

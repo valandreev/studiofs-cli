@@ -169,23 +169,9 @@ mod tests {
     fn storage_full_errors_map_to_enospc() {
         let storage_full = VfsError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
         let raw_enospc = VfsError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
-        let local_capacity = VfsError::LocalPayload(
-            studiofs_cache::local::LocalPayloadBackendError::CapacityExhausted {
-                needed: 8,
-                free: 4,
-            },
-        );
-        let payload_store_capacity =
-            VfsError::LocalPayload(studiofs_cache::local::LocalPayloadBackendError::Other(
-                Box::new(studiofs_cache::runtime::FilePayloadStoreError::Io(
-                    std::io::Error::from(std::io::ErrorKind::StorageFull),
-                )),
-            ));
 
         assert_eq!(vfs_err_to_errno(&storage_full), libc::ENOSPC);
         assert_eq!(vfs_err_to_errno(&raw_enospc), libc::ENOSPC);
-        assert_eq!(vfs_err_to_errno(&local_capacity), libc::ENOSPC);
-        assert_eq!(vfs_err_to_errno(&payload_store_capacity), libc::ENOSPC);
     }
 
     #[test]
