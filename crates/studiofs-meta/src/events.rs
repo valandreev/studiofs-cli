@@ -787,6 +787,44 @@ mod tests {
     }
 
     #[test]
+    fn event_decoders_reject_invalid_slice_ranges_in_both_wire_formats() {
+        for (start, end) in [(0, 0), (2, 1), (0, crate::schema::DEFAULT_CHUNK_SIZE + 1)] {
+            for (is_base, legacy_ordinal) in [(false, 6_u32), (true, 7_u32)] {
+                let chunk_slices = vec![(
+                    ChunkId(3),
+                    vec![SliceRecord::new(
+                        SliceId(4),
+                        SliceOrder(5),
+                        SliceRange { start, end },
+                        PayloadRef::new_partial(8, 1),
+                    )],
+                )];
+                let event = if is_base {
+                    MetaEvent::PublishRegularFileBaseSlices {
+                        ino: 20,
+                        chunk_slices: chunk_slices.clone(),
+                    }
+                } else {
+                    MetaEvent::SetRegularFileOverlaySlices {
+                        ino: 20,
+                        chunk_slices: chunk_slices.clone(),
+                    }
+                };
+                let versioned = encode_event(&event).expect("encode versioned event");
+                let legacy = postcard::to_stdvec(&(legacy_ordinal, (20_u64, chunk_slices)))
+                    .expect("encode legacy event");
+
+                for bytes in [&versioned, &legacy] {
+                    assert!(
+                        matches!(decode_event(bytes), Err(MetaError::Serialization(_))),
+                        "invalid range [{start}, {end}) must fail as persisted corruption"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn legacy_remove_attr_fixture_still_decodes() {
         let event = decode_event(&[1_u8, 42_u8]).expect("decode legacy event");
 

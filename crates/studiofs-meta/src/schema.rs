@@ -666,13 +666,33 @@ pub struct SliceOrder(pub u64);
 
 /// Chunk-relative byte range for one slice.
 ///
-/// Ranges are half-open: `[start, end)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Ranges are half-open: `[start, end)`. Use [`Self::new`] to validate bounds;
+/// deserialization rejects empty, reversed, and out-of-chunk ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SliceRange {
     /// Inclusive chunk-relative start offset.
     pub start: u32,
     /// Exclusive chunk-relative end offset.
     pub end: u32,
+}
+
+impl<'de> Deserialize<'de> for SliceRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename = "SliceRange")]
+        struct SliceRangeFields {
+            start: u32,
+            end: u32,
+        }
+
+        let fields = SliceRangeFields::deserialize(deserializer)?;
+        Self::new(fields.start, fields.end).ok_or_else(|| {
+            serde::de::Error::custom("slice range must satisfy start < end <= DEFAULT_CHUNK_SIZE")
+        })
+    }
 }
 
 impl SliceRange {
@@ -1960,6 +1980,51 @@ mod tests {
         let a = SliceRange::new(100, 300).expect("range a");
         let b = SliceRange::new(250, 450).expect("range b");
         assert_eq!(a.intersection(b), SliceRange::new(250, 300));
+    }
+
+    #[test]
+    fn slice_range_deserialization_rejects_invalid_bounds() {
+        for (start, end) in [
+            (0, 0),
+            (5, 5),
+            (9, 3),
+            (0, DEFAULT_CHUNK_SIZE + 1),
+            (DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE + 1),
+            (u32::MAX, u32::MAX),
+        ] {
+            let json = format!("{{\"start\":{start},\"end\":{end}}}");
+            assert!(
+                serde_json::from_str::<SliceRange>(&json).is_err(),
+                "accepted JSON range [{start}, {end})"
+            );
+            // The historical postcard struct is the ordered pair of u32 fields.
+            let bytes = postcard::to_stdvec(&(start, end)).expect("legacy range bytes");
+            assert!(
+                postcard::from_bytes::<SliceRange>(&bytes).is_err(),
+                "accepted postcard range [{start}, {end})"
+            );
+        }
+    }
+
+    #[test]
+    fn slice_range_deserialization_preserves_valid_wire_format() {
+        for (start, end) in [
+            (0, 1),
+            (10, 42),
+            (0, DEFAULT_CHUNK_SIZE),
+            (DEFAULT_CHUNK_SIZE - 1, DEFAULT_CHUNK_SIZE),
+        ] {
+            let range = SliceRange::new(start, end).expect("valid range");
+            let json = format!("{{\"start\":{start},\"end\":{end}}}");
+            assert_eq!(serde_json::to_string(&range).unwrap(), json);
+            assert_eq!(serde_json::from_str::<SliceRange>(&json).unwrap(), range);
+            let legacy_bytes = postcard::to_stdvec(&(start, end)).unwrap();
+            assert_eq!(postcard::to_stdvec(&range).unwrap(), legacy_bytes);
+            assert_eq!(
+                postcard::from_bytes::<SliceRange>(&legacy_bytes).unwrap(),
+                range
+            );
+        }
     }
 
     #[test]
