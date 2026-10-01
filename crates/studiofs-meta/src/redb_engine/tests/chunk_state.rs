@@ -1661,40 +1661,42 @@ fn test_backfill_pending_regular_file_recovery_preserves_existing_record() {
 #[test]
 fn invalid_persisted_slice_ranges_fail_after_redb_reopen() {
     for (start, end) in [(0, 0), (2, 1), (0, DEFAULT_CHUNK_SIZE + 1)] {
-        let dir = studiofs_test_support::workspace_target_tempdir("invalid-slice-range-");
-        let path = dir.path().join("meta.redb");
-        {
-            let engine = RedbMetaEngine::open(&path).unwrap();
-            engine.init_root(1000, 1000).unwrap();
-            engine
-                .set_format_info(&test_format_info("invalid-slice-range"))
-                .unwrap();
+        for table_def in [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE] {
+            let dir = studiofs_test_support::workspace_target_tempdir("invalid-slice-range-");
+            let path = dir.path().join("meta.redb");
+            {
+                let engine = RedbMetaEngine::open(&path).unwrap();
+                engine.init_root(1000, 1000).unwrap();
+                engine
+                    .set_format_info(&test_format_info("invalid-slice-range"))
+                    .unwrap();
 
-            let mut chunk = RegularFileChunkState::default();
-            chunk.insert_slice(SliceRecord::new(
-                SliceId(1),
-                SliceOrder(1),
-                SliceRange { start, end },
-                PayloadRef::new_partial(3001, 1),
-            ));
-            let bytes = encode(&chunk).unwrap();
-            let key = encode_regular_file_chunk_key(42, ChunkId(0));
-            let txn = engine.begin_write_txn().unwrap();
-            txn.open_table(REGULAR_FILE_OVERLAY_TABLE)
-                .unwrap()
-                .insert(key.as_slice(), bytes.as_slice())
-                .unwrap();
-            txn.commit().unwrap();
+                let mut chunk = RegularFileChunkState::default();
+                chunk.insert_slice(SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange { start, end },
+                    PayloadRef::new_partial(3001, 1),
+                ));
+                let bytes = encode(&chunk).unwrap();
+                let key = encode_regular_file_chunk_key(42, ChunkId(0));
+                let txn = engine.begin_write_txn().unwrap();
+                txn.open_table(table_def)
+                    .unwrap()
+                    .insert(key.as_slice(), bytes.as_slice())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            let reopened = RedbMetaEngine::open(&path).unwrap();
+            let error = reopened
+                .lookup_regular_file_slices(42, 0, 1)
+                .expect_err("invalid persisted range must fail before read planning");
+            assert!(
+                matches!(error, MetaError::Serialization(_)),
+                "invalid range [{start}, {end}) should be a typed corruption error: {error}"
+            );
         }
-
-        let reopened = RedbMetaEngine::open(&path).unwrap();
-        let error = reopened
-            .lookup_regular_file_slices(42, 0, 1)
-            .expect_err("invalid persisted range must fail before read planning");
-        assert!(
-            matches!(error, MetaError::Serialization(_)),
-            "invalid range [{start}, {end}) should be a typed corruption error: {error}"
-        );
     }
 }
 

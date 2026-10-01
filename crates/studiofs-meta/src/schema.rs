@@ -668,6 +668,7 @@ pub struct SliceOrder(pub u64);
 ///
 /// Ranges are half-open: `[start, end)`. Use [`Self::new`] to validate bounds;
 /// deserialization rejects empty, reversed, and out-of-chunk ranges.
+/// Public fields still permit unchecked in-memory construction and mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SliceRange {
     /// Inclusive chunk-relative start offset.
@@ -690,7 +691,10 @@ impl<'de> Deserialize<'de> for SliceRange {
 
         let fields = SliceRangeFields::deserialize(deserializer)?;
         Self::new(fields.start, fields.end).ok_or_else(|| {
-            serde::de::Error::custom("slice range must satisfy start < end <= DEFAULT_CHUNK_SIZE")
+            serde::de::Error::custom(format_args!(
+                "invalid slice range [{}, {}): expected start < end <= {DEFAULT_CHUNK_SIZE}",
+                fields.start, fields.end
+            ))
         })
     }
 }
@@ -1988,14 +1992,22 @@ mod tests {
             (0, 0),
             (5, 5),
             (9, 3),
+            (1, 0),
+            (DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE),
             (0, DEFAULT_CHUNK_SIZE + 1),
             (DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE + 1),
+            (DEFAULT_CHUNK_SIZE + 1, DEFAULT_CHUNK_SIZE + 2),
+            (u32::MAX - 1, u32::MAX),
             (u32::MAX, u32::MAX),
         ] {
             let json = format!("{{\"start\":{start},\"end\":{end}}}");
+            let error = serde_json::from_str::<SliceRange>(&json)
+                .expect_err("invalid JSON range must be rejected");
             assert!(
-                serde_json::from_str::<SliceRange>(&json).is_err(),
-                "accepted JSON range [{start}, {end})"
+                error.to_string().contains(&format!(
+                    "invalid slice range [{start}, {end}): expected start < end <= {DEFAULT_CHUNK_SIZE}"
+                )),
+                "missing range bounds in diagnostic: {error}"
             );
             // The historical postcard struct is the ordered pair of u32 fields.
             let bytes = postcard::to_stdvec(&(start, end)).expect("legacy range bytes");
