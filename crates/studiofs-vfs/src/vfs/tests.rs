@@ -11907,6 +11907,123 @@ fn completed_block_materialization_uses_prefetched_object_ids() {
 }
 
 #[test]
+fn storage_full_survives_writer_stack_materialization_and_next_write() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = tmp.path().join("meta.redb");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+    meta.init_root(0, 0).expect("init root");
+    let format_info = test_format_info("sfs-746-writer-stack-capacity-error");
+    meta.set_format_info(&format_info).expect("set format info");
+    let data_config = DataStoreConfig::from(&format_info);
+    let cache_dir = tmp.path().join("cache");
+    let rt = Arc::new(Runtime::new().expect("runtime"));
+    let _guard = rt.enter();
+    let block_size = u64::from(format_info.block_size);
+    let vfs = StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir.to_str().expect("cache dir str"),
+        block_size,
+        32 * 1024 * 1024,
+        VfsConfigRaw {
+            max_dirty_bytes: Some(block_size as usize),
+            write_eager_flush_batch_bytes: Some(block_size as usize),
+            ..VfsConfigRaw::default()
+        }
+        .validate()
+        .expect("test VFS config should validate"),
+    )
+    .expect("create VFS with one-block local payload budget");
+
+    rt.block_on(async {
+        let payload = vec![0x5A; block_size as usize];
+        let first = vfs
+            .create(1, b"first-capacity-block.bin", 0, 0, 0o644)
+            .expect("create first file");
+        let first_fh = vfs
+            .open_file(first.ino, OpenFlags::RDWR, false)
+            .expect("open first file");
+        vfs.record_writer_stack_state_bytes(first_fh, first.ino, 0, &payload)
+            .await
+            .expect("write first block");
+        vfs.materialize_writer_stack_for_inode(first.ino)
+            .await
+            .expect("first payload fills local budget");
+
+        let second = vfs
+            .create(1, b"second-capacity-block.bin", 0, 0, 0o644)
+            .expect("create second file");
+        let second_fh = vfs
+            .open_file(second.ino, OpenFlags::RDWR, false)
+            .expect("open second file");
+        vfs.record_writer_stack_state_bytes(second_fh, second.ino, 0, &payload)
+            .await
+            .expect("write second block into writer pages");
+
+        let materialization_error = vfs
+            .materialize_writer_stack_for_inode(second.ino)
+            .await
+            .expect_err("second payload exceeds local payload budget");
+        assert!(
+            materialization_error
+                .to_string()
+                .contains("writer stack finish failed"),
+            "missing materialization operation: {materialization_error}"
+        );
+        assert_eq!(
+            crate::classify_vfs_error(&materialization_error),
+            crate::BridgeVfsErrorKind::StorageFull
+        );
+
+        let sticky_error = vfs
+            .record_writer_stack_state_bytes(second_fh, second.ino, block_size, b"x")
+            .await
+            .expect_err("failed materialization blocks subsequent writes");
+        assert!(
+            sticky_error
+                .to_string()
+                .contains("writer stack write failed"),
+            "missing write operation: {sticky_error}"
+        );
+        assert_eq!(
+            crate::classify_vfs_error(&sticky_error),
+            crate::BridgeVfsErrorKind::StorageFull
+        );
+
+        let retry_error = vfs
+            .fsync(second.ino, false)
+            .await
+            .expect_err("fsync must retry the failed payload while capacity is still exhausted");
+        assert_eq!(
+            crate::classify_vfs_error(&retry_error),
+            crate::BridgeVfsErrorKind::StorageFull
+        );
+
+        let occupied_object_ids = vfs.local_payload_backend().object_ids();
+        assert_eq!(occupied_object_ids.len(), 1);
+        vfs.local_payload_backend()
+            .remove_batch(&occupied_object_ids)
+            .expect("free the fixture's occupied payload capacity");
+        vfs.fsync(second.ino, false)
+            .await
+            .expect("fsync retries the retained payload after capacity is freed");
+        let recovered_object_ids = vfs.local_payload_backend().object_ids();
+        assert_eq!(recovered_object_ids.len(), 1);
+        assert_ne!(recovered_object_ids, occupied_object_ids);
+        assert_eq!(
+            vfs.local_payload_backend()
+                .get(recovered_object_ids[0])
+                .expect("retried payload is stored")
+                .as_ref(),
+            payload.as_slice()
+        );
+        vfs.record_writer_stack_state_bytes(second_fh, second.ino, block_size, b"x")
+            .await
+            .expect("successful strict retry clears the sticky writer error");
+    });
+}
+
+#[test]
 fn completed_block_materialization_does_not_join_gapped_prefetch_batches() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-545-gapped-prefetch-ids");

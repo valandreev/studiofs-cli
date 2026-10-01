@@ -28,6 +28,30 @@ Both bridges follow the same pattern:
 3. Call `StudioVfs` (via `rt.block_on()`)
 4. Convert the result back to OS-specific response
 
+Local payload capacity exhaustion and OS disk-full errors use the shared VFS
+`StorageFull` category, including errors retained through local payload and
+writer materialization sources. POSIX adapters return `ENOSPC`; WinFSP returns
+`STATUS_DISK_FULL`. Resource pressure already classified as
+`InsufficientResources` keeps `ENOMEM` / `STATUS_INSUFFICIENT_RESOURCES`,
+and unrelated failures keep their existing mappings.
+Source inspection for disk-full is limited to VFS I/O, local payload, and
+upload-stage I/O errors; nested causes do not override object-corruption or
+remote-fetch categories. Writer failures retain the operation label as well as
+the original error source.
+
+Shutdown snapshots retain the disk-full category before discarding error
+sources, so repeated shutdown callers receive the same disk-full response.
+After failed writer materialization, a strict local barrier retries the retained
+slices using their original object IDs; it reports exhaustion until persistence
+succeeds, even when no new writer bytes or object IDs are needed.
+
+This disk-full mapping does not add quota handling: `FilesystemQuotaExceeded`
+(`EDQUOT` on POSIX) keeps its existing fallback mapping and must remain distinct
+from `ENOSPC` if quota reporting is added. Metadata failures represented by
+`MetaError::Storage(String)` also keep `GenericFailure`; the redb I/O cause is
+converted to text before reaching this bridge. Metadata disk-full reporting
+requires retaining that typed cause, rather than interpreting storage-error text.
+
 Path walks are centralized in VFS `NamespaceResolver`:
 - WinFSP uses `NamespacePathStyle::Windows` for full-path and parent resolution.
 - macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.

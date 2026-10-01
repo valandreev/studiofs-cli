@@ -40,6 +40,8 @@ pub enum BridgeVfsErrorKind {
     RemoteUnavailable,
     /// Insufficient resources are available to satisfy the request.
     InsufficientResources,
+    /// Local storage capacity is exhausted.
+    StorageFull,
     /// Persistent corruption was detected in metadata, data, or payload.
     DataCorruption,
     /// Internal runtime failure interrupted request processing.
@@ -65,7 +67,7 @@ pub struct BridgeAttrTimes {
 pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     match error {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
-        VfsError::Io(io_error) => classify_io_error(io_error.kind()),
+        VfsError::Io(io_error) => classify_storage_io_error(io_error),
         VfsError::Join(_) | VfsError::ShutdownJoin(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
         // Terminal local durability failure; do not expose it as a retryable timeout.
         VfsError::ShutdownMetadataTimeout(_) => BridgeVfsErrorKind::GenericFailure,
@@ -73,7 +75,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         VfsError::MetadataPersistenceDegraded => BridgeVfsErrorKind::MetadataPersistenceDegraded,
         VfsError::LocalPayload(local_error) => classify_local_payload_error(local_error),
         VfsError::UploadStage(UploadStageStoreError::Io(io_error)) => {
-            classify_io_error(io_error.kind())
+            classify_storage_io_error(io_error)
         }
         VfsError::WouldBlock | VfsError::RemoteContentPending => BridgeVfsErrorKind::Retryable,
         VfsError::InvalidName(_) => BridgeVfsErrorKind::InvalidInput,
@@ -82,13 +84,37 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     }
 }
 
+fn has_storage_full_source(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::StorageFull)
+            || matches!(
+                error.downcast_ref::<LocalPayloadBackendError>(),
+                Some(LocalPayloadBackendError::CapacityExhausted { .. })
+            )
+    })
+}
+
 fn classify_local_payload_error(error: &LocalPayloadBackendError) -> BridgeVfsErrorKind {
     match error {
-        LocalPayloadBackendError::Io(io_error) => classify_io_error(io_error.kind()),
-        LocalPayloadBackendError::CapacityExhausted { .. } => {
-            BridgeVfsErrorKind::InsufficientResources
+        LocalPayloadBackendError::Io(io_error) => classify_storage_io_error(io_error),
+        LocalPayloadBackendError::CapacityExhausted { .. } => BridgeVfsErrorKind::StorageFull,
+        LocalPayloadBackendError::Other(source) => {
+            if has_storage_full_source(source.as_ref()) {
+                BridgeVfsErrorKind::StorageFull
+            } else {
+                BridgeVfsErrorKind::CriticalRuntimeFailure
+            }
         }
-        LocalPayloadBackendError::Other(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
+    }
+}
+
+fn classify_storage_io_error(error: &std::io::Error) -> BridgeVfsErrorKind {
+    if has_storage_full_source(error) {
+        BridgeVfsErrorKind::StorageFull
+    } else {
+        classify_io_error(error.kind())
     }
 }
 
@@ -143,6 +169,7 @@ fn classify_fetch_error(error: &FetchError) -> BridgeVfsErrorKind {
 
 fn classify_io_error(kind: ErrorKind) -> BridgeVfsErrorKind {
     match kind {
+        ErrorKind::StorageFull => BridgeVfsErrorKind::StorageFull,
         ErrorKind::NotFound => BridgeVfsErrorKind::NotFound,
         ErrorKind::PermissionDenied => BridgeVfsErrorKind::PermissionDenied,
         ErrorKind::AlreadyExists => BridgeVfsErrorKind::AlreadyExists,
@@ -165,7 +192,10 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
 
-    use super::{BridgeAttrTimes, BridgeVfsErrorKind, classify_vfs_error, normalize_attr_times};
+    use super::{
+        BridgeAttrTimes, BridgeVfsErrorKind, classify_io_error, classify_vfs_error,
+        normalize_attr_times,
+    };
     use studiofs_cache::local::LocalPayloadBackendError;
     use studiofs_cache::upload_stage::UploadStageStoreError;
     use studiofs_data::{crypto::CryptoError, object::ObjectError, store::DataError};
@@ -237,6 +267,106 @@ mod tests {
             classify_vfs_error(&denied),
             BridgeVfsErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn storage_full_local_capacity_is_distinct_from_memory_pressure() {
+        let error = crate::VfsError::LocalPayload(LocalPayloadBackendError::CapacityExhausted {
+            needed: 4,
+            free: 0,
+        });
+        assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::StorageFull);
+    }
+
+    #[test]
+    fn classify_io_error_maps_storage_full() {
+        assert_eq!(
+            classify_io_error(ErrorKind::StorageFull),
+            BridgeVfsErrorKind::StorageFull
+        );
+    }
+
+    #[test]
+    fn classify_vfs_error_preserves_non_local_storage_full_categories() {
+        let object = crate::VfsError::Object(ObjectError::Io(std::io::Error::from(
+            ErrorKind::StorageFull,
+        )));
+        assert_eq!(
+            classify_vfs_error(&object),
+            BridgeVfsErrorKind::DataCorruption
+        );
+
+        let fetch_decode = crate::VfsError::Fetch(crate::fetch::FetchError::Decode(
+            ObjectError::Io(std::io::Error::from(ErrorKind::StorageFull)),
+        ));
+        assert_eq!(
+            classify_vfs_error(&fetch_decode),
+            BridgeVfsErrorKind::DataCorruption
+        );
+    }
+
+    #[test]
+    fn storage_full_io_errors_keep_their_sources() {
+        for error in [
+            crate::VfsError::Io(std::io::Error::from(ErrorKind::StorageFull)),
+            crate::VfsError::LocalPayload(LocalPayloadBackendError::Io(std::io::Error::from(
+                ErrorKind::StorageFull,
+            ))),
+            crate::VfsError::UploadStage(UploadStageStoreError::Io(std::io::Error::from(
+                ErrorKind::StorageFull,
+            ))),
+            crate::VfsError::LocalPayload(LocalPayloadBackendError::Other(Box::new(
+                studiofs_cache::runtime::FilePayloadStoreError::Io(std::io::Error::from(
+                    ErrorKind::StorageFull,
+                )),
+            ))),
+        ] {
+            assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::StorageFull);
+            let mut source: &(dyn std::error::Error + 'static) = &error;
+            while source.downcast_ref::<std::io::Error>().is_none() {
+                source = source.source().expect("I/O source must be retained");
+            }
+            assert_eq!(
+                source.downcast_ref::<std::io::Error>().unwrap().kind(),
+                ErrorKind::StorageFull,
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_full_native_windows_errors_are_classified() {
+        // ERROR_HANDLE_DISK_FULL and ERROR_DISK_FULL.
+        for code in [39, 112] {
+            let error = crate::VfsError::Io(std::io::Error::from_raw_os_error(code));
+            assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::StorageFull);
+            let crate::VfsError::Io(source) = error else {
+                unreachable!();
+            };
+            assert_eq!(source.raw_os_error(), Some(code));
+        }
+    }
+
+    #[test]
+    fn storage_full_classification_preserves_unrelated_errors() {
+        for kind in [
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+            ErrorKind::WriteZero,
+        ] {
+            let error = crate::VfsError::Io(std::io::Error::from(kind));
+            assert_eq!(
+                classify_vfs_error(&error),
+                BridgeVfsErrorKind::GenericFailure
+            );
+            let wrapped = crate::VfsError::LocalPayload(LocalPayloadBackendError::Other(Box::new(
+                studiofs_cache::runtime::FilePayloadStoreError::Io(std::io::Error::from(kind)),
+            )));
+            assert_eq!(
+                classify_vfs_error(&wrapped),
+                BridgeVfsErrorKind::CriticalRuntimeFailure
+            );
+        }
     }
 
     #[test]
@@ -386,7 +516,7 @@ mod tests {
             });
         assert_eq!(
             classify_vfs_error(&local_capacity),
-            BridgeVfsErrorKind::InsufficientResources
+            BridgeVfsErrorKind::StorageFull
         );
 
         let stage_timeout = crate::VfsError::UploadStage(UploadStageStoreError::Io(

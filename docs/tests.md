@@ -232,6 +232,35 @@ cargo test -p studiofs-vfs classify_vfs_error_preserves_timeout_category -- --no
 cargo test -p studiofs-bridge explicit_metadata_categories_map_to_distinct_errno_codes -- --nocapture
 ```
 
+### SFS-746 Disk-full Error Regressions
+
+These tests simulate local capacity exhaustion and native disk-full error codes
+without filling a real disk. They also check retained I/O sources and unchanged
+memory-pressure/generic error mappings. Object/fetch categories retain their
+precedence over nested disk-full causes; writer failures keep their operation
+labels. The separate transient retry regression verifies wrapped generic I/O
+failures and sticky-source cleanup. Disk-full regressions also cover shutdown
+owner/waiter replay, last-handle writer-state retention, and a strict `fsync`
+retry that reports exhaustion until capacity is freed, then persists the
+original bytes and clears the sticky error:
+
+```powershell
+cargo test -p studiofs-vfs --lib storage_full -- --nocapture
+cargo test -p studiofs-vfs --lib writer_stack_retries_transient_materialization_failure -- --nocapture
+cargo test -p studiofs-vfs --lib writer_stack_prepare_finish_can_retry_after_reservation_failure -- --nocapture
+cargo test -p studiofs-vfs --lib shutdown_replay -- --nocapture
+cargo test -p studiofs-winfsp --lib storage_full -- --nocapture
+```
+
+On Linux or macOS, also run the POSIX adapter checks:
+
+```sh
+cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
+```
+
+Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
+tests do not establish live mounted disk-full acceptance.
+
 ## Contract/Core Harness
 
 Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,

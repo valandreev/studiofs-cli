@@ -36,7 +36,7 @@ use studiofs_vfs::{
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
-use windows::Win32::Foundation::{NTSTATUS, STATUS_IO_DEVICE_ERROR};
+use windows::Win32::Foundation::{NTSTATUS, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR};
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
@@ -965,6 +965,7 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
         BridgeVfsErrorKind::InsufficientResources => {
             winfsp::FspError::from(STATUS_INSUFFICIENT_RESOURCES)
         }
+        BridgeVfsErrorKind::StorageFull => winfsp::FspError::from(STATUS_DISK_FULL),
         BridgeVfsErrorKind::DataCorruption => winfsp::FspError::from(STATUS_DATA_ERROR),
         BridgeVfsErrorKind::Retryable => {
             match &e {
@@ -2642,8 +2643,8 @@ mod tests {
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PATH_STACK_BUFFER_BYTES,
         PreparedWinfspNotifications, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
-        STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR, STATUS_DISK_CORRUPT_ERROR, STATUS_EA_TOO_LARGE,
-        STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
+        STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR, STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL,
+        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
         STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
         WinfspAsyncCallbackTracker, WinfspInvalidationQueue, WinfspKernelInvalidator,
         WinfspMetadataCachePolicy, attr_to_file_info, build_basic_info_setattr_args,
@@ -4114,6 +4115,42 @@ mod tests {
         let err = VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let status = vfs_to_winfsp_err(err).to_ntstatus();
         assert_eq!(status, STATUS_ACCESS_DENIED.0);
+    }
+
+    #[test]
+    fn storage_full_errors_map_to_disk_full() {
+        let storage_full = VfsError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let raw_disk_full = VfsError::Io(std::io::Error::from_raw_os_error(112));
+        let raw_handle_disk_full = VfsError::Io(std::io::Error::from_raw_os_error(39));
+
+        for error in [storage_full, raw_disk_full, raw_handle_disk_full] {
+            assert_eq!(vfs_to_winfsp_err(error).to_ntstatus(), STATUS_DISK_FULL.0);
+        }
+    }
+
+    #[test]
+    fn storage_full_mapping_keeps_memory_and_generic_io_errors_distinct() {
+        let out_of_memory = VfsError::Io(std::io::Error::from(std::io::ErrorKind::OutOfMemory));
+        let generic_io = VfsError::Io(std::io::Error::other("unclassified I/O failure"));
+
+        assert_eq!(
+            vfs_to_winfsp_err(out_of_memory).to_ntstatus(),
+            super::STATUS_UNSUCCESSFUL.0
+        );
+        assert_eq!(
+            vfs_to_winfsp_err(generic_io).to_ntstatus(),
+            super::STATUS_UNSUCCESSFUL.0
+        );
+
+        let transit_budget =
+            VfsError::Fetch(studiofs_vfs::fetch::FetchError::TransitBudgetTooSmall {
+                required_bytes: 8,
+                budget_bytes: 4,
+            });
+        assert_eq!(
+            vfs_to_winfsp_err(transit_budget).to_ntstatus(),
+            super::STATUS_INSUFFICIENT_RESOURCES.0
+        );
     }
 
     #[test]

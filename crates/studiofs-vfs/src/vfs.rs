@@ -2339,16 +2339,23 @@ pub(crate) enum ShutdownLocalPayloadError {
         needed: u64,
         free: u64,
     },
-    Other(String),
+    Other {
+        kind: io::ErrorKind,
+        message: String,
+    },
 }
 
 impl ShutdownError {
     pub(crate) fn from_vfs_error(error: &VfsError) -> Self {
+        // Replay retains kind/text, so preserve disk-full before dropping sources.
+        let storage_full_kind = (crate::bridge::classify_vfs_error(error)
+            == crate::bridge::BridgeVfsErrorKind::StorageFull)
+            .then_some(io::ErrorKind::StorageFull);
         match error {
             VfsError::Meta(error) => Self::Meta(error.clone()),
             VfsError::Data(error) => Self::Data(error.to_string()),
             VfsError::Io(error) => Self::Io {
-                kind: error.kind(),
+                kind: storage_full_kind.unwrap_or(error.kind()),
                 message: error.to_string(),
             },
             VfsError::Join(error) => Self::Join(error.to_string()),
@@ -2376,7 +2383,7 @@ impl ShutdownError {
             }
             VfsError::LocalPayload(error) => Self::LocalPayload(match error {
                 LocalPayloadBackendError::Io(error) => ShutdownLocalPayloadError::Io {
-                    kind: error.kind(),
+                    kind: storage_full_kind.unwrap_or(error.kind()),
                     message: error.to_string(),
                 },
                 LocalPayloadBackendError::CapacityExhausted { needed, free } => {
@@ -2385,14 +2392,13 @@ impl ShutdownError {
                         free: *free,
                     }
                 }
-                LocalPayloadBackendError::Other(error) => {
-                    ShutdownLocalPayloadError::Other(error.to_string())
-                }
-            }),
-            VfsError::UploadStage(error) => Self::UploadStage {
-                kind: match error {
-                    UploadStageStoreError::Io(error) => error.kind(),
+                LocalPayloadBackendError::Other(error) => ShutdownLocalPayloadError::Other {
+                    kind: storage_full_kind.unwrap_or(io::ErrorKind::Other),
+                    message: error.to_string(),
                 },
+            }),
+            VfsError::UploadStage(UploadStageStoreError::Io(error)) => Self::UploadStage {
+                kind: storage_full_kind.unwrap_or(error.kind()),
                 message: error.to_string(),
             },
             VfsError::Other(error) => Self::Other(error.clone()),
@@ -2435,8 +2441,8 @@ impl ShutdownError {
                 ShutdownLocalPayloadError::CapacityExhausted { needed, free } => {
                     LocalPayloadBackendError::CapacityExhausted { needed, free }
                 }
-                ShutdownLocalPayloadError::Other(message) => {
-                    LocalPayloadBackendError::Other(Box::new(io::Error::other(message)))
+                ShutdownLocalPayloadError::Other { kind, message } => {
+                    LocalPayloadBackendError::Other(Box::new(io::Error::new(kind, message)))
                 }
             }),
             Self::UploadStage { kind, message } => {

@@ -96,6 +96,7 @@ pub fn vfs_err_to_errno(error: &VfsError) -> i32 {
         BridgeVfsErrorKind::RepairRequired => libc::ENOTRECOVERABLE,
         BridgeVfsErrorKind::RemoteUnavailable => libc::EHOSTUNREACH,
         BridgeVfsErrorKind::InsufficientResources => libc::ENOMEM,
+        BridgeVfsErrorKind::StorageFull => libc::ENOSPC,
         BridgeVfsErrorKind::DataCorruption
         | BridgeVfsErrorKind::CriticalRuntimeFailure
         | BridgeVfsErrorKind::GenericFailure => libc::EIO,
@@ -162,6 +163,31 @@ mod tests {
             limit: 16,
         });
         assert_eq!(vfs_err_to_errno(&xattr_too_big), libc::E2BIG);
+    }
+
+    #[test]
+    fn storage_full_errors_map_to_enospc() {
+        let storage_full = VfsError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let raw_enospc = VfsError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
+
+        assert_eq!(vfs_err_to_errno(&storage_full), libc::ENOSPC);
+        assert_eq!(vfs_err_to_errno(&raw_enospc), libc::ENOSPC);
+    }
+
+    #[test]
+    fn storage_full_mapping_keeps_memory_and_generic_io_errors_distinct() {
+        let out_of_memory = VfsError::Io(std::io::Error::from(std::io::ErrorKind::OutOfMemory));
+        let generic_io = VfsError::Io(std::io::Error::other("unclassified I/O failure"));
+
+        assert_eq!(vfs_err_to_errno(&out_of_memory), libc::EIO);
+        assert_eq!(vfs_err_to_errno(&generic_io), libc::EIO);
+
+        let transit_budget =
+            VfsError::Fetch(studiofs_vfs::fetch::FetchError::TransitBudgetTooSmall {
+                required_bytes: 8,
+                budget_bytes: 4,
+            });
+        assert_eq!(vfs_err_to_errno(&transit_budget), libc::ENOMEM);
     }
 
     #[test]
