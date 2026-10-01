@@ -1527,6 +1527,97 @@ mod tests {
         assert!(matches!(waiter, Err(VfsError::Data(_))));
     }
 
+    #[test]
+    fn storage_full_survives_shutdown_result_replay() {
+        use crate::bridge::{BridgeVfsErrorKind, classify_vfs_error};
+        use crate::vfs::writer_stack::WriterStackError;
+        use studiofs_cache::{CachedStoreWriterError, upload_stage::UploadStageStoreError};
+
+        let writer_source = Arc::new(CachedStoreWriterError::LocalPayload {
+            object_id: 700,
+            source: LocalPayloadBackendError::CapacityExhausted { needed: 4, free: 0 },
+        });
+        let wrapped_io = || {
+            std::io::Error::other(LocalPayloadBackendError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "local storage full",
+            )))
+        };
+        let errors = [
+            WriterStackError::CachedStore {
+                source: Arc::clone(&writer_source),
+            }
+            .into_vfs_error("writer stack finish failed"),
+            WriterStackError::Sticky {
+                ino: 7,
+                message: "writer stack materialization failed".to_string(),
+                source: Some(writer_source),
+            }
+            .into_vfs_error("writer stack write failed"),
+            VfsError::Io(wrapped_io()),
+            VfsError::LocalPayload(LocalPayloadBackendError::Io(wrapped_io())),
+            VfsError::LocalPayload(LocalPayloadBackendError::Other(Box::new(wrapped_io()))),
+            VfsError::UploadStage(UploadStageStoreError::Io(wrapped_io())),
+        ];
+
+        for original in errors {
+            let expected_message = original.to_string();
+            assert_eq!(
+                classify_vfs_error(&original),
+                BridgeVfsErrorKind::StorageFull,
+                "original error: {original}"
+            );
+            let state = ShutdownState::new();
+            let owner = finish_shutdown_result(ShutdownOwnerGuard::new(&state), Err(original))
+                .expect_err("shutdown owner must receive the storage failure");
+            let ShutdownClaim::Completed(stored) = state.claim() else {
+                panic!("shutdown result must be retained")
+            };
+            let waiter = replay_shutdown_result(stored)
+                .expect_err("shutdown waiter must receive the same storage failure");
+
+            for error in [owner, waiter] {
+                assert_eq!(
+                    classify_vfs_error(&error),
+                    BridgeVfsErrorKind::StorageFull,
+                    "replayed error: {error}"
+                );
+                assert_eq!(error.to_string(), expected_message);
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_replay_preserves_unrelated_local_io_categories() {
+        use crate::bridge::{BridgeVfsErrorKind, classify_vfs_error};
+
+        let errors = [
+            (
+                VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "local access denied",
+                )),
+                BridgeVfsErrorKind::PermissionDenied,
+            ),
+            (
+                VfsError::Io(std::io::Error::other("unclassified writer failure")),
+                BridgeVfsErrorKind::GenericFailure,
+            ),
+            (
+                VfsError::LocalPayload(LocalPayloadBackendError::Other(Box::new(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "backend timeout"),
+                ))),
+                BridgeVfsErrorKind::CriticalRuntimeFailure,
+            ),
+        ];
+        for (original, expected) in errors {
+            let replayed = ShutdownError::from_vfs_error(&original).into_vfs_error();
+            assert_eq!(classify_vfs_error(&original), expected);
+            assert_eq!(classify_vfs_error(&replayed), expected, "{replayed}");
+            assert_eq!(replayed.to_string(), original.to_string());
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_replay_preserves_join_error_category_for_owner_and_waiter() {
         let state = ShutdownState::new();

@@ -11989,6 +11989,37 @@ fn storage_full_survives_writer_stack_materialization_and_next_write() {
             crate::classify_vfs_error(&sticky_error),
             crate::BridgeVfsErrorKind::StorageFull
         );
+
+        let retry_error = vfs
+            .fsync(second.ino, false)
+            .await
+            .expect_err("fsync must retry the failed payload while capacity is still exhausted");
+        assert_eq!(
+            crate::classify_vfs_error(&retry_error),
+            crate::BridgeVfsErrorKind::StorageFull
+        );
+
+        let occupied_object_ids = vfs.local_payload_backend().object_ids();
+        assert_eq!(occupied_object_ids.len(), 1);
+        vfs.local_payload_backend()
+            .remove_batch(&occupied_object_ids)
+            .expect("free the fixture's occupied payload capacity");
+        vfs.fsync(second.ino, false)
+            .await
+            .expect("fsync retries the retained payload after capacity is freed");
+        let recovered_object_ids = vfs.local_payload_backend().object_ids();
+        assert_eq!(recovered_object_ids.len(), 1);
+        assert_ne!(recovered_object_ids, occupied_object_ids);
+        assert_eq!(
+            vfs.local_payload_backend()
+                .get(recovered_object_ids[0])
+                .expect("retried payload is stored")
+                .as_ref(),
+            payload.as_slice()
+        );
+        vfs.record_writer_stack_state_bytes(second_fh, second.ino, block_size, b"x")
+            .await
+            .expect("successful strict retry clears the sticky writer error");
     });
 }
 

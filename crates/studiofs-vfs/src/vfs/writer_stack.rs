@@ -820,7 +820,7 @@ impl MountedWriterStack {
         let mut object_count = 0u64;
         for chunk in file.chunks.values_mut() {
             for slice in &mut chunk.slices {
-                if !slice.frozen && slice.writer.dirty_bytes() > 0 {
+                if slice.writer.dirty_bytes() > 0 {
                     slice.frozen = true;
                     object_count = object_count.saturating_add(staged_object_count(
                         slice.writer.dirty_bytes(),
@@ -1886,6 +1886,28 @@ mod tests {
     }
 
     #[test]
+    fn writer_stack_prepare_finish_can_retry_after_reservation_failure() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"data"))
+            .expect("write initial data");
+
+        assert_eq!(stack.prepare_finish_inode(7).expect("first prepare"), 1);
+        assert_eq!(
+            stack.prepare_finish_inode(7).expect("retry prepare"),
+            1,
+            "a reservation retry must retain the required object count"
+        );
+
+        let finished = stack
+            .finish_prepared_inode(7, 900)
+            .expect("finish with reserved object ID");
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].object_id, 900);
+    }
+
+    #[test]
     fn writer_stack_tracks_dirty_bytes_and_cleans_up_closed_finished_handles() {
         let (_dir, stack, _rx) = temp_stack(16, 8);
 
@@ -2367,13 +2389,30 @@ mod tests {
             .finish_inode(7)
             .expect_err("capacity failure during materialization");
         assert!(error_chain_has_capacity_exhausted(&materialization_error));
+        let materialization_source = match &materialization_error {
+            WriterStackError::CachedStore { source } => Arc::clone(source),
+            other => panic!("expected cached-store error, got {other}"),
+        };
+
+        stack.mark_closed(1);
+        let visible_after_release = stack.snapshot_read_spans(7, 0, 4);
+        assert_eq!(visible_after_release.len(), 1);
+        assert_eq!(
+            visible_after_release[0].data.as_ref(),
+            b"data",
+            "accepted bytes remain visible after the last handle is released"
+        );
 
         let sticky_error = stack
-            .write_bytes(write_spec(1, 7, 4, 701), Bytes::from_static(b"more"))
-            .expect_err("failed materialization blocks follow-up writes");
+            .write_bytes(write_spec(2, 7, 4, 701), Bytes::from_static(b"more"))
+            .expect_err("failed materialization blocks writes through a fresh handle");
         assert!(matches!(
-            sticky_error,
-            WriterStackError::Sticky { ino: 7, .. }
+            &sticky_error,
+            WriterStackError::Sticky {
+                ino: 7,
+                source: Some(source),
+                ..
+            } if Arc::ptr_eq(&materialization_source, source)
         ));
         assert!(error_chain_has_capacity_exhausted(&sticky_error));
     }

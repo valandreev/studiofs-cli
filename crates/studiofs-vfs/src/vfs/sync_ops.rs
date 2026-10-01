@@ -2283,9 +2283,7 @@ impl StudioVfs {
             .writer_stack
             .prepare_finish_inode(ino)
             .map_err(|error| error.into_vfs_error("writer stack finish failed"))?;
-        if object_count == 0 {
-            return Ok(0);
-        }
+        // Detached slices can still need a retry without reserving new IDs.
         let first_object_id = self
             .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;

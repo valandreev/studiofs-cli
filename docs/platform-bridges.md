@@ -39,6 +39,12 @@ upload-stage I/O errors; nested causes do not override object-corruption or
 remote-fetch categories. Writer failures retain the operation label as well as
 the original error source.
 
+Shutdown snapshots retain the disk-full category before discarding error
+sources, so repeated shutdown callers receive the same disk-full response.
+After failed writer materialization, a strict local barrier retries the retained
+slices using their original object IDs; it reports exhaustion until persistence
+succeeds, even when no new writer bytes or object IDs are needed.
+
 This disk-full mapping does not add quota handling: `FilesystemQuotaExceeded`
 (`EDQUOT` on POSIX) keeps its existing fallback mapping and must remain distinct
 from `ENOSPC` if quota reporting is added. Metadata failures represented by
