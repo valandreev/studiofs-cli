@@ -362,6 +362,15 @@ impl FilePayloadStore {
         self.layout.payload_object_path(object_id).try_exists()
     }
 
+    /// Includes dangling symlinks, which still require unlink during removal.
+    pub(crate) fn payload_path_exists(&self, object_id: u64) -> io::Result<bool> {
+        match std::fs::symlink_metadata(self.layout.payload_object_path(object_id)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Persists `data` as the payload for `object_id`.
     pub fn put(&self, object_id: u64, data: &[u8]) -> Result<(), FilePayloadStoreError> {
         self.put_with_intent(object_id, data)
@@ -584,12 +593,7 @@ impl FilePayloadStore {
 
     /// Removes the payload for `object_id`, if present; reports non-NotFound errors.
     pub fn remove(&self, object_id: u64) -> Result<(), FilePayloadStoreError> {
-        self.invalidate_cached_read_handle(object_id);
-        self.shared
-            .pending_grouped_sync
-            .object_ids
-            .lock()
-            .remove(&object_id);
+        self.invalidate_runtime_state(&[object_id]);
         let payload_path = self.layout.payload_object_path(object_id);
         #[cfg(test)]
         if self
@@ -631,6 +635,17 @@ impl FilePayloadStore {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Clears cached reads and pending object syncs without filesystem deletion.
+    pub(crate) fn invalidate_runtime_state(&self, object_ids: &[u64]) {
+        for &object_id in object_ids {
+            self.invalidate_cached_read_handle(object_id);
+        }
+        let mut pending = self.shared.pending_grouped_sync.object_ids.lock();
+        for object_id in object_ids {
+            pending.remove(object_id);
+        }
+    }
+
     /// Records final paths before the runtime relinquishes their index ownership.
     pub(crate) fn prepare_removal(
         &self,
@@ -640,10 +655,10 @@ impl FilePayloadStore {
         let mut content = String::with_capacity(27 + object_ids.len() * 129);
         content.push_str("version=1\nphase=committing\n");
         for &object_id in object_ids {
-            let final_hex = encode_batch_intent_path_hex(
-                &self.intent_relative_path(&self.layout.payload_object_path(object_id))?,
-            );
-            let _ = writeln!(content, "object={object_id}|final_hex={final_hex}");
+            let relative = self.layout.payload_object_relative_path(object_id);
+            let _ = write!(content, "object={object_id}|final_hex=");
+            write_batch_intent_path_hex(&mut content, &relative);
+            content.push('\n');
         }
         let intent_path = self.write_payload_intent(
             &content,
@@ -671,7 +686,8 @@ impl FilePayloadStore {
                     continue;
                 };
                 // Persist all attempted deletions even when another removal fails.
-                if synced_shards.insert(LocalPayloadLayout::payload_shard(object_id))
+                if (object_ids.len() == 1
+                    || synced_shards.insert(LocalPayloadLayout::payload_shard(object_id)))
                     && let Err(error) = self.sync_directory_put_barrier(payload_dir)
                 {
                     // A never-created shard has no deletion to persist.
@@ -881,14 +897,13 @@ impl FilePayloadStore {
             content.push_str("version=1\nphase=committing\n");
             for entry in staged {
                 let object_id = entry.entry.object_id;
-                let temp_hex =
-                    encode_batch_intent_path_hex(&self.intent_relative_path(&entry.temp_path)?);
-                let final_hex =
-                    encode_batch_intent_path_hex(&self.intent_relative_path(&entry.payload_path)?);
-                let _ = writeln!(
-                    content,
-                    "object={object_id}|temp_hex={temp_hex}|final_hex={final_hex}"
-                );
+                let temp = self.intent_relative_path(&entry.temp_path)?;
+                let final_path = self.intent_relative_path(&entry.payload_path)?;
+                let _ = write!(content, "object={object_id}|temp_hex=");
+                write_batch_intent_path_hex(&mut content, temp);
+                content.push_str("|final_hex=");
+                write_batch_intent_path_hex(&mut content, final_path);
+                content.push('\n');
             }
             self.write_payload_intent(&content, durable_sync)
         };
@@ -932,14 +947,14 @@ impl FilePayloadStore {
         result
     }
 
-    fn intent_relative_path(&self, path: &Path) -> Result<String, FilePayloadStoreError> {
+    fn intent_relative_path<'a>(&self, path: &'a Path) -> Result<&'a Path, FilePayloadStoreError> {
         let relative = path.strip_prefix(&self.layout.runtime_root).map_err(|_| {
             io::Error::other(format!(
                 "batch intent path is outside runtime root: {}",
                 path.display()
             ))
         })?;
-        Ok(relative.to_string_lossy().replace('\\', "/"))
+        Ok(relative)
     }
 
     #[cfg(test)]
@@ -1701,12 +1716,11 @@ fn remove_batch_payload_intent(path: &Path) {
     }
 }
 
-fn encode_batch_intent_path_hex(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        let _ = write!(&mut encoded, "{byte:02x}");
+fn write_batch_intent_path_hex(content: &mut String, path: &Path) {
+    for &byte in path.to_string_lossy().as_bytes() {
+        let byte = if byte == b'\\' { b'/' } else { byte };
+        let _ = write!(content, "{byte:02x}");
     }
-    encoded
 }
 
 #[cfg(test)]

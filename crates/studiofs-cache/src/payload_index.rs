@@ -197,6 +197,8 @@ pub struct CacheIndex {
     fail_next_write: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_read: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) lookup_read_transactions: std::sync::atomic::AtomicU64,
 }
 
 fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
@@ -237,6 +239,8 @@ impl CacheIndex {
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_read: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            lookup_read_transactions: std::sync::atomic::AtomicU64::new(0),
         };
         index.initialize_schema()?;
         Ok(index)
@@ -270,18 +274,29 @@ impl CacheIndex {
     /// Look up a single object id and return its current index entry, if present.
     pub fn get_entry(&self, object_id: u64) -> Result<Option<CacheIndexEntry>, CacheIndexError> {
         #[cfg(test)]
-        if self
-            .fail_next_read
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(CacheIndexError::Storage(RedbError::DatabaseClosed));
-        }
+        self.note_lookup_read_for_test()?;
         let txn = self.db.begin_read().map_err(storage_error)?;
         let payloads = txn
             .open_table(PAYLOAD_OBJECTS_TABLE)
             .map_err(storage_error)?;
         Ok(read_entry_from_payloads(&payloads, object_id)?
             .map(|entry| entry.into_public(object_id)))
+    }
+
+    /// Checks a batch for any indexed object using one read snapshot.
+    pub(crate) fn any_present(&self, object_ids: &[u64]) -> Result<bool, CacheIndexError> {
+        #[cfg(test)]
+        self.note_lookup_read_for_test()?;
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
+        for &object_id in object_ids {
+            if read_entry_from_payloads(&payloads, object_id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Insert or update a single entry, updating accounting counters atomically.
@@ -963,6 +978,19 @@ impl CacheIndex {
 }
 
 impl CacheIndex {
+    #[cfg(test)]
+    fn note_lookup_read_for_test(&self) -> Result<(), CacheIndexError> {
+        if self
+            .fail_next_read
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(CacheIndexError::Storage(RedbError::DatabaseClosed));
+        }
+        self.lookup_read_transactions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     fn maybe_fail_write_for_test(&self) -> Result<(), CacheIndexError> {
         #[cfg(test)]
         if self

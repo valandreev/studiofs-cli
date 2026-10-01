@@ -138,9 +138,11 @@ it; Fast mode adds no sync barriers. Failed directory barriers also retain the
 intent. Callers can retry removal immediately, and lightweight startup retires
 outstanding markers while preserving any payload that has since been reindexed.
 Removal of IDs absent from both the index and disk skips intent persistence,
-index writes and directory barriers under the mutation gates, while still
-clearing runtime pins, access touches and cached read handles. Presence-check
-errors propagate rather than being treated as absence. Outstanding markers are
+index writes, unlink and directory barriers under the mutation gates. The batch
+shares one index read snapshot and still clears runtime pins, access touches
+and cached read handles. Dangling symlink paths continue through normal deletion.
+Presence-check errors propagate rather than being treated as absence.
+Outstanding markers are
 replayed only before startup begins serving operations; a successful live retry
 can leave an older marker until the next startup.
 

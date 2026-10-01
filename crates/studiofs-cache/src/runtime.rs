@@ -501,12 +501,7 @@ impl LocalPayloadBackendRuntime {
         let mut unindexed = Vec::new();
         // An indexed immutable ID remains authoritative when a retry fails.
         for &object_id in object_ids {
-            if self
-                .index
-                .get_entry(object_id)
-                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
-                .is_none()
-            {
+            if self.index.get_entry(object_id)?.is_none() {
                 unindexed.push(object_id);
             }
         }
@@ -638,7 +633,7 @@ impl LocalPayloadBackendRuntime {
         let intent = self.payload_store.prepare_removal(object_ids)?;
         if let Err(error) = self.index.remove_batch(object_ids) {
             // A redb commit error may have applied the deletion. Keep recovery ownership.
-            return Err(LocalPayloadBackendError::Other(Box::new(error)));
+            return Err(error.into());
         }
         self.forget_runtime_pins(object_ids);
         self.forget_access_touches(object_ids);
@@ -654,8 +649,7 @@ impl LocalPayloadBackendRuntime {
             if self.is_runtime_pinned(object_id)
                 || !self
                     .index
-                    .get_entry(object_id)
-                    .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
+                    .get_entry(object_id)?
                     .is_some_and(|entry| entry.evictable)
             {
                 self.eviction_scan_skipped_non_evictable
@@ -710,10 +704,7 @@ impl LocalPayloadBackendRuntime {
                 break;
             }
 
-            let dirty_object_count = self
-                .index
-                .dirty_object_count()
-                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+            let dirty_object_count = self.index.dirty_object_count()?;
             if dirty_object_count == 0 {
                 current_after_evict =
                     self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
@@ -854,10 +845,7 @@ impl LocalPayloadBackendRuntime {
         operation: &'static str,
     ) -> Result<u64, LocalPayloadBackendError> {
         self.flush_access_touches(true, operation);
-        let stats = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        let stats = self.index.stats()?;
         if stats.current_bytes <= target_bytes {
             return Ok(stats.current_bytes);
         }
@@ -872,8 +860,7 @@ impl LocalPayloadBackendRuntime {
 
             let page = self
                 .index
-                .eviction_candidates_page_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)
-                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+                .eviction_candidates_page_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)?;
             if page.entries.is_empty() {
                 break;
             }
@@ -913,11 +900,7 @@ impl LocalPayloadBackendRuntime {
             }
         }
 
-        let final_current = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
-            .current_bytes;
+        let final_current = self.index.stats()?.current_bytes;
         if final_current > target_bytes {
             warn!(
                 operation,
@@ -956,10 +939,7 @@ impl LocalPayloadBackendRuntime {
         payload_len: u64,
         evictable: bool,
     ) -> Result<bool, LocalPayloadBackendError> {
-        let stats = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        let stats = self.index.stats()?;
         let Some(target_bytes) = self
             .budget_governor
             .target_before_insert(stats.current_bytes, payload_len)
@@ -1040,6 +1020,12 @@ impl From<file_payload_store::FilePayloadStoreError> for LocalPayloadBackendErro
             file_payload_store::FilePayloadStoreError::Io(error) => Self::Io(error),
             other => Self::Other(Box::new(other)),
         }
+    }
+}
+
+impl From<CacheIndexError> for LocalPayloadBackendError {
+    fn from(error: CacheIndexError) -> Self {
+        Self::Other(Box::new(error))
     }
 }
 
@@ -1185,7 +1171,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 error = ?error,
                 "local payload runtime index upsert failed after payload write; attempted payload rollback"
             );
-            return Err(LocalPayloadBackendError::Other(Box::new(error)));
+            return Err(error.into());
         }
 
         payload_commit.complete();
@@ -1199,11 +1185,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
 
         let mut updates = Vec::with_capacity(entries.len());
         let mut persisted_entries = Vec::with_capacity(entries.len());
-        let mut estimated_current = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
-            .current_bytes;
+        let mut estimated_current = self.index.stats()?.current_bytes;
 
         for entry in entries {
             let payload_len = u64::try_from(entry.data.len()).map_err(|_| {
@@ -1311,7 +1293,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 error = ?error,
                 "local payload runtime batch index upsert failed after payload writes; attempted payload rollback"
             );
-            return Err(LocalPayloadBackendError::Other(Box::new(error)));
+            return Err(error.into());
         }
 
         batch_commit.complete();
@@ -1327,10 +1309,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
         self.flush_access_touches(true, "run_pressure_maintenance");
-        let stats = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        let stats = self.index.stats()?;
         if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
             match self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")? {
                 Some(current_bytes) => {
@@ -1355,21 +1334,19 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .mark_uploading(object_id)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
+            .map_err(LocalPayloadBackendError::from)
     }
 
     fn mark_upload_failed(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .mark_upload_failed(object_id)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
+            .map_err(LocalPayloadBackendError::from)
     }
 
     fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
-        self.index
-            .mark_uploaded(object_id)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        self.index.mark_uploaded(object_id)?;
         self.note_storage_state_change();
         Ok(())
     }
@@ -1437,23 +1414,20 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(());
         }
         let _mutations = self.lock_payload_mutations(object_ids);
+        if self.index.any_present(object_ids)? {
+            return self.remove_payloads_locked(object_ids);
+        }
         for &object_id in object_ids {
-            if self
-                .index
-                .get_entry(object_id)
-                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
-                .is_some()
-                || self.payload_store.payload_exists(object_id)?
-            {
+            if self.payload_store.payload_path_exists(object_id)? {
                 return self.remove_payloads_locked(object_ids);
             }
         }
         // No persistent ownership remains, but stale runtime state must still be cleared.
         self.forget_runtime_pins(object_ids);
         self.forget_access_touches(object_ids);
-        let result = self.payload_store.remove_batch(object_ids);
+        self.payload_store.invalidate_runtime_state(object_ids);
         self.note_storage_state_change();
-        result.map_err(LocalPayloadBackendError::from)
+        Ok(())
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
@@ -1732,6 +1706,7 @@ mod tests {
             backend.pending_access_touches.lock().enqueue(99);
             let before = backend.payload_store.sync_barrier_snapshot();
             backend.fail_next_index_write_for_test();
+            backend.payload_store.fail_next_remove_for_test(99);
 
             backend.remove(99).unwrap();
             backend.remove_batch(&[99, 100]).unwrap();
@@ -1754,7 +1729,38 @@ mod tests {
                 backend.index.remove(100).is_err(),
                 "absent removal wrote the index"
             );
+            backend.put(99, b"stale", true).unwrap();
+            assert!(
+                matches!(backend.remove(99), Err(LocalPayloadBackendError::Io(_))),
+                "absent removal dispatched unlink and consumed its failure hook"
+            );
         }
+    }
+
+    #[test]
+    fn sfs754_absent_batch_uses_one_index_read_transaction() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x54; 16],
+        })
+        .unwrap();
+        let before = backend
+            .index
+            .lookup_read_transactions
+            .load(Ordering::Relaxed);
+
+        backend.remove_batch(&[99, 100, 101, 99]).unwrap();
+        assert_eq!(
+            backend
+                .index
+                .lookup_read_transactions
+                .load(Ordering::Relaxed)
+                - before,
+            1
+        );
     }
 
     #[test]
@@ -2014,10 +2020,44 @@ mod tests {
             backend.payload_store.put(88, b"file-only").unwrap();
             backend.remove_batch(&[999, 88]).unwrap();
             assert!(!layout.payload_object_path(88).exists());
+            #[cfg(unix)]
+            {
+                let path = layout.payload_object_path(88);
+                std::os::unix::fs::symlink("missing-target", &path).unwrap();
+                backend.remove_batch(&[999, 88]).unwrap();
+                assert_eq!(
+                    std::fs::symlink_metadata(path).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
+            }
             backend.put(89, b"index-only", true).unwrap();
             std::fs::remove_file(layout.payload_object_path(89)).unwrap();
             backend.remove_batch(&[999, 89]).unwrap();
             assert!(backend.index.get_entry(89).unwrap().is_none());
+            if sync_mode == LocalPayloadSyncMode::Durable {
+                backend.put(87, b"barrier-retry", true).unwrap();
+                let path = layout.payload_object_path(87);
+                backend
+                    .payload_store
+                    .fail_next_directory_sync_for_test(path.parent().unwrap());
+                assert!(backend.remove(87).is_err());
+                assert!(!path.exists());
+                let intent_dir = layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+                assert_eq!(std::fs::read_dir(&intent_dir).unwrap().count(), 1);
+                let before = backend.payload_store.sync_barrier_snapshot();
+                backend.remove(87).unwrap();
+                let after = backend.payload_store.sync_barrier_snapshot();
+                assert_eq!(
+                    after.per_put_file_sync_calls,
+                    before.per_put_file_sync_calls
+                );
+                assert_eq!(after.per_put_dir_sync_calls, before.per_put_dir_sync_calls);
+                assert_eq!(
+                    std::fs::read_dir(intent_dir).unwrap().count(),
+                    1,
+                    "an absent retry must not retire the marker for a failed deletion barrier"
+                );
+            }
             backend.put(90, b"retried", true).unwrap();
             backend.put(91, b"indexed", true).unwrap();
             backend.payload_store.fail_next_remove_for_test(90);
