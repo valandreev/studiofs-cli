@@ -4,6 +4,7 @@
 
 use std::array;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
 use std::num::NonZeroUsize;
@@ -629,13 +630,10 @@ impl FilePayloadStore {
     ) -> Result<PayloadBatchCommit, FilePayloadStoreError> {
         let mut content = String::from("version=1\nphase=committing\n");
         for &object_id in object_ids {
-            content.push_str("object=");
-            content.push_str(&object_id.to_string());
-            content.push_str("|final_hex=");
-            content.push_str(&encode_batch_intent_path_hex(
+            let final_hex = encode_batch_intent_path_hex(
                 &self.intent_relative_path(&self.layout.payload_object_path(object_id))?,
-            ));
-            content.push('\n');
+            );
+            let _ = writeln!(content, "object={object_id}|final_hex={final_hex}");
         }
         let intent_path = self.write_payload_intent(
             &content,
@@ -651,27 +649,27 @@ impl FilePayloadStore {
         commit: PayloadBatchCommit,
     ) -> Result<(), FilePayloadStoreError> {
         let mut first_error = self.remove_batch(object_ids).err();
-        let mut synced_dirs = HashSet::new();
-        for &object_id in object_ids {
-            if !matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
-                continue;
-            }
-            let payload_path = self.layout.payload_object_path(object_id);
-            let Some(payload_dir) = payload_path.parent() else {
-                first_error.get_or_insert_with(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "payload path has no parent").into()
-                });
-                continue;
-            };
-            // Persist all attempted deletions even when another removal fails.
-            if synced_dirs.insert(payload_dir.to_path_buf())
-                && let Err(error) = self.sync_directory_put_barrier(payload_dir)
-            {
-                // A never-created shard has no deletion to persist.
-                if !matches!(&error, FilePayloadStoreError::Io(error)
-                    if error.kind() == io::ErrorKind::NotFound)
+        if matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
+            let mut synced_dirs = HashSet::new();
+            for &object_id in object_ids {
+                let payload_path = self.layout.payload_object_path(object_id);
+                let Some(payload_dir) = payload_path.parent() else {
+                    first_error.get_or_insert_with(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "payload path has no parent")
+                            .into()
+                    });
+                    continue;
+                };
+                // Persist all attempted deletions even when another removal fails.
+                if synced_dirs.insert(payload_dir.to_path_buf())
+                    && let Err(error) = self.sync_directory_put_barrier(payload_dir)
                 {
-                    first_error.get_or_insert(error);
+                    // A never-created shard has no deletion to persist.
+                    if !matches!(&error, FilePayloadStoreError::Io(error)
+                    if error.kind() == io::ErrorKind::NotFound)
+                    {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
         }
@@ -872,17 +870,15 @@ impl FilePayloadStore {
             // Retain the v1 phase header for compatibility; recovery uses index presence.
             content.push_str("version=1\nphase=committing\n");
             for entry in staged {
-                content.push_str("object=");
-                content.push_str(&entry.entry.object_id.to_string());
-                content.push_str("|temp_hex=");
-                content.push_str(&encode_batch_intent_path_hex(
-                    &self.intent_relative_path(&entry.temp_path)?,
-                ));
-                content.push_str("|final_hex=");
-                content.push_str(&encode_batch_intent_path_hex(
-                    &self.intent_relative_path(&entry.payload_path)?,
-                ));
-                content.push('\n');
+                let object_id = entry.entry.object_id;
+                let temp_hex =
+                    encode_batch_intent_path_hex(&self.intent_relative_path(&entry.temp_path)?);
+                let final_hex =
+                    encode_batch_intent_path_hex(&self.intent_relative_path(&entry.payload_path)?);
+                let _ = writeln!(
+                    content,
+                    "object={object_id}|temp_hex={temp_hex}|final_hex={final_hex}"
+                );
             }
             self.write_payload_intent(&content, durable_sync)
         };
@@ -1698,7 +1694,6 @@ fn remove_batch_payload_intent(path: &Path) {
 fn encode_batch_intent_path_hex(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len() * 2);
     for byte in value.as_bytes() {
-        use std::fmt::Write as _;
         let _ = write!(&mut encoded, "{byte:02x}");
     }
     encoded

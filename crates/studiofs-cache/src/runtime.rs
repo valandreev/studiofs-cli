@@ -634,11 +634,6 @@ impl LocalPayloadBackendRuntime {
         }
     }
 
-    fn remove_batch_internal(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
-        let _mutations = self.lock_payload_mutations(object_ids);
-        self.remove_payloads_locked(object_ids)
-    }
-
     fn remove_payloads_locked(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
         let intent = self.payload_store.prepare_removal(object_ids)?;
         if let Err(error) = self.index.remove_batch(object_ids) {
@@ -1441,7 +1436,8 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         if object_ids.is_empty() {
             return Ok(());
         }
-        self.remove_batch_internal(object_ids)
+        let _mutations = self.lock_payload_mutations(object_ids);
+        self.remove_payloads_locked(object_ids)
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
