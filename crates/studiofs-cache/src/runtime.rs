@@ -297,6 +297,8 @@ pub struct LocalPayloadBackendRuntime {
     #[cfg(test)]
     low_space_wait_started: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
     #[cfg(test)]
+    low_space_wait_probe: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
     stop_next_put_before_index: AtomicBool,
     #[cfg(test)]
     rollback_after_absence: Mutex<
@@ -460,6 +462,8 @@ impl LocalPayloadBackendRuntime {
             #[cfg(test)]
             low_space_wait_started: Mutex::new(None),
             #[cfg(test)]
+            low_space_wait_probe: Mutex::new(None),
+            #[cfg(test)]
             stop_next_put_before_index: AtomicBool::new(false),
             #[cfg(test)]
             rollback_after_absence: Mutex::new(None),
@@ -497,12 +501,7 @@ impl LocalPayloadBackendRuntime {
         let mut unindexed = Vec::new();
         // An indexed immutable ID remains authoritative when a retry fails.
         for &object_id in object_ids {
-            if self
-                .index
-                .get_entry(object_id)
-                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
-                .is_none()
-            {
+            if self.index.get_entry(object_id)?.is_none() {
                 unindexed.push(object_id);
             }
         }
@@ -630,17 +629,20 @@ impl LocalPayloadBackendRuntime {
         }
     }
 
-    fn remove_batch_internal(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
-        let _mutations = self.lock_payload_mutations(object_ids);
-        self.index.remove_batch(object_ids)?;
+    fn remove_payloads_locked(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
+        let intent = self.payload_store.prepare_removal(object_ids)?;
+        if let Err(error) = self.index.remove_batch(object_ids) {
+            // A redb commit error may have applied the deletion. Keep recovery ownership.
+            return Err(error.into());
+        }
         self.forget_runtime_pins(object_ids);
         self.forget_access_touches(object_ids);
-        self.payload_store.remove_batch(object_ids);
+        let result = self.payload_store.rollback_batch(object_ids, intent);
         self.note_storage_state_change();
-        Ok(())
+        result.map_err(LocalPayloadBackendError::from)
     }
 
-    fn evict_batch_internal(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
+    fn evict_batch_internal(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
         let _mutations = self.lock_payload_mutations(object_ids);
         let mut eligible = Vec::with_capacity(object_ids.len());
         for &object_id in object_ids {
@@ -659,11 +661,7 @@ impl LocalPayloadBackendRuntime {
         if eligible.is_empty() {
             return Ok(());
         }
-        self.index.remove_batch(&eligible)?;
-        self.forget_access_touches(&eligible);
-        self.payload_store.remove_batch(&eligible);
-        self.note_storage_state_change();
-        Ok(())
+        self.remove_payloads_locked(&eligible)
     }
 
     fn note_storage_state_change(&self) {
@@ -680,6 +678,10 @@ impl LocalPayloadBackendRuntime {
         #[cfg(test)]
         if let Some(wait_started) = self.low_space_wait_started.lock().take() {
             wait_started.wait();
+        }
+        #[cfg(test)]
+        if let Some(probe) = self.low_space_wait_probe.lock().as_ref() {
+            let _ = probe.send(());
         }
         self.storage_state_changed
             .wait_for(&mut epoch, LOW_SPACE_UPLOAD_DRAIN_WAIT);
@@ -702,10 +704,7 @@ impl LocalPayloadBackendRuntime {
                 break;
             }
 
-            let dirty_object_count = self
-                .index
-                .dirty_object_count()
-                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+            let dirty_object_count = self.index.dirty_object_count()?;
             if dirty_object_count == 0 {
                 current_after_evict =
                     self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
@@ -846,15 +845,13 @@ impl LocalPayloadBackendRuntime {
         operation: &'static str,
     ) -> Result<u64, LocalPayloadBackendError> {
         self.flush_access_touches(true, operation);
-        let stats = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        let stats = self.index.stats()?;
         if stats.current_bytes <= target_bytes {
             return Ok(stats.current_bytes);
         }
 
         let mut cursor = None;
+        // The deletion limit also caps Durable shard-directory barriers per batch.
         let mut batch = Vec::with_capacity(EVICTION_DELETE_BATCH_SIZE);
         let mut estimated_current = stats.current_bytes;
         loop {
@@ -864,8 +861,7 @@ impl LocalPayloadBackendRuntime {
 
             let page = self
                 .index
-                .eviction_candidates_page_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)
-                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+                .eviction_candidates_page_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)?;
             if page.entries.is_empty() {
                 break;
             }
@@ -882,8 +878,7 @@ impl LocalPayloadBackendRuntime {
                 batch.push(candidate.object_id);
                 estimated_current = estimated_current.saturating_sub(candidate.payload_len);
                 if batch.len() >= EVICTION_DELETE_BATCH_SIZE {
-                    self.evict_batch_internal(&batch)
-                        .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+                    self.evict_batch_internal(&batch)?;
                     batch.clear();
                 }
             }
@@ -901,17 +896,12 @@ impl LocalPayloadBackendRuntime {
                 );
             }
             if !batch.is_empty() {
-                self.evict_batch_internal(&batch)
-                    .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+                self.evict_batch_internal(&batch)?;
                 batch.clear();
             }
         }
 
-        let final_current = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
-            .current_bytes;
+        let final_current = self.index.stats()?.current_bytes;
         if final_current > target_bytes {
             warn!(
                 operation,
@@ -950,10 +940,7 @@ impl LocalPayloadBackendRuntime {
         payload_len: u64,
         evictable: bool,
     ) -> Result<bool, LocalPayloadBackendError> {
-        let stats = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        let stats = self.index.stats()?;
         let Some(target_bytes) = self
             .budget_governor
             .target_before_insert(stats.current_bytes, payload_len)
@@ -1034,6 +1021,12 @@ impl From<file_payload_store::FilePayloadStoreError> for LocalPayloadBackendErro
             file_payload_store::FilePayloadStoreError::Io(error) => Self::Io(error),
             other => Self::Other(Box::new(other)),
         }
+    }
+}
+
+impl From<CacheIndexError> for LocalPayloadBackendError {
+    fn from(error: CacheIndexError) -> Self {
+        Self::Other(Box::new(error))
     }
 }
 
@@ -1179,7 +1172,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 error = ?error,
                 "local payload runtime index upsert failed after payload write; attempted payload rollback"
             );
-            return Err(LocalPayloadBackendError::Other(Box::new(error)));
+            return Err(error.into());
         }
 
         payload_commit.complete();
@@ -1193,11 +1186,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
 
         let mut updates = Vec::with_capacity(entries.len());
         let mut persisted_entries = Vec::with_capacity(entries.len());
-        let mut estimated_current = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
-            .current_bytes;
+        let mut estimated_current = self.index.stats()?.current_bytes;
 
         for entry in entries {
             let payload_len = u64::try_from(entry.data.len()).map_err(|_| {
@@ -1305,7 +1294,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 error = ?error,
                 "local payload runtime batch index upsert failed after payload writes; attempted payload rollback"
             );
-            return Err(LocalPayloadBackendError::Other(Box::new(error)));
+            return Err(error.into());
         }
 
         batch_commit.complete();
@@ -1321,10 +1310,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
         self.flush_access_touches(true, "run_pressure_maintenance");
-        let stats = self
-            .index
-            .stats()
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        let stats = self.index.stats()?;
         if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
             match self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")? {
                 Some(current_bytes) => {
@@ -1349,21 +1335,19 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .mark_uploading(object_id)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
+            .map_err(LocalPayloadBackendError::from)
     }
 
     fn mark_upload_failed(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
             .mark_upload_failed(object_id)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
+            .map_err(LocalPayloadBackendError::from)
     }
 
     fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
-        self.index
-            .mark_uploaded(object_id)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        self.index.mark_uploaded(object_id)?;
         self.note_storage_state_change();
         Ok(())
     }
@@ -1423,23 +1407,27 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn remove(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
-        let _mutation = self.lock_payload_mutations(&[object_id]);
-        self.index
-            .remove(object_id)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
-        self.forget_runtime_pins(&[object_id]);
-        self.forget_access_touches(&[object_id]);
-        self.payload_store.remove(object_id);
-        self.note_storage_state_change();
-        Ok(())
+        self.remove_batch(&[object_id])
     }
 
     fn remove_batch(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
         if object_ids.is_empty() {
             return Ok(());
         }
-        self.remove_batch_internal(object_ids)
-            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+        let _mutations = self.lock_payload_mutations(object_ids);
+        if self.index.any_present(object_ids)? {
+            return self.remove_payloads_locked(object_ids);
+        }
+        for &object_id in object_ids {
+            if self.payload_store.payload_path_exists(object_id)? {
+                return self.remove_payloads_locked(object_ids);
+            }
+        }
+        // No persistent ownership remains, but stale runtime state must still be cleared.
+        self.forget_runtime_pins(object_ids);
+        self.forget_access_touches(object_ids);
+        self.payload_store.invalidate_runtime_state(object_ids);
+        self.note_storage_state_change();
         Ok(())
     }
 
@@ -1693,6 +1681,481 @@ mod tests {
 
     fn create_v3_marker(layout: &LocalPayloadLayout) {
         layout.provision().unwrap();
+    }
+
+    #[test]
+    fn sfs754_foreground_eviction_coalesces_and_bounds_sync_barriers() {
+        // Preserve both a shared-shard fixture and a fixture with 129 distinct shards.
+        for (object_ids, expected_shards, file_syncs, dir_syncs) in [
+            (vec![107, 632], 1, 3, 5),
+            ((1..=129).collect::<Vec<_>>(), 129, 4, 134),
+        ] {
+            assert_eq!(
+                object_ids
+                    .iter()
+                    .map(|&id| LocalPayloadLayout::payload_shard(id))
+                    .collect::<HashSet<_>>()
+                    .len(),
+                expected_shards,
+                "eviction barrier fixture shard distribution changed; update object IDs"
+            );
+            for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+                let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+                let layout = LocalPayloadLayout::from_cache_root(temp.path());
+                create_v3_marker(&layout);
+                let backend = LocalPayloadBackendRuntime::open_with_reconcile_mode(
+                    LocalPayloadBackendConfig {
+                        cache_root: temp.path().to_path_buf(),
+                        volume_uuid: [0x54; 16],
+                    },
+                    Some(object_ids.len() as u64),
+                    sync_mode,
+                    LocalPayloadWriteMode::Buffered,
+                    LocalPayloadStartupReconcileMode::Lightweight,
+                )
+                .unwrap();
+                for &object_id in &object_ids {
+                    backend.put(object_id, b"x", true).unwrap();
+                }
+                let before = backend.payload_store.sync_barrier_snapshot();
+                let incoming = vec![0x54; object_ids.len()];
+
+                backend.put(1_000_000, &incoming, false).unwrap();
+
+                let after = backend.payload_store.sync_barrier_snapshot();
+                assert_eq!(
+                    (
+                        after.per_put_file_sync_calls - before.per_put_file_sync_calls,
+                        after.per_put_dir_sync_calls - before.per_put_dir_sync_calls,
+                    ),
+                    if sync_mode == LocalPayloadSyncMode::Durable {
+                        (file_syncs, dir_syncs)
+                    } else {
+                        (0, 0)
+                    },
+                    "foreground eviction must coalesce shards and split after 128 objects"
+                );
+                assert!(object_ids.iter().all(|&id| {
+                    !backend.contains(id) && !layout.payload_object_path(id).exists()
+                }));
+                assert_eq!(
+                    backend.get_for_upload(1_000_000).unwrap().as_ref(),
+                    incoming
+                );
+                assert!(
+                    std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                        .unwrap()
+                        .next()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sfs754_absent_removal_skips_durable_mutations_and_clears_runtime_state() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x54; 16],
+                },
+                None,
+                sync_mode,
+            )
+            .unwrap();
+            // Simulate stale runtime state after the file and index ownership are gone.
+            backend.payload_store.put(99, b"stale").unwrap();
+            let mut out = [0; 5];
+            assert_eq!(backend.payload_store.read_into(99, 0, &mut out), Some(5));
+            std::fs::remove_file(layout.payload_object_path(99)).unwrap();
+            backend.pin(99);
+            backend.pending_access_touches.lock().enqueue(99);
+            let before = backend.payload_store.sync_barrier_snapshot();
+            backend.fail_next_index_write_for_test();
+            backend.payload_store.fail_next_remove_for_test(99);
+
+            backend.remove(99).unwrap();
+            backend.remove_batch(&[99, 100]).unwrap();
+            assert!(!backend.is_runtime_pinned(99));
+            assert!(backend.pending_access_touches.lock().object_ids.is_empty());
+            assert_eq!(backend.payload_store.read_into(99, 0, &mut out), None);
+            let after = backend.payload_store.sync_barrier_snapshot();
+            assert_eq!(
+                after.per_put_file_sync_calls,
+                before.per_put_file_sync_calls
+            );
+            assert_eq!(after.per_put_dir_sync_calls, before.per_put_dir_sync_calls);
+            assert!(
+                std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert!(
+                backend.index.remove(100).is_err(),
+                "absent removal wrote the index"
+            );
+            backend.put(99, b"stale", true).unwrap();
+            assert!(
+                matches!(backend.remove(99), Err(LocalPayloadBackendError::Io(_))),
+                "absent removal dispatched unlink and consumed its failure hook"
+            );
+        }
+    }
+
+    #[test]
+    fn sfs754_absent_batch_uses_one_index_read_transaction() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x54; 16],
+        })
+        .unwrap();
+        let before = backend
+            .index
+            .lookup_read_transactions
+            .load(Ordering::Relaxed);
+
+        backend.remove_batch(&[99, 100, 101, 99]).unwrap();
+        assert_eq!(
+            backend
+                .index
+                .lookup_read_transactions
+                .load(Ordering::Relaxed)
+                - before,
+            1
+        );
+    }
+
+    #[test]
+    fn sfs754_absence_probe_errors_do_not_mutate_removal_state() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x54; 16],
+        })
+        .unwrap();
+        backend.pin(90);
+        let before = backend.payload_store.sync_barrier_snapshot();
+        backend.index.fail_next_read_for_test();
+
+        assert!(matches!(
+            backend.remove(90),
+            Err(LocalPayloadBackendError::Other(_))
+        ));
+        assert!(backend.is_runtime_pinned(90));
+        #[cfg(unix)]
+        {
+            let path = layout.payload_object_path(90);
+            let shard = path.parent().unwrap();
+            std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(shard.file_name().unwrap(), shard).unwrap();
+            assert!(matches!(
+                backend.remove(90),
+                Err(LocalPayloadBackendError::Io(_))
+            ));
+            assert!(backend.is_runtime_pinned(90));
+        }
+        let after = backend.payload_store.sync_barrier_snapshot();
+        assert_eq!(
+            after.per_put_file_sync_calls,
+            before.per_put_file_sync_calls
+        );
+        assert_eq!(after.per_put_dir_sync_calls, before.per_put_dir_sync_calls);
+        assert!(
+            std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sfs754_unlink_failure_reports_error_and_recovers_without_harming_indexed_payloads() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            for operation in ["single", "batch", "eviction"] {
+                let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+                let layout = LocalPayloadLayout::from_cache_root(temp.path());
+                create_v3_marker(&layout);
+                let config = LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x54; 16],
+                };
+                let backend = LocalPayloadBackendRuntime::open_with_reconcile_mode(
+                    config.clone(),
+                    None,
+                    sync_mode,
+                    LocalPayloadWriteMode::Buffered,
+                    LocalPayloadStartupReconcileMode::Lightweight,
+                )
+                .unwrap();
+                backend.put(90, b"blocked", true).unwrap();
+                backend.put(91, b"removed", true).unwrap();
+                backend.put(92, b"indexed", false).unwrap();
+                backend.put(93, b"pinned!", true).unwrap();
+                backend.pin(93);
+                assert_eq!(backend.get(90).unwrap().as_ref(), b"blocked");
+                backend.payload_store.fail_next_remove_for_test(90);
+                let before = backend.payload_store.sync_barrier_snapshot();
+
+                let result = match operation {
+                    "single" => backend.remove(90),
+                    "batch" => backend.remove_batch(&[90, 91]),
+                    _ => backend.evict_to_target_bytes(7, "sfs754").map(|_| ()),
+                };
+                assert!(
+                    matches!(result, Err(LocalPayloadBackendError::Io(ref error))
+                    if error.kind() == io::ErrorKind::PermissionDenied),
+                    "{sync_mode:?} {operation} reported clean removal: {result:?}"
+                );
+                assert_eq!(
+                    std::fs::read(layout.payload_object_path(90)).unwrap(),
+                    b"blocked"
+                );
+                assert!(backend.index.get_entry(90).unwrap().is_none());
+                assert!(!backend.contains(90));
+                assert_eq!(
+                    backend.lifecycle_state(90),
+                    LocalPayloadLifecycleState::Missing
+                );
+                if operation != "single" {
+                    assert!(!layout.payload_object_path(91).exists());
+                    assert!(backend.index.get_entry(91).unwrap().is_none());
+                }
+                let intent_dir = layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+                let intents = std::fs::read_dir(&intent_dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                assert_eq!(intents.len(), 1);
+                let intent = std::fs::read_to_string(&intents[0]).unwrap();
+                assert!(intent.contains("object=90|final_hex="));
+                assert!(!intent.contains("temp_hex="));
+                assert_eq!(backend.get(92).unwrap().as_ref(), b"indexed");
+                assert_eq!(backend.get(93).unwrap().as_ref(), b"pinned!");
+                assert!(backend.is_runtime_pinned(93));
+                assert!(!backend.is_evictable(93));
+                let after = backend.payload_store.sync_barrier_snapshot();
+                let shard_count = if operation == "single" { 1 } else { 2 };
+                assert_eq!(
+                    after.per_put_file_sync_calls - before.per_put_file_sync_calls,
+                    u64::from(sync_mode == LocalPayloadSyncMode::Durable)
+                );
+                assert_eq!(
+                    after.per_put_dir_sync_calls - before.per_put_dir_sync_calls,
+                    if sync_mode == LocalPayloadSyncMode::Durable {
+                        1 + shard_count
+                    } else {
+                        0
+                    }
+                );
+                drop(backend);
+
+                for _ in 0..2 {
+                    let reopened = LocalPayloadBackendRuntime::open_with_reconcile_mode(
+                        config.clone(),
+                        None,
+                        sync_mode,
+                        LocalPayloadWriteMode::Buffered,
+                        LocalPayloadStartupReconcileMode::Lightweight,
+                    )
+                    .unwrap();
+                    assert!(!layout.payload_object_path(90).exists());
+                    assert!(std::fs::read_dir(&intent_dir).unwrap().next().is_none());
+                    assert_eq!(reopened.get_for_upload(92).unwrap().as_ref(), b"indexed");
+                    assert_eq!(reopened.get(93).unwrap().as_ref(), b"pinned!");
+                    assert!(reopened.index.get_entry(92).unwrap().is_some());
+                    reopened.remove(90).unwrap();
+                    reopened.remove_batch(&[90, 91]).unwrap();
+                    reopened.remove(999).unwrap();
+                    reopened.remove_batch(&[]).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sfs754_failed_removal_intent_preserves_payload_and_index() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x54; 16],
+                },
+                None,
+                sync_mode,
+            )
+            .unwrap();
+            backend.put(90, b"indexed", false).unwrap();
+            backend.pin(90);
+            std::fs::remove_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR)).unwrap();
+
+            assert!(
+                backend.remove(90).is_err(),
+                "removal proceeded without recovery evidence"
+            );
+            assert!(backend.contains(90));
+            assert_eq!(backend.get_for_upload(90).unwrap().as_ref(), b"indexed");
+            assert!(backend.index.get_entry(90).unwrap().is_some());
+            assert!(backend.is_runtime_pinned(90));
+        }
+    }
+
+    #[test]
+    fn sfs754_failed_index_removal_preserves_payloads_until_intent_recovery() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            for operation in ["single", "batch", "eviction"] {
+                let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+                let layout = LocalPayloadLayout::from_cache_root(temp.path());
+                create_v3_marker(&layout);
+                let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                    LocalPayloadBackendConfig {
+                        cache_root: temp.path().to_path_buf(),
+                        volume_uuid: [0x54; 16],
+                    },
+                    None,
+                    sync_mode,
+                )
+                .unwrap();
+                backend.put(90, b"indexed", true).unwrap();
+                backend.put(91, b"another", false).unwrap();
+                backend.pin(91);
+                backend.fail_next_index_write_for_test();
+                let result = match operation {
+                    "single" => backend.remove(90),
+                    "batch" => backend.remove_batch(&[90, 91]),
+                    _ => backend.evict_to_target_bytes(7, "sfs754").map(|_| ()),
+                };
+                assert!(
+                    matches!(result, Err(LocalPayloadBackendError::Other(_))),
+                    "{result:?}"
+                );
+                assert_eq!(backend.get(90).unwrap().as_ref(), b"indexed");
+                assert_eq!(backend.get_for_upload(91).unwrap().as_ref(), b"another");
+                assert!(backend.index.get_entry(90).unwrap().is_some());
+                assert!(backend.index.get_entry(91).unwrap().is_some());
+                assert!(backend.is_runtime_pinned(91));
+                assert_eq!(backend.storage_stats().current_bytes, 14);
+                let intent_dir = layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+                assert_eq!(
+                    std::fs::read_dir(&intent_dir).unwrap().count(),
+                    1,
+                    "an index commit error can leave durable changes; keep recovery ownership"
+                );
+                reconcile_startup_state(
+                    &layout,
+                    &backend.index,
+                    LocalPayloadStartupReconcileMode::Lightweight,
+                )
+                .unwrap();
+                assert!(std::fs::read_dir(&intent_dir).unwrap().next().is_none());
+                assert_eq!(backend.get(90).unwrap().as_ref(), b"indexed");
+                assert_eq!(backend.get_for_upload(91).unwrap().as_ref(), b"another");
+                backend.remove_batch(&[90, 91]).unwrap();
+                assert!(!backend.contains(90));
+                assert!(!backend.contains(91));
+                assert!(!backend.is_runtime_pinned(91));
+                assert_eq!(backend.storage_stats().current_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn sfs754_live_removal_retry_and_reindexed_payload_survive_intent_replay() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let config = LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x54; 16],
+            };
+            let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                config.clone(),
+                None,
+                sync_mode,
+            )
+            .unwrap();
+            backend.payload_store.put(88, b"file-only").unwrap();
+            backend.remove_batch(&[999, 88]).unwrap();
+            assert!(!layout.payload_object_path(88).exists());
+            #[cfg(unix)]
+            {
+                let path = layout.payload_object_path(88);
+                std::os::unix::fs::symlink("missing-target", &path).unwrap();
+                backend.remove_batch(&[999, 88]).unwrap();
+                assert_eq!(
+                    std::fs::symlink_metadata(path).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
+            }
+            backend.put(89, b"index-only", true).unwrap();
+            std::fs::remove_file(layout.payload_object_path(89)).unwrap();
+            backend.remove_batch(&[999, 89]).unwrap();
+            assert!(backend.index.get_entry(89).unwrap().is_none());
+            if sync_mode == LocalPayloadSyncMode::Durable {
+                backend.put(87, b"barrier-retry", true).unwrap();
+                let path = layout.payload_object_path(87);
+                backend
+                    .payload_store
+                    .fail_next_directory_sync_for_test(path.parent().unwrap());
+                assert!(backend.remove(87).is_err());
+                assert!(!path.exists());
+                let intent_dir = layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+                assert_eq!(std::fs::read_dir(&intent_dir).unwrap().count(), 1);
+                let before = backend.payload_store.sync_barrier_snapshot();
+                backend.remove(87).unwrap();
+                let after = backend.payload_store.sync_barrier_snapshot();
+                assert_eq!(
+                    after.per_put_file_sync_calls,
+                    before.per_put_file_sync_calls
+                );
+                assert_eq!(after.per_put_dir_sync_calls, before.per_put_dir_sync_calls);
+                assert_eq!(
+                    std::fs::read_dir(intent_dir).unwrap().count(),
+                    1,
+                    "an absent retry must not retire the marker for a failed deletion barrier"
+                );
+            }
+            backend.put(90, b"retried", true).unwrap();
+            backend.put(91, b"indexed", true).unwrap();
+            backend.payload_store.fail_next_remove_for_test(90);
+            assert!(backend.remove(90).is_err());
+            backend.remove(90).unwrap();
+            assert!(!layout.payload_object_path(90).exists());
+            backend.payload_store.fail_next_remove_for_test(91);
+            assert!(backend.remove(91).is_err());
+            backend.put(91, b"indexed", false).unwrap();
+            drop(backend);
+
+            let reopened = LocalPayloadBackendRuntime::open_with_reconcile_mode(
+                config,
+                None,
+                sync_mode,
+                LocalPayloadWriteMode::Buffered,
+                LocalPayloadStartupReconcileMode::Lightweight,
+            )
+            .unwrap();
+            assert!(!layout.payload_object_path(90).exists());
+            assert_eq!(reopened.get_for_upload(91).unwrap().as_ref(), b"indexed");
+            assert!(
+                std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -2929,10 +3392,15 @@ mod tests {
             backend.mark_uploading(object_id).unwrap();
         }
 
+        let (wait_started_tx, wait_started_rx) = std::sync::mpsc::channel();
+        *backend.low_space_wait_probe.lock() = Some(wait_started_tx);
         let background = std::sync::Arc::clone(&backend);
         let join = std::thread::spawn(move || {
-            for object_id in 10..20 {
-                std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
+            // Complete one upload per actual wait; keep enough dirty bytes to reject the put.
+            for object_id in 10..10 + LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES as u64 {
+                wait_started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("put did not reach its next progress wait");
                 background.mark_uploaded(object_id).unwrap();
             }
         });

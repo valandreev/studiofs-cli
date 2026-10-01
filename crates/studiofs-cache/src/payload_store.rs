@@ -4,6 +4,7 @@
 
 use std::array;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
 use std::num::NonZeroUsize;
@@ -49,8 +50,8 @@ pub struct PayloadBatchEntry<'a> {
 }
 
 #[derive(Debug)]
-#[must_use = "batch payload commit intents must be completed after the index commit succeeds"]
-/// A handle that completes the payload-side intent for a batched write.
+#[must_use = "payload intents must be completed only after ownership is settled"]
+/// A handle that retires the payload-side recovery intent for a write or removal.
 pub struct PayloadBatchCommit {
     intent_path: PathBuf,
 }
@@ -102,6 +103,8 @@ struct PayloadStoreSharedState {
     read_counters: PayloadReadCounters,
     #[cfg(test)]
     fail_directory_sync: Mutex<Option<PathBuf>>,
+    #[cfg(test)]
+    fail_remove: Mutex<Option<u64>>,
     barrier_counters: SyncBarrierCounters,
 }
 
@@ -170,6 +173,8 @@ impl FilePayloadStore {
                 read_counters: PayloadReadCounters::default(),
                 #[cfg(test)]
                 fail_directory_sync: Mutex::new(None),
+                #[cfg(test)]
+                fail_remove: Mutex::new(None),
                 barrier_counters: SyncBarrierCounters::default(),
             }),
         })
@@ -355,6 +360,15 @@ impl FilePayloadStore {
     /// Checks whether a payload exists for `object_id`.
     pub fn payload_exists(&self, object_id: u64) -> io::Result<bool> {
         self.layout.payload_object_path(object_id).try_exists()
+    }
+
+    /// Includes dangling symlinks, which still require unlink during removal.
+    pub(crate) fn payload_path_exists(&self, object_id: u64) -> io::Result<bool> {
+        match std::fs::symlink_metadata(self.layout.payload_object_path(object_id)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Persists `data` as the payload for `object_id`.
@@ -577,71 +591,112 @@ impl FilePayloadStore {
         })
     }
 
-    /// Removes the payload for `object_id`, if present.
-    pub fn remove(&self, object_id: u64) {
-        self.invalidate_cached_read_handle(object_id);
-        self.shared
-            .pending_grouped_sync
-            .object_ids
-            .lock()
-            .remove(&object_id);
+    /// Removes the payload for `object_id`, if present; reports non-NotFound errors.
+    pub fn remove(&self, object_id: u64) -> Result<(), FilePayloadStoreError> {
+        self.invalidate_runtime_state(&[object_id]);
         let payload_path = self.layout.payload_object_path(object_id);
-        if let Err(error) = std::fs::remove_file(&payload_path)
-            && error.kind() != io::ErrorKind::NotFound
+        #[cfg(test)]
+        if self
+            .shared
+            .fail_remove
+            .lock()
+            .take_if(|id| *id == object_id)
+            .is_some()
         {
-            warn!(
-                object_id,
-                path = %payload_path.display(),
-                error = ?error,
-                "local payload runtime payload remove failed"
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected payload unlink failure",
+            )
+            .into());
+        }
+        match std::fs::remove_file(&payload_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                warn!(
+                    object_id,
+                    path = %payload_path.display(),
+                    error = ?error,
+                    "local payload runtime payload remove failed"
+                );
+                Err(error.into())
+            }
         }
     }
 
-    /// Removes payloads for all `object_ids`.
-    pub fn remove_batch(&self, object_ids: &[u64]) {
+    /// Attempts every payload removal and returns the first non-NotFound error.
+    pub fn remove_batch(&self, object_ids: &[u64]) -> Result<(), FilePayloadStoreError> {
+        let mut first_error = None;
         for object_id in object_ids {
-            self.remove(*object_id);
+            if let Err(error) = self.remove(*object_id) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Clears cached reads and pending object syncs without filesystem deletion.
+    pub(crate) fn invalidate_runtime_state(&self, object_ids: &[u64]) {
+        for &object_id in object_ids {
+            self.invalidate_cached_read_handle(object_id);
+        }
+        let mut pending = self.shared.pending_grouped_sync.object_ids.lock();
+        for object_id in object_ids {
+            pending.remove(object_id);
         }
     }
 
-    /// Removes failed puts' payloads before retiring their shared recovery intent.
+    /// Records final paths before the runtime relinquishes their index ownership.
+    pub(crate) fn prepare_removal(
+        &self,
+        object_ids: &[u64],
+    ) -> Result<PayloadBatchCommit, FilePayloadStoreError> {
+        // Canonical final paths and maximum-width object IDs fit in 129 bytes per record.
+        let mut content = String::with_capacity(27 + object_ids.len() * 129);
+        content.push_str("version=1\nphase=committing\n");
+        for &object_id in object_ids {
+            let relative = self.layout.payload_object_relative_path(object_id);
+            let _ = write!(content, "object={object_id}|final_hex=");
+            write_batch_intent_path_hex(&mut content, &relative);
+            content.push('\n');
+        }
+        let intent_path = self.write_payload_intent(
+            &content,
+            matches!(self.sync_mode, LocalPayloadSyncMode::Durable),
+        )?;
+        Ok(PayloadBatchCommit { intent_path })
+    }
+
+    /// Removes unindexed payloads before retiring their shared recovery intent.
     pub(crate) fn rollback_batch(
         &self,
         object_ids: &[u64],
         commit: PayloadBatchCommit,
     ) -> Result<(), FilePayloadStoreError> {
-        self.remove_batch(object_ids);
-        let mut synced_dirs = HashSet::new();
-        let mut first_error: Option<FilePayloadStoreError> = None;
-        for &object_id in object_ids {
-            match self.payload_exists(object_id) {
-                Ok(true) => {
+        let mut first_error = self.remove_batch(object_ids).err();
+        if matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
+            let mut synced_shards = HashSet::new();
+            for &object_id in object_ids {
+                let payload_path = self.layout.payload_object_path(object_id);
+                let Some(payload_dir) = payload_path.parent() else {
                     first_error.get_or_insert_with(|| {
-                        io::Error::other(format!("payload {object_id} remains after rollback"))
+                        io::Error::new(io::ErrorKind::InvalidInput, "payload path has no parent")
                             .into()
                     });
+                    continue;
+                };
+                // Persist all attempted deletions even when another removal fails.
+                if (object_ids.len() == 1
+                    || synced_shards.insert(LocalPayloadLayout::payload_shard(object_id)))
+                    && let Err(error) = self.sync_directory_put_barrier(payload_dir)
+                {
+                    // A never-created shard has no deletion to persist.
+                    if !matches!(&error, FilePayloadStoreError::Io(error)
+                    if error.kind() == io::ErrorKind::NotFound)
+                    {
+                        first_error.get_or_insert(error);
+                    }
                 }
-                Err(error) => {
-                    first_error.get_or_insert(error.into());
-                }
-                Ok(false) => {}
-            }
-            if !matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
-                continue;
-            }
-            let payload_path = self.layout.payload_object_path(object_id);
-            let Some(payload_dir) = payload_path.parent() else {
-                first_error.get_or_insert_with(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "payload path has no parent").into()
-                });
-                continue;
-            };
-            // Persist all attempted deletions even when another removal fails.
-            if synced_dirs.insert(payload_dir.to_path_buf())
-                && let Err(error) = self.sync_directory_put_barrier(payload_dir)
-            {
-                first_error.get_or_insert(error);
             }
         }
         if let Some(error) = first_error {
@@ -836,48 +891,36 @@ impl FilePayloadStore {
         staged: &[StagedBatchPayload<'_>],
         durable_sync: bool,
     ) -> Result<PathBuf, FilePayloadStoreError> {
-        let intent_dir = self.layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
-        let path = intent_dir.join(format!(
+        let write_intent = || {
+            let mut content = String::new();
+            // Retain the v1 phase header for compatibility; recovery uses index presence.
+            content.push_str("version=1\nphase=committing\n");
+            for entry in staged {
+                let object_id = entry.entry.object_id;
+                let temp = self.intent_relative_path(&entry.temp_path)?;
+                let final_path = self.intent_relative_path(&entry.payload_path)?;
+                let _ = write!(content, "object={object_id}|temp_hex=");
+                write_batch_intent_path_hex(&mut content, temp);
+                content.push_str("|final_hex=");
+                write_batch_intent_path_hex(&mut content, final_path);
+                content.push('\n');
+            }
+            self.write_payload_intent(&content, durable_sync)
+        };
+        write_intent().inspect_err(|_| self.cleanup_staged_batch_payloads(staged))
+    }
+
+    fn write_payload_intent(
+        &self,
+        content: &str,
+        durable_sync: bool,
+    ) -> Result<PathBuf, FilePayloadStoreError> {
+        let parent = self.layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+        let path = parent.join(format!(
             "batch-{}.{}",
             next_batch_intent_token(),
             LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION
         ));
-        if let Err(error) = self.write_batch_payload_intent_file(&path, staged, durable_sync) {
-            self.cleanup_staged_batch_payloads(staged);
-            return Err(error);
-        }
-        Ok(path)
-    }
-
-    fn write_batch_payload_intent_file(
-        &self,
-        path: &Path,
-        staged: &[StagedBatchPayload<'_>],
-        durable_sync: bool,
-    ) -> Result<(), FilePayloadStoreError> {
-        let mut content = String::new();
-        // Retain the v1 phase header for compatibility; recovery uses index presence.
-        content.push_str("version=1\nphase=committing\n");
-        for entry in staged {
-            content.push_str("object=");
-            content.push_str(&entry.entry.object_id.to_string());
-            content.push_str("|temp_hex=");
-            content.push_str(&encode_batch_intent_path_hex(
-                &self.intent_relative_path(&entry.temp_path)?,
-            ));
-            content.push_str("|final_hex=");
-            content.push_str(&encode_batch_intent_path_hex(
-                &self.intent_relative_path(&entry.payload_path)?,
-            ));
-            content.push('\n');
-        }
-
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::other(format!(
-                "batch intent path has no parent directory: {}",
-                path.display()
-            ))
-        })?;
         let temp_path = parent.join(format!("{}.tmp", next_batch_intent_token()));
         let result = (|| {
             let mut temp_file = File::create(&temp_path)?;
@@ -890,13 +933,13 @@ impl FilePayloadStore {
                     .fetch_add(1, Ordering::Relaxed);
             }
             drop(temp_file);
-            platform::rename_atomic(&temp_path, path)?;
-            if durable_sync && let Err(error) = self.sync_directory_put_barrier(parent) {
-                // Payload rename has not started, so this marker owns no final output.
-                let _ = std::fs::remove_file(path);
+            platform::rename_atomic(&temp_path, &path)?;
+            if durable_sync && let Err(error) = self.sync_directory_put_barrier(&parent) {
+                // No payload or index mutation has started, so this marker owns no output.
+                let _ = std::fs::remove_file(&path);
                 return Err(error);
             }
-            Ok(())
+            Ok(path)
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(temp_path);
@@ -904,14 +947,14 @@ impl FilePayloadStore {
         result
     }
 
-    fn intent_relative_path(&self, path: &Path) -> Result<String, FilePayloadStoreError> {
+    fn intent_relative_path<'a>(&self, path: &'a Path) -> Result<&'a Path, FilePayloadStoreError> {
         let relative = path.strip_prefix(&self.layout.runtime_root).map_err(|_| {
             io::Error::other(format!(
                 "batch intent path is outside runtime root: {}",
                 path.display()
             ))
         })?;
-        Ok(relative.to_string_lossy().replace('\\', "/"))
+        Ok(relative)
     }
 
     #[cfg(test)]
@@ -1345,6 +1388,11 @@ impl FilePayloadStore {
         *self.shared.fail_directory_sync.lock() = Some(dir.to_path_buf());
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_remove_for_test(&self, object_id: u64) {
+        *self.shared.fail_remove.lock() = Some(object_id);
+    }
+
     fn sync_directory_grouped_barrier(&self, dir: &Path) -> Result<(), FilePayloadStoreError> {
         match platform::sync_directory(dir) {
             Ok(()) => {
@@ -1668,18 +1716,70 @@ fn remove_batch_payload_intent(path: &Path) {
     }
 }
 
-fn encode_batch_intent_path_hex(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        use std::fmt::Write as _;
-        let _ = write!(&mut encoded, "{byte:02x}");
+fn write_batch_intent_path_hex(content: &mut String, path: &Path) {
+    for &byte in path.to_string_lossy().as_bytes() {
+        let byte = if byte == b'\\' { b'/' } else { byte };
+        let _ = write!(content, "{byte:02x}");
     }
-    encoded
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sfs754_batch_removal_logs_each_failed_object_with_path_and_os_error() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        for object_id in [90, 91] {
+            // A directory at the file path makes unlink fail on every supported OS.
+            std::fs::create_dir_all(layout.payload_object_path(object_id)).unwrap();
+        }
+        store.put(93, b"removed").unwrap();
+        let log_path = temp.path().join("removal.log");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(Arc::new(File::create(&log_path).unwrap()))
+            .finish();
+
+        let result =
+            tracing::subscriber::with_default(subscriber, || store.remove_batch(&[90, 91, 92, 93]));
+        assert!(matches!(result, Err(FilePayloadStoreError::Io(_))));
+        assert!(!layout.payload_object_path(93).exists());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(log.lines().count(), 2, "{log}");
+        for object_id in [90, 91] {
+            let path = layout.payload_object_path(object_id);
+            let error = std::fs::remove_file(&path).unwrap_err();
+            let line = log
+                .lines()
+                .find(|line| line.contains(&format!("object_id={object_id}")))
+                .unwrap();
+            assert!(line.contains(&format!("path={}", path.display())), "{line}");
+            assert!(line.contains(&format!("error={error:?}")), "{line}");
+            assert!(line.contains("WARN"), "{line}");
+        }
+    }
+
+    #[test]
+    fn sfs754_put_intent_path_error_cleans_uncommitted_staging() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+        let mut layout = LocalPayloadLayout::from_cache_root(temp.path().join("runtime"));
+        layout.tmp_dir = temp.path().join("outside-runtime");
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+
+        assert!(store.put(90, b"uncommitted").is_err());
+        assert!(!layout.payload_object_path(90).exists());
+        assert!(
+            std::fs::read_dir(&layout.tmp_dir)
+                .unwrap()
+                .all(|entry| entry.unwrap().path().is_dir()),
+            "intent serialization failure left an uncommitted staged payload"
+        );
+    }
 
     #[test]
     fn write_and_cold_reopen_roundtrip() {
