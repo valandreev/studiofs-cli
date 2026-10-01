@@ -4860,6 +4860,7 @@ name = "studiofs-bridge"
 version = "0.1.1"
 dependencies = [
  "libc",
+ "studiofs-cache",
  "studiofs-meta",
  "studiofs-vfs",
 ]
@@ -5061,6 +5062,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "parking_lot",
+ "studiofs-cache",
  "studiofs-data",
  "studiofs-meta",
  "studiofs-test-support",

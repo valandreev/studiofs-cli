@@ -28,6 +28,13 @@ Both bridges follow the same pattern:
 3. Call `StudioVfs` (via `rt.block_on()`)
 4. Convert the result back to OS-specific response
 
+Local payload capacity exhaustion and OS disk-full errors use the shared VFS
+`StorageFull` category, including errors retained through local payload and
+writer materialization sources. POSIX adapters return `ENOSPC`; WinFSP returns
+`STATUS_DISK_FULL`. Resource pressure already classified as
+`InsufficientResources` keeps `ENOMEM` / `STATUS_INSUFFICIENT_RESOURCES`,
+and unrelated failures keep their existing mappings.
+
 Path walks are centralized in VFS `NamespaceResolver`:
 - WinFSP uses `NamespacePathStyle::Windows` for full-path and parent resolution.
 - macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.

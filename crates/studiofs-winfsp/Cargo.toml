@@ -18,6 +18,7 @@ thiserror.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
+studiofs-cache.workspace = true
 studiofs-data.workspace = true
 tempfile.workspace = true
 dotenvy.workspace = true

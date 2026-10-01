@@ -40,6 +40,8 @@ pub enum BridgeVfsErrorKind {
     RemoteUnavailable,
     /// Insufficient resources are available to satisfy the request.
     InsufficientResources,
+    /// Local storage capacity is exhausted.
+    StorageFull,
     /// Persistent corruption was detected in metadata, data, or payload.
     DataCorruption,
     /// Internal runtime failure interrupted request processing.
@@ -63,6 +65,9 @@ pub struct BridgeAttrTimes {
 
 /// Maps an internal [`VfsError`] to a bridge error kind.
 pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
+    if has_storage_full_source(error) {
+        return BridgeVfsErrorKind::StorageFull;
+    }
     match error {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
         VfsError::Io(io_error) => classify_io_error(io_error.kind()),
@@ -82,12 +87,28 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     }
 }
 
+fn has_storage_full_source(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::StorageFull)
+            || matches!(
+                error.downcast_ref::<LocalPayloadBackendError>(),
+                Some(LocalPayloadBackendError::CapacityExhausted { .. })
+            )
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 fn classify_local_payload_error(error: &LocalPayloadBackendError) -> BridgeVfsErrorKind {
     match error {
         LocalPayloadBackendError::Io(io_error) => classify_io_error(io_error.kind()),
-        LocalPayloadBackendError::CapacityExhausted { .. } => {
-            BridgeVfsErrorKind::InsufficientResources
-        }
+        LocalPayloadBackendError::CapacityExhausted { .. } => BridgeVfsErrorKind::StorageFull,
         LocalPayloadBackendError::Other(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
     }
 }
@@ -240,6 +261,79 @@ mod tests {
     }
 
     #[test]
+    fn storage_full_local_capacity_is_distinct_from_memory_pressure() {
+        let error = crate::VfsError::LocalPayload(LocalPayloadBackendError::CapacityExhausted {
+            needed: 4,
+            free: 0,
+        });
+        assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::StorageFull);
+    }
+
+    #[test]
+    fn storage_full_io_errors_keep_their_sources() {
+        for error in [
+            crate::VfsError::Io(std::io::Error::from(ErrorKind::StorageFull)),
+            crate::VfsError::LocalPayload(LocalPayloadBackendError::Io(std::io::Error::from(
+                ErrorKind::StorageFull,
+            ))),
+            crate::VfsError::UploadStage(UploadStageStoreError::Io(std::io::Error::from(
+                ErrorKind::StorageFull,
+            ))),
+            crate::VfsError::LocalPayload(LocalPayloadBackendError::Other(Box::new(
+                studiofs_cache::runtime::FilePayloadStoreError::Io(std::io::Error::from(
+                    ErrorKind::StorageFull,
+                )),
+            ))),
+        ] {
+            assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::StorageFull);
+            let mut source: &(dyn std::error::Error + 'static) = &error;
+            while source.downcast_ref::<std::io::Error>().is_none() {
+                source = source.source().expect("I/O source must be retained");
+            }
+            assert_eq!(
+                source.downcast_ref::<std::io::Error>().unwrap().kind(),
+                ErrorKind::StorageFull,
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_full_native_windows_errors_are_classified() {
+        // ERROR_HANDLE_DISK_FULL and ERROR_DISK_FULL.
+        for code in [39, 112] {
+            let error = crate::VfsError::Io(std::io::Error::from_raw_os_error(code));
+            assert_eq!(classify_vfs_error(&error), BridgeVfsErrorKind::StorageFull);
+            let crate::VfsError::Io(source) = error else {
+                unreachable!();
+            };
+            assert_eq!(source.raw_os_error(), Some(code));
+        }
+    }
+
+    #[test]
+    fn storage_full_classification_preserves_unrelated_errors() {
+        for kind in [
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+            ErrorKind::WriteZero,
+        ] {
+            let error = crate::VfsError::Io(std::io::Error::from(kind));
+            assert_eq!(
+                classify_vfs_error(&error),
+                BridgeVfsErrorKind::GenericFailure
+            );
+            let wrapped = crate::VfsError::LocalPayload(LocalPayloadBackendError::Other(Box::new(
+                studiofs_cache::runtime::FilePayloadStoreError::Io(std::io::Error::from(kind)),
+            )));
+            assert_eq!(
+                classify_vfs_error(&wrapped),
+                BridgeVfsErrorKind::CriticalRuntimeFailure
+            );
+        }
+    }
+
+    #[test]
     fn classify_metadata_persistence_degradation_as_io_failure() {
         let degraded = crate::VfsError::MetadataPersistenceDegraded;
 
@@ -386,7 +480,7 @@ mod tests {
             });
         assert_eq!(
             classify_vfs_error(&local_capacity),
-            BridgeVfsErrorKind::InsufficientResources
+            BridgeVfsErrorKind::StorageFull
         );
 
         let stage_timeout = crate::VfsError::UploadStage(UploadStageStoreError::Io(

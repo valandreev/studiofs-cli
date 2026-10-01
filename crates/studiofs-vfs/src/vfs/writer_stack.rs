@@ -132,10 +132,26 @@ pub(super) enum WriterStackError {
     WriteTooLarge,
     #[error("writer stack object reservation exceeds u32::MAX")]
     ObjectReservationTooLarge,
-    #[error("cached-store writer failed: {0}")]
-    CachedStore(#[from] CachedStoreWriterError),
+    #[error("cached-store writer failed: {source}")]
+    CachedStore {
+        #[source]
+        source: Arc<CachedStoreWriterError>,
+    },
     #[error("sticky writer error for inode {ino}: {message}")]
-    Sticky { ino: Ino, message: String },
+    Sticky {
+        ino: Ino,
+        message: String,
+        #[source]
+        source: Option<Arc<CachedStoreWriterError>>,
+    },
+}
+
+impl From<CachedStoreWriterError> for WriterStackError {
+    fn from(error: CachedStoreWriterError) -> Self {
+        Self::CachedStore {
+            source: Arc::new(error),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -173,6 +189,7 @@ struct FileWriter {
     dirty_bytes: usize,
     last_write: Instant,
     sticky_error: Option<String>,
+    sticky_error_source: Option<Arc<CachedStoreWriterError>>,
 }
 
 #[derive(Default)]
@@ -309,6 +326,7 @@ impl MountedWriterStack {
                     dirty_bytes: 0,
                     last_write: Instant::now(),
                     sticky_error: None,
+                    sticky_error_source: None,
                 }))
             }))
         };
@@ -317,6 +335,7 @@ impl MountedWriterStack {
             return Err(WriterStackError::Sticky {
                 ino: spec.ino,
                 message,
+                source: file.sticky_error_source.clone(),
             });
         }
         if file.next_object_id < spec.first_object_id {
@@ -1110,11 +1129,13 @@ impl MountedWriterStack {
                     dirty_bytes: 0,
                     last_write: Instant::now(),
                     sticky_error: None,
+                    sticky_error_source: None,
                 }))
             }))
         };
         let mut file = file.lock();
         file.sticky_error = Some(message.into());
+        file.sticky_error_source = None;
     }
 
     pub(super) fn total_dirty_bytes(&self) -> usize {
@@ -1146,8 +1167,13 @@ impl MountedWriterStack {
             return Ok(());
         }
         if let Err(error) = self.cached_store.persist_detached_staged_slices(detached) {
-            self.set_sticky_error(ino, format!("writer stack materialization failed: {error}"));
-            return Err(WriterStackError::CachedStore(error));
+            let source = Arc::new(error);
+            self.set_sticky_error(
+                ino,
+                format!("writer stack materialization failed: {source}"),
+                Some(Arc::clone(&source)),
+            );
+            return Err(WriterStackError::CachedStore { source });
         }
         self.clear_pending_materialization_object_ids(ino, &object_ids);
         Ok(())
@@ -1181,18 +1207,26 @@ impl MountedWriterStack {
             });
             if !has_pending_materialization {
                 file.sticky_error = None;
+                file.sticky_error_source = None;
             }
         }
         self.remove_file_if_clean_and_closed(ino);
     }
 
-    fn set_sticky_error(&self, ino: Ino, message: impl Into<String>) {
+    fn set_sticky_error(
+        &self,
+        ino: Ino,
+        message: impl Into<String>,
+        source: Option<Arc<CachedStoreWriterError>>,
+    ) {
         let file = {
             let shard = self.shards[Self::inode_shard_index(ino)].lock();
             shard.files.get(&ino).cloned()
         };
         if let Some(file) = file {
-            file.lock().sticky_error = Some(message.into());
+            let mut file = file.lock();
+            file.sticky_error = Some(message.into());
+            file.sticky_error_source = source;
         }
     }
 
@@ -1377,9 +1411,7 @@ mod tests {
                 })
                 .is_ok();
             if failed {
-                return Err(LocalPayloadBackendError::Other(Box::new(
-                    std::io::Error::other("transient local payload failure"),
-                )));
+                return Err(LocalPayloadBackendError::CapacityExhausted { needed: 4, free: 0 });
             }
             Ok(())
         }
@@ -2016,7 +2048,9 @@ mod tests {
 
         assert!(matches!(
             err,
-            WriterStackError::CachedStore(CachedStoreWriterError::BufferLimitExceeded { .. })
+            WriterStackError::CachedStore {
+                source: error,
+            } if matches!(error.as_ref(), CachedStoreWriterError::BufferLimitExceeded { .. })
         ));
         assert_eq!(stack.visible_len(7), Some(0));
         assert!(!stack.has_dirty_writers(7));
@@ -2240,5 +2274,58 @@ mod tests {
         stack
             .write_bytes(write_spec(1, 7, 4, 701), Bytes::from_static(b"more"))
             .expect("successful retry clears sticky writer error");
+    }
+
+    #[test]
+    fn storage_full_remains_on_writer_stack_sticky_write() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000294")
+                .expect("open backend")
+                .backend;
+        let failing_backend = Arc::new(TransientFailingPutBackend::new(backend, 1));
+        let (store, _rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), failing_backend)
+            .expect("open store");
+        let stack = MountedWriterStack::new(
+            store,
+            WriterStackConfig {
+                block_size: 4,
+                chunk_size: 16,
+                page_size: 4,
+                dirty_byte_limit: None,
+                max_buffer_bytes: None,
+            },
+        );
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"data"))
+            .expect("write initial block");
+        let materialization_error = stack
+            .finish_inode(7)
+            .expect_err("capacity failure during materialization");
+        assert!(error_chain_has_capacity_exhausted(&materialization_error));
+
+        let sticky_error = stack
+            .write_bytes(write_spec(1, 7, 4, 701), Bytes::from_static(b"more"))
+            .expect_err("failed materialization blocks follow-up writes");
+        assert!(matches!(
+            sticky_error,
+            WriterStackError::Sticky { ino: 7, .. }
+        ));
+        assert!(error_chain_has_capacity_exhausted(&sticky_error));
+    }
+
+    fn error_chain_has_capacity_exhausted(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if matches!(
+                error.downcast_ref::<LocalPayloadBackendError>(),
+                Some(LocalPayloadBackendError::CapacityExhausted { .. })
+            ) {
+                return true;
+            }
+            current = error.source();
+        }
+        false
     }
 }
