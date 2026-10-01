@@ -612,6 +612,25 @@ impl FilePayloadStore {
         }
     }
 
+    /// Removes a failed put's payload before retiring its recovery intent.
+    pub(crate) fn rollback_put(&self, object_id: u64, commit: PayloadBatchCommit) {
+        self.remove(object_id);
+        if !matches!(self.payload_exists(object_id), Ok(false)) {
+            return;
+        }
+        if matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
+            let payload_path = self.layout.payload_object_path(object_id);
+            let Some(payload_dir) = payload_path.parent() else {
+                return;
+            };
+            // Persist deletion before discarding the evidence needed for recovery.
+            if self.sync_directory_put_barrier(payload_dir).is_err() {
+                return;
+            }
+        }
+        commit.complete();
+    }
+
     /// Flushes and syncs pending payload writes according to the configured sync mode.
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
         if matches!(self.sync_mode, LocalPayloadSyncMode::Fast) {

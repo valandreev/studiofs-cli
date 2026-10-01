@@ -1032,10 +1032,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             },
             evictable,
         }) {
-            self.payload_store.remove(object_id);
-            if matches!(self.payload_store.payload_exists(object_id), Ok(false)) {
-                payload_commit.complete();
-            }
+            self.payload_store.rollback_put(object_id, payload_commit);
             warn!(
                 object_id,
                 volume_uuid = ?self.volume_uuid,
@@ -1919,30 +1916,56 @@ mod tests {
 
     #[test]
     fn sfs753_failed_index_put_clears_intent_after_payload_rollback() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-");
-        let layout = LocalPayloadLayout::from_cache_root(temp.path());
-        create_v3_marker(&layout);
-        let config = LocalPayloadBackendConfig {
-            cache_root: temp.path().to_path_buf(),
-            volume_uuid: [0x76; 16],
-        };
-        let backend = LocalPayloadBackendRuntime::open(config.clone()).unwrap();
-        backend.put(1, b"kept", false).unwrap();
-        for object_id in 10..13 {
-            backend.fail_next_index_write_for_test();
-            assert!(backend.put(object_id, b"failed", false).is_err());
-            assert!(backend.index.get_entry(object_id).unwrap().is_none());
-            assert!(!layout.payload_object_path(object_id).exists());
-            assert!(
-                std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
-                    .unwrap()
-                    .next()
-                    .is_none()
-            );
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("test-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let config = LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x76; 16],
+            };
+            let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                config.clone(),
+                None,
+                sync_mode,
+            )
+            .unwrap();
+            backend.put(1, b"kept", false).unwrap();
+            for object_id in 10..13 {
+                let before = backend
+                    .payload_store
+                    .sync_barrier_snapshot()
+                    .per_put_dir_sync_calls;
+                backend.fail_next_index_write_for_test();
+                assert!(backend.put(object_id, b"failed", false).is_err());
+                assert_eq!(
+                    backend
+                        .payload_store
+                        .sync_barrier_snapshot()
+                        .per_put_dir_sync_calls
+                        - before,
+                    if sync_mode == LocalPayloadSyncMode::Durable {
+                        4
+                    } else {
+                        0
+                    },
+                    "Durable rollback must persist payload deletion before retiring the intent"
+                );
+                assert!(backend.index.get_entry(object_id).unwrap().is_none());
+                assert!(!layout.payload_object_path(object_id).exists());
+                assert!(
+                    std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                        .unwrap()
+                        .next()
+                        .is_none()
+                );
+            }
+            drop(backend);
+            let reopened =
+                LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(config, None, sync_mode)
+                    .unwrap();
+            assert_eq!(reopened.get_for_upload(1).unwrap().as_ref(), b"kept");
         }
-        drop(backend);
-        let reopened = LocalPayloadBackendRuntime::open(config).unwrap();
-        assert_eq!(reopened.get_for_upload(1).unwrap().as_ref(), b"kept");
     }
 
     #[test]
