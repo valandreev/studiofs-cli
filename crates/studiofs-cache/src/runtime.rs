@@ -1685,11 +1685,20 @@ mod tests {
 
     #[test]
     fn sfs754_foreground_eviction_coalesces_and_bounds_sync_barriers() {
-        // 107 and 632 share shard 23/02; IDs 1..=129 occupy distinct shards.
-        for (object_ids, file_syncs, dir_syncs) in [
-            (vec![107, 632], 3, 5),
-            ((1..=129).collect::<Vec<_>>(), 4, 134),
+        // Preserve both a shared-shard fixture and a fixture with 129 distinct shards.
+        for (object_ids, expected_shards, file_syncs, dir_syncs) in [
+            (vec![107, 632], 1, 3, 5),
+            ((1..=129).collect::<Vec<_>>(), 129, 4, 134),
         ] {
+            assert_eq!(
+                object_ids
+                    .iter()
+                    .map(|&id| LocalPayloadLayout::payload_shard(id))
+                    .collect::<HashSet<_>>()
+                    .len(),
+                expected_shards,
+                "eviction barrier fixture shard distribution changed; update object IDs"
+            );
             for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
                 let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
                 let layout = LocalPayloadLayout::from_cache_root(temp.path());
