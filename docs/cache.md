@@ -81,7 +81,7 @@ On backend startup, reconciliation runs before serving reads/writes:
    hardlinks survive regardless of upload lifecycle state.
 2. Lightweight mode removes unindexed final payloads only at paths named by
    put intents. Optional full sweep
-   (`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`) additionally removes
+   (`STUDIOFS_LOCAL_PAYLOAD_STARTUP_RECONCILE_MODE=full`) additionally removes
    stale index rows and scans for orphan payload files, including historical
    orphans without a put intent.
 3. VFS startup replay scans local metadata and durable local payload state,
@@ -102,6 +102,13 @@ the intent without adding file or directory syncs. A failed index commit retires
 its intent only after confirming payload removal; Durable mode adds a fourth
 directory barrier to persist deletion first. These operation counts do not establish mounted
 throughput or wall-clock cost.
+
+Single and batch index failures share this rollback path. Payloads with an
+existing index row are retained; only unindexed outputs are removed. Failed
+index checks, payload removal, or directory barriers retain the intent for
+startup recovery and produce a rollback warning. Object IDs identify immutable
+content: retrying or rehydrating the same bytes may reuse an ID, while changed
+content requires a fresh ID.
 
 Recovery is deliberately bounded by the local durability boundary. Bytes that
 only lived in writer memory before `flush`, `fsync`, close/release, or another

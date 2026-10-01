@@ -135,7 +135,6 @@ struct BatchIntentRecoveryReport {
 
 #[derive(Debug, Default)]
 struct BatchPayloadIntent {
-    phase: String,
     objects: Vec<BatchPayloadIntentObject>,
 }
 
@@ -206,10 +205,6 @@ fn read_batch_payload_intent(
                 return Ok(None);
             }
             saw_version = true;
-            continue;
-        }
-        if let Some(phase) = line.strip_prefix("phase=") {
-            intent.phase = phase.to_string();
             continue;
         }
         if let Some(row) = line.strip_prefix("object=")

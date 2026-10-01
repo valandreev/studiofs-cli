@@ -612,23 +612,35 @@ impl FilePayloadStore {
         }
     }
 
-    /// Removes a failed put's payload before retiring its recovery intent.
-    pub(crate) fn rollback_put(&self, object_id: u64, commit: PayloadBatchCommit) {
-        self.remove(object_id);
-        if !matches!(self.payload_exists(object_id), Ok(false)) {
-            return;
-        }
-        if matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
+    /// Removes failed puts' payloads before retiring their shared recovery intent.
+    pub(crate) fn rollback_batch(
+        &self,
+        object_ids: &[u64],
+        commit: PayloadBatchCommit,
+    ) -> Result<(), FilePayloadStoreError> {
+        self.remove_batch(object_ids);
+        let mut synced_dirs = HashSet::new();
+        for &object_id in object_ids {
+            if self.payload_exists(object_id)? {
+                return Err(io::Error::other(format!(
+                    "payload {object_id} remains after rollback"
+                ))
+                .into());
+            }
+            if !matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
+                continue;
+            }
             let payload_path = self.layout.payload_object_path(object_id);
-            let Some(payload_dir) = payload_path.parent() else {
-                return;
-            };
+            let payload_dir = payload_path.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "payload path has no parent")
+            })?;
             // Persist deletion before discarding the evidence needed for recovery.
-            if self.sync_directory_put_barrier(payload_dir).is_err() {
-                return;
+            if synced_dirs.insert(payload_dir.to_path_buf()) {
+                self.sync_directory_put_barrier(payload_dir)?;
             }
         }
         commit.complete();
+        Ok(())
     }
 
     /// Flushes and syncs pending payload writes according to the configured sync mode.
@@ -2131,6 +2143,38 @@ mod tests {
 
         assert_eq!(attempts, 2);
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn sfs753_failed_payload_removal_retains_intent_and_reports_error() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("test-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            let store = FilePayloadStore::open_with_sync_mode(layout.clone(), sync_mode).unwrap();
+            let commit = store
+                .put_batch(&[
+                    PayloadBatchEntry {
+                        object_id: 90,
+                        data: b"blocked",
+                    },
+                    PayloadBatchEntry {
+                        object_id: 91,
+                        data: b"removed",
+                    },
+                ])
+                .unwrap();
+            let intent_path = commit.intent_path.clone();
+            let blocked_path = layout.payload_object_path(90);
+            std::fs::remove_file(&blocked_path).unwrap();
+            std::fs::create_dir(&blocked_path).unwrap();
+            assert!(store.rollback_batch(&[90, 91], commit).is_err());
+            assert!(
+                intent_path.exists(),
+                "failed rollback discarded recovery evidence"
+            );
+            assert!(blocked_path.is_dir());
+            assert!(!layout.payload_object_path(91).exists());
+        }
     }
 
     #[test]

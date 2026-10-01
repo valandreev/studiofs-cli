@@ -324,6 +324,8 @@ impl CacheIndex {
         if updates.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {

@@ -359,6 +359,22 @@ impl LocalPayloadBackendRuntime {
         payload_sync_mode: LocalPayloadSyncMode,
         payload_write_mode: LocalPayloadWriteMode,
     ) -> Result<Self, LocalPayloadBackendOpenError> {
+        Self::open_with_reconcile_mode(
+            config,
+            cache_budget_bytes,
+            payload_sync_mode,
+            payload_write_mode,
+            LocalPayloadStartupReconcileMode::from_env(),
+        )
+    }
+
+    fn open_with_reconcile_mode(
+        config: LocalPayloadBackendConfig,
+        cache_budget_bytes: Option<u64>,
+        payload_sync_mode: LocalPayloadSyncMode,
+        payload_write_mode: LocalPayloadWriteMode,
+        startup_reconcile_mode: LocalPayloadStartupReconcileMode,
+    ) -> Result<Self, LocalPayloadBackendOpenError> {
         let layout = LocalPayloadLayout::from_cache_root(&config.cache_root);
         if !layout.payload_objects_dir.try_exists()?
             || !layout.upload_stage_objects_dir.try_exists()?
@@ -387,7 +403,6 @@ impl LocalPayloadBackendRuntime {
             source,
         })?;
 
-        let startup_reconcile_mode = LocalPayloadStartupReconcileMode::from_env();
         let startup_reconcile_report =
             reconcile_startup_state(&layout, &index, startup_reconcile_mode).map_err(|source| {
                 LocalPayloadBackendOpenError::StartupReconcile {
@@ -433,6 +448,27 @@ impl LocalPayloadBackendRuntime {
             #[cfg(test)]
             stop_next_put_before_index: AtomicBool::new(false),
         })
+    }
+
+    fn rollback_failed_index_put(
+        &self,
+        object_ids: &[u64],
+        commit: file_payload_store::PayloadBatchCommit,
+    ) -> Result<(), LocalPayloadBackendError> {
+        let mut unindexed = Vec::new();
+        for &object_id in object_ids {
+            if self
+                .index
+                .get_entry(object_id)
+                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
+                .is_none()
+            {
+                unindexed.push(object_id);
+            }
+        }
+        self.payload_store
+            .rollback_batch(&unindexed, commit)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
     }
 
     fn has_index_entry(&self, object_id: u64) -> bool {
@@ -1032,12 +1068,17 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             },
             evictable,
         }) {
-            self.payload_store.rollback_put(object_id, payload_commit);
+            if let Err(rollback_error) =
+                self.rollback_failed_index_put(&[object_id], payload_commit)
+            {
+                warn!(object_id, error = ?rollback_error,
+                    "local payload runtime rollback failed; retained recovery intent");
+            }
             warn!(
                 object_id,
                 volume_uuid = ?self.volume_uuid,
                 error = ?error,
-                "local payload runtime index upsert failed after payload write; removed payload for rollback"
+                "local payload runtime index upsert failed after payload write; attempted payload rollback"
             );
             return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
@@ -1152,11 +1193,16 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 .iter()
                 .map(|entry| entry.object_id)
                 .collect();
-            self.payload_store.remove_batch(&written_object_ids);
+            if let Err(rollback_error) =
+                self.rollback_failed_index_put(&written_object_ids, batch_commit)
+            {
+                warn!(object_count = persisted_entries.len(), error = ?rollback_error,
+                    "local payload runtime batch rollback failed; retained recovery intent");
+            }
             warn!(
                 object_count = persisted_entries.len(),
                 error = ?error,
-                "local payload runtime batch index upsert failed after payload writes; removed payloads for rollback"
+                "local payload runtime batch index upsert failed after payload writes; attempted payload rollback"
             );
             return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
@@ -1969,12 +2015,126 @@ mod tests {
     }
 
     #[test]
+    fn sfs753_failed_index_batch_clears_intent_after_payload_rollback() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("test-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let config = LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x77; 16],
+            };
+            let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                config.clone(),
+                None,
+                sync_mode,
+            )
+            .unwrap();
+            backend.put(1, b"kept", false).unwrap();
+            for first_id in [0x100, 0x200, 0x300] {
+                let entries: Vec<_> = [first_id, first_id + 1]
+                    .into_iter()
+                    .map(|object_id| LocalPayloadPut {
+                        object_id,
+                        data: Bytes::from_static(b"failed"),
+                        evictable: false,
+                    })
+                    .collect();
+                let shard_count = entries
+                    .iter()
+                    .map(|entry| {
+                        layout
+                            .payload_object_path(entry.object_id)
+                            .parent()
+                            .unwrap()
+                            .to_path_buf()
+                    })
+                    .collect::<HashSet<_>>()
+                    .len() as u64;
+                let before = backend
+                    .payload_store
+                    .sync_barrier_snapshot()
+                    .per_put_dir_sync_calls;
+                backend.fail_next_index_write_for_test();
+                assert!(backend.put_batch(&entries).is_err());
+                assert_eq!(
+                    backend
+                        .payload_store
+                        .sync_barrier_snapshot()
+                        .per_put_dir_sync_calls
+                        - before,
+                    if sync_mode == LocalPayloadSyncMode::Durable {
+                        2 + 2 * shard_count
+                    } else {
+                        0
+                    },
+                    "Durable batch rollback must persist deletion in every payload shard"
+                );
+                for entry in &entries {
+                    assert!(backend.index.get_entry(entry.object_id).unwrap().is_none());
+                    assert!(!layout.payload_object_path(entry.object_id).exists());
+                }
+                assert!(
+                    std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                        .unwrap()
+                        .next()
+                        .is_none(),
+                    "failed batch left a stale intent"
+                );
+            }
+            drop(backend);
+            let reopened =
+                LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(config, None, sync_mode)
+                    .unwrap();
+            assert_eq!(reopened.get_for_upload(1).unwrap().as_ref(), b"kept");
+        }
+    }
+
+    #[test]
+    fn sfs753_failed_repeat_put_preserves_indexed_pending_payload() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            for batch in [false, true] {
+                let temp = studiofs_test_support::workspace_target_tempdir("test-");
+                let layout = LocalPayloadLayout::from_cache_root(temp.path());
+                create_v3_marker(&layout);
+                let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                    LocalPayloadBackendConfig {
+                        cache_root: temp.path().to_path_buf(),
+                        volume_uuid: [0x78; 16],
+                    },
+                    None,
+                    sync_mode,
+                )
+                .unwrap();
+                backend.put(1, b"pending", false).unwrap();
+                let original = backend.index.get_entry(1).unwrap().unwrap();
+                backend.fail_next_index_write_for_test();
+                let result = if batch {
+                    backend.put_batch(&[
+                        LocalPayloadPut {
+                            object_id: 1,
+                            data: Bytes::from_static(b"pending"),
+                            evictable: false,
+                        },
+                        LocalPayloadPut {
+                            object_id: 2,
+                            data: Bytes::from_static(b"new"),
+                            evictable: false,
+                        },
+                    ])
+                } else {
+                    backend.put(1, b"pending", false)
+                };
+                assert!(result.is_err());
+                assert_eq!(backend.get_for_upload(1).unwrap().as_ref(), b"pending");
+                assert!(backend.index.get_entry(1).unwrap().unwrap() == original);
+                assert!(!layout.payload_object_path(2).exists());
+            }
+        }
+    }
+
+    #[test]
     fn sfs753_single_put_crash_recovery_is_lightweight_and_repeatable() {
-        assert_eq!(
-            LocalPayloadStartupReconcileMode::from_env(),
-            LocalPayloadStartupReconcileMode::Lightweight,
-            "this regression exercises the default startup mode"
-        );
         for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
             let temp = studiofs_test_support::workspace_target_tempdir("test-");
             let layout = LocalPayloadLayout::from_cache_root(temp.path());
@@ -1983,10 +2143,12 @@ mod tests {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x75; 16],
             };
-            let mut backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+            let mut backend = LocalPayloadBackendRuntime::open_with_reconcile_mode(
                 config.clone(),
                 None,
                 sync_mode,
+                LocalPayloadWriteMode::Buffered,
+                LocalPayloadStartupReconcileMode::Lightweight,
             )
             .unwrap();
             backend.put(1, b"indexed", true).unwrap();
@@ -2013,10 +2175,12 @@ mod tests {
                 assert!(backend.index.get_entry(object_id).unwrap().is_none());
                 drop(backend);
 
-                backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                backend = LocalPayloadBackendRuntime::open_with_reconcile_mode(
                     config.clone(),
                     None,
                     sync_mode,
+                    LocalPayloadWriteMode::Buffered,
+                    LocalPayloadStartupReconcileMode::Lightweight,
                 )
                 .unwrap();
                 for orphan_id in 100..=object_id {

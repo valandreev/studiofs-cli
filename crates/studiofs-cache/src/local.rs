@@ -128,6 +128,9 @@ pub trait LocalPayloadBackend: Send + Sync {
 
     /// Persists payload data for `object_id`.
     ///
+    /// An object ID names immutable content: repeated puts must use the same
+    /// bytes, and changed content requires a fresh ID.
+    ///
     /// `evictable` expresses whether the backend may evict the payload under
     /// storage pressure (subject to backend-specific constraints).
     fn put(
