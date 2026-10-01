@@ -668,6 +668,7 @@ pub struct SliceOrder(pub u64);
 ///
 /// Ranges are half-open: `[start, end)`. Use [`Self::new`] to validate bounds;
 /// deserialization rejects empty, reversed, and out-of-chunk ranges.
+/// Construction and deserialization both use the fixed [`DEFAULT_CHUNK_SIZE`].
 /// Public fields still permit unchecked in-memory construction and mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SliceRange {
