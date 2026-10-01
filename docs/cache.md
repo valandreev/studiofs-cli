@@ -130,12 +130,19 @@ intent: a redb commit error may arrive after the index changes became durable.
 Startup checks actual index ownership before removing any file.
 After successful index removal, unlink errors propagate to
 the caller and retain the intent; the index no longer advertises those payloads.
-Batch cleanup attempts every unlink and returns the first error. NotFound is
+Batch cleanup attempts every unlink, logs each non-NotFound failure with its
+object ID, path and OS error, and returns the first error. NotFound is
 idempotent, including for a never-created payload shard. Durable mode syncs the
 intent before index removal and each touched payload directory before retiring
 it; Fast mode adds no sync barriers. Failed directory barriers also retain the
 intent. Callers can retry removal immediately, and lightweight startup retires
 outstanding markers while preserving any payload that has since been reindexed.
+Removal of IDs absent from both the index and disk skips intent persistence,
+index writes and directory barriers under the mutation gates, while still
+clearing runtime pins, access touches and cached read handles. Presence-check
+errors propagate rather than being treated as absence. Outstanding markers are
+replayed only before startup begins serving operations; a successful live retry
+can leave an older marker until the next startup.
 
 Recovery is deliberately bounded by the local durability boundary. Bytes that
 only lived in writer memory before `flush`, `fsync`, close/release, or another

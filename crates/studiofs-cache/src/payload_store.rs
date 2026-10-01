@@ -608,7 +608,15 @@ impl FilePayloadStore {
         match std::fs::remove_file(&payload_path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                warn!(
+                    object_id,
+                    path = %payload_path.display(),
+                    error = ?error,
+                    "local payload runtime payload remove failed"
+                );
+                Err(error.into())
+            }
         }
     }
 
@@ -628,7 +636,9 @@ impl FilePayloadStore {
         &self,
         object_ids: &[u64],
     ) -> Result<PayloadBatchCommit, FilePayloadStoreError> {
-        let mut content = String::from("version=1\nphase=committing\n");
+        // Canonical final paths and maximum-width object IDs fit in 129 bytes per record.
+        let mut content = String::with_capacity(27 + object_ids.len() * 129);
+        content.push_str("version=1\nphase=committing\n");
         for &object_id in object_ids {
             let final_hex = encode_batch_intent_path_hex(
                 &self.intent_relative_path(&self.layout.payload_object_path(object_id))?,
@@ -650,7 +660,7 @@ impl FilePayloadStore {
     ) -> Result<(), FilePayloadStoreError> {
         let mut first_error = self.remove_batch(object_ids).err();
         if matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
-            let mut synced_dirs = HashSet::new();
+            let mut synced_shards = HashSet::new();
             for &object_id in object_ids {
                 let payload_path = self.layout.payload_object_path(object_id);
                 let Some(payload_dir) = payload_path.parent() else {
@@ -661,7 +671,7 @@ impl FilePayloadStore {
                     continue;
                 };
                 // Persist all attempted deletions even when another removal fails.
-                if synced_dirs.insert(payload_dir.to_path_buf())
+                if synced_shards.insert(LocalPayloadLayout::payload_shard(object_id))
                     && let Err(error) = self.sync_directory_put_barrier(payload_dir)
                 {
                     // A never-created shard has no deletion to persist.
@@ -1702,6 +1712,43 @@ fn encode_batch_intent_path_hex(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sfs754_batch_removal_logs_each_failed_object_with_path_and_os_error() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        for object_id in [90, 91] {
+            // A directory at the file path makes unlink fail on every supported OS.
+            std::fs::create_dir_all(layout.payload_object_path(object_id)).unwrap();
+        }
+        store.put(93, b"removed").unwrap();
+        let log_path = temp.path().join("removal.log");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(Arc::new(File::create(&log_path).unwrap()))
+            .finish();
+
+        let result =
+            tracing::subscriber::with_default(subscriber, || store.remove_batch(&[90, 91, 92, 93]));
+        assert!(matches!(result, Err(FilePayloadStoreError::Io(_))));
+        assert!(!layout.payload_object_path(93).exists());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(log.lines().count(), 2, "{log}");
+        for object_id in [90, 91] {
+            let path = layout.payload_object_path(object_id);
+            let error = std::fs::remove_file(&path).unwrap_err();
+            let line = log
+                .lines()
+                .find(|line| line.contains(&format!("object_id={object_id}")))
+                .unwrap();
+            assert!(line.contains(&format!("path={}", path.display())), "{line}");
+            assert!(line.contains(&format!("error={error:?}")), "{line}");
+            assert!(line.contains("WARN"), "{line}");
+        }
+    }
 
     #[test]
     fn sfs754_put_intent_path_error_cleans_uncommitted_staging() {

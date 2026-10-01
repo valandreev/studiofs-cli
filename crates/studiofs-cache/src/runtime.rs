@@ -1437,7 +1437,23 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(());
         }
         let _mutations = self.lock_payload_mutations(object_ids);
-        self.remove_payloads_locked(object_ids)
+        for &object_id in object_ids {
+            if self
+                .index
+                .get_entry(object_id)
+                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
+                .is_some()
+                || self.payload_store.payload_exists(object_id)?
+            {
+                return self.remove_payloads_locked(object_ids);
+            }
+        }
+        // No persistent ownership remains, but stale runtime state must still be cleared.
+        self.forget_runtime_pins(object_ids);
+        self.forget_access_touches(object_ids);
+        let result = self.payload_store.remove_batch(object_ids);
+        self.note_storage_state_change();
+        result.map_err(LocalPayloadBackendError::from)
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
@@ -1693,6 +1709,100 @@ mod tests {
     }
 
     #[test]
+    fn sfs754_absent_removal_skips_durable_mutations_and_clears_runtime_state() {
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x54; 16],
+                },
+                None,
+                sync_mode,
+            )
+            .unwrap();
+            // Simulate stale runtime state after the file and index ownership are gone.
+            backend.payload_store.put(99, b"stale").unwrap();
+            let mut out = [0; 5];
+            assert_eq!(backend.payload_store.read_into(99, 0, &mut out), Some(5));
+            std::fs::remove_file(layout.payload_object_path(99)).unwrap();
+            backend.pin(99);
+            backend.pending_access_touches.lock().enqueue(99);
+            let before = backend.payload_store.sync_barrier_snapshot();
+            backend.fail_next_index_write_for_test();
+
+            backend.remove(99).unwrap();
+            backend.remove_batch(&[99, 100]).unwrap();
+            assert!(!backend.is_runtime_pinned(99));
+            assert!(backend.pending_access_touches.lock().object_ids.is_empty());
+            assert_eq!(backend.payload_store.read_into(99, 0, &mut out), None);
+            let after = backend.payload_store.sync_barrier_snapshot();
+            assert_eq!(
+                after.per_put_file_sync_calls,
+                before.per_put_file_sync_calls
+            );
+            assert_eq!(after.per_put_dir_sync_calls, before.per_put_dir_sync_calls);
+            assert!(
+                std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert!(
+                backend.index.remove(100).is_err(),
+                "absent removal wrote the index"
+            );
+        }
+    }
+
+    #[test]
+    fn sfs754_absence_probe_errors_do_not_mutate_removal_state() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x54; 16],
+        })
+        .unwrap();
+        backend.pin(90);
+        let before = backend.payload_store.sync_barrier_snapshot();
+        backend.index.fail_next_read_for_test();
+
+        assert!(matches!(
+            backend.remove(90),
+            Err(LocalPayloadBackendError::Other(_))
+        ));
+        assert!(backend.is_runtime_pinned(90));
+        #[cfg(unix)]
+        {
+            let path = layout.payload_object_path(90);
+            let shard = path.parent().unwrap();
+            std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(shard.file_name().unwrap(), shard).unwrap();
+            assert!(matches!(
+                backend.remove(90),
+                Err(LocalPayloadBackendError::Io(_))
+            ));
+            assert!(backend.is_runtime_pinned(90));
+        }
+        let after = backend.payload_store.sync_barrier_snapshot();
+        assert_eq!(
+            after.per_put_file_sync_calls,
+            before.per_put_file_sync_calls
+        );
+        assert_eq!(after.per_put_dir_sync_calls, before.per_put_dir_sync_calls);
+        assert!(
+            std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn sfs754_unlink_failure_reports_error_and_recovers_without_harming_indexed_payloads() {
         for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
             for operation in ["single", "batch", "eviction"] {
@@ -1901,6 +2011,13 @@ mod tests {
                 sync_mode,
             )
             .unwrap();
+            backend.payload_store.put(88, b"file-only").unwrap();
+            backend.remove_batch(&[999, 88]).unwrap();
+            assert!(!layout.payload_object_path(88).exists());
+            backend.put(89, b"index-only", true).unwrap();
+            std::fs::remove_file(layout.payload_object_path(89)).unwrap();
+            backend.remove_batch(&[999, 89]).unwrap();
+            assert!(backend.index.get_entry(89).unwrap().is_none());
             backend.put(90, b"retried", true).unwrap();
             backend.put(91, b"indexed", true).unwrap();
             backend.payload_store.fail_next_remove_for_test(90);
