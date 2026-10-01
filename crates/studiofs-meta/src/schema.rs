@@ -716,6 +716,7 @@ impl SliceRange {
     }
 
     /// Returns `true` when the range does not cover any bytes.
+    /// Validated ranges are non-empty; this detects unchecked empty or reversed bounds.
     pub fn is_empty(self) -> bool {
         self.start >= self.end
     }
@@ -2012,6 +2013,7 @@ mod tests {
             );
             // The historical postcard struct is the ordered pair of u32 fields.
             let bytes = postcard::to_stdvec(&(start, end)).expect("legacy range bytes");
+            // Postcard discards custom error text, so only rejection is asserted here.
             assert!(
                 postcard::from_bytes::<SliceRange>(&bytes).is_err(),
                 "accepted postcard range [{start}, {end})"
