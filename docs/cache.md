@@ -74,16 +74,23 @@ cache-specific `CachePolicy` hooks.
 
 On backend startup, reconciliation runs before serving reads/writes:
 
-1. Default (`lightweight`) mode removes orphan temp files under `tmp/**`
-   and prunes dirty/uploading index rows that point to missing payload files.
-2. Optional full sweep (`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`)
-   additionally removes stale index rows and orphan payload files.
+1. Default (`lightweight`) mode replays single and batch put intents, removing
+   final payload files only when the put never reached the index. It also
+   removes orphan temp files under `tmp/**` and prunes dirty/uploading index rows that
+   point to missing payload files. Indexed payloads and their upload-stage
+   hardlinks survive regardless of upload lifecycle state.
+2. Lightweight mode removes unindexed final payloads only at paths named by
+   put intents. Optional full sweep
+   (`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`) additionally removes
+   stale index rows and scans for orphan payload files, including historical
+   orphans without a put intent.
 3. VFS startup replay scans local metadata and durable local payload state,
    restores upload-stage links for live unpublished objects, and rebuilds the
    runtime pending-upload queue.
 
 Reconciliation is scoped to the runtime root and does not mutate unrelated
 files under `<cache-root>`.
+Fast cache mode retains its existing no-fsync guarantees.
 
 Recovery is deliberately bounded by the local durability boundary. Bytes that
 only lived in writer memory before `flush`, `fsync`, close/release, or another

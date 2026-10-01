@@ -293,6 +293,8 @@ pub struct LocalPayloadBackendRuntime {
     low_space_exhausted_waits: AtomicU64,
     #[cfg(test)]
     low_space_wait_started: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    stop_next_put_before_index: AtomicBool,
 }
 
 struct DirtyValidationGuard<'a> {
@@ -428,6 +430,8 @@ impl LocalPayloadBackendRuntime {
             low_space_exhausted_waits: AtomicU64::new(0),
             #[cfg(test)]
             low_space_wait_started: Mutex::new(None),
+            #[cfg(test)]
+            stop_next_put_before_index: AtomicBool::new(false),
         })
     }
 
@@ -983,9 +987,22 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(());
         }
 
-        self.payload_store
-            .put(object_id, data)
+        let payload_commit = self
+            .payload_store
+            .put_with_intent(object_id, data)
             .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
+
+        // Leave the real file/index crash boundary intact for startup recovery tests.
+        #[cfg(test)]
+        if self
+            .stop_next_put_before_index
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(LocalPayloadBackendError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "injected stop after payload commit and before index commit",
+            )));
+        }
 
         let lifecycle = if evictable {
             LocalPayloadLifecycleState::Uploaded
@@ -1025,6 +1042,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
 
+        payload_commit.complete();
         Ok(())
     }
 
@@ -1894,6 +1912,79 @@ mod tests {
         drop(backend);
 
         assert!(!staged_tmp_dir_file.exists());
+    }
+
+    #[test]
+    fn sfs753_single_put_crash_recovery_is_lightweight_and_repeatable() {
+        assert_eq!(
+            LocalPayloadStartupReconcileMode::from_env(),
+            LocalPayloadStartupReconcileMode::Lightweight,
+            "this regression exercises the default startup mode"
+        );
+        for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+            let temp = studiofs_test_support::workspace_target_tempdir("test-");
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
+            create_v3_marker(&layout);
+            let config = LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x75; 16],
+            };
+            let mut backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                config.clone(),
+                None,
+                sync_mode,
+            )
+            .unwrap();
+            backend.put(1, b"indexed", true).unwrap();
+            backend.put(2, b"pending", false).unwrap();
+
+            // Historical untracked files still require Full mode; no new global sweep.
+            backend.payload_store.put(99, b"historical-orphan").unwrap();
+            for object_id in 100..103 {
+                backend
+                    .stop_next_put_before_index
+                    .store(true, Ordering::Relaxed);
+                let error = backend
+                    .put(object_id, b"interrupted", object_id % 2 == 0)
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    LocalPayloadBackendError::Io(ref source)
+                        if source.kind() == io::ErrorKind::Interrupted
+                ));
+                assert_eq!(
+                    std::fs::read(layout.payload_object_path(object_id)).unwrap(),
+                    b"interrupted"
+                );
+                assert!(backend.index.get_entry(object_id).unwrap().is_none());
+                drop(backend);
+
+                backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                    config.clone(),
+                    None,
+                    sync_mode,
+                )
+                .unwrap();
+                for orphan_id in 100..=object_id {
+                    assert!(
+                        !layout.payload_object_path(orphan_id).exists(),
+                        "unindexed payload {orphan_id} survived {sync_mode:?} restart"
+                    );
+                }
+                assert_eq!(backend.get(1).unwrap().as_ref(), b"indexed");
+                assert_eq!(backend.get_for_upload(2).unwrap().as_ref(), b"pending");
+                assert_eq!(backend.dirty_object_ids(), vec![2]);
+                assert_eq!(backend.index.stats().unwrap().current_bytes, 14);
+                assert_eq!(
+                    std::fs::read(layout.payload_object_path(99)).unwrap(),
+                    b"historical-orphan"
+                );
+                let intent_dir = layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+                if intent_dir.exists() {
+                    assert!(std::fs::read_dir(intent_dir).unwrap().next().is_none());
+                }
+            }
+        }
     }
 
     #[test]

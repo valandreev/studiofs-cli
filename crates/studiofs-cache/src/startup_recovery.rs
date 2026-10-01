@@ -361,7 +361,9 @@ fn remove_temp_files(layout: &LocalPayloadLayout) -> Result<u64, io::Error> {
     let mut removed = 0_u64;
     let intent_dir = batch_intent_dir(layout);
     visit_files_recursive(&layout.tmp_dir, &mut |file| -> io::Result<()> {
-        if file.starts_with(&intent_dir) {
+        if file.starts_with(&intent_dir)
+            && !file.extension().is_some_and(|extension| extension == "tmp")
+        {
             return Ok(());
         }
         if remove_file_if_present(file)? {
@@ -529,6 +531,36 @@ mod tests {
     }
 
     #[test]
+    fn startup_reconcile_lightweight_removes_incomplete_intent_temp_files() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let intent_dir = batch_intent_dir(&layout);
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        let incomplete_intent = intent_dir.join("interrupted-marker.tmp");
+        std::fs::write(&incomplete_intent, b"version=1\nphase=comm").unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+        assert_eq!(report.temp_files_removed, 1);
+        assert!(!incomplete_intent.exists());
+        assert!(
+            reconcile_startup_state(
+                &layout,
+                &index,
+                LocalPayloadStartupReconcileMode::Lightweight
+            )
+            .unwrap()
+            .is_clean()
+        );
+    }
+
+    #[test]
     fn startup_reconcile_lightweight_resolves_incomplete_batch_payload_intent() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
@@ -609,30 +641,68 @@ mod tests {
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
         let payload_store = FilePayloadStore::open(layout.clone()).unwrap();
-        payload_store.put(12, b"indexed").unwrap();
-        index
-            .upsert(super::super::CacheIndexUpsert {
-                object_id: 12,
-                payload_key: payload_key(&layout, 12),
-                payload_len: 7,
-                lifecycle: LocalPayloadLifecycleState::Uploaded,
-                origin: LocalPayloadOrigin::Downloaded,
-                upload_state: LocalPayloadUploadState::None,
-                evictable: true,
-            })
-            .unwrap();
+        let upload_stage = crate::upload_stage::UploadStageStore::open(layout.clone()).unwrap();
+        let payload_cases = [
+            (
+                12,
+                b"indexed".as_slice(),
+                LocalPayloadLifecycleState::Uploaded,
+                LocalPayloadUploadState::None,
+                LocalPayloadOrigin::Downloaded,
+            ),
+            (
+                13,
+                b"pending".as_slice(),
+                LocalPayloadLifecycleState::Dirty,
+                LocalPayloadUploadState::Pending,
+                LocalPayloadOrigin::Local,
+            ),
+            (
+                14,
+                b"uploading".as_slice(),
+                LocalPayloadLifecycleState::Uploading,
+                LocalPayloadUploadState::Uploading,
+                LocalPayloadOrigin::Local,
+            ),
+        ];
+        for &(object_id, bytes, lifecycle, upload_state, origin) in &payload_cases {
+            payload_store.put(object_id, bytes).unwrap();
+            index
+                .upsert(super::super::CacheIndexUpsert {
+                    object_id,
+                    payload_key: payload_key(&layout, object_id),
+                    payload_len: bytes.len() as u64,
+                    lifecycle,
+                    origin,
+                    upload_state,
+                    evictable: origin == LocalPayloadOrigin::Downloaded,
+                })
+                .unwrap();
+            if upload_state != LocalPayloadUploadState::None {
+                upload_stage.link_payload(object_id).unwrap();
+            }
+        }
 
-        let final_path_12 = layout
-            .payload_object_relative_path(12)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let intent_objects = payload_cases
+            .map(|(object_id, ..)| {
+                let final_path = layout
+                    .payload_object_relative_path(object_id)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                format!("object={object_id}|temp=|final={final_path}")
+            })
+            .join("\n");
         let intent_dir = layout.tmp_dir.join("batch-intents");
         std::fs::create_dir_all(&intent_dir).unwrap();
         std::fs::write(
             intent_dir.join("batch-0000000000000002.intent"),
-            format!("version=1\nphase=committed\nobject=12|temp=|final={final_path_12}\n"),
+            format!("version=1\nphase=committed\n{intent_objects}\n"),
         )
         .unwrap();
+
+        let orphan_path = layout.payload_object_path(15);
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_path, b"untracked orphan").unwrap();
 
         let report = reconcile_startup_state(
             &layout,
@@ -642,7 +712,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.batch_intents_resolved, 1);
-        assert_eq!(payload_store.get(12).unwrap().as_ref(), b"indexed");
+        for &(object_id, expected, lifecycle, upload_state, _) in &payload_cases {
+            assert_eq!(payload_store.get(object_id).unwrap().as_ref(), expected);
+            let entry = index.get_entry(object_id).unwrap().unwrap();
+            assert_eq!(entry.lifecycle, lifecycle);
+            assert_eq!(entry.upload_state, upload_state);
+        }
+        assert!(upload_stage.contains(13));
+        assert!(upload_stage.contains(14));
+        assert!(orphan_path.exists());
         assert!(!intent_dir.join("batch-0000000000000002.intent").exists());
     }
 

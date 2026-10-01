@@ -261,6 +261,25 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-753 Single-put Crash Recovery
+
+The cache regression stops the real single-put path after payload file commit
+and before index commit, then reopens the backend in default Lightweight mode.
+It checks three crash/restart cycles in both Durable and Fast modes, removes
+the incomplete puts, and preserves indexed files and pending uploads. The
+startup intent regression also preserves pending/in-flight upload-stage links.
+Interrupted intent-marker creation is covered by temporary-marker cleanup.
+These checks need no services or live mount:
+
+```powershell
+cargo test -p studiofs-cache --lib sfs753_single_put_crash_recovery_is_lightweight_and_repeatable -- --nocapture
+cargo test -p studiofs-cache --lib startup_reconcile_batch_intent_preserves_payloads_that_reached_index -- --nocapture
+cargo test -p studiofs-cache --lib startup_reconcile_lightweight_removes_incomplete_intent_temp_files -- --nocapture
+```
+
+Fast-mode coverage demonstrates process interruption recovery with surviving
+OS-cached files; it does not establish power-loss durability.
+
 ## Contract/Core Harness
 
 Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,

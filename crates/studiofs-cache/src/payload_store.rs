@@ -350,6 +350,17 @@ impl FilePayloadStore {
 
     /// Persists `data` as the payload for `object_id`.
     pub fn put(&self, object_id: u64, data: &[u8]) -> Result<(), FilePayloadStoreError> {
+        self.put_with_intent(object_id, data)?.complete();
+        Ok(())
+    }
+
+    /// Keeps the payload intent until the caller commits the corresponding index row.
+    pub(crate) fn put_with_intent(
+        &self,
+        object_id: u64,
+        data: &[u8],
+    ) -> Result<PayloadBatchCommit, FilePayloadStoreError> {
+        let durable_sync = matches!(self.sync_mode, LocalPayloadSyncMode::Durable);
         let payload_path = self.layout.payload_object_path(object_id);
         let payload_dir = payload_path.parent().ok_or_else(|| {
             io::Error::other(format!(
@@ -359,11 +370,17 @@ impl FilePayloadStore {
         })?;
         std::fs::create_dir_all(payload_dir)?;
 
-        let temp_path = self.write_temp_payload_file(
-            &self.layout.tmp_dir,
-            object_id,
-            data,
-            matches!(self.sync_mode, LocalPayloadSyncMode::Durable),
+        let temp_path =
+            self.write_temp_payload_file(&self.layout.tmp_dir, object_id, data, durable_sync)?;
+        let intent_path = self.write_batch_payload_intent(
+            "committing",
+            &[StagedBatchPayload {
+                entry: PayloadBatchEntry { object_id, data },
+                payload_path: payload_path.clone(),
+                payload_dir: payload_dir.to_path_buf(),
+                temp_path: temp_path.clone(),
+            }],
+            durable_sync,
         )?;
         match platform::rename_atomic(&temp_path, &payload_path) {
             Ok(()) => {}
@@ -396,7 +413,7 @@ impl FilePayloadStore {
         } else {
             self.record_grouped_sync_targets(object_id, payload_dir);
         }
-        Ok(())
+        Ok(PayloadBatchCommit { intent_path })
     }
 
     /// Persists a batch of payloads and returns a commit handle for the payload-side intent.
