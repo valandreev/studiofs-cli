@@ -11964,6 +11964,12 @@ fn storage_full_survives_writer_stack_materialization_and_next_write() {
             .materialize_writer_stack_for_inode(second.ino)
             .await
             .expect_err("second payload exceeds local payload budget");
+        assert!(
+            materialization_error
+                .to_string()
+                .contains("writer stack finish failed"),
+            "missing materialization operation: {materialization_error}"
+        );
         assert_eq!(
             crate::classify_vfs_error(&materialization_error),
             crate::BridgeVfsErrorKind::StorageFull
@@ -11973,6 +11979,12 @@ fn storage_full_survives_writer_stack_materialization_and_next_write() {
             .record_writer_stack_state_bytes(second_fh, second.ino, block_size, b"x")
             .await
             .expect_err("failed materialization blocks subsequent writes");
+        assert!(
+            sticky_error
+                .to_string()
+                .contains("writer stack write failed"),
+            "missing write operation: {sticky_error}"
+        );
         assert_eq!(
             crate::classify_vfs_error(&sticky_error),
             crate::BridgeVfsErrorKind::StorageFull

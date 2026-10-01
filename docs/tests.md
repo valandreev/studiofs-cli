@@ -236,10 +236,14 @@ cargo test -p studiofs-bridge explicit_metadata_categories_map_to_distinct_errno
 
 These tests simulate local capacity exhaustion and native disk-full error codes
 without filling a real disk. They also check retained I/O sources and unchanged
-memory-pressure/generic error mappings:
+memory-pressure/generic error mappings. Object/fetch categories retain their
+precedence over nested disk-full causes; writer failures keep their operation
+labels. The separate transient retry regression verifies wrapped generic I/O
+failures and sticky-source cleanup:
 
 ```powershell
 cargo test -p studiofs-vfs --lib storage_full -- --nocapture
+cargo test -p studiofs-vfs --lib writer_stack_retries_transient_materialization_failure -- --nocapture
 cargo test -p studiofs-winfsp --lib storage_full -- --nocapture
 ```
 

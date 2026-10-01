@@ -34,6 +34,10 @@ writer materialization sources. POSIX adapters return `ENOSPC`; WinFSP returns
 `STATUS_DISK_FULL`. Resource pressure already classified as
 `InsufficientResources` keeps `ENOMEM` / `STATUS_INSUFFICIENT_RESOURCES`,
 and unrelated failures keep their existing mappings.
+Source inspection for disk-full is limited to VFS I/O, local payload, and
+upload-stage I/O errors; nested causes do not override object-corruption or
+remote-fetch categories. Writer failures retain the operation label as well as
+the original error source.
 
 Path walks are centralized in VFS `NamespaceResolver`:
 - WinFSP uses `NamespacePathStyle::Windows` for full-path and parent resolution.

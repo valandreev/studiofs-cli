@@ -154,6 +154,23 @@ impl From<CachedStoreWriterError> for WriterStackError {
     }
 }
 
+impl WriterStackError {
+    pub(super) fn into_vfs_error(self, operation: &'static str) -> super::VfsError {
+        super::VfsError::Io(std::io::Error::other(ContextualWriterStackError {
+            operation,
+            source: self,
+        }))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}: {source}")]
+struct ContextualWriterStackError {
+    operation: &'static str,
+    #[source]
+    source: WriterStackError,
+}
+
 #[allow(dead_code)]
 struct SliceWriter {
     seq: u64,
@@ -1398,13 +1415,33 @@ mod tests {
     struct TransientFailingPutBackend {
         inner: Arc<dyn LocalPayloadBackend>,
         failures_remaining: AtomicUsize,
+        failure: fn() -> LocalPayloadBackendError,
     }
 
     impl TransientFailingPutBackend {
         fn new(inner: Arc<dyn LocalPayloadBackend>, failures: usize) -> Self {
+            Self::with_failure(inner, failures, || {
+                LocalPayloadBackendError::Other(Box::new(std::io::Error::other(
+                    "transient local payload failure",
+                )))
+            })
+        }
+
+        fn capacity_exhausting(inner: Arc<dyn LocalPayloadBackend>, failures: usize) -> Self {
+            Self::with_failure(inner, failures, || {
+                LocalPayloadBackendError::CapacityExhausted { needed: 4, free: 0 }
+            })
+        }
+
+        fn with_failure(
+            inner: Arc<dyn LocalPayloadBackend>,
+            failures: usize,
+            failure: fn() -> LocalPayloadBackendError,
+        ) -> Self {
             Self {
                 inner,
                 failures_remaining: AtomicUsize::new(failures),
+                failure,
             }
         }
 
@@ -1416,7 +1453,7 @@ mod tests {
                 })
                 .is_ok();
             if failed {
-                return Err(LocalPayloadBackendError::CapacityExhausted { needed: 4, free: 0 });
+                return Err((self.failure)());
             }
             Ok(())
         }
@@ -2266,9 +2303,30 @@ mod tests {
         stack
             .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"data"))
             .expect("write initial block");
-        stack
+        let materialization_error = stack
             .finish_inode(7)
             .expect_err("first materialization fails");
+        assert_transient_local_payload_error(&materialization_error);
+        let materialization_source = match &materialization_error {
+            WriterStackError::CachedStore { source } => Arc::clone(source),
+            other => panic!("expected cached-store error, got {other}"),
+        };
+
+        let sticky_error = stack
+            .write_bytes(write_spec(1, 7, 4, 701), Bytes::from_static(b"more"))
+            .expect_err("failed materialization blocks follow-up writes");
+        assert!(matches!(
+            &sticky_error,
+            WriterStackError::Sticky { ino: 7, .. }
+        ));
+        assert_transient_local_payload_error(&sticky_error);
+        assert!(matches!(
+            &sticky_error,
+            WriterStackError::Sticky {
+                source: Some(source),
+                ..
+            } if Arc::ptr_eq(&materialization_source, source)
+        ));
 
         let retried = stack
             .finish_inode(7)
@@ -2288,7 +2346,7 @@ mod tests {
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000294")
                 .expect("open backend")
                 .backend;
-        let failing_backend = Arc::new(TransientFailingPutBackend::new(backend, 1));
+        let failing_backend = Arc::new(TransientFailingPutBackend::capacity_exhausting(backend, 1));
         let (store, _rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), failing_backend)
             .expect("open store");
         let stack = MountedWriterStack::new(
@@ -2327,5 +2385,27 @@ mod tests {
                 Some(LocalPayloadBackendError::CapacityExhausted { .. })
             )
         })
+    }
+
+    fn assert_transient_local_payload_error(error: &(dyn std::error::Error + 'static)) {
+        let has_expected_io_error =
+            std::iter::successors(Some(error), |error| error.source()).any(|error| {
+                matches!(
+                    error.downcast_ref::<LocalPayloadBackendError>(),
+                    Some(LocalPayloadBackendError::Other(source))
+                        if source.downcast_ref::<std::io::Error>().is_some_and(|source| {
+                            source.kind() == std::io::ErrorKind::Other
+                                && source.to_string() == "transient local payload failure"
+                        })
+                )
+            });
+        assert!(
+            has_expected_io_error,
+            "expected wrapped transient I/O error"
+        );
+        assert!(
+            !error_chain_has_capacity_exhausted(error),
+            "transient I/O failure must not be classified as capacity exhaustion"
+        );
     }
 }

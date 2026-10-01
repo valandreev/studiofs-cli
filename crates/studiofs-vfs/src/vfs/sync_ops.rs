@@ -1,4 +1,3 @@
-use super::writer_stack::WriterStackError;
 use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino, InodeAttr,
@@ -19,12 +18,6 @@ use std::time::{Duration, Instant};
 use studiofs_meta::types::block_index_from_offset;
 
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
-
-impl From<WriterStackError> for VfsError {
-    fn from(error: WriterStackError) -> Self {
-        Self::Io(std::io::Error::other(error))
-    }
-}
 
 enum VfsWritePayload<'a> {
     Borrowed(&'a [u8]),
@@ -2132,7 +2125,7 @@ impl StudioVfs {
                         }
                     }
                 }
-                return Err(error.into());
+                return Err(error.into_vfs_error("writer stack write failed"));
             }
         };
         {
@@ -2214,9 +2207,7 @@ impl StudioVfs {
             .state
             .writer_stack
             .completed_block_count_for_inode(ino)
-            .map_err(|err| {
-                VfsError::Other(format!("writer stack completed block count failed: {err}"))
-            })?;
+            .map_err(|error| error.into_vfs_error("writer stack completed block count failed"))?;
         let object_count = self.completed_block_materialization_batch_blocks(object_count);
         if object_count == 0 {
             return Ok(());
@@ -2287,7 +2278,11 @@ impl StudioVfs {
     ///
     /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
-        let object_count = self.state.writer_stack.prepare_finish_inode(ino)?;
+        let object_count = self
+            .state
+            .writer_stack
+            .prepare_finish_inode(ino)
+            .map_err(|error| error.into_vfs_error("writer stack finish failed"))?;
         if object_count == 0 {
             return Ok(0);
         }
@@ -2297,7 +2292,8 @@ impl StudioVfs {
         let finished = self
             .state
             .writer_stack
-            .finish_prepared_inode(ino, first_object_id)?;
+            .finish_prepared_inode(ino, first_object_id)
+            .map_err(|error| error.into_vfs_error("writer stack finish failed"))?;
         if finished.is_empty() {
             return Ok(0);
         }
@@ -2323,7 +2319,8 @@ impl StudioVfs {
         let object_count = self
             .state
             .writer_stack
-            .prepare_finish_inode_if_idle(ino, min_idle)?;
+            .prepare_finish_inode_if_idle(ino, min_idle)
+            .map_err(|error| error.into_vfs_error("writer stack idle finish failed"))?;
         if object_count == 0 {
             return Ok(0);
         }
@@ -2333,7 +2330,8 @@ impl StudioVfs {
         let finished = self
             .state
             .writer_stack
-            .finish_prepared_inode(ino, first_object_id)?;
+            .finish_prepared_inode(ino, first_object_id)
+            .map_err(|error| error.into_vfs_error("writer stack idle finish failed"))?;
         if finished.is_empty() {
             return Ok(0);
         }
@@ -2358,7 +2356,8 @@ impl StudioVfs {
         let object_count = self
             .state
             .writer_stack
-            .completed_block_count_for_inode(ino)?;
+            .completed_block_count_for_inode(ino)
+            .map_err(|error| error.into_vfs_error("writer stack completed block count failed"))?;
         if object_count == 0 {
             return Ok(0);
         }
@@ -2366,11 +2365,11 @@ impl StudioVfs {
         let first_object_id = self
             .reserve_writer_stack_object_ids_by_count(ino, object_count)
             .await?;
-        let finished = self.state.writer_stack.flush_completed_blocks_for_inode(
-            ino,
-            first_object_id,
-            object_count as usize,
-        )?;
+        let finished = self
+            .state
+            .writer_stack
+            .flush_completed_blocks_for_inode(ino, first_object_id, object_count as usize)
+            .map_err(|error| error.into_vfs_error("writer stack completed block flush failed"))?;
         if finished.is_empty() {
             return Ok(0);
         }
