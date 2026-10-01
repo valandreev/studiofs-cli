@@ -92,15 +92,18 @@ Reconciliation is scoped to the runtime root and does not mutate unrelated
 files under `<cache-root>`.
 Fast cache mode retains its existing no-fsync guarantees.
 
-The put-intent directory is created once when the payload store opens; Durable
-mode syncs its parent before writes begin. On the successful same-device path, a
+The put-intent directory is created once when the payload store opens and must
+remain present while the backend is open; Durable mode syncs its parent before
+writes begin. On the successful same-device path, a
 Durable put syncs the payload temp file and the intent temp file, with three
 directory barriers for the intent, source temp, and destination payload
 directories. The `durable_mode_keeps_per_put_sync_barriers` regression measures these barrier
 calls; on Windows, directory barriers are intentionally no-ops. Fast mode writes
 the intent without adding file or directory syncs. A failed index commit retires
-its intent only after confirming payload removal; Durable mode adds a fourth
-directory barrier to persist deletion first. These operation counts do not establish mounted
+its intent only after confirming payload removal; a Durable single-put rollback
+adds a fourth directory barrier to persist deletion first. Batch rollback adds
+one barrier per distinct touched payload shard, including when another unlink
+fails; any error retains the intent. These operation counts do not establish mounted
 throughput or wall-clock cost.
 
 Single and batch index failures share this rollback path. Payloads with an

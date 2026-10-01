@@ -15,6 +15,7 @@ Failed or concurrent puts must not delete successfully indexed pending bytes. Re
 - [x] (2026-10-01 15:35Z) 46 focused cache tests pass; the nine SFS-753 tests also pass under externally configured Full mode.
 - [x] (2026-10-01 15:41Z) Completed check/Clippy/format/diff checks and independent production review; strengthened the acquisition probe and observed the final race test red/green again.
 - [x] (2026-10-01 15:41Z) Prepared delivery commands and review disposition. Commit/push and hosted results are recorded in PR #734 and the local review response.
+- [x] (2026-10-01 17:35Z) Verified eight follow-up threads. Eviction propagates index read failures and counts eligibility rechecks; rollback attempts every unique deletion barrier while retaining its first error and intent. Tests require a contended publication gate and measure both temp-file syncs. VFS classification has focused coverage; batch-only assertions and barrier counts are clarified.
 
 ## Surprises & Discoveries
 
@@ -58,6 +59,8 @@ Run commands sequentially in E:\dev\studiofs-cli:
     cargo test -p studiofs-cache --lib local_payload_backend_satisfies_local_payload_backend_contract -- --nocapture
     cargo check -p studiofs-cache
     cargo clippy -p studiofs-cache --all-targets -- -D warnings
+    cargo test -p studiofs-vfs --lib payload_store_io_conversion_preserves_bridge_error_kinds -- --nocapture
+    cargo clippy -p studiofs-vfs --all-targets -- -D warnings
     cargo fmt --all -- --check
     git diff --check
 
@@ -89,3 +92,5 @@ Revision note: 2026-10-01 15:13Z, created after confirming the shared same-ID ro
 Revision note: 2026-10-01 15:35Z, implemented the confirmed race and error-path fixes. A fresh read-only review found a pre-payload marker leak on intent-directory sync failure; the extended existing test reproduced it, and best-effort marker retirement now passes. Marker retention remains required after any payload rename or uncertain rollback deletion.
 
 Revision note: 2026-10-01 15:41Z, final local checks pass. The test's pre-call thread signal was replaced by a requested-stripe try-lock probe immediately before blocking acquisition; independent review confirmed the evidence caveat is resolved. All returned store I/O errors, including sync_data, use the adapter conversion. External delivery evidence is maintained in the PR.
+
+Revision note: 2026-10-01 17:35Z, follow-up comments have 47 focused passing cache/VFS tests and clean cache check plus cache/VFS Clippy. Red evidence: eviction silently returned 64 bytes instead of an index error; partial rollback performed zero instead of two directory barriers; the file-sync counter reported one instead of two. The simplified gate test fails explicitly with guards disabled and passes with guards restored. Live intent-directory deletion is outside the runtime contract; retain visible I/O failure rather than introducing per-put directory creation or claiming restored recovery evidence. Codebase Memory MCP returned Transport closed, so the follow-up was verified directly from source. Sixteen documented test names validate. Final commit/CI/thread outcomes are recorded in PR #734.

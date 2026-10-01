@@ -287,6 +287,7 @@ cargo test -p studiofs-cache --lib startup_reconcile_lightweight_resolves_incomp
 cargo test -p studiofs-cache --lib startup_reconcile_full_removes_orphan_payload_files -- --nocapture
 cargo test -p studiofs-cache --lib materialize_inflight_completion_saturates_at_zero -- --nocapture
 cargo test -p studiofs-cache --lib blocking_task_guards_retire_active_counts_on_drop -- --nocapture
+cargo test -p studiofs-vfs --lib payload_store_io_conversion_preserves_bridge_error_kinds -- --nocapture
 ```
 
 The crash regression selects Lightweight explicitly, so an externally configured
@@ -298,6 +299,8 @@ creation fails, typed permission errors and retained indexed bytes after a
 directory-barrier failure, and conflicting single/batch same-ID retries at the
 rollback boundary. Recovery accounting includes intent orphans and historical
 orphans once each, and repeat recovery is clean.
+The VFS conversion check pins generic I/O, permission and disk-full categories
+while retaining the underlying I/O source and its operation context.
 
 Fast-mode coverage demonstrates process interruption recovery with surviving
 OS-cached files; it does not establish power-loss durability.

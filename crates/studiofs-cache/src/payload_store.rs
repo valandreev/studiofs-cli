@@ -613,24 +613,39 @@ impl FilePayloadStore {
     ) -> Result<(), FilePayloadStoreError> {
         self.remove_batch(object_ids);
         let mut synced_dirs = HashSet::new();
+        let mut first_error: Option<FilePayloadStoreError> = None;
         for &object_id in object_ids {
-            if self.payload_exists(object_id)? {
-                return Err(io::Error::other(format!(
-                    "payload {object_id} remains after rollback"
-                ))
-                .into());
+            match self.payload_exists(object_id) {
+                Ok(true) => {
+                    first_error.get_or_insert_with(|| {
+                        io::Error::other(format!("payload {object_id} remains after rollback"))
+                            .into()
+                    });
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error.into());
+                }
+                Ok(false) => {}
             }
             if !matches!(self.sync_mode, LocalPayloadSyncMode::Durable) {
                 continue;
             }
             let payload_path = self.layout.payload_object_path(object_id);
-            let payload_dir = payload_path.parent().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "payload path has no parent")
-            })?;
-            // Persist deletion before discarding the evidence needed for recovery.
-            if synced_dirs.insert(payload_dir.to_path_buf()) {
-                self.sync_directory_put_barrier(payload_dir)?;
+            let Some(payload_dir) = payload_path.parent() else {
+                first_error.get_or_insert_with(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "payload path has no parent").into()
+                });
+                continue;
+            };
+            // Persist all attempted deletions even when another removal fails.
+            if synced_dirs.insert(payload_dir.to_path_buf())
+                && let Err(error) = self.sync_directory_put_barrier(payload_dir)
+            {
+                first_error.get_or_insert(error);
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         commit.complete();
         Ok(())
@@ -869,6 +884,10 @@ impl FilePayloadStore {
             platform::write_all(&mut temp_file, content.as_bytes())?;
             if durable_sync {
                 platform::sync_data(&temp_file)?;
+                self.shared
+                    .barrier_counters
+                    .per_put_file_sync_calls
+                    .fetch_add(1, Ordering::Relaxed);
             }
             drop(temp_file);
             platform::rename_atomic(&temp_path, path)?;
@@ -2259,6 +2278,7 @@ mod tests {
             let blocked_path = layout.payload_object_path(90);
             std::fs::remove_file(&blocked_path).unwrap();
             std::fs::create_dir(&blocked_path).unwrap();
+            let before = store.sync_barrier_snapshot().per_put_dir_sync_calls;
             assert!(store.rollback_batch(&[90, 91], commit).is_err());
             assert!(
                 intent_path.exists(),
@@ -2266,6 +2286,26 @@ mod tests {
             );
             assert!(blocked_path.is_dir());
             assert!(!layout.payload_object_path(91).exists());
+            let shard_count = [90, 91]
+                .into_iter()
+                .map(|id| {
+                    layout
+                        .payload_object_path(id)
+                        .parent()
+                        .unwrap()
+                        .to_path_buf()
+                })
+                .collect::<HashSet<_>>()
+                .len() as u64;
+            assert_eq!(
+                store.sync_barrier_snapshot().per_put_dir_sync_calls - before,
+                if sync_mode == LocalPayloadSyncMode::Durable {
+                    shard_count
+                } else {
+                    0
+                },
+                "one failed unlink must not suppress successful deletion barriers"
+            );
         }
     }
 
@@ -2278,9 +2318,9 @@ mod tests {
         store.put(7001, b"payload").unwrap();
 
         let stats = store.sync_barrier_snapshot();
-        assert!(
-            stats.per_put_file_sync_calls >= 1,
-            "durable mode should sync temp payload bytes before rename"
+        assert_eq!(
+            stats.per_put_file_sync_calls, 2,
+            "durable mode must sync both payload and intent temp bytes before rename"
         );
         assert_eq!(
             stats.per_put_dir_sync_calls, 3,

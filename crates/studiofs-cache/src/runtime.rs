@@ -642,19 +642,20 @@ impl LocalPayloadBackendRuntime {
 
     fn evict_batch_internal(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
         let _mutations = self.lock_payload_mutations(object_ids);
-        let eligible = object_ids
-            .iter()
-            .copied()
-            .filter(|object_id| {
-                !self.is_runtime_pinned(*object_id)
-                    && self
-                        .index
-                        .get_entry(*object_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|entry| entry.evictable)
-            })
-            .collect::<Vec<_>>();
+        let mut eligible = Vec::with_capacity(object_ids.len());
+        for &object_id in object_ids {
+            if self.is_runtime_pinned(object_id)
+                || !self
+                    .index
+                    .get_entry(object_id)?
+                    .is_some_and(|entry| entry.evictable)
+            {
+                self.eviction_scan_skipped_non_evictable
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            eligible.push(object_id);
+        }
         if eligible.is_empty() {
             return Ok(());
         }
@@ -2235,7 +2236,9 @@ mod tests {
                 assert!(result.is_err());
                 assert_eq!(backend.get_for_upload(1).unwrap().as_ref(), b"pending");
                 assert!(backend.index.get_entry(1).unwrap().unwrap() == original);
-                assert!(!layout.payload_object_path(2).exists());
+                if batch {
+                    assert!(!layout.payload_object_path(2).exists());
+                }
             }
         }
     }
@@ -2308,35 +2311,17 @@ mod tests {
                 let first_holds_gate = gate_probe_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("second put did not attempt its mutation gate");
-                if !first_holds_gate {
-                    let baseline_result = second_done_rx.recv_timeout(Duration::from_secs(5));
-                    let completed_before_release = baseline_result.is_ok();
-                    let _ = resume_tx.send(());
-                    let first_result = first.join().expect("first put thread panicked");
-                    let second_result = match baseline_result {
-                        Ok(result) => result,
-                        Err(_) => second_done_rx
-                            .recv_timeout(Duration::from_secs(5))
-                            .expect("second put did not finish after releasing rollback"),
-                    };
-                    second.join().expect("second put thread panicked");
-                    assert!(first_result.is_err());
-                    assert!(
-                        completed_before_release,
-                        "ungated second put did not publish before rollback"
-                    );
-                    assert!(second_result.is_ok());
-                } else {
-                    let _ = resume_tx.send(());
-                    assert!(first.join().expect("first put thread panicked").is_err());
-                    assert!(
-                        second_done_rx
-                            .recv_timeout(Duration::from_secs(5))
-                            .expect("gated second put did not finish after rollback")
-                            .is_ok()
-                    );
-                    second.join().expect("second put thread panicked");
-                }
+                let _ = resume_tx.send(());
+                assert!(first.join().expect("first put thread panicked").is_err());
+                let second_result = second_done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("second put did not finish after rollback");
+                second.join().expect("second put thread panicked");
+                assert!(
+                    first_holds_gate,
+                    "conflicting put must encounter the rollback gate"
+                );
+                assert!(second_result.is_ok());
 
                 assert_eq!(backend.get_for_upload(1).unwrap().as_ref(), b"same");
                 assert!(backend.index.get_entry(1).unwrap().is_some());
@@ -2678,6 +2663,15 @@ mod tests {
         .unwrap();
         backend.put(1, &[1_u8; 32], true).unwrap();
         backend.put(2, &[2_u8; 32], true).unwrap();
+        backend.index.fail_next_read_for_test();
+        let error = backend
+            .evict_to_target_bytes(32, "test_read_failure")
+            .expect_err("index revalidation failures must propagate out of eviction");
+        assert!(matches!(error, LocalPayloadBackendError::Other(ref source)
+            if source.downcast_ref::<CacheIndexError>().is_some()));
+        assert_eq!(backend.index.stats().unwrap().current_bytes, 64);
+        assert!(backend.contains(1));
+        assert!(backend.contains(2));
         backend.put(3, &[3_u8; 32], true).unwrap();
 
         let stats = backend.index.stats().unwrap();
@@ -3056,6 +3050,19 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 >= 1
         );
+        backend.pin(32);
+        let before = backend
+            .eviction_scan_skipped_non_evictable
+            .load(Ordering::Relaxed);
+        backend.evict_batch_internal(&[30, 32]).unwrap();
+        assert_eq!(
+            backend
+                .eviction_scan_skipped_non_evictable
+                .load(Ordering::Relaxed),
+            before + 2
+        );
+        assert!(backend.contains(30));
+        assert!(backend.contains(32));
     }
 
     #[test]

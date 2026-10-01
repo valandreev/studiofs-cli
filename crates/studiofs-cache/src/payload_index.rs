@@ -195,6 +195,8 @@ pub struct CacheIndex {
     last_touch_access_shards: [Mutex<LruCache<u64, Instant>>; TOUCH_ACCESS_LRU_SHARDS],
     #[cfg(test)]
     fail_next_write: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_read: std::sync::atomic::AtomicBool,
 }
 
 fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
@@ -233,6 +235,8 @@ impl CacheIndex {
             }),
             #[cfg(test)]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_read: std::sync::atomic::AtomicBool::new(false),
         };
         index.initialize_schema()?;
         Ok(index)
@@ -265,6 +269,13 @@ impl CacheIndex {
 
     /// Look up a single object id and return its current index entry, if present.
     pub fn get_entry(&self, object_id: u64) -> Result<Option<CacheIndexEntry>, CacheIndexError> {
+        #[cfg(test)]
+        if self
+            .fail_next_read
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(CacheIndexError::Storage(RedbError::DatabaseClosed));
+        }
         let txn = self.db.begin_read().map_err(storage_error)?;
         let payloads = txn
             .open_table(PAYLOAD_OBJECTS_TABLE)
@@ -966,6 +977,12 @@ impl CacheIndex {
     #[cfg(test)]
     pub(crate) fn fail_next_write_for_test(&self) {
         self.fail_next_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_read_for_test(&self) {
+        self.fail_next_read
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
