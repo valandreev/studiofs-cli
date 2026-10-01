@@ -453,7 +453,7 @@ fn pg_foreign_event_decode_error_identifies_the_event_log_row() {
             .await
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
-        let payload = [0xff_u8, 0x00];
+        let payload = [0x01_u8, 0xff];
         client
             .execute(
                 "INSERT INTO event_log \
@@ -472,6 +472,7 @@ fn pg_foreign_event_decode_error_identifies_the_event_log_row() {
             .expect_err("corrupt event payload must fail closed");
         assert!(matches!(&error, crate::engine::MetaError::Serialization(_)));
         let message = error.to_string();
+        assert!(message.contains("payload decode failed"), "{message}");
         assert!(message.contains(&format!("seq_id={seq_id}")), "{message}");
         assert!(message.contains("batch_version=1"), "{message}");
         assert!(message.contains("event_type=remove_attr"), "{message}");
