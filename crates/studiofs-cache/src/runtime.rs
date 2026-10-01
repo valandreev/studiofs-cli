@@ -851,6 +851,7 @@ impl LocalPayloadBackendRuntime {
         }
 
         let mut cursor = None;
+        // The deletion limit also caps Durable shard-directory barriers per batch.
         let mut batch = Vec::with_capacity(EVICTION_DELETE_BATCH_SIZE);
         let mut estimated_current = stats.current_bytes;
         loop {
@@ -1680,6 +1681,66 @@ mod tests {
 
     fn create_v3_marker(layout: &LocalPayloadLayout) {
         layout.provision().unwrap();
+    }
+
+    #[test]
+    fn sfs754_foreground_eviction_coalesces_and_bounds_sync_barriers() {
+        // 107 and 632 share shard 23/02; IDs 1..=129 occupy distinct shards.
+        for (object_ids, file_syncs, dir_syncs) in [
+            (vec![107, 632], 3, 5),
+            ((1..=129).collect::<Vec<_>>(), 4, 134),
+        ] {
+            for sync_mode in [LocalPayloadSyncMode::Durable, LocalPayloadSyncMode::Fast] {
+                let temp = studiofs_test_support::workspace_target_tempdir("sfs754-");
+                let layout = LocalPayloadLayout::from_cache_root(temp.path());
+                create_v3_marker(&layout);
+                let backend = LocalPayloadBackendRuntime::open_with_reconcile_mode(
+                    LocalPayloadBackendConfig {
+                        cache_root: temp.path().to_path_buf(),
+                        volume_uuid: [0x54; 16],
+                    },
+                    Some(object_ids.len() as u64),
+                    sync_mode,
+                    LocalPayloadWriteMode::Buffered,
+                    LocalPayloadStartupReconcileMode::Lightweight,
+                )
+                .unwrap();
+                for &object_id in &object_ids {
+                    backend.put(object_id, b"x", true).unwrap();
+                }
+                let before = backend.payload_store.sync_barrier_snapshot();
+                let incoming = vec![0x54; object_ids.len()];
+
+                backend.put(1_000_000, &incoming, false).unwrap();
+
+                let after = backend.payload_store.sync_barrier_snapshot();
+                assert_eq!(
+                    (
+                        after.per_put_file_sync_calls - before.per_put_file_sync_calls,
+                        after.per_put_dir_sync_calls - before.per_put_dir_sync_calls,
+                    ),
+                    if sync_mode == LocalPayloadSyncMode::Durable {
+                        (file_syncs, dir_syncs)
+                    } else {
+                        (0, 0)
+                    },
+                    "foreground eviction must coalesce shards and split after 128 objects"
+                );
+                assert!(object_ids.iter().all(|&id| {
+                    !backend.contains(id) && !layout.payload_object_path(id).exists()
+                }));
+                assert_eq!(
+                    backend.get_for_upload(1_000_000).unwrap().as_ref(),
+                    incoming
+                );
+                assert!(
+                    std::fs::read_dir(layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR))
+                        .unwrap()
+                        .next()
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]
