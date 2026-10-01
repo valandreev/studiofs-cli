@@ -39,6 +39,13 @@ upload-stage I/O errors; nested causes do not override object-corruption or
 remote-fetch categories. Writer failures retain the operation label as well as
 the original error source.
 
+This disk-full mapping does not add quota handling: `FilesystemQuotaExceeded`
+(`EDQUOT` on POSIX) keeps its existing fallback mapping and must remain distinct
+from `ENOSPC` if quota reporting is added. Metadata failures represented by
+`MetaError::Storage(String)` also keep `GenericFailure`; the redb I/O cause is
+converted to text before reaching this bridge. Metadata disk-full reporting
+requires retaining that typed cause, rather than interpreting storage-error text.
+
 Path walks are centralized in VFS `NamespaceResolver`:
 - WinFSP uses `NamespacePathStyle::Windows` for full-path and parent resolution.
 - macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
