@@ -127,11 +127,18 @@ impl LockTier {
     }
 }
 
-// Thread-local tracking of currently held lock tiers.
+#[derive(Debug, Clone, Copy)]
+struct HeldLock {
+    tier: LockTier,
+    id: u64,
+}
+
+// Thread-local tracking of currently held lock acquisitions.
 // Uses a simple stack to track nested lock acquisitions.
 // All state is thread-local to avoid cross-thread interference.
 thread_local! {
-    static HELD_LOCKS: RefCell<Vec<LockTier>> = RefCell::new(Vec::with_capacity(4));
+    static HELD_LOCKS: RefCell<Vec<HeldLock>> = RefCell::new(Vec::with_capacity(4));
+    static NEXT_LOCK_ID: RefCell<u64> = const { RefCell::new(0) };
 }
 
 /// Guard that tracks lock acquisition and validates ordering.
@@ -139,6 +146,7 @@ thread_local! {
 /// When dropped, the lock is released from the tracking stack.
 pub struct LockOrderGuard {
     tier: LockTier,
+    id: u64,
     pushed: bool,
     _marker: PhantomData<*mut ()>,
 }
@@ -153,6 +161,7 @@ impl LockOrderGuard {
         if !is_validation_enabled() {
             return LockOrderGuard {
                 tier,
+                id: 0,
                 pushed: false,
                 _marker: PhantomData,
             };
@@ -160,21 +169,26 @@ impl LockOrderGuard {
 
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
+            let id = NEXT_LOCK_ID.with(|next| {
+                let mut next = next.borrow_mut();
+                *next = next.wrapping_add(1);
+                *next
+            });
 
             // Check lock ordering: new tier must be >= last acquired tier
             // (i.e., same or lower priority than what we already hold).
             // We compare with last() because that's the most recently acquired lock.
             // Example: if we hold [Tier1, Tier5], last() is Tier5.
             // Trying to acquire Tier3 would violate ordering (3 < 5).
-            if let Some(&last_tier) = held.last()
-                && tier < last_tier
+            if let Some(last_lock) = held.last()
+                && tier < last_lock.tier
             {
                 let msg = format!(
                     "Lock ordering violation: trying to acquire {} (tier {}) while holding {} (tier {})",
                     tier.name(),
                     tier.level(),
-                    last_tier.name(),
-                    last_tier.level()
+                    last_lock.tier.name(),
+                    last_lock.tier.level()
                 );
 
                 if cfg!(test) {
@@ -184,10 +198,11 @@ impl LockOrderGuard {
                 }
             }
 
-            held.push(tier);
+            held.push(HeldLock { tier, id });
 
             LockOrderGuard {
                 tier,
+                id,
                 pushed: true,
                 _marker: PhantomData,
             }
@@ -202,15 +217,22 @@ impl LockOrderGuard {
         if !is_validation_enabled() {
             return LockOrderGuard {
                 tier,
+                id: 0,
                 pushed: false,
                 _marker: PhantomData,
             };
         }
 
         HELD_LOCKS.with(|held| {
-            held.borrow_mut().push(tier);
+            let id = NEXT_LOCK_ID.with(|next| {
+                let mut next = next.borrow_mut();
+                *next = next.wrapping_add(1);
+                *next
+            });
+            held.borrow_mut().push(HeldLock { tier, id });
             LockOrderGuard {
                 tier,
+                id,
                 pushed: true,
                 _marker: PhantomData,
             }
@@ -227,7 +249,7 @@ impl Drop for LockOrderGuard {
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
 
-            match held.iter().rposition(|&tier| tier == self.tier) {
+            match held.iter().position(|lock| lock.id == self.id) {
                 Some(pos) => {
                     if pos != held.len() - 1 {
                         warn!(
@@ -271,12 +293,48 @@ pub fn is_validation_enabled() -> bool {
 
 /// Get the current lock stack for debugging.
 pub fn debug_lock_stack() -> Vec<LockTier> {
-    HELD_LOCKS.with(|held| held.borrow().clone())
+    HELD_LOCKS.with(|held| held.borrow().iter().map(|lock| lock.tier).collect())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct LockOrderEvents(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LockOrderEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = LockOrderMessageVisitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.0.lock().expect("lock captured events").push(message);
+            }
+        }
+    }
+
+    struct LockOrderMessageVisitor(Option<String>);
+
+    impl tracing::field::Visit for LockOrderMessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+    }
 
     #[test]
     #[should_panic(expected = "Lock ordering violation")]
@@ -317,6 +375,45 @@ mod tests {
 
         drop(guards);
         assert!(debug_lock_stack().is_empty());
+    }
+
+    #[test]
+    fn test_same_tier_out_of_order_release_keeps_stack_consistent() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(LockOrderEvents(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut guards = vec![
+                LockOrderGuard::acquire(LockTier::Namespace),
+                LockOrderGuard::acquire(LockTier::Namespace),
+            ];
+
+            drop(guards.remove(0));
+            assert_eq!(debug_lock_stack(), vec![LockTier::Namespace]);
+
+            drop(guards);
+            assert!(debug_lock_stack().is_empty());
+        });
+        assert_eq!(
+            *events.lock().expect("lock captured events"),
+            vec!["Lock guard dropped in wrong order"]
+        );
+    }
+
+    #[test]
+    fn test_same_tier_nested_release_is_silent() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(LockOrderEvents(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            let guard1 = LockOrderGuard::acquire(LockTier::Namespace);
+            let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
+
+            drop(guard2);
+            assert_eq!(debug_lock_stack(), vec![LockTier::Namespace]);
+
+            drop(guard1);
+            assert!(debug_lock_stack().is_empty());
+        });
+        assert!(events.lock().expect("lock captured events").is_empty());
     }
 
     #[test]
