@@ -2404,6 +2404,7 @@ pub(crate) struct ReplyTaskTracker {
     // Preserve the count on poison: these replies must finish before session teardown.
     active: Mutex<usize>,
     idle: Condvar,
+    // Test-only first-wait entry probe, omitted from the production layout.
     #[cfg(test)]
     wait_started: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -2428,9 +2429,11 @@ impl ReplyTaskTracker {
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        let mut wait_started = self.wait_started.as_ref();
         while *active != 0 {
             #[cfg(test)]
-            if let Some(started) = &self.wait_started {
+            if let Some(started) = wait_started.take() {
                 // The receiver's next lock must follow the atomic unlock in wait.
                 let _ = started.send(());
             }
@@ -4674,6 +4677,11 @@ pub(crate) mod tests {
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "drain must wait for the last active reply"
+        );
         drop(second);
         done_rx
             .recv_timeout(Duration::from_secs(1))
@@ -4708,6 +4716,11 @@ pub(crate) mod tests {
         wait_started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("reply drain must enter the condition-variable wait");
+        assert_eq!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "drain must wait for the active reply"
+        );
         drop(task);
         done_rx
             .recv_timeout(Duration::from_secs(1))
