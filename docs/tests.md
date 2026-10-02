@@ -272,6 +272,9 @@ dispatch rollback serialized.
 Writer-byte regressions cover ignored/updated submissions and both staging
 paths with a closed worker channel. A bounded accounting hook overlaps staged
 submission with completion/cancellation while checking the ownership lock scope.
+Additional boundaries cover pin-before-stats protection, pin/unpin waits outside
+accounting, known/legacy completion lengths, and batch submission overlapping
+terminal cleanup while preserving submission counts and queue-depth peaks.
 
 ```powershell
 cargo test -p studiofs-cache --lib sfs752_ -- --nocapture

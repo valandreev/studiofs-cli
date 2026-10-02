@@ -29,6 +29,11 @@ references without letting an active upload lose its protection from eviction.
   upload-reader fallback and independent source review; prepared delivery.
 - [x] (2026-10-02 10:23Z) Committed/pushed the local review fix as `fcbe9ba7`,
   updated PR #737 and verified its matching remote head.
+- [x] (2026-10-02 10:43Z) Verified the second local review, reproduced three
+  pin/accounting/stats regressions, narrowed accounting and added batch overlap coverage.
+- [x] (2026-10-02 10:49Z) Focused cache/VFS tests, checks, Clippy, formatting
+  and final source diff review passed for the second local review follow-up.
+- [ ] Commit/push the second follow-up and verify the updated PR head.
 
 ## Surprises & Discoveries
 
@@ -110,6 +115,34 @@ The bounded accounting test overlaps submission with completion/cancellation,
 and stale-epoch terminal regressions retain the pin ownership checks requested
 by finding 8. No test establishes an unconditional or 100-percent race guarantee.
 Date/author: 2026-10-02, Codex (local review follow-up).
+
+The second report's findings 3.1/5.1 are addressed by an internal queue helper
+returning `(UploadSubmitOutcome, usize)` with the final count sampled under the
+same mutex as dispatch/rollback. Public signatures remain unchanged. Shared
+cached-store submission records every attempt and peak from that sample, with
+no second `pending_count()` lock and no final-batch-depth shortcut.
+For findings 3.2/5.2, acquire the staged provisional pin before accounting and
+compensate after releasing accounting; retain the accounting/queue ownership
+critical section. A shared private helper submits an already-pinned candidate.
+For finding 3.3, the length-inferred facade pins before observing payload stats;
+a regression removes an eviction-eligible payload at that observation boundary
+and failed before protection moved earlier. Backend pin ordering stays global;
+per-object serialization remains separate measured performance work.
+Date/author: 2026-10-02, Codex (second local review follow-up).
+
+For findings 4.1 and 4.3, move retry snapshots with `mem::replace` and compare
+the full failed operation before restoration. All rollback callers still retain
+the queue mutex while storing and restoring that exact operation. For findings
+4.2/5.3, prefer the known queued payload length when writer accounting has no
+contribution; retain backend stats for legacy zero-length entries. The known
+length regression failed on an unnecessary stats call before the change.
+For finding 4.4, sort/deduplicate the temporary hardlink IDs while preserving
+the input operation sequence, each pin reservation and every submit attempt.
+Keep the public slice-based staging API instead of adding an iterator facade.
+The requested batch/concurrent-completion test coordinates backend batch pinning
+and old-owner queue removal, then checks queue pins, writer bytes, attempted
+submissions, the observed peak and final eviction eligibility.
+Date/author: 2026-10-02, Codex (second local review follow-up).
 
 ## Outcomes & Retrospective
 
@@ -199,6 +232,15 @@ Local review validation also ran these focused commands:
 The tests above each ran one passing test. The final `sfs752_` filter passed
 14 and the queue filter passed 23; the VFS rebase filter passed three.
 
+Second local review results: `sfs752_` passed 19 tests, `upload_queue::tests`
+passed 24, detached writer persistence passed one, VFS rebase passed three,
+and upload-reader fallback passed one. Filters overlap. Cache/VFS check and
+all-targets Clippy, workspace format check and `git diff --check` passed.
+Three new regressions failed before pin-before-stats protection, narrower
+accounting scope and known-length completion accounting were implemented.
+The bounded batch/terminal overlap and queue-depth rollback tests also passed.
+Full workspace suites, live mounts, remote services and benchmarks were not run.
+
 ## Validation and Acceptance
 
 Repeated same/older submissions and duplicate batch inputs leave one queue pin
@@ -230,9 +272,10 @@ source files, so graph discovery was followed by direct source reads.
 including rollback on dispatch failure. `CachedStore` consumes that outcome in
 both single and batch submissions. Existing complete/cancel/retry/rebase APIs
 and local-backend lifecycle methods retain their contracts.
-The private `CachedStore::submit_upload_with_payload_outcome` returns
-`UploadSubmitOutcome` for staged accounting. Public cached-store submission APIs
-retain their unit-returning contracts.
+The private `CachedStore::submit_pinned_upload_with_payload` submits a protected
+candidate and returns `UploadSubmitOutcome`; its caller compensates non-new pins.
+The crate-private queue helper also returns the sampled pending count. Public
+queue and cached-store submission signatures retain their contracts.
 
 Revision 2026-10-02: recorded the six red cache regressions and the two existing
 lock-scope races that must be closed before compensating provisional pins.
@@ -249,3 +292,6 @@ accounting and its queue lifecycle races, preserved public facade APIs, and
 recorded focused validation plus evidence-based dispositions before delivery.
 Revision 2026-10-02: recorded the delivered local review fix and verified PR
 update without claiming full-suite, mounted or service-backed acceptance.
+Revision 2026-10-02: recorded the second review's lock narrowing, atomic depth
+sample, pin-before-stats regression, completion-length fallback and targeted
+batch overlap test; structural MCP was unavailable, so source checks were used.

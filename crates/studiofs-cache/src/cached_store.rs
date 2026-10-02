@@ -487,7 +487,7 @@ pub struct CachedStore {
     upload_queue: Arc<UploadQueue>,
     /// Writer-staged bytes attributed to accepted uploads by object id.
     // Serializes staged queue ownership and its byte accounting with terminal removal.
-    // ponytail: global accounting lock; narrow with per-object pin ordering if measured.
+    // ponytail: global accounting lock; per-object accounting if queue contention is measured.
     pending_upload_bytes_by_object: Mutex<HashMap<ObjectId, u64>>,
     #[cfg(test)]
     upload_accounting_hook: Mutex<Option<UploadAccountingHook>>,
@@ -862,12 +862,23 @@ impl CachedStore {
     /// Updates and ignored submissions reuse the existing owner's pin. A closed
     /// worker channel rolls back the submission and releases its provisional pin.
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
+        self.pin(object_id);
         let payload_len = self
             .local_payload_backend
             .object_stats(object_id)
             .map(|stats| stats.payload_len)
             .unwrap_or(0);
-        self.submit_upload_with_payload(ino, offset, offset, object_id, content_epoch, payload_len);
+        let outcome = self.submit_pinned_upload_with_payload(
+            ino,
+            offset,
+            offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        );
+        if outcome != UploadSubmitOutcome::New {
+            self.unpin(object_id);
+        }
     }
 
     /// Submits a single upload op with explicit payload geometry.
@@ -883,29 +894,8 @@ impl CachedStore {
         content_epoch: u64,
         payload_len: u64,
     ) {
-        self.submit_upload_with_payload_outcome(
-            ino,
-            offset,
-            object_file_offset,
-            object_id,
-            content_epoch,
-            payload_len,
-        );
-    }
-
-    fn submit_upload_with_payload_outcome(
-        &self,
-        ino: u64,
-        offset: u64,
-        object_file_offset: u64,
-        object_id: ObjectId,
-        content_epoch: u64,
-        payload_len: u64,
-    ) -> UploadSubmitOutcome {
-        // Protect the payload before a worker can claim it. Updates and ignored
-        // submissions reuse the queue's existing owner instead of adding one.
         self.pin(object_id);
-        let outcome = self.upload_queue.submit_with_payload(
+        let outcome = self.submit_pinned_upload_with_payload(
             ino,
             offset,
             object_file_offset,
@@ -916,9 +906,27 @@ impl CachedStore {
         if outcome != UploadSubmitOutcome::New {
             self.unpin(object_id);
         }
-        self.metrics
-            .upload_queue
-            .record_submit(self.upload_queue.pending_count());
+    }
+
+    // Caller owns a provisional pin and releases it unless this creates a queue owner.
+    fn submit_pinned_upload_with_payload(
+        &self,
+        ino: u64,
+        offset: u64,
+        object_file_offset: u64,
+        object_id: ObjectId,
+        content_epoch: u64,
+        payload_len: u64,
+    ) -> UploadSubmitOutcome {
+        let (outcome, pending_count) = self.upload_queue.submit_with_payload_and_pending_count(
+            ino,
+            offset,
+            object_file_offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        );
+        self.metrics.upload_queue.record_submit(pending_count);
         outcome
     }
 
@@ -930,10 +938,12 @@ impl CachedStore {
                 pinned.insert_many(ops.iter().map(|(_, _, _, object_id, _, _)| *object_id));
             self.local_payload_backend.pin_batch(&first_pins);
         }
-        let object_ids = ops
+        let mut object_ids = ops
             .iter()
             .map(|(_, _, _, object_id, _, _)| *object_id)
             .collect::<Vec<_>>();
+        object_ids.sort_unstable();
+        object_ids.dedup();
         if let Err(error) = self.upload_stage_store.link_payload_batch(&object_ids) {
             warn!(
                 object_count = object_ids.len(),
@@ -942,7 +952,7 @@ impl CachedStore {
             );
         }
         for (ino, offset, object_file_offset, object_id, content_epoch, payload_len) in ops {
-            let outcome = self.upload_queue.submit_with_payload(
+            let outcome = self.submit_pinned_upload_with_payload(
                 *ino,
                 *offset,
                 *object_file_offset,
@@ -953,9 +963,6 @@ impl CachedStore {
             if outcome != UploadSubmitOutcome::New {
                 self.unpin(*object_id);
             }
-            self.metrics
-                .upload_queue
-                .record_submit(self.upload_queue.pending_count());
         }
     }
 
@@ -968,11 +975,14 @@ impl CachedStore {
             let mut bytes = self.record_upload_terminal(&mut pending_bytes, op.object_id);
             drop(pending_bytes);
             if bytes == 0 {
-                bytes = self
-                    .local_payload_backend
-                    .object_stats(op.object_id)
-                    .map(|stats| stats.payload_len)
-                    .unwrap_or(0);
+                bytes = if op.payload_len > 0 {
+                    op.payload_len
+                } else {
+                    self.local_payload_backend
+                        .object_stats(op.object_id)
+                        .map(|stats| stats.payload_len)
+                        .unwrap_or(0)
+                };
             }
             self.unpin(op.object_id);
             self.metrics.upload_queue.record_complete(bytes);
@@ -1088,9 +1098,10 @@ impl CachedStore {
         payload_len: usize,
     ) {
         self.writer_counters.record_staged(payload_len);
+        self.pin(object_id);
         // Commit accounting before a terminal operation can remove this owner.
         let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
-        let outcome = self.submit_upload_with_payload_outcome(
+        let outcome = self.submit_pinned_upload_with_payload(
             ino,
             offset,
             offset,
@@ -1110,6 +1121,10 @@ impl CachedStore {
                 self.writer_counters.record_upload_terminal(previous);
             }
             self.writer_counters.record_pending_upload(payload_len);
+        }
+        drop(pending_bytes);
+        if outcome != UploadSubmitOutcome::New {
+            self.unpin(object_id);
         }
     }
 
@@ -1819,10 +1834,13 @@ mod tests {
         puts: Arc<Mutex<Vec<RecordedPayloadPut>>>,
         fail_next_owned_put: Arc<std::sync::atomic::AtomicBool>,
         fail_next_remove: Arc<std::sync::atomic::AtomicBool>,
+        evict_on_unpinned_stats: Arc<std::sync::atomic::AtomicBool>,
+        object_stats_calls: Arc<AtomicU64>,
         pin_transition_hook: Arc<Mutex<Option<PinTransitionHook>>>,
     }
 
     struct PinTransitionHook {
+        unpin_only: bool,
         entered: std::sync::mpsc::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     }
@@ -1834,6 +1852,8 @@ mod tests {
                 puts: Arc::new(Mutex::new(Vec::new())),
                 fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fail_next_remove: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                evict_on_unpinned_stats: Arc::default(),
+                object_stats_calls: Arc::default(),
                 pin_transition_hook: Arc::default(),
             }
         }
@@ -1844,6 +1864,8 @@ mod tests {
                 puts: Arc::new(Mutex::new(Vec::new())),
                 fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 fail_next_remove: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                evict_on_unpinned_stats: Arc::default(),
+                object_stats_calls: Arc::default(),
                 pin_transition_hook: Arc::default(),
             }
         }
@@ -1852,8 +1874,14 @@ mod tests {
             std::mem::take(&mut *self.puts.lock())
         }
 
-        fn pause_pin_transition(&self) {
-            if let Some(hook) = self.pin_transition_hook.lock().take() {
+        fn pause_pin_transition(&self, unpin: bool) {
+            let mut hook = self.pin_transition_hook.lock();
+            if hook.as_ref().is_some_and(|hook| hook.unpin_only && !unpin) {
+                return;
+            }
+            let next_hook = hook.take();
+            drop(hook);
+            if let Some(hook) = next_hook {
                 hook.entered.send(()).unwrap();
                 hook.release.recv_timeout(Duration::from_secs(5)).unwrap();
             }
@@ -1950,17 +1978,17 @@ mod tests {
         }
 
         fn pin(&self, object_id: u64) {
-            self.pause_pin_transition();
+            self.pause_pin_transition(false);
             self.inner.pin(object_id);
         }
 
         fn unpin(&self, object_id: u64) {
-            self.pause_pin_transition();
+            self.pause_pin_transition(true);
             self.inner.unpin(object_id);
         }
 
         fn pin_batch(&self, object_ids: &[u64]) {
-            self.pause_pin_transition();
+            self.pause_pin_transition(false);
             self.inner.pin_batch(object_ids);
         }
 
@@ -1997,7 +2025,14 @@ mod tests {
         }
 
         fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
-            self.inner.object_stats(object_id)
+            self.object_stats_calls.fetch_add(1, Ordering::Relaxed);
+            let stats = self.inner.object_stats(object_id);
+            if self.evict_on_unpinned_stats.load(Ordering::SeqCst)
+                && self.inner.is_evictable(object_id)
+            {
+                self.inner.remove(object_id).unwrap();
+            }
+            stats
         }
 
         fn object_ids(&self) -> Vec<u64> {
@@ -2739,6 +2774,149 @@ mod tests {
     }
 
     #[test]
+    fn sfs752_batch_submission_overlaps_terminal_cleanup_without_leaks() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+        let (store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+        store.put(101, b"payload", false).unwrap();
+        store.put(102, b"other", false).unwrap();
+        store.submit_staged_upload(1, 0, 101, 3, 7);
+        let previous = store.snapshot_pending_uploads().pop().unwrap();
+        let (pin_entered_tx, pin_entered_rx) = std::sync::mpsc::channel();
+        let (pin_release_tx, pin_release_rx) = std::sync::mpsc::channel();
+        *backend.pin_transition_hook.lock() = Some(PinTransitionHook {
+            unpin_only: false,
+            entered: pin_entered_tx,
+            release: pin_release_rx,
+        });
+        let (terminal_entered_tx, terminal_entered_rx) = std::sync::mpsc::channel();
+        let (terminal_release_tx, terminal_release_rx) = std::sync::mpsc::channel();
+        *store.upload_accounting_hook.lock() = Some(UploadAccountingHook {
+            entered: terminal_entered_tx,
+            release: terminal_release_rx,
+        });
+        let batch_store = Arc::clone(&store);
+        let batch = std::thread::spawn(move || {
+            batch_store.submit_uploads_batch(&[
+                (1, 0, 0, 101, 3, 7),
+                (1, 8, 8, 102, 3, 5),
+                (1, 8, 8, 102, 3, 5),
+            ])
+        });
+        pin_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let terminal_store = Arc::clone(&store);
+        let terminal = std::thread::spawn(move || terminal_store.complete_upload(&previous));
+        terminal_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(store.pending_upload_count(), 0);
+        terminal_release_tx.send(()).unwrap();
+        pin_release_tx.send(()).unwrap();
+        batch.join().unwrap();
+        terminal.join().unwrap();
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+        assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+        assert_eq!(store.pinned.lock().objects.get(&101), Some(&1));
+        assert_eq!(store.pinned.lock().objects.get(&102), Some(&1));
+        let metrics = store.cache_pipeline_metrics().upload_queue;
+        assert_eq!(metrics.submitted, 4);
+        assert_eq!(metrics.pending_depth_peak, 2);
+        for op in store.snapshot_pending_uploads() {
+            store.mark_uploaded(op.object_id).unwrap();
+            store.complete_upload(&op);
+            assert!(store.local_payload_backend.is_evictable(op.object_id));
+        }
+        assert_eq!(store.pending_upload_count(), 0);
+        assert!(store.pinned.lock().objects.is_empty());
+    }
+
+    #[test]
+    fn sfs752_submit_pins_before_reading_payload_stats() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+        let (store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+        store.put(101, b"payload", false).unwrap();
+        store.mark_uploaded(101).unwrap();
+        backend
+            .evict_on_unpinned_stats
+            .store(true, Ordering::SeqCst);
+        store.submit_upload(1, 0, 101, 3);
+        assert_eq!(store.get_for_upload(101).as_deref(), Some(&b"payload"[..]));
+        let op = store.snapshot_pending_uploads().pop().unwrap();
+        assert_eq!(op.payload_len, 7);
+        store.complete_upload(&op);
+        assert!(store.pinned.lock().objects.is_empty());
+    }
+
+    #[test]
+    fn sfs752_completion_uses_known_payload_length_or_legacy_stats() {
+        for payload_len in [7, 0] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+            let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+            let (store, _rx) =
+                CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+            store.put(101, b"payload", false).unwrap();
+            store.submit_upload_with_payload(1, 0, 0, 101, 3, payload_len);
+            let op = store.snapshot_pending_uploads().pop().unwrap();
+            store.complete_upload(&op);
+            assert_eq!(
+                store.cache_pipeline_metrics().upload_queue.completed_bytes,
+                7
+            );
+            assert_eq!(
+                backend.object_stats_calls.load(Ordering::Relaxed),
+                u64::from(payload_len == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn sfs752_staged_backend_transitions_do_not_hold_accounting_lock() {
+        for unpin_only in [false, true] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+            let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+            let (store, rx) =
+                CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+            let _rx = if unpin_only {
+                drop(rx);
+                None
+            } else {
+                Some(rx)
+            };
+            store.put(101, b"payload", false).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *backend.pin_transition_hook.lock() = Some(PinTransitionHook {
+                unpin_only,
+                entered: entered_tx,
+                release: release_rx,
+            });
+            let background = Arc::clone(&store);
+            let thread =
+                std::thread::spawn(move || background.submit_staged_upload(1, 0, 101, 3, 7));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let accounting_was_free = store.pending_upload_bytes_by_object.try_lock().is_some();
+            release_tx.send(()).unwrap();
+            thread.join().unwrap();
+            assert!(
+                accounting_was_free,
+                "backend pin/unpin waits must be outside accounting lock"
+            );
+            if let Some(op) = store.snapshot_pending_uploads().pop() {
+                store.complete_upload(&op);
+            }
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+            assert!(store.pinned.lock().objects.is_empty());
+        }
+    }
+
+    #[test]
     fn sfs752_staged_and_terminal_transitions_lock_pending_byte_accounting() {
         for transition in 0..3 {
             let dir = studiofs_test_support::workspace_target_tempdir("test-");
@@ -2875,6 +3053,7 @@ mod tests {
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             *backend.pin_transition_hook.lock() = Some(PinTransitionHook {
+                unpin_only: false,
                 entered: entered_tx,
                 release: release_rx,
             });

@@ -38,9 +38,10 @@
 //! `LockOrderGuard`; the ordering is enforced by the call structure.
 //!
 //! Writer upload byte accounting acquires
-//! `CachedStore::pending_upload_bytes_by_object` before staged submission or
-//! terminal queue removal. Staged submission may acquire `pinned` and the
-//! backend locks above, then the queue's `pending_state` after releasing them.
+//! `CachedStore::pending_upload_bytes_by_object` before staged queue submission
+//! or terminal queue removal, then the queue's `pending_state`. Staged submission
+//! acquires its provisional pin before accounting and compensates it after
+//! accounting is released, so backend pin/unpin waits do not retain accounting.
 //! Completion/cancellation acquire `pending_state` under the accounting lock,
 //! reconcile the accepted owner's bytes, and release accounting before backend
 //! reads or unpinning. Queue/backend code must not re-enter byte accounting.

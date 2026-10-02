@@ -184,6 +184,27 @@ impl UploadQueue {
         content_epoch: u64,
         payload_len: u64,
     ) -> UploadSubmitOutcome {
+        self.submit_with_payload_and_pending_count(
+            ino,
+            offset,
+            object_file_offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        )
+        .0
+    }
+
+    /// Returns the outcome and pending count sampled under the same queue lock.
+    pub(crate) fn submit_with_payload_and_pending_count(
+        &self,
+        ino: Ino,
+        offset: u64,
+        object_file_offset: u64,
+        object_id: u64,
+        content_epoch: u64,
+        payload_len: u64,
+    ) -> (UploadSubmitOutcome, usize) {
         let op = PendingUpload {
             ino,
             offset,
@@ -225,11 +246,12 @@ impl UploadQueue {
                 UploadSubmitOutcome::Ignored
             }
         };
+        let pending_count = state.by_object.len();
         drop(state);
         if became_idle {
             self.idle_notify.notify_waiters();
         }
-        outcome
+        (outcome, pending_count)
     }
 
     /// Mark an upload as complete.
@@ -523,8 +545,7 @@ impl UploadQueue {
         {
             return None;
         }
-        let previous = current.clone();
-        *current = op.clone();
+        let previous = std::mem::replace(current, op.clone());
         state.dirty_objects.insert(op.object_id);
         Some(previous)
     }
@@ -558,12 +579,7 @@ impl UploadQueue {
         let Some(current) = state.by_object.get_mut(&failed_op.object_id) else {
             return;
         };
-        if current.ino == failed_op.ino
-            && current.offset == failed_op.offset
-            && current.content_epoch == failed_op.content_epoch
-            && current.retry_count == failed_op.retry_count
-            && current.not_before_unix_ms == failed_op.not_before_unix_ms
-        {
+        if current == failed_op {
             *current = previous;
         }
     }
@@ -684,6 +700,39 @@ mod tests {
 
         assert!(queue.complete(&updated));
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn sfs752_submission_reports_count_after_commit_or_rollback() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, rx) = UploadQueue::new(dir.path());
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 1, 7),
+            (UploadSubmitOutcome::New, 1)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 2, 7),
+            (UploadSubmitOutcome::Updated, 1)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 1, 7),
+            (UploadSubmitOutcome::Ignored, 1)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 8, 8, 102, 1, 5),
+            (UploadSubmitOutcome::New, 2)
+        );
+        drop(rx);
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 16, 16, 103, 1, 9),
+            (UploadSubmitOutcome::Closed, 2)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 3, 9),
+            (UploadSubmitOutcome::Closed, 2)
+        );
+        assert_eq!(queue.snapshot_pending()[0].content_epoch, 2);
+        assert_eq!(queue.snapshot_pending()[0].payload_len, 7);
     }
 
     #[tokio::test]

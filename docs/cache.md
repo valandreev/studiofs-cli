@@ -182,6 +182,9 @@ updates replace that object's byte contribution; ignored and closed-channel
 submissions preserve prior accounting. Staged submission and terminal removal
 share the accounting mutex so completion cannot outrun byte registration or
 remove a newly accepted owner's contribution.
+Backend provisional pin acquisition and compensation run outside that accounting
+lock. Queue submission samples its resulting depth under the queue lock, keeping
+per-attempt counts and peak observations without a second queue lock acquisition.
 
 Durable local payload state lives in the cached store plus local metadata; the
 mount must not create a second foreground payload pipeline.
