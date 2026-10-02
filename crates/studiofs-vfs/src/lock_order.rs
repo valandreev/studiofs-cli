@@ -2,6 +2,9 @@
 //!
 //! This module provides runtime validation of lock ordering to prevent deadlocks.
 //! The lock ordering is defined in AGENTS.md and must be followed strictly.
+//! With validation enabled, thread-local acquisition IDs distinguish guards of
+//! the same tier. Out-of-order releases warn and remove only the dropped guard's
+//! acquisition, preserving the remaining stack.
 //!
 //! # Lock Ordering (Tier 1 = highest priority)
 //!
@@ -145,7 +148,9 @@ fn next_lock_id() -> u64 {
 
 /// Guard that tracks lock acquisition and validates ordering.
 ///
-/// When dropped, the lock is released from the tracking stack.
+/// With validation enabled, each guard retains its acquisition ID, so release
+/// inversions are detected even between guards of the same tier. Dropping a
+/// guard removes only its acquisition from the tracking stack.
 pub struct LockOrderGuard {
     tier: LockTier,
     id: u64,
@@ -243,11 +248,17 @@ impl Drop for LockOrderGuard {
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
 
-            match held.iter().position(|(_, id)| *id == self.id) {
+            match held.iter().rposition(|(_, id)| *id == self.id) {
                 Some(pos) => {
-                    if pos != held.len() - 1 {
+                    if pos != held.len() - 1
+                        && let Some(&(top_tier, top_id)) = held.last()
+                    {
                         warn!(
-                            expected = self.tier.name(),
+                            dropped_tier = self.tier.name(),
+                            dropped_id = self.id,
+                            top_tier = top_tier.name(),
+                            top_id,
+                            stack_depth = held.len(),
                             "Lock guard dropped in wrong order"
                         );
                     }
@@ -255,8 +266,9 @@ impl Drop for LockOrderGuard {
                 }
                 None => {
                     warn!(
-                        expected = self.tier.name(),
-                        "Lock guard dropped but tier was not found in thread-local stack"
+                        dropped_tier = self.tier.name(),
+                        dropped_id = self.id,
+                        "Lock guard dropped but acquisition was not found in thread-local stack"
                     );
                 }
             }
@@ -302,6 +314,7 @@ mod tests {
         let output = Arc::new(tempfile::tempfile().expect("create captured tracing output"));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
             .with_writer(output.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, body);
@@ -342,16 +355,30 @@ mod tests {
 
     #[test]
     fn test_out_of_order_release_keeps_stack_consistent() {
-        let mut guards = vec![
-            LockOrderGuard::acquire(LockTier::Shutdown),
-            LockOrderGuard::acquire(LockTier::Namespace),
-        ];
+        let guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
+        let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
+        let dropped_id = guard1.id;
+        let top_id = guard2.id;
 
-        drop(guards.remove(0));
-        assert_eq!(debug_lock_stack(), vec![LockTier::Namespace]);
+        let captured = capture_warnings_while(|| {
+            drop(guard1);
+            assert_eq!(debug_lock_stack(), vec![LockTier::Namespace]);
 
-        drop(guards);
-        assert!(debug_lock_stack().is_empty());
+            drop(guard2);
+            assert!(debug_lock_stack().is_empty());
+        });
+        for field in [
+            "dropped_tier=\"Shutdown\"".to_owned(),
+            format!("dropped_id={dropped_id}"),
+            "top_tier=\"Namespace\"".to_owned(),
+            format!("top_id={top_id}"),
+            "stack_depth=2".to_owned(),
+        ] {
+            assert!(
+                captured.split_whitespace().any(|token| token == field),
+                "missing {field}: {captured}"
+            );
+        }
     }
 
     #[test]
@@ -391,6 +418,52 @@ mod tests {
             captured.trim().is_empty(),
             "expected no diagnostic, got: {captured}"
         );
+    }
+
+    #[test]
+    fn test_unchecked_middle_release_keeps_stack_consistent() {
+        let captured = capture_warnings_while(|| {
+            let guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
+            let guard2 = LockOrderGuard::acquire_unchecked(LockTier::Namespace);
+            let guard3 = LockOrderGuard::acquire_unchecked(LockTier::Namespace);
+
+            drop(guard2);
+            assert_eq!(
+                debug_lock_stack(),
+                vec![LockTier::Shutdown, LockTier::Namespace]
+            );
+            drop(guard3);
+            assert_eq!(debug_lock_stack(), vec![LockTier::Shutdown]);
+            drop(guard1);
+            assert!(debug_lock_stack().is_empty());
+        });
+        assert_eq!(
+            captured
+                .matches("Lock guard dropped in wrong order")
+                .count(),
+            1,
+            "expected exactly one out-of-order diagnostic, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn test_lock_tracking_is_thread_local() {
+        let guard = LockOrderGuard::acquire(LockTier::Namespace);
+        let next_id = NEXT_LOCK_ID.with(Cell::get);
+        std::thread::spawn(|| {
+            assert!(debug_lock_stack().is_empty());
+            let guard = LockOrderGuard::acquire(LockTier::Shutdown);
+            assert_eq!(guard.id, 1);
+            assert_eq!(debug_lock_stack(), vec![LockTier::Shutdown]);
+            drop(guard);
+            assert!(debug_lock_stack().is_empty());
+        })
+        .join()
+        .expect("lock tracking thread should complete");
+        assert_eq!(NEXT_LOCK_ID.with(Cell::get), next_id);
+        assert_eq!(debug_lock_stack(), vec![LockTier::Namespace]);
+        drop(guard);
+        assert!(debug_lock_stack().is_empty());
     }
 
     #[test]
