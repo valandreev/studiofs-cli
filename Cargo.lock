@@ -5041,6 +5041,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
+ "static_assertions",
  "studiofs-cache",
  "studiofs-data",
  "studiofs-meta",
