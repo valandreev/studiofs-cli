@@ -151,8 +151,24 @@ fn next_lock_id() -> u64 {
 /// With validation enabled, each guard retains its acquisition ID, so release
 /// inversions are detected even between guards of the same tier. Dropping a
 /// guard removes only its acquisition from the tracking stack.
+/// Guards cannot be sent or shared across threads because they track the
+/// acquiring thread's stack.
+///
+/// ```compile_fail
+/// use studiofs_vfs::LockOrderGuard;
+/// fn require_send<T: Send>() {}
+/// require_send::<LockOrderGuard>();
+/// ```
+///
+/// ```compile_fail
+/// use studiofs_vfs::LockOrderGuard;
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<LockOrderGuard>();
+/// ```
 pub struct LockOrderGuard {
     tier: LockTier,
+    // Zero is used when validation is disabled and also occurs at counter wrap.
+    // `pushed` determines whether this acquisition is tracked.
     id: u64,
     pushed: bool,
     _marker: PhantomData<*mut ()>,
@@ -178,20 +194,17 @@ impl LockOrderGuard {
             let mut held = held.borrow_mut();
             let id = next_lock_id();
 
-            // Check lock ordering: new tier must be >= last acquired tier
-            // (i.e., same or lower priority than what we already hold).
-            // We compare with last() because that's the most recently acquired lock.
-            // Example: if we hold [Tier1, Tier5], last() is Tier5.
-            // Trying to acquire Tier3 would violate ordering (3 < 5).
-            if let Some(&(last_tier, _)) = held.last()
-                && tier < last_tier
+            // Check every held acquisition: unchecked or warned acquisitions
+            // can leave the stack's tiers out of order.
+            if let Some(&(violating_tier, _)) =
+                held.iter().rfind(|(held_tier, _)| tier < *held_tier)
             {
                 let msg = format!(
                     "Lock ordering violation: trying to acquire {} (tier {}) while holding {} (tier {})",
                     tier.name(),
                     tier.level(),
-                    last_tier.name(),
-                    last_tier.level()
+                    violating_tier.name(),
+                    violating_tier.level()
                 );
 
                 if cfg!(test) {
@@ -216,6 +229,7 @@ impl LockOrderGuard {
     ///
     /// Use this when lock ordering cannot be statically determined.
     /// The caller is responsible for ensuring correct ordering.
+    /// This acquisition is still tracked and checked by later calls to `acquire`.
     pub fn acquire_unchecked(tier: LockTier) -> Self {
         if !is_validation_enabled() {
             return LockOrderGuard {
@@ -336,6 +350,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "while holding Upload (tier 5)")]
+    fn test_checked_acquire_rejects_older_tier_after_unchecked_acquire() {
+        let _guard1 = LockOrderGuard::acquire(LockTier::Upload);
+        let _guard2 = LockOrderGuard::acquire_unchecked(LockTier::Shutdown);
+        let _guard3 = LockOrderGuard::acquire(LockTier::Namespace);
+    }
+
+    #[test]
     fn test_correct_lock_order() {
         // Acquire higher priority lock first
         let _guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
@@ -383,10 +405,13 @@ mod tests {
 
     #[test]
     fn test_same_tier_out_of_order_release_keeps_stack_consistent() {
-        let captured = capture_warnings_while(|| {
-            let guard1 = LockOrderGuard::acquire(LockTier::Namespace);
-            let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
+        let guard1 = LockOrderGuard::acquire(LockTier::Namespace);
+        let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
+        let dropped_id = guard1.id;
+        let top_id = guard2.id;
+        assert_ne!(dropped_id, top_id);
 
+        let captured = capture_warnings_while(|| {
             drop(guard1);
             assert_eq!(debug_lock_stack(), vec![LockTier::Namespace]);
 
@@ -400,6 +425,45 @@ mod tests {
             1,
             "expected exactly one out-of-order diagnostic, got: {captured}"
         );
+        for field in [
+            "dropped_tier=\"Namespace\"".to_owned(),
+            format!("dropped_id={dropped_id}"),
+            "top_tier=\"Namespace\"".to_owned(),
+            format!("top_id={top_id}"),
+            "stack_depth=2".to_owned(),
+        ] {
+            assert!(
+                captured.split_whitespace().any(|token| token == field),
+                "missing {field}: {captured}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_acquisition_warns_and_preserves_other_guards() {
+        let remaining = LockOrderGuard::acquire(LockTier::Shutdown);
+        let missing = LockOrderGuard::acquire(LockTier::Namespace);
+        let missing_id = missing.id;
+        // Simulate losing only the newer acquisition's stack entry.
+        let _ = HELD_LOCKS.with(|held| held.borrow_mut().pop());
+
+        let captured = capture_warnings_while(|| drop(missing));
+        assert!(
+            captured
+                .contains("Lock guard dropped but acquisition was not found in thread-local stack")
+        );
+        for field in [
+            "dropped_tier=\"Namespace\"".to_owned(),
+            format!("dropped_id={missing_id}"),
+        ] {
+            assert!(
+                captured.split_whitespace().any(|token| token == field),
+                "missing {field}: {captured}"
+            );
+        }
+        assert_eq!(debug_lock_stack(), vec![LockTier::Shutdown]);
+        drop(remaining);
+        assert!(debug_lock_stack().is_empty());
     }
 
     #[test]
