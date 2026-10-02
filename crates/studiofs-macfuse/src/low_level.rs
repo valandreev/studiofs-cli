@@ -4,6 +4,10 @@
 //! low-level macFUSE FFI. Public types copy callback-owned values before they
 //! can cross async boundaries and keep request/reply ownership explicit.
 
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -284,8 +288,8 @@ pub(crate) mod raw {
         pub fn fuse_session_destroy(session: *mut FuseSession);
         /// Ask a session loop to exit.
         pub fn fuse_session_exit(session: *mut FuseSession);
-        /// Run a low-level session loop on the current thread.
-        pub fn fuse_session_loop(session: *mut FuseSession) -> c_int;
+        /// Run a low-level session loop with native callback workers.
+        pub fn fuse_session_loop_mt(session: *mut FuseSession) -> c_int;
         /// Notify the kernel to invalidate inode cache state.
         pub fn fuse_lowlevel_notify_inval_inode(
             channel: *mut FuseChan,
@@ -732,6 +736,8 @@ impl Session {
     /// returned session lifetime.
     /// `userdata` must remain valid until the session is destroyed, unless the
     /// callback table intentionally handles a null user-data pointer.
+    /// Callbacks and their user data must support concurrent access from
+    /// macFUSE worker threads. Each request must still have one reply owner.
     pub unsafe fn mount_with_ops(
         config: &SessionConfig,
         ops: LowLevelOperations,
@@ -819,11 +825,17 @@ impl Session {
         self.control.invalidation_queue.attach_metrics(vfs);
     }
 
-    /// Run the low-level session loop on the current thread.
+    /// Run the low-level session loop with concurrent native callback workers.
+    ///
+    /// This blocks the current thread until macFUSE joins its callback workers.
+    /// Callers must then drain any replies queued outside those native workers
+    /// before destroying the session.
     pub fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live session owned by this wrapper for the
-        // duration of the blocking loop call.
-        let result = unsafe { raw::fuse_session_loop(self.raw.as_ptr()) };
+        // blocking call. mount_with_ops requires thread-safe callback state;
+        // macFUSE disables worker cancellation during callbacks and joins the
+        // workers before returning, keeping their request buffers live.
+        let result = unsafe { raw::fuse_session_loop_mt(self.raw.as_ptr()) };
         // An external unmount returns from the loop without going through
         // SessionControl::request_exit, so stop queued kernel sends here too.
         self.control.shutdown_invalidation();
