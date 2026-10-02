@@ -269,10 +269,14 @@ worker channels, retry/rebase failures, and independent reader pins. The last up
 owner releases its pin exactly once; uploaded payloads then become evictable.
 Bounded synchronization checks keep logical/backend pin transitions and queue
 dispatch rollback serialized.
+Writer-byte regressions cover ignored/updated submissions and both staging
+paths with a closed worker channel. A bounded accounting hook overlaps staged
+submission with completion/cancellation while checking the ownership lock scope.
 
 ```powershell
 cargo test -p studiofs-cache --lib sfs752_ -- --nocapture
 cargo test -p studiofs-cache --lib upload_queue::tests -- --nocapture
+cargo test -p studiofs-vfs --lib upload_disk_reread_falls_back_without_stage_link_after_foreground_idle -- --nocapture
 cargo check -p studiofs-cache
 cargo clippy -p studiofs-cache --all-targets -- -D warnings
 ```

@@ -37,6 +37,15 @@
 //! ascending stripe order. These auxiliary locks are outside `LockTier` and
 //! `LockOrderGuard`; the ordering is enforced by the call structure.
 //!
+//! Writer upload byte accounting acquires
+//! `CachedStore::pending_upload_bytes_by_object` before staged submission or
+//! terminal queue removal. Staged submission may acquire `pinned` and the
+//! backend locks above, then the queue's `pending_state` after releasing them.
+//! Completion/cancellation acquire `pending_state` under the accounting lock,
+//! reconcile the accepted owner's bytes, and release accounting before backend
+//! reads or unpinning. Queue/backend code must not re-enter byte accounting.
+//! These locks are also outside `LockTier` and `LockOrderGuard`.
+//!
 //! Payload writes/removals hold the same stripe gates across I/O. A colliding
 //! gate can therefore stall unrelated pin transitions behind the store-wide
 //! mutex; a batch may wait for all 64 stripes. Per-object transition ordering

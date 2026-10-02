@@ -3212,7 +3212,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_disk_reread_waits_for_foreground_reads_to_be_idle() {
+    fn upload_disk_reread_falls_back_without_stage_link_after_foreground_idle() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-yields-to-read");
         let object_id = 0xA1A0_0001;
@@ -3222,6 +3222,12 @@ mod tests {
             vfs.payload_store_put_async(object_id, payload.clone(), false)
                 .await
                 .expect("persist upload payload");
+            assert!(
+                !vfs.upload_stage_contains_async(object_id)
+                    .await
+                    .expect("check upload stage"),
+                "payload should have no upload-stage hardlink"
+            );
             vfs.state.read.mark_foreground_read(now_unix_millis());
 
             let port = VfsUploadLocalPayloadPort { vfs: vfs.clone() };
@@ -3246,6 +3252,21 @@ mod tests {
             assert_eq!(
                 reread_payload,
                 Bytes::from_static(b"disk-backed upload payload")
+            );
+            assert_eq!(
+                vfs.state
+                    .upload
+                    .upload_fallback_rereads
+                    .load(Ordering::Relaxed),
+                1,
+                "missing stage link should use the local payload backend fallback"
+            );
+            assert_eq!(
+                vfs.state
+                    .upload
+                    .upload_staged_payload_reads
+                    .load(Ordering::Relaxed),
+                0
             );
         });
     }

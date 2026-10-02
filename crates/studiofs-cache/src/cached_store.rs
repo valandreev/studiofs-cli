@@ -106,7 +106,7 @@ pub struct CachedStoreWriterCountersSnapshot {
     pub dirty_bytes: u64,
     /// Total bytes staged into the local cache backend.
     pub staged_bytes: u64,
-    /// Bytes currently attributed to pending uploads.
+    /// Writer-staged bytes currently attributed to accepted pending uploads.
     pub pending_upload_bytes: u64,
     /// Total number of slices staged.
     pub staged_slices: u64,
@@ -327,6 +327,12 @@ struct PinnedState {
     objects: HashMap<ObjectId, usize>,
 }
 
+#[cfg(test)]
+struct UploadAccountingHook {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 impl PinnedState {
     fn insert(&mut self, object_id: ObjectId) -> bool {
         let count = self.objects.entry(object_id).or_default();
@@ -479,8 +485,12 @@ pub struct CachedStore {
     pinned: Mutex<PinnedState>,
     /// Queue that schedules staged uploads for worker dispatch.
     upload_queue: Arc<UploadQueue>,
-    /// Bytes currently pending upload per object id.
+    /// Writer-staged bytes attributed to accepted uploads by object id.
+    // Serializes staged queue ownership and its byte accounting with terminal removal.
+    // ponytail: global accounting lock; narrow with per-object pin ordering if measured.
     pending_upload_bytes_by_object: Mutex<HashMap<ObjectId, u64>>,
+    #[cfg(test)]
+    upload_accounting_hook: Mutex<Option<UploadAccountingHook>>,
     /// Atomic counters for writer staging and upload metrics.
     writer_counters: CachedStoreWriterCounters,
     /// Pipeline metrics exposed for diagnostics and observability.
@@ -507,6 +517,8 @@ impl CachedStore {
             pinned: Mutex::new(PinnedState::default()),
             upload_queue,
             pending_upload_bytes_by_object: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            upload_accounting_hook: Mutex::new(None),
             writer_counters: CachedStoreWriterCounters::default(),
             metrics: CachePipelineMetrics::default(),
         });
@@ -845,7 +857,10 @@ impl CachedStore {
         }
     }
 
-    /// Submits a single upload op to the upload queue and pins the object until terminal.
+    /// Submits an upload, retaining a pin for each new accepted queue owner until terminal.
+    ///
+    /// Updates and ignored submissions reuse the existing owner's pin. A closed
+    /// worker channel rolls back the submission and releases its provisional pin.
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
         let payload_len = self
             .local_payload_backend
@@ -856,6 +871,9 @@ impl CachedStore {
     }
 
     /// Submits a single upload op with explicit payload geometry.
+    ///
+    /// Only a new accepted entry retains the provisional pin. Updates, ignored
+    /// submissions and closed-channel rollback preserve the previous owner's pin.
     pub fn submit_upload_with_payload(
         &self,
         ino: u64,
@@ -865,6 +883,25 @@ impl CachedStore {
         content_epoch: u64,
         payload_len: u64,
     ) {
+        self.submit_upload_with_payload_outcome(
+            ino,
+            offset,
+            object_file_offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        );
+    }
+
+    fn submit_upload_with_payload_outcome(
+        &self,
+        ino: u64,
+        offset: u64,
+        object_file_offset: u64,
+        object_id: ObjectId,
+        content_epoch: u64,
+        payload_len: u64,
+    ) -> UploadSubmitOutcome {
         // Protect the payload before a worker can claim it. Updates and ignored
         // submissions reuse the queue's existing owner instead of adding one.
         self.pin(object_id);
@@ -882,6 +919,7 @@ impl CachedStore {
         self.metrics
             .upload_queue
             .record_submit(self.upload_queue.pending_count());
+        outcome
     }
 
     /// Submits a batch of upload ops, retaining one pin per new queue owner.
@@ -923,8 +961,12 @@ impl CachedStore {
 
     /// Records completion for an upload op, unpinning the object if it reached terminal.
     pub fn complete_upload(&self, op: &PendingUpload) {
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.complete(op) {
-            let mut bytes = self.record_upload_terminal(op.object_id);
+            #[cfg(test)]
+            self.pause_upload_accounting_for_test();
+            let mut bytes = self.record_upload_terminal(&mut pending_bytes, op.object_id);
+            drop(pending_bytes);
             if bytes == 0 {
                 bytes = self
                     .local_payload_backend
@@ -957,8 +999,12 @@ impl CachedStore {
 
     /// Cancels an upload op and unpins the object if the cancellation succeeded.
     pub fn cancel_upload(&self, op: &PendingUpload) {
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.cancel(op) {
-            self.record_upload_terminal(op.object_id);
+            #[cfg(test)]
+            self.pause_upload_accounting_for_test();
+            self.record_upload_terminal(&mut pending_bytes, op.object_id);
+            drop(pending_bytes);
             self.unpin(op.object_id);
             self.metrics.upload_queue.record_cancel();
         }
@@ -1041,12 +1087,10 @@ impl CachedStore {
         content_epoch: u64,
         payload_len: usize,
     ) {
-        self.pending_upload_bytes_by_object
-            .lock()
-            .insert(object_id, saturating_u64_from_usize(payload_len));
         self.writer_counters.record_staged(payload_len);
-        self.writer_counters.record_pending_upload(payload_len);
-        self.submit_upload_with_payload(
+        // Commit accounting before a terminal operation can remove this owner.
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
+        let outcome = self.submit_upload_with_payload_outcome(
             ino,
             offset,
             offset,
@@ -1054,14 +1098,36 @@ impl CachedStore {
             content_epoch,
             saturating_u64_from_usize(payload_len),
         );
+        #[cfg(test)]
+        self.pause_upload_accounting_for_test();
+        if matches!(
+            outcome,
+            UploadSubmitOutcome::New | UploadSubmitOutcome::Updated
+        ) {
+            if let Some(previous) =
+                pending_bytes.insert(object_id, saturating_u64_from_usize(payload_len))
+            {
+                self.writer_counters.record_upload_terminal(previous);
+            }
+            self.writer_counters.record_pending_upload(payload_len);
+        }
     }
 
-    fn record_upload_terminal(&self, object_id: ObjectId) -> u64 {
-        if let Some(bytes) = self
-            .pending_upload_bytes_by_object
-            .lock()
-            .remove(&object_id)
-        {
+    #[cfg(test)]
+    fn pause_upload_accounting_for_test(&self) {
+        let hook = self.upload_accounting_hook.lock().take();
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(());
+            let _ = hook.release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+
+    fn record_upload_terminal(
+        &self,
+        pending_bytes: &mut HashMap<ObjectId, u64>,
+        object_id: ObjectId,
+    ) -> u64 {
+        if let Some(bytes) = pending_bytes.remove(&object_id) {
             self.writer_counters.record_upload_terminal(bytes);
             bytes
         } else {
@@ -2670,6 +2736,129 @@ mod tests {
         assert_eq!(writer.read_accepted(16, &mut tail), 2);
         assert_eq!(&tail, b"qr");
         assert_eq!(writer.dirty_bytes(), 2);
+    }
+
+    #[test]
+    fn sfs752_staged_and_terminal_transitions_lock_pending_byte_accounting() {
+        for transition in 0..3 {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let (store, _rx) = temp_cached_store(&dir);
+            store.put(101, b"payload", false).unwrap();
+            let previous = if transition == 0 {
+                None
+            } else {
+                store.submit_staged_upload(1, 0, 101, 3, 7);
+                store.snapshot_pending_uploads().pop()
+            };
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *store.upload_accounting_hook.lock() = Some(UploadAccountingHook {
+                entered: entered_tx,
+                release: release_rx,
+            });
+            let background = Arc::clone(&store);
+            let thread = std::thread::spawn(move || match transition {
+                0 => background.submit_staged_upload(1, 0, 101, 3, 7),
+                1 => background.complete_upload(&previous.unwrap()),
+                _ => background.cancel_upload(&previous.unwrap()),
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let accounting_was_locked = store.pending_upload_bytes_by_object.try_lock().is_none();
+            let current = store.snapshot_pending_uploads().pop();
+            let competing_store = Arc::clone(&store);
+            let competing = std::thread::spawn(move || {
+                if transition == 0 {
+                    competing_store.complete_upload(&current.unwrap());
+                } else {
+                    competing_store.submit_staged_upload(1, 0, 101, 4, 7);
+                }
+            });
+            release_tx.send(()).unwrap();
+            thread.join().unwrap();
+            competing.join().unwrap();
+            assert!(
+                accounting_was_locked,
+                "accounting transition {transition} must be serialized with queue ownership"
+            );
+            if let Some(current) = store.snapshot_pending_uploads().pop() {
+                store.complete_upload(&current);
+            }
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+            assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+            assert!(store.pinned.lock().objects.is_empty());
+        }
+    }
+
+    #[test]
+    fn sfs752_staged_pending_bytes_follow_accepted_updates() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, _rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.submit_staged_upload(1, 0, 101, 3, 7);
+        let previous = store.snapshot_pending_uploads().pop().unwrap();
+        for (ino, offset, epoch) in [(1, 0, 3), (1, 0, 2), (2, 0, 4), (1, 8, 4)] {
+            store.submit_staged_upload(ino, offset, 101, epoch, 99);
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 7);
+            assert_eq!(
+                store.pending_upload_bytes_by_object.lock().get(&101),
+                Some(&7)
+            );
+        }
+        store.submit_staged_upload(1, 0, 101, 4, 9);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 9);
+        store.complete_upload(&previous);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 9);
+        let current = store.snapshot_pending_uploads().pop().unwrap();
+        store.cancel_upload(&current);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+        assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+    }
+
+    #[test]
+    fn sfs752_closed_staging_does_not_count_pending_bytes() {
+        for detached in [false, true] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let (store, rx) = temp_cached_store(&dir);
+            drop(rx);
+            let mut writer = store.open_writer_slice(writer_config());
+            writer.write_at(0, b"abcdefgh").unwrap();
+            if detached {
+                let entries = writer.detach_completed_blocks(1).unwrap();
+                store.persist_detached_staged_slices(entries).unwrap();
+            } else {
+                writer.flush_to(8).unwrap();
+            }
+            let counters = store.snapshot_writer_counters();
+            assert_eq!(counters.staged_bytes, 8);
+            assert_eq!(counters.pending_upload_bytes, 0);
+            assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+            assert_eq!(store.pending_upload_count(), 0);
+            assert_eq!(
+                store.get_for_upload(10_000).as_deref(),
+                Some(&b"abcdefgh"[..])
+            );
+            assert!(!store.local_payload_backend.is_evictable(10_000));
+        }
+    }
+
+    #[test]
+    fn sfs752_closed_staged_update_preserves_pending_bytes() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.submit_staged_upload(1, 0, 101, 3, 7);
+        let previous = store.snapshot_pending_uploads().pop().unwrap();
+        drop(rx);
+        store.submit_staged_upload(1, 0, 101, 4, 99);
+        assert_eq!(store.snapshot_pending_uploads(), vec![previous.clone()]);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 7);
+        assert_eq!(
+            store.pending_upload_bytes_by_object.lock().get(&101),
+            Some(&7)
+        );
+        store.complete_upload(&previous);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+        assert!(store.pending_upload_bytes_by_object.lock().is_empty());
     }
 
     #[test]

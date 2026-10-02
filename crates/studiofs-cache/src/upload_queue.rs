@@ -198,7 +198,7 @@ impl UploadQueue {
 
         let mut state = self.pending_state.lock();
         let mut became_idle = false;
-        let outcome = match Self::record_pending_or_update(&mut state, op.clone()) {
+        let outcome = match Self::record_pending_or_update(&mut state, &op) {
             PendingSubmit::New if self.dispatch_wakeup_locked(&mut state) => {
                 UploadSubmitOutcome::New
             }
@@ -436,14 +436,13 @@ impl UploadQueue {
         self.shutdown_notify.notify_waiters();
     }
 
-    fn record_pending_or_update(state: &mut PendingState, op: PendingUpload) -> PendingSubmit {
+    fn record_pending_or_update(state: &mut PendingState, op: &PendingUpload) -> PendingSubmit {
         if let Some(current) = state.by_object.get_mut(&op.object_id) {
             if current.ino == op.ino
                 && current.offset == op.offset
                 && op.content_epoch > current.content_epoch
             {
-                let previous = current.clone();
-                *current = op.clone();
+                let previous = std::mem::replace(current, op.clone());
                 state.dirty_objects.insert(op.object_id);
                 return PendingSubmit::Updated(previous);
             }
@@ -565,7 +564,7 @@ impl UploadQueue {
             && current.retry_count == failed_op.retry_count
             && current.not_before_unix_ms == failed_op.not_before_unix_ms
         {
-            *current = previous.clone();
+            *current = previous;
         }
     }
 

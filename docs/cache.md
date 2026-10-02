@@ -177,6 +177,12 @@ Completion or cancellation releases that pin only when the operation matches
 the current entry. Closed-channel rollback preserves any prior owner, and
 dirty lifecycle state remains protected independently of runtime pins.
 
+Writer pending-upload bytes count each accepted staged object once. Accepted
+updates replace that object's byte contribution; ignored and closed-channel
+submissions preserve prior accounting. Staged submission and terminal removal
+share the accounting mutex so completion cannot outrun byte registration or
+remove a newly accepted owner's contribution.
+
 Durable local payload state lives in the cached store plus local metadata; the
 mount must not create a second foreground payload pipeline.
 

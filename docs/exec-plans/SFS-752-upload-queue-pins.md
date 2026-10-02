@@ -23,6 +23,11 @@ references without letting an active upload lose its protection from eviction.
   PR #737 and verified SFS-752 is In Review with the PR attached.
 - [x] (2026-10-02 09:39Z) Implemented the three attached review changes,
   validated the follow-up and prepared technical thread replies.
+- [x] (2026-10-02 10:13Z) Verified the local review report, reproduced three
+  pending-byte leaks and a missing accounting lock boundary, and fixed them.
+- [x] (2026-10-02 10:22Z) Validated final accounting/clone changes, real
+  upload-reader fallback and independent source review; prepared delivery.
+- [ ] Commit/push the local review follow-up and update PR #737.
 
 ## Surprises & Discoveries
 
@@ -39,6 +44,14 @@ overtake the backend change.
 
 The closed-dispatch regression failed at the exact rollback boundary before
 the fix (`submit lock must cover rollback`), then passed with atomic submission.
+
+The local review also exposed writer pending-byte accounting that incremented
+for every staging attempt while its map kept only one size per object. Three
+red regressions showed leaked bytes for ignored, updated and closed submits.
+The accounting-boundary test failed before serialization. Registering bytes
+after enqueue without a lock allows an immediately completed upload to outrun
+registration; removing a queue owner before taking the accounting lock can
+instead consume a newly staged owner's contribution.
 
 ## Decision Log
 
@@ -65,6 +78,38 @@ Extend the existing queue critical section to retry/rebase rollback so the
 record/update-dispatch-rollback invariant applies to all queue ingress paths.
 Date/author: 2026-10-02, Codex (PR #737 review follow-up).
 
+For local review findings 1 and 8, retain the existing writer-byte map mutex
+through staged submission and accepted accounting. New/updated entries replace
+their single contribution; ignored/closed submissions preserve prior bytes.
+Completion and cancellation take that mutex before queue removal, reconcile
+bytes and release it before backend access or unpinning. This protects both
+registration and old-terminal/new-owner races. Total staged bytes still describe
+local materialization, regardless of queue acceptance. A private facade helper
+returns the outcome for accounting; public submit APIs retain their unit-returning
+contracts, and their pin documentation is corrected (finding 3).
+Date/author: 2026-10-02, Codex (local review follow-up).
+
+Finding 2's missing-payload claim is rejected: the real upload reader first
+tries the stage hardlink, then reads the pinned durable local backend if the
+stage is absent. The shared VFS reader test now asserts that absence, exact
+payload bytes, one backend fallback and zero stage reads. Keep background batch
+submission best-effort for links; pre-commit writer staging still propagates
+its linking errors under its separate durability contract.
+Date/author: 2026-10-02, Codex (local review follow-up).
+
+Do not fold per-operation batch metrics into one update (finding 4): each call
+counts a submission attempt and samples the queue high-water mark; one final
+depth can miss a peak while the worker drains. Global pin contention (finding 5)
+remains the already documented measured-performance follow-up. Remove redundant
+owned clones (finding 6) by borrowing submission input once and moving rollback
+state. Do not reserve an entire batch for `insert_many` (finding 7) without
+evidence: its result contains only first pins, and a duplicate batch has no
+first pins; preallocation would allocate where the current empty vector does not.
+The bounded accounting test overlaps submission with completion/cancellation,
+and stale-epoch terminal regressions retain the pin ownership checks requested
+by finding 8. No test establishes an unconditional or 100-percent race guarantee.
+Date/author: 2026-10-02, Codex (local review follow-up).
+
 ## Outcomes & Retrospective
 
 Implementation is complete. Eight SFS-752 regressions, 21 queue tests and 10
@@ -83,6 +128,15 @@ passed 23 queue tests, 10 SFS-752 regressions and three VFS rebase tests.
 Cache check/Clippy and format/whitespace checks passed. Independent source review
 found no actionable defect. Per-object pin serialization was considered and
 deferred as measured performance work, preserving the current correctness fix.
+
+The local review follow-up fixes staged pending-byte leaks while preserving
+public facade return types and removes redundant queue-state clones. Four new
+cache regressions failed before their fixes; final checks passed 14 SFS-752
+tests, 23 queue tests, one existing detached-accounting test, the real VFS
+reader fallback test and three VFS rebase tests (filters overlap). Cache/VFS
+check and all-target Clippy, formatting and whitespace checks passed.
+Independent source review found no remaining actionable issue. Full workspace,
+mounted and service-backed suites remain unrun. Delivery is the remaining step.
 
 ## Context and Orientation
 
@@ -133,6 +187,16 @@ filter passed 23, and the VFS filter passed three. Cache check/Clippy and
 format/whitespace checks passed. The retry rollback lock-boundary regression
 failed before atomic retry dispatch and passed after it.
 
+Local review validation also ran these focused commands:
+
+    cargo test -p studiofs-cache --lib detached_persist_with_upload_counts_pending_bytes_once -- --nocapture
+    cargo test -p studiofs-vfs --lib upload_disk_reread_falls_back_without_stage_link_after_foreground_idle -- --nocapture
+    cargo check -p studiofs-cache -p studiofs-vfs
+    cargo clippy -p studiofs-cache -p studiofs-vfs --all-targets -- -D warnings
+
+The tests above each ran one passing test. The final `sfs752_` filter passed
+14 and the queue filter passed 23; the VFS rebase filter passed three.
+
 ## Validation and Acceptance
 
 Repeated same/older submissions and duplicate batch inputs leave one queue pin
@@ -163,6 +227,9 @@ source files, so graph discovery was followed by direct source reads.
 including rollback on dispatch failure. `CachedStore` consumes that outcome in
 both single and batch submissions. Existing complete/cancel/retry/rebase APIs
 and local-backend lifecycle methods retain their contracts.
+The private `CachedStore::submit_upload_with_payload_outcome` returns
+`UploadSubmitOutcome` for staged accounting. Public cached-store submission APIs
+retain their unit-returning contracts.
 
 Revision 2026-10-02: recorded the six red cache regressions and the two existing
 lock-scope races that must be closed before compensating provisional pins.
@@ -174,3 +241,6 @@ Revision 2026-10-02: recorded the attached review scope and lock-order tradeoff;
 retry/rebase serialization and focused follow-up validation are in progress.
 Revision 2026-10-02: completed the review changes and recorded focused passing
 validation; prepared one follow-up commit and replies for all attached threads.
+Revision 2026-10-02: verified every local review finding, fixed writer-byte
+accounting and its queue lifecycle races, preserved public facade APIs, and
+recorded focused validation plus evidence-based dispositions before delivery.
