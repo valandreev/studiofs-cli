@@ -19,7 +19,8 @@ references without letting an active upload lose its protection from eviction.
   single/batch provisional pins; closed both existing lock-scope races.
 - [x] (2026-10-02 09:21Z) Focused cache tests, crate check/Clippy and independent
   source review passed; three focused VFS rebase tests also passed.
-- [ ] Commit/push all task files and create a regular PR; update Linear to In Review.
+- [x] (2026-10-02 09:23Z) Committed/pushed all task files, created regular
+  PR #737 and verified SFS-752 is In Review with the PR attached.
 
 ## Surprises & Discoveries
 
@@ -56,8 +57,10 @@ Date/author: 2026-10-02, Codex.
 Implementation is complete. Eight SFS-752 regressions, 21 queue tests and 10
 pin-filtered tests passed (filters overlap). Three focused VFS worker rebase
 tests passed. Cache check/Clippy, formatting and whitespace checks passed.
-Independent source review found no actionable correctness issue. Commit/PR
-delivery remains. Full workspace suites and live mounted acceptance were not run.
+Independent source review found no actionable correctness issue. All task files
+were committed and pushed before creating regular PR #737; SFS-752 is In Review.
+Full workspace suites and live mounted acceptance were not run. The fix reuses
+the existing queue and pin locks and native backend batch pinning.
 
 ## Context and Orientation
 
@@ -122,6 +125,8 @@ local dirty state remains the replay source.
 ## Artifacts and Notes
 
 Issue: https://linear.app/valandreev/issue/SFS-752/keep-cache-pin-counts-aligned-with-accepted-upload-queue-entries
+PR: https://github.com/valandreev/studiofs-cli/pull/737
+Implementation commit: `5e784917`.
 Graph generation 2026-10-02T09:01:39Z reported metadata changes for relied-on
 source files, so graph discovery was followed by direct source reads.
 
@@ -136,3 +141,5 @@ Revision 2026-10-02: recorded the six red cache regressions and the two existing
 lock-scope races that must be closed before compensating provisional pins.
 Revision 2026-10-02: recorded the implemented ownership outcome, passing focused
 checks and independent source review; delivery is the remaining step.
+Revision 2026-10-02: recorded the actual regular PR and verified Linear review
+status after delivery, without claiming full-suite or mounted acceptance.
