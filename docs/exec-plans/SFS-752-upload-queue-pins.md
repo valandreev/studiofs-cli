@@ -33,7 +33,8 @@ references without letting an active upload lose its protection from eviction.
   pin/accounting/stats regressions, narrowed accounting and added batch overlap coverage.
 - [x] (2026-10-02 10:49Z) Focused cache/VFS tests, checks, Clippy, formatting
   and final source diff review passed for the second local review follow-up.
-- [ ] Commit/push the second follow-up and verify the updated PR head.
+- [x] (2026-10-02 10:50Z) Committed/pushed the second follow-up as `17ec7d70`,
+  updated PR #737 and verified its matching remote head and clean working tree.
 
 ## Surprises & Discoveries
 
@@ -263,6 +264,7 @@ Issue: https://linear.app/valandreev/issue/SFS-752/keep-cache-pin-counts-aligned
 PR: https://github.com/valandreev/studiofs-cli/pull/737
 Implementation commit: `5e784917`.
 Local review accounting fix: `fcbe9ba7`.
+Second local review lock/depth/stats fix: `17ec7d70`.
 Graph generation 2026-10-02T09:01:39Z reported metadata changes for relied-on
 source files, so graph discovery was followed by direct source reads.
 
@@ -295,3 +297,5 @@ update without claiming full-suite, mounted or service-backed acceptance.
 Revision 2026-10-02: recorded the second review's lock narrowing, atomic depth
 sample, pin-before-stats regression, completion-length fallback and targeted
 batch overlap test; structural MCP was unavailable, so source checks were used.
+Revision 2026-10-02: recorded second-review passing validation and verified
+delivery to PR #737; full-suite and mounted acceptance remain user-run gates.
