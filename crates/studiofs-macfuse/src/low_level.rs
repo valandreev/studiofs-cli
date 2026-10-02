@@ -839,11 +839,7 @@ impl Session {
         // An external unmount returns from the loop without going through
         // SessionControl::request_exit, so stop queued kernel sends here too.
         self.control.shutdown_invalidation();
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(result.abs()))
-        }
+        session_loop_result(result)
     }
 }
 
@@ -1829,6 +1825,16 @@ pub enum DirectoryEntryError {
     },
 }
 
+fn session_loop_result(result: c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        // libfuse2 reports failure as -1 without transporting a worker's
+        // thread-local errno to the caller. Neither -result nor errno is reliable.
+        Err(io::Error::other("macFUSE session loop failed"))
+    }
+}
+
 fn reply_result(result: c_int) -> io::Result<()> {
     if result == 0 {
         Ok(())
@@ -1843,6 +1849,14 @@ mod tests {
     use std::future::Future;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn session_loop_failure_does_not_invent_a_system_errno() {
+        assert!(session_loop_result(0).is_ok());
+        let error = session_loop_result(-1).expect_err("native loop failed");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.raw_os_error(), None);
+    }
 
     #[test]
     fn session_exit_handle_repeated_request_is_forwarded_while_session_is_live() {

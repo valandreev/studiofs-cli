@@ -7,7 +7,6 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -19,6 +18,7 @@ use super::{LowLevelOperations, Session, SessionConfig, raw};
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 const TEARDOWN_WAIT: Duration = Duration::from_secs(1);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type WriteCallback = unsafe extern "C" fn(
     *mut raw::FuseReq,
@@ -99,40 +99,6 @@ fn receive_before_teardown<T>(receiver: &mpsc::Receiver<T>, operation: &str) -> 
         })
 }
 
-fn stat_completes_before(path: &Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        let mut probe = Command::new("/usr/bin/stat")
-            .args(["-f", "%i"])
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start macFUSE readiness probe");
-        loop {
-            if let Some(status) = probe.try_wait().expect("poll macFUSE readiness probe") {
-                if status.success() {
-                    return true;
-                }
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                probe
-                    .kill()
-                    .expect("stop timed-out macFUSE readiness probe");
-                probe
-                    .wait()
-                    .expect("reap timed-out macFUSE readiness probe");
-                return false;
-            }
-            thread::yield_now();
-        }
-    }
-}
-
 fn remove_mount_point(path: &Path) -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + OPERATION_TIMEOUT;
     loop {
@@ -142,7 +108,7 @@ fn remove_mount_point(path: &Path) -> std::io::Result<()> {
                     && std::time::Instant::now() < deadline =>
             {
                 // macFUSE may release the mounted vnode after fuse_unmount returns.
-                thread::yield_now();
+                thread::sleep(POLL_INTERVAL);
             }
             result => return result,
         }
@@ -215,10 +181,22 @@ fn session_serves_peer_request_and_drains_blocked_callback_on_exit() {
     });
 
     let ready_path = mount_point.join("mount-ready");
-    let ready = stat_completes_before(&ready_path, OPERATION_TIMEOUT);
+    let deadline = std::time::Instant::now() + OPERATION_TIMEOUT;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let ready_worker = thread::spawn(move || {
+        while std::time::Instant::now() < deadline {
+            if fs::metadata(&ready_path).is_ok() {
+                let _ = ready_tx.send(true);
+                return;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        let _ = ready_tx.send(false);
+    });
+    let ready_result = ready_rx.recv_timeout(OPERATION_TIMEOUT);
     // Keep both write handles open across unmount so worker-thread drops cannot
     // enqueue release callbacks while the session is shutting down.
-    let setup = if ready {
+    let setup = if matches!(ready_result, Ok(true)) {
         (|| {
             let blocked_file = Arc::new(
                 OpenOptions::new()
@@ -248,10 +226,17 @@ fn session_serves_peer_request_and_drains_blocked_callback_on_exit() {
             receive_before_teardown(&session_run_rx, "setup session destruction")
                 .expect("setup session destruction failed");
             session_worker.join().expect("join failed session worker");
+            // Unmount releases a readiness syscall that missed the initial deadline.
+            // Keep its worker and the fixture owned until completion is confirmed.
+            if ready_result.is_err() {
+                receive_before_teardown(&ready_rx, "readiness syscall completion");
+            }
+            ready_worker.join().expect("join failed readiness worker");
             remove_mount_point(&mount_point).expect("remove failed native mount point");
             panic!("native macFUSE setup failed: {error}");
         }
     };
+    ready_worker.join().expect("join readiness worker");
     let (entered_tx, entered_rx) = mpsc::channel();
     let (finished_tx, finished_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -264,7 +249,7 @@ fn session_serves_peer_request_and_drains_blocked_callback_on_exit() {
     *CALLBACK_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
-    let mut gate_reset = GateReset(Some(release_tx));
+    let gate_reset = GateReset(Some(release_tx));
 
     let blocked_write_file = Arc::clone(&blocked_file);
     let (blocked_done_tx, blocked_done_rx) = mpsc::channel();
@@ -296,7 +281,7 @@ fn session_serves_peer_request_and_drains_blocked_callback_on_exit() {
     };
     let run_returned_while_blocked = session_run_early.is_ok();
 
-    drop(gate_reset.0.take());
+    drop(gate_reset);
     if entered {
         receive_before_teardown(&finished_rx, "blocked callback completion");
     }
@@ -325,7 +310,6 @@ fn session_serves_peer_request_and_drains_blocked_callback_on_exit() {
         .runtime()
         .block_on(fixture.vfs().shutdown(Duration::ZERO));
 
-    assert!(ready, "mount readiness request did not complete");
     assert!(entered, "blocked write callback did not start");
     assert!(
         unrelated_returned_while_blocked,

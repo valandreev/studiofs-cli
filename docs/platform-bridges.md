@@ -74,6 +74,9 @@ requests to progress. The loop joins those workers before returning. StudioFS
 then drains replies queued on its runtime before destroying the session and
 boxed callback state. Each request retains a single reply owner. The libfuse2
 API has no worker-count configuration argument.
+macFUSE grows the pool when workers are occupied and retires idle workers;
+StudioFS does not configure an additional worker limit. Write callbacks await
+the VFS local durability path, without synchronous S3 or PostgreSQL publication.
 
 Native concurrency and shutdown acceptance holds one real write callback,
 requires a write to a different open file to finish within three seconds, and
