@@ -2404,6 +2404,8 @@ pub(crate) struct ReplyTaskTracker {
     // Preserve the count on poison: these replies must finish before session teardown.
     active: Mutex<usize>,
     idle: Condvar,
+    #[cfg(test)]
+    wait_started: Option<std::sync::mpsc::Sender<()>>,
 }
 
 pub(crate) struct ReplyTaskGuard {
@@ -2427,6 +2429,11 @@ impl ReplyTaskTracker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *active != 0 {
+            #[cfg(test)]
+            if let Some(started) = &self.wait_started {
+                // The receiver's next lock must follow the atomic unlock in wait.
+                let _ = started.send(());
+            }
             active = self
                 .idle
                 .wait(active)
@@ -4637,7 +4644,11 @@ pub(crate) mod tests {
 
     #[test]
     fn reply_task_tracker_recovers_poison_without_losing_active_replies() {
-        let tracker = Arc::new(ReplyTaskTracker::default());
+        let (wait_started_tx, wait_started_rx) = std::sync::mpsc::channel();
+        let tracker = Arc::new(ReplyTaskTracker {
+            wait_started: Some(wait_started_tx),
+            ..ReplyTaskTracker::default()
+        });
         poison_reply_tracker(&tracker);
         let first = tracker.track();
         let second = tracker.track();
@@ -4655,7 +4666,9 @@ pub(crate) mod tests {
             waiting_tracker.wait_for_idle();
             done_tx.send(()).expect("signal drained poisoned tracker");
         });
-        let premature_drain = done_rx.recv_timeout(Duration::from_millis(50));
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("poisoned reply drain must enter the condition-variable wait");
         drop(first);
         let remaining = *tracker
             .active
@@ -4667,10 +4680,6 @@ pub(crate) mod tests {
             .expect("poisoned tracker must drain after both replies finish");
         waiter.join().expect("join poisoned tracker waiter");
 
-        assert_eq!(
-            premature_drain,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        );
         assert_eq!(remaining, 1);
         assert_eq!(
             *tracker
@@ -4683,7 +4692,11 @@ pub(crate) mod tests {
 
     #[test]
     fn reply_task_tracker_waits_until_async_reply_finishes() {
-        let tracker = Arc::new(ReplyTaskTracker::default());
+        let (wait_started_tx, wait_started_rx) = std::sync::mpsc::channel();
+        let tracker = Arc::new(ReplyTaskTracker {
+            wait_started: Some(wait_started_tx),
+            ..ReplyTaskTracker::default()
+        });
         let task = tracker.track();
         let waiting_tracker = Arc::clone(&tracker);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -4692,10 +4705,9 @@ pub(crate) mod tests {
             done_tx.send(()).expect("signal drained reply task");
         });
 
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "reply task drain must wait while a callback still owns its request"
-        );
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reply drain must enter the condition-variable wait");
         drop(task);
         done_rx
             .recv_timeout(Duration::from_secs(1))
