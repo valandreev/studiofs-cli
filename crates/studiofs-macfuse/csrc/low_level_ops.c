@@ -151,6 +151,16 @@ size_t studiofs_macfuse_low_level_ops_size(void) {
     return sizeof(struct fuse_lowlevel_ops);
 }
 
+const struct fuse_lowlevel_ops *studiofs_macfuse_test_ops_with_write(
+    void (*write)(fuse_req_t, fuse_ino_t, const char *, size_t, off_t,
+                  struct fuse_file_info *)) {
+    /* The native test serializes setup; libfuse copies the table on creation. */
+    static _Thread_local struct fuse_lowlevel_ops ops;
+    ops = STUDIOFS_LOW_LEVEL_OPS;
+    ops.write = write;
+    return &ops;
+}
+
 int studiofs_macfuse_low_level_ops_has_xattr_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->getxattr != NULL && ops->listxattr != NULL &&
            ops->setxattr != NULL && ops->removexattr != NULL;

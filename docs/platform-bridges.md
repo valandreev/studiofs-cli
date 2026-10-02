@@ -68,6 +68,25 @@ opt-in:
 STUDIOFS_MOUNT_BACKEND=fskit studiofs mount <volume> /Volumes/<name>
 ```
 
+The legacy backend uses libfuse2's `fuse_session_loop_mt`: macFUSE manages
+concurrent native callback workers, so a blocked local callback allows unrelated
+requests to progress. The loop joins those workers before returning. StudioFS
+then drains replies queued on its runtime before destroying the session and
+boxed callback state. Each request retains a single reply owner. The libfuse2
+API has no worker-count configuration argument.
+macFUSE grows the pool when workers are occupied and retires idle workers;
+StudioFS does not configure an additional worker limit. Write callbacks await
+the VFS local durability path, without synchronous S3 or PostgreSQL publication.
+
+Native concurrency and shutdown acceptance holds one real write callback,
+requires a write to a different open file to finish within three seconds, and
+checks that the loop waits for the held callback after exit is requested:
+
+    cargo test -p studiofs-macfuse --lib session_tests -- --ignored --nocapture --test-threads=1
+
+This requires a native legacy macFUSE mount; an ignored result does not prove
+callback concurrency.
+
 The FSKit path uses macFUSE `MFMount.framework` and does not open `/dev/fuse` or
 call the legacy libfuse session/reply APIs. It reuses the existing
 `StudioVfsAdapter`, keeps the received message alive until its reply is sent,

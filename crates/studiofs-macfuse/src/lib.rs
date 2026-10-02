@@ -555,6 +555,15 @@ mod tests {
     }
 
     #[test]
+    fn callback_state_is_shared_across_session_worker_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        // SAFETY-free contract check: `fuse_session_loop_mt` invokes low-level
+        // callbacks concurrently, so the boxed callback state must be `Sync`.
+        assert_send_sync::<super::adapter::CallbackState>();
+    }
+
+    #[test]
     fn cli_signal_guard_restores_handlers_after_session_watcher_drops() {
         super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
         assert!(!super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));

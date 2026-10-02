@@ -1439,10 +1439,8 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    /// Run the potentially waiting rmdir path away from the single macFUSE
-    /// session-loop thread. macFUSE delivers callbacks serially through that
-    /// loop; sleeping there would prevent the queued child unlink callbacks
-    /// from running and make the directory stay non-empty indefinitely.
+    /// Run the potentially waiting rmdir path outside macFUSE callback workers
+    /// so queued child unlinks can progress without tying up native workers.
     pub(crate) fn queue_rmdir_reply(
         self: &Arc<Self>,
         parent: u64,
@@ -1473,7 +1471,7 @@ impl StudioVfsAdapter {
         });
     }
 
-    /// Run symlink creation away from the single macFUSE session-loop thread.
+    /// Run symlink creation outside macFUSE callback workers.
     /// A parent directory may still be settling in deferred metadata while the
     /// kernel delivers the child symlink callback.
     pub(crate) fn queue_symlink_reply(
