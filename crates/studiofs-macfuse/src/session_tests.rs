@@ -20,6 +20,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 // Detached Disk Arbitration unmount may outlast the foreground operation budget.
 const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(15);
+const MOUNT_POINT_REMOVAL_TIMEOUT: Duration = Duration::from_secs(3);
 const TEARDOWN_WAIT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -170,18 +171,22 @@ fn mount_point_is_active(path: &Path) -> std::io::Result<bool> {
 }
 
 fn remove_mount_point(path: &Path) -> std::io::Result<()> {
-    remove_mount_point_with(path, std::time::Instant::now() + UNMOUNT_TIMEOUT, |path| {
-        fs::remove_dir(path)
-    })
+    remove_mount_point_with(
+        path,
+        std::time::Instant::now() + UNMOUNT_TIMEOUT,
+        MOUNT_POINT_REMOVAL_TIMEOUT,
+        |path| fs::remove_dir(path),
+    )
 }
 
 fn remove_mount_point_with(
     path: &Path,
-    deadline: std::time::Instant,
+    unmount_deadline: std::time::Instant,
+    removal_timeout: Duration,
     mut remove_dir: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     while mount_point_is_active(path)? {
-        if std::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= unmount_deadline {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
@@ -194,11 +199,12 @@ fn remove_mount_point_with(
         // does not acknowledge that worker's Disk Arbitration completion.
         thread::sleep(POLL_INTERVAL);
     }
+    let removal_deadline = std::time::Instant::now() + removal_timeout;
     loop {
         match remove_dir(path) {
             Err(error)
                 if error.raw_os_error() == Some(libc::EBUSY)
-                    && std::time::Instant::now() < deadline =>
+                    && std::time::Instant::now() < removal_deadline =>
             {
                 // The mount table can clear before the mounted vnode is released.
                 thread::sleep(POLL_INTERVAL);
@@ -209,7 +215,7 @@ fn remove_mount_point_with(
 }
 
 #[test]
-fn remove_mount_point_retries_busy_directory_after_unmount() {
+fn remove_mount_point_retries_busy_directory_after_unmount_budget_is_exhausted() {
     let mount_point = TempMountDir::create(studiofs_test_support::workspace_target_temp_path(
         "macfuse-busy-dir-",
     ))
@@ -217,7 +223,8 @@ fn remove_mount_point_retries_busy_directory_after_unmount() {
     let mut attempts = 0;
     remove_mount_point_with(
         mount_point.path(),
-        std::time::Instant::now() + UNMOUNT_TIMEOUT,
+        std::time::Instant::now(),
+        MOUNT_POINT_REMOVAL_TIMEOUT,
         |path| {
             attempts += 1;
             if attempts < 3 {
@@ -240,12 +247,13 @@ fn remove_mount_point_returns_terminal_removal_errors() {
     .expect("create unmounted test directory");
     for (errno, budget) in [
         (libc::EBUSY, Duration::ZERO),
-        (libc::EPERM, UNMOUNT_TIMEOUT),
+        (libc::EPERM, MOUNT_POINT_REMOVAL_TIMEOUT),
     ] {
         let mut attempts = 0;
         let error = remove_mount_point_with(
             mount_point.path(),
-            std::time::Instant::now() + budget,
+            std::time::Instant::now() + UNMOUNT_TIMEOUT,
+            budget,
             |_| {
                 attempts += 1;
                 Err(std::io::Error::from_raw_os_error(errno))
