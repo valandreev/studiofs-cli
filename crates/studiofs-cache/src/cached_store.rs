@@ -1173,6 +1173,11 @@ impl CachedStoreWriterSlice {
     }
 
     /// Stages up to `max_blocks` completed blocks and returns their metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if geometry validation or block staging fails.
+    /// Errors have the same partial-success behavior as [`Self::flush_to`].
     pub fn flush_completed_blocks(
         &mut self,
         max_blocks: usize,
@@ -1231,6 +1236,11 @@ impl CachedStoreWriterSlice {
     }
 
     /// Freezes (stages) pending dirty bytes if the writer is older than `max_age`.
+    ///
+    /// # Errors
+    ///
+    /// When staging is required, errors have the same conditions and partial-success
+    /// behavior as [`Self::finish`].
     pub fn freeze_if_older_than(
         &mut self,
         max_age: Duration,
@@ -2316,6 +2326,8 @@ mod tests {
             writer.flush_to(16)
         }
         .expect("retry second block");
+        // Characterize direct staging: retry does not recover the first block's metadata.
+        // MountedWriterStack retains detached metadata instead of using this path.
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].object_id, 10_001);
         assert_eq!(staged[0].offset, 8);
