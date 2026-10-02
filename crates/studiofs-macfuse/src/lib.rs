@@ -552,6 +552,14 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<super::low_level::Session>();
+    }
+
+    #[test]
+    fn callback_state_is_shared_across_session_worker_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        // SAFETY-free contract check: `fuse_session_loop_mt` invokes low-level
+        // callbacks concurrently, so the boxed callback state must be `Sync`.
         assert_send_sync::<super::adapter::CallbackState>();
     }
 
