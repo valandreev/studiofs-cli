@@ -155,7 +155,7 @@ const struct fuse_lowlevel_ops *studiofs_macfuse_test_ops_with_write(
     void (*write)(fuse_req_t, fuse_ino_t, const char *, size_t, off_t,
                   struct fuse_file_info *)) {
     /* The native test serializes setup; libfuse copies the table on creation. */
-    static struct fuse_lowlevel_ops ops;
+    static _Thread_local struct fuse_lowlevel_ops ops;
     ops = STUDIOFS_LOW_LEVEL_OPS;
     ops.write = write;
     return &ops;

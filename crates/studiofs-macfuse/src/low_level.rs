@@ -1831,7 +1831,9 @@ fn session_loop_result(result: c_int) -> io::Result<()> {
     } else {
         // libfuse2 reports failure as -1 without transporting a worker's
         // thread-local errno to the caller. Neither -result nor errno is reliable.
-        Err(io::Error::other("macFUSE session loop failed"))
+        Err(io::Error::other(format!(
+            "macFUSE session loop failed with exit code {result}"
+        )))
     }
 }
 
@@ -1856,6 +1858,10 @@ mod tests {
         let error = session_loop_result(-1).expect_err("native loop failed");
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(error.raw_os_error(), None);
+        assert_eq!(
+            error.to_string(),
+            "macFUSE session loop failed with exit code -1"
+        );
     }
 
     #[test]
