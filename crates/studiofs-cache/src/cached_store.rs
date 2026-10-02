@@ -155,9 +155,13 @@ impl CachedStoreWriterCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_pending_upload(&self, bytes: usize) {
-        self.pending_upload_bytes
-            .fetch_add(saturating_u64_from_usize(bytes), Ordering::Relaxed);
+    fn replace_pending_upload(&self, previous: u64, bytes: u64) {
+        // One RMW keeps lock-free snapshots from seeing a subtract/add gap.
+        let _ = self.pending_upload_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |pending| Some(pending.saturating_sub(previous).saturating_add(bytes)),
+        );
     }
 
     fn record_upload_terminal(&self, bytes: u64) {
@@ -1000,8 +1004,15 @@ impl CachedStore {
 
     /// Requeues an upload op after rebasing it onto newer metadata.
     pub fn requeue_rebased_upload(&self, current: &PendingUpload, rebased: PendingUpload) -> bool {
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
+        let payload_len = rebased.payload_len;
         let queued = self.upload_queue.requeue_rebased(current, rebased);
         if queued {
+            if let Some(bytes) = pending_bytes.get_mut(&current.object_id) {
+                let previous = std::mem::replace(bytes, payload_len);
+                self.writer_counters
+                    .replace_pending_upload(previous, payload_len);
+            }
             self.metrics.upload_queue.record_requeue();
         }
         queued
@@ -1116,10 +1127,11 @@ impl CachedStore {
             outcome,
             UploadSubmitOutcome::New | UploadSubmitOutcome::Updated
         ) {
-            if let Some(previous) = pending_bytes.insert(object_id, payload_len_u64) {
-                self.writer_counters.record_upload_terminal(previous);
-            }
-            self.writer_counters.record_pending_upload(payload_len);
+            let previous = pending_bytes
+                .insert(object_id, payload_len_u64)
+                .unwrap_or(0);
+            self.writer_counters
+                .replace_pending_upload(previous, payload_len_u64);
         }
         drop(pending_bytes);
         if outcome != UploadSubmitOutcome::New {
@@ -2840,6 +2852,7 @@ mod tests {
         backend
             .evict_on_unpinned_stats
             .store(true, Ordering::SeqCst);
+        assert!(store.local_payload_backend.is_evictable(101));
         store.submit_upload(1, 0, 101, 3);
         assert_eq!(store.get_for_upload(101).as_deref(), Some(&b"payload"[..]));
         let op = store.snapshot_pending_uploads().pop().unwrap();
@@ -2988,26 +3001,94 @@ mod tests {
     }
 
     #[test]
+    fn sfs752_rebased_staged_bytes_follow_accepted_geometry() {
+        for payload_len in [3, 0, 9] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let (store, rx) = temp_cached_store(&dir);
+            store.submit_staged_upload(1, 0, 101, 3, 7);
+            let old = store.snapshot_pending_uploads().pop().unwrap();
+            let rebased = PendingUpload {
+                offset: 8,
+                object_file_offset: 2,
+                content_epoch: 4,
+                payload_len,
+                ..old.clone()
+            };
+            assert!(store.requeue_rebased_upload(&old, rebased.clone()));
+            assert_eq!(
+                store.snapshot_writer_counters().pending_upload_bytes,
+                payload_len
+            );
+            assert_eq!(
+                store.pending_upload_bytes_by_object.lock().get(&101),
+                Some(&payload_len)
+            );
+            // Neither a stale candidate nor closed dispatch may reattribute bytes.
+            assert!(!store.requeue_rebased_upload(&old, old.clone()));
+            drop(rx);
+            let rejected = PendingUpload {
+                payload_len: 99,
+                ..rebased.clone()
+            };
+            assert!(!store.requeue_rebased_upload(&rebased, rejected));
+            assert_eq!(store.snapshot_pending_uploads(), vec![rebased.clone()]);
+            assert_eq!(
+                store.snapshot_writer_counters().pending_upload_bytes,
+                payload_len
+            );
+            store.complete_upload(&old);
+            assert_eq!(
+                store.snapshot_writer_counters().pending_upload_bytes,
+                payload_len
+            );
+            store.complete_upload(&rebased);
+            assert_eq!(
+                store.cache_pipeline_metrics().upload_queue.completed_bytes,
+                payload_len
+            );
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+            assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+            assert!(store.pinned.lock().objects.is_empty());
+        }
+    }
+
+    #[test]
     fn sfs752_staged_pending_bytes_follow_accepted_updates() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (store, _rx) = temp_cached_store(&dir);
         store.put(101, b"payload", false).unwrap();
         store.submit_staged_upload(1, 0, 101, 3, 7);
-        let previous = store.snapshot_pending_uploads().pop().unwrap();
+        store.submit_staged_upload(1, 8, 102, 3, 5);
+        let other = store
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| op.object_id == 102)
+            .unwrap();
+        let previous = store
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| op.object_id == 101)
+            .unwrap();
         for (ino, offset, epoch) in [(1, 0, 3), (1, 0, 2), (2, 0, 4), (1, 8, 4)] {
             store.submit_staged_upload(ino, offset, 101, epoch, 99);
-            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 7);
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 12);
             assert_eq!(
                 store.pending_upload_bytes_by_object.lock().get(&101),
                 Some(&7)
             );
         }
         store.submit_staged_upload(1, 0, 101, 4, 9);
-        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 9);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 14);
         store.complete_upload(&previous);
-        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 9);
-        let current = store.snapshot_pending_uploads().pop().unwrap();
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 14);
+        let current = store
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| op.object_id == 101)
+            .unwrap();
         store.cancel_upload(&current);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 5);
+        store.cancel_upload(&other);
         assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
         assert!(store.pending_upload_bytes_by_object.lock().is_empty());
     }
@@ -3031,6 +3112,7 @@ mod tests {
             assert_eq!(counters.pending_upload_bytes, 0);
             assert!(store.pending_upload_bytes_by_object.lock().is_empty());
             assert_eq!(store.pending_upload_count(), 0);
+            assert!(store.pinned.lock().objects.is_empty());
             assert_eq!(
                 store.get_for_upload(10_000).as_deref(),
                 Some(&b"abcdefgh"[..])

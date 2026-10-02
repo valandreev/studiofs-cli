@@ -196,7 +196,9 @@ impl UploadQueue {
         .0
     }
 
-    /// Returns the outcome and pending count sampled under the same queue lock.
+    /// Returns the outcome and global pending-object count across all inodes.
+    /// The count is sampled under the queue lock after submission or `Closed`
+    /// rollback, so rejected candidates do not inflate the observed depth.
     pub(crate) fn submit_with_payload_and_pending_count(
         &self,
         ino: Ino,

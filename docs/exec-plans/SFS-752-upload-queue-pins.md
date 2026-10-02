@@ -35,6 +35,14 @@ references without letting an active upload lose its protection from eviction.
   and final source diff review passed for the second local review follow-up.
 - [x] (2026-10-02 10:50Z) Committed/pushed the second follow-up as `17ec7d70`,
   updated PR #737 and verified its matching remote head and clean working tree.
+- [x] (2026-10-02 11:03Z) Delivered the third review's zero-byte repair as
+  `a839f1d2` and its delivery record as `e9be25f6`, with matching PR head verified.
+- [x] (2026-10-02 11:24Z) Verified seven new PR threads, reproduced stale
+  rebased accounting, implemented atomic contribution replacement and strengthened
+  fixture/pin assertions and documentation.
+- [x] (2026-10-02 11:28Z) Validated the seven-thread follow-up with focused
+  cache/VFS tests, checks, Clippy and independent source review.
+- [ ] Commit/push the follow-up, reply inline and resolve all seven threads.
 
 ## Surprises & Discoveries
 
@@ -61,6 +69,21 @@ registration; removing a queue owner before taking the accounting lock can
 instead consume a newly staged owner's contribution.
 
 ## Decision Log
+
+Seven-thread PR follow-up: rebased queue replacement now holds the accounting
+mutex before the queue lock and refreshes an existing staged contribution only
+after dispatch succeeds. It preserves absent legacy accounting, known zero-byte
+entries, failed/stale rebases and queue pin ownership. Completion still removes
+the actual contribution and retains the existing legacy stats fallback.
+Contribution replacement uses a single atomic RMW for both restaging and rebase,
+so lock-free snapshots see the pre- or post-replacement total, never the old
+subtract/add intermediate total. This does not claim a transactional snapshot
+across separate counters or separate concurrent operations.
+Closed staging tests now check logical pin release for both direct and detached
+paths; pin-before-stats tests assert initial backend eviction eligibility.
+Queue depth documentation states global scope and sampling after rollback.
+The documented check/Clippy gate includes VFS. Progress and artifacts now record
+the previously delivered zero-byte review commits.
 
 Third local review (head `7c886ad6`) dispositions:
 
@@ -175,6 +198,18 @@ submissions, the observed peak and final eviction eligibility.
 Date/author: 2026-10-02, Codex (second local review follow-up).
 
 ## Outcomes & Retrospective
+
+The seven-thread follow-up keeps staged accounting aligned with accepted rebased
+geometry and replaces contributions with one atomic RMW. Its rebase regression
+failed before the fix (7 staged bytes versus 3 accepted bytes) and now covers
+smaller, zero and larger lengths, stale/closed candidates and terminal metrics.
+The existing restaging regression also preserves another object's contribution.
+Closed-staging logical pin assertions and the eviction fixture precondition are
+explicit. Queue sampling docs, VFS validation commands and the third delivery
+trail are corrected. Final checks passed 21 SFS-752 regressions, 24 queue tests,
+three VFS rebase tests and one VFS fallback test; cache/VFS check and all-targets
+Clippy, formatting and whitespace checks passed. Independent source review found
+no actionable defect. Filters overlap; full suites and live mounts were not run.
 
 Implementation is complete. Eight SFS-752 regressions, 21 queue tests and 10
 pin-filtered tests passed (filters overlap). Three focused VFS worker rebase
@@ -294,6 +329,7 @@ PR: https://github.com/valandreev/studiofs-cli/pull/737
 Implementation commit: `5e784917`.
 Local review accounting fix: `fcbe9ba7`.
 Second local review lock/depth/stats fix: `17ec7d70`.
+Third local review zero-byte fix: `a839f1d2`; delivery record: `e9be25f6`.
 Graph generation 2026-10-02T09:01:39Z reported metadata changes for relied-on
 source files, so graph discovery was followed by direct source reads.
 

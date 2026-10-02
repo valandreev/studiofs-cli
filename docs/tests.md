@@ -277,13 +277,16 @@ accounting, known/legacy completion lengths, and batch submission overlapping
 terminal cleanup while preserving submission counts and queue-depth peaks.
 Zero-byte staged accounting is distinguished from an absent contribution, so
 completion does not query backend stats for a known zero-length upload.
+Accepted rebases refresh staged-byte attribution, including zero lengths; stale
+and closed-channel rebases preserve it. Restaging replaces the byte counter in
+one atomic update while retaining other objects' contributions.
 
 ```powershell
 cargo test -p studiofs-cache --lib sfs752_ -- --nocapture
 cargo test -p studiofs-cache --lib upload_queue::tests -- --nocapture
 cargo test -p studiofs-vfs --lib upload_disk_reread_falls_back_without_stage_link_after_foreground_idle -- --nocapture
-cargo check -p studiofs-cache
-cargo clippy -p studiofs-cache --all-targets -- -D warnings
+cargo check -p studiofs-cache -p studiofs-vfs
+cargo clippy -p studiofs-cache -p studiofs-vfs --all-targets -- -D warnings
 ```
 
 This gate does not establish live mounted or remote-service acceptance.
