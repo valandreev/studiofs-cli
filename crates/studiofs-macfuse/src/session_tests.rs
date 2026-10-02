@@ -2,9 +2,10 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -125,20 +126,71 @@ impl Drop for TempMountDir {
     }
 }
 
-fn remove_mount_point(path: &Path) -> std::io::Result<()> {
-    let deadline = std::time::Instant::now() + OPERATION_TIMEOUT;
-    loop {
-        match fs::remove_dir(path) {
-            Err(error)
-                if error.raw_os_error() == Some(libc::EBUSY)
-                    && std::time::Instant::now() < deadline =>
-            {
-                // macFUSE may release the mounted vnode after fuse_unmount returns.
-                thread::sleep(POLL_INTERVAL);
-            }
-            result => return result,
-        }
+fn mount_point_is_active(path: &Path) -> std::io::Result<bool> {
+    // MNT_NOWAIT reads the kernel's mount table without asking a stopped FUSE
+    // session to service statfs. Use caller-owned storage rather than getmntinfo's
+    // shared buffer, since macFUSE also has background threads.
+    // SAFETY: A null buffer requests only the current mount count.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    let mut capacity = count as usize + 1;
+    loop {
+        let buffer_size = capacity
+            .checked_mul(std::mem::size_of::<libc::statfs>())
+            .and_then(|size| size.try_into().ok())
+            .ok_or_else(|| std::io::Error::other("mount table is too large"))?;
+        let mut mounts = Vec::<libc::statfs>::with_capacity(capacity);
+        // SAFETY: The buffer is aligned and writable for buffer_size bytes.
+        // getfsstat initializes each of the returned statfs entries.
+        let count = unsafe { libc::getfsstat(mounts.as_mut_ptr(), buffer_size, libc::MNT_NOWAIT) };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count as usize == capacity {
+            // A full buffer may omit the mount after concurrent table growth.
+            capacity *= 2;
+            continue;
+        }
+        // SAFETY: getfsstat initialized count entries, fewer than capacity.
+        unsafe { mounts.set_len(count as usize) };
+        return Ok(mounts.iter().any(|mount| {
+            // SAFETY: The kernel returns a NUL-terminated mount point name.
+            unsafe { CStr::from_ptr(mount.f_mntonname.as_ptr()) }.to_bytes()
+                == path.as_os_str().as_bytes()
+        }));
+    }
+}
+
+fn remove_mount_point(path: &Path) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + CALLBACK_TIMEOUT;
+    while mount_point_is_active(path)? {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "native macFUSE unmount did not complete: {}",
+                    path.display()
+                ),
+            ));
+        }
+        // fuse_unmount starts a detached macFUSE worker. Session destruction
+        // does not acknowledge that worker's Disk Arbitration completion.
+        thread::sleep(POLL_INTERVAL);
+    }
+    fs::remove_dir(path)
+}
+
+#[test]
+fn mount_table_distinguishes_mount_point_from_child_directory() {
+    assert!(mount_point_is_active(Path::new("/")).expect("read root mount"));
+    let mount_point = TempMountDir::create(studiofs_test_support::workspace_target_temp_path(
+        "macfuse-mount-table-",
+    ))
+    .expect("create unmounted test directory");
+    assert!(!mount_point_is_active(mount_point.path()).expect("read mount table"));
+    remove_mount_point(mount_point.path()).expect("remove unmounted directory");
 }
 
 #[test]
