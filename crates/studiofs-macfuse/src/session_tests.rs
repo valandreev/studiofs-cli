@@ -17,7 +17,7 @@ use super::{LowLevelOperations, Session, SessionConfig, raw};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
-const TEARDOWN_WAIT: Duration = Duration::from_secs(1);
+const TEARDOWN_WAIT: Duration = Duration::from_millis(150);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type WriteCallback = unsafe extern "C" fn(
@@ -120,8 +120,8 @@ impl TempMountDir {
 impl Drop for TempMountDir {
     fn drop(&mut self) {
         // A normal teardown removes the directory first. During unwinding a
-        // live mount may still return EBUSY; do not hide the original failure.
-        let _ = fs::remove_dir(&self.path);
+        // live mount may still return EBUSY, so use the same bounded cleanup.
+        let _ = remove_mount_point(&self.path);
     }
 }
 

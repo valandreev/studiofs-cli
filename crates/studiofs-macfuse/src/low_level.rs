@@ -4,7 +4,7 @@
 //! low-level macFUSE FFI. Public types copy callback-owned values before they
 //! can cross async boundaries and keep request/reply ownership explicit.
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[path = "session_tests.rs"]
 mod session_tests;
 
@@ -1832,7 +1832,7 @@ fn session_loop_result(result: c_int) -> io::Result<()> {
         // libfuse2 reports failure as -1 without transporting a worker's
         // thread-local errno to the caller. Neither -result nor errno is reliable.
         Err(io::Error::other(format!(
-            "macFUSE session loop failed with exit code {result}"
+            "macFUSE session loop failed with return code {result}"
         )))
     }
 }
@@ -1860,7 +1860,7 @@ mod tests {
         assert_eq!(error.raw_os_error(), None);
         assert_eq!(
             error.to_string(),
-            "macFUSE session loop failed with exit code -1"
+            "macFUSE session loop failed with return code -1"
         );
     }
 
