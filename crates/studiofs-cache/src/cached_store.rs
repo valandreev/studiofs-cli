@@ -1282,6 +1282,14 @@ impl CachedStoreWriterSlice {
         }
         if let Err(source) = self.store.upload_stage_store.link_payload(object_id) {
             self.restore_staged_prefix(payload);
+            // This writer still owns the object id: upload submission follows linking.
+            if let Err(cleanup_error) = self.store.local_payload_backend.remove(object_id) {
+                warn!(
+                    object_id,
+                    error = ?cleanup_error,
+                    "failed to clean up local payload after linking failure"
+                );
+            }
             return Err(CachedStoreWriterError::UploadStage { object_id, source });
         }
         self.cache_hot_upload_if_enabled(object_id, payload, can_reuse_hot_payload);
@@ -2170,6 +2178,11 @@ mod tests {
     fn writer_slice_keeps_dirty_prefix_retryable_after_upload_stage_failure() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut other_config = writer_config();
+        other_config.first_object_id = 20_000;
+        let mut other_writer = cached_store.open_writer_slice(other_config);
+        other_writer.write_at(0, b"retained").expect("other write");
+        other_writer.flush_to(8).expect("other accepted upload");
         let mut writer = cached_store.open_writer_slice(writer_config());
         let layout = LocalPayloadLayout::from_cache_root(dir.path());
         let stage_path = layout.upload_stage_object_path(10_000);
@@ -2184,6 +2197,32 @@ mod tests {
         assert!(matches!(err, CachedStoreWriterError::UploadStage { .. }));
         assert_eq!(writer.dirty_bytes(), 8);
         assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 8);
+
+        let mut accepted = [0; 8];
+        assert_eq!(writer.read_accepted(0, &mut accepted), 8);
+        assert_eq!(&accepted, b"abcdefgh");
+        assert!(!layout.payload_object_path(10_000).exists());
+        assert!(
+            cached_store
+                .local_payload_backend
+                .object_stats(10_000)
+                .is_none()
+        );
+        assert!(
+            !cached_store
+                .local_payload_backend
+                .dirty_object_ids()
+                .contains(&10_000)
+        );
+        assert_eq!(cached_store.pending_upload_count(), 1);
+        assert_eq!(
+            cached_store
+                .get_staged_for_upload(20_000)
+                .expect("accepted upload retained")
+                .as_ref(),
+            b"retained"
+        );
+        assert!(layout.payload_object_path(20_000).exists());
 
         std::fs::remove_file(stage_parent).expect("remove stage obstruction");
         let staged = writer.flush_to(8).expect("retry flush");
