@@ -1140,13 +1140,17 @@ impl CachedStoreWriterSlice {
 
     /// Stages completed blocks up to `target_offset` and returns their metadata.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if geometry validation or block staging fails.
     /// On error, earlier successful blocks remain staged, but their metadata is not returned.
     /// The failed block and remaining bytes stay buffered for retry. Use
     /// [`Self::detach_completed_blocks`] when the caller must retain metadata across
     /// persistence failures.
+    /// On link failure, the failed payload is removed on a best-effort basis. Its bytes
+    /// remain in memory only after successful cleanup; dropping the writer discards them.
+    /// Cleanup failures are logged and may leave a persisted dirty object until retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if geometry validation or block staging fails.
     pub fn flush_to(
         &mut self,
         target_offset: u64,
@@ -1174,10 +1178,11 @@ impl CachedStoreWriterSlice {
 
     /// Stages up to `max_blocks` completed blocks and returns their metadata.
     ///
+    /// Failure, retry, and memory-only durability behavior are the same as [`Self::flush_to`].
+    ///
     /// # Errors
     ///
     /// Returns an error if geometry validation or block staging fails.
-    /// Errors have the same partial-success behavior as [`Self::flush_to`].
     pub fn flush_completed_blocks(
         &mut self,
         max_blocks: usize,
@@ -1209,11 +1214,12 @@ impl CachedStoreWriterSlice {
 
     /// Stages all remaining dirty bytes (including a final partial block) and returns their metadata.
     ///
+    /// Failure, retry, and memory-only durability behavior are the same as [`Self::flush_to`].
+    /// Use [`Self::detach_finish`] to retain metadata across persistence failures.
+    ///
     /// # Errors
     ///
     /// Returns an error if geometry validation or block staging fails.
-    /// Errors have the same partial-success behavior as [`Self::flush_to`].
-    /// Use [`Self::detach_finish`] to retain metadata across persistence failures.
     pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
@@ -1237,10 +1243,11 @@ impl CachedStoreWriterSlice {
 
     /// Freezes (stages) pending dirty bytes if the writer is older than `max_age`.
     ///
+    /// When staging is required, failure and retry behavior are the same as [`Self::finish`].
+    ///
     /// # Errors
     ///
-    /// When staging is required, errors have the same conditions and partial-success
-    /// behavior as [`Self::finish`].
+    /// Returns an error if staging is required and geometry validation or block staging fails.
     pub fn freeze_if_older_than(
         &mut self,
         max_age: Duration,
@@ -1734,6 +1741,7 @@ mod tests {
         inner: Arc<dyn LocalPayloadBackend>,
         puts: Arc<Mutex<Vec<RecordedPayloadPut>>>,
         fail_next_owned_put: Arc<std::sync::atomic::AtomicBool>,
+        fail_next_remove: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl RecordingOwnedPayloadBackend {
@@ -1742,6 +1750,7 @@ mod tests {
                 inner,
                 puts: Arc::new(Mutex::new(Vec::new())),
                 fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fail_next_remove: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -1750,6 +1759,7 @@ mod tests {
                 inner,
                 puts: Arc::new(Mutex::new(Vec::new())),
                 fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                fail_next_remove: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -1856,6 +1866,11 @@ mod tests {
         }
 
         fn remove(&self, object_id: u64) -> Result<(), crate::local::LocalPayloadBackendError> {
+            if self.fail_next_remove.swap(false, Ordering::SeqCst) {
+                return Err(crate::local::LocalPayloadBackendError::Io(
+                    std::io::Error::other("injected remove failure"),
+                ));
+            }
             self.inner.remove(object_id)
         }
 
@@ -2263,6 +2278,63 @@ mod tests {
             cached_store
                 .get_staged_for_upload(staged[0].object_id)
                 .expect("retry staged payload")
+                .as_ref(),
+            b"abcdefgh"
+        );
+        assert_eq!(writer.dirty_bytes(), 0);
+    }
+
+    #[test]
+    fn writer_slice_retry_cleans_payload_after_link_and_remove_failure() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner = open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+            .expect("open backend")
+            .backend;
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+        backend.fail_next_remove.store(true, Ordering::SeqCst);
+        let (store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open store");
+        let mut writer = store.open_writer_slice(writer_config());
+        let layout = LocalPayloadLayout::from_cache_root(dir.path());
+        let stage_path = layout.upload_stage_object_path(10_000);
+        let parent = stage_path.parent().expect("stage parent");
+        std::fs::create_dir_all(parent.parent().expect("grandparent")).expect("create grandparent");
+        std::fs::File::create(parent).expect("obstruct stage");
+        writer.write_at(0, b"abcdefgh").expect("write");
+
+        assert!(matches!(
+            writer.flush_to(8),
+            Err(CachedStoreWriterError::UploadStage {
+                object_id: 10_000,
+                ..
+            })
+        ));
+        let mut bytes = [0; 8];
+        assert_eq!(writer.read_accepted(0, &mut bytes), 8);
+        assert_eq!(&bytes, b"abcdefgh");
+        assert_eq!(writer.dirty_bytes(), 8);
+        assert_eq!(store.snapshot_writer_counters().dirty_bytes, 8);
+        assert_eq!(store.pending_upload_count(), 0);
+        assert_eq!(store.local_payload_backend.dirty_object_ids(), vec![10_000]);
+        assert!(layout.payload_object_path(10_000).exists());
+
+        // Retry with the link still obstructed; the one-shot removal failure is gone.
+        assert!(writer.flush_to(8).is_err());
+        assert!(store.local_payload_backend.dirty_object_ids().is_empty());
+        assert!(store.local_payload_backend.object_stats(10_000).is_none());
+        assert!(!layout.payload_object_path(10_000).exists());
+        assert_eq!(writer.read_accepted(0, &mut bytes), 8);
+        assert_eq!(&bytes, b"abcdefgh");
+        assert_eq!(store.pending_upload_count(), 0);
+
+        std::fs::remove_file(parent).expect("clear obstruction");
+        let staged = writer.flush_to(8).expect("successful retry");
+        assert_eq!(staged[0].object_id, 10_000);
+        assert_eq!(store.pending_upload_count(), 1);
+        assert_eq!(
+            store
+                .get_staged_for_upload(10_000)
+                .expect("staged bytes")
                 .as_ref(),
             b"abcdefgh"
         );
