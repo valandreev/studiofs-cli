@@ -64,7 +64,7 @@
 //! let ns = self.state.namespace.lock();
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 
 use tracing::warn;
@@ -138,7 +138,16 @@ struct HeldLock {
 // All state is thread-local to avoid cross-thread interference.
 thread_local! {
     static HELD_LOCKS: RefCell<Vec<HeldLock>> = RefCell::new(Vec::with_capacity(4));
-    static NEXT_LOCK_ID: RefCell<u64> = const { RefCell::new(0) };
+    static NEXT_LOCK_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Hands out the identity for the next lock acquisition.
+fn next_lock_id() -> u64 {
+    NEXT_LOCK_ID.with(|next| {
+        let id = next.get().wrapping_add(1);
+        next.set(id);
+        id
+    })
 }
 
 /// Guard that tracks lock acquisition and validates ordering.
@@ -169,11 +178,7 @@ impl LockOrderGuard {
 
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
-            let id = NEXT_LOCK_ID.with(|next| {
-                let mut next = next.borrow_mut();
-                *next = next.wrapping_add(1);
-                *next
-            });
+            let id = next_lock_id();
 
             // Check lock ordering: new tier must be >= last acquired tier
             // (i.e., same or lower priority than what we already hold).
@@ -224,11 +229,7 @@ impl LockOrderGuard {
         }
 
         HELD_LOCKS.with(|held| {
-            let id = NEXT_LOCK_ID.with(|next| {
-                let mut next = next.borrow_mut();
-                *next = next.wrapping_add(1);
-                *next
-            });
+            let id = next_lock_id();
             held.borrow_mut().push(HeldLock { tier, id });
             LockOrderGuard {
                 tier,
@@ -301,39 +302,43 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use tracing_subscriber::prelude::*;
 
-    #[derive(Clone)]
-    struct LockOrderEvents(Arc<Mutex<Vec<String>>>);
+    /// Shared tracing text sink so tests can observe diagnostics.
+    #[derive(Clone, Default)]
+    struct CapturedOutput(Arc<Mutex<Vec<u8>>>);
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LockOrderEvents {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _context: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut visitor = LockOrderMessageVisitor(None);
-            event.record(&mut visitor);
-            if let Some(message) = visitor.0 {
-                self.0.lock().expect("lock captured events").push(message);
-            }
+    impl std::io::Write for CapturedOutput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("lock captured output")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
-    struct LockOrderMessageVisitor(Option<String>);
+    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CapturedOutput {
+        type Writer = Self;
 
-    impl tracing::field::Visit for LockOrderMessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = Some(format!("{value:?}"));
-            }
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
         }
+    }
 
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = Some(value.to_owned());
-            }
-        }
+    /// Runs body with tracing text routed into a string.
+    fn capture_warnings_while(body: impl FnOnce()) -> String {
+        let output = CapturedOutput::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        String::from_utf8(output.0.lock().expect("lock captured output").clone())
+            .expect("captured tracing output is UTF-8")
     }
 
     #[test]
@@ -379,9 +384,7 @@ mod tests {
 
     #[test]
     fn test_same_tier_out_of_order_release_keeps_stack_consistent() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(LockOrderEvents(Arc::clone(&events)));
-        tracing::subscriber::with_default(subscriber, || {
+        let captured = capture_warnings_while(|| {
             let mut guards = vec![
                 LockOrderGuard::acquire(LockTier::Namespace),
                 LockOrderGuard::acquire(LockTier::Namespace),
@@ -394,16 +397,17 @@ mod tests {
             assert!(debug_lock_stack().is_empty());
         });
         assert_eq!(
-            *events.lock().expect("lock captured events"),
-            vec!["Lock guard dropped in wrong order"]
+            captured
+                .matches("Lock guard dropped in wrong order")
+                .count(),
+            1,
+            "expected exactly one out-of-order diagnostic, got: {captured}"
         );
     }
 
     #[test]
     fn test_same_tier_nested_release_is_silent() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(LockOrderEvents(Arc::clone(&events)));
-        tracing::subscriber::with_default(subscriber, || {
+        let captured = capture_warnings_while(|| {
             let guard1 = LockOrderGuard::acquire(LockTier::Namespace);
             let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
 
@@ -413,7 +417,10 @@ mod tests {
             drop(guard1);
             assert!(debug_lock_stack().is_empty());
         });
-        assert!(events.lock().expect("lock captured events").is_empty());
+        assert!(
+            captured.trim().is_empty(),
+            "expected no diagnostic, got: {captured}"
+        );
     }
 
     #[test]
