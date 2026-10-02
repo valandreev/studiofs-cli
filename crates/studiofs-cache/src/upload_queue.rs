@@ -48,6 +48,8 @@ pub struct UploadQueue {
     shutdown_notify: Notify,
     #[cfg(test)]
     wait_for_idle_hook: Mutex<Option<Arc<WaitForIdleHook>>>,
+    #[cfg(test)]
+    closed_submit_hook: Mutex<Option<Arc<ClosedSubmitHook>>>,
 }
 
 #[cfg(test)]
@@ -64,6 +66,12 @@ impl Default for WaitForIdleHook {
             release: Notify::new(),
         }
     }
+}
+
+#[cfg(test)]
+struct ClosedSubmitHook {
+    entered: tokio::sync::mpsc::UnboundedSender<PendingUpload>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 /// Atomically-consistent index of in-flight uploads.
@@ -90,6 +98,19 @@ pub struct UploadQueueIngressSnapshot {
 }
 
 const UPLOAD_WAKEUP_CAPACITY: usize = 1;
+
+/// Result of submitting an upload to the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadSubmitOutcome {
+    /// The submission created a new queue owner; the caller must retain its pin.
+    New,
+    /// The submission updated an existing queue entry without adding an owner.
+    Updated,
+    /// The submission was stale or duplicated an existing queue entry.
+    Ignored,
+    /// The queue wakeup channel was closed and the attempted change was rolled back.
+    Closed,
+}
 
 enum PendingSubmit {
     New,
@@ -123,14 +144,22 @@ impl UploadQueue {
             shutdown_notify: Notify::new(),
             #[cfg(test)]
             wait_for_idle_hook: Mutex::new(None),
+            #[cfg(test)]
+            closed_submit_hook: Mutex::new(None),
         });
 
         (queue, rx)
     }
 
     /// Submit a new pending upload (hot path — non-blocking).
-    pub fn submit(&self, ino: Ino, offset: u64, object_id: u64, content_epoch: u64) {
-        self.submit_with_payload(ino, offset, offset, object_id, content_epoch, 0);
+    pub fn submit(
+        &self,
+        ino: Ino,
+        offset: u64,
+        object_id: u64,
+        content_epoch: u64,
+    ) -> UploadSubmitOutcome {
+        self.submit_with_payload(ino, offset, offset, object_id, content_epoch, 0)
     }
 
     /// Submit a pending upload with explicit uploaded-payload geometry.
@@ -142,7 +171,7 @@ impl UploadQueue {
         object_id: u64,
         content_epoch: u64,
         payload_len: u64,
-    ) {
+    ) -> UploadSubmitOutcome {
         let op = PendingUpload {
             ino,
             offset,
@@ -155,20 +184,43 @@ impl UploadQueue {
             retry_count: 0,
         };
 
-        match self.record_pending_or_update(op.clone()) {
+        let mut state = self.pending_state.lock();
+        let outcome = match Self::record_pending_or_update(&mut state, op.clone()) {
             PendingSubmit::New => {
-                self.dispatch_wakeup(&op, None);
+                if !self.dispatch_wakeup_locked(&mut state) {
+                    #[cfg(test)]
+                    self.pause_closed_submit_for_test(&op);
+                    let (_, became_idle) = Self::remove_pending_if_matches_locked(&mut state, &op);
+                    drop(state);
+                    if became_idle {
+                        self.idle_notify.notify_waiters();
+                    }
+                    return UploadSubmitOutcome::Closed;
+                } else {
+                    UploadSubmitOutcome::New
+                }
             }
             PendingSubmit::Updated(previous) => {
-                self.dispatch_wakeup(&op, Some(previous));
+                if !self.dispatch_wakeup_locked(&mut state) {
+                    #[cfg(test)]
+                    self.pause_closed_submit_for_test(&op);
+                    Self::restore_pending_if_current_matches_locked(&mut state, &op, previous);
+                    drop(state);
+                    return UploadSubmitOutcome::Closed;
+                } else {
+                    UploadSubmitOutcome::Updated
+                }
             }
             PendingSubmit::Ignored => {
                 debug!(
                     object_id,
                     ino, offset, content_epoch, "upload submit ignored: object already pending"
                 );
+                UploadSubmitOutcome::Ignored
             }
-        }
+        };
+        drop(state);
+        outcome
     }
 
     /// Mark an upload as complete.
@@ -359,8 +411,7 @@ impl UploadQueue {
         self.shutdown_notify.notify_waiters();
     }
 
-    fn record_pending_or_update(&self, op: PendingUpload) -> PendingSubmit {
-        let mut state = self.pending_state.lock();
+    fn record_pending_or_update(state: &mut PendingState, op: PendingUpload) -> PendingSubmit {
         if let Some(current) = state.by_object.get_mut(&op.object_id) {
             if current.ino == op.ino
                 && current.offset == op.offset
@@ -384,14 +435,7 @@ impl UploadQueue {
     fn dispatch_wakeup(&self, op: &PendingUpload, previous: Option<PendingUpload>) -> bool {
         let closed = {
             let mut state = self.pending_state.lock();
-            match self.sender.try_send(()) {
-                Ok(()) => false,
-                Err(mpsc::error::TrySendError::Full(())) => {
-                    state.wakeup_coalesced = state.wakeup_coalesced.saturating_add(1);
-                    false
-                }
-                Err(mpsc::error::TrySendError::Closed(())) => true,
-            }
+            !self.dispatch_wakeup_locked(&mut state)
         };
         if closed {
             if let Some(previous) = previous {
@@ -405,27 +449,64 @@ impl UploadQueue {
         }
     }
 
+    fn dispatch_wakeup_locked(&self, state: &mut PendingState) -> bool {
+        match self.sender.try_send(()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                state.wakeup_coalesced = state.wakeup_coalesced.saturating_add(1);
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_closed_submit_hook(&self, hook: Arc<ClosedSubmitHook>) {
+        *self.closed_submit_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn pause_closed_submit_for_test(&self, op: &PendingUpload) {
+        let hook = self.closed_submit_hook.lock().clone();
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(op.clone());
+            let _ = hook
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        }
+    }
+
     fn remove_pending_if_matches(&self, op: &PendingUpload) -> bool {
         let mut state = self.pending_state.lock();
+        let (removed, became_idle) = Self::remove_pending_if_matches_locked(&mut state, op);
+        drop(state);
+        if became_idle {
+            self.idle_notify.notify_waiters();
+        }
+        removed
+    }
+
+    fn remove_pending_if_matches_locked(
+        state: &mut PendingState,
+        op: &PendingUpload,
+    ) -> (bool, bool) {
         let Entry::Occupied(entry) = state.by_object.entry(op.object_id) else {
-            return false;
+            return (false, false);
         };
         let current = entry.get();
         if current.ino != op.ino
             || current.offset != op.offset
             || current.content_epoch != op.content_epoch
         {
-            return false;
+            return (false, false);
         }
         let removed = entry.remove();
-        Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
+        Self::remove_inode_index_entry(state, removed.ino, op.object_id);
         state.dirty_objects.remove(&op.object_id);
         let became_idle = state.by_object.is_empty();
-        drop(state);
-        if became_idle {
-            self.idle_notify.notify_waiters();
-        }
-        true
+        (true, became_idle)
     }
 
     fn update_pending_if_matches(&self, op: &PendingUpload) -> Option<PendingUpload> {
@@ -471,6 +552,14 @@ impl UploadQueue {
         previous: PendingUpload,
     ) {
         let mut state = self.pending_state.lock();
+        Self::restore_pending_if_current_matches_locked(&mut state, failed_op, previous);
+    }
+
+    fn restore_pending_if_current_matches_locked(
+        state: &mut PendingState,
+        failed_op: &PendingUpload,
+        previous: PendingUpload,
+    ) {
         let Some(current) = state.by_object.get_mut(&failed_op.object_id) else {
             return;
         };
@@ -524,7 +613,7 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit(100, 0, 42, 7);
+        assert_eq!(queue.submit(100, 0, 42, 7), UploadSubmitOutcome::New);
         assert_eq!(queue.pending_count(), 1);
 
         let op = recv_one(&queue, &mut rx).await;
@@ -553,8 +642,13 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit(1, 0, 77, 1);
-        queue.submit(1, 0, 77, 1);
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::New);
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::Ignored);
+        assert_eq!(
+            queue.submit(2, 0, 77, 2),
+            UploadSubmitOutcome::Ignored,
+            "a reused object ID with a different owner identity is ignored"
+        );
 
         assert_eq!(queue.pending_count(), 1);
         let op = recv_one(&queue, &mut rx).await;
@@ -567,9 +661,12 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit(1, 1_048_569, 77, 2);
+        assert_eq!(queue.submit(1, 1_048_569, 77, 2), UploadSubmitOutcome::New);
         let stale = recv_one(&queue, &mut rx).await;
-        queue.submit(1, 1_048_569, 77, 3);
+        assert_eq!(
+            queue.submit(1, 1_048_569, 77, 3),
+            UploadSubmitOutcome::Updated
+        );
 
         assert_eq!(queue.pending_count(), 1);
         let updated = recv_one(&queue, &mut rx).await;
@@ -591,6 +688,50 @@ mod tests {
         assert_eq!(pending_for_inode[0].content_epoch, 3);
 
         assert!(queue.complete(&updated));
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sfs752_closed_update_restores_previous_pending_upload() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::New);
+        let previous = recv_one(&queue, &mut rx).await;
+        drop(rx);
+
+        assert_eq!(queue.submit(1, 0, 77, 2), UploadSubmitOutcome::Closed);
+        assert_eq!(queue.snapshot_pending(), vec![previous]);
+    }
+
+    #[tokio::test]
+    async fn sfs752_closed_submit_holds_state_lock_through_rollback() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, rx) = UploadQueue::new(dir.path());
+        drop(rx);
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        queue.set_closed_submit_hook(Arc::new(ClosedSubmitHook {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }));
+
+        let first_queue = Arc::clone(&queue);
+        let first = tokio::task::spawn_blocking(move || {
+            first_queue.submit_with_payload(1, 0, 0, 77, 1, 10)
+        });
+        let first_paused = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("first closed submit reaches rollback")
+            .expect("closed submit hook remains connected");
+        assert_eq!(first_paused.content_epoch, 1);
+        let rollback_holds_state_lock = queue.pending_state.try_lock().is_none();
+        release_tx.send(()).expect("release first closed submit");
+        assert_eq!(
+            first.await.expect("first submit task"),
+            UploadSubmitOutcome::Closed
+        );
+        assert!(rollback_holds_state_lock, "submit lock must cover rollback");
         assert_eq!(queue.pending_count(), 0);
     }
 

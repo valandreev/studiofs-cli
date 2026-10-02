@@ -261,6 +261,24 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-752 Upload Queue Pin Ownership
+
+These focused tests use the real local payload backend without S3 or PostgreSQL.
+They check ignored and updated submissions, repeated batch object IDs, closed
+worker channels, retry failures, and independent reader pins. The last upload
+owner releases its pin exactly once; uploaded payloads then become evictable.
+Bounded synchronization checks keep logical/backend pin transitions and queue
+dispatch rollback serialized.
+
+```powershell
+cargo test -p studiofs-cache --lib sfs752_ -- --nocapture
+cargo test -p studiofs-cache --lib upload_queue::tests -- --nocapture
+cargo check -p studiofs-cache
+cargo clippy -p studiofs-cache --all-targets -- -D warnings
+```
+
+This gate does not establish live mounted or remote-service acceptance.
+
 ### SFS-753 Single-put Crash Recovery
 
 The cache regression stops the real single-put path after payload file commit

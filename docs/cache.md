@@ -169,6 +169,14 @@ runtime. It is intentionally focused on:
 - upload helpers used by the background uploader
 - runtime metrics used by `status`
 
+Upload queue ownership is unique by object ID. Single and batch submissions
+reserve a pin before worker dispatch, then retain it only for a new accepted
+entry. Ignored submissions and newer-epoch updates release their provisional
+reference; updates, retries and rebases retain the existing owner's pin.
+Completion or cancellation releases that pin only when the operation matches
+the current entry. Closed-channel rollback preserves any prior owner, and
+dirty lifecycle state remains protected independently of runtime pins.
+
 Durable local payload state lives in the cached store plus local metadata; the
 mount must not create a second foreground payload pipeline.
 
