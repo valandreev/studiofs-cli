@@ -49,7 +49,7 @@ pub struct UploadQueue {
     #[cfg(test)]
     wait_for_idle_hook: Mutex<Option<Arc<WaitForIdleHook>>>,
     #[cfg(test)]
-    closed_dispatch_hook: Mutex<Option<Arc<ClosedDispatchHook>>>,
+    closed_dispatch_hook: Mutex<Option<ClosedDispatchHook>>,
 }
 
 #[cfg(test)]
@@ -71,7 +71,7 @@ impl Default for WaitForIdleHook {
 #[cfg(test)]
 struct ClosedDispatchHook {
     entered: tokio::sync::mpsc::UnboundedSender<PendingUpload>,
-    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// Atomically-consistent index of in-flight uploads.
@@ -197,31 +197,25 @@ impl UploadQueue {
         };
 
         let mut state = self.pending_state.lock();
+        let mut became_idle = false;
         let outcome = match Self::record_pending_or_update(&mut state, op.clone()) {
+            PendingSubmit::New if self.dispatch_wakeup_locked(&mut state) => {
+                UploadSubmitOutcome::New
+            }
             PendingSubmit::New => {
-                if !self.dispatch_wakeup_locked(&mut state) {
-                    #[cfg(test)]
-                    self.pause_closed_dispatch_for_test(&op);
-                    let (_, became_idle) = Self::remove_pending_if_matches_locked(&mut state, &op);
-                    drop(state);
-                    if became_idle {
-                        self.idle_notify.notify_waiters();
-                    }
-                    return UploadSubmitOutcome::Closed;
-                } else {
-                    UploadSubmitOutcome::New
-                }
+                #[cfg(test)]
+                self.pause_closed_dispatch_for_test(&op);
+                (_, became_idle) = Self::remove_pending_if_matches_locked(&mut state, &op);
+                UploadSubmitOutcome::Closed
+            }
+            PendingSubmit::Updated(_) if self.dispatch_wakeup_locked(&mut state) => {
+                UploadSubmitOutcome::Updated
             }
             PendingSubmit::Updated(previous) => {
-                if !self.dispatch_wakeup_locked(&mut state) {
-                    #[cfg(test)]
-                    self.pause_closed_dispatch_for_test(&op);
-                    Self::restore_pending_if_current_matches_locked(&mut state, &op, previous);
-                    drop(state);
-                    return UploadSubmitOutcome::Closed;
-                } else {
-                    UploadSubmitOutcome::Updated
-                }
+                #[cfg(test)]
+                self.pause_closed_dispatch_for_test(&op);
+                Self::restore_pending_if_current_matches_locked(&mut state, &op, previous);
+                UploadSubmitOutcome::Closed
             }
             PendingSubmit::Ignored => {
                 debug!(
@@ -232,6 +226,9 @@ impl UploadQueue {
             }
         };
         drop(state);
+        if became_idle {
+            self.idle_notify.notify_waiters();
+        }
         outcome
     }
 
@@ -472,20 +469,16 @@ impl UploadQueue {
     }
 
     #[cfg(test)]
-    fn set_closed_dispatch_hook(&self, hook: Arc<ClosedDispatchHook>) {
+    fn set_closed_dispatch_hook(&self, hook: ClosedDispatchHook) {
         *self.closed_dispatch_hook.lock() = Some(hook);
     }
 
     #[cfg(test)]
     fn pause_closed_dispatch_for_test(&self, op: &PendingUpload) {
-        let hook = self.closed_dispatch_hook.lock().clone();
+        let hook = self.closed_dispatch_hook.lock().take();
         if let Some(hook) = hook {
             let _ = hook.entered.send(op.clone());
-            let _ = hook
-                .release
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(5));
+            let _ = hook.release.recv_timeout(Duration::from_secs(5));
         }
     }
 
@@ -714,10 +707,10 @@ mod tests {
 
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        queue.set_closed_dispatch_hook(Arc::new(ClosedDispatchHook {
+        queue.set_closed_dispatch_hook(ClosedDispatchHook {
             entered: entered_tx,
-            release: std::sync::Mutex::new(release_rx),
-        }));
+            release: release_rx,
+        });
 
         let first_queue = Arc::clone(&queue);
         let first = tokio::task::spawn_blocking(move || {
@@ -749,10 +742,10 @@ mod tests {
 
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        queue.set_closed_dispatch_hook(Arc::new(ClosedDispatchHook {
+        queue.set_closed_dispatch_hook(ClosedDispatchHook {
             entered: entered_tx,
-            release: std::sync::Mutex::new(release_rx),
-        }));
+            release: release_rx,
+        });
 
         let requeue_queue = Arc::clone(&queue);
         let requeue = tokio::task::spawn_blocking(move || requeue_queue.requeue(retry));
@@ -785,10 +778,10 @@ mod tests {
 
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        queue.set_closed_dispatch_hook(Arc::new(ClosedDispatchHook {
+        queue.set_closed_dispatch_hook(ClosedDispatchHook {
             entered: entered_tx,
-            release: std::sync::Mutex::new(release_rx),
-        }));
+            release: release_rx,
+        });
 
         let requeue_queue = Arc::clone(&queue);
         let expected = current.clone();
