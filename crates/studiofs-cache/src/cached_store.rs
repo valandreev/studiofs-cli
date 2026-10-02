@@ -157,11 +157,19 @@ impl CachedStoreWriterCounters {
 
     fn replace_pending_upload(&self, previous: u64, bytes: u64) {
         // One RMW keeps lock-free snapshots from seeing a subtract/add gap.
-        let _ = self.pending_upload_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |pending| Some(pending.saturating_sub(previous).saturating_add(bytes)),
-        );
+        let mut pending = self.pending_upload_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = pending.saturating_sub(previous).saturating_add(bytes);
+            match self.pending_upload_bytes.compare_exchange_weak(
+                pending,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => pending = actual,
+            }
+        }
     }
 
     fn record_upload_terminal(&self, bytes: u64) {
