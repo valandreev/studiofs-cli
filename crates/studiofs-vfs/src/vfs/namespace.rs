@@ -1308,7 +1308,7 @@ impl StudioVfs {
         self.state
             .namespace
             .namespace_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current == u64::MAX {
                     warn!("namespace_epoch saturated at u64::MAX");
                 }

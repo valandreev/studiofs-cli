@@ -517,11 +517,11 @@ impl FileSessionEntry {
     }
 
     fn update_max_queue_depth(&self, candidate: u64) {
-        let _ =
-            self.max_queue_depth
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    (candidate > current).then_some(candidate)
-                });
+        let _ = self
+            .max_queue_depth
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (candidate > current).then_some(candidate)
+            });
     }
 
     fn note_active_start(&self, op: FileSessionOperation) {
@@ -538,14 +538,14 @@ impl FileSessionEntry {
     fn note_active_finish(&self, op: FileSessionOperation) {
         if op == FileSessionOperation::Delete {
             self.active_delete_ops
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
                 })
                 .ok();
         }
         if op.shared_lock() {
             self.active_shared_locks
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
                 })
                 .ok();
@@ -585,14 +585,14 @@ impl Drop for FileSessionQueueGuard<'_> {
         self.session.queued_ops.fetch_sub(1, Ordering::Relaxed);
         self.counters
             .queued_ops
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .ok();
         if self.op == FileSessionOperation::Delete {
             self.session
                 .queued_delete_ops
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
                 })
                 .ok();
@@ -724,7 +724,7 @@ impl FileSessionState {
         sessions.remove(&ino);
         self.counters
             .active_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .ok();
@@ -742,11 +742,12 @@ impl FileSessionState {
         let queue_depth = session.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
         session.update_max_queue_depth(queue_depth);
         let global_queue_depth = counters.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = counters.max_queue_depth.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| (global_queue_depth > current).then_some(global_queue_depth),
-        );
+        let _ =
+            counters
+                .max_queue_depth
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (global_queue_depth > current).then_some(global_queue_depth)
+                });
         let queued_op = FileSessionQueueGuard {
             session: &session,
             counters: &self.counters,
@@ -814,7 +815,7 @@ impl FileSessionState {
         session.open_handles.store(remaining, Ordering::Relaxed);
         self.counters
             .open_handles
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .ok();

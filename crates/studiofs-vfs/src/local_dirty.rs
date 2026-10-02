@@ -2689,7 +2689,7 @@ impl StudioVfs {
         if bytes == 0 {
             return;
         }
-        let _ = self.state.local_dirty.pending_bytes.fetch_update(
+        let _ = self.state.local_dirty.pending_bytes.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |pending| Some(pending.saturating_sub(bytes)),
@@ -2714,7 +2714,7 @@ impl StudioVfs {
             .state
             .local_dirty
             .pending_persisted_slice_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                 Some(pending.saturating_sub(bytes))
             });
     }
@@ -2736,7 +2736,7 @@ impl StudioVfs {
 
     fn subtract_pending_slice_counts(&self, total: usize, persisted: usize) {
         if total > 0 {
-            let _ = self.state.local_dirty.pending_slice_count.fetch_update(
+            let _ = self.state.local_dirty.pending_slice_count.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |pending| {
@@ -2753,7 +2753,7 @@ impl StudioVfs {
                 .state
                 .local_dirty
                 .pending_persisted_slice_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                     debug_assert!(
                         pending >= persisted,
                         "pending_persisted_slice_count underflow: pending={pending}, subtract={persisted}"
