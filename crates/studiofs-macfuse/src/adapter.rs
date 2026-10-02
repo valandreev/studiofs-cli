@@ -2401,6 +2401,7 @@ impl CallbackState {
 
 #[derive(Default)]
 pub(crate) struct ReplyTaskTracker {
+    // Preserve the count on poison: these replies must finish before session teardown.
     active: Mutex<usize>,
     idle: Condvar,
 }
@@ -2414,7 +2415,7 @@ impl ReplyTaskTracker {
         *self
             .active
             .lock()
-            .expect("reply task tracker lock should not be poisoned") += 1;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         ReplyTaskGuard {
             tracker: Arc::clone(self),
         }
@@ -2424,12 +2425,12 @@ impl ReplyTaskTracker {
         let mut active = self
             .active
             .lock()
-            .expect("reply task tracker lock should not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *active != 0 {
             active = self
                 .idle
                 .wait(active)
-                .expect("reply task tracker lock should not be poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 }
@@ -2440,7 +2441,7 @@ impl Drop for ReplyTaskGuard {
             .tracker
             .active
             .lock()
-            .expect("reply task tracker lock should not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *active -= 1;
         if *active == 0 {
             self.tracker.idle.notify_all();
@@ -4610,10 +4611,75 @@ async fn acquire_read_admission<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
     use studiofs_vfs::contract_harness::ContractVfsFixture;
+
+    fn poison_reply_tracker(tracker: &ReplyTaskTracker) {
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _active = tracker
+                    .active
+                    .lock()
+                    .expect("lock tracker before poisoning");
+                panic!("poison reply tracker without changing its count");
+            })
+            .is_err()
+        );
+        assert!(tracker.active.is_poisoned());
+    }
+
+    #[cfg(studiofs_fskit)]
+    pub(crate) fn poison_reply_task_tracker(callback_state: &CallbackState) {
+        poison_reply_tracker(&callback_state.adapter.reply_tasks);
+    }
+
+    #[test]
+    fn reply_task_tracker_recovers_poison_without_losing_active_replies() {
+        let tracker = Arc::new(ReplyTaskTracker::default());
+        poison_reply_tracker(&tracker);
+        let first = tracker.track();
+        let second = tracker.track();
+        assert_eq!(
+            *tracker
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2
+        );
+
+        let waiting_tracker = Arc::clone(&tracker);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiting_tracker.wait_for_idle();
+            done_tx.send(()).expect("signal drained poisoned tracker");
+        });
+        let premature_drain = done_rx.recv_timeout(Duration::from_millis(50));
+        drop(first);
+        let remaining = *tracker
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(second);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("poisoned tracker must drain after both replies finish");
+        waiter.join().expect("join poisoned tracker waiter");
+
+        assert_eq!(
+            premature_drain,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(remaining, 1);
+        assert_eq!(
+            *tracker
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            0
+        );
+    }
 
     #[test]
     fn reply_task_tracker_waits_until_async_reply_finishes() {

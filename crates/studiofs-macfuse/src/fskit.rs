@@ -2846,6 +2846,69 @@ mod tests {
     }
 
     #[test]
+    fn fskit_rmdir_replies_once_when_reply_task_tracker_is_poisoned() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-poisoned-reply")
+                .expect("create fixture");
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound reply reads");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let callback_state = Arc::new(CallbackState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+        ));
+        crate::adapter::tests::poison_reply_task_tracker(&callback_state);
+        let dispatcher = FsKitDispatcher::new(
+            Arc::clone(&callback_state),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+
+        let name = b"missing\0";
+        let mut frame = vec![0_u8; size_of::<FuseInHeader>()];
+        let frame_len = (frame.len() + name.len()) as u32;
+        frame[..4].copy_from_slice(&frame_len.to_ne_bytes());
+        frame[4..8].copy_from_slice(&FUSE_RMDIR.to_ne_bytes());
+        frame[8..16].copy_from_slice(&31_u64.to_ne_bytes());
+        frame[16..24].copy_from_slice(&studiofs_meta::schema::ROOT_INO.to_ne_bytes());
+        frame.extend_from_slice(name);
+        peer.write_all(&frame).expect("send RMDIR");
+        let retained = control.retained_channel().expect("retain channel");
+        let message = FsKitMessage::receive(&retained).expect("receive RMDIR");
+        dispatcher.dispatch(message);
+
+        let (drained_sender, drained_receiver) = mpsc::channel();
+        let drain_state = Arc::clone(&callback_state);
+        let waiter = std::thread::spawn(move || {
+            drain_state.wait_for_reply_tasks();
+            drained_sender.send(()).expect("signal drained reply tasks");
+        });
+        let drained = drained_receiver.recv_timeout(Duration::from_secs(1));
+        control.close();
+        drained.expect("reply task tracker must drain");
+        waiter.join().expect("join reply task drain waiter");
+
+        let mut reply = [0_u8; size_of::<FuseOutHeader>()];
+        peer.read_exact(&mut reply).expect("RMDIR requires a reply");
+        let mut extra = [0_u8; 1];
+        let extra_read = peer.read(&mut extra);
+
+        let header = read_copy::<FuseOutHeader>(&reply, 0).expect("decode RMDIR reply");
+        assert_eq!((header.unique, header.error), (31, -libc::ENOENT));
+        assert_eq!(extra_read.expect("check for a second reply"), 0);
+    }
+
+    #[test]
     fn fskit_run_answers_init_before_mount_completes() {
         use std::io::{Read, Write};
         use std::os::fd::IntoRawFd;
