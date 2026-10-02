@@ -42,7 +42,9 @@ references without letting an active upload lose its protection from eviction.
   fixture/pin assertions and documentation.
 - [x] (2026-10-02 11:28Z) Validated the seven-thread follow-up with focused
   cache/VFS tests, checks, Clippy and independent source review.
-- [ ] Commit/push the follow-up, reply inline and resolve all seven threads.
+- [x] (2026-10-02 11:30Z) Committed/pushed `8cfce6ae`, updated PR #737,
+  replied inline and resolved all seven attached threads; verified the matching
+  PR head and clean working tree.
 
 ## Surprises & Discoveries
 
@@ -210,6 +212,9 @@ trail are corrected. Final checks passed 21 SFS-752 regressions, 24 queue tests,
 three VFS rebase tests and one VFS fallback test; cache/VFS check and all-targets
 Clippy, formatting and whitespace checks passed. Independent source review found
 no actionable defect. Filters overlap; full suites and live mounts were not run.
+Delivered as `8cfce6ae`; all seven attached threads have technical replies and
+are resolved. The PR description records the scoped validation and remaining
+user-run full gate.
 
 Implementation is complete. Eight SFS-752 regressions, 21 queue tests and 10
 pin-filtered tests passed (filters overlap). Three focused VFS worker rebase
@@ -330,6 +335,7 @@ Implementation commit: `5e784917`.
 Local review accounting fix: `fcbe9ba7`.
 Second local review lock/depth/stats fix: `17ec7d70`.
 Third local review zero-byte fix: `a839f1d2`; delivery record: `e9be25f6`.
+Seven-thread PR rebase/atomic-accounting fix: `8cfce6ae`.
 Graph generation 2026-10-02T09:01:39Z reported metadata changes for relied-on
 source files, so graph discovery was followed by direct source reads.
 
