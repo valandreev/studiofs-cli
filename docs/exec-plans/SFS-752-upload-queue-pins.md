@@ -88,7 +88,8 @@ tests passed, as did cache check, cache all-targets Clippy, workspace formatting
 and whitespace checks. Only private cache accounting and test-hook docs changed;
 no VFS rerun was needed. Full suites and live mounts were not run. Graph coverage
 reported metadata changes for both source files, so findings were checked against
-direct source. Publication is the remaining delivery step.
+direct source. Delivered as `a839f1d2`, pushed to PR #737 with its description
+updated; verified the matching remote head and clean working tree.
 
 Keep protection in place before publishing an operation to workers. Use the
 queue's submission outcome to release only provisional references that did not
