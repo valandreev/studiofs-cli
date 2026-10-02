@@ -275,6 +275,8 @@ submission with completion/cancellation while checking the ownership lock scope.
 Additional boundaries cover pin-before-stats protection, pin/unpin waits outside
 accounting, known/legacy completion lengths, and batch submission overlapping
 terminal cleanup while preserving submission counts and queue-depth peaks.
+Zero-byte staged accounting is distinguished from an absent contribution, so
+completion does not query backend stats for a known zero-length upload.
 
 ```powershell
 cargo test -p studiofs-cache --lib sfs752_ -- --nocapture

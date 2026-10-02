@@ -69,6 +69,7 @@ impl Default for WaitForIdleHook {
 }
 
 #[cfg(test)]
+/// One-shot test hook; consumed on first activation.
 struct ClosedDispatchHook {
     entered: tokio::sync::mpsc::UnboundedSender<PendingUpload>,
     release: std::sync::mpsc::Receiver<()>,

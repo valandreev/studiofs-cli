@@ -62,6 +62,34 @@ instead consume a newly staged owner's contribution.
 
 ## Decision Log
 
+Third local review (head `7c886ad6`) dispositions:
+
+- Finding 1 confirmed: a present zero-byte accounting entry was mistaken for
+  an absent entry. `record_upload_terminal` now returns `Option<u64>`, and
+  completion releases accounting before resolving any backend fallback.
+  A focused zero-byte staging regression failed with one stats call before
+  the fix and passes with none after it; legacy unknown-length fallback remains.
+- Findings 2 and 6 fixed: reuse the staging length conversion and document the
+  one-shot lifecycle of both test hooks.
+- Finding 3 deferred: replacing the existing public six-tuple batch API requires
+  migrating callers and is a separate API refactor. No transposed caller was
+  identified by the report; preserve this review repair's public contract.
+- Finding 4 retained: the owned candidate is used after insertion for exact
+  closed-dispatch rollback identity and test-hook observation. Moving it into
+  the map requires changing rollback plumbing or cloning elsewhere. Its current
+  fixed-field clone has no heap allocation; no measured bottleneck warrants
+  redesigning that verified boundary in this repair. Do not broadly derive Copy.
+- Finding 5 deferred as the report itself requests a future performance pass:
+  a batch-wide queue critical section changes contention and worker interleaving
+  and needs measurements. Current per-attempt depth peaks remain preserved.
+
+Third review validation (2026-10-02 11:01Z): 20 SFS-752 regressions and 24 queue
+tests passed, as did cache check, cache all-targets Clippy, workspace formatting
+and whitespace checks. Only private cache accounting and test-hook docs changed;
+no VFS rerun was needed. Full suites and live mounts were not run. Graph coverage
+reported metadata changes for both source files, so findings were checked against
+direct source. Publication is the remaining delivery step.
+
 Keep protection in place before publishing an operation to workers. Use the
 queue's submission outcome to release only provisional references that did not
 create ownership. Retain the native backend batch-pin path and existing rebase
