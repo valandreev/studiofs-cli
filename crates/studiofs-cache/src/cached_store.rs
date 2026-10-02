@@ -473,7 +473,9 @@ pub struct CachedStore {
     upload_stage_store: UploadStageStore,
     /// In-memory hot-upload cache state.
     upload_hot: Mutex<UploadHotState>,
-    /// Pin accounting for currently referenced cached objects.
+    /// Pin accounting for currently referenced cached objects. First/final
+    /// transitions retain this lock through the backend mutation-gate transition.
+    // ponytail: store-wide transition lock; use per-object ordering if contention is measured.
     pinned: Mutex<PinnedState>,
     /// Queue that schedules staged uploads for worker dispatch.
     upload_queue: Arc<UploadQueue>,

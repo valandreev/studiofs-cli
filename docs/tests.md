@@ -265,7 +265,7 @@ tests do not establish live mounted disk-full acceptance.
 
 These focused tests use the real local payload backend without S3 or PostgreSQL.
 They check ignored and updated submissions, repeated batch object IDs, closed
-worker channels, retry failures, and independent reader pins. The last upload
+worker channels, retry/rebase failures, and independent reader pins. The last upload
 owner releases its pin exactly once; uploaded payloads then become evictable.
 Bounded synchronization checks keep logical/backend pin transitions and queue
 dispatch rollback serialized.

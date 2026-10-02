@@ -21,6 +21,8 @@ references without letting an active upload lose its protection from eviction.
   source review passed; three focused VFS rebase tests also passed.
 - [x] (2026-10-02 09:23Z) Committed/pushed all task files, created regular
   PR #737 and verified SFS-752 is In Review with the PR attached.
+- [x] (2026-10-02 09:39Z) Implemented the three attached review changes,
+  validated the follow-up and prepared technical thread replies.
 
 ## Surprises & Discoveries
 
@@ -52,6 +54,17 @@ including native batch pins. These existing locks make ownership results safe
 to consume without adding a new synchronization layer.
 Date/author: 2026-10-02, Codex.
 
+PR review confirmed that backend mutation stripe gates cover payload I/O and
+can delay all first/final pin transitions behind the existing store-wide mutex.
+Document the order `CachedStore::pinned` then ascending backend mutation gates
+then backend `runtime_pinned`, including the prohibition on backend re-entry.
+Retain this correctness mechanism; per-object serialization is a separate
+performance change requiring measured contention and safe map-entry lifetime
+and batch ordering. Public submit docs must specify provisional pin ownership.
+Extend the existing queue critical section to retry/rebase rollback so the
+record/update-dispatch-rollback invariant applies to all queue ingress paths.
+Date/author: 2026-10-02, Codex (PR #737 review follow-up).
+
 ## Outcomes & Retrospective
 
 Implementation is complete. Eight SFS-752 regressions, 21 queue tests and 10
@@ -61,6 +74,15 @@ Independent source review found no actionable correctness issue. All task files
 were committed and pushed before creating regular PR #737; SFS-752 is In Review.
 Full workspace suites and live mounted acceptance were not run. The fix reuses
 the existing queue and pin locks and native backend batch pinning.
+
+The PR review follow-up documents the auxiliary backend lock order and its
+contention tradeoff, adds provisional pin ownership to both public submit docs,
+and makes retry/rebase dispatch rollback atomic under the same queue mutex.
+The new bounded retry regression failed before the change; final validation
+passed 23 queue tests, 10 SFS-752 regressions and three VFS rebase tests.
+Cache check/Clippy and format/whitespace checks passed. Independent source review
+found no actionable defect. Per-object pin serialization was considered and
+deferred as measured performance work, preserving the current correctness fix.
 
 ## Context and Orientation
 
@@ -100,11 +122,16 @@ All commands run from `E:\dev\studiofs-cli` in PowerShell. Run Cargo sequentiall
     cargo fmt --all -- --check
     git diff --check
 
-Observed results: 8, 21, 10 and 3 passed respectively, with no ignored or failed
+Initial delivery results: 8, 21, 10 and 3 passed respectively, with no ignored or failed
 tests. Cache check/Clippy and format/whitespace checks exited successfully.
 The initial six cache regressions and queue lock-boundary regression failed
 before their fixes. If a shared Cargo target is locked, reuse an isolated target
 directory under `target/`.
+
+PR review follow-up results: the `sfs752_` filter passed 10 tests, the queue
+filter passed 23, and the VFS filter passed three. Cache check/Clippy and
+format/whitespace checks passed. The retry rollback lock-boundary regression
+failed before atomic retry dispatch and passed after it.
 
 ## Validation and Acceptance
 
@@ -143,3 +170,7 @@ Revision 2026-10-02: recorded the implemented ownership outcome, passing focused
 checks and independent source review; delivery is the remaining step.
 Revision 2026-10-02: recorded the actual regular PR and verified Linear review
 status after delivery, without claiming full-suite or mounted acceptance.
+Revision 2026-10-02: recorded the attached review scope and lock-order tradeoff;
+retry/rebase serialization and focused follow-up validation are in progress.
+Revision 2026-10-02: completed the review changes and recorded focused passing
+validation; prepared one follow-up commit and replies for all attached threads.
