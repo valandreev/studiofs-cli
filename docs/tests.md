@@ -261,6 +261,36 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-752 Upload Queue Pin Ownership
+
+These focused tests use the real local payload backend without S3 or PostgreSQL.
+They check ignored and updated submissions, repeated batch object IDs, closed
+worker channels, retry/rebase failures, and independent reader pins. The last upload
+owner releases its pin exactly once; uploaded payloads then become evictable.
+Bounded synchronization checks keep logical/backend pin transitions and queue
+dispatch rollback serialized.
+Writer-byte regressions cover ignored/updated submissions and both staging
+paths with a closed worker channel. A bounded accounting hook overlaps staged
+submission with completion/cancellation while checking the ownership lock scope.
+Additional boundaries cover pin-before-stats protection, pin/unpin waits outside
+accounting, known/legacy completion lengths, and batch submission overlapping
+terminal cleanup while preserving submission counts and queue-depth peaks.
+Zero-byte staged accounting is distinguished from an absent contribution, so
+completion does not query backend stats for a known zero-length upload.
+Accepted rebases refresh staged-byte attribution, including zero lengths; stale
+and closed-channel rebases preserve it. Restaging replaces the byte counter in
+one atomic update while retaining other objects' contributions.
+
+```powershell
+cargo test -p studiofs-cache --lib sfs752_ -- --nocapture
+cargo test -p studiofs-cache --lib upload_queue::tests -- --nocapture
+cargo test -p studiofs-vfs --lib upload_disk_reread_falls_back_without_stage_link_after_foreground_idle -- --nocapture
+cargo check -p studiofs-cache -p studiofs-vfs
+cargo clippy -p studiofs-cache -p studiofs-vfs --all-targets -- -D warnings
+```
+
+This gate does not establish live mounted or remote-service acceptance.
+
 ### SFS-753 Single-put Crash Recovery
 
 The cache regression stops the real single-put path after payload file commit

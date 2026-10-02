@@ -21,7 +21,7 @@ use crate::local::{
 };
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::runtime::LocalPayloadLayout;
-use crate::upload_queue::{PendingUpload, UploadQueue};
+use crate::upload_queue::{PendingUpload, UploadQueue, UploadSubmitOutcome};
 use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
 /// Stable identifier for cached payload objects.
@@ -106,7 +106,7 @@ pub struct CachedStoreWriterCountersSnapshot {
     pub dirty_bytes: u64,
     /// Total bytes staged into the local cache backend.
     pub staged_bytes: u64,
-    /// Bytes currently attributed to pending uploads.
+    /// Writer-staged bytes currently attributed to accepted pending uploads.
     pub pending_upload_bytes: u64,
     /// Total number of slices staged.
     pub staged_slices: u64,
@@ -155,9 +155,21 @@ impl CachedStoreWriterCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_pending_upload(&self, bytes: usize) {
-        self.pending_upload_bytes
-            .fetch_add(saturating_u64_from_usize(bytes), Ordering::Relaxed);
+    fn replace_pending_upload(&self, previous: u64, bytes: u64) {
+        // One RMW keeps lock-free snapshots from seeing a subtract/add gap.
+        let mut pending = self.pending_upload_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = pending.saturating_sub(previous).saturating_add(bytes);
+            match self.pending_upload_bytes.compare_exchange_weak(
+                pending,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => pending = actual,
+            }
+        }
     }
 
     fn record_upload_terminal(&self, bytes: u64) {
@@ -327,6 +339,13 @@ struct PinnedState {
     objects: HashMap<ObjectId, usize>,
 }
 
+#[cfg(test)]
+/// One-shot test hook; consumed on first activation.
+struct UploadAccountingHook {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 impl PinnedState {
     fn insert(&mut self, object_id: ObjectId) -> bool {
         let count = self.objects.entry(object_id).or_default();
@@ -473,12 +492,18 @@ pub struct CachedStore {
     upload_stage_store: UploadStageStore,
     /// In-memory hot-upload cache state.
     upload_hot: Mutex<UploadHotState>,
-    /// Pin accounting for currently referenced cached objects.
+    /// Pin accounting for currently referenced cached objects. First/final
+    /// transitions retain this lock through the backend mutation-gate transition.
+    // ponytail: store-wide transition lock; use per-object ordering if contention is measured.
     pinned: Mutex<PinnedState>,
     /// Queue that schedules staged uploads for worker dispatch.
     upload_queue: Arc<UploadQueue>,
-    /// Bytes currently pending upload per object id.
+    /// Writer-staged bytes attributed to accepted uploads by object id.
+    // Serializes staged queue ownership and its byte accounting with terminal removal.
+    // ponytail: global accounting lock; per-object accounting if queue contention is measured.
     pending_upload_bytes_by_object: Mutex<HashMap<ObjectId, u64>>,
+    #[cfg(test)]
+    upload_accounting_hook: Mutex<Option<UploadAccountingHook>>,
     /// Atomic counters for writer staging and upload metrics.
     writer_counters: CachedStoreWriterCounters,
     /// Pipeline metrics exposed for diagnostics and observability.
@@ -505,6 +530,8 @@ impl CachedStore {
             pinned: Mutex::new(PinnedState::default()),
             upload_queue,
             pending_upload_bytes_by_object: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            upload_accounting_hook: Mutex::new(None),
             writer_counters: CachedStoreWriterCounters::default(),
             metrics: CachePipelineMetrics::default(),
         });
@@ -824,8 +851,8 @@ impl CachedStore {
 
     /// Pins an object so it is not evicted while in use or pending upload.
     pub fn pin(&self, object_id: ObjectId) {
-        let first_pin = self.pinned.lock().insert(object_id);
-        if first_pin {
+        let mut pinned = self.pinned.lock();
+        if pinned.insert(object_id) {
             self.local_payload_backend.pin(object_id);
         }
     }
@@ -837,23 +864,40 @@ impl CachedStore {
 
     /// Releases a pin on an object, allowing eviction once the final pin is dropped.
     pub fn unpin(&self, object_id: ObjectId) {
-        let last_pin = self.pinned.lock().remove(object_id);
-        if last_pin {
+        let mut pinned = self.pinned.lock();
+        if pinned.remove(object_id) {
             self.local_payload_backend.unpin(object_id);
         }
     }
 
-    /// Submits a single upload op to the upload queue and pins the object until terminal.
+    /// Submits an upload, retaining a pin for each new accepted queue owner until terminal.
+    ///
+    /// Updates and ignored submissions reuse the existing owner's pin. A closed
+    /// worker channel rolls back the submission and releases its provisional pin.
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
+        self.pin(object_id);
         let payload_len = self
             .local_payload_backend
             .object_stats(object_id)
             .map(|stats| stats.payload_len)
             .unwrap_or(0);
-        self.submit_upload_with_payload(ino, offset, offset, object_id, content_epoch, payload_len);
+        let outcome = self.submit_pinned_upload_with_payload(
+            ino,
+            offset,
+            offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        );
+        if outcome != UploadSubmitOutcome::New {
+            self.unpin(object_id);
+        }
     }
 
     /// Submits a single upload op with explicit payload geometry.
+    ///
+    /// Only a new accepted entry retains the provisional pin. Updates, ignored
+    /// submissions and closed-channel rollback preserve the previous owner's pin.
     pub fn submit_upload_with_payload(
         &self,
         ino: u64,
@@ -864,7 +908,7 @@ impl CachedStore {
         payload_len: u64,
     ) {
         self.pin(object_id);
-        self.upload_queue.submit_with_payload(
+        let outcome = self.submit_pinned_upload_with_payload(
             ino,
             offset,
             object_file_offset,
@@ -872,22 +916,47 @@ impl CachedStore {
             content_epoch,
             payload_len,
         );
-        self.metrics
-            .upload_queue
-            .record_submit(self.upload_queue.pending_count());
+        if outcome != UploadSubmitOutcome::New {
+            self.unpin(object_id);
+        }
     }
 
-    /// Submits a batch of upload ops to the upload queue and pins all referenced objects.
+    // Caller owns a provisional pin and releases it unless this creates a queue owner.
+    fn submit_pinned_upload_with_payload(
+        &self,
+        ino: u64,
+        offset: u64,
+        object_file_offset: u64,
+        object_id: ObjectId,
+        content_epoch: u64,
+        payload_len: u64,
+    ) -> UploadSubmitOutcome {
+        let (outcome, pending_count) = self.upload_queue.submit_with_payload_and_pending_count(
+            ino,
+            offset,
+            object_file_offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        );
+        self.metrics.upload_queue.record_submit(pending_count);
+        outcome
+    }
+
+    /// Submits a batch of upload ops, retaining one pin per new queue owner.
     pub fn submit_uploads_batch(&self, ops: &[(u64, u64, u64, ObjectId, u64, u64)]) {
-        let first_pins = {
+        {
             let mut pinned = self.pinned.lock();
-            pinned.insert_many(ops.iter().map(|(_, _, _, object_id, _, _)| *object_id))
-        };
-        self.local_payload_backend.pin_batch(&first_pins);
-        let object_ids = ops
+            let first_pins =
+                pinned.insert_many(ops.iter().map(|(_, _, _, object_id, _, _)| *object_id));
+            self.local_payload_backend.pin_batch(&first_pins);
+        }
+        let mut object_ids = ops
             .iter()
             .map(|(_, _, _, object_id, _, _)| *object_id)
             .collect::<Vec<_>>();
+        object_ids.sort_unstable();
+        object_ids.dedup();
         if let Err(error) = self.upload_stage_store.link_payload_batch(&object_ids) {
             warn!(
                 object_count = object_ids.len(),
@@ -896,7 +965,7 @@ impl CachedStore {
             );
         }
         for (ino, offset, object_file_offset, object_id, content_epoch, payload_len) in ops {
-            self.upload_queue.submit_with_payload(
+            let outcome = self.submit_pinned_upload_with_payload(
                 *ino,
                 *offset,
                 *object_file_offset,
@@ -904,23 +973,29 @@ impl CachedStore {
                 *content_epoch,
                 *payload_len,
             );
-            self.metrics
-                .upload_queue
-                .record_submit(self.upload_queue.pending_count());
+            if outcome != UploadSubmitOutcome::New {
+                self.unpin(*object_id);
+            }
         }
     }
 
     /// Records completion for an upload op, unpinning the object if it reached terminal.
     pub fn complete_upload(&self, op: &PendingUpload) {
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.complete(op) {
-            let mut bytes = self.record_upload_terminal(op.object_id);
-            if bytes == 0 {
-                bytes = self
+            #[cfg(test)]
+            self.pause_upload_accounting_for_test();
+            let accounted_bytes = self.record_upload_terminal(&mut pending_bytes, op.object_id);
+            drop(pending_bytes);
+            let bytes = match accounted_bytes {
+                Some(bytes) => bytes,
+                None if op.payload_len > 0 => op.payload_len,
+                None => self
                     .local_payload_backend
                     .object_stats(op.object_id)
                     .map(|stats| stats.payload_len)
-                    .unwrap_or(0);
-            }
+                    .unwrap_or(0),
+            };
             self.unpin(op.object_id);
             self.metrics.upload_queue.record_complete(bytes);
         }
@@ -937,8 +1012,15 @@ impl CachedStore {
 
     /// Requeues an upload op after rebasing it onto newer metadata.
     pub fn requeue_rebased_upload(&self, current: &PendingUpload, rebased: PendingUpload) -> bool {
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
+        let payload_len = rebased.payload_len;
         let queued = self.upload_queue.requeue_rebased(current, rebased);
         if queued {
+            if let Some(bytes) = pending_bytes.get_mut(&current.object_id) {
+                let previous = std::mem::replace(bytes, payload_len);
+                self.writer_counters
+                    .replace_pending_upload(previous, payload_len);
+            }
             self.metrics.upload_queue.record_requeue();
         }
         queued
@@ -946,8 +1028,12 @@ impl CachedStore {
 
     /// Cancels an upload op and unpins the object if the cancellation succeeded.
     pub fn cancel_upload(&self, op: &PendingUpload) {
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.cancel(op) {
-            self.record_upload_terminal(op.object_id);
+            #[cfg(test)]
+            self.pause_upload_accounting_for_test();
+            self.record_upload_terminal(&mut pending_bytes, op.object_id);
+            drop(pending_bytes);
             self.unpin(op.object_id);
             self.metrics.upload_queue.record_cancel();
         }
@@ -1030,32 +1116,54 @@ impl CachedStore {
         content_epoch: u64,
         payload_len: usize,
     ) {
-        self.pending_upload_bytes_by_object
-            .lock()
-            .insert(object_id, saturating_u64_from_usize(payload_len));
         self.writer_counters.record_staged(payload_len);
-        self.writer_counters.record_pending_upload(payload_len);
-        self.submit_upload_with_payload(
+        let payload_len_u64 = saturating_u64_from_usize(payload_len);
+        self.pin(object_id);
+        // Commit accounting before a terminal operation can remove this owner.
+        let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
+        let outcome = self.submit_pinned_upload_with_payload(
             ino,
             offset,
             offset,
             object_id,
             content_epoch,
-            saturating_u64_from_usize(payload_len),
+            payload_len_u64,
         );
+        #[cfg(test)]
+        self.pause_upload_accounting_for_test();
+        if matches!(
+            outcome,
+            UploadSubmitOutcome::New | UploadSubmitOutcome::Updated
+        ) {
+            let previous = pending_bytes
+                .insert(object_id, payload_len_u64)
+                .unwrap_or(0);
+            self.writer_counters
+                .replace_pending_upload(previous, payload_len_u64);
+        }
+        drop(pending_bytes);
+        if outcome != UploadSubmitOutcome::New {
+            self.unpin(object_id);
+        }
     }
 
-    fn record_upload_terminal(&self, object_id: ObjectId) -> u64 {
-        if let Some(bytes) = self
-            .pending_upload_bytes_by_object
-            .lock()
-            .remove(&object_id)
-        {
-            self.writer_counters.record_upload_terminal(bytes);
-            bytes
-        } else {
-            0
+    #[cfg(test)]
+    fn pause_upload_accounting_for_test(&self) {
+        let hook = self.upload_accounting_hook.lock().take();
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(());
+            let _ = hook.release.recv_timeout(Duration::from_secs(5));
         }
+    }
+
+    fn record_upload_terminal(
+        &self,
+        pending_bytes: &mut HashMap<ObjectId, u64>,
+        object_id: ObjectId,
+    ) -> Option<u64> {
+        let bytes = pending_bytes.remove(&object_id)?;
+        self.writer_counters.record_upload_terminal(bytes);
+        Some(bytes)
     }
 }
 
@@ -1742,6 +1850,15 @@ mod tests {
         puts: Arc<Mutex<Vec<RecordedPayloadPut>>>,
         fail_next_owned_put: Arc<std::sync::atomic::AtomicBool>,
         fail_next_remove: Arc<std::sync::atomic::AtomicBool>,
+        evict_on_unpinned_stats: Arc<std::sync::atomic::AtomicBool>,
+        object_stats_calls: Arc<AtomicU64>,
+        pin_transition_hook: Arc<Mutex<Option<PinTransitionHook>>>,
+    }
+
+    struct PinTransitionHook {
+        unpin_only: bool,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
     }
 
     impl RecordingOwnedPayloadBackend {
@@ -1751,6 +1868,9 @@ mod tests {
                 puts: Arc::new(Mutex::new(Vec::new())),
                 fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fail_next_remove: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                evict_on_unpinned_stats: Arc::default(),
+                object_stats_calls: Arc::default(),
+                pin_transition_hook: Arc::default(),
             }
         }
 
@@ -1760,11 +1880,27 @@ mod tests {
                 puts: Arc::new(Mutex::new(Vec::new())),
                 fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 fail_next_remove: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                evict_on_unpinned_stats: Arc::default(),
+                object_stats_calls: Arc::default(),
+                pin_transition_hook: Arc::default(),
             }
         }
 
         fn take_owned_puts(&self) -> Vec<RecordedPayloadPut> {
             std::mem::take(&mut *self.puts.lock())
+        }
+
+        fn pause_pin_transition(&self, unpin: bool) {
+            let mut hook = self.pin_transition_hook.lock();
+            if hook.as_ref().is_some_and(|hook| hook.unpin_only && !unpin) {
+                return;
+            }
+            let next_hook = hook.take();
+            drop(hook);
+            if let Some(hook) = next_hook {
+                hook.entered.send(()).unwrap();
+                hook.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
         }
     }
 
@@ -1858,11 +1994,18 @@ mod tests {
         }
 
         fn pin(&self, object_id: u64) {
+            self.pause_pin_transition(false);
             self.inner.pin(object_id);
         }
 
         fn unpin(&self, object_id: u64) {
+            self.pause_pin_transition(true);
             self.inner.unpin(object_id);
+        }
+
+        fn pin_batch(&self, object_ids: &[u64]) {
+            self.pause_pin_transition(false);
+            self.inner.pin_batch(object_ids);
         }
 
         fn remove(&self, object_id: u64) -> Result<(), crate::local::LocalPayloadBackendError> {
@@ -1898,7 +2041,14 @@ mod tests {
         }
 
         fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
-            self.inner.object_stats(object_id)
+            self.object_stats_calls.fetch_add(1, Ordering::Relaxed);
+            let stats = self.inner.object_stats(object_id);
+            if self.evict_on_unpinned_stats.load(Ordering::SeqCst)
+                && self.inner.is_evictable(object_id)
+            {
+                self.inner.remove(object_id).unwrap();
+            }
+            stats
         }
 
         fn object_ids(&self) -> Vec<u64> {
@@ -2637,6 +2787,523 @@ mod tests {
         assert_eq!(writer.read_accepted(16, &mut tail), 2);
         assert_eq!(&tail, b"qr");
         assert_eq!(writer.dirty_bytes(), 2);
+    }
+
+    #[test]
+    fn sfs752_batch_submission_overlaps_terminal_cleanup_without_leaks() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+        let (store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+        store.put(101, b"payload", false).unwrap();
+        store.put(102, b"other", false).unwrap();
+        store.submit_staged_upload(1, 0, 101, 3, 7);
+        let previous = store.snapshot_pending_uploads().pop().unwrap();
+        let (pin_entered_tx, pin_entered_rx) = std::sync::mpsc::channel();
+        let (pin_release_tx, pin_release_rx) = std::sync::mpsc::channel();
+        *backend.pin_transition_hook.lock() = Some(PinTransitionHook {
+            unpin_only: false,
+            entered: pin_entered_tx,
+            release: pin_release_rx,
+        });
+        let (terminal_entered_tx, terminal_entered_rx) = std::sync::mpsc::channel();
+        let (terminal_release_tx, terminal_release_rx) = std::sync::mpsc::channel();
+        *store.upload_accounting_hook.lock() = Some(UploadAccountingHook {
+            entered: terminal_entered_tx,
+            release: terminal_release_rx,
+        });
+        let batch_store = Arc::clone(&store);
+        let batch = std::thread::spawn(move || {
+            batch_store.submit_uploads_batch(&[
+                (1, 0, 0, 101, 3, 7),
+                (1, 8, 8, 102, 3, 5),
+                (1, 8, 8, 102, 3, 5),
+            ])
+        });
+        pin_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let terminal_store = Arc::clone(&store);
+        let terminal = std::thread::spawn(move || terminal_store.complete_upload(&previous));
+        terminal_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(store.pending_upload_count(), 0);
+        terminal_release_tx.send(()).unwrap();
+        pin_release_tx.send(()).unwrap();
+        batch.join().unwrap();
+        terminal.join().unwrap();
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+        assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+        assert_eq!(store.pinned.lock().objects.get(&101), Some(&1));
+        assert_eq!(store.pinned.lock().objects.get(&102), Some(&1));
+        let metrics = store.cache_pipeline_metrics().upload_queue;
+        assert_eq!(metrics.submitted, 4);
+        assert_eq!(metrics.pending_depth_peak, 2);
+        for op in store.snapshot_pending_uploads() {
+            store.mark_uploaded(op.object_id).unwrap();
+            store.complete_upload(&op);
+            assert!(store.local_payload_backend.is_evictable(op.object_id));
+        }
+        assert_eq!(store.pending_upload_count(), 0);
+        assert!(store.pinned.lock().objects.is_empty());
+    }
+
+    #[test]
+    fn sfs752_submit_pins_before_reading_payload_stats() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+        let (store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+        store.put(101, b"payload", false).unwrap();
+        store.mark_uploaded(101).unwrap();
+        backend
+            .evict_on_unpinned_stats
+            .store(true, Ordering::SeqCst);
+        assert!(store.local_payload_backend.is_evictable(101));
+        store.submit_upload(1, 0, 101, 3);
+        assert_eq!(store.get_for_upload(101).as_deref(), Some(&b"payload"[..]));
+        let op = store.snapshot_pending_uploads().pop().unwrap();
+        assert_eq!(op.payload_len, 7);
+        store.complete_upload(&op);
+        assert!(store.pinned.lock().objects.is_empty());
+    }
+
+    #[test]
+    fn sfs752_zero_byte_staging_does_not_read_completion_stats() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+        let (store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+        store.submit_staged_upload(1, 0, 101, 3, 0);
+        assert_eq!(
+            store.pending_upload_bytes_by_object.lock().get(&101),
+            Some(&0)
+        );
+        let op = store.snapshot_pending_uploads().pop().unwrap();
+        store.complete_upload(&op);
+        assert_eq!(backend.object_stats_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            store.cache_pipeline_metrics().upload_queue.completed_bytes,
+            0
+        );
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+        assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+        assert!(store.pinned.lock().objects.is_empty());
+    }
+
+    #[test]
+    fn sfs752_completion_uses_known_payload_length_or_legacy_stats() {
+        for payload_len in [7, 0] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+            let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+            let (store, _rx) =
+                CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+            store.put(101, b"payload", false).unwrap();
+            store.submit_upload_with_payload(1, 0, 0, 101, 3, payload_len);
+            let op = store.snapshot_pending_uploads().pop().unwrap();
+            store.complete_upload(&op);
+            assert_eq!(
+                store.cache_pipeline_metrics().upload_queue.completed_bytes,
+                7
+            );
+            assert_eq!(
+                backend.object_stats_calls.load(Ordering::Relaxed),
+                u64::from(payload_len == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn sfs752_staged_backend_transitions_do_not_hold_accounting_lock() {
+        for unpin_only in [false, true] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+            let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+            let (store, rx) =
+                CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+            let _rx = if unpin_only {
+                drop(rx);
+                None
+            } else {
+                Some(rx)
+            };
+            store.put(101, b"payload", false).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *backend.pin_transition_hook.lock() = Some(PinTransitionHook {
+                unpin_only,
+                entered: entered_tx,
+                release: release_rx,
+            });
+            let background = Arc::clone(&store);
+            let thread =
+                std::thread::spawn(move || background.submit_staged_upload(1, 0, 101, 3, 7));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let accounting_was_free = store.pending_upload_bytes_by_object.try_lock().is_some();
+            release_tx.send(()).unwrap();
+            thread.join().unwrap();
+            assert!(
+                accounting_was_free,
+                "backend pin/unpin waits must be outside accounting lock"
+            );
+            if let Some(op) = store.snapshot_pending_uploads().pop() {
+                store.complete_upload(&op);
+            }
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+            assert!(store.pinned.lock().objects.is_empty());
+        }
+    }
+
+    #[test]
+    fn sfs752_staged_and_terminal_transitions_lock_pending_byte_accounting() {
+        for transition in 0..3 {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let (store, _rx) = temp_cached_store(&dir);
+            store.put(101, b"payload", false).unwrap();
+            let previous = if transition == 0 {
+                None
+            } else {
+                store.submit_staged_upload(1, 0, 101, 3, 7);
+                store.snapshot_pending_uploads().pop()
+            };
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *store.upload_accounting_hook.lock() = Some(UploadAccountingHook {
+                entered: entered_tx,
+                release: release_rx,
+            });
+            let background = Arc::clone(&store);
+            let thread = std::thread::spawn(move || match transition {
+                0 => background.submit_staged_upload(1, 0, 101, 3, 7),
+                1 => background.complete_upload(&previous.unwrap()),
+                _ => background.cancel_upload(&previous.unwrap()),
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let accounting_was_locked = store.pending_upload_bytes_by_object.try_lock().is_none();
+            let current = store.snapshot_pending_uploads().pop();
+            let competing_store = Arc::clone(&store);
+            let competing = std::thread::spawn(move || {
+                if transition == 0 {
+                    competing_store.complete_upload(&current.unwrap());
+                } else {
+                    competing_store.submit_staged_upload(1, 0, 101, 4, 7);
+                }
+            });
+            release_tx.send(()).unwrap();
+            thread.join().unwrap();
+            competing.join().unwrap();
+            assert!(
+                accounting_was_locked,
+                "accounting transition {transition} must be serialized with queue ownership"
+            );
+            if let Some(current) = store.snapshot_pending_uploads().pop() {
+                store.complete_upload(&current);
+            }
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+            assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+            assert!(store.pinned.lock().objects.is_empty());
+        }
+    }
+
+    #[test]
+    fn sfs752_rebased_staged_bytes_follow_accepted_geometry() {
+        for payload_len in [3, 0, 9] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let (store, rx) = temp_cached_store(&dir);
+            store.submit_staged_upload(1, 0, 101, 3, 7);
+            let old = store.snapshot_pending_uploads().pop().unwrap();
+            let rebased = PendingUpload {
+                offset: 8,
+                object_file_offset: 2,
+                content_epoch: 4,
+                payload_len,
+                ..old.clone()
+            };
+            assert!(store.requeue_rebased_upload(&old, rebased.clone()));
+            assert_eq!(
+                store.snapshot_writer_counters().pending_upload_bytes,
+                payload_len
+            );
+            assert_eq!(
+                store.pending_upload_bytes_by_object.lock().get(&101),
+                Some(&payload_len)
+            );
+            // Neither a stale candidate nor closed dispatch may reattribute bytes.
+            assert!(!store.requeue_rebased_upload(&old, old.clone()));
+            drop(rx);
+            let rejected = PendingUpload {
+                payload_len: 99,
+                ..rebased.clone()
+            };
+            assert!(!store.requeue_rebased_upload(&rebased, rejected));
+            assert_eq!(store.snapshot_pending_uploads(), vec![rebased.clone()]);
+            assert_eq!(
+                store.snapshot_writer_counters().pending_upload_bytes,
+                payload_len
+            );
+            store.complete_upload(&old);
+            assert_eq!(
+                store.snapshot_writer_counters().pending_upload_bytes,
+                payload_len
+            );
+            store.complete_upload(&rebased);
+            assert_eq!(
+                store.cache_pipeline_metrics().upload_queue.completed_bytes,
+                payload_len
+            );
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+            assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+            assert!(store.pinned.lock().objects.is_empty());
+        }
+    }
+
+    #[test]
+    fn sfs752_staged_pending_bytes_follow_accepted_updates() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, _rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.submit_staged_upload(1, 0, 101, 3, 7);
+        store.submit_staged_upload(1, 8, 102, 3, 5);
+        let other = store
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| op.object_id == 102)
+            .unwrap();
+        let previous = store
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| op.object_id == 101)
+            .unwrap();
+        for (ino, offset, epoch) in [(1, 0, 3), (1, 0, 2), (2, 0, 4), (1, 8, 4)] {
+            store.submit_staged_upload(ino, offset, 101, epoch, 99);
+            assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 12);
+            assert_eq!(
+                store.pending_upload_bytes_by_object.lock().get(&101),
+                Some(&7)
+            );
+        }
+        store.submit_staged_upload(1, 0, 101, 4, 9);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 14);
+        store.complete_upload(&previous);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 14);
+        let current = store
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| op.object_id == 101)
+            .unwrap();
+        store.cancel_upload(&current);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 5);
+        store.cancel_upload(&other);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+        assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+    }
+
+    #[test]
+    fn sfs752_closed_staging_does_not_count_pending_bytes() {
+        for detached in [false, true] {
+            let dir = studiofs_test_support::workspace_target_tempdir("test-");
+            let (store, rx) = temp_cached_store(&dir);
+            drop(rx);
+            let mut writer = store.open_writer_slice(writer_config());
+            writer.write_at(0, b"abcdefgh").unwrap();
+            if detached {
+                let entries = writer.detach_completed_blocks(1).unwrap();
+                store.persist_detached_staged_slices(entries).unwrap();
+            } else {
+                writer.flush_to(8).unwrap();
+            }
+            let counters = store.snapshot_writer_counters();
+            assert_eq!(counters.staged_bytes, 8);
+            assert_eq!(counters.pending_upload_bytes, 0);
+            assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+            assert_eq!(store.pending_upload_count(), 0);
+            assert!(store.pinned.lock().objects.is_empty());
+            assert_eq!(
+                store.get_for_upload(10_000).as_deref(),
+                Some(&b"abcdefgh"[..])
+            );
+            assert!(!store.local_payload_backend.is_evictable(10_000));
+        }
+    }
+
+    #[test]
+    fn sfs752_closed_staged_update_preserves_pending_bytes() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.submit_staged_upload(1, 0, 101, 3, 7);
+        let previous = store.snapshot_pending_uploads().pop().unwrap();
+        drop(rx);
+        store.submit_staged_upload(1, 0, 101, 4, 99);
+        assert_eq!(store.snapshot_pending_uploads(), vec![previous.clone()]);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 7);
+        assert_eq!(
+            store.pending_upload_bytes_by_object.lock().get(&101),
+            Some(&7)
+        );
+        store.complete_upload(&previous);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 0);
+        assert!(store.pending_upload_bytes_by_object.lock().is_empty());
+    }
+
+    #[test]
+    fn sfs752_backend_pin_transitions_hold_the_logical_pin_lock() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let inner = temp_cached_store(&dir).0.local_payload_backend.clone();
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner));
+        let (store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
+        store.put(101, b"payload", false).unwrap();
+        // Pause exactly before the backend transition; logical state must stay
+        // locked until it finishes so another owner cannot overtake it.
+        for transition in 0..3 {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *backend.pin_transition_hook.lock() = Some(PinTransitionHook {
+                unpin_only: false,
+                entered: entered_tx,
+                release: release_rx,
+            });
+            let background = Arc::clone(&store);
+            let thread = std::thread::spawn(move || match transition {
+                0 => background.pin(101),
+                1 => background.unpin(101),
+                _ => background.submit_uploads_batch(&[(1, 0, 0, 101, 3, 7)]),
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let was_locked = store.pinned.try_lock().is_none();
+            release_tx.send(()).unwrap();
+            thread.join().unwrap();
+            assert!(
+                was_locked,
+                "backend transition {transition} must not be overtaken"
+            );
+        }
+    }
+
+    #[test]
+    fn sfs752_ignored_submissions_retain_only_the_active_upload_pin() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, _rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.submit_upload(1, 0, 101, 3);
+        for (ino, offset, epoch) in [(1, 0, 3), (1, 0, 2), (2, 0, 4), (1, 8, 4)] {
+            store.submit_upload(ino, offset, 101, epoch);
+        }
+        assert_eq!(store.pinned.lock().objects.get(&101), Some(&1));
+        let op = store.snapshot_pending_uploads().pop().unwrap();
+        store.mark_uploaded(101).unwrap();
+        assert!(!store.local_payload_backend.is_evictable(101));
+        store.complete_upload(&op);
+        store.complete_upload(&op);
+        assert_eq!(store.pinned.lock().objects.get(&101), None);
+        assert!(store.local_payload_backend.is_evictable(101));
+    }
+
+    #[test]
+    fn sfs752_duplicate_batches_keep_one_pin_per_object() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, _rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.put(102, b"other", false).unwrap();
+        let ops = [
+            (1, 0, 0, 101, 3, 7),
+            (1, 0, 0, 101, 2, 7),
+            (1, 0, 0, 101, 4, 7),
+            (1, 8, 8, 102, 3, 5),
+        ];
+        store.submit_uploads_batch(&ops);
+        store.submit_uploads_batch(&ops);
+        assert_eq!(store.pinned.lock().objects.get(&101), Some(&1));
+        assert_eq!(store.pinned.lock().objects.get(&102), Some(&1));
+        for op in store.snapshot_pending_uploads() {
+            store.mark_uploaded(op.object_id).unwrap();
+            store.complete_upload(&op);
+            assert!(store.local_payload_backend.is_evictable(op.object_id));
+        }
+        assert!(store.pinned.lock().objects.is_empty());
+        assert_eq!(store.pending_upload_count(), 0);
+    }
+
+    #[test]
+    fn sfs752_epoch_update_and_rebase_reuse_the_upload_pin() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, _rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.pin(101); // Independent reader owns another reference.
+        store.submit_upload(1, 0, 101, 2);
+        let old = store.snapshot_pending_uploads().pop().unwrap();
+        store.submit_upload(1, 0, 101, 3);
+        store.complete_upload(&old);
+        let current = store.snapshot_pending_uploads().pop().unwrap();
+        let rebased = PendingUpload {
+            offset: 8,
+            content_epoch: 4,
+            ..current.clone()
+        };
+        assert!(store.requeue_rebased_upload(&current, rebased.clone()));
+        assert_eq!(store.pinned.lock().objects.get(&101), Some(&2));
+        store.mark_uploaded(101).unwrap();
+        store.complete_upload(&current);
+        assert!(!store.local_payload_backend.is_evictable(101));
+        store.complete_upload(&rebased);
+        assert_eq!(store.pinned.lock().objects.get(&101), Some(&1));
+        store.unpin(101);
+        assert!(store.local_payload_backend.is_evictable(101));
+    }
+
+    #[test]
+    fn sfs752_closed_submission_releases_only_provisional_pins() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.put(102, b"other", false).unwrap();
+        drop(rx);
+        store.submit_upload(1, 0, 101, 3);
+        store.submit_uploads_batch(&[(1, 0, 0, 101, 3, 7), (1, 8, 8, 102, 3, 5)]);
+        assert_eq!(store.pending_upload_count(), 0);
+        assert!(store.pinned.lock().objects.is_empty());
+        assert!(!store.local_payload_backend.is_evictable(101));
+        assert!(!store.local_payload_backend.is_evictable(102));
+        store.mark_uploaded(101).unwrap();
+        store.mark_uploaded(102).unwrap();
+        assert!(store.local_payload_backend.is_evictable(101));
+        assert!(store.local_payload_backend.is_evictable(102));
+    }
+
+    #[test]
+    fn sfs752_failed_retry_preserves_the_existing_owner() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store, mut rx) = temp_cached_store(&dir);
+        store.put(101, b"payload", false).unwrap();
+        store.submit_upload(1, 0, 101, 3);
+        let op = try_recv_one(&store, &mut rx);
+        store.mark_uploading(101).unwrap();
+        store.mark_upload_failed(101).unwrap();
+        assert!(store.requeue_upload(op.clone()));
+        let op = try_recv_one(&store, &mut rx);
+        drop(rx);
+        let retry = PendingUpload {
+            retry_count: 1,
+            ..op.clone()
+        };
+        assert!(!store.requeue_upload(retry));
+        store.submit_upload(1, 0, 101, 3); // Stale-upload fallback.
+        store.submit_upload(1, 0, 101, 4); // Failed update restores the old owner.
+        assert_eq!(store.snapshot_pending_uploads(), vec![op.clone()]);
+        assert_eq!(store.pinned.lock().objects.get(&101), Some(&1));
+        assert_eq!(
+            store.lifecycle_state(101),
+            LocalPayloadLifecycleState::Dirty
+        );
+        assert_eq!(store.get_for_upload(101).as_deref(), Some(&b"payload"[..]));
+        assert!(!store.local_payload_backend.is_evictable(101));
+        store.mark_uploaded(101).unwrap();
+        store.complete_upload(&op);
+        assert!(store.local_payload_backend.is_evictable(101));
     }
 
     #[tokio::test]

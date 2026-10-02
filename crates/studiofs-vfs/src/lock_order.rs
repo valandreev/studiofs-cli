@@ -26,6 +26,35 @@
 //! with `LockTier` or validated by `LockOrderGuard`; their ordering is enforced
 //! by the call structure above.
 //!
+//! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
+//! acquire locks in this order:
+//! `CachedStore::pinned` -> local backend payload mutation stripe gates ->
+//! backend `runtime_pinned`. `pin`, `unpin`, and the first pins in
+//! `submit_uploads_batch` hold the store-wide pin mutex through the backend
+//! transition so another owner cannot overtake its first/final reference.
+//! Backend code holding a payload gate or `runtime_pinned` must not re-enter
+//! cached-store pin accounting. Batch gates are deduplicated and acquired in
+//! ascending stripe order. These auxiliary locks are outside `LockTier` and
+//! `LockOrderGuard`; the ordering is enforced by the call structure.
+//!
+//! Writer upload byte accounting acquires
+//! `CachedStore::pending_upload_bytes_by_object` before staged queue submission,
+//! rebased queue replacement or terminal queue removal, then the queue's
+//! `pending_state`. A successful rebase refreshes an existing staged contribution
+//! before releasing accounting. Staged submission
+//! acquires its provisional pin before accounting and compensates it after
+//! accounting is released, so backend pin/unpin waits do not retain accounting.
+//! Completion/cancellation acquire `pending_state` under the accounting lock,
+//! reconcile the accepted owner's bytes, and release accounting before backend
+//! reads or unpinning. Queue/backend code must not re-enter byte accounting.
+//! These locks are also outside `LockTier` and `LockOrderGuard`.
+//!
+//! Payload writes/removals hold the same stripe gates across I/O. A colliding
+//! gate can therefore stall unrelated pin transitions behind the store-wide
+//! mutex; a batch may wait for all 64 stripes. Per-object transition ordering
+//! is a possible performance change if contention is measured, and must retain
+//! the same logical/backend first/final ordering and stable batch lock order.
+//!
 //! # Usage
 //!
 //! ```rust,ignore

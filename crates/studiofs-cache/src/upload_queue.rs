@@ -48,6 +48,8 @@ pub struct UploadQueue {
     shutdown_notify: Notify,
     #[cfg(test)]
     wait_for_idle_hook: Mutex<Option<Arc<WaitForIdleHook>>>,
+    #[cfg(test)]
+    closed_dispatch_hook: Mutex<Option<ClosedDispatchHook>>,
 }
 
 #[cfg(test)]
@@ -64,6 +66,13 @@ impl Default for WaitForIdleHook {
             release: Notify::new(),
         }
     }
+}
+
+#[cfg(test)]
+/// One-shot test hook; consumed on first activation.
+struct ClosedDispatchHook {
+    entered: tokio::sync::mpsc::UnboundedSender<PendingUpload>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// Atomically-consistent index of in-flight uploads.
@@ -90,6 +99,19 @@ pub struct UploadQueueIngressSnapshot {
 }
 
 const UPLOAD_WAKEUP_CAPACITY: usize = 1;
+
+/// Result of submitting an upload to the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadSubmitOutcome {
+    /// The submission created a new queue owner; the caller must retain its pin.
+    New,
+    /// The submission updated an existing queue entry without adding an owner.
+    Updated,
+    /// The submission was stale or duplicated an existing queue entry.
+    Ignored,
+    /// The queue wakeup channel was closed and the attempted change was rolled back.
+    Closed,
+}
 
 enum PendingSubmit {
     New,
@@ -123,17 +145,37 @@ impl UploadQueue {
             shutdown_notify: Notify::new(),
             #[cfg(test)]
             wait_for_idle_hook: Mutex::new(None),
+            #[cfg(test)]
+            closed_dispatch_hook: Mutex::new(None),
         });
 
         (queue, rx)
     }
 
-    /// Submit a new pending upload (hot path — non-blocking).
-    pub fn submit(&self, ino: Ino, offset: u64, object_id: u64, content_epoch: u64) {
-        self.submit_with_payload(ino, offset, offset, object_id, content_epoch, 0);
+    /// Submit a pending upload (hot path — non-blocking).
+    ///
+    /// Callers pinning the payload must acquire a provisional pin before submission.
+    /// Retain it only for [`UploadSubmitOutcome::New`]; release it for `Updated`,
+    /// `Ignored`, and `Closed`. Existing entry pin
+    /// ownership is unchanged by `Updated`/`Ignored` and restored if `Closed`
+    /// rolls an update back.
+    pub fn submit(
+        &self,
+        ino: Ino,
+        offset: u64,
+        object_id: u64,
+        content_epoch: u64,
+    ) -> UploadSubmitOutcome {
+        self.submit_with_payload(ino, offset, offset, object_id, content_epoch, 0)
     }
 
     /// Submit a pending upload with explicit uploaded-payload geometry.
+    ///
+    /// Callers pinning the payload must acquire a provisional pin before submission.
+    /// Retain it only for [`UploadSubmitOutcome::New`]; release it for `Updated`,
+    /// `Ignored`, and `Closed`. Existing entry pin
+    /// ownership is unchanged by `Updated`/`Ignored` and restored if `Closed`
+    /// rolls an update back.
     pub fn submit_with_payload(
         &self,
         ino: Ino,
@@ -142,7 +184,30 @@ impl UploadQueue {
         object_id: u64,
         content_epoch: u64,
         payload_len: u64,
-    ) {
+    ) -> UploadSubmitOutcome {
+        self.submit_with_payload_and_pending_count(
+            ino,
+            offset,
+            object_file_offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        )
+        .0
+    }
+
+    /// Returns the outcome and global pending-object count across all inodes.
+    /// The count is sampled under the queue lock after submission or `Closed`
+    /// rollback, so rejected candidates do not inflate the observed depth.
+    pub(crate) fn submit_with_payload_and_pending_count(
+        &self,
+        ino: Ino,
+        offset: u64,
+        object_file_offset: u64,
+        object_id: u64,
+        content_epoch: u64,
+        payload_len: u64,
+    ) -> (UploadSubmitOutcome, usize) {
         let op = PendingUpload {
             ino,
             offset,
@@ -155,20 +220,41 @@ impl UploadQueue {
             retry_count: 0,
         };
 
-        match self.record_pending_or_update(op.clone()) {
+        let mut state = self.pending_state.lock();
+        let mut became_idle = false;
+        let outcome = match Self::record_pending_or_update(&mut state, &op) {
+            PendingSubmit::New if self.dispatch_wakeup_locked(&mut state) => {
+                UploadSubmitOutcome::New
+            }
             PendingSubmit::New => {
-                self.dispatch_wakeup(&op, None);
+                #[cfg(test)]
+                self.pause_closed_dispatch_for_test(&op);
+                (_, became_idle) = Self::remove_pending_if_matches_locked(&mut state, &op);
+                UploadSubmitOutcome::Closed
+            }
+            PendingSubmit::Updated(_) if self.dispatch_wakeup_locked(&mut state) => {
+                UploadSubmitOutcome::Updated
             }
             PendingSubmit::Updated(previous) => {
-                self.dispatch_wakeup(&op, Some(previous));
+                #[cfg(test)]
+                self.pause_closed_dispatch_for_test(&op);
+                Self::restore_pending_if_current_matches_locked(&mut state, &op, previous);
+                UploadSubmitOutcome::Closed
             }
             PendingSubmit::Ignored => {
                 debug!(
                     object_id,
                     ino, offset, content_epoch, "upload submit ignored: object already pending"
                 );
+                UploadSubmitOutcome::Ignored
             }
+        };
+        let pending_count = state.by_object.len();
+        drop(state);
+        if became_idle {
+            self.idle_notify.notify_waiters();
         }
+        (outcome, pending_count)
     }
 
     /// Mark an upload as complete.
@@ -185,10 +271,17 @@ impl UploadQueue {
     /// sent for retry; `false` means the op was already terminal, stale, or
     /// the worker channel is closed.
     pub fn requeue(&self, op: PendingUpload) -> bool {
-        let Some(previous) = self.update_pending_if_matches(&op) else {
+        let mut state = self.pending_state.lock();
+        let Some(previous) = Self::update_pending_if_matches_locked(&mut state, &op) else {
             return false;
         };
-        self.dispatch_wakeup(&op, Some(previous))
+        if !self.dispatch_wakeup_locked(&mut state) {
+            #[cfg(test)]
+            self.pause_closed_dispatch_for_test(&op);
+            Self::restore_pending_if_current_matches_locked(&mut state, &op, previous);
+            return false;
+        }
+        true
     }
 
     /// Requeue an upload after metadata rebased it onto a different content epoch.
@@ -196,10 +289,19 @@ impl UploadQueue {
     /// The `current` op must still match the live pending entry. `rebased` is
     /// then sent to workers and becomes the new pending state.
     pub fn requeue_rebased(&self, current: &PendingUpload, rebased: PendingUpload) -> bool {
-        let Some(previous) = self.update_pending_if_matches_to(current, &rebased) else {
+        let mut state = self.pending_state.lock();
+        let Some(previous) =
+            Self::update_pending_if_matches_to_locked(&mut state, current, &rebased)
+        else {
             return false;
         };
-        self.dispatch_wakeup(&rebased, Some(previous))
+        if !self.dispatch_wakeup_locked(&mut state) {
+            #[cfg(test)]
+            self.pause_closed_dispatch_for_test(&rebased);
+            Self::restore_pending_if_current_matches_locked(&mut state, &rebased, previous);
+            return false;
+        }
+        true
     }
 
     /// Cancel a pending upload and decrement pending count.
@@ -359,15 +461,13 @@ impl UploadQueue {
         self.shutdown_notify.notify_waiters();
     }
 
-    fn record_pending_or_update(&self, op: PendingUpload) -> PendingSubmit {
-        let mut state = self.pending_state.lock();
+    fn record_pending_or_update(state: &mut PendingState, op: &PendingUpload) -> PendingSubmit {
         if let Some(current) = state.by_object.get_mut(&op.object_id) {
             if current.ino == op.ino
                 && current.offset == op.offset
                 && op.content_epoch > current.content_epoch
             {
-                let previous = current.clone();
-                *current = op.clone();
+                let previous = std::mem::replace(current, op.clone());
                 state.dirty_objects.insert(op.object_id);
                 return PendingSubmit::Updated(previous);
             }
@@ -381,55 +481,66 @@ impl UploadQueue {
         PendingSubmit::New
     }
 
-    fn dispatch_wakeup(&self, op: &PendingUpload, previous: Option<PendingUpload>) -> bool {
-        let closed = {
-            let mut state = self.pending_state.lock();
-            match self.sender.try_send(()) {
-                Ok(()) => false,
-                Err(mpsc::error::TrySendError::Full(())) => {
-                    state.wakeup_coalesced = state.wakeup_coalesced.saturating_add(1);
-                    false
-                }
-                Err(mpsc::error::TrySendError::Closed(())) => true,
+    fn dispatch_wakeup_locked(&self, state: &mut PendingState) -> bool {
+        match self.sender.try_send(()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                state.wakeup_coalesced = state.wakeup_coalesced.saturating_add(1);
+                true
             }
-        };
-        if closed {
-            if let Some(previous) = previous {
-                self.restore_pending_if_current_matches(op, previous);
-            } else {
-                self.remove_pending_if_matches(op);
-            }
-            false
-        } else {
-            true
+            Err(mpsc::error::TrySendError::Closed(())) => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_closed_dispatch_hook(&self, hook: ClosedDispatchHook) {
+        *self.closed_dispatch_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn pause_closed_dispatch_for_test(&self, op: &PendingUpload) {
+        let hook = self.closed_dispatch_hook.lock().take();
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(op.clone());
+            let _ = hook.release.recv_timeout(Duration::from_secs(5));
         }
     }
 
     fn remove_pending_if_matches(&self, op: &PendingUpload) -> bool {
         let mut state = self.pending_state.lock();
+        let (removed, became_idle) = Self::remove_pending_if_matches_locked(&mut state, op);
+        drop(state);
+        if became_idle {
+            self.idle_notify.notify_waiters();
+        }
+        removed
+    }
+
+    fn remove_pending_if_matches_locked(
+        state: &mut PendingState,
+        op: &PendingUpload,
+    ) -> (bool, bool) {
         let Entry::Occupied(entry) = state.by_object.entry(op.object_id) else {
-            return false;
+            return (false, false);
         };
         let current = entry.get();
         if current.ino != op.ino
             || current.offset != op.offset
             || current.content_epoch != op.content_epoch
         {
-            return false;
+            return (false, false);
         }
         let removed = entry.remove();
-        Self::remove_inode_index_entry(&mut state, removed.ino, op.object_id);
+        Self::remove_inode_index_entry(state, removed.ino, op.object_id);
         state.dirty_objects.remove(&op.object_id);
         let became_idle = state.by_object.is_empty();
-        drop(state);
-        if became_idle {
-            self.idle_notify.notify_waiters();
-        }
-        true
+        (true, became_idle)
     }
 
-    fn update_pending_if_matches(&self, op: &PendingUpload) -> Option<PendingUpload> {
-        let mut state = self.pending_state.lock();
+    fn update_pending_if_matches_locked(
+        state: &mut PendingState,
+        op: &PendingUpload,
+    ) -> Option<PendingUpload> {
         let current = state.by_object.get_mut(&op.object_id)?;
         if current.ino != op.ino
             || current.offset != op.offset
@@ -437,14 +548,13 @@ impl UploadQueue {
         {
             return None;
         }
-        let previous = current.clone();
-        *current = op.clone();
+        let previous = std::mem::replace(current, op.clone());
         state.dirty_objects.insert(op.object_id);
         Some(previous)
     }
 
-    fn update_pending_if_matches_to(
-        &self,
+    fn update_pending_if_matches_to_locked(
+        state: &mut PendingState,
         expected: &PendingUpload,
         replacement: &PendingUpload,
     ) -> Option<PendingUpload> {
@@ -452,7 +562,6 @@ impl UploadQueue {
             return None;
         }
 
-        let mut state = self.pending_state.lock();
         let current = state.by_object.get_mut(&expected.object_id)?;
         if current.ino != expected.ino
             || current.offset != expected.offset
@@ -465,22 +574,16 @@ impl UploadQueue {
         Some(previous)
     }
 
-    fn restore_pending_if_current_matches(
-        &self,
+    fn restore_pending_if_current_matches_locked(
+        state: &mut PendingState,
         failed_op: &PendingUpload,
         previous: PendingUpload,
     ) {
-        let mut state = self.pending_state.lock();
         let Some(current) = state.by_object.get_mut(&failed_op.object_id) else {
             return;
         };
-        if current.ino == failed_op.ino
-            && current.offset == failed_op.offset
-            && current.content_epoch == failed_op.content_epoch
-            && current.retry_count == failed_op.retry_count
-            && current.not_before_unix_ms == failed_op.not_before_unix_ms
-        {
-            *current = previous.clone();
+        if current == failed_op {
+            *current = previous;
         }
     }
 
@@ -524,7 +627,7 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit(100, 0, 42, 7);
+        assert_eq!(queue.submit(100, 0, 42, 7), UploadSubmitOutcome::New);
         assert_eq!(queue.pending_count(), 1);
 
         let op = recv_one(&queue, &mut rx).await;
@@ -553,8 +656,13 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit(1, 0, 77, 1);
-        queue.submit(1, 0, 77, 1);
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::New);
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::Ignored);
+        assert_eq!(
+            queue.submit(2, 0, 77, 2),
+            UploadSubmitOutcome::Ignored,
+            "a reused object ID with a different owner identity is ignored"
+        );
 
         assert_eq!(queue.pending_count(), 1);
         let op = recv_one(&queue, &mut rx).await;
@@ -567,9 +675,12 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit(1, 1_048_569, 77, 2);
+        assert_eq!(queue.submit(1, 1_048_569, 77, 2), UploadSubmitOutcome::New);
         let stale = recv_one(&queue, &mut rx).await;
-        queue.submit(1, 1_048_569, 77, 3);
+        assert_eq!(
+            queue.submit(1, 1_048_569, 77, 3),
+            UploadSubmitOutcome::Updated
+        );
 
         assert_eq!(queue.pending_count(), 1);
         let updated = recv_one(&queue, &mut rx).await;
@@ -592,6 +703,154 @@ mod tests {
 
         assert!(queue.complete(&updated));
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn sfs752_submission_reports_count_after_commit_or_rollback() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, rx) = UploadQueue::new(dir.path());
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 1, 7),
+            (UploadSubmitOutcome::New, 1)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 2, 7),
+            (UploadSubmitOutcome::Updated, 1)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 1, 7),
+            (UploadSubmitOutcome::Ignored, 1)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 8, 8, 102, 1, 5),
+            (UploadSubmitOutcome::New, 2)
+        );
+        drop(rx);
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 16, 16, 103, 1, 9),
+            (UploadSubmitOutcome::Closed, 2)
+        );
+        assert_eq!(
+            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 3, 9),
+            (UploadSubmitOutcome::Closed, 2)
+        );
+        assert_eq!(queue.snapshot_pending()[0].content_epoch, 2);
+        assert_eq!(queue.snapshot_pending()[0].payload_len, 7);
+    }
+
+    #[tokio::test]
+    async fn sfs752_closed_update_restores_previous_pending_upload() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::New);
+        let previous = recv_one(&queue, &mut rx).await;
+        drop(rx);
+
+        assert_eq!(queue.submit(1, 0, 77, 2), UploadSubmitOutcome::Closed);
+        assert_eq!(queue.snapshot_pending(), vec![previous]);
+    }
+
+    #[tokio::test]
+    async fn sfs752_closed_submit_holds_state_lock_through_rollback() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, rx) = UploadQueue::new(dir.path());
+        drop(rx);
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        queue.set_closed_dispatch_hook(ClosedDispatchHook {
+            entered: entered_tx,
+            release: release_rx,
+        });
+
+        let first_queue = Arc::clone(&queue);
+        let first = tokio::task::spawn_blocking(move || {
+            first_queue.submit_with_payload(1, 0, 0, 77, 1, 10)
+        });
+        let first_paused = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("first closed submit reaches rollback")
+            .expect("closed submit hook remains connected");
+        assert_eq!(first_paused.content_epoch, 1);
+        let rollback_holds_state_lock = queue.pending_state.try_lock().is_none();
+        release_tx.send(()).expect("release first closed submit");
+        assert_eq!(
+            first.await.expect("first submit task"),
+            UploadSubmitOutcome::Closed
+        );
+        assert!(rollback_holds_state_lock, "submit lock must cover rollback");
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sfs752_failed_requeue_holds_state_lock_through_rollback() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+        queue.submit(1, 0, 77, 1);
+        let mut retry = recv_one(&queue, &mut rx).await;
+        drop(rx);
+        retry.retry_count = 1;
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        queue.set_closed_dispatch_hook(ClosedDispatchHook {
+            entered: entered_tx,
+            release: release_rx,
+        });
+
+        let requeue_queue = Arc::clone(&queue);
+        let requeue = tokio::task::spawn_blocking(move || requeue_queue.requeue(retry));
+        let paused = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("closed requeue reaches rollback")
+            .expect("closed dispatch hook remains connected");
+        assert_eq!(paused.retry_count, 1);
+        let rollback_holds_state_lock = queue.pending_state.try_lock().is_none();
+        release_tx.send(()).expect("release failed requeue");
+        assert!(!requeue.await.expect("requeue task"));
+        assert!(
+            rollback_holds_state_lock,
+            "requeue lock must cover rollback"
+        );
+        assert_eq!(queue.snapshot_pending()[0].retry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sfs752_failed_rebased_requeue_holds_state_lock_and_restores_pending() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+        queue.submit_with_payload(1, 0, 0, 77, 1, 10);
+        let current = recv_one(&queue, &mut rx).await;
+        drop(rx);
+        let mut rebased = current.clone();
+        rebased.offset = 10;
+        rebased.object_file_offset = 10;
+        rebased.content_epoch = 2;
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        queue.set_closed_dispatch_hook(ClosedDispatchHook {
+            entered: entered_tx,
+            release: release_rx,
+        });
+
+        let requeue_queue = Arc::clone(&queue);
+        let expected = current.clone();
+        let requeue =
+            tokio::task::spawn_blocking(move || requeue_queue.requeue_rebased(&current, rebased));
+        let paused = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("closed rebased requeue reaches rollback")
+            .expect("closed dispatch hook remains connected");
+        assert_eq!(paused.offset, 10);
+        let rollback_holds_state_lock = queue.pending_state.try_lock().is_none();
+        release_tx.send(()).expect("release failed rebased requeue");
+        assert!(!requeue.await.expect("rebased requeue task"));
+        assert!(
+            rollback_holds_state_lock,
+            "rebased requeue lock must cover rollback"
+        );
+        assert_eq!(queue.snapshot_pending(), vec![expected]);
     }
 
     #[tokio::test]
