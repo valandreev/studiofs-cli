@@ -2867,7 +2867,7 @@ mod tests {
             fixture.runtime().handle().clone(),
             false,
         ));
-        crate::adapter::tests::poison_reply_task_tracker(&callback_state);
+        callback_state.poison_reply_tracker_for_test();
         let dispatcher = FsKitDispatcher::new(
             Arc::clone(&callback_state),
             fixture.runtime().handle().clone(),
