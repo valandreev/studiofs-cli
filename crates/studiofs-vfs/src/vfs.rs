@@ -2016,7 +2016,7 @@ impl ReadState {
 
     fn decrement_active_access_class(&self, class: AccessClass) {
         self.active_access_classes[class.index()]
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_sub(1))
             })
             .ok();
@@ -2163,7 +2163,7 @@ impl ReadState {
     fn unmark_foreground_read(&self, now_ms: u64) {
         let previous = self
             .foreground_reads_inflight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
             .unwrap_or(0);
@@ -7090,13 +7090,11 @@ impl StudioVfs {
         if bytes == 0 {
             return;
         }
-        let _ = self
-            .state
-            .local_dirty
-            .local_sync_unsynced_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                Some(pending.saturating_sub(bytes))
-            });
+        let _ = self.state.local_dirty.local_sync_unsynced_bytes.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |pending| Some(pending.saturating_sub(bytes)),
+        );
     }
 
     fn write_admission_buffer_budget_bytes(&self) -> usize {
