@@ -171,6 +171,7 @@ pub struct LockOrderGuard {
     // `pushed` determines whether this acquisition is tracked.
     id: u64,
     pushed: bool,
+    // Keep `*mut ()`: it makes this guard !Send and !Sync for the thread-local stack.
     _marker: PhantomData<*mut ()>,
 }
 
@@ -322,6 +323,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    static_assertions::assert_not_impl_any!(LockOrderGuard: Send, Sync);
 
     /// Runs body with tracing text routed into a string.
     fn capture_warnings_while(body: impl FnOnce()) -> String {
