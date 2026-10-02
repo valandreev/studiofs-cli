@@ -552,6 +552,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<super::low_level::Session>();
+        assert_send_sync::<super::adapter::CallbackState>();
     }
 
     #[test]
