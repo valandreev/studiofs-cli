@@ -1140,9 +1140,13 @@ impl CachedStoreWriterSlice {
 
     /// Stages completed blocks up to `target_offset` and returns their metadata.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if geometry validation or block staging fails.
     /// On error, earlier successful blocks remain staged, but their metadata is not returned.
-    /// The failed block and remaining bytes stay buffered for retry. Use detached staging
-    /// when the caller must retain metadata across persistence failures.
+    /// The failed block and remaining bytes stay buffered for retry. Use
+    /// [`Self::detach_completed_blocks`] when the caller must retain metadata across
+    /// persistence failures.
     pub fn flush_to(
         &mut self,
         target_offset: u64,
@@ -1200,7 +1204,11 @@ impl CachedStoreWriterSlice {
 
     /// Stages all remaining dirty bytes (including a final partial block) and returns their metadata.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if geometry validation or block staging fails.
     /// Errors have the same partial-success behavior as [`Self::flush_to`].
+    /// Use [`Self::detach_finish`] to retain metadata across persistence failures.
     pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
@@ -2252,60 +2260,67 @@ mod tests {
     }
 
     #[test]
-    fn writer_slice_multi_block_failure_keeps_successful_prefix_staged() {
-        for finish in [false, true] {
-            let dir = studiofs_test_support::workspace_target_tempdir("test-");
-            let (cached_store, _rx) = temp_cached_store(&dir);
-            let mut writer = cached_store.open_writer_slice(writer_config());
-            let layout = LocalPayloadLayout::from_cache_root(dir.path());
-            let stage_path = layout.upload_stage_object_path(10_001);
-            let stage_parent = stage_path.parent().expect("stage parent");
-            std::fs::create_dir_all(stage_parent.parent().expect("stage grandparent"))
-                .expect("stage grandparent dir");
-            std::fs::File::create(stage_parent).expect("second block obstruction");
-            writer.write_at(0, b"abcdefghijklmnop").expect("two blocks");
+    fn writer_slice_multi_block_flush_failure_keeps_successful_prefix_staged() {
+        assert_multi_block_failure_keeps_successful_prefix_staged(false);
+    }
 
-            let err = if finish {
-                writer.finish()
-            } else {
-                writer.flush_to(16)
-            }
-            .expect_err("second block link failure");
-            assert!(matches!(
-                err,
-                CachedStoreWriterError::UploadStage {
-                    object_id: 10_001,
-                    ..
-                }
-            ));
-            assert_eq!(
-                cached_store
-                    .get_staged_for_upload(10_000)
-                    .expect("first block retained")
-                    .as_ref(),
-                b"abcdefgh"
-            );
-            assert!(layout.payload_object_path(10_000).exists());
-            assert!(!layout.payload_object_path(10_001).exists());
-            assert_eq!(cached_store.pending_upload_count(), 1);
-            let mut tail = [0; 8];
-            assert_eq!(writer.read_accepted(8, &mut tail), 8);
-            assert_eq!(&tail, b"ijklmnop");
-            assert_eq!(writer.dirty_bytes(), 8);
+    #[test]
+    fn writer_slice_multi_block_finish_failure_keeps_successful_prefix_staged() {
+        assert_multi_block_failure_keeps_successful_prefix_staged(true);
+    }
 
-            std::fs::remove_file(stage_parent).expect("remove second block obstruction");
-            let staged = if finish {
-                writer.finish()
-            } else {
-                writer.flush_to(16)
-            }
-            .expect("retry second block");
-            assert_eq!(staged.len(), 1);
-            assert_eq!(staged[0].object_id, 10_001);
-            assert_eq!(staged[0].offset, 8);
-            assert_eq!(cached_store.pending_upload_count(), 2);
-            assert_eq!(writer.dirty_bytes(), 0);
+    fn assert_multi_block_failure_keeps_successful_prefix_staged(finish: bool) {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+        let layout = LocalPayloadLayout::from_cache_root(dir.path());
+        let stage_path = layout.upload_stage_object_path(10_001);
+        let stage_parent = stage_path.parent().expect("stage parent");
+        std::fs::create_dir_all(stage_parent.parent().expect("stage grandparent"))
+            .expect("stage grandparent dir");
+        std::fs::File::create(stage_parent).expect("second block obstruction");
+        writer.write_at(0, b"abcdefghijklmnop").expect("two blocks");
+
+        let err = if finish {
+            writer.finish()
+        } else {
+            writer.flush_to(16)
         }
+        .expect_err("second block link failure");
+        assert!(matches!(
+            err,
+            CachedStoreWriterError::UploadStage {
+                object_id: 10_001,
+                ..
+            }
+        ));
+        assert_eq!(
+            cached_store
+                .get_staged_for_upload(10_000)
+                .expect("first block retained")
+                .as_ref(),
+            b"abcdefgh"
+        );
+        assert!(layout.payload_object_path(10_000).exists());
+        assert!(!layout.payload_object_path(10_001).exists());
+        assert_eq!(cached_store.pending_upload_count(), 1);
+        let mut tail = [0; 8];
+        assert_eq!(writer.read_accepted(8, &mut tail), 8);
+        assert_eq!(&tail, b"ijklmnop");
+        assert_eq!(writer.dirty_bytes(), 8);
+
+        std::fs::remove_file(stage_parent).expect("remove second block obstruction");
+        let staged = if finish {
+            writer.finish()
+        } else {
+            writer.flush_to(16)
+        }
+        .expect("retry second block");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].object_id, 10_001);
+        assert_eq!(staged[0].offset, 8);
+        assert_eq!(cached_store.pending_upload_count(), 2);
+        assert_eq!(writer.dirty_bytes(), 0);
     }
 
     #[test]
