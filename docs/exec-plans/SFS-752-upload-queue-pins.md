@@ -27,7 +27,8 @@ references without letting an active upload lose its protection from eviction.
   pending-byte leaks and a missing accounting lock boundary, and fixed them.
 - [x] (2026-10-02 10:22Z) Validated final accounting/clone changes, real
   upload-reader fallback and independent source review; prepared delivery.
-- [ ] Commit/push the local review follow-up and update PR #737.
+- [x] (2026-10-02 10:23Z) Committed/pushed the local review fix as `fcbe9ba7`,
+  updated PR #737 and verified its matching remote head.
 
 ## Surprises & Discoveries
 
@@ -136,7 +137,8 @@ tests, 23 queue tests, one existing detached-accounting test, the real VFS
 reader fallback test and three VFS rebase tests (filters overlap). Cache/VFS
 check and all-target Clippy, formatting and whitespace checks passed.
 Independent source review found no remaining actionable issue. Full workspace,
-mounted and service-backed suites remain unrun. Delivery is the remaining step.
+mounted and service-backed suites remain unrun. The validated follow-up was
+committed as `fcbe9ba7`, pushed, and included in the updated PR #737 description.
 
 ## Context and Orientation
 
@@ -218,6 +220,7 @@ local dirty state remains the replay source.
 Issue: https://linear.app/valandreev/issue/SFS-752/keep-cache-pin-counts-aligned-with-accepted-upload-queue-entries
 PR: https://github.com/valandreev/studiofs-cli/pull/737
 Implementation commit: `5e784917`.
+Local review accounting fix: `fcbe9ba7`.
 Graph generation 2026-10-02T09:01:39Z reported metadata changes for relied-on
 source files, so graph discovery was followed by direct source reads.
 
@@ -244,3 +247,5 @@ validation; prepared one follow-up commit and replies for all attached threads.
 Revision 2026-10-02: verified every local review finding, fixed writer-byte
 accounting and its queue lifecycle races, preserved public facade APIs, and
 recorded focused validation plus evidence-based dispositions before delivery.
+Revision 2026-10-02: recorded the delivered local review fix and verified PR
+update without claiming full-suite, mounted or service-backed acceptance.
