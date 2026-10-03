@@ -489,6 +489,7 @@ impl VfsBootstrap {
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
             read_only_mount,
+            debug_pending_path_suffix: DebugPendingPathSuffix::from_env(),
             snapshot_mount_fence,
             data_write: resources.data_write,
             snapshot_worker,
