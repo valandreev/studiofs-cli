@@ -1,3 +1,4 @@
+use crate::lock_order::LockOrderSubtier;
 use crate::{LockTier, OrderedMutex};
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
@@ -209,8 +210,8 @@ struct FileWriter {
 }
 
 impl FileWriter {
-    fn new_ordered(ino: Ino, visible_len: u64, next_object_id: u64) -> Arc<OrderedMutex<Self>> {
-        Arc::new(OrderedMutex::new(
+    fn new_shared(ino: Ino, visible_len: u64, next_object_id: u64) -> Arc<OrderedMutex<Self>> {
+        Arc::new(OrderedMutex::new_with_subtier(
             Self {
                 ino,
                 visible_len,
@@ -221,6 +222,7 @@ impl FileWriter {
                 sticky_error: None,
             },
             LockTier::LocalDirty,
+            LockOrderSubtier::FileWriter,
         ))
     }
 }
@@ -231,7 +233,6 @@ struct StickyError {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 struct WriterShard {
     files: HashMap<Ino, Arc<OrderedMutex<FileWriter>>>,
     handle_counts_by_ino: HashMap<Ino, usize>,
@@ -295,10 +296,22 @@ impl MountedWriterStack {
             cached_store,
             config,
             shards: (0..Self::SHARDS)
-                .map(|_| OrderedMutex::new(WriterShard::default(), LockTier::LocalDirty))
+                .map(|_| {
+                    OrderedMutex::new_with_subtier(
+                        WriterShard::default(),
+                        LockTier::LocalDirty,
+                        LockOrderSubtier::InodeShard,
+                    )
+                })
                 .collect(),
             handle_shards: (0..Self::SHARDS)
-                .map(|_| OrderedMutex::new(HandleShard::default(), LockTier::LocalDirty))
+                .map(|_| {
+                    OrderedMutex::new_with_subtier(
+                        HandleShard::default(),
+                        LockTier::LocalDirty,
+                        LockOrderSubtier::HandleShard,
+                    )
+                })
                 .collect(),
             next_seq: AtomicU64::new(1),
             dirty_bytes: AtomicUsize::new(0),
@@ -356,7 +369,7 @@ impl MountedWriterStack {
         let file = {
             let mut shard = self.shards[shard_index].lock();
             Arc::clone(shard.files.entry(spec.ino).or_insert_with(|| {
-                FileWriter::new_ordered(spec.ino, spec.current_size, spec.first_object_id)
+                FileWriter::new_shared(spec.ino, spec.current_size, spec.first_object_id)
             }))
         };
         let mut file = file.lock();
@@ -1123,13 +1136,18 @@ impl MountedWriterStack {
     pub(super) fn snapshot_dirty_inodes_by_bytes(&self) -> Vec<Ino> {
         let mut dirty = Vec::new();
         for shard in self.shards.iter() {
-            let shard = shard.lock();
-            for ino in &shard.dirty_inodes {
-                if let Some(file) = shard.files.get(ino) {
-                    let bytes = file.lock().dirty_bytes;
-                    if bytes > 0 {
-                        dirty.push((*ino, bytes));
-                    }
+            let dirty_files = {
+                let shard = shard.lock();
+                shard
+                    .dirty_inodes
+                    .iter()
+                    .filter_map(|ino| shard.files.get(ino).map(|file| (*ino, Arc::clone(file))))
+                    .collect::<Vec<_>>()
+            };
+            for (ino, file) in dirty_files {
+                let bytes = file.lock().dirty_bytes;
+                if bytes > 0 {
+                    dirty.push((ino, bytes));
                 }
             }
         }
@@ -1153,7 +1171,7 @@ impl MountedWriterStack {
                 shard
                     .files
                     .entry(ino)
-                    .or_insert_with(|| FileWriter::new_ordered(ino, 0, 0)),
+                    .or_insert_with(|| FileWriter::new_shared(ino, 0, 0)),
             )
         };
         let mut file = file.lock();
@@ -1410,6 +1428,10 @@ mod tests {
     };
     use studiofs_cache::{CachedStoreConfig, open_local_payload_backend};
     use tokio::sync::mpsc;
+
+    fn lock_order_test_namespace() -> super::super::namespace::NamespaceState {
+        super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096)
+    }
 
     struct SlowPutBackend {
         inner: Arc<dyn LocalPayloadBackend>,
@@ -1746,7 +1768,7 @@ mod tests {
             let shard = stack.shards[MountedWriterStack::inode_shard_index(ino)].lock();
             let file = Arc::clone(shard.files.get(&ino).expect("writer file"));
             let _file = file.lock();
-            let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+            let namespace = lock_order_test_namespace();
             let _dirty_attrs = namespace.dirty_attrs.lock();
 
             assert_eq!(
@@ -1763,12 +1785,12 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "trying to acquire LocalDirty (tier 2) while holding Namespace (tier 3)"
+        expected = "trying to acquire LocalDirty::InodeShard (tier 2) while holding Namespace (tier 3)"
     )]
     fn writer_stack_lock_order_rejects_namespace_before_visible_len_shard_lookup() {
         let (_dir, stack, _rx) = temp_stack(64, 16);
         let ino = 11;
-        let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+        let namespace = lock_order_test_namespace();
         let _dirty_attrs = namespace.dirty_attrs.lock();
 
         let _ = stack.visible_len(ino);
@@ -1776,7 +1798,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "trying to acquire LocalDirty (tier 2) while holding Namespace (tier 3)"
+        expected = "trying to acquire LocalDirty::FileWriter (tier 2) while holding Namespace (tier 3)"
     )]
     fn writer_stack_lock_order_rejects_namespace_before_file() {
         let (_dir, stack, _rx) = temp_stack(64, 16);
@@ -1789,18 +1811,38 @@ mod tests {
             .expect("seed writer state");
         let shard_index = MountedWriterStack::inode_shard_index(ino);
         let file = Arc::clone(&stack.shards[shard_index].lock().files[&ino]);
-        let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+        let namespace = lock_order_test_namespace();
         let _dirty_attrs = namespace.dirty_attrs.lock();
         let _file = file.lock();
     }
 
     #[test]
     #[should_panic(
-        expected = "trying to acquire LocalDirty (tier 2) while holding Namespace (tier 3)"
+        expected = "trying to acquire LocalDirty::InodeShard (tier 2) while holding LocalDirty::FileWriter (tier 2)"
+    )]
+    fn writer_stack_lock_order_rejects_file_before_shard() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let ino = 11;
+        stack
+            .write_bytes(
+                write_spec(7, ino, 0, 100),
+                Bytes::from_static(b"seed writer state"),
+            )
+            .expect("seed writer state");
+        let shard_index = MountedWriterStack::inode_shard_index(ino);
+        let file = Arc::clone(&stack.shards[shard_index].lock().files[&ino]);
+
+        let _file = file.lock();
+        let _shard = stack.shards[shard_index].lock();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "trying to acquire LocalDirty::HandleShard (tier 2) while holding Namespace (tier 3)"
     )]
     fn writer_stack_lock_order_rejects_namespace_before_handle_shard() {
         let (_dir, stack, _rx) = temp_stack(64, 16);
-        let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+        let namespace = lock_order_test_namespace();
         let _dirty_attrs = namespace.dirty_attrs.lock();
 
         let _handle_shard = stack.handle_shards[MountedWriterStack::handle_shard_index(7)].lock();
@@ -1808,7 +1850,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "trying to acquire Shutdown (tier 1) while holding LocalDirty (tier 2)"
+        expected = "trying to acquire Shutdown (tier 1) while holding LocalDirty::InodeShard (tier 2)"
     )]
     fn shutdown_phase_lock_order_rejects_writer_shard_before_claim() {
         let (_dir, stack, _rx) = temp_stack(64, 16);

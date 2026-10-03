@@ -19,11 +19,11 @@
 //! 8.  `MetricsState` — metrics (rarely needs locking)
 //!
 //! Mounted writer inode shards, handle shards, and per-file state use tier 2.
-//! Within that tier, nested acquisitions follow inode shard -> file. Handle
-//! shards are released before acquiring inode shards, and file guards are
-//! released before reacquiring a shard or staging detached payloads. Equal
-//! tiers are accepted by the validator; the shard/file order is enforced by
-//! these acquisition scopes. Ordinary writer and namespace operations release
+//! Writer subtiers validate inode/handle shard -> per-file acquisition without
+//! changing the public tier vocabulary. Handle shards are released before
+//! acquiring inode shards, and file guards are released before reacquiring a
+//! shard or staging detached payloads. Equal tiers without writer subtiers are
+//! accepted by the validator. Ordinary writer and namespace operations release
 //! their guards between phases. Synchronous guards must not cross an await;
 //! async admission and metadata-sync locks are outside thread-local validation.
 //!
@@ -92,6 +92,7 @@ pub enum LockTier {
     Shutdown = 1,
     /// Tier 2: writer/cache dirty-state owners, including mounted writer
     /// inode/handle shards, per-file state, and `local_dirty` bookkeeping.
+    /// Mounted writer mutexes use subtiers to enforce shard-before-file order.
     LocalDirty = 2,
     /// Tier 3: NamespaceState
     Namespace = 3,
@@ -141,11 +142,46 @@ impl LockTier {
     }
 }
 
+/// Fine-grained order for mounted writer locks that share `LocalDirty`.
+///
+/// This preserves the public tier while making shard-before-file ordering
+/// observable to the validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockOrderSubtier {
+    InodeShard,
+    HandleShard,
+    FileWriter,
+}
+
+impl LockOrderSubtier {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::InodeShard | Self::HandleShard => 0,
+            Self::FileWriter => 1,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::InodeShard => "InodeShard",
+            Self::HandleShard => "HandleShard",
+            Self::FileWriter => "FileWriter",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeldLock {
+    tier: LockTier,
+    subtier: Option<LockOrderSubtier>,
+    id: u64,
+}
+
 // Thread-local tracking of currently held lock acquisitions.
 // Uses a simple stack to track nested lock acquisitions.
 // All state is thread-local to avoid cross-thread interference.
 thread_local! {
-    static HELD_LOCKS: RefCell<Vec<(LockTier, u64)>> = RefCell::new(Vec::with_capacity(4));
+    static HELD_LOCKS: RefCell<Vec<HeldLock>> = RefCell::new(Vec::with_capacity(4));
     static NEXT_LOCK_ID: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -155,6 +191,13 @@ fn next_lock_id() -> u64 {
         next.set(next.get().wrapping_add(1));
         next.get()
     })
+}
+
+fn lock_name(tier: LockTier, subtier: Option<LockOrderSubtier>) -> String {
+    match subtier {
+        Some(subtier) => format!("{}::{}", tier.name(), subtier.name()),
+        None => tier.name().to_owned(),
+    }
 }
 
 /// Guard that tracks lock acquisition and validates ordering.
@@ -178,6 +221,7 @@ fn next_lock_id() -> u64 {
 /// ```
 pub struct LockOrderGuard {
     tier: LockTier,
+    subtier: Option<LockOrderSubtier>,
     // Zero is used when validation is disabled and also occurs at counter wrap.
     // `pushed` determines whether this acquisition is tracked.
     id: u64,
@@ -193,9 +237,14 @@ impl LockOrderGuard {
     /// Returns a guard that must be held while the lock is held.
     ///
     pub fn acquire(tier: LockTier) -> Self {
+        Self::acquire_with_subtier(tier, None)
+    }
+
+    pub(crate) fn acquire_with_subtier(tier: LockTier, subtier: Option<LockOrderSubtier>) -> Self {
         if !is_validation_enabled() {
             return LockOrderGuard {
                 tier,
+                subtier,
                 id: 0,
                 pushed: false,
                 _marker: PhantomData,
@@ -208,15 +257,26 @@ impl LockOrderGuard {
 
             // Check every held acquisition: unchecked or warned acquisitions
             // can leave the stack's tiers out of order.
-            if let Some(&(violating_tier, _)) =
-                held.iter().rfind(|(held_tier, _)| tier < *held_tier)
-            {
+            let violating_lock = held
+                .iter()
+                .rfind(|held_lock| {
+                    tier < held_lock.tier
+                        || (tier == held_lock.tier
+                            && matches!(
+                                (subtier, held_lock.subtier),
+                                (Some(new), Some(held)) if new.rank() < held.rank()
+                            ))
+                })
+                .copied();
+            if let Some(violating_lock) = violating_lock {
+                let acquiring_name = lock_name(tier, subtier);
+                let holding_name = lock_name(violating_lock.tier, violating_lock.subtier);
                 let msg = format!(
                     "Lock ordering violation: trying to acquire {} (tier {}) while holding {} (tier {})",
-                    tier.name(),
+                    acquiring_name,
                     tier.level(),
-                    violating_tier.name(),
-                    violating_tier.level()
+                    holding_name,
+                    violating_lock.tier.level()
                 );
 
                 if cfg!(test) {
@@ -226,10 +286,11 @@ impl LockOrderGuard {
                 }
             }
 
-            held.push((tier, id));
+            held.push(HeldLock { tier, subtier, id });
 
             LockOrderGuard {
                 tier,
+                subtier,
                 id,
                 pushed: true,
                 _marker: PhantomData,
@@ -246,6 +307,7 @@ impl LockOrderGuard {
         if !is_validation_enabled() {
             return LockOrderGuard {
                 tier,
+                subtier: None,
                 id: 0,
                 pushed: false,
                 _marker: PhantomData,
@@ -254,9 +316,14 @@ impl LockOrderGuard {
 
         HELD_LOCKS.with(|held| {
             let id = next_lock_id();
-            held.borrow_mut().push((tier, id));
+            held.borrow_mut().push(HeldLock {
+                tier,
+                subtier: None,
+                id,
+            });
             LockOrderGuard {
                 tier,
+                subtier: None,
                 id,
                 pushed: true,
                 _marker: PhantomData,
@@ -274,16 +341,18 @@ impl Drop for LockOrderGuard {
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
 
-            match held.iter().rposition(|(_, id)| *id == self.id) {
+            match held.iter().rposition(|lock| lock.id == self.id) {
                 Some(pos) => {
                     if pos != held.len() - 1
-                        && let Some(&(top_tier, top_id)) = held.last()
+                        && let Some(top_lock) = held.last()
                     {
                         warn!(
                             dropped_tier = self.tier.name(),
+                            dropped_subtier = self.subtier.map(LockOrderSubtier::name),
                             dropped_id = self.id,
-                            top_tier = top_tier.name(),
-                            top_id,
+                            top_tier = top_lock.tier.name(),
+                            top_subtier = top_lock.subtier.map(LockOrderSubtier::name),
+                            top_id = top_lock.id,
                             stack_depth = held.len(),
                             "Lock guard dropped in wrong order"
                         );
@@ -306,13 +375,13 @@ impl Drop for LockOrderGuard {
 
 /// Check if lock ordering validation is enabled.
 ///
-/// Always enabled in debug builds, configurable in release.
+/// Always enabled in debug and unit-test builds, configurable in release libraries.
 pub fn is_validation_enabled() -> bool {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     {
         true
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(all(not(debug_assertions), not(test)))]
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
@@ -325,7 +394,7 @@ pub fn is_validation_enabled() -> bool {
 
 /// Get the current lock stack for debugging.
 pub fn debug_lock_stack() -> Vec<LockTier> {
-    HELD_LOCKS.with(|held| held.borrow().iter().map(|(tier, _)| *tier).collect())
+    HELD_LOCKS.with(|held| held.borrow().iter().map(|lock| lock.tier).collect())
 }
 
 #[cfg(test)]
@@ -336,6 +405,12 @@ mod tests {
     use super::*;
 
     static_assertions::assert_not_impl_any!(LockOrderGuard: Send, Sync);
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn lock_order_validation_is_enabled_for_release_tests() {
+        assert!(is_validation_enabled());
+    }
 
     /// Runs body with tracing text routed into a string.
     fn capture_warnings_while(body: impl FnOnce()) -> String {

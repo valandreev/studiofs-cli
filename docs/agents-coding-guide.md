@@ -143,8 +143,9 @@ Participating synchronous VFS mutexes use `OrderedMutex` so validation observes
 their actual guard lifetime. Within tier 2, the mounted writer stack nests inode
 shard before per-file state. Handle shards are released before inode shards;
 per-file guards are released before shard reacquisition and detached payload
-staging. Equal-tier acquisition is accepted by the validator, so this internal
-order is enforced by the acquisition scopes. Ordinary writer/namespace phases
+staging. Writer lock subtiers make shard-before-file acquisition enforceable
+without changing the public `LockTier::LocalDirty` priority; guards without a
+writer subtier retain the equal-tier behavior. Ordinary writer/namespace phases
 and shutdown draining release their synchronous guards between phases; never
 hold them across `await`.
 

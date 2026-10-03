@@ -24,12 +24,16 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+fn lock_order_test_namespace() -> NamespaceState {
+    NamespaceState::new(8, 4096, 8, 4096, 8, 4096)
+}
+
 #[test]
 fn shutdown_phase_lock_order_tracks_real_phase_and_namespace_guards() {
     use crate::lock_order::debug_lock_stack;
 
     let shutdown = ShutdownState::new();
-    let namespace = NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+    let namespace = lock_order_test_namespace();
     {
         let _phase = shutdown.shutdown_phase.lock();
         assert_eq!(debug_lock_stack(), vec![LockTier::Shutdown]);
@@ -46,7 +50,7 @@ fn shutdown_phase_lock_order_tracks_real_phase_and_namespace_guards() {
 #[should_panic(expected = "trying to acquire Shutdown (tier 1) while holding Namespace (tier 3)")]
 fn shutdown_phase_lock_order_rejects_namespace_before_claim() {
     let shutdown = ShutdownState::new();
-    let namespace = NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+    let namespace = lock_order_test_namespace();
     let _attrs = namespace.dirty_attrs.lock();
     let _claim = shutdown.claim();
 }
