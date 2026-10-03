@@ -1151,22 +1151,42 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "pending_slice_count underflow")]
-    fn pending_slice_counter_underflow_is_caught_in_debug_builds() {
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "pending_slice_count underflow")
+    )]
+    fn pending_slice_counter_underflow_panics_in_debug_and_saturates_in_release() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-counter-underflow");
 
         vfs.subtract_pending_slice_counts(1, 0);
+        assert_eq!(
+            vfs.state
+                .local_dirty
+                .pending_slice_count
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
-    #[should_panic(expected = "pending_persisted_slice_count underflow")]
-    fn pending_persisted_slice_counter_underflow_is_caught_in_debug_builds() {
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "pending_persisted_slice_count underflow")
+    )]
+    fn pending_persisted_slice_counter_underflow_panics_in_debug_and_saturates_in_release() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) =
             make_unstarted_test_vfs(&tmp, "pending-persisted-slice-counter-underflow");
 
         vfs.subtract_pending_slice_counts(0, 1);
+        assert_eq!(
+            vfs.state
+                .local_dirty
+                .pending_persisted_slice_count
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

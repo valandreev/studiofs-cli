@@ -517,11 +517,7 @@ impl FileSessionEntry {
     }
 
     fn update_max_queue_depth(&self, candidate: u64) {
-        let _ = self
-            .max_queue_depth
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (candidate > current).then_some(candidate)
-            });
+        self.max_queue_depth.fetch_max(candidate, Ordering::Relaxed);
     }
 
     fn note_active_start(&self, op: FileSessionOperation) {
@@ -742,12 +738,9 @@ impl FileSessionState {
         let queue_depth = session.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
         session.update_max_queue_depth(queue_depth);
         let global_queue_depth = counters.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ =
-            counters
-                .max_queue_depth
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    (global_queue_depth > current).then_some(global_queue_depth)
-                });
+        counters
+            .max_queue_depth
+            .fetch_max(global_queue_depth, Ordering::Relaxed);
         let queued_op = FileSessionQueueGuard {
             session: &session,
             counters: &self.counters,

@@ -8,14 +8,28 @@
 //!
 //! # Lock Ordering (Tier 1 = highest priority)
 //!
-//! 1.  `ShutdownState` — shutdown flags
-//! 2.  `local_dirty` subsystem — pending local dirty-state bookkeeping
+//! 1.  `ShutdownState` — shutdown phase and synchronous task ownership
+//! 2.  Writer/cache dirty-state owners — mounted writer shards/files and
+//!     `local_dirty` bookkeeping (`LockTier::LocalDirty`)
 //! 3.  `NamespaceState` — dentry/attr caches
 //! 4.  `IncarnationState` — inode incarnation tracking
 //! 5.  `UploadState` — upload queue and cancellations
 //! 6.  `AclState` — ACL state
 //! 7.  `FileLockState` — file locks
 //! 8.  `MetricsState` — metrics (rarely needs locking)
+//!
+//! Mounted writer inode shards, handle shards, and per-file state use tier 2.
+//! Writer subtiers permit inode shard -> per-file acquisition without changing
+//! the public tier vocabulary. Other nested writer-lock pairs are rejected:
+//! handle shards are released before inode access, shard guards are not nested,
+//! and file guards are released before shard reacquisition. Equal-tier pairs
+//! involving an unranked guard retain their existing behavior: writer locks
+//! nested with unranked `local_dirty` locks are not checked in either direction.
+//! Releasing file guards before detached-payload staging remains a call-structure
+//! requirement, not a writer-subtier validation guarantee.
+//! Ordinary writer and namespace operations release their guards between
+//! phases. Synchronous guards must not cross an await;
+//! async admission and metadata-sync locks are outside thread-local validation.
 //!
 //! When nesting the sustained-write tracker with `HandleTable`, acquire the
 //! tracker mutex before reading or mutating the handle table. Writer opens use
@@ -78,9 +92,12 @@ use tracing::warn;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum LockTier {
-    /// Tier 1: ShutdownState
+    /// Tier 1: shutdown phase and synchronous task ownership.
     Shutdown = 1,
-    /// Tier 2: `local_dirty` subsystem
+    /// Tier 2: writer/cache dirty-state owners, including mounted writer
+    /// inode/handle shards, per-file state, and `local_dirty` bookkeeping.
+    /// Writer subtiers allow inode-shard -> file nesting and reject other
+    /// nested writer-lock pairs.
     LocalDirty = 2,
     /// Tier 3: NamespaceState
     Namespace = 3,
@@ -130,11 +147,49 @@ impl LockTier {
     }
 }
 
+/// Fine-grained order for mounted writer locks that share `LocalDirty`.
+///
+/// This preserves the public tier while making shard-before-file ordering
+/// observable to the validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockOrderSubtier {
+    InodeShard,
+    HandleShard,
+    FileWriter,
+}
+
+impl LockOrderSubtier {
+    const fn allows_nested_acquisition(self, acquiring: Self) -> bool {
+        matches!((self, acquiring), (Self::InodeShard, Self::FileWriter))
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::InodeShard => "InodeShard",
+            Self::HandleShard => "HandleShard",
+            Self::FileWriter => "FileWriter",
+        }
+    }
+}
+
+/// Returns the current test thread's writer-lock subtier stack.
+#[cfg(test)]
+pub(crate) fn debug_lock_subtier_stack() -> Vec<Option<LockOrderSubtier>> {
+    HELD_LOCKS.with(|held| held.borrow().iter().map(|lock| lock.subtier).collect())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeldLock {
+    tier: LockTier,
+    subtier: Option<LockOrderSubtier>,
+    id: u64,
+}
+
 // Thread-local tracking of currently held lock acquisitions.
 // Uses a simple stack to track nested lock acquisitions.
 // All state is thread-local to avoid cross-thread interference.
 thread_local! {
-    static HELD_LOCKS: RefCell<Vec<(LockTier, u64)>> = RefCell::new(Vec::with_capacity(4));
+    static HELD_LOCKS: RefCell<Vec<HeldLock>> = RefCell::new(Vec::with_capacity(4));
     static NEXT_LOCK_ID: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -144,6 +199,13 @@ fn next_lock_id() -> u64 {
         next.set(next.get().wrapping_add(1));
         next.get()
     })
+}
+
+fn lock_name(tier: LockTier, subtier: Option<LockOrderSubtier>) -> String {
+    match subtier {
+        Some(subtier) => format!("{}::{}", tier.name(), subtier.name()),
+        None => tier.name().to_owned(),
+    }
 }
 
 /// Guard that tracks lock acquisition and validates ordering.
@@ -167,6 +229,7 @@ fn next_lock_id() -> u64 {
 /// ```
 pub struct LockOrderGuard {
     tier: LockTier,
+    subtier: Option<LockOrderSubtier>,
     // Zero is used when validation is disabled and also occurs at counter wrap.
     // `pushed` determines whether this acquisition is tracked.
     id: u64,
@@ -182,9 +245,14 @@ impl LockOrderGuard {
     /// Returns a guard that must be held while the lock is held.
     ///
     pub fn acquire(tier: LockTier) -> Self {
+        Self::acquire_with_subtier(tier, None)
+    }
+
+    pub(crate) fn acquire_with_subtier(tier: LockTier, subtier: Option<LockOrderSubtier>) -> Self {
         if !is_validation_enabled() {
             return LockOrderGuard {
                 tier,
+                subtier,
                 id: 0,
                 pushed: false,
                 _marker: PhantomData,
@@ -197,15 +265,27 @@ impl LockOrderGuard {
 
             // Check every held acquisition: unchecked or warned acquisitions
             // can leave the stack's tiers out of order.
-            if let Some(&(violating_tier, _)) =
-                held.iter().rfind(|(held_tier, _)| tier < *held_tier)
-            {
+            let violating_lock = held
+                .iter()
+                .rfind(|held_lock| {
+                    tier < held_lock.tier
+                        || (tier == held_lock.tier
+                            && matches!(
+                                (held_lock.subtier, subtier),
+                                (Some(held), Some(acquiring))
+                                    if !held.allows_nested_acquisition(acquiring)
+                            ))
+                })
+                .copied();
+            if let Some(violating_lock) = violating_lock {
+                let acquiring_name = lock_name(tier, subtier);
+                let holding_name = lock_name(violating_lock.tier, violating_lock.subtier);
                 let msg = format!(
                     "Lock ordering violation: trying to acquire {} (tier {}) while holding {} (tier {})",
-                    tier.name(),
+                    acquiring_name,
                     tier.level(),
-                    violating_tier.name(),
-                    violating_tier.level()
+                    holding_name,
+                    violating_lock.tier.level()
                 );
 
                 if cfg!(test) {
@@ -215,10 +295,11 @@ impl LockOrderGuard {
                 }
             }
 
-            held.push((tier, id));
+            held.push(HeldLock { tier, subtier, id });
 
             LockOrderGuard {
                 tier,
+                subtier,
                 id,
                 pushed: true,
                 _marker: PhantomData,
@@ -235,6 +316,7 @@ impl LockOrderGuard {
         if !is_validation_enabled() {
             return LockOrderGuard {
                 tier,
+                subtier: None,
                 id: 0,
                 pushed: false,
                 _marker: PhantomData,
@@ -243,9 +325,14 @@ impl LockOrderGuard {
 
         HELD_LOCKS.with(|held| {
             let id = next_lock_id();
-            held.borrow_mut().push((tier, id));
+            held.borrow_mut().push(HeldLock {
+                tier,
+                subtier: None,
+                id,
+            });
             LockOrderGuard {
                 tier,
+                subtier: None,
                 id,
                 pushed: true,
                 _marker: PhantomData,
@@ -263,16 +350,18 @@ impl Drop for LockOrderGuard {
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
 
-            match held.iter().rposition(|(_, id)| *id == self.id) {
+            match held.iter().rposition(|lock| lock.id == self.id) {
                 Some(pos) => {
                     if pos != held.len() - 1
-                        && let Some(&(top_tier, top_id)) = held.last()
+                        && let Some(top_lock) = held.last()
                     {
                         warn!(
                             dropped_tier = self.tier.name(),
+                            dropped_subtier = self.subtier.map(LockOrderSubtier::name),
                             dropped_id = self.id,
-                            top_tier = top_tier.name(),
-                            top_id,
+                            top_tier = top_lock.tier.name(),
+                            top_subtier = top_lock.subtier.map(LockOrderSubtier::name),
+                            top_id = top_lock.id,
                             stack_depth = held.len(),
                             "Lock guard dropped in wrong order"
                         );
@@ -295,7 +384,9 @@ impl Drop for LockOrderGuard {
 
 /// Check if lock ordering validation is enabled.
 ///
-/// Always enabled in debug builds, configurable in release.
+/// Always enabled in debug builds. Release unit tests default to enabled;
+/// release libraries default to disabled. In release, the cached environment
+/// setting overrides either default: `1`/`true` enables, other values disable.
 pub fn is_validation_enabled() -> bool {
     #[cfg(debug_assertions)]
     {
@@ -307,14 +398,14 @@ pub fn is_validation_enabled() -> bool {
         *ENABLED.get_or_init(|| {
             std::env::var("STUDIOFS_LOCK_ORDER_VALIDATION")
                 .map(|v| v == "1" || v == "true")
-                .unwrap_or(false)
+                .unwrap_or(cfg!(test))
         })
     }
 }
 
 /// Get the current lock stack for debugging.
 pub fn debug_lock_stack() -> Vec<LockTier> {
-    HELD_LOCKS.with(|held| held.borrow().iter().map(|(tier, _)| *tier).collect())
+    HELD_LOCKS.with(|held| held.borrow().iter().map(|lock| lock.tier).collect())
 }
 
 #[cfg(test)]
@@ -325,6 +416,20 @@ mod tests {
     use super::*;
 
     static_assertions::assert_not_impl_any!(LockOrderGuard: Send, Sync);
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn lock_order_validation_respects_release_test_configuration() {
+        let expected = std::env::var("STUDIOFS_LOCK_ORDER_VALIDATION")
+            .map(|value| value == "1" || value == "true")
+            .unwrap_or(true);
+        assert_eq!(is_validation_enabled(), expected);
+        if !expected {
+            let _namespace = LockOrderGuard::acquire(LockTier::Namespace);
+            let _dirty = LockOrderGuard::acquire(LockTier::LocalDirty);
+            assert!(debug_lock_stack().is_empty());
+        }
+    }
 
     /// Runs body with tracing text routed into a string.
     fn capture_warnings_while(body: impl FnOnce()) -> String {
@@ -368,6 +473,26 @@ mod tests {
         let _guard2 = LockOrderGuard::acquire(LockTier::Namespace);
         // Even lower - still fine
         let _guard3 = LockOrderGuard::acquire(LockTier::Metrics);
+    }
+
+    #[test]
+    fn test_writer_subtier_nesting_only_allows_inode_shard_then_file() {
+        let subtiers = [
+            LockOrderSubtier::HandleShard,
+            LockOrderSubtier::InodeShard,
+            LockOrderSubtier::FileWriter,
+        ];
+
+        for held in subtiers {
+            for acquiring in subtiers {
+                assert_eq!(
+                    held.allows_nested_acquisition(acquiring),
+                    held == LockOrderSubtier::InodeShard
+                        && acquiring == LockOrderSubtier::FileWriter,
+                    "unexpected nested pair: {held:?} then {acquiring:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -443,6 +568,32 @@ mod tests {
     }
 
     #[test]
+    fn test_writer_subtier_out_of_order_release_reports_subtiers() {
+        let shard = LockOrderGuard::acquire_with_subtier(
+            LockTier::LocalDirty,
+            Some(LockOrderSubtier::InodeShard),
+        );
+        let file = LockOrderGuard::acquire_with_subtier(
+            LockTier::LocalDirty,
+            Some(LockOrderSubtier::FileWriter),
+        );
+
+        let captured = capture_warnings_while(|| {
+            drop(shard);
+            drop(file);
+        });
+        for field in [
+            "dropped_subtier=\"InodeShard\"",
+            "top_subtier=\"FileWriter\"",
+        ] {
+            assert!(
+                captured.split_whitespace().any(|token| token == field),
+                "missing {field}: {captured}"
+            );
+        }
+    }
+
+    #[test]
     fn test_missing_acquisition_warns_and_preserves_other_guards() {
         let remaining = LockOrderGuard::acquire(LockTier::Shutdown);
         let missing = LockOrderGuard::acquire(LockTier::Namespace);
@@ -484,6 +635,31 @@ mod tests {
         assert!(
             captured.trim().is_empty(),
             "expected no diagnostic, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn test_unranked_local_dirty_guards_keep_equal_tier_compatibility() {
+        let captured = capture_warnings_while(|| {
+            let plain = LockOrderGuard::acquire(LockTier::LocalDirty);
+            let writer = LockOrderGuard::acquire_with_subtier(
+                LockTier::LocalDirty,
+                Some(LockOrderSubtier::InodeShard),
+            );
+            drop(writer);
+            drop(plain);
+
+            let writer = LockOrderGuard::acquire_with_subtier(
+                LockTier::LocalDirty,
+                Some(LockOrderSubtier::FileWriter),
+            );
+            let plain = LockOrderGuard::acquire(LockTier::LocalDirty);
+            drop(plain);
+            drop(writer);
+        });
+        assert!(
+            captured.trim().is_empty(),
+            "expected unranked LocalDirty locks to retain equal-tier compatibility, got: {captured}"
         );
     }
 
@@ -536,7 +712,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Lock ordering violation")]
     fn test_lock_ordering_with_multiple_tiers() {
-        // Acquire Tier 1, then Tier 5
+        // Acquire Tier 1, then Tier 3 (Namespace)
         let _guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
         let _guard2 = LockOrderGuard::acquire(LockTier::Namespace);
         // Should NOT be able to acquire LocalDirty while holding Namespace.

@@ -2467,7 +2467,7 @@ enum ShutdownClaim {
 }
 
 struct ShutdownState {
-    shutdown_phase: Mutex<ShutdownPhase>,
+    shutdown_phase: OrderedMutex<ShutdownPhase>,
     mutating_operation_gate: tokio::sync::RwLock<()>,
     shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_final_drain_active: std::sync::atomic::AtomicBool,
@@ -2494,7 +2494,7 @@ pub(super) struct BackgroundCleanupThreadTask {
 impl ShutdownState {
     fn new() -> Self {
         Self {
-            shutdown_phase: Mutex::new(ShutdownPhase::Running),
+            shutdown_phase: OrderedMutex::new(ShutdownPhase::Running, LockTier::Shutdown),
             mutating_operation_gate: tokio::sync::RwLock::new(()),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_final_drain_active: std::sync::atomic::AtomicBool::new(false),
@@ -2526,12 +2526,20 @@ impl ShutdownState {
     }
 
     fn abort(&self) {
-        *self.shutdown_phase.lock() = ShutdownPhase::Aborted;
+        {
+            let mut phase = self.shutdown_phase.lock();
+            *phase = ShutdownPhase::Aborted;
+        }
+        // Drop the phase guard before waking waiters that may reacquire it.
         self.shutdown_notify.notify_waiters();
     }
 
     fn complete(&self, error: Option<ShutdownError>) {
-        *self.shutdown_phase.lock() = ShutdownPhase::Completed(error);
+        {
+            let mut phase = self.shutdown_phase.lock();
+            *phase = ShutdownPhase::Completed(error);
+        }
+        // Drop the phase guard before waking waiters that may reacquire it.
         self.shutdown_notify.notify_waiters();
     }
 }
