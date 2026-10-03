@@ -339,6 +339,25 @@ mod tests {
         assert_eq!(cloned.raw_os_error(), Some(raw_code));
     }
 
+    #[test]
+    fn cloned_overlay_size_mismatch_preserves_typed_error_and_sizes() {
+        use studiofs_data::object::ObjectError;
+
+        let error = VfsError::Object(ObjectError::SizeMismatch {
+            original_size: 10,
+            compressed_size: 11,
+            actual_size: usize::MAX,
+        });
+        assert!(matches!(
+            clone_overlay_batch_error(&error),
+            VfsError::Object(ObjectError::SizeMismatch {
+                original_size: 10,
+                compressed_size: 11,
+                actual_size: usize::MAX,
+            })
+        ));
+    }
+
     fn single_block_fixture(
         ino: Ino,
         block_index: u32,

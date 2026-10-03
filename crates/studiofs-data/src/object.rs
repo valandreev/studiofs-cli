@@ -61,7 +61,7 @@ pub enum ObjectError {
 
     /// An uncompressed payload does not match both declared header sizes.
     #[error(
-        "payload size mismatch: original {original_size}, compressed {compressed_size}, actual {actual_size}"
+        "payload size mismatch: original {original_size} bytes, compressed {compressed_size} bytes, actual {actual_size} bytes"
     )]
     SizeMismatch {
         /// Original payload size declared in the header.
@@ -371,13 +371,19 @@ pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     // Without compression, both header sizes must describe the actual payload.
     let payload_len = payload.len();
     if header.original_size != header.compressed_size
-        || header.compressed_size as usize != payload_len
+        || usize::try_from(header.compressed_size) != Ok(payload_len)
     {
         return Err(ObjectError::SizeMismatch {
             original_size: header.original_size,
             compressed_size: header.compressed_size,
             actual_size: payload_len,
         });
+    }
+
+    if header.compressed_size > MAX_OBJECT_SIZE {
+        return Err(ObjectError::ObjectTooLarge(u64::from(
+            header.compressed_size,
+        )));
     }
 
     // Verify checksum
@@ -646,20 +652,22 @@ mod tests {
                 Bytes::copy_from_slice(&header.to_bytes()),
                 Bytes::copy_from_slice(payload),
             ]);
-            let result = read_object(object);
-            assert!(
-                matches!(
-                    result,
-                    Err(ObjectError::SizeMismatch {
-                        original_size: original,
-                        compressed_size: compressed,
-                        actual_size,
-                    }) if original == original_size
-                        && compressed == compressed_size
-                        && actual_size == payload.len()
-                ),
-                "failed rejection for original_size={original_size}, compressed_size={compressed_size}: {result:?}"
-            );
+            for object in [object.clone(), Buffer::from(object.to_bytes())] {
+                let result = read_object(object);
+                assert!(
+                    matches!(
+                        result,
+                        Err(ObjectError::SizeMismatch {
+                            original_size: original,
+                            compressed_size: compressed,
+                            actual_size,
+                        }) if original == original_size
+                            && compressed == compressed_size
+                            && actual_size == payload.len()
+                    ),
+                    "failed rejection for original_size={original_size}, compressed_size={compressed_size}: {result:?}"
+                );
+            }
         }
     }
 
@@ -667,6 +675,22 @@ mod tests {
     fn test_empty_object_roundtrip() {
         let object = create_object_buffer(Bytes::new()).unwrap();
         assert!(read_object(object).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_object_rejects_oversized_checksummed_payload() {
+        // Share the allocation across chunks to keep this boundary fixture small.
+        let chunk = Bytes::from(vec![0xAB; 1024 * 1024]);
+        let mut chunks = vec![chunk; MAX_OBJECT_SIZE as usize / (1024 * 1024)];
+        chunks.push(Bytes::from_static(b"x"));
+        let payload = Buffer::from(chunks.clone());
+        let size = MAX_OBJECT_SIZE + 1;
+        let header = ObjectHeader::new(size, size, xxh64_buffer(&payload));
+        chunks.insert(0, Bytes::copy_from_slice(&header.to_bytes()));
+        assert!(matches!(
+            read_object(Buffer::from(chunks)),
+            Err(ObjectError::ObjectTooLarge(actual)) if actual == u64::from(size)
+        ));
     }
 
     #[test]
