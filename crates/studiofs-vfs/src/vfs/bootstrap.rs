@@ -1211,6 +1211,27 @@ mod tests {
     }
 
     #[test]
+    fn build_vfs_bootstrap_plan_rejects_tiny_block_size() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let mut format_info = test_format_info("bootstrap-tiny-block-size");
+        format_info.block_size = 1;
+
+        let error =
+            VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+                .expect_err("tiny block size should fail before bootstrap IO starts");
+
+        assert!(error.to_string().contains("minimum"));
+    }
+
+    #[test]
+    fn validate_volume_block_size_accepts_minimum_addressable_size() {
+        assert!(validate_volume_block_size(MIN_BLOCK_SIZE_BYTES).is_ok());
+        assert!(validate_volume_block_size(MIN_BLOCK_SIZE_BYTES - 1).is_err());
+    }
+
+    #[test]
     fn build_vfs_bootstrap_plan_clamps_local_backend_budget_for_tiny_cache() {
         let config: VfsConfigValidated = VfsConfig::default()
             .try_into()

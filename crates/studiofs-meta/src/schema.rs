@@ -21,8 +21,17 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 // Constants
 // =============================================================================
 
+/// Bytes in one mebibyte.
+pub const BYTES_PER_MIB: u32 = 1024 * 1024;
+/// Maximum whole-MiB block size representable by the persisted `u32` byte field.
+pub const MAX_BLOCK_SIZE_MIB: u32 = u32::MAX / BYTES_PER_MIB;
+/// Minimum addressable file range expected from `u32` block indexes.
+pub const MIN_PRACTICAL_ADDRESSABLE_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
+/// Minimum block size that supports the practical range with `u32` block indexes.
+pub const MIN_BLOCK_SIZE_BYTES: u32 =
+    MIN_PRACTICAL_ADDRESSABLE_BYTES.div_ceil(u32::MAX as u64) as u32;
 /// Default logical block size: 4 MiB.
-pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_BLOCK_SIZE: u32 = 4 * BYTES_PER_MIB;
 /// Default chunk size for the chunk/slice object graph: 64 MiB.
 ///
 /// Follow-up: promote this into persisted `FormatInfo` once chunk-size
@@ -1833,11 +1842,25 @@ pub enum FormatInfoError {
     /// A volume block size must be greater than zero.
     #[error("block size must be greater than zero")]
     ZeroBlockSize,
+    /// The block size does not provide the minimum addressable file range.
+    #[error(
+        "block size {block_size_bytes} bytes is below the minimum supported size of {minimum_bytes} bytes"
+    )]
+    BlockSizeBelowMinimum {
+        /// Requested block size in bytes.
+        block_size_bytes: u32,
+        /// Minimum block size in bytes.
+        minimum_bytes: u32,
+    },
     /// The requested MiB count cannot be represented as a `u32` byte count.
-    #[error("block size {block_size_mb} MiB exceeds the maximum representable size of 4095 MiB")]
+    #[error(
+        "block size {block_size_mb} MiB exceeds the maximum representable size of {max_block_size_mib} MiB"
+    )]
     BlockSizeOverflow {
         /// Requested block size in MiB.
         block_size_mb: u32,
+        /// Maximum whole-MiB size representable by the persisted byte field.
+        max_block_size_mib: u32,
     },
     /// Encryption configuration generation failed.
     #[error(transparent)]
@@ -1853,7 +1876,8 @@ impl FormatInfo {
     ///
     /// # Errors
     ///
-    /// Returns an error if the block size is zero, exceeds 4095 MiB, or
+    /// Returns an error if the block size is zero, exceeds
+    /// [`MAX_BLOCK_SIZE_MIB`], or
     /// encryption key generation fails.
     pub fn new(
         name: String,
@@ -1864,9 +1888,13 @@ impl FormatInfo {
         if block_size_mb == 0 {
             return Err(FormatInfoError::ZeroBlockSize);
         }
-        let block_size = block_size_mb
-            .checked_mul(1024 * 1024)
-            .ok_or(FormatInfoError::BlockSizeOverflow { block_size_mb })?;
+        let block_size =
+            block_size_mb
+                .checked_mul(BYTES_PER_MIB)
+                .ok_or(FormatInfoError::BlockSizeOverflow {
+                    block_size_mb,
+                    max_block_size_mib: MAX_BLOCK_SIZE_MIB,
+                })?;
         Ok(Self {
             format_version: CURRENT_FORMAT_VERSION,
             name,
@@ -1888,13 +1916,19 @@ impl FormatInfo {
         if self.block_size == 0 {
             return Err(FormatInfoError::ZeroBlockSize);
         }
+        if self.block_size < MIN_BLOCK_SIZE_BYTES {
+            return Err(FormatInfoError::BlockSizeBelowMinimum {
+                block_size_bytes: self.block_size,
+                minimum_bytes: MIN_BLOCK_SIZE_BYTES,
+            });
+        }
         self.encryption.validate()?;
         Ok(())
     }
 
     /// Get block size in MiB (for display purposes).
     pub fn block_size_mb(&self) -> u32 {
-        self.block_size / (1024 * 1024)
+        self.block_size / BYTES_PER_MIB
     }
 }
 
@@ -2392,8 +2426,10 @@ mod tests {
             );
             assert!(matches!(
                 result,
-                Err(FormatInfoError::BlockSizeOverflow { block_size_mb: found })
-                    if found == block_size_mb
+                Err(FormatInfoError::BlockSizeOverflow {
+                    block_size_mb: found,
+                    max_block_size_mib,
+                }) if found == block_size_mb && max_block_size_mib == MAX_BLOCK_SIZE_MIB
             ));
         }
     }
@@ -2412,6 +2448,38 @@ mod tests {
             assert_eq!(info.block_size_mb(), block_size_mb);
             assert!(info.validate_format_contract().is_ok());
         }
+    }
+
+    #[test]
+    fn format_info_validate_format_contract_rejects_tiny_block_size() {
+        let mut info = FormatInfo::new(
+            "volume".into(),
+            "uuid".into(),
+            test_format_info_data_store(),
+            1,
+        )
+        .expect("construct format info");
+        info.block_size = 1;
+
+        assert_eq!(
+            info.validate_format_contract(),
+            Err(FormatInfoError::BlockSizeBelowMinimum {
+                block_size_bytes: 1,
+                minimum_bytes: MIN_BLOCK_SIZE_BYTES,
+            })
+        );
+
+        info.block_size = MIN_BLOCK_SIZE_BYTES - 1;
+        assert!(matches!(
+            info.validate_format_contract(),
+            Err(FormatInfoError::BlockSizeBelowMinimum { .. })
+        ));
+
+        info.block_size = MIN_BLOCK_SIZE_BYTES;
+        assert!(info.validate_format_contract().is_ok());
+        assert!(
+            (u32::MAX as u64) * u64::from(MIN_BLOCK_SIZE_BYTES) >= MIN_PRACTICAL_ADDRESSABLE_BYTES
+        );
     }
 
     fn test_format_info_data_store() -> FormatInfoDataStore {
