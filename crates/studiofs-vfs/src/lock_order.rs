@@ -74,11 +74,16 @@
 //!
 //! # Usage
 //!
+//! Within VFS, prefer `OrderedMutex`: it registers the tier before locking and
+//! retains the validation guard until the mutex is released. `LockOrderGuard`
+//! provides the underlying tracking mechanism.
+//!
 //! ```rust,ignore
-//! // Before acquiring a lock, register the lock tier:
-//! let _guard = LockOrderGuard::acquire(LockTier::Namespace);
-//! // Now safe to acquire namespace lock
-//! let ns = self.state.namespace.lock();
+//! use crate::lock_order::LockTier;
+//! use crate::ordered_mutex::OrderedMutex;
+//!
+//! let namespace = OrderedMutex::new((), LockTier::Namespace);
+//! let ns = namespace.lock();
 //! ```
 
 use std::cell::{Cell, RefCell};
@@ -634,16 +639,22 @@ mod tests {
 
     #[test]
     fn test_middle_release_keeps_stack_consistent() {
+        let guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
+        let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
+        let guard3 = LockOrderGuard::acquire(LockTier::Namespace);
+        let dropped_id = guard2.id;
+        let top_id = guard3.id;
         let captured = capture_warnings_while(|| {
-            let guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
-            let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
-            let guard3 = LockOrderGuard::acquire(LockTier::Namespace);
-
             drop(guard2);
             assert_eq!(
                 debug_lock_stack(),
                 vec![LockTier::Shutdown, LockTier::Namespace]
             );
+            HELD_LOCKS.with(|held| {
+                let held = held.borrow();
+                assert_eq!(held[0].id, guard1.id);
+                assert_eq!(held[1].id, guard3.id);
+            });
             drop(guard3);
             assert_eq!(debug_lock_stack(), vec![LockTier::Shutdown]);
             drop(guard1);
@@ -656,6 +667,16 @@ mod tests {
             1,
             "expected exactly one out-of-order diagnostic, got: {captured}"
         );
+        for field in [
+            format!("dropped_id={dropped_id}"),
+            format!("top_id={top_id}"),
+            "stack_depth=3".to_owned(),
+        ] {
+            assert!(
+                captured.split_whitespace().any(|token| token == field),
+                "missing {field}: {captured}"
+            );
+        }
     }
 
     #[test]
