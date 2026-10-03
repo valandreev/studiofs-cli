@@ -614,6 +614,14 @@ Important families supported in code:
 - janitor/admin policy: `STUDIOFS_JANITOR_*`, `STUDIOFS_PG_*`
 - bridge-specific knobs: `STUDIOFS_WINFSP_*`
 
+`STUDIOFS_DEBUG_PENDING_PATH_SUFFIX` enables pending-upload diagnostics for
+matching inode paths. It is read once at mount/VFS construction; later environment
+changes have no effect on that VFS instance. Set it before mounting and recreate
+the mount/VFS to change or disable it. Unset, blank, and separator-only values
+disable the probe. Matching ignores ASCII case, treats `/` and `\` as equivalent,
+and accepts either a path suffix or the configured suffix's basename, even when
+the configured value includes directories.
+
 If an override is still needed regularly by ordinary operators, promote it to a
 documented CLI/config flag instead of teaching the whole env matrix again.
 

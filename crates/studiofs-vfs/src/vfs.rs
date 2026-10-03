@@ -874,7 +874,8 @@ impl DebugPendingPathSuffix {
     }
 
     fn matches_path(&self, path: &str) -> bool {
-        let normalized_path = path.replace('/', "\\").to_ascii_lowercase();
+        let mut normalized_path = path.replace('/', "\\");
+        normalized_path.make_ascii_lowercase();
         let trimmed_path = normalized_path.trim_end_matches('\\');
         let basename = trimmed_path.rsplit('\\').next().unwrap_or("");
         trimmed_path.ends_with(&self.normalized_suffix) || basename == self.normalized_basename
