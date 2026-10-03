@@ -74,9 +74,9 @@
 //!
 //! # Usage
 //!
-//! Within VFS, prefer `OrderedMutex`: it registers the tier before locking and
-//! retains the validation guard until the mutex is released. `LockOrderGuard`
-//! provides the underlying tracking mechanism.
+//! Within VFS, prefer [`OrderedMutex`](crate::OrderedMutex): it registers the
+//! tier before locking and retains the validation guard until the mutex is
+//! released. `LockOrderGuard` provides the underlying tracking mechanism.
 //!
 //! ```rust
 //! use studiofs_vfs::{LockTier, OrderedMutex};
