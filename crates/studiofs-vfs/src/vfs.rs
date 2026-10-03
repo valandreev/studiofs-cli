@@ -837,6 +837,7 @@ const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 800 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 800 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 
+/// Cached ASCII-case-insensitive path suffix for pending-upload diagnostics.
 #[derive(Debug)]
 struct DebugPendingPathSuffix {
     normalized_suffix: String,
@@ -855,12 +856,15 @@ impl DebugPendingPathSuffix {
             return None;
         }
 
-        let normalized_suffix = suffix.replace('/', "\\").to_ascii_lowercase();
+        let mut normalized_suffix = suffix.replace('/', "\\").to_ascii_lowercase();
+        normalized_suffix.truncate(normalized_suffix.trim_end_matches('\\').len());
+        if normalized_suffix.is_empty() {
+            return None;
+        }
         let normalized_basename = normalized_suffix
-            .trim_end_matches('\\')
             .rsplit('\\')
             .next()
-            .unwrap_or(normalized_suffix.as_str())
+            .unwrap_or("")
             .to_owned();
 
         Some(Self {
@@ -871,8 +875,9 @@ impl DebugPendingPathSuffix {
 
     fn matches_path(&self, path: &str) -> bool {
         let normalized_path = path.replace('/', "\\").to_ascii_lowercase();
-        let basename = normalized_path.rsplit('\\').next().unwrap_or("");
-        normalized_path.ends_with(&self.normalized_suffix) || basename == self.normalized_basename
+        let trimmed_path = normalized_path.trim_end_matches('\\');
+        let basename = trimmed_path.rsplit('\\').next().unwrap_or("");
+        trimmed_path.ends_with(&self.normalized_suffix) || basename == self.normalized_basename
     }
 }
 

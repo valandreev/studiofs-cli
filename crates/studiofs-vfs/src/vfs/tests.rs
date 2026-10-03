@@ -2088,12 +2088,38 @@ fn make_test_vfs_with_config(
 fn debug_pending_path_suffix_filters_by_normalized_suffix_and_basename() {
     assert!(DebugPendingPathSuffix::new("").is_none());
     assert!(DebugPendingPathSuffix::new(" \t ").is_none());
+    assert!(DebugPendingPathSuffix::new("/").is_none());
+    assert!(DebugPendingPathSuffix::new("\\").is_none());
+    assert!(DebugPendingPathSuffix::new("\\\\").is_none());
+    assert!(DebugPendingPathSuffix::new("//").is_none());
 
     let filter = DebugPendingPathSuffix::new("C:/previous/TARGET.TXT")
         .expect("parse enabled diagnostic filter");
     assert!(filter.matches_path("c:\\previous\\target.txt"));
+    assert!(filter.matches_path("C:/previous/target.txt/"));
     assert!(filter.matches_path("D:/other/TARGET.TXT"));
+    assert!(filter.matches_path("D:/other/TARGET.TXT/"));
+    assert!(!filter.matches_path("\\"));
     assert!(!filter.matches_path("D:/other/other.txt"));
+}
+
+#[test]
+fn vfs_debug_pending_target_path_matches_configured_inode() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "debug-pending-target-path");
+    let attr = vfs
+        .create(ROOT_INO, b"target.txt", 1000, 1000, 0o644)
+        .expect("create target file");
+
+    assert!(vfs.debug_pending_target_path(ROOT_INO).is_none());
+    let expected_path = vfs
+        .best_effort_path_for_inode(attr.ino)
+        .expect("resolve target path");
+    Arc::get_mut(&mut vfs)
+        .expect("fixture has one VFS owner")
+        .debug_pending_path_suffix = DebugPendingPathSuffix::new("target.txt");
+
+    assert_eq!(vfs.debug_pending_target_path(attr.ino), Some(expected_path));
 }
 
 #[test]
