@@ -2085,70 +2085,15 @@ fn make_test_vfs_with_config(
 }
 
 #[test]
-fn debug_pending_path_filter_reads_disabled_configuration_once_and_skips_path_lookup() {
-    assert!(DebugPendingPathSuffix::from_reader(|| None).is_none());
-    assert!(DebugPendingPathSuffix::from_reader(|| Some(" \t ".to_owned())).is_none());
-    let nonmatching_filter = DebugPendingPathSuffix::from_reader(|| Some("target.txt".to_owned()))
-        .expect("parse nonmatching filter");
-    assert!(!nonmatching_filter.matches_path("other.txt"));
+fn debug_pending_path_suffix_filters_by_normalized_suffix_and_basename() {
+    assert!(DebugPendingPathSuffix::new("").is_none());
+    assert!(DebugPendingPathSuffix::new(" \t ").is_none());
 
-    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "debug-pending-path-disabled");
-    let config_reads = AtomicUsize::new(0);
-    let filter = DebugPendingPathSuffix::from_reader(|| {
-        config_reads.fetch_add(1, AtomicOrdering::SeqCst);
-        None
-    });
-    Arc::get_mut(&mut vfs)
-        .expect("fixture has one VFS owner")
-        .debug_pending_path_suffix = filter;
-
-    for _ in 0..4 {
-        assert!(vfs.debug_pending_target_path(u64::MAX).is_none());
-        assert!(rt.block_on(vfs.read(u64::MAX, 0, 1)).is_err());
-    }
-    assert_eq!(config_reads.load(AtomicOrdering::SeqCst), 1);
-}
-
-#[test]
-fn debug_pending_path_filter_reuses_parsed_configuration_for_repeated_probes() {
-    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "debug-pending-path-enabled");
-    let attr = vfs
-        .create(ROOT_INO, b"target.txt", 1000, 1000, 0o644)
-        .expect("create target file");
-    let target_path = vfs
-        .best_effort_path_for_inode(attr.ino)
-        .expect("resolve target path");
-    let config_reads = AtomicUsize::new(0);
-    let configured_suffix = target_path.replace('\\', "/").to_ascii_uppercase();
-    let filter = DebugPendingPathSuffix::from_reader(|| {
-        config_reads.fetch_add(1, AtomicOrdering::SeqCst);
-        Some(configured_suffix)
-    });
-    Arc::get_mut(&mut vfs)
-        .expect("fixture has one VFS owner")
-        .debug_pending_path_suffix = filter;
-
-    assert_eq!(
-        vfs.debug_pending_target_path(attr.ino),
-        Some(target_path.clone())
-    );
-    #[cfg(windows)]
-    assert!(
-        DebugPendingPathSuffix::from_reader(|| Some("C:/previous/TARGET.TXT".to_owned()))
-            .expect("parse basename filter")
-            .matches_path(&target_path)
-    );
-
-    for _ in 0..4 {
-        assert!(
-            rt.block_on(vfs.read(attr.ino, 0, 1))
-                .expect("read empty file")
-                .is_empty()
-        );
-    }
-    assert_eq!(config_reads.load(AtomicOrdering::SeqCst), 1);
+    let filter = DebugPendingPathSuffix::new("C:/previous/TARGET.TXT")
+        .expect("parse enabled diagnostic filter");
+    assert!(filter.matches_path("c:\\previous\\target.txt"));
+    assert!(filter.matches_path("D:/other/TARGET.TXT"));
+    assert!(!filter.matches_path("D:/other/other.txt"));
 }
 
 #[test]

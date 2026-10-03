@@ -845,11 +845,11 @@ struct DebugPendingPathSuffix {
 
 impl DebugPendingPathSuffix {
     fn from_env() -> Option<Self> {
-        Self::from_reader(|| std::env::var(DEBUG_PENDING_PATH_SUFFIX_ENV).ok())
+        let suffix = std::env::var(DEBUG_PENDING_PATH_SUFFIX_ENV).ok()?;
+        Self::new(&suffix)
     }
 
-    fn from_reader(read: impl FnOnce() -> Option<String>) -> Option<Self> {
-        let suffix = read()?;
+    fn new(suffix: &str) -> Option<Self> {
         let suffix = suffix.trim();
         if suffix.is_empty() {
             return None;
@@ -871,10 +871,7 @@ impl DebugPendingPathSuffix {
 
     fn matches_path(&self, path: &str) -> bool {
         let normalized_path = path.replace('/', "\\").to_ascii_lowercase();
-        let basename = Path::new(&normalized_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
+        let basename = normalized_path.rsplit('\\').next().unwrap_or("");
         normalized_path.ends_with(&self.normalized_suffix) || basename == self.normalized_basename
     }
 }
