@@ -74,11 +74,15 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! // Before acquiring a lock, register the lock tier:
-//! let _guard = LockOrderGuard::acquire(LockTier::Namespace);
-//! // Now safe to acquire namespace lock
-//! let ns = self.state.namespace.lock();
+//! Within VFS, prefer [`OrderedMutex`](crate::OrderedMutex): it registers the
+//! tier before locking and retains the validation guard until the mutex is
+//! released. `LockOrderGuard` provides the underlying tracking mechanism.
+//!
+//! ```rust
+//! use studiofs_vfs::{LockTier, OrderedMutex};
+//!
+//! let namespace = OrderedMutex::new((), LockTier::Namespace);
+//! let _ns = namespace.lock();
 //! ```
 
 use std::cell::{Cell, RefCell};
@@ -263,8 +267,8 @@ impl LockOrderGuard {
             let mut held = held.borrow_mut();
             let id = next_lock_id();
 
-            // Check every held acquisition: unchecked or warned acquisitions
-            // can leave the stack's tiers out of order.
+            // Check every held acquisition: warned acquisitions can leave the
+            // stack's tiers out of order.
             let violating_lock = held
                 .iter()
                 .rfind(|held_lock| {
@@ -299,39 +303,6 @@ impl LockOrderGuard {
             LockOrderGuard {
                 tier,
                 subtier,
-                id,
-                pushed: true,
-                _marker: PhantomData,
-            }
-        })
-    }
-
-    /// Acquire without validation (for dynamic/conditional locking).
-    ///
-    /// Use this when lock ordering cannot be statically determined.
-    /// The caller is responsible for ensuring correct ordering.
-    /// This acquisition is still tracked and checked by later calls to `acquire`.
-    pub fn acquire_unchecked(tier: LockTier) -> Self {
-        if !is_validation_enabled() {
-            return LockOrderGuard {
-                tier,
-                subtier: None,
-                id: 0,
-                pushed: false,
-                _marker: PhantomData,
-            };
-        }
-
-        HELD_LOCKS.with(|held| {
-            let id = next_lock_id();
-            held.borrow_mut().push(HeldLock {
-                tier,
-                subtier: None,
-                id,
-            });
-            LockOrderGuard {
-                tier,
-                subtier: None,
                 id,
                 pushed: true,
                 _marker: PhantomData,
@@ -458,9 +429,11 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "while holding Upload (tier 5)")]
-    fn test_checked_acquire_rejects_older_tier_after_unchecked_acquire() {
-        let _guard1 = LockOrderGuard::acquire(LockTier::Upload);
-        let _guard2 = LockOrderGuard::acquire_unchecked(LockTier::Shutdown);
+    fn test_checked_acquire_rejects_older_tier_in_disordered_stack() {
+        let _guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
+        let _guard2 = LockOrderGuard::acquire(LockTier::Upload);
+        // Simulate the disordered stack left by a warned production acquisition.
+        HELD_LOCKS.with(|held| held.borrow_mut().swap(0, 1));
         let _guard3 = LockOrderGuard::acquire(LockTier::Namespace);
     }
 
@@ -663,17 +636,23 @@ mod tests {
     }
 
     #[test]
-    fn test_unchecked_middle_release_keeps_stack_consistent() {
+    fn test_middle_release_keeps_stack_consistent() {
+        let guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
+        let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
+        let guard3 = LockOrderGuard::acquire(LockTier::Namespace);
+        let dropped_id = guard2.id;
+        let top_id = guard3.id;
         let captured = capture_warnings_while(|| {
-            let guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
-            let guard2 = LockOrderGuard::acquire_unchecked(LockTier::Namespace);
-            let guard3 = LockOrderGuard::acquire_unchecked(LockTier::Namespace);
-
             drop(guard2);
             assert_eq!(
                 debug_lock_stack(),
                 vec![LockTier::Shutdown, LockTier::Namespace]
             );
+            HELD_LOCKS.with(|held| {
+                let held = held.borrow();
+                assert_eq!(held[0].id, guard1.id);
+                assert_eq!(held[1].id, guard3.id);
+            });
             drop(guard3);
             assert_eq!(debug_lock_stack(), vec![LockTier::Shutdown]);
             drop(guard1);
@@ -686,6 +665,18 @@ mod tests {
             1,
             "expected exactly one out-of-order diagnostic, got: {captured}"
         );
+        for field in [
+            "dropped_tier=\"Namespace\"".to_owned(),
+            format!("dropped_id={dropped_id}"),
+            "top_tier=\"Namespace\"".to_owned(),
+            format!("top_id={top_id}"),
+            "stack_depth=3".to_owned(),
+        ] {
+            assert!(
+                captured.split_whitespace().any(|token| token == field),
+                "missing {field}: {captured}"
+            );
+        }
     }
 
     #[test]
