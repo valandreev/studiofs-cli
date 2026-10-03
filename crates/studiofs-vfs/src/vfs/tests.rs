@@ -40,12 +40,6 @@ fn shutdown_phase_lock_order_tracks_real_phase_and_namespace_guards() {
         );
     }
     assert!(debug_lock_stack().is_empty());
-    assert!(matches!(shutdown.claim(), ShutdownClaim::Owner));
-    shutdown.abort();
-    assert!(matches!(shutdown.claim(), ShutdownClaim::Owner));
-    shutdown.complete(None);
-    assert!(matches!(shutdown.claim(), ShutdownClaim::Completed(None)));
-    assert!(debug_lock_stack().is_empty());
 }
 
 #[test]

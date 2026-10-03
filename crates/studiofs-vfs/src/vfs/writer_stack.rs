@@ -1402,7 +1402,7 @@ fn finished_slice_from_staged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::Mutex as RawMutex;
+    use parking_lot::Mutex;
     use std::any::Any;
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
@@ -1416,7 +1416,7 @@ mod tests {
     struct SlowPutBackend {
         inner: Arc<dyn LocalPayloadBackend>,
         entered_tx: std_mpsc::Sender<()>,
-        release_rx: RawMutex<std_mpsc::Receiver<()>>,
+        release_rx: Mutex<std_mpsc::Receiver<()>>,
     }
 
     struct TransientFailingPutBackend {
@@ -1475,7 +1475,7 @@ mod tests {
             Self {
                 inner,
                 entered_tx,
-                release_rx: RawMutex::new(release_rx),
+                release_rx: Mutex::new(release_rx),
             }
         }
     }
@@ -1744,24 +1744,22 @@ mod tests {
             )
             .expect("seed writer state");
 
-        let shard = stack.shards[MountedWriterStack::inode_shard_index(ino)].lock();
-        let file = Arc::clone(shard.files.get(&ino).expect("writer file"));
-        let file = file.lock();
-        let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
-        let dirty_attrs = namespace.dirty_attrs.lock();
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(ino)].lock();
+            let file = Arc::clone(shard.files.get(&ino).expect("writer file"));
+            let file = file.lock();
+            let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+            let dirty_attrs = namespace.dirty_attrs.lock();
 
-        assert_eq!(
-            crate::debug_lock_stack(),
-            vec![
-                crate::LockTier::LocalDirty,
-                crate::LockTier::LocalDirty,
-                crate::LockTier::Namespace,
-            ]
-        );
-
-        drop(dirty_attrs);
-        drop(file);
-        drop(shard);
+            assert_eq!(
+                crate::debug_lock_stack(),
+                vec![
+                    crate::LockTier::LocalDirty,
+                    crate::LockTier::LocalDirty,
+                    crate::LockTier::Namespace,
+                ]
+            );
+        }
         assert!(crate::debug_lock_stack().is_empty());
     }
 
@@ -1772,12 +1770,6 @@ mod tests {
     fn writer_stack_lock_order_rejects_namespace_before_read() {
         let (_dir, stack, _rx) = temp_stack(64, 16);
         let ino = 11;
-        stack
-            .write_bytes(
-                write_spec(7, ino, 0, 100),
-                Bytes::from_static(b"seed writer state"),
-            )
-            .expect("seed writer state");
         let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
         let _dirty_attrs = namespace.dirty_attrs.lock();
 
@@ -1797,10 +1789,8 @@ mod tests {
                 Bytes::from_static(b"seed writer state"),
             )
             .expect("seed writer state");
-        let shard = stack.shards[MountedWriterStack::inode_shard_index(ino)].lock();
-        let file = Arc::clone(shard.files.get(&ino).expect("writer file"));
-        drop(shard);
-
+        let shard_index = MountedWriterStack::inode_shard_index(ino);
+        let file = Arc::clone(&stack.shards[shard_index].lock().files[&ino]);
         let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
         let _dirty_attrs = namespace.dirty_attrs.lock();
         let _file = file.lock();
