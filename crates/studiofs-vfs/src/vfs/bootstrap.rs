@@ -401,11 +401,11 @@ struct VfsBootstrap {
     snapshot_mount_fence: Option<SnapshotMountFence>,
 }
 
-pub(super) struct VfsBootstrapOptions {
-    pub(super) cache_runtime: Option<PreparedLocalPayloadRuntime>,
-    pub(super) debug_pending_path_suffix_reader: fn() -> Option<DebugPendingPathSuffix>,
-    pub(super) read_only_mount: bool,
-    pub(super) snapshot_mount_fence: Option<SnapshotMountFence>,
+struct VfsBootstrapOptions {
+    cache_runtime: Option<PreparedLocalPayloadRuntime>,
+    debug_pending_path_suffix_reader: fn() -> Option<DebugPendingPathSuffix>,
+    read_only_mount: bool,
+    snapshot_mount_fence: Option<SnapshotMountFence>,
 }
 
 impl VfsBootstrap {
@@ -808,7 +808,7 @@ impl StudioVfs {
         )
     }
 
-    pub(super) fn new_impl<M>(
+    fn new_impl<M>(
         meta: Arc<M>,
         data_config: &DataStoreConfig,
         cache_dir: &str,
@@ -830,6 +830,35 @@ impl StudioVfs {
             options,
         )?
         .finish()
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_debug_pending_path_suffix_reader<M>(
+        meta: Arc<M>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        memory_cache_budget_bytes: u64,
+        config: VfsConfigValidated,
+        debug_pending_path_suffix_reader: fn() -> Option<DebugPendingPathSuffix>,
+    ) -> VfsResult<Arc<Self>>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
+        Self::new_impl(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            memory_cache_budget_bytes,
+            config,
+            VfsBootstrapOptions {
+                cache_runtime: None,
+                debug_pending_path_suffix_reader,
+                read_only_mount: false,
+                snapshot_mount_fence: None,
+            },
+        )
     }
 }
 

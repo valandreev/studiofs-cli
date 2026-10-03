@@ -619,8 +619,11 @@ matching inode paths. It is read once at mount/VFS construction; later environme
 changes have no effect on that VFS instance. Set it before mounting and recreate
 the mount/VFS to change or disable it. Unset, blank, and separator-only values
 disable the probe. Matching ignores ASCII case, treats `/` and `\` as equivalent,
-and accepts either a path suffix or the configured suffix's basename, even when
-the configured value includes directories.
+and compares a raw string suffix or the configured suffix's basename, even when
+the configured value includes directories. The suffix comparison has no path
+component boundary: `target.txt` also matches `mytarget.txt`. See
+[`DebugPendingPathSuffix`](../crates/studiofs-vfs/src/vfs.rs) for the matching
+implementation.
 
 If an override is still needed regularly by ordinary operators, promote it to a
 documented CLI/config flag instead of teaching the whole env matrix again.

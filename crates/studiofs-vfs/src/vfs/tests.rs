@@ -2040,20 +2040,17 @@ fn make_unstarted_test_vfs_with_optional_debug_pending_path_reader(
     let cache_dir = cache_dir.to_str().expect("cache dir str");
     let config = cfg.try_into().expect("test VFS config should validate");
     let vfs = match debug_pending_path_suffix_reader {
-        Some(debug_pending_path_suffix_reader) => StudioVfs::new_impl(
-            meta.clone(),
-            &data_config,
-            cache_dir,
-            64 * 1024 * 1024,
-            32 * 1024 * 1024,
-            config,
-            super::bootstrap::VfsBootstrapOptions {
-                cache_runtime: None,
+        Some(debug_pending_path_suffix_reader) => {
+            StudioVfs::new_with_debug_pending_path_suffix_reader(
+                meta.clone(),
+                &data_config,
+                cache_dir,
+                64 * 1024 * 1024,
+                32 * 1024 * 1024,
+                config,
                 debug_pending_path_suffix_reader,
-                read_only_mount: false,
-                snapshot_mount_fence: None,
-            },
-        ),
+            )
+        }
         None => StudioVfs::new(
             meta.clone(),
             &data_config,
