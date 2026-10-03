@@ -263,8 +263,8 @@ impl LockOrderGuard {
             let mut held = held.borrow_mut();
             let id = next_lock_id();
 
-            // Check every held acquisition: unchecked or warned acquisitions
-            // can leave the stack's tiers out of order.
+            // Check every held acquisition: warned acquisitions can leave the
+            // stack's tiers out of order.
             let violating_lock = held
                 .iter()
                 .rfind(|held_lock| {
@@ -300,39 +300,6 @@ impl LockOrderGuard {
             LockOrderGuard {
                 tier,
                 subtier,
-                id,
-                pushed: true,
-                _marker: PhantomData,
-            }
-        })
-    }
-
-    /// Acquire without validation (for dynamic/conditional locking).
-    ///
-    /// Use this when lock ordering cannot be statically determined.
-    /// The caller is responsible for ensuring correct ordering.
-    /// This acquisition is still tracked and checked by later calls to `acquire`.
-    pub fn acquire_unchecked(tier: LockTier) -> Self {
-        if !is_validation_enabled() {
-            return LockOrderGuard {
-                tier,
-                subtier: None,
-                id: 0,
-                pushed: false,
-                _marker: PhantomData,
-            };
-        }
-
-        HELD_LOCKS.with(|held| {
-            let id = next_lock_id();
-            held.borrow_mut().push(HeldLock {
-                tier,
-                subtier: None,
-                id,
-            });
-            LockOrderGuard {
-                tier,
-                subtier: None,
                 id,
                 pushed: true,
                 _marker: PhantomData,
@@ -459,9 +426,11 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "while holding Upload (tier 5)")]
-    fn test_checked_acquire_rejects_older_tier_after_unchecked_acquire() {
-        let _guard1 = LockOrderGuard::acquire(LockTier::Upload);
-        let _guard2 = LockOrderGuard::acquire_unchecked(LockTier::Shutdown);
+    fn test_checked_acquire_rejects_older_tier_in_disordered_stack() {
+        let _guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
+        let _guard2 = LockOrderGuard::acquire(LockTier::Upload);
+        // Simulate the disordered stack left by a warned production acquisition.
+        HELD_LOCKS.with(|held| held.borrow_mut().swap(0, 1));
         let _guard3 = LockOrderGuard::acquire(LockTier::Namespace);
     }
 
@@ -664,11 +633,11 @@ mod tests {
     }
 
     #[test]
-    fn test_unchecked_middle_release_keeps_stack_consistent() {
+    fn test_middle_release_keeps_stack_consistent() {
         let captured = capture_warnings_while(|| {
             let guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
-            let guard2 = LockOrderGuard::acquire_unchecked(LockTier::Namespace);
-            let guard3 = LockOrderGuard::acquire_unchecked(LockTier::Namespace);
+            let guard2 = LockOrderGuard::acquire(LockTier::Namespace);
+            let guard3 = LockOrderGuard::acquire(LockTier::Namespace);
 
             drop(guard2);
             assert_eq!(
