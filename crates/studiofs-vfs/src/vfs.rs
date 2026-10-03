@@ -2467,7 +2467,7 @@ enum ShutdownClaim {
 }
 
 struct ShutdownState {
-    shutdown_phase: Mutex<ShutdownPhase>,
+    shutdown_phase: OrderedMutex<ShutdownPhase>,
     mutating_operation_gate: tokio::sync::RwLock<()>,
     shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown_final_drain_active: std::sync::atomic::AtomicBool,
@@ -2494,7 +2494,7 @@ pub(super) struct BackgroundCleanupThreadTask {
 impl ShutdownState {
     fn new() -> Self {
         Self {
-            shutdown_phase: Mutex::new(ShutdownPhase::Running),
+            shutdown_phase: OrderedMutex::new(ShutdownPhase::Running, LockTier::Shutdown),
             mutating_operation_gate: tokio::sync::RwLock::new(()),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_final_drain_active: std::sync::atomic::AtomicBool::new(false),

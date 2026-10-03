@@ -129,14 +129,29 @@ Access pattern: use `self.state.<subsystem>.<field>` instead of direct monolithi
 
 Higher priority (lower tier number) must be acquired first:
 
-1. `ShutdownState`
-2. Writer/cache dirty-state owners
+1. `ShutdownState` phase and synchronous task ownership (`LockTier::Shutdown`)
+2. Writer/cache dirty-state owners (`LockTier::LocalDirty`): mounted writer
+   inode shards, handle shards, per-file state, and `local_dirty` bookkeeping
 3. `NamespaceState`
 4. `IncarnationState`
 5. `UploadState`
 6. `AclState`
 7. `FileLockState`
 8. `MetricsState`
+
+Participating synchronous VFS mutexes use `OrderedMutex` so validation observes
+their actual guard lifetime. Within tier 2, the mounted writer stack nests inode
+shard before per-file state. Handle shards are released before inode shards;
+per-file guards are released before shard reacquisition and detached payload
+staging. Equal-tier acquisition is accepted by the validator, so this internal
+order is enforced by the acquisition scopes. Ordinary writer/namespace phases
+and shutdown draining release their synchronous guards between phases; never
+hold them across `await`.
+
+Async admission and metadata-sync locks are outside the thread-local validator.
+Independent cached-store internals, payload gates, and handle-table coordination
+retain their specific ordering rules documented in `lock_order.rs`; do not wrap
+them merely to increase the instrumented-lock count.
 
 ## Local-only durability contracts
 

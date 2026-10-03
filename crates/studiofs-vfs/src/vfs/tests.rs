@@ -25,6 +25,39 @@ use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
 #[test]
+fn shutdown_phase_lock_order_tracks_real_phase_and_namespace_guards() {
+    use crate::lock_order::debug_lock_stack;
+
+    let shutdown = ShutdownState::new();
+    let namespace = NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+    {
+        let _phase = shutdown.shutdown_phase.lock();
+        assert_eq!(debug_lock_stack(), vec![LockTier::Shutdown]);
+        let _attrs = namespace.dirty_attrs.lock();
+        assert_eq!(
+            debug_lock_stack(),
+            vec![LockTier::Shutdown, LockTier::Namespace]
+        );
+    }
+    assert!(debug_lock_stack().is_empty());
+    assert!(matches!(shutdown.claim(), ShutdownClaim::Owner));
+    shutdown.abort();
+    assert!(matches!(shutdown.claim(), ShutdownClaim::Owner));
+    shutdown.complete(None);
+    assert!(matches!(shutdown.claim(), ShutdownClaim::Completed(None)));
+    assert!(debug_lock_stack().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "trying to acquire Shutdown (tier 1) while holding Namespace (tier 3)")]
+fn shutdown_phase_lock_order_rejects_namespace_before_claim() {
+    let shutdown = ShutdownState::new();
+    let namespace = NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
+    let _attrs = namespace.dirty_attrs.lock();
+    let _claim = shutdown.claim();
+}
+
+#[test]
 fn startup_panic_guard_converts_prewarm_panic_to_error() {
     let result = catch_startup_panic(|| -> VfsResult<()> {
         panic!("linux prewarm panic");

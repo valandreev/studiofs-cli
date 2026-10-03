@@ -8,14 +8,24 @@
 //!
 //! # Lock Ordering (Tier 1 = highest priority)
 //!
-//! 1.  `ShutdownState` — shutdown flags
-//! 2.  `local_dirty` subsystem — pending local dirty-state bookkeeping
+//! 1.  `ShutdownState` — shutdown phase and synchronous task ownership
+//! 2.  Writer/cache dirty-state owners — mounted writer shards/files and
+//!     `local_dirty` bookkeeping (`LockTier::LocalDirty`)
 //! 3.  `NamespaceState` — dentry/attr caches
 //! 4.  `IncarnationState` — inode incarnation tracking
 //! 5.  `UploadState` — upload queue and cancellations
 //! 6.  `AclState` — ACL state
 //! 7.  `FileLockState` — file locks
 //! 8.  `MetricsState` — metrics (rarely needs locking)
+//!
+//! Mounted writer inode shards, handle shards, and per-file state use tier 2.
+//! Within that tier, nested acquisitions follow inode shard -> file. Handle
+//! shards are released before acquiring inode shards, and file guards are
+//! released before reacquiring a shard or staging detached payloads. Equal
+//! tiers are accepted by the validator; the shard/file order is enforced by
+//! these acquisition scopes. Ordinary writer and namespace operations release
+//! their guards between phases. Synchronous guards must not cross an await;
+//! async admission and metadata-sync locks are outside thread-local validation.
 //!
 //! When nesting the sustained-write tracker with `HandleTable`, acquire the
 //! tracker mutex before reading or mutating the handle table. Writer opens use
@@ -78,9 +88,10 @@ use tracing::warn;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum LockTier {
-    /// Tier 1: ShutdownState
+    /// Tier 1: shutdown phase and synchronous task ownership.
     Shutdown = 1,
-    /// Tier 2: `local_dirty` subsystem
+    /// Tier 2: writer/cache dirty-state owners, including mounted writer
+    /// inode/handle shards, per-file state, and `local_dirty` bookkeeping.
     LocalDirty = 2,
     /// Tier 3: NamespaceState
     Namespace = 3,
