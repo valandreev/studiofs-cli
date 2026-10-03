@@ -186,8 +186,9 @@ use studiofs_meta::engine::{
     MetadataAuthorityStatus, PgSyncDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason,
 };
 use studiofs_meta::schema::{
-    ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass,
-    ROOT_INO, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
+    ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, FormatInfoError, InodeLifecycleState,
+    MAX_SUPPORTED_BLOCK_SIZE_BYTES, MIN_BLOCK_SIZE_BYTES, PayloadRetentionClass, ROOT_INO,
+    ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
     UploadState as MetaUploadState, chunk_id_from_offset, chunk_start_offset,
 };
 use studiofs_meta::types::{
@@ -202,6 +203,10 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+// Every block size allowed by metadata must fit in the cloud-fragment layout.
+const _: () =
+    assert!(MAX_SUPPORTED_BLOCK_SIZE_BYTES as usize <= CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT);
 
 /// Maximum number of runtime events retained for VFS diagnostics.
 pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
@@ -3639,12 +3644,23 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
             "volume block_size 0 is invalid; block_size must be non-zero".to_string(),
         ));
     }
-    let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
-    if (block_size as usize) > cloud_logical_block_capacity {
-        return Err(VfsError::Other(format!(
-            "volume block_size {} exceeds 4x4 cloud fragment capacity {} ({} fragments x {} bytes)",
-            block_size, cloud_logical_block_capacity, CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE
-        )));
+    if block_size < MIN_BLOCK_SIZE_BYTES {
+        return Err(
+            MetaError::InvalidFormatConfig(FormatInfoError::BlockSizeBelowMinimum {
+                block_size_bytes: block_size,
+                minimum_bytes: MIN_BLOCK_SIZE_BYTES,
+            })
+            .into(),
+        );
+    }
+    if block_size > MAX_SUPPORTED_BLOCK_SIZE_BYTES {
+        return Err(
+            MetaError::InvalidFormatConfig(FormatInfoError::BlockSizeAboveMaximum {
+                block_size_bytes: block_size,
+                maximum_bytes: MAX_SUPPORTED_BLOCK_SIZE_BYTES,
+            })
+            .into(),
+        );
     }
     Ok(())
 }
@@ -3673,26 +3689,6 @@ fn drain_lag_pacing_attribution_ms(
     let denominator = u128::from(requested_delay_ms);
     let attributed_ms = numerator.div_ceil(denominator);
     Some(attributed_ms.min(u128::from(u64::MAX)) as u64)
-}
-
-fn warn_small_block_addressability(block_size: u32) {
-    let block_size_nonzero = block_size.max(1) as u128;
-    const MIN_PRACTICAL_ADDRESSABLE_BYTES: u128 = 64u128 * 1024 * 1024 * 1024 * 1024;
-    let max_addressable_bytes = (u32::MAX as u128).saturating_mul(block_size_nonzero);
-    debug_assert!(
-        max_addressable_bytes >= MIN_PRACTICAL_ADDRESSABLE_BYTES,
-        "configured block_size={} yields only {} addressable bytes with u32 block indices",
-        block_size_nonzero,
-        max_addressable_bytes
-    );
-    if max_addressable_bytes < MIN_PRACTICAL_ADDRESSABLE_BYTES {
-        warn!(
-            block_size,
-            max_addressable_bytes,
-            min_recommended = MIN_PRACTICAL_ADDRESSABLE_BYTES,
-            "small block_size reduces max file addressability with u32 block indices"
-        );
-    }
 }
 
 fn derive_buffer_blocks_default(read_buffer_mb: u64, block_size: u32) -> u32 {

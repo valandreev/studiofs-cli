@@ -327,6 +327,103 @@ mod tests {
     }
 
     #[test]
+    fn format_info_decode_rejects_zero_block_size() {
+        let mut info = FormatInfo::new(
+            "volume".to_string(),
+            "volume-uuid".to_string(),
+            FormatInfoDataStore {
+                endpoint: String::new(),
+                bucket: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+                region: String::new(),
+            },
+            1,
+        )
+        .expect("construct format info");
+        info.block_size = 0;
+        let bytes = serde_json::to_vec(&info).expect("serialize format info");
+
+        assert!(matches!(
+            decode_format_info(&bytes),
+            Err(MetaError::InvalidFormatConfig(
+                FormatInfoError::ZeroBlockSize
+            ))
+        ));
+    }
+
+    #[test]
+    fn format_info_decode_rejects_tiny_nonzero_block_size() {
+        let mut info = FormatInfo::new(
+            "volume".to_string(),
+            "volume-uuid".to_string(),
+            FormatInfoDataStore {
+                endpoint: String::new(),
+                bucket: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+                region: String::new(),
+            },
+            1,
+        )
+        .expect("construct format info");
+        info.block_size = 1;
+        let bytes = serde_json::to_vec(&info).expect("serialize format info");
+
+        assert!(matches!(
+            decode_format_info(&bytes),
+            Err(MetaError::InvalidFormatConfig(
+                FormatInfoError::BlockSizeBelowMinimum {
+                    block_size_bytes: 1,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn format_info_decode_rejects_block_size_above_supported_maximum() {
+        let mut info = FormatInfo::new(
+            "volume".to_string(),
+            "volume-uuid".to_string(),
+            FormatInfoDataStore {
+                endpoint: String::new(),
+                bucket: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+                region: String::new(),
+            },
+            4,
+        )
+        .expect("construct format info at maximum supported block size");
+        info.block_size = 5 * 1024 * 1024;
+        let bytes = serde_json::to_vec(&info).expect("serialize format info");
+
+        assert!(matches!(
+            decode_format_info(&bytes),
+            Err(MetaError::InvalidFormatConfig(
+                FormatInfoError::BlockSizeAboveMaximum {
+                    block_size_bytes,
+                    maximum_bytes,
+                }
+            )) if block_size_bytes == 5 * BYTES_PER_MIB
+                && maximum_bytes == 4 * BYTES_PER_MIB
+        ));
+    }
+
+    #[test]
+    fn encryption_contract_errors_still_convert_to_meta_error() {
+        let error = MetaError::from(schema::EncryptionContractError::Disabled);
+
+        assert!(matches!(
+            error,
+            MetaError::InvalidFormatConfig(schema::FormatInfoError::Encryption(
+                schema::EncryptionContractError::Disabled
+            ))
+        ));
+    }
+
+    #[test]
     fn checkpoint_descriptor_validator_reports_each_invalid_field() {
         let bytes = b"checkpoint";
         let digest = Sha256::digest(bytes);

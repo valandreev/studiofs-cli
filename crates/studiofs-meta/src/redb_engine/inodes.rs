@@ -1548,7 +1548,7 @@ mod tests {
                 secret_key: "secret-key".to_string(),
                 region: String::new(),
             },
-            u32::from(CURRENT_FORMAT_VERSION),
+            4,
         )
         .expect("generate format info")
     }

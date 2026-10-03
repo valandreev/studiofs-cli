@@ -79,8 +79,10 @@ impl VfsBootstrapPlan {
         memory_cache_budget_bytes: u64,
         config: &VfsConfigValidated,
     ) -> VfsResult<Self> {
-        let data_prefix = normalize_data_prefix(&format_info);
         let block_size = format_info.block_size;
+        validate_volume_block_size(block_size)?;
+
+        let data_prefix = normalize_data_prefix(&format_info);
         let cache_runtime_tuning = resolve_cache_runtime_tuning_overrides(
             derive_cache_runtime_tuning(cache_size, block_size, memory_cache_budget_bytes),
             config,
@@ -101,9 +103,6 @@ impl VfsBootstrapPlan {
                 "configured cache_size is below current local-cache durability requirements; clamping local backend budget upward"
             );
         }
-        validate_volume_block_size(block_size)?;
-        warn_small_block_addressability(block_size);
-
         let readahead_base_width = config.readahead_width;
         let readahead_max_width =
             derive_readahead_max_width(config.read_buffer_mb, block_size, readahead_base_width);
@@ -1184,12 +1183,15 @@ mod tests {
             VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
                 .expect_err("oversized block size should fail before bootstrap IO starts");
 
-        assert!(
-            error
-                .to_string()
-                .contains("exceeds 4x4 cloud fragment capacity"),
-            "bootstrap plan should reject volumes whose block size cannot fit in the cloud fragment layout"
-        );
+        assert!(matches!(
+            error,
+            VfsError::Meta(MetaError::InvalidFormatConfig(
+                studiofs_meta::schema::FormatInfoError::BlockSizeAboveMaximum {
+                    block_size_bytes,
+                    maximum_bytes: MAX_SUPPORTED_BLOCK_SIZE_BYTES,
+                }
+            )) if block_size_bytes as usize == CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT + 1
+        ));
     }
 
     #[test]
@@ -1208,6 +1210,57 @@ mod tests {
             error.to_string().contains("block_size must be non-zero"),
             "bootstrap plan should reject volumes whose block size is zero"
         );
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_rejects_tiny_block_size() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let mut format_info = test_format_info("bootstrap-tiny-block-size");
+        format_info.block_size = 1;
+
+        let error =
+            VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+                .expect_err("tiny block size should fail before bootstrap IO starts");
+
+        assert!(matches!(
+            error,
+            VfsError::Meta(MetaError::InvalidFormatConfig(
+                studiofs_meta::schema::FormatInfoError::BlockSizeBelowMinimum {
+                    block_size_bytes: 1,
+                    minimum_bytes: MIN_BLOCK_SIZE_BYTES,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn validate_volume_block_size_accepts_minimum_addressable_size() {
+        assert_eq!(MIN_BLOCK_SIZE_BYTES, 16 * 1024);
+        assert!(validate_volume_block_size(16 * 1024).is_ok());
+        assert!(validate_volume_block_size(MIN_BLOCK_SIZE_BYTES).is_ok());
+        assert!(validate_volume_block_size(MAX_SUPPORTED_BLOCK_SIZE_BYTES).is_ok());
+        assert!(validate_volume_block_size(MIN_BLOCK_SIZE_BYTES - 1).is_err());
+        assert!(validate_volume_block_size(MAX_SUPPORTED_BLOCK_SIZE_BYTES + 1).is_err());
+        assert!(matches!(
+            validate_volume_block_size(8 * 1024),
+            Err(VfsError::Meta(MetaError::InvalidFormatConfig(
+                studiofs_meta::schema::FormatInfoError::BlockSizeBelowMinimum { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_accepts_minimum_addressable_block_size() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let mut format_info = test_format_info("bootstrap-minimum-block-size");
+        format_info.block_size = 16 * 1024;
+
+        VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+            .expect("16 KiB blocks should support the minimum addressable range");
     }
 
     #[test]

@@ -348,7 +348,7 @@ pub enum MetaError {
 
     /// Persisted format metadata is structurally valid but violates the current format contract.
     #[error("invalid format config: {0}")]
-    InvalidFormatConfig(#[from] EncryptionContractError),
+    InvalidFormatConfig(#[from] FormatInfoError),
 
     /// The metadata store has not been initialized yet.
     #[error("format info not found — run `studiofs init` first")]
@@ -431,6 +431,12 @@ pub enum MetaError {
 
 /// Standard result type returned by metadata APIs.
 pub type MetaResult<T> = Result<T, MetaError>;
+
+impl From<crate::schema::EncryptionContractError> for MetaError {
+    fn from(error: crate::schema::EncryptionContractError) -> Self {
+        Self::InvalidFormatConfig(FormatInfoError::Encryption(error))
+    }
+}
 
 impl MetaError {
     /// Returns `true` when the error indicates that the redb database file
