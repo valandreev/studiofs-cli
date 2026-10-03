@@ -179,23 +179,11 @@ impl<'a> NamespaceCreateTxn<'a> {
     }
 
     pub(super) fn increment_total_inodes(&self) -> MetaResult<()> {
-        let mut counters = self
-            .txn
-            .open_table(COUNTERS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let total_inodes = match counters
-            .get(counters::TOTAL_INODES)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(v) => v.value(),
-            None => 0,
-        };
-        let next_total = total_inodes
-            .checked_add(1)
-            .ok_or_else(|| MetaError::Storage("total inodes counter overflow".to_string()))?;
-        counters
-            .insert(counters::TOTAL_INODES, next_total)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        RedbMetaEngine::update_counter_in_txn(self.txn, counters::TOTAL_INODES, |total| {
+            total
+                .checked_add(1)
+                .ok_or_else(|| MetaError::Storage("total inodes counter overflow".to_string()))
+        })?;
         Ok(())
     }
 

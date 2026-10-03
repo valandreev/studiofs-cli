@@ -299,6 +299,46 @@ fn namespace_create_checks_total_inode_overflow_before_writing_namespace_state()
 }
 
 #[test]
+fn pending_create_undo_id_overflow_preserves_existing_undo_record() {
+    let engine = temp_engine();
+    engine
+        .set_counter(NEXT_UNDO_OP_ID_COUNTER, u64::MAX)
+        .unwrap();
+    let existing_undo = UndoLogRecord {
+        op_id: u64::MAX,
+        kind: UndoLogKind::PendingCreate,
+        phase: UndoLogPhase::Started,
+        ino: 70_001,
+        parent: ROOT_INO,
+        name: b"existing-undo.txt".to_vec(),
+        created_at: 0,
+    };
+    engine.append_undo_log(&existing_undo).unwrap();
+
+    let pending = PendingCreateRecord {
+        ino: 70_002,
+        parent: ROOT_INO,
+        name: b"rejected-pending-create.txt".to_vec(),
+        kind: FileType::RegularFile,
+        created_at: 0,
+    };
+    let error = engine
+        .add_pending_create(&pending)
+        .expect_err("a saturated undo operation ID counter must reject pending create");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("undo op ID allocation overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter(NEXT_UNDO_OP_ID_COUNTER).unwrap(),
+        u64::MAX
+    );
+    assert!(engine.list_pending_creates().unwrap().is_empty());
+    assert_eq!(engine.list_undo_logs().unwrap(), vec![existing_undo]);
+}
+
+#[test]
 fn replica_removal_error_aborts_prior_metadata_writes() {
     let backend = RemoveFaultBackend::default();
     let engine = removal_fault_engine(&backend);

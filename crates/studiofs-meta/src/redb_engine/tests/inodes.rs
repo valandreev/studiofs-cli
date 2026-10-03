@@ -79,6 +79,38 @@ fn test_object_id_allocation_reports_hard_stream_overflow() {
 }
 
 #[test]
+fn test_object_id_batch_respects_remaining_inode_stream_headroom() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::NEXT_INODE, u64::MAX - 3)
+        .unwrap();
+
+    assert_eq!(
+        engine.next_object_ids(3).unwrap(),
+        vec![u64::MAX - 3, u64::MAX - 2, u64::MAX - 1]
+    );
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
+
+    let error = engine
+        .next_object_ids(1)
+        .expect_err("no object ID may be allocated after the stream reaches MAX");
+    assert!(error.to_string().contains("object ID allocation overflow"));
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
+
+    engine
+        .set_counter(counters::NEXT_INODE, u64::MAX - 2)
+        .unwrap();
+    let error = engine
+        .next_object_ids(3)
+        .expect_err("a batch extending past MAX must fail as a whole");
+    assert!(error.to_string().contains("object ID allocation overflow"));
+    assert_eq!(
+        engine.get_counter(counters::NEXT_INODE).unwrap(),
+        u64::MAX - 2
+    );
+}
+
+#[test]
 fn test_list_inode_attrs_ignores_sparse_next_inode_range() {
     let engine = temp_engine();
     let file = engine

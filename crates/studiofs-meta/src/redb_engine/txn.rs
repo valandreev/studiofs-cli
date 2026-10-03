@@ -1499,7 +1499,9 @@ impl RedbMetaEngine {
             Some(v) => v.value(),
             None => 1,
         };
-        let next = current.saturating_add(1);
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| MetaError::Storage("undo op ID allocation overflow".to_string()))?;
         counters.insert(NEXT_UNDO_OP_ID_COUNTER, next)?;
         Ok(current)
     }
