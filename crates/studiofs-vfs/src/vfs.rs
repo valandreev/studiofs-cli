@@ -204,9 +204,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-// The metadata block-size limit must match the cloud-fragment layout.
-const _: [(); MAX_SUPPORTED_BLOCK_SIZE_BYTES as usize] =
-    [(); CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT];
+// Every block size allowed by metadata must fit in the cloud-fragment layout.
+const _: () =
+    assert!(MAX_SUPPORTED_BLOCK_SIZE_BYTES as usize <= CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT);
 
 /// Maximum number of runtime events retained for VFS diagnostics.
 pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
