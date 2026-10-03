@@ -204,6 +204,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+// The metadata block-size limit must match the cloud-fragment layout.
+const _: [(); MAX_SUPPORTED_BLOCK_SIZE_BYTES as usize] =
+    [(); CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT];
+
 /// Maximum number of runtime events retained for VFS diagnostics.
 pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
 const ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT: usize = 32;
@@ -3657,13 +3661,6 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
             })
             .into(),
         );
-    }
-    let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
-    if (block_size as usize) > cloud_logical_block_capacity {
-        return Err(VfsError::Other(format!(
-            "volume block_size {} exceeds 4x4 cloud fragment capacity {} ({} fragments x {} bytes)",
-            block_size, cloud_logical_block_capacity, CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE
-        )));
     }
     Ok(())
 }

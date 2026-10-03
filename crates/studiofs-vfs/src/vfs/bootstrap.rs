@@ -1237,10 +1237,6 @@ mod tests {
 
     #[test]
     fn validate_volume_block_size_accepts_minimum_addressable_size() {
-        assert_eq!(
-            MAX_SUPPORTED_BLOCK_SIZE_BYTES as usize,
-            CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT
-        );
         assert_eq!(MIN_BLOCK_SIZE_BYTES, 16 * 1024);
         assert!(validate_volume_block_size(16 * 1024).is_ok());
         assert!(validate_volume_block_size(MIN_BLOCK_SIZE_BYTES).is_ok());
