@@ -2003,6 +2003,29 @@ fn make_unstarted_test_vfs_with_config(
     volume_suffix: &str,
     cfg: VfsConfig,
 ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    make_unstarted_test_vfs_with_optional_debug_pending_path_reader(tmp, volume_suffix, cfg, None)
+}
+
+fn make_unstarted_test_vfs_with_debug_pending_suffix_reader(
+    tmp: &TempDir,
+    volume_suffix: &str,
+    cfg: VfsConfig,
+    debug_pending_path_suffix_reader: fn() -> Option<DebugPendingPathSuffix>,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    make_unstarted_test_vfs_with_optional_debug_pending_path_reader(
+        tmp,
+        volume_suffix,
+        cfg,
+        Some(debug_pending_path_suffix_reader),
+    )
+}
+
+fn make_unstarted_test_vfs_with_optional_debug_pending_path_reader(
+    tmp: &TempDir,
+    volume_suffix: &str,
+    cfg: VfsConfig,
+    debug_pending_path_suffix_reader: Option<fn() -> Option<DebugPendingPathSuffix>>,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
     meta.init_root(0, 0).expect("init root");
@@ -2014,14 +2037,29 @@ fn make_unstarted_test_vfs_with_config(
     let cache_dir = tmp.path().join("cache");
     let rt = Arc::new(Runtime::new().expect("runtime"));
     let _guard = rt.enter();
-    let vfs = StudioVfs::new(
-        meta.clone(),
-        &data_config,
-        cache_dir.to_str().expect("cache dir str"),
-        64 * 1024 * 1024,
-        32 * 1024 * 1024,
-        cfg.try_into().expect("test VFS config should validate"),
-    )
+    let cache_dir = cache_dir.to_str().expect("cache dir str");
+    let config = cfg.try_into().expect("test VFS config should validate");
+    let vfs = match debug_pending_path_suffix_reader {
+        Some(debug_pending_path_suffix_reader) => {
+            StudioVfs::new_with_debug_pending_path_suffix_reader(
+                meta.clone(),
+                &data_config,
+                cache_dir,
+                64 * 1024 * 1024,
+                32 * 1024 * 1024,
+                config,
+                debug_pending_path_suffix_reader,
+            )
+        }
+        None => StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            cache_dir,
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            config,
+        ),
+    }
     .expect("create vfs");
     (rt, vfs, meta)
 }
@@ -2082,6 +2120,89 @@ fn make_test_vfs_with_config(
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
     (rt, vfs, meta)
+}
+
+#[test]
+fn debug_pending_path_suffix_filters_by_normalized_suffix_and_basename() {
+    assert!(DebugPendingPathSuffix::new("").is_none());
+    assert!(DebugPendingPathSuffix::new(" \t ").is_none());
+    assert!(DebugPendingPathSuffix::new("/").is_none());
+    assert!(DebugPendingPathSuffix::new("\\").is_none());
+    assert!(DebugPendingPathSuffix::new("\\\\").is_none());
+    assert!(DebugPendingPathSuffix::new("//").is_none());
+
+    let filter = DebugPendingPathSuffix::new("C:/previous/TARGET.TXT")
+        .expect("parse enabled diagnostic filter");
+    assert!(filter.matches_path("c:\\previous\\target.txt"));
+    assert!(filter.matches_path("C:/previous/target.txt/"));
+    assert!(filter.matches_path("D:/other/TARGET.TXT"));
+    assert!(filter.matches_path("D:/other/TARGET.TXT/"));
+    assert!(!filter.matches_path("\\"));
+    assert!(!filter.matches_path("D:/other/other.txt"));
+}
+
+thread_local! {
+    static DEBUG_PENDING_PATH_SUFFIX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DEBUG_PENDING_PATH_SUFFIX_TEST_VALUE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn counted_debug_pending_path_suffix() -> Option<DebugPendingPathSuffix> {
+    DEBUG_PENDING_PATH_SUFFIX_READS.with(|reads| reads.set(reads.get() + 1));
+    DEBUG_PENDING_PATH_SUFFIX_TEST_VALUE
+        .with(|suffix| DebugPendingPathSuffix::new(suffix.borrow().as_str()))
+}
+
+#[test]
+fn vfs_bootstrap_reads_debug_pending_path_suffix_once_for_repeated_probes() {
+    let candidates = [
+        format!("sfs-743-probe-{}-a", std::process::id()),
+        format!("sfs-743-probe-{}-b", std::process::id()),
+    ];
+    let ambient_suffix = std::env::var(DEBUG_PENDING_PATH_SUFFIX_ENV)
+        .ok()
+        .and_then(|suffix| DebugPendingPathSuffix::new(&suffix));
+    let target_name = candidates
+        .into_iter()
+        .find(|candidate| {
+            !ambient_suffix
+                .as_ref()
+                .is_some_and(|suffix| suffix.matches_path(candidate))
+        })
+        .expect("one probe target should differ from the ambient diagnostic suffix");
+    DEBUG_PENDING_PATH_SUFFIX_READS.with(|reads| reads.set(0));
+    DEBUG_PENDING_PATH_SUFFIX_TEST_VALUE.with(|suffix| *suffix.borrow_mut() = target_name.clone());
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs_with_debug_pending_suffix_reader(
+        &tmp,
+        "debug-pending-target-path",
+        VfsConfig::default(),
+        counted_debug_pending_path_suffix,
+    );
+    let attr = vfs
+        .create(ROOT_INO, target_name.as_bytes(), 1000, 1000, 0o644)
+        .expect("create target file");
+
+    assert_eq!(
+        DEBUG_PENDING_PATH_SUFFIX_READS.with(std::cell::Cell::get),
+        1,
+        "bootstrap should resolve the diagnostic setting once"
+    );
+    assert!(vfs.debug_pending_target_path(ROOT_INO).is_none());
+    let expected_path = vfs
+        .best_effort_path_for_inode(attr.ino)
+        .expect("resolve target path");
+    for _ in 0..4 {
+        assert_eq!(
+            vfs.debug_pending_target_path(attr.ino),
+            Some(expected_path.clone())
+        );
+    }
+    assert_eq!(
+        DEBUG_PENDING_PATH_SUFFIX_READS.with(std::cell::Cell::get),
+        1,
+        "repeated probes should reuse the bootstrap value"
+    );
 }
 
 #[test]

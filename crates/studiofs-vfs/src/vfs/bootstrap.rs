@@ -396,12 +396,14 @@ struct VfsBootstrap {
     plan: VfsBootstrapPlan,
     resources: VfsBootstrapResources,
     cache_dir: PathBuf,
+    debug_pending_path_suffix_reader: fn() -> Option<DebugPendingPathSuffix>,
     read_only_mount: bool,
     snapshot_mount_fence: Option<SnapshotMountFence>,
 }
 
 struct VfsBootstrapOptions {
     cache_runtime: Option<PreparedLocalPayloadRuntime>,
+    debug_pending_path_suffix_reader: fn() -> Option<DebugPendingPathSuffix>,
     read_only_mount: bool,
     snapshot_mount_fence: Option<SnapshotMountFence>,
 }
@@ -421,6 +423,7 @@ impl VfsBootstrap {
     {
         let VfsBootstrapOptions {
             cache_runtime,
+            debug_pending_path_suffix_reader,
             read_only_mount,
             snapshot_mount_fence,
         } = options;
@@ -440,6 +443,7 @@ impl VfsBootstrap {
             plan,
             resources,
             cache_dir: PathBuf::from(cache_dir),
+            debug_pending_path_suffix_reader,
             read_only_mount,
             snapshot_mount_fence,
         })
@@ -452,6 +456,7 @@ impl VfsBootstrap {
             plan,
             resources,
             cache_dir,
+            debug_pending_path_suffix_reader,
             read_only_mount,
             snapshot_mount_fence,
         } = self;
@@ -489,6 +494,7 @@ impl VfsBootstrap {
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
             read_only_mount,
+            debug_pending_path_suffix: debug_pending_path_suffix_reader(),
             snapshot_mount_fence,
             data_write: resources.data_write,
             snapshot_worker,
@@ -736,6 +742,7 @@ impl StudioVfs {
             config,
             VfsBootstrapOptions {
                 cache_runtime: None,
+                debug_pending_path_suffix_reader: DebugPendingPathSuffix::from_env,
                 read_only_mount: false,
                 snapshot_mount_fence: None,
             },
@@ -764,6 +771,7 @@ impl StudioVfs {
             config,
             VfsBootstrapOptions {
                 cache_runtime: Some(cache_runtime),
+                debug_pending_path_suffix_reader: DebugPendingPathSuffix::from_env,
                 read_only_mount: false,
                 snapshot_mount_fence: None,
             },
@@ -793,6 +801,7 @@ impl StudioVfs {
             config,
             VfsBootstrapOptions {
                 cache_runtime: None,
+                debug_pending_path_suffix_reader: DebugPendingPathSuffix::from_env,
                 read_only_mount: true,
                 snapshot_mount_fence: Some(snapshot_mount_fence),
             },
@@ -821,6 +830,35 @@ impl StudioVfs {
             options,
         )?
         .finish()
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_debug_pending_path_suffix_reader<M>(
+        meta: Arc<M>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        memory_cache_budget_bytes: u64,
+        config: VfsConfigValidated,
+        debug_pending_path_suffix_reader: fn() -> Option<DebugPendingPathSuffix>,
+    ) -> VfsResult<Arc<Self>>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
+        Self::new_impl(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            memory_cache_budget_bytes,
+            config,
+            VfsBootstrapOptions {
+                cache_runtime: None,
+                debug_pending_path_suffix_reader,
+                read_only_mount: false,
+                snapshot_mount_fence: None,
+            },
+        )
     }
 }
 

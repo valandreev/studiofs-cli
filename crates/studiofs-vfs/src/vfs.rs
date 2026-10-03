@@ -836,6 +836,52 @@ const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 800 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 800 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
+
+/// Cached ASCII-case-insensitive path suffix for pending-upload diagnostics.
+#[derive(Debug)]
+struct DebugPendingPathSuffix {
+    normalized_suffix: String,
+    normalized_basename: String,
+}
+
+impl DebugPendingPathSuffix {
+    fn from_env() -> Option<Self> {
+        let suffix = std::env::var(DEBUG_PENDING_PATH_SUFFIX_ENV).ok()?;
+        Self::new(&suffix)
+    }
+
+    fn new(suffix: &str) -> Option<Self> {
+        let suffix = suffix.trim();
+        if suffix.is_empty() {
+            return None;
+        }
+
+        let mut normalized_suffix = suffix.replace('/', "\\").to_ascii_lowercase();
+        normalized_suffix.truncate(normalized_suffix.trim_end_matches('\\').len());
+        if normalized_suffix.is_empty() {
+            return None;
+        }
+        let normalized_basename = normalized_suffix
+            .rsplit('\\')
+            .next()
+            .unwrap_or("")
+            .to_owned();
+
+        Some(Self {
+            normalized_suffix,
+            normalized_basename,
+        })
+    }
+
+    fn matches_path(&self, path: &str) -> bool {
+        let mut normalized_path = path.replace('/', "\\");
+        normalized_path.make_ascii_lowercase();
+        let trimmed_path = normalized_path.trim_end_matches('\\');
+        let basename = trimmed_path.rsplit('\\').next().unwrap_or("");
+        trimmed_path.ends_with(&self.normalized_suffix) || basename == self.normalized_basename
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
     /// Newly inserted cache entries eligible for promotion.
@@ -3798,6 +3844,8 @@ pub struct StudioVfs {
     meta: MetaExecutor<dyn VfsMeta>,
     /// Whether this VFS is backed by an immutable snapshot artifact.
     read_only_mount: bool,
+    /// Environment filter read once at construction; changing it requires a new VFS.
+    debug_pending_path_suffix: Option<DebugPendingPathSuffix>,
     /// Optional durable-lease fence for an immutable snapshot mount.
     snapshot_mount_fence: Option<SnapshotMountFence>,
     /// Data store for writes (uploads, deletes, GC).
@@ -5789,25 +5837,9 @@ impl StudioVfs {
     }
 
     fn debug_pending_target_path(&self, ino: Ino) -> Option<String> {
-        let suffix = std::env::var(DEBUG_PENDING_PATH_SUFFIX_ENV).ok()?;
-        let suffix = suffix.trim();
-        if suffix.is_empty() {
-            return None;
-        }
-        let normalized_suffix = suffix.replace('/', "\\").to_ascii_lowercase();
-        let normalized_basename = normalized_suffix
-            .trim_end_matches('\\')
-            .rsplit('\\')
-            .next()
-            .unwrap_or(normalized_suffix.as_str());
+        let suffix = self.debug_pending_path_suffix.as_ref()?;
         let path = self.best_effort_path_for_inode(ino)?;
-        let normalized_path = path.replace('/', "\\").to_ascii_lowercase();
-        let basename = Path::new(&normalized_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        (normalized_path.ends_with(&normalized_suffix) || basename == normalized_basename)
-            .then_some(path)
+        suffix.matches_path(&path).then_some(path)
     }
 
     fn debug_pending_inode_state(&self, ino: Ino, event: &str) {
