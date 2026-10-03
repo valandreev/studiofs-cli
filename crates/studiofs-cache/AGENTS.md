@@ -14,6 +14,8 @@ and the relevant local-first contract section before editing.
   discarded merely because remote state is unavailable.
 - Use bounded waits and observable state for upload-idle tests. Do not stabilize
   a race with fixed sleeps or unbounded polling.
+- Keep all `unsafe` in this crate confined to `src/payload_platform.rs`, with
+  each exception scoped to its individual unsafe block or extern block.
 - Run focused cache tests and crate check/Clippy. Remote S3 validation is ignored
   infrastructure evidence and must be reported separately.
 

@@ -13,16 +13,6 @@ use studiofs_cache::{
 use studiofs_meta::schema::{ChunkId, chunk_id_from_offset, chunk_start_offset};
 use studiofs_meta::types::Ino;
 
-#[derive(Debug, Clone)]
-#[cfg(test)]
-struct WriterStackReadSpan {
-    start: u64,
-    end: u64,
-    block_offset: u64,
-    seq: u64,
-    data: Bytes,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WriterStackReadClaim {
     pub(super) start: u64,
@@ -170,6 +160,8 @@ struct ContextualWriterStackError {
 
 struct SliceWriter {
     seq: u64,
+    // Logical append frontier for coalescing writes; the writer's accepted range covers only
+    // bytes still buffered after completed prefixes have been detached or staged.
     end: u64,
     content_epoch: u64,
     writer: CachedStoreWriterSlice,
@@ -483,76 +475,6 @@ impl MountedWriterStack {
             throttled,
             next_object_id,
         })
-    }
-
-    #[cfg(test)]
-    fn snapshot_read_spans(&self, ino: Ino, offset: u64, length: u64) -> Vec<WriterStackReadSpan> {
-        let Some(end) = offset.checked_add(length) else {
-            return Vec::new();
-        };
-        if length == 0 {
-            return Vec::new();
-        }
-        let file = {
-            let shard = self.shards[Self::inode_shard_index(ino)].lock();
-            let Some(file) = shard.files.get(&ino) else {
-                return Vec::new();
-            };
-            Arc::clone(file)
-        };
-        let file = file.lock();
-        if file.ino != ino {
-            return Vec::new();
-        }
-        let mut spans = Vec::new();
-        let start_chunk = chunk_id_from_offset(offset, self.config.chunk_size);
-        let end_chunk = chunk_id_from_offset(end.saturating_sub(1), self.config.chunk_size);
-        for chunk in file
-            .chunks
-            .range(start_chunk..=end_chunk)
-            .map(|(_, chunk)| chunk)
-        {
-            for slice in &chunk.slices {
-                for materializing in &slice.materializing {
-                    let start = materializing.start.max(offset);
-                    let stop = materializing.end.min(end);
-                    if start >= stop {
-                        continue;
-                    }
-                    spans.push(WriterStackReadSpan {
-                        start,
-                        end: stop,
-                        block_offset: start.saturating_sub(materializing.start),
-                        seq: materializing.seq,
-                        data: materializing.data.clone(),
-                    });
-                }
-                let Some((accepted_start, accepted_end)) = slice.writer.accepted_range() else {
-                    continue;
-                };
-                let start = accepted_start.max(offset);
-                let stop = accepted_end.min(end);
-                if start >= stop {
-                    continue;
-                }
-                let len = usize::try_from(stop.saturating_sub(start)).unwrap_or(usize::MAX);
-                let mut data = vec![0; len];
-                let read = slice.writer.read_accepted(start, &mut data);
-                if read == 0 {
-                    continue;
-                }
-                data.truncate(read);
-                spans.push(WriterStackReadSpan {
-                    start,
-                    end: start.saturating_add(read as u64),
-                    block_offset: 0,
-                    seq: slice.seq,
-                    data: Bytes::from(data),
-                });
-            }
-        }
-        spans.sort_by_key(|span| std::cmp::Reverse(span.seq));
-        spans
     }
 
     pub(super) fn snapshot_read_claims(
@@ -1955,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_stack_read_spans_return_latest_overwrite_first() {
+    fn writer_stack_copy_read_spans_preserves_latest_overwrite() {
         let (_dir, stack, _rx) = temp_stack(16, 8);
 
         stack
@@ -1965,11 +1887,17 @@ mod tests {
             .write_bytes(write_spec(1, 7, 2, 101), Bytes::from_static(b"XY"))
             .expect("overwrite");
 
-        let spans = stack.snapshot_read_spans(7, 0, 6);
-        assert_eq!(spans[0].start, 2);
-        assert_eq!(spans[0].end, 4);
-        assert_eq!(spans[0].data.as_ref(), b"XY");
-        assert!(spans[0].seq > spans[1].seq);
+        let mut out = [0_u8; 6];
+        let claims = stack.copy_read_spans_into(7, 0, &mut out);
+
+        assert_eq!(&out, b"abXYef");
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (2, 4), (4, 6)]
+        );
     }
 
     #[test]
@@ -1982,9 +1910,17 @@ mod tests {
             .expect("borrowed write");
         payload.fill(b'X');
 
-        let spans = stack.snapshot_read_spans(7, 0, 14);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].data.as_ref(), b"borrowed-input");
+        let mut out = [0_u8; 14];
+        let claims = stack.copy_read_spans_into(7, 0, &mut out);
+
+        assert_eq!(&out, b"borrowed-input");
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 14)]
+        );
     }
 
     #[test]
@@ -1996,12 +1932,21 @@ mod tests {
             .write_owned_bytes(write_spec(1, 7, 0, 100), payload)
             .expect("owned write");
 
-        let spans = stack.snapshot_read_spans(7, 0, 11);
-        assert_eq!(spans[0].data.as_ref(), b"owned-input");
+        let mut out = [0_u8; 11];
+        let claims = stack.copy_read_spans_into(7, 0, &mut out);
+
+        assert_eq!(&out, b"owned-input");
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 11)]
+        );
     }
 
     #[test]
-    fn writer_stack_read_span_offsets_are_relative_to_returned_data() {
+    fn writer_stack_copy_read_spans_clip_to_requested_range() {
         let (_dir, stack, _rx) = temp_stack(64, 8);
         let payload = Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz0123456789");
 
@@ -2009,15 +1954,16 @@ mod tests {
             .write_bytes(write_spec(1, 7, 0, 100), payload.clone())
             .expect("dirty write");
 
-        let spans = stack.snapshot_read_spans(7, 30, 6);
+        let mut out = [0_u8; 6];
+        let claims = stack.copy_read_spans_into(7, 30, &mut out);
 
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].start, 30);
-        assert_eq!(spans[0].end, 36);
-        assert_eq!(spans[0].data.as_ref(), b"456789");
+        assert_eq!(&out, b"456789");
         assert_eq!(
-            spans[0].block_offset, 0,
-            "returned dirty data is already clipped to the span, so assembler offset must be data-relative"
+            claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(30, 36)]
         );
     }
 
@@ -2133,11 +2079,19 @@ mod tests {
             .expect("sparse write");
 
         assert_eq!(accepted.visible_len, 27);
-        let spans = stack.snapshot_read_spans(7, 0, 32);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].start, 24);
-        assert_eq!(spans[0].end, 27);
-        assert_eq!(spans[0].data.as_ref(), b"end");
+        let mut out = [0xa5; 32];
+        let claims = stack.copy_read_spans_into(7, 0, &mut out);
+        let mut expected = [0xa5; 32];
+        expected[24..27].copy_from_slice(b"end");
+
+        assert_eq!(out, expected);
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(24, 27)]
+        );
     }
 
     #[test]
@@ -2186,11 +2140,26 @@ mod tests {
         assert_eq!(finished[0].chunk_offset, 0);
         assert_eq!(finished[0].len, 8);
         assert_eq!(stack.dirty_bytes_for_inode(7), 4);
-        let spans = stack.snapshot_read_spans(7, 0, 12);
-        assert!(
-            spans
+        let mut whole_out = [0; 12];
+        let whole_claims = stack.copy_read_spans_into(7, 0, &mut whole_out);
+        assert_eq!(&whole_out, b"abcdefghijkl");
+        assert_eq!(
+            whole_claims
                 .iter()
-                .any(|span| { span.start == 8 && span.end == 12 && span.data.as_ref() == b"ijkl" })
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 8), (8, 12)]
+        );
+
+        let mut tail_out = [0; 4];
+        let tail_claims = stack.copy_read_spans_into(7, 8, &mut tail_out);
+        assert_eq!(&tail_out, b"ijkl");
+        assert_eq!(
+            tail_claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(8, 12)]
         );
     }
 
@@ -2440,18 +2409,24 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("flush should enter backend put");
 
-        let spans = stack.snapshot_read_spans(7, 0, 4);
+        let mut out = [0; 4];
+        let claims = stack.copy_read_spans_into(7, 0, &mut out);
 
         release_tx.send(()).expect("release slow put");
         staging_thread
             .join()
             .expect("staging thread")
             .expect("flush completed block");
-        assert_eq!(spans.len(), 1);
         assert_eq!(
-            spans[0].data.as_ref(),
-            b"slow",
+            &out, b"slow",
             "detached-but-not-yet-installed bytes must remain visible to same-mount reads"
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 4)]
         );
     }
 
@@ -2579,12 +2554,18 @@ mod tests {
         };
 
         stack.mark_closed(1);
-        let visible_after_release = stack.snapshot_read_spans(7, 0, 4);
-        assert_eq!(visible_after_release.len(), 1);
+        let mut visible_after_release = [0; 4];
+        let visible_claims = stack.copy_read_spans_into(7, 0, &mut visible_after_release);
         assert_eq!(
-            visible_after_release[0].data.as_ref(),
-            b"data",
+            &visible_after_release, b"data",
             "accepted bytes remain visible after the last handle is released"
+        );
+        assert_eq!(
+            visible_claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 4)]
         );
 
         let sticky_error = stack
