@@ -55,9 +55,12 @@ pub struct CachedStoreWriterConfig {
     pub page_size: usize,
     /// Optional dirty-byte threshold for throttling signals.
     pub dirty_byte_limit: Option<usize>,
-    /// Optional cap (bytes) on each write's logical end offset relative to the
+    /// Hard cap (bytes) on each write's logical end offset relative to the
     /// writer's active start, rounded up to `page_size`.
     /// Sparse gaps and page-alignment padding count toward this limit.
+    /// `None` uses a 64 MiB default. Writes exceeding the cap return
+    /// [`CachedStoreWriterError::BufferLimitExceeded`] with the rounded
+    /// requested size and limit before recording bytes from that write.
     pub max_buffer_bytes: Option<usize>,
     /// Whether to enqueue uploads as blocks are staged.
     pub submit_upload: bool,
