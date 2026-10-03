@@ -349,6 +349,14 @@ pub use create_object_buffer_with as create_object_buffer_with_flags;
 ///
 /// # Returns
 /// Original payload data
+///
+/// # Errors
+/// Returns [`ObjectError::Io`] for a truncated header, [`ObjectError::InvalidMagic`]
+/// or [`ObjectError::UnsupportedVersion`] for an invalid header, and
+/// [`ObjectError::LegacyCompressionUnsupported`] for legacy compression.
+/// Uncompressed payloads return [`ObjectError::SizeMismatch`] for inconsistent
+/// sizes, [`ObjectError::ObjectTooLarge`] for consistent sizes above the limit,
+/// or [`ObjectError::ChecksumMismatch`] for a checksum failure.
 pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     let data: Buffer = data.into();
     if data.len() < ObjectHeader::SIZE {
@@ -678,19 +686,37 @@ mod tests {
     }
 
     #[test]
-    fn test_object_rejects_oversized_checksummed_payload() {
+    fn test_object_rejects_oversized_payload_before_checksum() {
         // Share the allocation across chunks to keep this boundary fixture small.
         let chunk = Bytes::from(vec![0xAB; 1024 * 1024]);
         let mut chunks = vec![chunk; MAX_OBJECT_SIZE as usize / (1024 * 1024)];
         chunks.push(Bytes::from_static(b"x"));
-        let payload = Buffer::from(chunks.clone());
         let size = MAX_OBJECT_SIZE + 1;
-        let header = ObjectHeader::new(size, size, xxh64_buffer(&payload));
+        // Size rejection must happen before checksum verification.
+        let header = ObjectHeader::new(size, size, 0);
         chunks.insert(0, Bytes::copy_from_slice(&header.to_bytes()));
         assert!(matches!(
             read_object(Buffer::from(chunks)),
             Err(ObjectError::ObjectTooLarge(actual)) if actual == u64::from(size)
         ));
+    }
+
+    #[test]
+    fn test_empty_payload_rejects_nonzero_header_sizes() {
+        for (original_size, compressed_size) in [(1, 0), (0, 1), (1, 1)] {
+            let header = ObjectHeader::new(original_size, compressed_size, xxh64(b"", 0));
+            assert!(
+                matches!(
+                    read_object(Bytes::copy_from_slice(&header.to_bytes())),
+                    Err(ObjectError::SizeMismatch {
+                        original_size: original,
+                        compressed_size: compressed,
+                        actual_size: 0,
+                    }) if original == original_size && compressed == compressed_size
+                ),
+                "empty payload accepted sizes ({original_size}, {compressed_size})"
+            );
+        }
     }
 
     #[test]
