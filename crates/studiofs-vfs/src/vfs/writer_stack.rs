@@ -1143,9 +1143,10 @@ impl MountedWriterStack {
                     continue;
                 }
                 dirty_files.extend(
-                    shard.dirty_inodes.iter().filter_map(|ino| {
-                        shard.files.get(ino).map(|file| (*ino, Arc::clone(file)))
-                    }),
+                    shard
+                        .dirty_inodes
+                        .iter()
+                        .filter_map(|ino| shard.files.get(ino).cloned().map(|file| (*ino, file))),
                 );
             }
             for (ino, file) in dirty_files.drain(..) {
@@ -1171,12 +1172,11 @@ impl MountedWriterStack {
     pub(super) fn inject_sticky_error_for_test(&self, ino: Ino, message: impl Into<String>) {
         let file = {
             let mut shard = self.shards[Self::inode_shard_index(ino)].lock();
-            Arc::clone(
-                shard
-                    .files
-                    .entry(ino)
-                    .or_insert_with(|| FileWriter::new_shared(ino, 0, 0)),
-            )
+            shard
+                .files
+                .entry(ino)
+                .or_insert_with(|| FileWriter::new_shared(ino, 0, 0))
+                .clone()
         };
         let mut file = file.lock();
         file.sticky_error = Some(StickyError {

@@ -2526,20 +2526,12 @@ impl ShutdownState {
     }
 
     fn abort(&self) {
-        {
-            let mut phase = self.shutdown_phase.lock();
-            *phase = ShutdownPhase::Aborted;
-        }
-        // Drop the phase guard before waking waiters that may reacquire it.
+        *self.shutdown_phase.lock() = ShutdownPhase::Aborted;
         self.shutdown_notify.notify_waiters();
     }
 
     fn complete(&self, error: Option<ShutdownError>) {
-        {
-            let mut phase = self.shutdown_phase.lock();
-            *phase = ShutdownPhase::Completed(error);
-        }
-        // Drop the phase guard before waking waiters that may reacquire it.
+        *self.shutdown_phase.lock() = ShutdownPhase::Completed(error);
         self.shutdown_notify.notify_waiters();
     }
 }
