@@ -190,8 +190,11 @@ impl<'a> NamespaceCreateTxn<'a> {
             Some(v) => v.value(),
             None => 0,
         };
+        let next_total = total_inodes
+            .checked_add(1)
+            .ok_or_else(|| MetaError::Storage("total inodes counter overflow".to_string()))?;
         counters
-            .insert(counters::TOTAL_INODES, total_inodes + 1)
+            .insert(counters::TOTAL_INODES, next_total)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }

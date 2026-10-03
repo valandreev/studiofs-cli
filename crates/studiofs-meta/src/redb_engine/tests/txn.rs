@@ -170,6 +170,8 @@ fn append_event_accepts_last_sequence_and_rejects_overflow_without_mutation() {
     let txn = engine.begin_write_txn().unwrap();
     let error = RedbMetaEngine::append_event_in_txn(&txn, &event)
         .expect_err("event sequence allocation at u64::MAX must fail");
+    // Commit deliberately to prove the rejected append wrote no partial records;
+    // aborting here would hide mutations made before returning the error.
     txn.commit().unwrap();
 
     assert!(
@@ -219,6 +221,81 @@ fn namespace_create_rolls_back_when_event_sequence_overflows() {
     let events = read.open_table(EVENT_LOG_TABLE).unwrap();
     assert!(events.get(u64::MAX - 1).unwrap().is_none());
     assert!(events.get(u64::MAX).unwrap().is_none());
+}
+
+#[test]
+fn namespace_create_checks_total_inode_overflow_before_writing_namespace_state() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::TOTAL_INODES, u64::MAX - 1)
+        .unwrap();
+    let root_before = engine.get_attr(ROOT_INO).unwrap();
+
+    let last_valid = engine
+        .create_file_with_ino(
+            100_000,
+            ROOT_INO,
+            b"last-valid-inode-count.txt",
+            1000,
+            1000,
+            0o644,
+        )
+        .expect("incrementing the total inode count from MAX-1 must succeed");
+
+    assert_eq!(last_valid.ino, 100_000);
+    assert_eq!(
+        engine.get_counter(counters::TOTAL_INODES).unwrap(),
+        u64::MAX
+    );
+    assert_eq!(
+        engine
+            .lookup(ROOT_INO, b"last-valid-inode-count.txt")
+            .unwrap()
+            .ino,
+        last_valid.ino
+    );
+    let next_event_seq = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let root_at_limit = engine.get_attr(ROOT_INO).unwrap();
+
+    let error = engine
+        .create_file_with_ino(
+            100_001,
+            ROOT_INO,
+            b"overflow-inode-count.txt",
+            1000,
+            1000,
+            0o644,
+        )
+        .expect_err("creating an inode when the total inode counter is MAX must fail");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("total inodes") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter(counters::TOTAL_INODES).unwrap(),
+        u64::MAX
+    );
+    assert!(
+        engine
+            .lookup(ROOT_INO, b"overflow-inode-count.txt")
+            .is_err()
+    );
+    assert!(engine.get_attr(100_001).is_err());
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_at_limit);
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        next_event_seq
+    );
+    assert_eq!(root_before, root_at_limit);
+    let read = engine.begin_read_txn().unwrap();
+    assert!(
+        read.open_table(EVENT_LOG_TABLE)
+            .unwrap()
+            .get(next_event_seq)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
