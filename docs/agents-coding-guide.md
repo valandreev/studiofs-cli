@@ -144,9 +144,12 @@ their actual guard lifetime. Within tier 2, the only permitted nested mounted
 writer locks are inode shard followed by its per-file state. Handle shards are
 released before inode-shard access; shard guards are not nested, and per-file
 guards are released before shard reacquisition and detached-payload staging.
-Writer lock subtiers enforce these rules without changing the public
-`LockTier::LocalDirty` priority. Guards without a writer subtier retain existing
-equal-tier behavior. Ordinary writer/namespace phases and shutdown draining
+Writer lock subtiers enforce the shard/file nesting rules without changing the
+public `LockTier::LocalDirty` priority. Equal-tier pairs involving an unranked
+guard retain existing behavior: writer locks nested with unranked `local_dirty`
+locks are not checked in either direction. Releasing per-file guards before
+detached-payload staging remains a call-structure requirement, not a validator
+guarantee. Ordinary writer/namespace phases and shutdown draining
 release their synchronous guards between phases; never hold them across `await`.
 
 Async admission and metadata-sync locks are outside the thread-local validator.

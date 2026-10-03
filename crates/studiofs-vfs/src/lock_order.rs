@@ -22,8 +22,11 @@
 //! Writer subtiers permit inode shard -> per-file acquisition without changing
 //! the public tier vocabulary. Other nested writer-lock pairs are rejected:
 //! handle shards are released before inode access, shard guards are not nested,
-//! and file guards are released before shard reacquisition or staging detached
-//! payloads. Equal tiers without writer subtiers retain their existing behavior.
+//! and file guards are released before shard reacquisition. Equal-tier pairs
+//! involving an unranked guard retain their existing behavior: writer locks
+//! nested with unranked `local_dirty` locks are not checked in either direction.
+//! Releasing file guards before detached-payload staging remains a call-structure
+//! requirement, not a writer-subtier validation guarantee.
 //! Ordinary writer and namespace operations release their guards between
 //! phases. Synchronous guards must not cross an await;
 //! async admission and metadata-sync locks are outside thread-local validation.
@@ -381,19 +384,21 @@ impl Drop for LockOrderGuard {
 
 /// Check if lock ordering validation is enabled.
 ///
-/// Always enabled in debug and unit-test builds, configurable in release libraries.
+/// Always enabled in debug builds. Release unit tests default to enabled;
+/// release libraries default to disabled. In release, the cached environment
+/// setting overrides either default: `1`/`true` enables, other values disable.
 pub fn is_validation_enabled() -> bool {
-    #[cfg(any(debug_assertions, test))]
+    #[cfg(debug_assertions)]
     {
         true
     }
-    #[cfg(all(not(debug_assertions), not(test)))]
+    #[cfg(not(debug_assertions))]
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var("STUDIOFS_LOCK_ORDER_VALIDATION")
                 .map(|v| v == "1" || v == "true")
-                .unwrap_or(false)
+                .unwrap_or(cfg!(test))
         })
     }
 }
@@ -414,8 +419,16 @@ mod tests {
 
     #[test]
     #[cfg(not(debug_assertions))]
-    fn lock_order_validation_is_enabled_for_release_tests() {
-        assert!(is_validation_enabled());
+    fn lock_order_validation_respects_release_test_configuration() {
+        let expected = std::env::var("STUDIOFS_LOCK_ORDER_VALIDATION")
+            .map(|value| value == "1" || value == "true")
+            .unwrap_or(true);
+        assert_eq!(is_validation_enabled(), expected);
+        if !expected {
+            let _namespace = LockOrderGuard::acquire(LockTier::Namespace);
+            let _dirty = LockOrderGuard::acquire(LockTier::LocalDirty);
+            assert!(debug_lock_stack().is_empty());
+        }
     }
 
     /// Runs body with tracing text routed into a string.
