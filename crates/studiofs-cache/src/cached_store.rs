@@ -55,7 +55,9 @@ pub struct CachedStoreWriterConfig {
     pub page_size: usize,
     /// Optional dirty-byte threshold for throttling signals.
     pub dirty_byte_limit: Option<usize>,
-    /// Optional cap on the writer's buffered bytes.
+    /// Optional cap (bytes) on each write's logical end offset relative to the
+    /// writer's active start, rounded up to `page_size`.
+    /// Sparse gaps and page-alignment padding count toward this limit.
     pub max_buffer_bytes: Option<usize>,
     /// Whether to enqueue uploads as blocks are staged.
     pub submit_upload: bool,
