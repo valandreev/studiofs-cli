@@ -24,7 +24,9 @@ pub const MAGIC: &[u8; 4] = b"STFS";
 /// Current object format version.
 pub const VERSION: u16 = 2;
 
-/// Maximum object size (for safety check, e.g., 64MB).
+/// Maximum payload size accepted by the object format: 64 MiB.
+/// Decoding checks this limit after buffering; it does not bound download or
+/// decryption allocations.
 pub const MAX_OBJECT_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Fixed logical block size: 4 MiB.
@@ -379,7 +381,7 @@ pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     // Without compression, both header sizes must describe the actual payload.
     let payload_len = payload.len();
     if header.original_size != header.compressed_size
-        || usize::try_from(header.compressed_size) != Ok(payload_len)
+        || !usize::try_from(header.compressed_size).is_ok_and(|size| size == payload_len)
     {
         return Err(ObjectError::SizeMismatch {
             original_size: header.original_size,
@@ -683,6 +685,22 @@ mod tests {
     fn test_empty_object_roundtrip() {
         let object = create_object_buffer(Bytes::new()).unwrap();
         assert!(read_object(object).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_object_accepts_maximum_payload_size() {
+        let chunk = Bytes::from(vec![0xAB; 1024 * 1024]);
+        let mut chunks = vec![chunk; MAX_OBJECT_SIZE as usize / (1024 * 1024)];
+        let payload = Buffer::from(chunks.clone());
+        let header = ObjectHeader::new(MAX_OBJECT_SIZE, MAX_OBJECT_SIZE, xxh64_buffer(&payload));
+        chunks.insert(0, Bytes::copy_from_slice(&header.to_bytes()));
+
+        let decoded = read_object(Buffer::from(chunks)).unwrap();
+        assert_eq!(decoded.len(), MAX_OBJECT_SIZE as usize);
+        assert!(decoded.iter().all(|byte| *byte == 0xAB));
+        // The writer accepts the same inclusive boundary as the reader.
+        let encoded = create_object_buffer(decoded).unwrap();
+        assert_eq!(encoded.len(), ObjectHeader::SIZE + MAX_OBJECT_SIZE as usize);
     }
 
     #[test]
