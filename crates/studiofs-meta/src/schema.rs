@@ -29,7 +29,7 @@ pub const MAX_BLOCK_SIZE_MIB: u32 = u32::MAX / BYTES_PER_MIB;
 pub const MIN_PRACTICAL_ADDRESSABLE_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 /// Minimum block size that supports the practical range with `u32` block indexes.
 pub const MIN_BLOCK_SIZE_BYTES: u32 =
-    MIN_PRACTICAL_ADDRESSABLE_BYTES.div_ceil(u32::MAX as u64) as u32;
+    MIN_PRACTICAL_ADDRESSABLE_BYTES.div_ceil(u32::MAX as u64 + 1) as u32;
 /// Default logical block size: 4 MiB.
 pub const DEFAULT_BLOCK_SIZE: u32 = 4 * BYTES_PER_MIB;
 /// Default chunk size for the chunk/slice object graph: 64 MiB.
@@ -2477,8 +2477,10 @@ mod tests {
 
         info.block_size = MIN_BLOCK_SIZE_BYTES;
         assert!(info.validate_format_contract().is_ok());
+        assert_eq!(MIN_BLOCK_SIZE_BYTES, 16 * 1024);
         assert!(
-            (u32::MAX as u64) * u64::from(MIN_BLOCK_SIZE_BYTES) >= MIN_PRACTICAL_ADDRESSABLE_BYTES
+            (u32::MAX as u64 + 1) * u64::from(MIN_BLOCK_SIZE_BYTES)
+                >= MIN_PRACTICAL_ADDRESSABLE_BYTES
         );
     }
 

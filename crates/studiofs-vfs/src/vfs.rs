@@ -186,10 +186,10 @@ use studiofs_meta::engine::{
     MetadataAuthorityStatus, PgSyncDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason,
 };
 use studiofs_meta::schema::{
-    ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, MIN_BLOCK_SIZE_BYTES,
-    MIN_PRACTICAL_ADDRESSABLE_BYTES, PayloadRetentionClass, ROOT_INO, ResolvedSliceSource,
-    SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord, UploadState as MetaUploadState,
-    chunk_id_from_offset, chunk_start_offset,
+    ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, FormatInfoError, InodeLifecycleState,
+    MIN_BLOCK_SIZE_BYTES, MIN_PRACTICAL_ADDRESSABLE_BYTES, PayloadRetentionClass, ROOT_INO,
+    ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
+    UploadState as MetaUploadState, chunk_id_from_offset, chunk_start_offset,
 };
 use studiofs_meta::types::{
     AccessLevel, FileType, Ino, InodeAttr, PayloadRef, block_index_from_offset, offset_within_block,
@@ -3641,9 +3641,13 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
         ));
     }
     if block_size < MIN_BLOCK_SIZE_BYTES {
-        return Err(VfsError::Other(format!(
-            "volume block_size {block_size} is below the minimum supported size {MIN_BLOCK_SIZE_BYTES}"
-        )));
+        return Err(
+            MetaError::InvalidFormatConfig(FormatInfoError::BlockSizeBelowMinimum {
+                block_size_bytes: block_size,
+                minimum_bytes: MIN_BLOCK_SIZE_BYTES,
+            })
+            .into(),
+        );
     }
     let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
     if (block_size as usize) > cloud_logical_block_capacity {
@@ -3681,24 +3685,16 @@ fn drain_lag_pacing_attribution_ms(
     Some(attributed_ms.min(u128::from(u64::MAX)) as u64)
 }
 
-fn warn_small_block_addressability(block_size: u32) {
-    let block_size_nonzero = block_size.max(1) as u128;
+fn debug_assert_block_size_addressability(block_size: u32) {
     let min_practical_addressable_bytes = MIN_PRACTICAL_ADDRESSABLE_BYTES as u128;
-    let max_addressable_bytes = (u32::MAX as u128).saturating_mul(block_size_nonzero);
+    let block_count = u32::MAX as u128 + 1;
+    let max_addressable_bytes = block_count * u128::from(block_size);
     debug_assert!(
         max_addressable_bytes >= min_practical_addressable_bytes,
         "configured block_size={} yields only {} addressable bytes with u32 block indices",
-        block_size_nonzero,
+        block_size,
         max_addressable_bytes
     );
-    if max_addressable_bytes < min_practical_addressable_bytes {
-        warn!(
-            block_size,
-            max_addressable_bytes,
-            min_recommended = min_practical_addressable_bytes,
-            "small block_size reduces max file addressability with u32 block indices"
-        );
-    }
 }
 
 fn derive_buffer_blocks_default(read_buffer_mb: u64, block_size: u32) -> u32 {
