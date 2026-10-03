@@ -109,6 +109,61 @@ fn namespace_mutation_batch_rolls_back_on_middle_conflict() {
 }
 
 #[test]
+fn namespace_mutation_batch_rolls_back_when_total_inode_counter_overflows() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::TOTAL_INODES, u64::MAX - 1)
+        .unwrap();
+    let root_before = engine.get_attr(ROOT_INO).unwrap();
+    let next_event_before = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+
+    let error = engine
+        .apply_namespace_mutations(&[
+            NamespaceMutation::CreateDir {
+                ino: 41,
+                parent: ROOT_INO,
+                name: b"rolled-back-first-dir".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                mode: 0o755,
+            },
+            NamespaceMutation::CreateFile {
+                ino: 42,
+                parent: ROOT_INO,
+                name: b"rejected-second.txt".to_vec(),
+                uid: 1000,
+                gid: 1000,
+                mode: 0o644,
+            },
+        ])
+        .expect_err("second namespace mutation must fail when total inodes reaches MAX");
+
+    assert!(matches!(
+        error,
+        MetaError::NamespaceBatchOperation { index: 1, source }
+            if matches!(&*source, MetaError::Storage(message)
+                if message.contains("total inodes") && message.contains("overflow"))
+    ));
+    assert_eq!(engine.get_counter(counters::TOTAL_INODES).unwrap(), u64::MAX - 1);
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        next_event_before
+    );
+    assert!(engine.lookup(ROOT_INO, b"rolled-back-first-dir").is_err());
+    assert!(engine.lookup(ROOT_INO, b"rejected-second.txt").is_err());
+    assert!(engine.get_attr(41).is_err());
+    assert!(engine.get_attr(42).is_err());
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_before);
+    let read = engine.begin_read_txn().unwrap();
+    assert!(read
+        .open_table(EVENT_LOG_TABLE)
+        .unwrap()
+        .get(next_event_before)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn namespace_mutation_batch_reports_invalid_parent_and_preserves_single_create_behavior() {
     let engine = temp_engine();
     let parent_file = engine

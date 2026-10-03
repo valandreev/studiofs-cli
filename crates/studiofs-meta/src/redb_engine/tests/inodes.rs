@@ -79,6 +79,38 @@ fn test_object_id_allocation_reports_hard_stream_overflow() {
 }
 
 #[test]
+fn test_object_id_batch_respects_remaining_inode_stream_headroom() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::NEXT_INODE, u64::MAX - 3)
+        .unwrap();
+
+    assert_eq!(
+        engine.next_object_ids(3).unwrap(),
+        vec![u64::MAX - 3, u64::MAX - 2, u64::MAX - 1]
+    );
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
+
+    let error = engine
+        .next_object_ids(1)
+        .expect_err("no object ID may be allocated after the stream reaches MAX");
+    assert!(error.to_string().contains("object ID allocation overflow"));
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
+
+    engine
+        .set_counter(counters::NEXT_INODE, u64::MAX - 2)
+        .unwrap();
+    let error = engine
+        .next_object_ids(3)
+        .expect_err("a batch extending past MAX must fail as a whole");
+    assert!(error.to_string().contains("object ID allocation overflow"));
+    assert_eq!(
+        engine.get_counter(counters::NEXT_INODE).unwrap(),
+        u64::MAX - 2
+    );
+}
+
+#[test]
 fn test_list_inode_attrs_ignores_sparse_next_inode_range() {
     let engine = temp_engine();
     let file = engine
@@ -374,6 +406,59 @@ fn test_incr_counter_accumulates_from_zero() {
     assert_eq!(first, 3);
     assert_eq!(second, 7);
     assert_eq!(engine.get_counter("test_hits").unwrap(), 7);
+}
+
+#[test]
+fn test_incr_counter_rejects_overflow_without_changing_persisted_value() {
+    let engine = temp_engine();
+    engine.set_counter("test_overflow", u64::MAX - 1).unwrap();
+
+    assert_eq!(engine.incr_counter("test_overflow", 1).unwrap(), u64::MAX);
+    assert_eq!(engine.get_counter("test_overflow").unwrap(), u64::MAX);
+    assert_eq!(engine.incr_counter("test_overflow", 0).unwrap(), u64::MAX);
+    assert_eq!(engine.get_counter("test_overflow").unwrap(), u64::MAX);
+
+    let error = engine
+        .incr_counter("test_overflow", 1)
+        .expect_err("incrementing a saturated counter must fail");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("test_overflow") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(engine.get_counter("test_overflow").unwrap(), u64::MAX);
+
+    engine.set_counter("test_multi_overflow", u64::MAX - 1).unwrap();
+    let error = engine
+        .incr_counter("test_multi_overflow", 2)
+        .expect_err("an increment larger than the remaining headroom must fail");
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("test_multi_overflow") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter("test_multi_overflow").unwrap(),
+        u64::MAX - 1
+    );
+}
+
+#[test]
+fn test_next_inode_rejects_overflow_after_last_valid_allocation() {
+    let engine = temp_engine();
+    engine.set_counter(counters::NEXT_INODE, u64::MAX - 1).unwrap();
+
+    assert_eq!(engine.next_inode().unwrap(), u64::MAX - 1);
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
+
+    let error = engine
+        .next_inode()
+        .expect_err("allocating when the next-inode counter is saturated must fail");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("inode allocation overflow")),
+        "{error:?}"
+    );
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
 }
 
 #[test]

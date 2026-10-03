@@ -139,6 +139,205 @@ fn acl_removal_fault_fixture(
 }
 
 #[test]
+fn append_event_accepts_last_sequence_and_rejects_overflow_without_mutation() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::NEXT_EVENT_SEQ, u64::MAX - 1)
+        .unwrap();
+    let event = MetaEvent::SetAttr {
+        attr: engine.get_attr(ROOT_INO).unwrap(),
+    };
+
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::append_event_in_txn(&txn, &event).unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        u64::MAX
+    );
+    {
+        let read = engine.begin_read_txn().unwrap();
+        assert!(
+            read.open_table(EVENT_LOG_TABLE)
+                .unwrap()
+                .get(u64::MAX - 1)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    let txn = engine.begin_write_txn().unwrap();
+    let error = RedbMetaEngine::append_event_in_txn(&txn, &event)
+        .expect_err("event sequence allocation at u64::MAX must fail");
+    // Commit deliberately to prove the rejected append wrote no partial records;
+    // aborting here would hide mutations made before returning the error.
+    txn.commit().unwrap();
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("event sequence") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        u64::MAX
+    );
+    let read = engine.begin_read_txn().unwrap();
+    let events = read.open_table(EVENT_LOG_TABLE).unwrap();
+    assert!(events.get(u64::MAX - 1).unwrap().is_some());
+    assert!(events.get(u64::MAX).unwrap().is_none());
+}
+
+#[test]
+fn namespace_create_rolls_back_when_event_sequence_overflows() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::NEXT_EVENT_SEQ, u64::MAX - 1)
+        .unwrap();
+    let root_before = engine.get_attr(ROOT_INO).unwrap();
+
+    let result = engine.create_file_with_ino(
+        u64::MAX - 100,
+        ROOT_INO,
+        b"event-overflow.txt",
+        1000,
+        1000,
+        0o644,
+    );
+
+    let error = result.expect_err("namespace creation must roll back after event overflow");
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("event sequence") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert!(engine.lookup(ROOT_INO, b"event-overflow.txt").is_err());
+    assert!(engine.get_attr(u64::MAX - 100).is_err());
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_before);
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        u64::MAX - 1
+    );
+    let read = engine.begin_read_txn().unwrap();
+    let events = read.open_table(EVENT_LOG_TABLE).unwrap();
+    assert!(events.get(u64::MAX - 1).unwrap().is_none());
+    assert!(events.get(u64::MAX).unwrap().is_none());
+}
+
+#[test]
+fn namespace_create_checks_total_inode_overflow_before_writing_namespace_state() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::TOTAL_INODES, u64::MAX - 1)
+        .unwrap();
+    let last_valid = engine
+        .create_file_with_ino(
+            100_000,
+            ROOT_INO,
+            b"last-valid-inode-count.txt",
+            1000,
+            1000,
+            0o644,
+        )
+        .expect("incrementing the total inode count from MAX-1 must succeed");
+
+    assert_eq!(last_valid.ino, 100_000);
+    assert_eq!(
+        engine.get_counter(counters::TOTAL_INODES).unwrap(),
+        u64::MAX
+    );
+    assert_eq!(
+        engine
+            .lookup(ROOT_INO, b"last-valid-inode-count.txt")
+            .unwrap()
+            .ino,
+        last_valid.ino
+    );
+    let next_event_seq = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let root_at_limit = engine.get_attr(ROOT_INO).unwrap();
+
+    let error = engine
+        .create_file_with_ino(
+            100_001,
+            ROOT_INO,
+            b"overflow-inode-count.txt",
+            1000,
+            1000,
+            0o644,
+        )
+        .expect_err("creating an inode when the total inode counter is MAX must fail");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("total inodes") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter(counters::TOTAL_INODES).unwrap(),
+        u64::MAX
+    );
+    assert!(
+        engine
+            .lookup(ROOT_INO, b"overflow-inode-count.txt")
+            .is_err()
+    );
+    assert!(engine.get_attr(100_001).is_err());
+    // The total-inode guard rejects before namespace or journal writes;
+    // these assertions verify early rejection, not rollback of prior writes.
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_at_limit);
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        next_event_seq
+    );
+    let read = engine.begin_read_txn().unwrap();
+    assert!(
+        read.open_table(EVENT_LOG_TABLE)
+            .unwrap()
+            .get(next_event_seq)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn pending_create_undo_id_overflow_preserves_existing_undo_record() {
+    let engine = temp_engine();
+    engine
+        .set_counter(NEXT_UNDO_OP_ID_COUNTER, u64::MAX)
+        .unwrap();
+    let existing_undo = UndoLogRecord {
+        op_id: u64::MAX,
+        kind: UndoLogKind::PendingCreate,
+        phase: UndoLogPhase::Started,
+        ino: 70_001,
+        parent: ROOT_INO,
+        name: b"existing-undo.txt".to_vec(),
+        created_at: 0,
+    };
+    engine.append_undo_log(&existing_undo).unwrap();
+
+    let pending = PendingCreateRecord {
+        ino: 70_002,
+        parent: ROOT_INO,
+        name: b"rejected-pending-create.txt".to_vec(),
+        kind: FileType::RegularFile,
+        created_at: 0,
+    };
+    let error = engine
+        .add_pending_create(&pending)
+        .expect_err("a saturated undo operation ID counter must reject pending create");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("undo op ID allocation overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter(NEXT_UNDO_OP_ID_COUNTER).unwrap(),
+        u64::MAX
+    );
+    assert!(engine.list_pending_creates().unwrap().is_empty());
+    assert_eq!(engine.list_undo_logs().unwrap(), vec![existing_undo]);
+}
+
+#[test]
 fn replica_removal_error_aborts_prior_metadata_writes() {
     let backend = RemoveFaultBackend::default();
     let engine = removal_fault_engine(&backend);
@@ -174,7 +373,7 @@ fn replica_removal_error_aborts_prior_metadata_writes() {
     let result = (|| -> MetaResult<()> {
         let txn = engine.begin_write_txn()?;
         RedbMetaEngine::update_counter_in_txn(&txn, "replica-removal-regression", |value| {
-            value + 1
+            Ok(value + 1)
         })?;
         backend.corrupt_read_at.store(branch, Ordering::SeqCst);
         RedbMetaEngine::apply_replica_aux_state_in_txn(
@@ -409,7 +608,7 @@ fn table_removal_error_aborts_metadata_write_transaction() {
         let txn = db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        RedbMetaEngine::update_counter_in_txn(&txn, "removal-regression", |value| value + 1)?;
+        RedbMetaEngine::update_counter_in_txn(&txn, "removal-regression", |value| Ok(value + 1))?;
         backend.corrupt_read_at.store(branch, Ordering::SeqCst);
         RedbMetaEngine::remove_symlink_overlay_in_txn(&txn, 0)?;
         txn.commit()
