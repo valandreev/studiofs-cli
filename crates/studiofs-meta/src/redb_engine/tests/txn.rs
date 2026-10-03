@@ -229,8 +229,6 @@ fn namespace_create_checks_total_inode_overflow_before_writing_namespace_state()
     engine
         .set_counter(counters::TOTAL_INODES, u64::MAX - 1)
         .unwrap();
-    let root_before = engine.get_attr(ROOT_INO).unwrap();
-
     let last_valid = engine
         .create_file_with_ino(
             100_000,
@@ -282,12 +280,13 @@ fn namespace_create_checks_total_inode_overflow_before_writing_namespace_state()
             .is_err()
     );
     assert!(engine.get_attr(100_001).is_err());
+    // The total-inode guard rejects before namespace or journal writes;
+    // these assertions verify early rejection, not rollback of prior writes.
     assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_at_limit);
     assert_eq!(
         engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
         next_event_seq
     );
-    assert_eq!(root_before, root_at_limit);
     let read = engine.begin_read_txn().unwrap();
     assert!(
         read.open_table(EVENT_LOG_TABLE)

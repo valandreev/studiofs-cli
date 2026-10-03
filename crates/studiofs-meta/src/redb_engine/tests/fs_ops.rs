@@ -119,13 +119,13 @@ fn namespace_mutation_batch_rolls_back_when_total_inode_counter_overflows() {
 
     let error = engine
         .apply_namespace_mutations(&[
-            NamespaceMutation::CreateFile {
+            NamespaceMutation::CreateDir {
                 ino: 41,
                 parent: ROOT_INO,
-                name: b"rolled-back-first.txt".to_vec(),
+                name: b"rolled-back-first-dir".to_vec(),
                 uid: 1000,
                 gid: 1000,
-                mode: 0o644,
+                mode: 0o755,
             },
             NamespaceMutation::CreateFile {
                 ino: 42,
@@ -149,7 +149,7 @@ fn namespace_mutation_batch_rolls_back_when_total_inode_counter_overflows() {
         engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
         next_event_before
     );
-    assert!(engine.lookup(ROOT_INO, b"rolled-back-first.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"rolled-back-first-dir").is_err());
     assert!(engine.lookup(ROOT_INO, b"rejected-second.txt").is_err());
     assert!(engine.get_attr(41).is_err());
     assert!(engine.get_attr(42).is_err());

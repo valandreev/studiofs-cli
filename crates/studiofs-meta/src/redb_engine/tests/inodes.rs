@@ -455,7 +455,7 @@ fn test_next_inode_rejects_overflow_after_last_valid_allocation() {
         .expect_err("allocating when the next-inode counter is saturated must fail");
 
     assert!(
-        matches!(&error, MetaError::Storage(message) if message.contains("inode") && message.contains("overflow")),
+        matches!(&error, MetaError::Storage(message) if message.contains("inode allocation overflow")),
         "{error:?}"
     );
     assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
