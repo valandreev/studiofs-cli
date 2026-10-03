@@ -2,9 +2,10 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -17,6 +18,9 @@ use super::{LowLevelOperations, Session, SessionConfig, raw};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
+// Detached Disk Arbitration unmount may outlast the foreground operation budget.
+const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(15);
+const MOUNT_POINT_REMOVAL_TIMEOUT: Duration = Duration::from_secs(3);
 const TEARDOWN_WAIT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -109,7 +113,11 @@ struct TempMountDir {
 impl TempMountDir {
     fn create(path: PathBuf) -> std::io::Result<Self> {
         fs::create_dir(&path)?;
-        Ok(Self { path })
+        let mut mount_point = Self { path };
+        // Match the kernel's resolved mount name before mounting. Resolving a
+        // stopped FUSE mount during teardown could block on a native request.
+        mount_point.path = fs::canonicalize(&mount_point.path)?;
+        Ok(mount_point)
     }
 
     fn path(&self) -> &Path {
@@ -125,20 +133,158 @@ impl Drop for TempMountDir {
     }
 }
 
-fn remove_mount_point(path: &Path) -> std::io::Result<()> {
-    let deadline = std::time::Instant::now() + OPERATION_TIMEOUT;
+fn mount_point_is_active(path: &Path) -> std::io::Result<bool> {
+    // MNT_NOWAIT reads the kernel's mount table without asking a stopped FUSE
+    // session to service statfs. Use caller-owned storage rather than getmntinfo's
+    // shared buffer, since macFUSE also has background threads.
+    // SAFETY: A null buffer requests only the current mount count.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut capacity = count as usize + 1;
     loop {
-        match fs::remove_dir(path) {
+        let buffer_size = capacity
+            .checked_mul(std::mem::size_of::<libc::statfs>())
+            .and_then(|size| size.try_into().ok())
+            .ok_or_else(|| std::io::Error::other("mount table is too large"))?;
+        let mut mounts = Vec::<libc::statfs>::with_capacity(capacity);
+        // SAFETY: The buffer is aligned and writable for buffer_size bytes.
+        // getfsstat initializes each of the returned statfs entries.
+        let count = unsafe { libc::getfsstat(mounts.as_mut_ptr(), buffer_size, libc::MNT_NOWAIT) };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count as usize == capacity {
+            // A full buffer may omit the mount after concurrent table growth.
+            capacity *= 2;
+            continue;
+        }
+        // SAFETY: getfsstat initialized count entries, fewer than capacity.
+        unsafe { mounts.set_len(count as usize) };
+        return Ok(mounts.iter().any(|mount| {
+            // SAFETY: The kernel returns a NUL-terminated mount point name.
+            unsafe { CStr::from_ptr(mount.f_mntonname.as_ptr()) }.to_bytes()
+                == path.as_os_str().as_bytes()
+        }));
+    }
+}
+
+fn remove_mount_point(path: &Path) -> std::io::Result<()> {
+    remove_mount_point_with(
+        path,
+        std::time::Instant::now() + UNMOUNT_TIMEOUT,
+        MOUNT_POINT_REMOVAL_TIMEOUT,
+        |path| fs::remove_dir(path),
+    )
+}
+
+fn remove_mount_point_with(
+    path: &Path,
+    unmount_deadline: std::time::Instant,
+    removal_timeout: Duration,
+    mut remove_dir: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    while mount_point_is_active(path)? {
+        if std::time::Instant::now() >= unmount_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "native macFUSE unmount did not complete: {}",
+                    path.display()
+                ),
+            ));
+        }
+        // fuse_unmount starts a detached macFUSE worker. Session destruction
+        // does not acknowledge that worker's Disk Arbitration completion.
+        thread::sleep(POLL_INTERVAL);
+    }
+    let removal_deadline = std::time::Instant::now() + removal_timeout;
+    loop {
+        match remove_dir(path) {
             Err(error)
                 if error.raw_os_error() == Some(libc::EBUSY)
-                    && std::time::Instant::now() < deadline =>
+                    && std::time::Instant::now() < removal_deadline =>
             {
-                // macFUSE may release the mounted vnode after fuse_unmount returns.
+                // The mount table can clear before the mounted vnode is released.
                 thread::sleep(POLL_INTERVAL);
             }
             result => return result,
         }
     }
+}
+
+#[test]
+fn remove_mount_point_retries_busy_directory_after_unmount_budget_is_exhausted() {
+    let mount_point = TempMountDir::create(studiofs_test_support::workspace_target_temp_path(
+        "macfuse-busy-dir-",
+    ))
+    .expect("create unmounted test directory");
+    let mut attempts = 0;
+    remove_mount_point_with(
+        mount_point.path(),
+        std::time::Instant::now(),
+        MOUNT_POINT_REMOVAL_TIMEOUT,
+        |path| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+            } else {
+                fs::remove_dir(path)
+            }
+        },
+    )
+    .expect("remove directory after transient EBUSY");
+    assert_eq!(attempts, 3);
+    assert!(!mount_point.path().exists());
+}
+
+#[test]
+fn remove_mount_point_returns_terminal_removal_errors() {
+    let mount_point = TempMountDir::create(studiofs_test_support::workspace_target_temp_path(
+        "macfuse-terminal-dir-",
+    ))
+    .expect("create unmounted test directory");
+    for (errno, budget) in [
+        (libc::EBUSY, Duration::ZERO),
+        (libc::EPERM, MOUNT_POINT_REMOVAL_TIMEOUT),
+    ] {
+        let mut attempts = 0;
+        let error = remove_mount_point_with(
+            mount_point.path(),
+            std::time::Instant::now() + UNMOUNT_TIMEOUT,
+            budget,
+            |_| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(errno))
+            },
+        )
+        .expect_err("return expired EBUSY or non-retryable error");
+        assert_eq!(error.raw_os_error(), Some(errno));
+        assert_eq!(attempts, 1);
+    }
+}
+
+#[test]
+fn mount_table_reports_unmounted_directory_as_inactive() {
+    assert!(mount_point_is_active(Path::new("/")).expect("read root mount"));
+    let mount_point = TempMountDir::create(studiofs_test_support::workspace_target_temp_path(
+        "macfuse-mount-table-",
+    ))
+    .expect("create unmounted test directory");
+    assert!(!mount_point_is_active(mount_point.path()).expect("read mount table"));
+    remove_mount_point(mount_point.path()).expect("remove unmounted directory");
+}
+
+#[test]
+fn temp_mount_dir_resolves_symlinked_prefix_before_mount() {
+    let scratch = studiofs_test_support::workspace_target_tempdir("macfuse-dir-alias-");
+    let canonical_root = fs::canonicalize(scratch.path()).expect("resolve test directory");
+    let alias = scratch.path().join("alias");
+    std::os::unix::fs::symlink(&canonical_root, &alias).expect("create directory alias");
+    let mount_point =
+        TempMountDir::create(alias.join("mount")).expect("create aliased mount point");
+    assert_eq!(mount_point.path(), canonical_root.join("mount"));
 }
 
 #[test]

@@ -41,7 +41,7 @@ impl StudioVfs {
         self.state
             .acl
             .acl_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(1))
             })
             .ok();
@@ -52,7 +52,7 @@ impl StudioVfs {
         self.state
             .acl
             .acl_namespace_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(1))
             })
             .ok();

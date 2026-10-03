@@ -40,7 +40,7 @@ fn record_dealloc(size: usize) {
     let size = size as u64;
     DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
     DEALLOCATED_TOTAL_BYTES.fetch_add(size, Ordering::Relaxed);
-    let _ = CURRENT_BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = CURRENT_BYTES.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_sub(size))
     });
 }
@@ -52,7 +52,7 @@ fn record_realloc(old_size: usize, new_size: usize) {
     ALLOCATED_TOTAL_BYTES.fetch_add(new_size, Ordering::Relaxed);
     DEALLOCATED_TOTAL_BYTES.fetch_add(old_size, Ordering::Relaxed);
     let current = CURRENT_BYTES
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             Some(current.saturating_sub(old_size).saturating_add(new_size))
         })
         .unwrap_or_default()

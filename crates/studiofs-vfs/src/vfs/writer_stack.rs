@@ -1172,7 +1172,7 @@ impl MountedWriterStack {
     fn subtract_dirty(&self, amount: usize) {
         let _ = self
             .dirty_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(amount))
             });
     }
@@ -1455,7 +1455,7 @@ mod tests {
         fn maybe_fail(&self) -> Result<(), LocalPayloadBackendError> {
             let failed = self
                 .failures_remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                     (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok();

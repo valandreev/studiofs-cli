@@ -1191,7 +1191,7 @@ impl StudioVfs {
         self.state
             .namespace
             .attribute_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(1))
             })
             .ok();
