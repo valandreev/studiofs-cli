@@ -270,11 +270,10 @@ impl LockOrderGuard {
                 .rfind(|held_lock| {
                     tier < held_lock.tier
                         || (tier == held_lock.tier
-                            && matches!(
-                                (held_lock.subtier, subtier),
-                                (Some(held), Some(acquiring))
-                                    if !held.allows_nested_acquisition(acquiring)
-                            ))
+                            && held_lock
+                                .subtier
+                                .zip(subtier)
+                                .is_some_and(|(held, next)| !held.allows_nested_acquisition(next)))
                 })
                 .copied();
             if let Some(violating_lock) = violating_lock {
