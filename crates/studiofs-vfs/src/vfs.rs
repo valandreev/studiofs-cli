@@ -2527,11 +2527,13 @@ impl ShutdownState {
 
     fn abort(&self) {
         *self.shutdown_phase.lock() = ShutdownPhase::Aborted;
+        // The temporary phase guard drops at the statement boundary before waking waiters.
         self.shutdown_notify.notify_waiters();
     }
 
     fn complete(&self, error: Option<ShutdownError>) {
         *self.shutdown_phase.lock() = ShutdownPhase::Completed(error);
+        // The temporary phase guard drops at the statement boundary before waking waiters.
         self.shutdown_notify.notify_waiters();
     }
 }
