@@ -187,7 +187,7 @@ use studiofs_meta::engine::{
 };
 use studiofs_meta::schema::{
     ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, FormatInfoError, InodeLifecycleState,
-    MIN_BLOCK_SIZE_BYTES, MIN_PRACTICAL_ADDRESSABLE_BYTES, PayloadRetentionClass, ROOT_INO,
+    MAX_SUPPORTED_BLOCK_SIZE_BYTES, MIN_BLOCK_SIZE_BYTES, PayloadRetentionClass, ROOT_INO,
     ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
     UploadState as MetaUploadState, chunk_id_from_offset, chunk_start_offset,
 };
@@ -3649,6 +3649,15 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
             .into(),
         );
     }
+    if block_size > MAX_SUPPORTED_BLOCK_SIZE_BYTES {
+        return Err(
+            MetaError::InvalidFormatConfig(FormatInfoError::BlockSizeAboveMaximum {
+                block_size_bytes: block_size,
+                maximum_bytes: MAX_SUPPORTED_BLOCK_SIZE_BYTES,
+            })
+            .into(),
+        );
+    }
     let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
     if (block_size as usize) > cloud_logical_block_capacity {
         return Err(VfsError::Other(format!(
@@ -3683,18 +3692,6 @@ fn drain_lag_pacing_attribution_ms(
     let denominator = u128::from(requested_delay_ms);
     let attributed_ms = numerator.div_ceil(denominator);
     Some(attributed_ms.min(u128::from(u64::MAX)) as u64)
-}
-
-fn debug_assert_block_size_addressability(block_size: u32) {
-    let min_practical_addressable_bytes = MIN_PRACTICAL_ADDRESSABLE_BYTES as u128;
-    let block_count = u32::MAX as u128 + 1;
-    let max_addressable_bytes = block_count * u128::from(block_size);
-    debug_assert!(
-        max_addressable_bytes >= min_practical_addressable_bytes,
-        "configured block_size={} yields only {} addressable bytes with u32 block indices",
-        block_size,
-        max_addressable_bytes
-    );
 }
 
 fn derive_buffer_blocks_default(read_buffer_mb: u64, block_size: u32) -> u32 {

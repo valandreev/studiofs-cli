@@ -300,7 +300,7 @@ mod tests {
                 secret_key: "test".to_string(),
                 region: "us-east-1".to_string(),
             },
-            16,
+            4,
         )
         .expect("create test format info");
         format_info.metadata = MetadataConfig {

@@ -59,7 +59,7 @@ mod tests {
                 secret_key: "async-meta-secret".to_string(),
                 region: String::new(),
             },
-            16,
+            4,
         )
         .expect("generate format info");
         engine.set_format_info(&info).expect("set format info");

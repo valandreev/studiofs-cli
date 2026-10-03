@@ -25,9 +25,13 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const BYTES_PER_MIB: u32 = 1024 * 1024;
 /// Maximum whole-MiB block size representable by the persisted `u32` byte field.
 pub const MAX_BLOCK_SIZE_MIB: u32 = u32::MAX / BYTES_PER_MIB;
-/// Minimum addressable file range expected from `u32` block indexes.
+/// Largest block size supported by the current cloud-fragment format.
+pub const MAX_SUPPORTED_BLOCK_SIZE_BYTES: u32 = 4 * BYTES_PER_MIB;
+/// Minimum addressable file range expected from `u32` block indexes; this is not a file-size limit.
 pub const MIN_PRACTICAL_ADDRESSABLE_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
-/// Minimum block size that supports the practical range with `u32` block indexes.
+/// Minimum block size needed for `u32` indexes to cover at least 64 TiB.
+///
+/// This does not cap file size or prevent `block_index_from_offset` from truncating larger indexes.
 pub const MIN_BLOCK_SIZE_BYTES: u32 =
     MIN_PRACTICAL_ADDRESSABLE_BYTES.div_ceil(u32::MAX as u64 + 1) as u32;
 /// Default logical block size: 4 MiB.
@@ -1852,6 +1856,16 @@ pub enum FormatInfoError {
         /// Minimum block size in bytes.
         minimum_bytes: u32,
     },
+    /// The block size exceeds the maximum supported by the current cloud-fragment format.
+    #[error(
+        "block size {block_size_bytes} bytes is above the maximum supported size of {maximum_bytes} bytes"
+    )]
+    BlockSizeAboveMaximum {
+        /// Requested block size in bytes.
+        block_size_bytes: u32,
+        /// Maximum block size in bytes.
+        maximum_bytes: u32,
+    },
     /// The requested MiB count cannot be represented as a `u32` byte count.
     #[error(
         "block size {block_size_mb} MiB exceeds the maximum representable size of {max_block_size_mib} MiB"
@@ -1871,14 +1885,14 @@ impl FormatInfo {
     /// Create a new format info with the specified parameters.
     ///
     /// `block_size_mb` is measured in MiB; the persisted field stores bytes.
-    /// The conversion limit is for the persisted `u32` field; the selected
-    /// metadata backend may impose a smaller limit.
+    /// The persisted `u32` field can represent larger values, but the current
+    /// cloud-fragment format supports at most [`MAX_SUPPORTED_BLOCK_SIZE_BYTES`].
     ///
     /// # Errors
     ///
-    /// Returns an error if the block size is zero, exceeds
-    /// [`MAX_BLOCK_SIZE_MIB`], or
-    /// encryption key generation fails.
+    /// Returns an error if the block size is zero, cannot fit in the persisted
+    /// field, exceeds [`MAX_SUPPORTED_BLOCK_SIZE_BYTES`], or encryption key
+    /// generation fails.
     pub fn new(
         name: String,
         uuid: String,
@@ -1895,6 +1909,7 @@ impl FormatInfo {
                     block_size_mb,
                     max_block_size_mib: MAX_BLOCK_SIZE_MIB,
                 })?;
+        validate_block_size(block_size)?;
         Ok(Self {
             format_version: CURRENT_FORMAT_VERSION,
             name,
@@ -1913,23 +1928,36 @@ impl FormatInfo {
 
     /// Validate metadata format contracts enforced at mount/open boundaries.
     pub fn validate_format_contract(&self) -> Result<(), FormatInfoError> {
-        if self.block_size == 0 {
-            return Err(FormatInfoError::ZeroBlockSize);
-        }
-        if self.block_size < MIN_BLOCK_SIZE_BYTES {
-            return Err(FormatInfoError::BlockSizeBelowMinimum {
-                block_size_bytes: self.block_size,
-                minimum_bytes: MIN_BLOCK_SIZE_BYTES,
-            });
-        }
+        validate_block_size(self.block_size)?;
         self.encryption.validate()?;
         Ok(())
     }
 
     /// Get block size in MiB (for display purposes).
+    ///
+    /// Sub-MiB sizes are rounded up to the next whole MiB.
     pub fn block_size_mb(&self) -> u32 {
-        self.block_size / BYTES_PER_MIB
+        self.block_size.div_ceil(BYTES_PER_MIB)
     }
+}
+
+fn validate_block_size(block_size: u32) -> Result<(), FormatInfoError> {
+    if block_size == 0 {
+        return Err(FormatInfoError::ZeroBlockSize);
+    }
+    if block_size < MIN_BLOCK_SIZE_BYTES {
+        return Err(FormatInfoError::BlockSizeBelowMinimum {
+            block_size_bytes: block_size,
+            minimum_bytes: MIN_BLOCK_SIZE_BYTES,
+        });
+    }
+    if block_size > MAX_SUPPORTED_BLOCK_SIZE_BYTES {
+        return Err(FormatInfoError::BlockSizeAboveMaximum {
+            block_size_bytes: block_size,
+            maximum_bytes: MAX_SUPPORTED_BLOCK_SIZE_BYTES,
+        });
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -1958,7 +1986,9 @@ pub mod counters {
 // Helper Functions
 // =============================================================================
 
-/// Calculate the block index for a given file offset.
+/// Calculate the block index for a file offset.
+///
+/// The caller must keep the index within `u32`; larger indexes are truncated.
 #[inline]
 pub fn block_index_from_offset(offset: u64, block_size: u32) -> u32 {
     (offset / block_size as u64) as u32
@@ -2435,8 +2465,31 @@ mod tests {
     }
 
     #[test]
-    fn format_info_new_preserves_representable_block_sizes() {
-        for block_size_mb in [1, 16, 2047, 4095] {
+    fn format_info_new_rejects_unsupported_block_sizes() {
+        let data_store = test_format_info_data_store();
+        for block_size_mb in [5, 4095] {
+            assert!(
+                matches!(
+                    FormatInfo::new(
+                        "volume".to_string(),
+                        "volume-uuid".to_string(),
+                        data_store.clone(),
+                        block_size_mb,
+                    ),
+                    Err(FormatInfoError::BlockSizeAboveMaximum {
+                        block_size_bytes,
+                        maximum_bytes,
+                    }) if block_size_bytes == block_size_mb * BYTES_PER_MIB
+                        && maximum_bytes == 4 * BYTES_PER_MIB
+                ),
+                "{block_size_mb} MiB blocks exceed the VFS-supported maximum"
+            );
+        }
+    }
+
+    #[test]
+    fn format_info_new_preserves_supported_block_sizes() {
+        for block_size_mb in [1, 2, 3, 4] {
             let info = FormatInfo::new(
                 "volume".to_string(),
                 "volume-uuid".to_string(),
@@ -2484,6 +2537,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_info_validate_format_contract_rejects_oversized_block_size() {
+        let mut info = FormatInfo::new(
+            "volume".into(),
+            "uuid".into(),
+            test_format_info_data_store(),
+            4,
+        )
+        .expect("construct format info at supported maximum");
+        info.block_size = 4 * BYTES_PER_MIB + 1;
+        assert_eq!(
+            info.validate_format_contract(),
+            Err(FormatInfoError::BlockSizeAboveMaximum {
+                block_size_bytes: 4 * BYTES_PER_MIB + 1,
+                maximum_bytes: 4 * BYTES_PER_MIB,
+            })
+        );
+    }
+
+    #[test]
+    fn format_info_block_size_mb_rounds_sub_mib_sizes_up() {
+        let mut info = FormatInfo::new(
+            "volume".into(),
+            "uuid".into(),
+            test_format_info_data_store(),
+            1,
+        )
+        .expect("construct format info");
+        info.block_size = 16 * 1024;
+
+        assert_eq!(info.block_size_mb(), 1);
+    }
+
     fn test_format_info_data_store() -> FormatInfoDataStore {
         FormatInfoDataStore {
             endpoint: String::new(),
@@ -2509,7 +2595,7 @@ mod tests {
                 secret_key: secret_key.to_string(),
                 region: "region".to_string(),
             },
-            16,
+            4,
         )
         .expect("build format info");
         info.metadata.remote = Some(RemoteStoreConfig {

@@ -289,7 +289,7 @@ fn generated_encryption_config_and_format_info_use_fallible_contract() {
             secret_key: "studiofs123".into(),
             region: String::new(),
         },
-        16,
+        4,
     )
     .expect("generate format info");
 

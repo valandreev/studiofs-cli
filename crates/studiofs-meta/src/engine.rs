@@ -432,6 +432,12 @@ pub enum MetaError {
 /// Standard result type returned by metadata APIs.
 pub type MetaResult<T> = Result<T, MetaError>;
 
+impl From<crate::schema::EncryptionContractError> for MetaError {
+    fn from(error: crate::schema::EncryptionContractError) -> Self {
+        Self::InvalidFormatConfig(FormatInfoError::Encryption(error))
+    }
+}
+
 impl MetaError {
     /// Returns `true` when the error indicates that the redb database file
     /// requires repair (e.g. after an unclean shutdown) and the read-only
