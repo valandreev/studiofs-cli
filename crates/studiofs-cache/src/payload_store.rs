@@ -1179,22 +1179,15 @@ impl FilePayloadStore {
     }
 
     fn open_for_read(&self, path: &Path) -> io::Result<File> {
-        let file = if self.read_mode == LocalPayloadReadMode::Unbuffered {
+        if self.read_mode == LocalPayloadReadMode::Unbuffered {
             match platform::open_read_only_unbuffered(path) {
-                Ok(file) => Ok(file),
                 Err(error) if platform::is_unbuffered_io_unsupported_error(&error) => {
                     platform::open_read_only(path)
                 }
-                Err(error) => Err(error),
+                result => result,
             }
         } else {
             platform::open_read_only(path)
-        };
-
-        match file {
-            Ok(file) => Ok(file),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
-            Err(error) => Err(error),
         }
     }
 

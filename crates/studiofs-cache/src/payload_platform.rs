@@ -157,17 +157,6 @@ pub fn can_read_unbuffered_range(offset: u64, len: usize, alignment: usize) -> b
     can_read_unbuffered_range_impl(offset, len, alignment)
 }
 
-/// Write all bytes to an unbuffered payload file.
-pub fn write_all_unbuffered(file: &mut File, buf: &[u8]) -> io::Result<()> {
-    let mut scratch = UnbufferedWriteBuffer::new();
-    write_all_unbuffered_with_buffer(
-        file,
-        buf,
-        &mut scratch,
-        default_unbuffered_write_alignment(),
-    )
-}
-
 /// Write all bytes to an unbuffered payload file, reusing caller-owned scratch.
 pub fn write_all_unbuffered_with_buffer(
     file: &mut File,
@@ -434,16 +423,6 @@ fn can_read_unbuffered_range_impl(offset: u64, len: usize, alignment: usize) -> 
 }
 
 #[cfg(not(windows))]
-fn default_unbuffered_write_alignment() -> usize {
-    1
-}
-
-#[cfg(windows)]
-fn default_unbuffered_write_alignment() -> usize {
-    WINDOWS_UNBUFFERED_WRITE_ALIGNMENT
-}
-
-#[cfg(not(windows))]
 fn write_all_unbuffered_impl(
     file: &mut File,
     buf: &[u8],
@@ -624,7 +603,7 @@ fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
 #[cfg(test)]
 #[cfg(windows)]
 fn copy_for_unbuffered_test<'a>(scratch: &'a mut UnbufferedWriteBuffer, buf: &[u8]) -> &'a [u8] {
-    scratch.aligned_copy(buf, default_unbuffered_write_alignment())
+    scratch.aligned_copy(buf, WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
 }
 
 #[cfg(test)]

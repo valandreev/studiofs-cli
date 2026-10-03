@@ -450,11 +450,6 @@ impl UploadQueue {
             .any(|op| op.content_epoch > content_epoch)
     }
 
-    /// O(1) check whether a specific object id is currently pending upload.
-    pub fn has_pending_object(&self, object_id: u64) -> bool {
-        self.pending_state.lock().by_object.contains_key(&object_id)
-    }
-
     /// Request shutdown of this queue and wake all `wait_for_idle` callers.
     pub fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
