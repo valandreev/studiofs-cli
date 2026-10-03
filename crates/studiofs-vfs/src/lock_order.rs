@@ -78,12 +78,11 @@
 //! retains the validation guard until the mutex is released. `LockOrderGuard`
 //! provides the underlying tracking mechanism.
 //!
-//! ```rust,ignore
-//! use crate::lock_order::LockTier;
-//! use crate::ordered_mutex::OrderedMutex;
+//! ```rust
+//! use studiofs_vfs::{LockTier, OrderedMutex};
 //!
 //! let namespace = OrderedMutex::new((), LockTier::Namespace);
-//! let ns = namespace.lock();
+//! let _ns = namespace.lock();
 //! ```
 
 use std::cell::{Cell, RefCell};
@@ -668,7 +667,9 @@ mod tests {
             "expected exactly one out-of-order diagnostic, got: {captured}"
         );
         for field in [
+            "dropped_tier=\"Namespace\"".to_owned(),
             format!("dropped_id={dropped_id}"),
+            "top_tier=\"Namespace\"".to_owned(),
             format!("top_id={top_id}"),
             "stack_depth=3".to_owned(),
         ] {
