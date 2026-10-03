@@ -298,11 +298,19 @@ fn open_read_only_impl(path: &Path) -> io::Result<File> {
 fn open_file_descriptor_limit_impl() -> Option<usize> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     // SAFETY: getrlimit initializes the provided rlimit on success.
+    #[expect(
+        unsafe_code,
+        reason = "getrlimit writes its result to this valid output pointer."
+    )]
     let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
     if rc != 0 {
         return None;
     }
     // SAFETY: rc == 0 means getrlimit wrote a valid rlimit.
+    #[expect(
+        unsafe_code,
+        reason = "Successful getrlimit initialized the MaybeUninit value."
+    )]
     let limit = unsafe { limit.assume_init() };
     if limit.rlim_cur == libc::RLIM_INFINITY {
         return None;
@@ -330,6 +338,10 @@ fn open_read_only_unbuffered_impl(path: &Path) -> io::Result<File> {
 
     let file = open_read_only(path)?;
     // SAFETY: `file` owns a live descriptor for the duration of this call.
+    #[expect(
+        unsafe_code,
+        reason = "fcntl applies F_NOCACHE to this live file descriptor."
+    )]
     let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
     if result == -1 {
         return Err(io::Error::last_os_error());
@@ -537,6 +549,10 @@ fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
+    #[expect(
+        unsafe_code,
+        reason = "Declares the two Windows volume-query FFI entry points."
+    )]
     unsafe extern "system" {
         #[link_name = "GetVolumePathNameW"]
         fn get_volume_path_name_w(
@@ -565,6 +581,10 @@ fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
 
     // SAFETY: Both buffers are valid NUL-terminated UTF-16 buffers for the
     // duration of the calls. The output buffer length is passed in WCHAR units.
+    #[expect(
+        unsafe_code,
+        reason = "Uses NUL-terminated buffers with a checked output length."
+    )]
     let volume_ok = unsafe {
         get_volume_path_name_w(
             file_name.as_ptr(),
@@ -582,6 +602,10 @@ fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
     let mut total_clusters = 0_u32;
     // SAFETY: `volume_path` was filled by GetVolumePathNameW and remains a
     // valid NUL-terminated UTF-16 root path. All output pointers are valid.
+    #[expect(
+        unsafe_code,
+        reason = "Queries disk geometry using the validated path and outputs."
+    )]
     let disk_ok = unsafe {
         get_disk_free_space_w(
             volume_path.as_ptr(),
@@ -696,6 +720,10 @@ fn advise_random_impl(file: &File) -> io::Result<()> {
 
     // SAFETY: The file descriptor from `as_raw_fd` remains valid for the lifetime of
     // `file`, and POSIX_FADV_RANDOM is advisory only.
+    #[expect(
+        unsafe_code,
+        reason = "Applies POSIX_FADV_RANDOM to this live file descriptor."
+    )]
     let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
     if rc == 0 {
         Ok(())
@@ -720,6 +748,10 @@ fn advise_will_need_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
 
     let offset = u64_to_off_t(offset)?;
     let len = u64_to_off_t(len)?;
+    #[expect(
+        unsafe_code,
+        reason = "Applies POSIX_FADV_WILLNEED to checked offsets on a live file."
+    )]
     let rc = unsafe {
         // SAFETY: The file descriptor is borrowed from a live `File`, and POSIX_WILLNEED
         // is advisory; arguments are validated against off_t bounds above.
