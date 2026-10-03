@@ -327,6 +327,32 @@ mod tests {
     }
 
     #[test]
+    fn format_info_decode_rejects_zero_block_size() {
+        let mut info = FormatInfo::new(
+            "volume".to_string(),
+            "volume-uuid".to_string(),
+            FormatInfoDataStore {
+                endpoint: String::new(),
+                bucket: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+                region: String::new(),
+            },
+            1,
+        )
+        .expect("construct format info");
+        info.block_size = 0;
+        let bytes = serde_json::to_vec(&info).expect("serialize format info");
+
+        assert!(matches!(
+            decode_format_info(&bytes),
+            Err(MetaError::InvalidFormatConfig(
+                FormatInfoError::ZeroBlockSize
+            ))
+        ));
+    }
+
+    #[test]
     fn checkpoint_descriptor_validator_reports_each_invalid_field() {
         let bytes = b"checkpoint";
         let digest = Sha256::digest(bytes);

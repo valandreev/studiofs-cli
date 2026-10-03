@@ -348,7 +348,7 @@ pub enum MetaError {
 
     /// Persisted format metadata is structurally valid but violates the current format contract.
     #[error("invalid format config: {0}")]
-    InvalidFormatConfig(#[from] EncryptionContractError),
+    InvalidFormatConfig(#[from] FormatInfoError),
 
     /// The metadata store has not been initialized yet.
     #[error("format info not found — run `studiofs init` first")]

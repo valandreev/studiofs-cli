@@ -1568,7 +1568,7 @@ pub struct FormatInfo {
     pub metadata: MetadataConfig,
     /// Transparent remote-object encryption settings.
     pub encryption: EncryptionConfig,
-    /// Block size in bytes (configurable at init, default 16MB).
+    /// Block size in bytes (default [`DEFAULT_BLOCK_SIZE`]), persisted as a `u32`.
     pub block_size: u32,
 }
 
@@ -1827,14 +1827,46 @@ fn default_metadata_prefix() -> String {
     "metadata/".to_string()
 }
 
+/// Failure to construct or validate a volume format record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FormatInfoError {
+    /// A volume block size must be greater than zero.
+    #[error("block size must be greater than zero")]
+    ZeroBlockSize,
+    /// The requested MiB count cannot be represented as a `u32` byte count.
+    #[error("block size {block_size_mb} MiB exceeds the maximum representable size of 4095 MiB")]
+    BlockSizeOverflow {
+        /// Requested block size in MiB.
+        block_size_mb: u32,
+    },
+    /// Encryption configuration generation failed.
+    #[error(transparent)]
+    Encryption(#[from] EncryptionContractError),
+}
+
 impl FormatInfo {
     /// Create a new format info with the specified parameters.
+    ///
+    /// `block_size_mb` is measured in MiB; the persisted field stores bytes.
+    /// The conversion limit is for the persisted `u32` field; the selected
+    /// metadata backend may impose a smaller limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block size is zero, exceeds 4095 MiB, or
+    /// encryption key generation fails.
     pub fn new(
         name: String,
         uuid: String,
         data_store: FormatInfoDataStore,
         block_size_mb: u32,
-    ) -> Result<Self, EncryptionContractError> {
+    ) -> Result<Self, FormatInfoError> {
+        if block_size_mb == 0 {
+            return Err(FormatInfoError::ZeroBlockSize);
+        }
+        let block_size = block_size_mb
+            .checked_mul(1024 * 1024)
+            .ok_or(FormatInfoError::BlockSizeOverflow { block_size_mb })?;
         Ok(Self {
             format_version: CURRENT_FORMAT_VERSION,
             name,
@@ -1847,16 +1879,20 @@ impl FormatInfo {
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
             encryption: EncryptionConfig::generate()?,
-            block_size: block_size_mb * 1024 * 1024, // Convert MB to bytes
+            block_size,
         })
     }
 
     /// Validate metadata format contracts enforced at mount/open boundaries.
-    pub fn validate_format_contract(&self) -> Result<(), EncryptionContractError> {
-        self.encryption.validate()
+    pub fn validate_format_contract(&self) -> Result<(), FormatInfoError> {
+        if self.block_size == 0 {
+            return Err(FormatInfoError::ZeroBlockSize);
+        }
+        self.encryption.validate()?;
+        Ok(())
     }
 
-    /// Get block size in megabytes (for display purposes).
+    /// Get block size in MiB (for display purposes).
     pub fn block_size_mb(&self) -> u32 {
         self.block_size / (1024 * 1024)
     }
@@ -2337,6 +2373,55 @@ mod tests {
 
         attr.kind = FileType::Directory;
         assert!(!attr.is_upload_pending());
+    }
+
+    #[test]
+    fn format_info_new_rejects_overflowing_block_sizes() {
+        let data_store = test_format_info_data_store();
+        assert!(matches!(
+            FormatInfo::new("volume".into(), "uuid".into(), data_store.clone(), 0),
+            Err(FormatInfoError::ZeroBlockSize)
+        ));
+
+        for block_size_mb in [4096, u32::MAX] {
+            let result = FormatInfo::new(
+                "volume".to_string(),
+                "volume-uuid".to_string(),
+                data_store.clone(),
+                block_size_mb,
+            );
+            assert!(matches!(
+                result,
+                Err(FormatInfoError::BlockSizeOverflow { block_size_mb: found })
+                    if found == block_size_mb
+            ));
+        }
+    }
+
+    #[test]
+    fn format_info_new_preserves_representable_block_sizes() {
+        for block_size_mb in [1, 16, 2047, 4095] {
+            let info = FormatInfo::new(
+                "volume".to_string(),
+                "volume-uuid".to_string(),
+                test_format_info_data_store(),
+                block_size_mb,
+            )
+            .expect("representable block size");
+            assert_eq!(info.block_size, block_size_mb * 1024 * 1024);
+            assert_eq!(info.block_size_mb(), block_size_mb);
+            assert!(info.validate_format_contract().is_ok());
+        }
+    }
+
+    fn test_format_info_data_store() -> FormatInfoDataStore {
+        FormatInfoDataStore {
+            endpoint: String::new(),
+            bucket: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: String::new(),
+        }
     }
 
     #[test]
