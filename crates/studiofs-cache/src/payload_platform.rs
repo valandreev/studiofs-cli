@@ -295,6 +295,10 @@ fn open_read_only_impl(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "getrlimit writes a valid rlimit to this local FFI buffer."
+)]
 fn open_file_descriptor_limit_impl() -> Option<usize> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     // SAFETY: getrlimit initializes the provided rlimit on success.
@@ -325,6 +329,10 @@ fn open_read_only_impl(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "fcntl applies the macOS no-cache flag to this live file descriptor."
+)]
 fn open_read_only_unbuffered_impl(path: &Path) -> io::Result<File> {
     use std::os::fd::AsRawFd;
 
@@ -533,6 +541,10 @@ fn is_windows_unbuffered_ptr_aligned(ptr: usize, alignment: usize) -> bool {
 }
 
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "Windows volume queries use checked UTF-16 buffers in this FFI helper."
+)]
 fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -691,6 +703,10 @@ fn is_windows_sync_unsupported_error(error: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "posix_fadvise applies an advisory hint to this live file descriptor."
+)]
 fn advise_random_impl(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -715,6 +731,10 @@ fn advise_random_impl(_file: &File) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "posix_fadvise applies an advisory hint to validated file offsets."
+)]
 fn advise_will_need_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 

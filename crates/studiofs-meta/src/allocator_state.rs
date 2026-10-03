@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "SFS-632 wires this staged private state into PostgreSQL-backed local roots."
-)]
-
 use std::ops::Range;
 
 const STATE_VERSION: u8 = 1;
@@ -10,7 +5,6 @@ const RECORD_ENCODED_LEN: usize = 11;
 const ENCODED_LEN: usize = 1 + 2 * RECORD_ENCODED_LEN;
 pub(crate) const COUNTER_BITS: u32 = 39;
 pub(crate) const COUNTER_LIMIT: u64 = 1 << COUNTER_BITS;
-pub(crate) const MAX_COUNTER: u64 = COUNTER_LIMIT - 1;
 pub(crate) const MAX_NAMESPACE: u32 = 0x00ff_ffff;
 const LOCAL_ID_BATCH_SIZE: u64 = 4_096;
 
@@ -146,6 +140,8 @@ impl AllocatorStateV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MAX_COUNTER: u64 = COUNTER_LIMIT - 1;
 
     #[test]
     fn sfs623_allocator_state_encodes_lowest_and_highest_valid_ids() {

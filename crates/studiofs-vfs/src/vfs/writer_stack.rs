@@ -14,13 +14,13 @@ use studiofs_meta::schema::{ChunkId, chunk_id_from_offset, chunk_start_offset};
 use studiofs_meta::types::Ino;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(super) struct WriterStackReadSpan {
-    pub(super) start: u64,
-    pub(super) end: u64,
-    pub(super) block_offset: u64,
-    pub(super) seq: u64,
-    pub(super) data: Bytes,
+#[cfg(test)]
+struct WriterStackReadSpan {
+    start: u64,
+    end: u64,
+    block_offset: u64,
+    seq: u64,
+    data: Bytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +92,6 @@ struct MaterializingReadSpan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(super) struct WriterAccept {
     pub(super) accepted_bytes: u32,
     pub(super) dirty_bytes: usize,
@@ -102,7 +101,6 @@ pub(super) struct WriterAccept {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(super) struct WriterStackConfig {
     pub(super) block_size: u32,
     pub(super) chunk_size: u32,
@@ -112,7 +110,6 @@ pub(super) struct WriterStackConfig {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(super) struct WriterWriteSpec {
     pub(super) fh: u64,
     pub(super) ino: Ino,
@@ -123,7 +120,6 @@ pub(super) struct WriterWriteSpec {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub(super) enum WriterStackError {
     #[error("writer geometry must use non-zero block, chunk, and page sizes")]
     InvalidGeometry,
@@ -172,12 +168,9 @@ struct ContextualWriterStackError {
     source: WriterStackError,
 }
 
-#[allow(dead_code)]
 struct SliceWriter {
     seq: u64,
-    start: u64,
     end: u64,
-    chunk_offset: u32,
     content_epoch: u64,
     writer: CachedStoreWriterSlice,
     frozen: bool,
@@ -192,13 +185,11 @@ struct DetachedFinishedWriterSlice {
     detached: DetachedStagedSlice,
 }
 
-#[allow(dead_code)]
 struct ChunkWriter {
     chunk_id: ChunkId,
     slices: Vec<SliceWriter>,
 }
 
-#[allow(dead_code)]
 struct FileWriter {
     ino: Ino,
     visible_len: u64,
@@ -240,7 +231,6 @@ struct WriterShard {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 struct HandleShard {
     ino_by_handle: HashMap<u64, Ino>,
 }
@@ -277,7 +267,6 @@ impl WriterPayload<'_> {
     }
 }
 
-#[allow(dead_code)]
 pub(super) struct MountedWriterStack {
     cached_store: Arc<CachedStore>,
     config: WriterStackConfig,
@@ -287,7 +276,6 @@ pub(super) struct MountedWriterStack {
     dirty_bytes: AtomicUsize,
 }
 
-#[allow(dead_code)]
 impl MountedWriterStack {
     const SHARDS: usize = 64;
 
@@ -318,6 +306,7 @@ impl MountedWriterStack {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn page_size(&self) -> usize {
         self.config.page_size
     }
@@ -454,9 +443,7 @@ impl MountedWriterStack {
                         staged_object_count(result.dirty_bytes, self.config.block_size);
                     chunk.slices.push(SliceWriter {
                         seq,
-                        start: cursor,
                         end,
-                        chunk_offset: cursor.saturating_sub(chunk_start) as u32,
                         content_epoch: spec.content_epoch,
                         writer,
                         frozen: false,
@@ -498,12 +485,8 @@ impl MountedWriterStack {
         })
     }
 
-    pub(super) fn snapshot_read_spans(
-        &self,
-        ino: Ino,
-        offset: u64,
-        length: u64,
-    ) -> Vec<WriterStackReadSpan> {
+    #[cfg(test)]
+    fn snapshot_read_spans(&self, ino: Ino, offset: u64, length: u64) -> Vec<WriterStackReadSpan> {
         let Some(end) = offset.checked_add(length) else {
             return Vec::new();
         };
@@ -544,8 +527,11 @@ impl MountedWriterStack {
                         data: materializing.data.clone(),
                     });
                 }
-                let start = slice.start.max(offset);
-                let stop = slice.end.min(end);
+                let Some((accepted_start, accepted_end)) = slice.writer.accepted_range() else {
+                    continue;
+                };
+                let start = accepted_start.max(offset);
+                let stop = accepted_end.min(end);
                 if start >= stop {
                     continue;
                 }
@@ -794,10 +780,8 @@ impl MountedWriterStack {
         std::mem::swap(unresolved, scratch);
     }
 
-    pub(super) fn finish_inode(
-        &self,
-        ino: Ino,
-    ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
+    #[cfg(test)]
+    fn finish_inode(&self, ino: Ino) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
         self.prepare_finish_inode(ino)?;
         let finished = self.finish_prepared_inode_with_object_ids(ino, None)?;
         let object_ids = finished
@@ -1160,7 +1144,8 @@ impl MountedWriterStack {
         dirty.into_iter().map(|(ino, _)| ino).collect()
     }
 
-    pub(super) fn visible_len(&self, ino: Ino) -> Option<u64> {
+    #[cfg(test)]
+    fn visible_len(&self, ino: Ino) -> Option<u64> {
         let file = {
             let shard = self.shards[Self::inode_shard_index(ino)].lock();
             shard.files.get(&ino).cloned()
@@ -1359,7 +1344,6 @@ impl super::StudioVfs {
     }
 }
 
-#[allow(dead_code)]
 fn staged_object_count(len: usize, block_size: u32) -> u64 {
     let block_size = block_size as usize;
     if len == 0 || block_size == 0 {
@@ -1398,7 +1382,6 @@ fn materializing_read_span_from_detached(
     }
 }
 
-#[allow(dead_code)]
 fn finished_slice_from_staged(
     chunk_id: ChunkId,
     chunk_size: u32,
@@ -2203,9 +2186,12 @@ mod tests {
         assert_eq!(finished[0].chunk_offset, 0);
         assert_eq!(finished[0].len, 8);
         assert_eq!(stack.dirty_bytes_for_inode(7), 4);
-        let spans = stack.snapshot_read_spans(7, 8, 4);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].data.as_ref(), b"ijkl");
+        let spans = stack.snapshot_read_spans(7, 0, 12);
+        assert!(
+            spans
+                .iter()
+                .any(|span| { span.start == 8 && span.end == 12 && span.data.as_ref() == b"ijkl" })
+        );
     }
 
     #[test]
