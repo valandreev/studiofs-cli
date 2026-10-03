@@ -621,7 +621,10 @@ impl RedbMetaEngine {
             Some(v) => v.value(),
             None => 1,
         };
-        counters.insert(crate::schema::counters::NEXT_EVENT_SEQ, seq_id + 1)?;
+        let next_seq_id = seq_id
+            .checked_add(1)
+            .ok_or_else(|| MetaError::Storage("event sequence allocation overflow".to_string()))?;
+        counters.insert(crate::schema::counters::NEXT_EVENT_SEQ, next_seq_id)?;
 
         // Encode and insert the event
         let mut events = txn
@@ -1571,7 +1574,7 @@ impl RedbMetaEngine {
         update: F,
     ) -> MetaResult<u64>
     where
-        F: FnOnce(u64) -> u64,
+        F: FnOnce(u64) -> MetaResult<u64>,
     {
         let mut table = txn
             .open_table(COUNTERS_TABLE)
@@ -1580,7 +1583,7 @@ impl RedbMetaEngine {
             Some(v) => v.value(),
             None => 0,
         };
-        let new_val = update(current);
+        let new_val = update(current)?;
         table.insert(name, new_val)?;
         Ok(new_val)
     }

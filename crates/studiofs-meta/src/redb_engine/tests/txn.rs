@@ -139,6 +139,89 @@ fn acl_removal_fault_fixture(
 }
 
 #[test]
+fn append_event_accepts_last_sequence_and_rejects_overflow_without_mutation() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::NEXT_EVENT_SEQ, u64::MAX - 1)
+        .unwrap();
+    let event = MetaEvent::SetAttr {
+        attr: engine.get_attr(ROOT_INO).unwrap(),
+    };
+
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::append_event_in_txn(&txn, &event).unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        u64::MAX
+    );
+    {
+        let read = engine.begin_read_txn().unwrap();
+        assert!(
+            read.open_table(EVENT_LOG_TABLE)
+                .unwrap()
+                .get(u64::MAX - 1)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    let txn = engine.begin_write_txn().unwrap();
+    let error = RedbMetaEngine::append_event_in_txn(&txn, &event)
+        .expect_err("event sequence allocation at u64::MAX must fail");
+    txn.commit().unwrap();
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("event sequence") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        u64::MAX
+    );
+    let read = engine.begin_read_txn().unwrap();
+    let events = read.open_table(EVENT_LOG_TABLE).unwrap();
+    assert!(events.get(u64::MAX - 1).unwrap().is_some());
+    assert!(events.get(u64::MAX).unwrap().is_none());
+}
+
+#[test]
+fn namespace_create_rolls_back_when_event_sequence_overflows() {
+    let engine = temp_engine();
+    engine
+        .set_counter(counters::NEXT_EVENT_SEQ, u64::MAX - 1)
+        .unwrap();
+    let root_before = engine.get_attr(ROOT_INO).unwrap();
+
+    let result = engine.create_file_with_ino(
+        u64::MAX - 100,
+        ROOT_INO,
+        b"event-overflow.txt",
+        1000,
+        1000,
+        0o644,
+    );
+
+    let error = result.expect_err("namespace creation must roll back after event overflow");
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("event sequence") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert!(engine.lookup(ROOT_INO, b"event-overflow.txt").is_err());
+    assert!(engine.get_attr(u64::MAX - 100).is_err());
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_before);
+    assert_eq!(
+        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        u64::MAX - 1
+    );
+    let read = engine.begin_read_txn().unwrap();
+    let events = read.open_table(EVENT_LOG_TABLE).unwrap();
+    assert!(events.get(u64::MAX - 1).unwrap().is_none());
+    assert!(events.get(u64::MAX).unwrap().is_none());
+}
+
+#[test]
 fn replica_removal_error_aborts_prior_metadata_writes() {
     let backend = RemoveFaultBackend::default();
     let engine = removal_fault_engine(&backend);
@@ -174,7 +257,7 @@ fn replica_removal_error_aborts_prior_metadata_writes() {
     let result = (|| -> MetaResult<()> {
         let txn = engine.begin_write_txn()?;
         RedbMetaEngine::update_counter_in_txn(&txn, "replica-removal-regression", |value| {
-            value + 1
+            Ok(value + 1)
         })?;
         backend.corrupt_read_at.store(branch, Ordering::SeqCst);
         RedbMetaEngine::apply_replica_aux_state_in_txn(
@@ -409,7 +492,7 @@ fn table_removal_error_aborts_metadata_write_transaction() {
         let txn = db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        RedbMetaEngine::update_counter_in_txn(&txn, "removal-regression", |value| value + 1)?;
+        RedbMetaEngine::update_counter_in_txn(&txn, "removal-regression", |value| Ok(value + 1))?;
         backend.corrupt_read_at.store(branch, Ordering::SeqCst);
         RedbMetaEngine::remove_symlink_overlay_in_txn(&txn, 0)?;
         txn.commit()

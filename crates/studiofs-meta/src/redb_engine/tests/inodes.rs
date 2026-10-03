@@ -377,6 +377,59 @@ fn test_incr_counter_accumulates_from_zero() {
 }
 
 #[test]
+fn test_incr_counter_rejects_overflow_without_changing_persisted_value() {
+    let engine = temp_engine();
+    engine.set_counter("test_overflow", u64::MAX - 1).unwrap();
+
+    assert_eq!(engine.incr_counter("test_overflow", 1).unwrap(), u64::MAX);
+    assert_eq!(engine.get_counter("test_overflow").unwrap(), u64::MAX);
+    assert_eq!(engine.incr_counter("test_overflow", 0).unwrap(), u64::MAX);
+    assert_eq!(engine.get_counter("test_overflow").unwrap(), u64::MAX);
+
+    let error = engine
+        .incr_counter("test_overflow", 1)
+        .expect_err("incrementing a saturated counter must fail");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("test_overflow") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(engine.get_counter("test_overflow").unwrap(), u64::MAX);
+
+    engine.set_counter("test_multi_overflow", u64::MAX - 1).unwrap();
+    let error = engine
+        .incr_counter("test_multi_overflow", 2)
+        .expect_err("an increment larger than the remaining headroom must fail");
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("test_multi_overflow") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_counter("test_multi_overflow").unwrap(),
+        u64::MAX - 1
+    );
+}
+
+#[test]
+fn test_next_inode_rejects_overflow_after_last_valid_allocation() {
+    let engine = temp_engine();
+    engine.set_counter(counters::NEXT_INODE, u64::MAX - 1).unwrap();
+
+    assert_eq!(engine.next_inode().unwrap(), u64::MAX - 1);
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
+
+    let error = engine
+        .next_inode()
+        .expect_err("allocating when the next-inode counter is saturated must fail");
+
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("inode") && message.contains("overflow")),
+        "{error:?}"
+    );
+    assert_eq!(engine.get_counter(counters::NEXT_INODE).unwrap(), u64::MAX);
+}
+
+#[test]
 fn test_decr_counter_unset() {
     let engine = temp_engine();
     // Decrementing an unset counter (defaults to 0) saturates at 0

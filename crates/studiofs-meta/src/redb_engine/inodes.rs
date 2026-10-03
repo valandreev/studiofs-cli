@@ -1334,7 +1334,11 @@ impl MetaInodes for RedbMetaEngine {
 
     fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
         let txn = self.begin_write_txn()?;
-        let new_val = Self::update_counter_in_txn(&txn, name, |current| current + delta)?;
+        let new_val = Self::update_counter_in_txn(&txn, name, |current| {
+            current
+                .checked_add(delta)
+                .ok_or_else(|| MetaError::Storage(format!("counter increment overflow: {name}")))
+        })?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(new_val)
@@ -1343,7 +1347,7 @@ impl MetaInodes for RedbMetaEngine {
     fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
         let txn = self.begin_write_txn()?;
         let new_val =
-            Self::update_counter_in_txn(&txn, name, |current| current.saturating_sub(delta))?;
+            Self::update_counter_in_txn(&txn, name, |current| Ok(current.saturating_sub(delta)))?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(new_val)
@@ -1378,8 +1382,11 @@ impl MetaInodes for RedbMetaEngine {
                 Some(v) => v.value(),
                 None => ROOT_INO + 1,
             };
+            let next_ino = ino
+                .checked_add(1)
+                .ok_or_else(|| MetaError::Storage("inode allocation overflow".to_string()))?;
             table
-                .insert(counters::NEXT_INODE, ino + 1)
+                .insert(counters::NEXT_INODE, next_ino)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         txn.commit()
