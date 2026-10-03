@@ -684,6 +684,15 @@ fn clone_object_error(
         ObjectError::UnsupportedVersion(version) => ObjectError::UnsupportedVersion(*version),
         ObjectError::Io(error) => ObjectError::Io(clone_io_error(error)),
         ObjectError::LegacyCompressionUnsupported => ObjectError::LegacyCompressionUnsupported,
+        ObjectError::SizeMismatch {
+            original_size,
+            compressed_size,
+            actual_size,
+        } => ObjectError::SizeMismatch {
+            original_size: *original_size,
+            compressed_size: *compressed_size,
+            actual_size: *actual_size,
+        },
         ObjectError::ChecksumMismatch { expected, computed } => ObjectError::ChecksumMismatch {
             expected: *expected,
             computed: *computed,

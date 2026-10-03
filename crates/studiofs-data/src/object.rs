@@ -24,7 +24,9 @@ pub const MAGIC: &[u8; 4] = b"STFS";
 /// Current object format version.
 pub const VERSION: u16 = 2;
 
-/// Maximum object size (for safety check, e.g., 64MB).
+/// Maximum payload size accepted by the object format: 64 MiB.
+/// Decoding checks this limit after buffering; it does not bound download or
+/// decryption allocations.
 pub const MAX_OBJECT_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Fixed logical block size: 4 MiB.
@@ -58,6 +60,19 @@ pub enum ObjectError {
     /// The object declares legacy LZ4 compression that is no longer supported.
     #[error("legacy compressed object is not supported in this build")]
     LegacyCompressionUnsupported,
+
+    /// An uncompressed payload does not match both declared header sizes.
+    #[error(
+        "payload size mismatch: original {original_size} bytes, compressed {compressed_size} bytes, actual {actual_size} bytes"
+    )]
+    SizeMismatch {
+        /// Original payload size declared in the header.
+        original_size: u32,
+        /// Stored payload size declared in the header.
+        compressed_size: u32,
+        /// Actual payload length excluding the header.
+        actual_size: usize,
+    },
 
     /// Header checksum check failed against the payload contents.
     #[error("checksum mismatch: expected {expected:016x}, got {computed:016x}")]
@@ -214,6 +229,9 @@ impl ObjectHeader {
     }
 
     /// Deserialize header from bytes (little-endian).
+    ///
+    /// Checks header length, magic, and version. Use [`read_object`] to validate
+    /// payload sizes, compression support, and checksum.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ObjectError> {
         if bytes.len() < Self::SIZE {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "header too short").into());
@@ -326,13 +344,21 @@ pub use create_object_buffer_with as create_object_buffer_with_flags;
 
 /// Read and validate an object.
 ///
-/// Validates header and checksum, then returns raw payload bytes.
+/// Validates header, payload sizes, and checksum, then returns raw payload bytes.
 ///
 /// # Arguments
 /// * `data` - Complete object bytes (header + payload)
 ///
 /// # Returns
 /// Original payload data
+///
+/// # Errors
+/// Returns [`ObjectError::Io`] for a truncated header, [`ObjectError::InvalidMagic`]
+/// or [`ObjectError::UnsupportedVersion`] for an invalid header, and
+/// [`ObjectError::LegacyCompressionUnsupported`] for legacy compression.
+/// Uncompressed payloads return [`ObjectError::SizeMismatch`] for inconsistent
+/// sizes, [`ObjectError::ObjectTooLarge`] for consistent sizes above the limit,
+/// or [`ObjectError::ChecksumMismatch`] for a checksum failure.
 pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     let data: Buffer = data.into();
     if data.len() < ObjectHeader::SIZE {
@@ -348,19 +374,26 @@ pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     let header = ObjectHeader::from_bytes(&header_bytes)?;
     let payload = data.slice(ObjectHeader::SIZE..);
 
-    // Validate payload size
-    let compressed_size = usize::try_from(header.compressed_size)
-        .map_err(|_| ObjectError::InvalidFragmentLayout("compressed size overflow".into()))?;
-    if payload.len() != compressed_size {
-        tracing::warn!(
-            "Payload size mismatch: expected {}, got {}",
-            header.compressed_size,
-            payload.len()
-        );
-    }
-
     if header.is_compressed() {
         return Err(ObjectError::LegacyCompressionUnsupported);
+    }
+
+    // Without compression, both header sizes must describe the actual payload.
+    let payload_len = payload.len();
+    if header.original_size != header.compressed_size
+        || !usize::try_from(header.compressed_size).is_ok_and(|size| size == payload_len)
+    {
+        return Err(ObjectError::SizeMismatch {
+            original_size: header.original_size,
+            compressed_size: header.compressed_size,
+            actual_size: payload_len,
+        });
+    }
+
+    if header.compressed_size > MAX_OBJECT_SIZE {
+        return Err(ObjectError::ObjectTooLarge(u64::from(
+            header.compressed_size,
+        )));
     }
 
     // Verify checksum
@@ -394,6 +427,8 @@ fn xxh64_buffer(data: &Buffer) -> u64 {
 /// Read object header only (without loading payload bytes into a second buffer).
 ///
 /// Useful for quick metadata inspection.
+/// Validates header length, magic, and supported version only. Payload sizes,
+/// compression support, and checksum are validated by [`read_object`].
 pub fn read_header(data: &[u8]) -> Result<ObjectHeader, ObjectError> {
     if data.len() < ObjectHeader::SIZE {
         return Err(
@@ -605,6 +640,101 @@ mod tests {
 
         let result = read_object(Bytes::from(object));
         assert!(matches!(result, Err(ObjectError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn test_object_rejects_mismatched_header_sizes_with_valid_checksum() {
+        let payload = b"checksummed payload";
+        let size = payload.len() as u32;
+        for (original_size, compressed_size) in [
+            (size - 1, size),
+            (size + 1, size),
+            (size, size - 1),
+            (size, size + 1),
+            (size - 1, size - 1),
+            (size + 1, size + 1),
+            (0, 0),
+            (0, size),
+            (size, 0),
+        ] {
+            let header = ObjectHeader::new(original_size, compressed_size, xxh64(payload, 0));
+            let object = Buffer::from(vec![
+                Bytes::copy_from_slice(&header.to_bytes()),
+                Bytes::copy_from_slice(payload),
+            ]);
+            for object in [object.clone(), Buffer::from(object.to_bytes())] {
+                let result = read_object(object);
+                assert!(
+                    matches!(
+                        result,
+                        Err(ObjectError::SizeMismatch {
+                            original_size: original,
+                            compressed_size: compressed,
+                            actual_size,
+                        }) if original == original_size
+                            && compressed == compressed_size
+                            && actual_size == payload.len()
+                    ),
+                    "failed rejection for original_size={original_size}, compressed_size={compressed_size}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_object_roundtrip() {
+        let object = create_object_buffer(Bytes::new()).unwrap();
+        assert!(read_object(object).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_object_accepts_maximum_payload_size() {
+        let chunk = Bytes::from(vec![0xAB; 1024 * 1024]);
+        let mut chunks = vec![chunk; MAX_OBJECT_SIZE as usize / (1024 * 1024)];
+        let payload = Buffer::from(chunks.clone());
+        let header = ObjectHeader::new(MAX_OBJECT_SIZE, MAX_OBJECT_SIZE, xxh64_buffer(&payload));
+        chunks.insert(0, Bytes::copy_from_slice(&header.to_bytes()));
+
+        let decoded = read_object(Buffer::from(chunks)).unwrap();
+        assert_eq!(decoded.len(), MAX_OBJECT_SIZE as usize);
+        assert!(decoded.iter().all(|byte| *byte == 0xAB));
+        // The writer accepts the same inclusive boundary as the reader.
+        let encoded = create_object_buffer(decoded).unwrap();
+        assert_eq!(encoded.len(), ObjectHeader::SIZE + MAX_OBJECT_SIZE as usize);
+    }
+
+    #[test]
+    fn test_object_rejects_oversized_payload_before_checksum() {
+        // Share the allocation across chunks to keep this boundary fixture small.
+        let chunk = Bytes::from(vec![0xAB; 1024 * 1024]);
+        let mut chunks = vec![chunk; MAX_OBJECT_SIZE as usize / (1024 * 1024)];
+        chunks.push(Bytes::from_static(b"x"));
+        let size = MAX_OBJECT_SIZE + 1;
+        // Size rejection must happen before checksum verification.
+        let header = ObjectHeader::new(size, size, 0);
+        chunks.insert(0, Bytes::copy_from_slice(&header.to_bytes()));
+        assert!(matches!(
+            read_object(Buffer::from(chunks)),
+            Err(ObjectError::ObjectTooLarge(actual)) if actual == u64::from(size)
+        ));
+    }
+
+    #[test]
+    fn test_empty_payload_rejects_nonzero_header_sizes() {
+        for (original_size, compressed_size) in [(1, 0), (0, 1), (1, 1)] {
+            let header = ObjectHeader::new(original_size, compressed_size, xxh64(b"", 0));
+            assert!(
+                matches!(
+                    read_object(Bytes::copy_from_slice(&header.to_bytes())),
+                    Err(ObjectError::SizeMismatch {
+                        original_size: original,
+                        compressed_size: compressed,
+                        actual_size: 0,
+                    }) if original == original_size && compressed == compressed_size
+                ),
+                "empty payload accepted sizes ({original_size}, {compressed_size})"
+            );
+        }
     }
 
     #[test]
