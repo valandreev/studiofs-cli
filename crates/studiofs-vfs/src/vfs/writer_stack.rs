@@ -208,6 +208,23 @@ struct FileWriter {
     sticky_error: Option<StickyError>,
 }
 
+impl FileWriter {
+    fn new_ordered(ino: Ino, visible_len: u64, next_object_id: u64) -> Arc<OrderedMutex<Self>> {
+        Arc::new(OrderedMutex::new(
+            Self {
+                ino,
+                visible_len,
+                next_object_id,
+                chunks: BTreeMap::new(),
+                dirty_bytes: 0,
+                last_write: Instant::now(),
+                sticky_error: None,
+            },
+            LockTier::LocalDirty,
+        ))
+    }
+}
+
 struct StickyError {
     message: String,
     source: Option<Arc<CachedStoreWriterError>>,
@@ -339,18 +356,7 @@ impl MountedWriterStack {
         let file = {
             let mut shard = self.shards[shard_index].lock();
             Arc::clone(shard.files.entry(spec.ino).or_insert_with(|| {
-                Arc::new(OrderedMutex::new(
-                    FileWriter {
-                        ino: spec.ino,
-                        visible_len: spec.current_size,
-                        next_object_id: spec.first_object_id,
-                        chunks: BTreeMap::new(),
-                        dirty_bytes: 0,
-                        last_write: Instant::now(),
-                        sticky_error: None,
-                    },
-                    LockTier::LocalDirty,
-                ))
+                FileWriter::new_ordered(spec.ino, spec.current_size, spec.first_object_id)
             }))
         };
         let mut file = file.lock();
@@ -1143,20 +1149,12 @@ impl MountedWriterStack {
     pub(super) fn inject_sticky_error_for_test(&self, ino: Ino, message: impl Into<String>) {
         let file = {
             let mut shard = self.shards[Self::inode_shard_index(ino)].lock();
-            Arc::clone(shard.files.entry(ino).or_insert_with(|| {
-                Arc::new(OrderedMutex::new(
-                    FileWriter {
-                        ino,
-                        visible_len: 0,
-                        next_object_id: 0,
-                        chunks: BTreeMap::new(),
-                        dirty_bytes: 0,
-                        last_write: Instant::now(),
-                        sticky_error: None,
-                    },
-                    LockTier::LocalDirty,
-                ))
-            }))
+            Arc::clone(
+                shard
+                    .files
+                    .entry(ino)
+                    .or_insert_with(|| FileWriter::new_ordered(ino, 0, 0)),
+            )
         };
         let mut file = file.lock();
         file.sticky_error = Some(StickyError {
@@ -1747,9 +1745,9 @@ mod tests {
         {
             let shard = stack.shards[MountedWriterStack::inode_shard_index(ino)].lock();
             let file = Arc::clone(shard.files.get(&ino).expect("writer file"));
-            let file = file.lock();
+            let _file = file.lock();
             let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
-            let dirty_attrs = namespace.dirty_attrs.lock();
+            let _dirty_attrs = namespace.dirty_attrs.lock();
 
             assert_eq!(
                 crate::debug_lock_stack(),
@@ -1767,7 +1765,7 @@ mod tests {
     #[should_panic(
         expected = "trying to acquire LocalDirty (tier 2) while holding Namespace (tier 3)"
     )]
-    fn writer_stack_lock_order_rejects_namespace_before_read() {
+    fn writer_stack_lock_order_rejects_namespace_before_visible_len_shard_lookup() {
         let (_dir, stack, _rx) = temp_stack(64, 16);
         let ino = 11;
         let namespace = super::super::namespace::NamespaceState::new(8, 4096, 8, 4096, 8, 4096);
@@ -1806,6 +1804,17 @@ mod tests {
         let _dirty_attrs = namespace.dirty_attrs.lock();
 
         let _handle_shard = stack.handle_shards[MountedWriterStack::handle_shard_index(7)].lock();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "trying to acquire Shutdown (tier 1) while holding LocalDirty (tier 2)"
+    )]
+    fn shutdown_phase_lock_order_rejects_writer_shard_before_claim() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let shutdown = super::super::ShutdownState::new();
+        let _shard = stack.shards[0].lock();
+        let _claim = shutdown.claim();
     }
 
     #[test]
