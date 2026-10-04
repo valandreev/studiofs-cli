@@ -298,7 +298,7 @@ pub(crate) mod raw {
             len: off_t,
         ) -> c_int;
         /// Notify the kernel to invalidate a cached directory entry.
-        #[cfg(all(test, target_os = "macos"))]
+        #[cfg(test)]
         pub fn fuse_lowlevel_notify_inval_entry(
             channel: *mut FuseChan,
             parent: FuseIno,
@@ -883,7 +883,7 @@ struct SessionInvalidationQueue {
 struct SessionInvalidationQueueState {
     closed: bool,
     pending: VecDeque<u64>,
-    kinds: HashMap<u64, bool>,
+    invalidate_data: HashMap<u64, bool>,
     queue_peak: usize,
     coalesced: u64,
     snapshot_generation: u64,
@@ -906,7 +906,7 @@ impl SessionInvalidationQueue {
             state: ParkingMutex::new(SessionInvalidationQueueState {
                 closed: false,
                 pending: VecDeque::new(),
-                kinds: HashMap::new(),
+                invalidate_data: HashMap::new(),
                 queue_peak: 0,
                 coalesced: 0,
                 snapshot_generation: 0,
@@ -953,13 +953,13 @@ impl SessionInvalidationQueue {
             if state.closed {
                 return;
             }
-            if let Some(kind) = state.kinds.get_mut(&ino) {
-                *kind |= data;
+            if let Some(invalidate_data) = state.invalidate_data.get_mut(&ino) {
+                *invalidate_data |= data;
                 state.coalesced = state.coalesced.saturating_add(1);
                 break;
             }
             if state.pending.len() < MACFUSE_INVALIDATION_QUEUE_CAPACITY {
-                state.kinds.insert(ino, data);
+                state.invalidate_data.insert(ino, data);
                 state.pending.push_back(ino);
                 state.queue_peak = state.queue_peak.max(state.pending.len());
                 self.wake.notify_one();
@@ -987,7 +987,7 @@ impl SessionInvalidationQueue {
         let mut state = self.state.lock();
         loop {
             if let Some(ino) = state.pending.pop_front() {
-                let data = state.kinds.remove(&ino).unwrap_or(false);
+                let data = state.invalidate_data.remove(&ino).unwrap_or(false);
                 self.wake.notify_one();
                 let snapshot = Self::next_metrics_snapshot(&mut state);
                 drop(state);
@@ -1033,7 +1033,7 @@ impl SessionInvalidationQueue {
         let mut state = self.state.lock();
         state.closed = true;
         state.pending.clear();
-        state.kinds.clear();
+        state.invalidate_data.clear();
         self.wake.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
@@ -1751,45 +1751,47 @@ fn reply_result(result: c_int) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     #[test]
     fn disabled_entry_invalidation_preserves_inode_and_attr_notifications() {
-        let config = super::SessionConfig::new("target/macfuse-name-cache-policy", "policy");
+        let config = SessionConfig::new("target/macfuse-name-cache-policy", "policy");
         assert!(
             config
                 .mount_argv_strings()
                 .iter()
                 .any(|arg| arg == "-onovncache")
         );
-        let queue = super::SessionInvalidationQueue::new();
-        let invalidator = super::MacFuseKernelInvalidator {
-            queue: std::sync::Arc::clone(&queue),
+        let queue = SessionInvalidationQueue::new();
+        let invalidator = MacFuseKernelInvalidator {
+            queue: Arc::clone(&queue),
         };
-        studiofs_vfs::KernelInvalidator::inval_entry(&invalidator, 1, b"entry");
+        invalidator.inval_entry(1, b"entry");
         assert_eq!(queue.metrics_snapshot().queue_depth, 0);
 
-        studiofs_vfs::KernelInvalidator::inval_inode_attrs(&invalidator, 1);
+        invalidator.inval_inode_attrs(1);
         assert_eq!(queue.metrics_snapshot().queue_depth, 1);
-        studiofs_vfs::KernelInvalidator::inval_inode(&invalidator, 42);
+        invalidator.inval_inode(42);
         assert_eq!(
             queue.next(),
-            Some(super::InodeInvalidation {
+            Some(InodeInvalidation {
                 ino: 1,
                 data: false
             })
         );
         assert_eq!(
             queue.next(),
-            Some(super::InodeInvalidation {
+            Some(InodeInvalidation {
                 ino: 42,
                 data: true
             })
         );
+        queue.close();
+        assert_eq!(queue.next(), None);
     }
-
-    use super::*;
-    use std::future::Future;
-    use std::sync::mpsc;
-    use std::time::Duration;
 
     #[test]
     fn session_loop_failure_does_not_invent_a_system_errno() {
@@ -2137,7 +2139,10 @@ mod tests {
         {
             let state = queue.state.lock();
             assert_eq!(state.pending.len(), MACFUSE_INVALIDATION_QUEUE_CAPACITY);
-            assert_eq!(state.kinds.len(), MACFUSE_INVALIDATION_QUEUE_CAPACITY);
+            assert_eq!(
+                state.invalidate_data.len(),
+                MACFUSE_INVALIDATION_QUEUE_CAPACITY
+            );
         }
 
         let producer_queue = Arc::clone(&queue);

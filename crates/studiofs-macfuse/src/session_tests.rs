@@ -305,6 +305,7 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
     const ROOT_MISSING_NAME: &[u8] = b"missing-root-entry";
     const CHILD_MISSING_NAME: &[u8] = b"missing-child-entry";
     const CHILD_FILE_NAME: &[u8] = b"child-file";
+    const INITIAL_NAME: &[u8] = b"initial-entry";
     const NEGATIVE_NAME: &[u8] = b"negative-then-created";
     const RECREATE_NAME: &[u8] = b"recreate-entry";
     const RENAME_SOURCE_NAME: &[u8] = b"rename-source";
@@ -339,7 +340,7 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
         .create(child.ino, CHILD_FILE_NAME, uid, gid, 0o644)
         .expect("create child directory entry");
     let initial = vfs
-        .create(CONTRACT_ROOT_INO, b"initial-entry", uid, gid, 0o644)
+        .create(CONTRACT_ROOT_INO, INITIAL_NAME, uid, gid, 0o644)
         .expect("create initial entry");
     let recreate_before = vfs
         .create(CONTRACT_ROOT_INO, RECREATE_NAME, uid, gid, 0o644)
@@ -415,14 +416,14 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
         // Defer assertion panics until the caller has destroyed the session
         // and callback userdata, just as it defers ordinary probe errors.
         let native_probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mount_deadline = std::time::Instant::now() + OPERATION_TIMEOUT;
-            let ready_path = probe_mount_path.join("mount-ready");
+            let readiness_deadline = std::time::Instant::now() + OPERATION_TIMEOUT;
+            let ready_path = probe_mount_path.join(std::ffi::OsStr::from_bytes(MOUNT_READY_NAME));
             loop {
                 match fs::metadata(&ready_path) {
                     Ok(_) => break,
                     Err(error)
                         if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENXIO))
-                            && std::time::Instant::now() < mount_deadline =>
+                            && std::time::Instant::now() < readiness_deadline =>
                     {
                         thread::sleep(POLL_INTERVAL);
                     }
@@ -431,7 +432,7 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
             }
 
             let root_entries = fs::read_dir(&probe_mount_path)?.collect::<Result<Vec<_>, _>>()?;
-            let root_path = probe_mount_path.clone();
+            let root_path = probe_mount_path;
             let observed_root_ino = fs::metadata(&root_path)?.ino();
             let child_path = root_path.join(std::ffi::OsStr::from_bytes(CHILD_NAME));
             let observed_child_ino = fs::metadata(&child_path)?.ino();
@@ -449,7 +450,7 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
             let child_entries = fs::read_dir(&child_path)?.collect::<Result<Vec<_>, _>>()?;
             let child_file_path = child_path.join(std::ffi::OsStr::from_bytes(CHILD_FILE_NAME));
             let observed_child_file_ino = fs::metadata(&child_file_path)?.ino();
-            let initial_path = root_path.join("initial-entry");
+            let initial_path = root_path.join(std::ffi::OsStr::from_bytes(INITIAL_NAME));
             let observed_initial_ino = fs::metadata(&initial_path)?.ino();
 
             let root_missing_name =
@@ -530,13 +531,13 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
             }
             let observed_rename_target_after = fs::metadata(&rename_target_path)?.ino();
 
-            // Close the initial directory handle and open a fresh one after the
-            // external mutations to prove the new listing is visible.
+            // Release the collected entries, which may retain directory
+            // resources, before enumerating the namespace after mutations.
             drop(root_entries);
             let reopened_entries = fs::read_dir(&root_path)?.collect::<Result<Vec<_>, _>>()?;
             let reopened_names = reopened_entries
                 .iter()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .map(|entry| entry.file_name())
                 .collect::<std::collections::BTreeSet<_>>();
 
             assert_eq!(observed_root_ino, CONTRACT_ROOT_INO);
@@ -559,16 +560,16 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
             assert_eq!(observed_rename_target_before, expected_rename_target_ino);
             assert_ne!(observed_rename_target_before, observed_rename_target_after);
             assert_eq!(observed_rename_target_after, expected_rename_source_ino);
-            assert!(reopened_names.contains("negative-then-created"));
-            assert!(reopened_names.contains("recreate-entry"));
-            assert!(reopened_names.contains("rename-target"));
-            assert!(!reopened_names.contains("rename-source"));
+            assert!(reopened_names.contains(std::ffi::OsStr::from_bytes(NEGATIVE_NAME)));
+            assert!(reopened_names.contains(std::ffi::OsStr::from_bytes(RECREATE_NAME)));
+            assert!(reopened_names.contains(std::ffi::OsStr::from_bytes(RENAME_TARGET_NAME)));
+            assert!(!reopened_names.contains(std::ffi::OsStr::from_bytes(RENAME_SOURCE_NAME)));
             Ok::<_, std::io::Error>(())
         }));
         let _ = native_probe_tx.send(native_probe);
     });
 
-    let native_probe_received = native_probe_rx.recv_timeout(OPERATION_TIMEOUT);
+    let native_probe_received = native_probe_rx.recv_timeout(OPERATION_TIMEOUT.saturating_mul(2));
     let probe_timed_out = native_probe_received.is_err();
     if probe_timed_out {
         exit.request_exit();
