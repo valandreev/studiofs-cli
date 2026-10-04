@@ -445,7 +445,7 @@ impl PgSnapshotBackend {
                     current_namespace_version: loaded.descriptor.checkpoint_version,
                     flushed_event_seq: 0,
                     next_event_seq: local
-                        .get_counter("nextEventSeq")
+                        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
                         .map_err(SnapshotSourceError::local)?,
                     initial_overlay: OverlayConflictSets::default(),
                 },

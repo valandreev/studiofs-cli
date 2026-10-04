@@ -76,7 +76,9 @@ impl PgMetaEngine {
         }
         let active_open_overlay = self.active_open_inode_overlay(active_open_inodes);
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
-        let end = self.local.get_counter("nextEventSeq")?;
+        let end = self
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?;
         if end <= start {
             return Ok(active_open_overlay);
         }
@@ -397,7 +399,9 @@ impl PgMetaEngine {
         let (position_guard, mut pending_state) =
             self.lock_local_position_and_pending_state_with_execution(Some(&execution))?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
-        let next_event_seq = self.local.get_counter("nextEventSeq")?;
+        let next_event_seq = self
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?;
         let initial_overlay =
             self.local_overlay_conflicts_with_active_open_inodes(None, Some(&execution))?;
         let outcome = self.apply_replay_page_atomically_locked(
