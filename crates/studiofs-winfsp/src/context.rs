@@ -37,7 +37,8 @@ use studiofs_vfs::{
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
 use windows::Win32::Foundation::{
-    NTSTATUS, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR, STATUS_IO_REPARSE_DATA_INVALID,
+    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR,
+    STATUS_IO_REPARSE_DATA_INVALID,
 };
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -838,7 +839,6 @@ fn encode_symlink_reparse(target: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
     let substitute_len = u16::try_from(name_bytes).map_err(|_| STATUS_IO_REPARSE_DATA_INVALID)?;
     let print_len = substitute_len;
     let data_len = u16::try_from(data_len).map_err(|_| STATUS_IO_REPARSE_DATA_INVALID)?;
-    let utf16: Vec<u16> = win_path.encode_utf16().collect();
     let mut buf = vec![0u8; total];
 
     buf[0..4].copy_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
@@ -854,7 +854,7 @@ fn encode_symlink_reparse(target: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
         .as_chunks_mut::<2>()
         .0
         .iter_mut()
-        .zip(&utf16)
+        .zip(win_path.encode_utf16())
     {
         chunk.copy_from_slice(&unit.to_le_bytes());
     }
@@ -868,8 +868,10 @@ fn encode_symlink_reparse(target: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
 /// Returns the total reparse data length.
 fn write_reparse_to_buffer(target: &[u8], buffer: &mut [u8]) -> Result<u64, NTSTATUS> {
     let encoded = encode_symlink_reparse(target)?;
-    let len = encoded.len().min(buffer.len());
-    buffer[..len].copy_from_slice(&encoded[..len]);
+    if buffer.len() < encoded.len() {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    buffer[..encoded.len()].copy_from_slice(&encoded);
     Ok(encoded.len() as u64)
 }
 
@@ -2384,6 +2386,10 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
+        let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+        if attr.kind != FileType::Symlink {
+            return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
+        }
         let target = self.vfs.readlink(context.ino).map_err(vfs_to_winfsp_err)?;
         write_reparse_to_buffer(&target, buffer).map_err(winfsp::FspError::from)
     }
@@ -2675,13 +2681,14 @@ mod tests {
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PATH_STACK_BUFFER_BYTES,
         PreparedWinfspNotifications, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
-        STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR, STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL,
-        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
-        STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
-        WinfspAsyncCallbackTracker, WinfspInvalidationQueue, WinfspKernelInvalidator,
-        WinfspMetadataCachePolicy, attr_to_file_info, build_basic_info_setattr_args,
-        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
-        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        STATUS_BAD_NETWORK_PATH, STATUS_BUFFER_TOO_SMALL, STATUS_DATA_ERROR,
+        STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
+        STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
+        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
+        WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
+        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
+        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
+        is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
         maybe_hide_platform_root_path, notify_filter_for_kind, open_flags_from_access,
         resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
@@ -4102,6 +4109,111 @@ mod tests {
             encode_symlink_reparse(oversized_unicode_target.as_bytes()),
             Err(super::STATUS_IO_REPARSE_DATA_INVALID)
         );
+    }
+
+    #[test]
+    fn get_reparse_point_callbacks_reject_non_symlink_handles() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("non-symlink-reparse");
+        let file = vfs
+            .create(ROOT_INO, b"ordinary", 0, 0, 0o644)
+            .expect("create");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"directory", 0, 0, 0o755)
+            .expect("mkdir");
+        for (attr, name, is_dir) in [(file, "\\ordinary", false), (dir, "\\directory", true)] {
+            let file_name = U16CString::from_str(name).expect("u16 path");
+            let handle = StudioFileHandle::new(attr.ino, is_dir, 0, OpenFlags::RDONLY);
+            let mut buffer = [0xa5; 32];
+            let error = <StudioFsContext as FileSystemContext>::get_reparse_point(
+                &ctx,
+                &handle,
+                file_name.as_ucstr(),
+                &mut buffer,
+            )
+            .expect_err("ordinary inode is not a reparse point");
+            assert_eq!(error.to_ntstatus(), super::STATUS_NOT_A_REPARSE_POINT.0);
+            assert_eq!(buffer, [0xa5; 32]);
+            let error = <StudioFsContext as FileSystemContext>::get_reparse_point_by_name(
+                &ctx,
+                file_name.as_ucstr(),
+                is_dir,
+                &mut buffer,
+            )
+            .expect_err("ordinary path is not a reparse point");
+            assert_eq!(error.to_ntstatus(), super::STATUS_NOT_A_REPARSE_POINT.0);
+            assert_eq!(buffer, [0xa5; 32]);
+        }
+    }
+
+    #[test]
+    fn get_reparse_point_callbacks_reject_short_buffers_without_partial_data() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("short-symlink-reparse-buffer");
+        let attr = vfs
+            .symlink(ROOT_INO, b"short-link", b"/x", 0, 0)
+            .expect("create symlink");
+        let file_name = U16CString::from_str(r"\short-link").expect("u16 path");
+        let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDONLY);
+        let encoded = encode_symlink_reparse(b"/x").expect("target should encode");
+
+        for buffer_len in [10, encoded.len(), encoded.len() + 8] {
+            let mut by_name_buffer = vec![0xa5; buffer_len];
+            let by_name = <StudioFsContext as FileSystemContext>::get_reparse_point_by_name(
+                &ctx,
+                file_name.as_ucstr(),
+                false,
+                &mut by_name_buffer,
+            );
+
+            if buffer_len < encoded.len() {
+                assert_eq!(
+                    by_name
+                        .expect_err("short by-name buffer should fail")
+                        .to_ntstatus(),
+                    STATUS_BUFFER_TOO_SMALL.0
+                );
+                assert!(by_name_buffer.iter().all(|&byte| byte == 0xa5));
+            } else {
+                assert_eq!(
+                    by_name.expect("by-name buffer should fit"),
+                    encoded.len() as u64
+                );
+                assert_eq!(&by_name_buffer[..encoded.len()], encoded);
+                assert!(
+                    by_name_buffer[encoded.len()..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+            }
+
+            let mut by_handle_buffer = vec![0xa5; buffer_len];
+            let by_handle = <StudioFsContext as FileSystemContext>::get_reparse_point(
+                &ctx,
+                &handle,
+                file_name.as_ucstr(),
+                &mut by_handle_buffer,
+            );
+
+            if buffer_len < encoded.len() {
+                assert_eq!(
+                    by_handle
+                        .expect_err("short by-handle buffer should fail")
+                        .to_ntstatus(),
+                    STATUS_BUFFER_TOO_SMALL.0
+                );
+                assert!(by_handle_buffer.iter().all(|&byte| byte == 0xa5));
+            } else {
+                assert_eq!(
+                    by_handle.expect("by-handle buffer should fit"),
+                    encoded.len() as u64
+                );
+                assert_eq!(&by_handle_buffer[..encoded.len()], encoded);
+                assert!(
+                    by_handle_buffer[encoded.len()..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+            }
+        }
     }
 
     #[test]
