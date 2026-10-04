@@ -872,9 +872,10 @@ fn encode_symlink_reparse(target: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
 fn write_reparse_to_buffer(target: &[u8], buffer: &mut [u8]) -> Result<u64, NTSTATUS> {
     let encoded = encode_symlink_reparse(target)?;
     // winfsp 0.12 returns a length only on success; errors cannot carry a
-    // required-size hint. WinFSP 2.1 supplies the full native reparse capacity,
-    // which matches the encoder's limit. Short buffers must fail without a
-    // partial copy or a successful length larger than the bytes written.
+    // required-size hint. WinFSP 2.1 supplies a fixed response payload capacity
+    // smaller than the native reparse limit because of its response header.
+    // Short buffers must fail without a partial copy or a successful length
+    // larger than the bytes written.
     if buffer.len() < encoded.len() {
         return Err(STATUS_BUFFER_TOO_SMALL);
     }
@@ -4149,6 +4150,48 @@ mod tests {
             .expect_err("ordinary path is not a reparse point");
             assert_eq!(error.to_ntstatus(), super::STATUS_NOT_A_REPARSE_POINT.0);
             assert_eq!(buffer, [0xa5; 32]);
+        }
+    }
+
+    #[test]
+    fn get_reparse_point_callbacks_reject_native_limit_target_in_service_buffer() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("service-symlink-reparse-buffer");
+        let target = vec![b'a'; 4091];
+        let attr = vfs
+            .symlink(ROOT_INO, b"service-link", &target, 0, 0)
+            .expect("symlink");
+        let file_name = U16CString::from_str(r"\service-link").expect("u16 path");
+        let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDONLY);
+        let mut buffer = vec![0xa5; winfsp::constants::FSP_FSCTL_TRANSACT_RSP_BUFFER_SIZEMAX];
+        assert!(
+            buffer.len()
+                < encode_symlink_reparse(&target)
+                    .expect("native limit fits")
+                    .len()
+        );
+        for by_name in [true, false] {
+            let result = if by_name {
+                <StudioFsContext as FileSystemContext>::get_reparse_point_by_name(
+                    &ctx,
+                    file_name.as_ucstr(),
+                    false,
+                    &mut buffer,
+                )
+            } else {
+                <StudioFsContext as FileSystemContext>::get_reparse_point(
+                    &ctx,
+                    &handle,
+                    file_name.as_ucstr(),
+                    &mut buffer,
+                )
+            };
+            assert_eq!(
+                result
+                    .expect_err("service capacity is smaller")
+                    .to_ntstatus(),
+                STATUS_BUFFER_TOO_SMALL.0
+            );
+            assert!(buffer.iter().all(|&byte| byte == 0xa5));
         }
     }
 
