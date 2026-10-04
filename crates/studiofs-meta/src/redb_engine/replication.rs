@@ -1414,8 +1414,9 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    // Shared set_*_in_txn helpers below write foreign mirror state into the active
-    // serving tables. Event-specific replay logic controls which updates are applied.
+    /// Applies replica events to the active serving tables within the supplied transaction.
+    /// Uses the shared setters defined in `redb_engine/txn.rs` to write foreign mirror state;
+    /// event-specific replay logic controls which updates are applied.
     pub(crate) fn apply_replica_serving_state_in_txn<E: Borrow<crate::events::MetaEvent>>(
         txn: &RedbWriteTransaction<'_>,
         events: &[E],
