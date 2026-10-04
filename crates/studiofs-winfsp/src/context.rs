@@ -36,11 +36,15 @@ use studiofs_vfs::{
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
-use windows::Win32::Foundation::{NTSTATUS, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR};
+use windows::Win32::Foundation::{
+    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR,
+    STATUS_IO_REPARSE_DATA_INVALID,
+};
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
 };
+use windows::Win32::Storage::FileSystem::MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
 use winfsp::U16CStr;
 use winfsp::filesystem::*;
 use winfsp::filesystem::{AsyncFileSystemContext, DirBuffer};
@@ -813,17 +817,31 @@ fn maybe_hide_platform_root_entry(
 ///   PrintNameLength             (u16)
 ///   Flags                       (u32) = SYMLINK_FLAG_RELATIVE (1)
 ///   PathBuffer                  (WCHAR[])
-fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
+fn encode_symlink_reparse(target: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
     let target_str = String::from_utf8_lossy(target);
     let win_path = target_str.replace('/', "\\");
-    let utf16: Vec<u16> = win_path.encode_utf16().collect();
-    let name_bytes = utf16.len() * 2;
-
-    let substitute_len = name_bytes as u16;
-    let print_len = substitute_len;
+    let utf16_units = win_path.encode_utf16().count();
+    let name_bytes = utf16_units
+        .checked_mul(2)
+        .ok_or(STATUS_IO_REPARSE_DATA_INVALID)?;
     // 4 offsets (2B each) + flags (4B) + 2× path
-    let data_len: u16 = 4 * 2 + 4 + substitute_len + print_len;
-    let total = 8 + data_len as usize;
+    let data_len = 12usize
+        .checked_add(
+            name_bytes
+                .checked_mul(2)
+                .ok_or(STATUS_IO_REPARSE_DATA_INVALID)?,
+        )
+        .ok_or(STATUS_IO_REPARSE_DATA_INVALID)?;
+    let total = 8usize
+        .checked_add(data_len)
+        .filter(|&len| len <= MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize)
+        .ok_or(STATUS_IO_REPARSE_DATA_INVALID)?;
+    // With the native 16 KiB limit, 20 + 4 * utf16_units allows at most
+    // 4,091 units: name_bytes <= 8,182 and data_len <= 16,376 fit u16.
+    // The checked arithmetic above establishes this bound before narrowing.
+    let substitute_len = u16::try_from(name_bytes).map_err(|_| STATUS_IO_REPARSE_DATA_INVALID)?;
+    let print_len = substitute_len;
+    let data_len = u16::try_from(data_len).map_err(|_| STATUS_IO_REPARSE_DATA_INVALID)?;
     let mut buf = vec![0u8; total];
 
     buf[0..4].copy_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
@@ -839,23 +857,30 @@ fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
         .as_chunks_mut::<2>()
         .0
         .iter_mut()
-        .zip(&utf16)
+        .zip(win_path.encode_utf16())
     {
         chunk.copy_from_slice(&unit.to_le_bytes());
     }
     let print_start = path_buf_offset + name_bytes;
     buf.copy_within(path_buf_offset..path_buf_offset + name_bytes, print_start);
 
-    buf
+    Ok(buf)
 }
 
 /// Encode a symlink reparse buffer and copy it into the output buffer.
 /// Returns the total reparse data length.
-fn write_reparse_to_buffer(target: &[u8], buffer: &mut [u8]) -> u64 {
-    let encoded = encode_symlink_reparse(target);
-    let len = encoded.len().min(buffer.len());
-    buffer[..len].copy_from_slice(&encoded[..len]);
-    encoded.len() as u64
+fn write_reparse_to_buffer(target: &[u8], buffer: &mut [u8]) -> Result<u64, NTSTATUS> {
+    let encoded = encode_symlink_reparse(target)?;
+    // winfsp 0.12 returns a length only on success; errors cannot carry a
+    // required-size hint. WinFSP 2.1 supplies a fixed response payload capacity
+    // smaller than the native reparse limit because of its response header.
+    // Short buffers must fail without a partial copy or a successful length
+    // larger than the bytes written.
+    if buffer.len() < encoded.len() {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    buffer[..encoded.len()].copy_from_slice(&encoded);
+    Ok(encoded.len() as u64)
 }
 
 /// Decode a symlink target from a Windows REPARSE_DATA_BUFFER (IO_REPARSE_TAG_SYMLINK).
@@ -2360,7 +2385,7 @@ impl FileSystemContext for StudioFsContext {
             return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
         }
         let target = self.vfs.readlink(attr.ino).map_err(vfs_to_winfsp_err)?;
-        Ok(write_reparse_to_buffer(&target, buffer))
+        write_reparse_to_buffer(&target, buffer).map_err(winfsp::FspError::from)
     }
 
     fn get_reparse_point(
@@ -2369,8 +2394,12 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
+        let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+        if attr.kind != FileType::Symlink {
+            return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
+        }
         let target = self.vfs.readlink(context.ino).map_err(vfs_to_winfsp_err)?;
-        Ok(write_reparse_to_buffer(&target, buffer))
+        write_reparse_to_buffer(&target, buffer).map_err(winfsp::FspError::from)
     }
 
     fn set_reparse_point(
@@ -2660,13 +2689,14 @@ mod tests {
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PATH_STACK_BUFFER_BYTES,
         PreparedWinfspNotifications, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
-        STATUS_BAD_NETWORK_PATH, STATUS_DATA_ERROR, STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL,
-        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
-        STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
-        WinfspAsyncCallbackTracker, WinfspInvalidationQueue, WinfspKernelInvalidator,
-        WinfspMetadataCachePolicy, attr_to_file_info, build_basic_info_setattr_args,
-        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
-        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        STATUS_BAD_NETWORK_PATH, STATUS_BUFFER_TOO_SMALL, STATUS_DATA_ERROR,
+        STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
+        STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
+        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
+        WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
+        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
+        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
+        is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
         maybe_hide_platform_root_path, notify_filter_for_kind, open_flags_from_access,
         resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
@@ -4027,7 +4057,7 @@ mod tests {
             (b"a\\b", b"a\0\\\0b\0".as_slice(), b"a/b"),
             (b"\xff", b"\xfd\xff".as_slice(), "\u{fffd}".as_bytes()),
         ] {
-            let encoded = encode_symlink_reparse(target);
+            let encoded = encode_symlink_reparse(target).expect("small target should encode");
             let name_len = u16::try_from(expected.len()).expect("small fixture");
             assert_eq!(encoded.len(), 20 + 2 * expected.len());
             assert_eq!(&encoded[..4], &[0x0c, 0x00, 0x00, 0xa0]); // symlink tag
@@ -4047,8 +4077,233 @@ mod tests {
     }
 
     #[test]
+    fn symlink_reparse_encoding_accepts_native_limit_and_rejects_first_oversized_target() {
+        let largest_target = vec![b'a'; 4091];
+        let encoded = encode_symlink_reparse(&largest_target).expect("largest target should fit");
+        assert_eq!(
+            encoded.len(),
+            super::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize
+        );
+
+        let first_oversized_target = vec![b'a'; 4092];
+        assert_eq!(
+            encode_symlink_reparse(&first_oversized_target),
+            Err(super::STATUS_IO_REPARSE_DATA_INVALID)
+        );
+
+        // This used to overflow ReparseDataLength before allocating the output,
+        // then panic while writing through the truncated allocation length.
+        let formerly_panicking_target = vec![b'a'; 16_381];
+        assert_eq!(
+            encode_symlink_reparse(&formerly_panicking_target),
+            Err(super::STATUS_IO_REPARSE_DATA_INVALID)
+        );
+    }
+
+    #[test]
+    fn symlink_reparse_encoding_sizes_unicode_as_utf16_units() {
+        // 2,045 supplementary characters occupy 4,090 UTF-16 units, followed
+        // by one BMP character for the maximum accepted 4,091 units.
+        let largest_unicode_target = format!("{}x", "😀".repeat(2045));
+        let encoded = encode_symlink_reparse(largest_unicode_target.as_bytes())
+            .expect("maximum UTF-16-sized target should fit");
+        assert_eq!(
+            encoded.len(),
+            super::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize
+        );
+
+        let oversized_unicode_target = "😀".repeat(2046);
+        assert_eq!(
+            encode_symlink_reparse(oversized_unicode_target.as_bytes()),
+            Err(super::STATUS_IO_REPARSE_DATA_INVALID)
+        );
+    }
+
+    #[test]
+    fn get_reparse_point_callbacks_reject_non_symlink_handles() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("non-symlink-reparse");
+        let file = vfs
+            .create(ROOT_INO, b"ordinary", 0, 0, 0o644)
+            .expect("create");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"directory", 0, 0, 0o755)
+            .expect("mkdir");
+        for (attr, name, is_dir) in [(file, "\\ordinary", false), (dir, "\\directory", true)] {
+            let file_name = U16CString::from_str(name).expect("u16 path");
+            let handle = StudioFileHandle::new(attr.ino, is_dir, 0, OpenFlags::RDONLY);
+            let mut buffer = [0xa5; 32];
+            let error = <StudioFsContext as FileSystemContext>::get_reparse_point(
+                &ctx,
+                &handle,
+                file_name.as_ucstr(),
+                &mut buffer,
+            )
+            .expect_err("ordinary inode is not a reparse point");
+            assert_eq!(error.to_ntstatus(), super::STATUS_NOT_A_REPARSE_POINT.0);
+            assert_eq!(buffer, [0xa5; 32]);
+            let error = <StudioFsContext as FileSystemContext>::get_reparse_point_by_name(
+                &ctx,
+                file_name.as_ucstr(),
+                is_dir,
+                &mut buffer,
+            )
+            .expect_err("ordinary path is not a reparse point");
+            assert_eq!(error.to_ntstatus(), super::STATUS_NOT_A_REPARSE_POINT.0);
+            assert_eq!(buffer, [0xa5; 32]);
+        }
+    }
+
+    #[test]
+    fn get_reparse_point_callbacks_reject_native_limit_target_in_service_buffer() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("service-symlink-reparse-buffer");
+        let target = vec![b'a'; 4091];
+        let attr = vfs
+            .symlink(ROOT_INO, b"service-link", &target, 0, 0)
+            .expect("symlink");
+        let file_name = U16CString::from_str(r"\service-link").expect("u16 path");
+        let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDONLY);
+        let mut buffer = vec![0xa5; winfsp::constants::FSP_FSCTL_TRANSACT_RSP_BUFFER_SIZEMAX];
+        assert!(
+            buffer.len()
+                < encode_symlink_reparse(&target)
+                    .expect("native limit fits")
+                    .len()
+        );
+        for by_name in [true, false] {
+            let result = if by_name {
+                <StudioFsContext as FileSystemContext>::get_reparse_point_by_name(
+                    &ctx,
+                    file_name.as_ucstr(),
+                    false,
+                    &mut buffer,
+                )
+            } else {
+                <StudioFsContext as FileSystemContext>::get_reparse_point(
+                    &ctx,
+                    &handle,
+                    file_name.as_ucstr(),
+                    &mut buffer,
+                )
+            };
+            assert_eq!(
+                result
+                    .expect_err("service capacity is smaller")
+                    .to_ntstatus(),
+                STATUS_BUFFER_TOO_SMALL.0
+            );
+            assert!(buffer.iter().all(|&byte| byte == 0xa5));
+        }
+    }
+
+    #[test]
+    fn get_reparse_point_callbacks_reject_short_buffers_without_partial_data() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("short-symlink-reparse-buffer");
+        let attr = vfs
+            .symlink(ROOT_INO, b"short-link", b"/x", 0, 0)
+            .expect("create symlink");
+        let file_name = U16CString::from_str(r"\short-link").expect("u16 path");
+        let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDONLY);
+        let encoded = encode_symlink_reparse(b"/x").expect("target should encode");
+
+        for buffer_len in [10, encoded.len(), encoded.len() + 8] {
+            let mut by_name_buffer = vec![0xa5; buffer_len];
+            let by_name = <StudioFsContext as FileSystemContext>::get_reparse_point_by_name(
+                &ctx,
+                file_name.as_ucstr(),
+                false,
+                &mut by_name_buffer,
+            );
+
+            if buffer_len < encoded.len() {
+                assert_eq!(
+                    by_name
+                        .expect_err("short by-name buffer should fail")
+                        .to_ntstatus(),
+                    STATUS_BUFFER_TOO_SMALL.0
+                );
+                assert!(by_name_buffer.iter().all(|&byte| byte == 0xa5));
+            } else {
+                assert_eq!(
+                    by_name.expect("by-name buffer should fit"),
+                    encoded.len() as u64
+                );
+                assert_eq!(&by_name_buffer[..encoded.len()], encoded);
+                assert!(
+                    by_name_buffer[encoded.len()..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+            }
+
+            let mut by_handle_buffer = vec![0xa5; buffer_len];
+            let by_handle = <StudioFsContext as FileSystemContext>::get_reparse_point(
+                &ctx,
+                &handle,
+                file_name.as_ucstr(),
+                &mut by_handle_buffer,
+            );
+
+            if buffer_len < encoded.len() {
+                assert_eq!(
+                    by_handle
+                        .expect_err("short by-handle buffer should fail")
+                        .to_ntstatus(),
+                    STATUS_BUFFER_TOO_SMALL.0
+                );
+                assert!(by_handle_buffer.iter().all(|&byte| byte == 0xa5));
+            } else {
+                assert_eq!(
+                    by_handle.expect("by-handle buffer should fit"),
+                    encoded.len() as u64
+                );
+                assert_eq!(&by_handle_buffer[..encoded.len()], encoded);
+                assert!(
+                    by_handle_buffer[encoded.len()..]
+                        .iter()
+                        .all(|&byte| byte == 0xa5)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_reparse_point_callbacks_reject_targets_over_native_limit() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("oversized-symlink-reparse");
+        let target = vec![b'a'; 4092];
+        let attr = vfs
+            .symlink(ROOT_INO, b"oversized-link", &target, 0, 0)
+            .expect("create symlink");
+        let file_name = U16CString::from_str(r"\oversized-link").expect("u16 path");
+        let mut buffer = vec![0u8; super::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
+        let expected_status = super::STATUS_IO_REPARSE_DATA_INVALID.0;
+
+        buffer.fill(0xa5);
+        let by_name = <StudioFsContext as FileSystemContext>::get_reparse_point_by_name(
+            &ctx,
+            file_name.as_ucstr(),
+            false,
+            &mut buffer,
+        )
+        .expect_err("by-name callback must reject oversized target");
+        assert_eq!(by_name.to_ntstatus(), expected_status);
+        assert!(buffer.iter().all(|&byte| byte == 0xa5));
+
+        let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDONLY);
+        buffer.fill(0xa5);
+        let by_handle = <StudioFsContext as FileSystemContext>::get_reparse_point(
+            &ctx,
+            &handle,
+            file_name.as_ucstr(),
+            &mut buffer,
+        )
+        .expect_err("by-handle callback must reject oversized target");
+        assert_eq!(by_handle.to_ntstatus(), expected_status);
+        assert!(buffer.iter().all(|&byte| byte == 0xa5));
+    }
+
+    #[test]
     fn resolve_create_callback_kind_prefers_decoded_reparse_target() {
-        let encoded = encode_symlink_reparse(b"/target/path");
+        let encoded = encode_symlink_reparse(b"/target/path").expect("small target should encode");
         assert_eq!(
             resolve_create_callback_kind(FILE_DIRECTORY_FILE_OPTION, Some(&encoded), true),
             CreateCallbackKind::Symlink(b"/target/path".to_vec())
