@@ -360,7 +360,7 @@ impl PgMetaEngine {
             Instant::now() + self.command_timeout,
             "pending state",
         )?;
-        let next_event_seq = snapshot.get_counter("nextEventSeq")?;
+        let next_event_seq = snapshot.get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?;
         let flushed_event_seq = self.flushed_event_seq.load(Ordering::Acquire);
         Ok(checkpoint_source_event_seq_if_clean(
             *pending_state,

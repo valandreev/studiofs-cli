@@ -359,7 +359,9 @@ impl PgMetaEngine {
         state: &mut PendingReplicationState,
     ) -> MetaResult<()> {
         let mut event_start = self.flushed_event_seq.load(Ordering::SeqCst);
-        let event_end = self.local.get_counter("nextEventSeq")?;
+        let event_end = self
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?;
         if event_end <= event_start {
             Self::clear_pending_state(state);
             return Ok(());

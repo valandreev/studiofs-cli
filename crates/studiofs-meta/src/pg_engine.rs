@@ -1537,7 +1537,7 @@ impl PgMetaEngine {
         let restored_flushed_event_seq = Self::load_persisted_flushed_event_seq(&local)?;
         let restored_flushed_event_seq =
             if restored_flushed_event_seq == 0 && !Self::has_any_local_overlay_mutation(&local)? {
-                local.get_counter("nextEventSeq")?
+                local.get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?
             } else {
                 restored_flushed_event_seq
             };
@@ -1840,10 +1840,14 @@ impl PgMetaEngine {
         // `f` is expected to execute one local redb operation that is already
         // atomic at the engine layer (single redb write txn where applicable).
         // This wrapper only tracks local event-seq growth for replication.
-        let before_seq = self.local.get_counter("nextEventSeq")?;
+        let before_seq = self
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?;
         let result = f(&self.local)?;
         let hint = hint(&result);
-        let after_seq = self.local.get_counter("nextEventSeq")?;
+        let after_seq = self
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?;
         drop(pending_guard);
         if self.mark_pending_after_mutation(before_seq, after_seq, hint)? {
             self.signal_poll_wakeup();
