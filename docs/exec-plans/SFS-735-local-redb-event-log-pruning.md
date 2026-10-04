@@ -137,7 +137,7 @@ The legacy-history coverage error applies only to local databases written by ear
 
 ## Context and Orientation
 
-`RedbMetaEngine` owns `EVENT_LOG_TABLE` and allocates monotonically increasing sequence keys. `PgMetaEngine` owns the durable `LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER`, which records the first sequence not yet acknowledged as complete. The local repair state added by SFS-734 lives outside the event journal, so acknowledged journal history is no longer needed for that recovery path.
+`RedbMetaEngine` owns `EVENT_LOG_TABLE` and allocates monotonically increasing sequence keys. `PgMetaEngine` owns the durable `schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ` key, which records the first sequence not yet acknowledged as complete. The local repair state added by SFS-734 lives outside the event journal, so acknowledged journal history is no longer needed for that recovery path.
 
 The foreign serving-rename path also reduces local namespace events to decide whether a destination remains locally removed. Its durable `Created`/`Removed` summary must cover the pruned prefix before replaying retained events.
 
