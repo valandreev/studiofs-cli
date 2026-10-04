@@ -4013,20 +4013,32 @@ mod tests {
 
     #[test]
     fn symlink_reparse_encoding_preserves_utf16le_layout_and_roundtrip() {
-        for (target, expected) in [
-            (b"".as_slice(), b"".as_slice()),
-            (b"/a/b", b"\\\0a\0\\\0b\0".as_slice()),
+        for (target, expected, decoded) in [
+            (b"".as_slice(), b"".as_slice(), b"".as_slice()),
+            (b"/a/b", b"\\\0a\0\\\0b\0".as_slice(), b"/a/b"),
             (
                 "\u{1f600}/\u{0457}".as_bytes(),
                 b"\x3d\xd8\x00\xde\\\0\x57\x04".as_slice(),
+                "\u{1f600}/\u{0457}".as_bytes(),
             ),
+            (b"a\\b", b"a\0\\\0b\0".as_slice(), b"a/b"),
+            (b"\xff", b"\xfd\xff".as_slice(), "\u{fffd}".as_bytes()),
         ] {
             let encoded = encode_symlink_reparse(target);
+            let name_len = u16::try_from(expected.len()).expect("small fixture");
+            assert_eq!(encoded.len(), 20 + 2 * expected.len());
+            assert_eq!(&encoded[..4], &[0x0c, 0x00, 0x00, 0xa0]); // symlink tag
+            assert_eq!(&encoded[4..6], &(12 + 2 * name_len).to_le_bytes());
+            assert_eq!(&encoded[6..10], &[0; 4]); // reserved and substitute offset
+            assert_eq!(&encoded[10..12], &name_len.to_le_bytes());
+            assert_eq!(&encoded[12..14], &name_len.to_le_bytes()); // print offset
+            assert_eq!(&encoded[14..16], &name_len.to_le_bytes());
+            assert_eq!(&encoded[16..20], &[1, 0, 0, 0]); // relative flag
             assert_eq!(&encoded[20..20 + expected.len()], expected);
             assert_eq!(&encoded[20 + expected.len()..], expected);
             assert_eq!(
                 super::decode_symlink_reparse(&encoded),
-                Some(target.to_vec())
+                Some(decoded.to_vec())
             );
         }
     }
