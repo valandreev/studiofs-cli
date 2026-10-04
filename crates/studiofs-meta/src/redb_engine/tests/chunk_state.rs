@@ -2173,7 +2173,7 @@ fn publish_regular_file_overlay_to_base_appends_dentry_only_on_first_visibility(
             .unwrap()
     );
 
-    let second_publish_start = engine.get_counter("nextEventSeq").unwrap();
+    let second_publish_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let mut attr = engine.get_attr(file.ino).unwrap();
     attr.size = 8192;
     attr.content_epoch = 2;
@@ -2187,7 +2187,7 @@ fn publish_regular_file_overlay_to_base_appends_dentry_only_on_first_visibility(
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
             .unwrap()
     );
-    let second_publish_end = engine.get_counter("nextEventSeq").unwrap();
+    let second_publish_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let second_publish_events = engine
         .read_events_range(second_publish_start, second_publish_end)

@@ -115,7 +115,7 @@ fn namespace_mutation_batch_rolls_back_when_total_inode_counter_overflows() {
         .set_counter(counters::TOTAL_INODES, u64::MAX - 1)
         .unwrap();
     let root_before = engine.get_attr(ROOT_INO).unwrap();
-    let next_event_before = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let error = engine
         .apply_namespace_mutations(&[
@@ -146,7 +146,7 @@ fn namespace_mutation_batch_rolls_back_when_total_inode_counter_overflows() {
     ));
     assert_eq!(engine.get_counter(counters::TOTAL_INODES).unwrap(), u64::MAX - 1);
     assert_eq!(
-        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
         next_event_before
     );
     assert!(engine.lookup(ROOT_INO, b"rolled-back-first-dir").is_err());

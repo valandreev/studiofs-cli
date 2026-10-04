@@ -51,7 +51,7 @@ fn aborted_replay_page_does_not_persist_state_or_cursor() {
         ],
         is_self_batch: false,
     }];
-    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let txn = pg.local.begin_write_txn().unwrap();
     let outcome = RemoteApplyCoordinator::new(&pg.local)
         .apply_decoded_batches_in_txn(
@@ -114,7 +114,7 @@ fn failed_replay_page_does_not_persist_state_or_cursor() {
             last_seq: 0,
             current_namespace_version: 0,
             flushed_event_seq: 0,
-            next_event_seq: pg.local.get_counter("nextEventSeq").unwrap(),
+            next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
             initial_overlay: OverlayConflictSets::default(),
         },
     );
@@ -136,7 +136,7 @@ fn failed_replay_page_does_not_persist_state_or_cursor() {
 fn expired_replay_page_deadline_rolls_back_without_advancing_cursor() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let ino = ROOT_INO + 704;
-    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let cancelled = || false;
     let execution = RemoteReplayExecution::new(Instant::now(), &cancelled);
 
@@ -181,7 +181,7 @@ fn replay_lock_acquisition_observes_cancellation_while_lock_is_held() {
         let check_count = std::sync::atomic::AtomicUsize::new(0);
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+        let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
         let inode = ROOT_INO + 800 + u64::from(hold_pending_state);
 
         std::thread::scope(|scope| {
@@ -263,7 +263,7 @@ fn cancellation_after_replay_position_write_aborts_before_commit() {
     let cancelled = || shutdown.load(std::sync::atomic::Ordering::Acquire);
     let execution =
         RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
-    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let result = pg.apply_replay_page_atomically_with_execution(
         vec![DecodedReplayBatch {
@@ -306,7 +306,7 @@ fn cancellation_after_serving_state_reconciliation_rolls_back_before_commit() {
     };
     let execution =
         RemoteReplayExecution::new(Instant::now() + Duration::from_secs(60), &cancelled);
-    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let result = pg.apply_replay_page_atomically_with_execution(
         vec![DecodedReplayBatch {
             batch_version: 1,
@@ -348,7 +348,7 @@ fn cancelled_replay_page_rolls_back_self_ack_and_reapplies_entire_page() {
         .unwrap();
     pg.create_dir(ROOT_INO, b"self-page", 0, 0, 0o755)
         .expect("create local namespace event");
-    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let local_events = pg
         .local
         .read_events_range(flushed_before, next_event_seq)
@@ -442,7 +442,7 @@ fn cancelled_replay_stops_while_scanning_local_journal() {
     let flushed_event_seq = pg.flushed_event_seq.load(Ordering::SeqCst);
     pg.create_dir(ROOT_INO, b"self-prefix", 0, 0, 0o755)
         .expect("create acknowledged local namespace event");
-    let self_prefix_end = pg.local.get_counter("nextEventSeq").unwrap();
+    let self_prefix_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let self_events = RemoteApplyCoordinator::project_local_batch(
         &pg.local
             .read_events_range(flushed_event_seq, self_prefix_end)
@@ -454,7 +454,7 @@ fn cancelled_replay_stops_while_scanning_local_journal() {
         pg.create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
             .expect("create pending local namespace event");
     }
-    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let local_event_count = pg
         .local
         .read_events_range(flushed_event_seq, next_event_seq)
@@ -514,7 +514,7 @@ fn cancelled_replay_stops_while_preparing_local_overlay() {
         pg.create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
             .expect("create pending local namespace event");
     }
-    let end = pg.local.get_counter("nextEventSeq").unwrap();
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let event_count = pg.local.read_events_range(start, end).unwrap().len();
     assert!(event_count > 3, "fixture has enough journal rows");
 
@@ -574,7 +574,7 @@ fn committed_replay_pages_persist_state_and_resume_from_next_version() {
     let (dir, pg) = temp_pg_engine_for_unit();
     let first_ino = ROOT_INO + 701;
     let second_ino = ROOT_INO + 702;
-    let next_event_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let page = |batch_version: i64, ino: Ino, name: &[u8]| {
         vec![DecodedReplayBatch {
@@ -640,7 +640,7 @@ fn committed_replay_pages_persist_state_and_resume_from_next_version() {
                 last_seq: persisted_version,
                 current_namespace_version: 1,
                 flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
-                next_event_seq: pg.local.get_counter("nextEventSeq").unwrap(),
+                next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
                 initial_overlay: OverlayConflictSets::default(),
             },
             None,
@@ -664,7 +664,7 @@ fn committed_replay_pages_persist_state_and_resume_from_next_version() {
                 last_seq: persisted_version,
                 current_namespace_version: 1,
                 flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
-                next_event_seq: pg.local.get_counter("nextEventSeq").unwrap(),
+                next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
                 initial_overlay: OverlayConflictSets::default(),
             },
         )
@@ -916,7 +916,7 @@ fn project_local_batch_hides_uncommitted_regular_file_namespace_from_local_log()
     set_file_state(&pg, draft.ino, 4096, 1);
     pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(9003, 4096))
         .expect("stage local-only payload");
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let start = pg.flushed_event_seq.load(Ordering::SeqCst);
     let events = pg.local.read_events_range(start, end).expect("read events");
     let projected = RemoteApplyCoordinator::project_local_batch(&events);
@@ -947,7 +947,7 @@ fn project_local_batch_keeps_delete_before_publish_out_of_pg() {
     pg.unlink(ROOT_INO, b"deleted-draft.bin")
         .expect("unlink unpublished draft");
 
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let events = pg.local.read_events_range(start, end).expect("read events");
     let projected = RemoteApplyCoordinator::project_local_batch(&events);
 
@@ -977,7 +977,7 @@ fn project_local_batch_keeps_empty_deleted_draft_out_of_pg() {
     pg.unlink(ROOT_INO, b"deleted-empty-draft.bin")
         .expect("unlink empty draft");
 
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let events = pg.local.read_events_range(start, end).expect("read events");
     let projected = RemoteApplyCoordinator::project_local_batch(&events);
 
@@ -1083,7 +1083,7 @@ fn remote_snapshot_hides_brand_new_empty_regular_file_namespace() {
 fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let (_remote_dir, remote) = temp_pg_engine_for_unit();
-    let start = pg.local.get_counter("nextEventSeq").expect("start seq");
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("start seq");
     let file = pg
         .create_file(ROOT_INO, b"published-empty.bin", 0, 0, 0o644)
         .expect("create empty file");
@@ -1092,7 +1092,7 @@ fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
             .expect("publish empty file"),
         "empty file publish should succeed"
     );
-    let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("end seq");
 
     let events = pg
         .local
@@ -1416,7 +1416,7 @@ fn self_batch_prefix_matching_bounds_work_for_long_late_and_missing_matches() {
         pg.local
             .set_xattr(ROOT_INO, b"user.echo", b"match", 0)
             .unwrap();
-        let end = pg.local.get_counter("nextEventSeq").unwrap();
+        let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
         let coordinator = RemoteApplyCoordinator::new(&pg.local);
         let txn = pg.local.begin_write_txn().unwrap();
         for (value, expected) in [(b"match".as_slice(), Some(end)), (b"absent", None)] {
@@ -1651,7 +1651,7 @@ fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
         .create_file(ROOT_INO, b"projected-self-ack.bin", 0, 0, 0o644)
         .expect("create file");
     set_file_state(&pg, file.ino, 4096, 1);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack setup events");
 
@@ -1669,7 +1669,7 @@ fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
             .expect("publish base graph"),
         "base graph publish must succeed"
     );
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let events = pg
         .local
         .read_events_range(start, end)
@@ -1698,7 +1698,7 @@ fn self_batch_acknowledges_contextually_filtered_draft_before_visible_namespace(
         .expect("create unpublished draft");
     pg.create_dir(ROOT_INO, b"visible-dir", 0, 0, 0o755)
         .expect("create visible directory");
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let local_events = pg
         .local
         .read_events_range(start, end)
@@ -1720,7 +1720,7 @@ fn self_batch_acknowledges_prefix_without_retiring_later_local_only_draft() {
     let start = pg.flushed_event_seq.load(Ordering::SeqCst);
     pg.create_dir(ROOT_INO, b"visible-dir", 0, 0, 0o755)
         .expect("create visible directory");
-    let published_end = pg.local.get_counter("nextEventSeq").expect("published end");
+    let published_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("published end");
     let published_events = pg
         .local
         .read_events_range(start, published_end)
@@ -1729,7 +1729,7 @@ fn self_batch_acknowledges_prefix_without_retiring_later_local_only_draft() {
 
     pg.create_file(ROOT_INO, b"later-unpublished-draft.bin", 0, 0, 0o644)
         .expect("create later unpublished draft");
-    let current_end = pg.local.get_counter("nextEventSeq").expect("current end");
+    let current_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("current end");
 
     assert_eq!(
         RemoteApplyCoordinator::new(&pg.local)
@@ -1787,7 +1787,7 @@ fn self_batch_reconcile_uses_overlay_after_ack_for_dentries() {
     let entry = pg
         .create_dir(ROOT_INO, b"self-visible-dir", 0, 0, 0o755)
         .expect("create local dir");
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let events = pg.local.read_events_range(start, end).expect("read events");
     let projected = RemoteApplyCoordinator::project_local_batch(&events);
     let dentry_key = encode_dentry_key(ROOT_INO, b"self-visible-dir");
@@ -1845,7 +1845,7 @@ fn self_batch_reconcile_uses_overlay_after_ack_for_dentries() {
 fn self_replay_ack_clears_stale_foreign_regular_file_protection_after_repair() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = create_published_small_file(&pg, ROOT_INO, b"repaired-self-publish.bin", 77_101);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("acknowledge setup");
 
@@ -1867,7 +1867,7 @@ fn self_replay_ack_clears_stale_foreign_regular_file_protection_after_repair() {
         pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 7)
             .expect("publish self payload")
     );
-    let self_end = pg.local.get_counter("nextEventSeq").expect("self end");
+    let self_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("self end");
     let self_events = pg
         .local
         .read_events_range(self_start, self_end)
@@ -1954,7 +1954,7 @@ fn foreign_unlink_after_local_rename_removes_destination_alias() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"file.txt", 77_010);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
 
@@ -1987,7 +1987,7 @@ fn foreign_unlink_during_local_append_removes_serving_dentry() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"append-target.txt", 77_011);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
 
@@ -2039,7 +2039,7 @@ fn foreign_unlink_during_local_append_removes_serving_dentry() {
             .expect("publish local append"),
         "local append publish should still succeed by inode"
     );
-    let local_append_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let local_append_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let local_events = pg
         .local
         .read_events_range(local_append_start, local_append_end)
@@ -2062,7 +2062,7 @@ fn foreign_unlink_during_active_open_handle_preserves_inode_binding() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"open-target.txt", 77_210);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
     pg.note_active_open_inode(file.ino);
@@ -2107,7 +2107,7 @@ fn active_open_handle_can_flush_dirty_attr_after_foreign_unlink() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"open-target.txt", 77_212);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
     pg.note_active_open_inode(file.ino);
@@ -2143,7 +2143,7 @@ fn active_open_handle_does_not_hide_foreign_content_publish() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"publish-target.txt", 77_211);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
     pg.note_active_open_inode(file.ino);
@@ -2191,7 +2191,7 @@ fn foreign_rename_replace_during_local_append_removes_source_dentry() {
 
     let source = create_published_small_file(&pg, ROOT_INO, b"slot-3.txt", 77_112);
     let target = create_published_small_file(&pg, ROOT_INO, b"slot-3-renamed.txt", 77_113);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
 
@@ -2242,7 +2242,7 @@ fn foreign_rename_replace_during_local_append_removes_source_dentry() {
             .expect("publish local append"),
         "local append publish should still succeed by inode after source rename"
     );
-    let local_append_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let local_append_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let local_events = pg
         .local
         .read_events_range(local_append_start, local_append_end)
@@ -2269,7 +2269,7 @@ fn foreign_unlink_during_local_uploading_preserves_writer_dentry() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"uploading-target.txt", 77_014);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
 
@@ -2358,7 +2358,7 @@ fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
     let local_file = pg
         .create_file(ROOT_INO, b"slot.txt", 0, 0, 0o644)
         .expect("create local slot");
-    let local_end = pg.local.get_counter("nextEventSeq").expect("local end");
+    let local_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("local end");
     let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
     let slot_key = encode_dentry_key(ROOT_INO, b"slot.txt");
     assert!(
@@ -2427,7 +2427,7 @@ fn foreign_unready_add_entry_does_not_hide_visible_local_regular_file() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let local_file = create_published_small_file(&pg, ROOT_INO, b"slot.txt", 77_018);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
 
@@ -2533,7 +2533,7 @@ fn foreign_base_publish_preserves_unflushed_local_overlay_payload() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"payload.txt", 77_020);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
 
@@ -2582,7 +2582,7 @@ fn decoded_replay_coalesces_regular_file_serving_reconciliation() {
 
     let first = create_published_small_file(&pg, ROOT_INO, b"first.bin", 77_023);
     let second = create_published_small_file(&pg, ROOT_INO, b"second.bin", 77_024);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
 
@@ -2868,7 +2868,7 @@ fn attr_only_foreign_batch_must_not_regress_published_file_content_state() {
 
     let file = create_published_small_file(&pg, ROOT_INO, b"attr-only-regression.txt", 77_052);
     let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let local_events = pg
         .local
         .read_events_range(start, end)
@@ -2944,7 +2944,7 @@ fn attr_only_updating_foreign_batch_must_not_hide_published_file_content_state()
     let file =
         create_published_small_file(&pg, ROOT_INO, b"attr-only-updating-regression.txt", 77_054);
     let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let local_events = pg
         .local
         .read_events_range(start, end)
@@ -3031,7 +3031,7 @@ fn newer_attr_only_updating_foreign_batch_preserves_uploading_marker_and_old_con
 
     let file = create_published_small_file(&pg, ROOT_INO, b"newer-attr-only-updating.txt", 77_060);
     let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let local_events = pg
         .local
         .read_events_range(start, end)
@@ -4031,7 +4031,7 @@ fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
         "local publish should succeed"
     );
     let events_start = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let events_end = pg.local.get_counter("nextEventSeq").expect("events end");
+    let events_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("events end");
     let local_events = pg
         .local
         .read_events_range(events_start, events_end)
@@ -4078,7 +4078,7 @@ fn unit_remote_projection_preserves_nested_base_graph_publish() {
     let (_writer_dir, writer) = temp_pg_engine_for_unit();
     let (_remote_dir, remote) = temp_pg_engine_for_unit();
 
-    let start = writer.local.get_counter("nextEventSeq").expect("start seq");
+    let start = writer.local.get_counter(NEXT_EVENT_SEQ).expect("start seq");
     let dir = writer
         .create_dir(ROOT_INO, b"nested", 0, 0, 0o755)
         .expect("create dir");
@@ -4097,7 +4097,7 @@ fn unit_remote_projection_preserves_nested_base_graph_publish() {
             .expect("publish base graph"),
         "publish must succeed"
     );
-    let end = writer.local.get_counter("nextEventSeq").expect("end seq");
+    let end = writer.local.get_counter(NEXT_EVENT_SEQ).expect("end seq");
 
     apply_projected_remote_range(&writer, &remote, start, end);
 
@@ -4125,7 +4125,7 @@ fn unit_remote_projection_base_graph_publish_replaces_base_graph_on_shrink() {
 
     let batch1_start = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("batch1 start");
     let file = writer
         .create_file(ROOT_INO, b"shrink.bin", 0, 0, 0o644)
@@ -4148,7 +4148,7 @@ fn unit_remote_projection_base_graph_publish_replaces_base_graph_on_shrink() {
     );
     let batch1_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("batch1 end");
     apply_projected_remote_range(&writer, &remote, batch1_start, batch1_end);
 
@@ -4175,7 +4175,7 @@ fn unit_remote_projection_base_graph_publish_replaces_base_graph_on_shrink() {
     );
     let batch2_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("batch2 end");
     apply_projected_remote_range(&writer, &remote, batch2_start, batch2_end);
 
@@ -4200,7 +4200,7 @@ fn unit_remote_projection_updates_nested_file_after_temp_rename_then_publish() {
 
     let batch1_start = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("batch1 start");
     let dir = writer
         .create_dir(ROOT_INO, b"drafts", 0, 0, 0o755)
@@ -4213,7 +4213,7 @@ fn unit_remote_projection_updates_nested_file_after_temp_rename_then_publish() {
         .expect("rename temp to final");
     let batch1_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("batch1 end");
 
     apply_projected_remote_range(&writer, &remote, batch1_start, batch1_end);
@@ -4245,7 +4245,7 @@ fn unit_remote_projection_updates_nested_file_after_temp_rename_then_publish() {
     );
     let batch2_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("batch2 end");
 
     apply_projected_remote_range(&writer, &remote, batch2_start, batch2_end);
@@ -4274,7 +4274,7 @@ fn unit_remote_projection_keeps_published_file_visible_when_unpublished_epoch_is
 
     let seed_start = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("seed start");
     let dir = writer
         .create_dir(ROOT_INO, b"shared", 0, 0, 0o755)
@@ -4294,7 +4294,7 @@ fn unit_remote_projection_keeps_published_file_visible_when_unpublished_epoch_is
             .expect("publish seed base graph"),
         "seed publish must succeed"
     );
-    let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+    let seed_end = writer.local.get_counter(NEXT_EVENT_SEQ).expect("seed end");
 
     apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
 
@@ -4322,7 +4322,7 @@ fn unit_remote_projection_keeps_published_file_visible_when_unpublished_epoch_is
     );
     let upload_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("upload end");
 
     apply_projected_remote_range(&writer, &remote, upload_start, upload_end);
@@ -4332,7 +4332,7 @@ fn unit_remote_projection_keeps_published_file_visible_when_unpublished_epoch_is
         .expect("unlink unpublished replacement");
     let delete_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("delete end");
 
     apply_projected_remote_range(&writer, &remote, upload_end, delete_end);
@@ -4382,7 +4382,7 @@ fn unit_remote_projection_preserves_overlay_publish_path() {
     let (_writer_dir, writer) = temp_pg_engine_for_unit();
     let (_remote_dir, remote) = temp_pg_engine_for_unit();
 
-    let start = writer.local.get_counter("nextEventSeq").expect("start seq");
+    let start = writer.local.get_counter(NEXT_EVENT_SEQ).expect("start seq");
     let file = writer
         .create_file(ROOT_INO, b"overlay.bin", 0, 0, 0o644)
         .expect("create overlay file");
@@ -4403,7 +4403,7 @@ fn unit_remote_projection_preserves_overlay_publish_path() {
             .expect("publish overlay to base"),
         "overlay publish must succeed"
     );
-    let end = writer.local.get_counter("nextEventSeq").expect("end seq");
+    let end = writer.local.get_counter(NEXT_EVENT_SEQ).expect("end seq");
 
     apply_projected_remote_range(&writer, &remote, start, end);
 
@@ -6151,7 +6151,7 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
         .expect("create local directory");
 
     let start = a.flushed_event_seq.load(Ordering::SeqCst);
-    let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
+    let end = a.local.get_counter(NEXT_EVENT_SEQ).expect("nextEventSeq");
     let events = a.local.read_events_range(start, end).expect("local events");
     let _version = a
         .push_event_log_batch_locked(&events)
@@ -6164,7 +6164,7 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
         let _ = reopened.sync_metadata();
         reopened.lookup(ROOT_INO, b"draft").is_ok()
             && reopened.flushed_event_seq.load(Ordering::SeqCst)
-                == reopened.local.get_counter("nextEventSeq").unwrap_or(0)
+                == reopened.local.get_counter(NEXT_EVENT_SEQ).unwrap_or(0)
     }));
 }
 
@@ -6192,7 +6192,7 @@ fn test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover() {
         .create_dir(ROOT_INO, b"remote.txt", 0, 0, 0o755)
         .expect("create local entry");
     let start = a.flushed_event_seq.load(Ordering::SeqCst);
-    let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
+    let end = a.local.get_counter(NEXT_EVENT_SEQ).expect("nextEventSeq");
     let events = a.local.read_events_range(start, end).expect("local events");
     let _version = a
         .push_event_log_batch_locked(&events)
@@ -6814,7 +6814,7 @@ fn sparse_ready_foreign_publish_preserves_disjoint_base_ranges_when_not_complete
         "local sparse tail publish should succeed"
     );
     let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let local_events = pg
         .local
         .read_events_range(start, end)
@@ -7145,7 +7145,7 @@ fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial(
 
     let seed_start = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("seed start");
     let file = writer
         .create_file(ROOT_INO, b"sparse-partial-serving-size.bin", 0, 0, 0o644)
@@ -7162,7 +7162,7 @@ fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial(
             .expect("publish sparse head"),
         "initial sparse head publish should succeed"
     );
-    let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+    let seed_end = writer.local.get_counter(NEXT_EVENT_SEQ).expect("seed end");
     apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
 
     let remote_file = remote
@@ -7187,7 +7187,7 @@ fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial(
     );
     let sparse_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("sparse end");
 
     apply_projected_remote_range(&writer, &remote, sparse_start, sparse_end);
@@ -7213,7 +7213,7 @@ fn metadata_only_sparse_extend_replay_advances_peer_logical_size() {
 
     let seed_start = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("seed start");
     let file = writer
         .create_file(ROOT_INO, b"sparse-metadata-only-extend.bin", 0, 0, 0o644)
@@ -7235,7 +7235,7 @@ fn metadata_only_sparse_extend_replay_advances_peer_logical_size() {
             .expect("publish initial sparse file"),
         "initial sparse publish should succeed"
     );
-    let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+    let seed_end = writer.local.get_counter(NEXT_EVENT_SEQ).expect("seed end");
     apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
 
     let remote_file = remote
@@ -7257,7 +7257,7 @@ fn metadata_only_sparse_extend_replay_advances_peer_logical_size() {
     );
     let extend_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("extend end");
 
     apply_projected_remote_range(&writer, &remote, extend_start, extend_end);
@@ -7346,7 +7346,7 @@ fn unit_remote_projection_converges_nested_rename_overwrite_to_source_inode() {
 
     let seed_start = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("seed start");
     let dir = writer
         .create_dir(ROOT_INO, b"shared", 0, 0, 0o755)
@@ -7366,7 +7366,7 @@ fn unit_remote_projection_converges_nested_rename_overwrite_to_source_inode() {
             .expect("publish old base graph"),
         "old base graph publish must succeed"
     );
-    let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+    let seed_end = writer.local.get_counter(NEXT_EVENT_SEQ).expect("seed end");
 
     apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
 
@@ -7406,7 +7406,7 @@ fn unit_remote_projection_converges_nested_rename_overwrite_to_source_inode() {
         .expect("rename replacement over final");
     let replace_end = writer
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("replace end");
 
     apply_projected_remote_range(&writer, &remote, replace_start, replace_end);

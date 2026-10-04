@@ -3217,7 +3217,7 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
         )
         .expect("persist allocator state");
 
-    let event_seq = local.get_counter("nextEventSeq").expect("event start");
+    let event_seq = local.get_counter(NEXT_EVENT_SEQ).expect("event start");
     local
         .create_file(ROOT_INO, b"pending-local-file.bin", 0, 0, 0o644)
         .expect("create pending local file");
@@ -3276,7 +3276,7 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
     );
     assert!(
         local
-            .get_counter("nextEventSeq")
+            .get_counter(NEXT_EVENT_SEQ)
             .expect("read event-log end")
             > event_seq,
         "rejected pending state must retain the local event-log suffix"
@@ -4778,7 +4778,7 @@ fn startup_snapshot_replaces_acknowledged_local_overlay() {
     pg.local
         .create_dir(ROOT_INO, b"acknowledged", 0, 0, 0o755)
         .expect("create local directory");
-    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let event_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     pg.persist_flushed_event_seq(event_end)
         .expect("acknowledge local events");
 
@@ -4803,10 +4803,7 @@ fn replacing_local_state_resets_the_in_memory_prune_cursor() {
         pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
             .expect("create acknowledged local directory");
     }
-    let old_cursor = pg
-        .local
-        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
-        .unwrap();
+    let old_cursor = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     pg.persist_flushed_event_seq(old_cursor)
         .expect("acknowledge old local events");
 
@@ -5475,7 +5472,7 @@ fn snapshot_reconcile_resets_stale_regular_file_serving_attr() {
             .expect("publish local payload"),
         "local publish should make the file unprotected"
     );
-    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let event_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     pg.flushed_event_seq.store(event_end, Ordering::SeqCst);
 
     let mut remote_attr = pg.get_attr(file.ino).expect("load published attr");
@@ -5579,7 +5576,7 @@ fn snapshot_rebootstrap_preserves_active_open_inode_binding() {
             },
         ])
         .expect("publish file metadata to base");
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
     pg.note_active_open_inode(file.ino);
@@ -5970,7 +5967,7 @@ fn checkpoint_source_event_seq_uses_captured_redb_counter() {
         .begin_serving_checkpoint_snapshot()
         .expect("capture local read transaction");
     let captured_event_seq = snapshot
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read captured event sequence");
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::Acquire),
@@ -5994,7 +5991,7 @@ fn checkpoint_source_event_seq_uses_captured_redb_counter() {
     let live_event_seq =
         <crate::redb_engine::RedbMetaEngine as crate::engine::MetaInodes>::get_counter(
             pg.local.as_ref(),
-            "nextEventSeq",
+            NEXT_EVENT_SEQ,
         )
         .expect("read live event sequence");
     assert!(live_event_seq > captured_event_seq);
