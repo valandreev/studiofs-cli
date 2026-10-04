@@ -1,6 +1,7 @@
 //! redb implementation of MetaEngine.
 //!
-//! Uses redb as an embedded ACID KV store for all filesystem metadata.
+//! Uses redb as the embedded ACID store for the local metadata view that serves
+//! mounted foreground filesystem operations.
 
 use crate::coherence::{InvalidationIntent, InvalidationJournal, PendingInvalidations};
 use crate::engine::*;

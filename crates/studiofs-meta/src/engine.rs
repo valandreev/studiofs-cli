@@ -1,7 +1,9 @@
-//! MetaEngine trait — abstract interface for metadata storage.
+//! Metadata-engine interfaces and shared types.
 //!
-//! This trait defines all metadata operations. The default implementation is `RedbMetaEngine`,
-//! but the design supports swapping to PostgreSQL/Redis for multi-user mode.
+//! `MetaEngine` is the aggregate capability contract for metadata operations.
+//! Mounted foreground metadata is served from local `redb`. For PostgreSQL-
+//! backed volumes, `PgMetaEngine` bootstraps and replicates shared state to its
+//! local `redb` view; PostgreSQL is not a foreground metadata read backend.
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
@@ -1620,7 +1622,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         object_id: u64,
     ) -> MetaResult<bool>;
 
-    /// Batch form of [`mark_regular_file_overlay_object_uploaded_if_matches`].
+    /// Batch form of [`Self::mark_regular_file_overlay_objects_uploaded_if_match`].
     ///
     /// Returns the object ids that still matched the inode/epoch overlay.
     fn mark_regular_file_overlay_objects_uploaded_if_match(
