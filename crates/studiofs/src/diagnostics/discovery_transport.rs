@@ -691,6 +691,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_security_descriptor_remains_valid_after_thread_transfer() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WindowsSecurityDescriptor>();
+
+        let descriptor = WindowsSecurityDescriptor::same_user_only()
+            .expect("create diagnostics security descriptor");
+        assert!(!descriptor.as_ptr().0.is_null());
+        std::thread::spawn(move || {
+            // SAFETY: Successful construction owns an initialized descriptor
+            // that remains live and unmodified throughout this read-only call.
+            assert!(unsafe {
+                windows::Win32::Security::IsValidSecurityDescriptor(descriptor.as_ptr()).as_bool()
+            });
+            drop(descriptor);
+        })
+        .join()
+        .expect("validate and drop descriptor on another thread");
+    }
+
+    #[test]
     fn windows_client_disconnect_error_232_is_expected() {
         let disconnect = anyhow::Error::from(std::io::Error::from_raw_os_error(232));
         let other_pipe_error = anyhow::Error::from(std::io::Error::from_raw_os_error(109));

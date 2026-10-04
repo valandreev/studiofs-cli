@@ -1607,6 +1607,11 @@ impl StudioFsContext {
         let sd = &self.default_sd;
         if let Some(buf) = buf {
             let copy_len = sd.len().min(buf.len());
+            // SAFETY: `sd` is initialized for `copy_len` bytes. WinFSP supplies
+            // `buf` as an exclusive output buffer; c_void occupies one byte, so
+            // its length bounds this write and its pointer is aligned for u8.
+            // The output buffer cannot overlap the separately owned `default_sd`
+            // allocation borrowed through `self`, and both remain live here.
             unsafe {
                 std::ptr::copy_nonoverlapping(sd.as_ptr(), buf.as_mut_ptr() as *mut u8, copy_len);
             }
