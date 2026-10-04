@@ -6,7 +6,8 @@
 //! - Regular files are represented as chunk/slice object graphs
 //! - Payload objects are immutable - never modified, only created/deleted
 //! - Local overlay and remote-visible base views are modeled explicitly
-//! - All metadata lives in redb, S3 stores only raw payload objects
+//! - Local `redb` serves mounted foreground metadata; PostgreSQL supplies
+//!   bootstrap and replication, and S3 stores payload objects.
 
 use rand::TryRngCore;
 use rand::rngs::OsRng;
@@ -38,8 +39,8 @@ pub const MIN_BLOCK_SIZE_BYTES: u32 =
 pub const DEFAULT_BLOCK_SIZE: u32 = 4 * BYTES_PER_MIB;
 /// Default chunk size for the chunk/slice object graph: 64 MiB.
 ///
-/// Follow-up: promote this into persisted `FormatInfo` once chunk-size
-/// migration/versioning is introduced.
+/// The chunk size is a compile-time default, not a persisted `FormatInfo` field;
+/// changing it requires a metadata-format migration.
 pub const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 /// Current on-disk metadata and PostgreSQL sync format version.
 pub const CURRENT_FORMAT_VERSION: u16 = 5;
@@ -1972,6 +1973,8 @@ pub mod counters {
     pub const NEXT_OBJECT_ID: &str = "nextObjectId";
     /// Next sequence number to allocate in the local metadata event log.
     pub const NEXT_EVENT_SEQ: &str = "nextEventSeq";
+    /// First local event sequence not yet acknowledged as complete by PostgreSQL replication.
+    pub const LOCAL_PG_FLUSHED_EVENT_SEQ: &str = "pgLastFlushedLocalEventSeq";
     /// Inclusive acknowledged/pruned-through frontier; gaps may have no corresponding event row.
     pub const LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ: &str = "localEventLogPrunedThroughSeq";
     /// Version of the dentry authority summary that covers the pruned local event prefix.

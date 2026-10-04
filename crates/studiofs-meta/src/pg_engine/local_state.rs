@@ -1,11 +1,11 @@
 use super::{
     LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS, LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL,
-    LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, LOCAL_PG_NAMESPACE_VERSION_COUNTER,
-    LOCAL_PG_VERSION_COUNTER, LocalEventRange, PendingReplicationState, PgMetaEngine,
-    StartupSnapshotImportMode,
+    LOCAL_PG_NAMESPACE_VERSION_COUNTER, LOCAL_PG_VERSION_COUNTER, LocalEventRange,
+    PendingReplicationState, PgMetaEngine, StartupSnapshotImportMode,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::{LocalEventLogPruneBatch, RedbMetaEngine};
+use crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Sort ranges and merge overlaps or adjacency without replacing the vector.
@@ -127,7 +127,7 @@ impl PgMetaEngine {
     }
 
     pub(super) fn load_persisted_flushed_event_seq(local: &RedbMetaEngine) -> MetaResult<u64> {
-        let flushed = local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)?;
+        let flushed = local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)?;
         let pruned_through =
             local.get_counter(crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ)?;
         Ok(if pruned_through == 0 {
@@ -184,8 +184,7 @@ impl PgMetaEngine {
         if seq <= self.flushed_event_seq.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.local
-            .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, seq)?;
+        self.local.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, seq)?;
         self.flushed_event_seq.store(seq, Ordering::SeqCst);
         Ok(())
     }
@@ -373,10 +372,7 @@ impl PgMetaEngine {
                 (outcome.max_namespace_version >= 0)
                     .then_some(outcome.max_namespace_version as u64),
             ),
-            (
-                LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
-                outcome.flushed_event_seq,
-            ),
+            (LOCAL_PG_FLUSHED_EVENT_SEQ, outcome.flushed_event_seq),
         ];
         RedbMetaEngine::update_counters_in_txn(txn, &positions)
     }

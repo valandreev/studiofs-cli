@@ -111,7 +111,6 @@ fn resolve_pg_pool_size(configured: usize) -> MetaResult<usize> {
 pub(crate) const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 pub(crate) const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
-const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
 const LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS: usize = 256;
 const LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL: usize = 16;
 pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =
@@ -151,7 +150,7 @@ pub(super) enum StartupSnapshotImportMode {
 pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
     matches!(
         name,
-        LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER
+        crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ
             | crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ
             | crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION
             | LOCAL_PG_CLIENT_SLOT_COUNTER

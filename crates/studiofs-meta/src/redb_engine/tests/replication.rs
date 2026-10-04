@@ -19,7 +19,7 @@ fn first_event_seq_returns_none_for_empty_log() {
 fn first_event_seq_returns_lowest_durable_sequence() {
     let engine = temp_engine();
     clear_event_log_for_test(&engine);
-    engine.set_counter("nextEventSeq", 1_000_000).unwrap();
+    engine.set_counter(NEXT_EVENT_SEQ, 1_000_000).unwrap();
     engine
         .create_file(ROOT_INO, b"sparse-event-log.txt", 1000, 1000, 0o644)
         .unwrap();
@@ -58,14 +58,14 @@ fn local_event_pruning_removes_bounded_prefix_below_exclusive_floor() {
         }
     }
     txn.commit().unwrap();
-    engine.set_counter("nextEventSeq", 7).unwrap();
+    engine.set_counter(NEXT_EVENT_SEQ, 7).unwrap();
 
     assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 2);
     assert_eq!(event_log_sequences(&engine), vec![3, 4, 5, 6]);
     assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 2);
     assert_eq!(event_log_sequences(&engine), vec![5, 6]);
     assert_eq!(engine.prune_local_event_log_before(5, 2).unwrap().rows, 0);
-    assert_eq!(engine.get_counter("nextEventSeq").unwrap(), 7);
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), 7);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn local_event_pruning_removes_sparse_acknowledged_rows_across_batches() {
         }
     }
     txn.commit().unwrap();
-    engine.set_counter("nextEventSeq", 6).unwrap();
+    engine.set_counter(NEXT_EVENT_SEQ, 6).unwrap();
 
     assert_eq!(engine.prune_local_event_log_before(6, 2).unwrap().rows, 2);
     assert_eq!(event_log_sequences(&engine), vec![4, 5]);
@@ -102,7 +102,7 @@ fn local_event_pruning_drop_before_commit_preserves_rows_and_floor() {
         }
     }
     txn.commit().unwrap();
-    engine.set_counter("nextEventSeq", 4).unwrap();
+    engine.set_counter(NEXT_EVENT_SEQ, 4).unwrap();
 
     let txn = engine.begin_write_txn().unwrap();
     let batch = RedbMetaEngine::prune_local_event_log_batch_in_txn(&txn, 4, 2).unwrap();
@@ -214,7 +214,7 @@ fn local_event_pruning_floor_and_sequence_survive_reopen() {
         }
     }
     txn.commit().unwrap();
-    engine.set_counter("nextEventSeq", 7).unwrap();
+    engine.set_counter(NEXT_EVENT_SEQ, 7).unwrap();
 
     let first_batch = engine.prune_local_event_log_before(6, 2).unwrap();
     assert_eq!(first_batch.rows, 2);
@@ -229,7 +229,7 @@ fn local_event_pruning_floor_and_sequence_survive_reopen() {
             .unwrap(),
         2
     );
-    assert_eq!(reopened.get_counter("nextEventSeq").unwrap(), 7);
+    assert_eq!(reopened.get_counter(NEXT_EVENT_SEQ).unwrap(), 7);
 
     let second_batch = reopened.prune_local_event_log_before(6, 2).unwrap();
     assert_eq!(second_batch.rows, 2);
@@ -788,8 +788,8 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
         .expect("local rename should be accepted");
     engine
         .set_counter(
-            "pgLastFlushedLocalEventSeq",
-            engine.get_counter("nextEventSeq").unwrap(),
+            LOCAL_PG_FLUSHED_EVENT_SEQ,
+            engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
         )
         .unwrap();
     engine
@@ -797,12 +797,12 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
         .expect("local unlink should be accepted");
     engine
         .set_counter(
-            "pgLastFlushedLocalEventSeq",
-            engine.get_counter("nextEventSeq").unwrap(),
+            LOCAL_PG_FLUSHED_EVENT_SEQ,
+            engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
         )
         .unwrap();
     assert!(engine.lookup(ROOT_INO, b"renamed-link").is_err());
-    let prune_cursor = engine.get_counter("nextEventSeq").unwrap();
+    let prune_cursor = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let pruned = engine.prune_local_event_log_before(prune_cursor, 32).unwrap();
     assert!(pruned.rows >= 2);
     assert!(event_log_sequences(&engine).is_empty());
@@ -858,9 +858,9 @@ fn replica_serving_rename_preserves_unflushed_unlink_after_create_was_pruned() {
     engine
         .create_symlink(ROOT_INO, b"destination-link", b"local-target.txt", 0, 0)
         .unwrap();
-    let acknowledged_through = engine.get_counter("nextEventSeq").unwrap();
+    let acknowledged_through = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     engine
-        .set_counter("pgLastFlushedLocalEventSeq", acknowledged_through)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, acknowledged_through)
         .unwrap();
     assert!(
         engine
@@ -914,7 +914,7 @@ fn replica_serving_rename_can_reuse_pruned_local_create_then_remove_name() {
         .create_symlink(ROOT_INO, b"destination-link", b"local-target.txt", 0, 0)
         .unwrap();
     engine.unlink(ROOT_INO, b"destination-link").unwrap();
-    let prune_cursor = engine.get_counter("nextEventSeq").unwrap();
+    let prune_cursor = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let rows_before = event_log_sequences(&engine).len();
     assert!(rows_before > 1);
     for _ in 0..rows_before {

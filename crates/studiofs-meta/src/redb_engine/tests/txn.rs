@@ -198,7 +198,7 @@ fn acl_removal_fault_fixture(
         }
         txn.open_table(COUNTERS_TABLE)
             .unwrap()
-            .insert(counters::NEXT_EVENT_SEQ, 7)
+            .insert(NEXT_EVENT_SEQ, 7)
             .unwrap();
     }
     txn.commit().unwrap();
@@ -220,9 +220,7 @@ fn acl_removal_fault_fixture(
 #[test]
 fn append_event_accepts_last_sequence_and_rejects_overflow_without_mutation() {
     let engine = temp_engine();
-    engine
-        .set_counter(counters::NEXT_EVENT_SEQ, u64::MAX - 1)
-        .unwrap();
+    engine.set_counter(NEXT_EVENT_SEQ, u64::MAX - 1).unwrap();
     let event = MetaEvent::SetAttr {
         attr: engine.get_attr(ROOT_INO).unwrap(),
     };
@@ -231,10 +229,7 @@ fn append_event_accepts_last_sequence_and_rejects_overflow_without_mutation() {
     RedbMetaEngine::append_event_in_txn(&txn, &event).unwrap();
     txn.commit().unwrap();
 
-    assert_eq!(
-        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
-        u64::MAX
-    );
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), u64::MAX);
     {
         let read = engine.begin_read_txn().unwrap();
         assert!(
@@ -257,10 +252,7 @@ fn append_event_accepts_last_sequence_and_rejects_overflow_without_mutation() {
         matches!(&error, MetaError::Storage(message) if message.contains("event sequence") && message.contains("overflow")),
         "{error:?}"
     );
-    assert_eq!(
-        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
-        u64::MAX
-    );
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), u64::MAX);
     let read = engine.begin_read_txn().unwrap();
     let events = read.open_table(EVENT_LOG_TABLE).unwrap();
     assert!(events.get(u64::MAX - 1).unwrap().is_some());
@@ -270,9 +262,7 @@ fn append_event_accepts_last_sequence_and_rejects_overflow_without_mutation() {
 #[test]
 fn namespace_create_rolls_back_when_event_sequence_overflows() {
     let engine = temp_engine();
-    engine
-        .set_counter(counters::NEXT_EVENT_SEQ, u64::MAX - 1)
-        .unwrap();
+    engine.set_counter(NEXT_EVENT_SEQ, u64::MAX - 1).unwrap();
     let root_before = engine.get_attr(ROOT_INO).unwrap();
 
     let result = engine.create_file_with_ino(
@@ -292,10 +282,7 @@ fn namespace_create_rolls_back_when_event_sequence_overflows() {
     assert!(engine.lookup(ROOT_INO, b"event-overflow.txt").is_err());
     assert!(engine.get_attr(u64::MAX - 100).is_err());
     assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_before);
-    assert_eq!(
-        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
-        u64::MAX - 1
-    );
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), u64::MAX - 1);
     let read = engine.begin_read_txn().unwrap();
     let events = read.open_table(EVENT_LOG_TABLE).unwrap();
     assert!(events.get(u64::MAX - 1).unwrap().is_none());
@@ -331,7 +318,7 @@ fn namespace_create_checks_total_inode_overflow_before_writing_namespace_state()
             .ino,
         last_valid.ino
     );
-    let next_event_seq = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let next_event_seq = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let root_at_limit = engine.get_attr(ROOT_INO).unwrap();
 
     let error = engine
@@ -362,10 +349,7 @@ fn namespace_create_checks_total_inode_overflow_before_writing_namespace_state()
     // The total-inode guard rejects before namespace or journal writes;
     // these assertions verify early rejection, not rollback of prior writes.
     assert_eq!(engine.get_attr(ROOT_INO).unwrap(), root_at_limit);
-    assert_eq!(
-        engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(),
-        next_event_seq
-    );
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event_seq);
     let read = engine.begin_read_txn().unwrap();
     assert!(
         read.open_table(EVENT_LOG_TABLE)
@@ -506,7 +490,7 @@ fn acl_rule_removal_error_aborts_tombstone_and_event_writes() {
     assert_eq!(
         read.open_table(COUNTERS_TABLE)
             .unwrap()
-            .get(counters::NEXT_EVENT_SEQ)
+            .get(NEXT_EVENT_SEQ)
             .unwrap()
             .unwrap()
             .value(),
@@ -554,7 +538,7 @@ fn acl_tombstone_removal_error_rolls_back_rule_update() {
     assert_eq!(
         read.open_table(COUNTERS_TABLE)
             .unwrap()
-            .get(counters::NEXT_EVENT_SEQ)
+            .get(NEXT_EVENT_SEQ)
             .unwrap()
             .unwrap()
             .value(),

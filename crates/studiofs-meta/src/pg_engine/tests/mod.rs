@@ -5,6 +5,7 @@ use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::inode_allocator::AllocatorRuntime;
 use crate::pg_engine::lifecycle::{drain_startup_catch_up_pages, rebootstrap_startup_target};
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
+use crate::schema::counters::{LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -370,8 +371,10 @@ fn seed_local(path: &std::path::Path, info: &FormatInfo) {
     let seed = RedbMetaEngine::open(path).expect("seed open");
     seed.set_format_info(info).expect("set format");
     seed.init_root(0, 0).expect("init root");
-    let next_event_seq = seed.get_counter("nextEventSeq").expect("nextEventSeq");
-    seed.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, next_event_seq)
+    let next_event_seq = seed
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("read next event sequence after initializing seed root");
+    seed.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, next_event_seq)
         .expect("seed flushed event seq");
 }
 
@@ -456,7 +459,9 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     local
         .set_remote_namespace_visibility_filter(true)
         .expect("enable remote namespace visibility filter");
-    let flushed_event_seq = local.get_counter("nextEventSeq").expect("nextEventSeq");
+    let flushed_event_seq = local
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("read local event cursor after initializing root");
 
     let metadata_invalidation_notify = Arc::clone(&local.invalidation_notify);
     let engine = PgMetaEngine {
@@ -596,7 +601,7 @@ fn acknowledge_local_prefix_from_self_batch(
     batch_events: &[MetaEvent],
 ) -> MetaResult<()> {
     let flushed_event_seq = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let next_event_seq = pg.local.get_counter("nextEventSeq")?;
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ)?;
     if let Some(next_flushed_event_seq) = RemoteApplyCoordinator::new(&pg.local)
         .acknowledge_local_prefix_from_self_batch(batch_events, flushed_event_seq, next_event_seq)?
     {
@@ -613,7 +618,7 @@ fn apply_decoded_foreign_batches_locked(
 ) -> MetaResult<bool> {
     let coordinator = RemoteApplyCoordinator::new(&pg.local);
     let flushed_event_seq = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let next_event_seq = pg.local.get_counter("nextEventSeq")?;
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ)?;
     let initial_overlay = pg.local_overlay_conflicts()?;
     let outcome = coordinator.apply_decoded_batches(
         batches,

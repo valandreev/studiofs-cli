@@ -1,6 +1,9 @@
 //! StudioFS Metadata Engine
 //!
-//! Provides metadata storage for the virtual filesystem using redb as the embedded KV store.
+//! Provides metadata storage for the virtual filesystem. Mounted foreground
+//! operations use the local `redb` view. For PostgreSQL-backed volumes,
+//! `PgMetaEngine` bootstraps and replicates shared state into that view;
+//! PostgreSQL is not a foreground metadata read backend.
 //! All filesystem structure (inodes, directory entries, chunk/slice mappings) is managed here.
 
 #![forbid(unsafe_code)]
@@ -261,8 +264,8 @@ pub fn open_meta_engine_with_options(
                 ensure_supported_format_version(&info)?;
                 if info.metadata.backend == MetadataBackend::Postgres {
                     redb.set_counter(pg_engine::LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)?;
-                    redb.set_counter("pgLastAppliedBatchVersion", 0)?;
-                    redb.set_counter("pgLastAppliedNamespaceBatchVersion", 0)?;
+                    redb.set_counter(pg_engine::LOCAL_PG_VERSION_COUNTER, 0)?;
+                    redb.set_counter(pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)?;
                 }
                 info
                 // redb dropped here — releases file lock
@@ -527,32 +530,32 @@ mod tests {
         let path = dir.path().join("pg-repair-reset.db");
         let redb = RedbMetaEngine::open(&path).expect("open redb");
 
-        redb.set_counter("pgLastAppliedBatchVersion", 42)
+        redb.set_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER, 42)
             .expect("seed pg replay position");
-        redb.set_counter("pgLastAppliedNamespaceBatchVersion", 41)
+        redb.set_counter(crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER, 41)
             .expect("seed pg namespace position");
-        redb.set_counter("pgLastFlushedLocalEventSeq", 7)
+        redb.set_counter(crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ, 7)
             .expect("seed local flush position");
         redb.set_counter("pgClientSlotPlusOne", 3)
             .expect("seed client slot");
 
-        redb.set_counter("pgLastAppliedBatchVersion", 0)
+        redb.set_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER, 0)
             .expect("reset pg replay position");
-        redb.set_counter("pgLastAppliedNamespaceBatchVersion", 0)
+        redb.set_counter(crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)
             .expect("reset pg namespace position");
 
         assert_eq!(
-            redb.get_counter("pgLastAppliedBatchVersion")
+            redb.get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER)
                 .expect("pg replay position"),
             0
         );
         assert_eq!(
-            redb.get_counter("pgLastAppliedNamespaceBatchVersion")
+            redb.get_counter(crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER)
                 .expect("pg namespace position"),
             0
         );
         assert_eq!(
-            redb.get_counter("pgLastFlushedLocalEventSeq")
+            redb.get_counter(crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ)
                 .expect("local flush position"),
             7,
             "repair reset must not make already-flushed local events publish again"

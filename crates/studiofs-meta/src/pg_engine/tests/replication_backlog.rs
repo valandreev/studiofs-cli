@@ -61,7 +61,7 @@ fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() 
         .expect("create acknowledged directory");
     let cursor = pg
         .local
-        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read acknowledged end");
     pg.persist_flushed_event_seq(cursor)
         .expect("persist acknowledged local cursor");
@@ -70,7 +70,7 @@ fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() 
         .expect("create rejected suffix");
     let completed_end = pg
         .local
-        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read completed suffix end");
     assert!(completed_end > cursor + 1);
     pg.reject_local_event_ranges(&[LocalEventRange {
@@ -87,7 +87,7 @@ fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() 
         .expect("create unprocessed suffix");
     let next_event_seq = pg
         .local
-        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read next event sequence");
 
     let pruned = pg
@@ -98,9 +98,7 @@ fn local_event_pruning_keeps_rejected_and_unprocessed_suffix_without_postgres() 
     assert_eq!(pg.local.first_event_seq().unwrap(), Some(cursor));
     assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
     assert_eq!(
-        pg.local
-            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
-            .unwrap(),
+        pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
         next_event_seq,
         "pruning must not renumber local event sequences"
     );
@@ -117,12 +115,12 @@ fn pruned_acknowledged_prefix_reopens_with_unacknowledged_journal_suffix() {
         pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
             .expect("create acknowledged directory");
     }
-    let suffix_start = pg.local.get_counter("nextEventSeq").unwrap();
+    let suffix_start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     pg.persist_flushed_event_seq(suffix_start)
         .expect("persist acknowledged prefix cursor");
     pg.create_dir(ROOT_INO, b"unacknowledged", 0, 0, 0o755)
         .expect("create unacknowledged suffix");
-    let suffix_end = pg.local.get_counter("nextEventSeq").unwrap();
+    let suffix_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let expected_suffix = pg
         .local
         .read_events_range(suffix_start, suffix_end)
@@ -212,7 +210,7 @@ fn background_local_event_pruning_drains_full_batches_up_to_its_budget() {
     }
     txn.commit().unwrap();
     pg.local
-        .set_counter(crate::schema::counters::NEXT_EVENT_SEQ, next_event_seq)
+        .set_counter(NEXT_EVENT_SEQ, next_event_seq)
         .unwrap();
     pg.persist_flushed_event_seq(next_event_seq)
         .expect("persist acknowledged event cursor");
@@ -231,9 +229,7 @@ fn background_local_event_pruning_drains_full_batches_up_to_its_budget() {
     );
     assert_eq!(pg.local.first_event_seq().unwrap(), Some(4_097));
     assert_eq!(
-        pg.local
-            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
-            .unwrap(),
+        pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
         next_event_seq
     );
 }
@@ -243,7 +239,7 @@ fn background_local_event_pruning_skips_work_after_shutdown() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     pg.create_dir(ROOT_INO, b"shutdown-pending", 0, 0, 0o755)
         .expect("create pruneable event");
-    let cursor = pg.local.get_counter("nextEventSeq").unwrap();
+    let cursor = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     pg.persist_flushed_event_seq(cursor)
         .expect("acknowledge pruneable event");
 
@@ -266,7 +262,7 @@ fn background_local_event_pruning_stops_after_short_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     pg.create_dir(ROOT_INO, b"short-prune-batch", 0, 0, 0o755)
         .expect("create an acknowledged local event");
-    let cursor = pg.local.get_counter("nextEventSeq").unwrap();
+    let cursor = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let eligible_rows = usize::try_from(cursor - 1).unwrap();
     assert!(eligible_rows < LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS);
     pg.persist_flushed_event_seq(cursor)
@@ -313,7 +309,7 @@ fn pg_pending_deletion_batch_applies_locally_in_one_transaction() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let markers = [(60, 600), (70, 700)];
     let before = pg.local.metadata_write_observability();
-    let start_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let start_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     pg.add_pending_deletions(&markers)
         .expect("apply pending deletion batch through PgMeta");
@@ -327,7 +323,7 @@ fn pg_pending_deletion_batch_applies_locally_in_one_transaction() {
     assert_eq!(after.commit.calls - before.commit.calls, 2);
     assert_eq!(pg.get_pending_deletions().unwrap(), markers.to_vec());
 
-    let end_seq = pg.local.get_counter("nextEventSeq").unwrap();
+    let end_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let events = pg
         .local
         .read_events_range(start_seq, end_seq)
@@ -380,17 +376,17 @@ fn restore_pending_state_acknowledges_initial_root_snapshot_event() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let root_event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read root event end");
     pg.local
         .create_dir(ROOT_INO, b"after-root", 0, 0, 0o755)
         .expect("create local directory after root setup");
     let event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read local event end");
     pg.local
-        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 0)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, 0)
         .expect("reset the startup cursor");
     pg.flushed_event_seq.store(0, Ordering::SeqCst);
 
@@ -404,7 +400,7 @@ fn restore_pending_state_acknowledges_initial_root_snapshot_event() {
     );
     assert_eq!(
         pg.local
-            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)
             .expect("read persisted startup cursor"),
         root_event_end
     );
@@ -426,13 +422,13 @@ fn unpublished_file_deletion_suffix_is_not_remote_visible() {
         .expect("create visible pending prefix");
     let create_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read create start");
     pg.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
         .expect("create unpublished file");
     let create_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read create end");
     pg.create_file(ROOT_INO, b"draft-2.txt", 0, 0, 0o644)
         .expect("create second unpublished file");
@@ -452,7 +448,7 @@ fn unpublished_file_deletion_suffix_is_not_remote_visible() {
     );
     let deletion_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read deletion start");
 
     pg.unlink(ROOT_INO, b"draft.txt")
@@ -462,7 +458,7 @@ fn unpublished_file_deletion_suffix_is_not_remote_visible() {
 
     let deletion_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read deletion end");
     let deletion_events = pg
         .local
@@ -503,14 +499,14 @@ fn pending_state_survives_flushed_cursor_persist_failure() {
         .expect("create unpublished file");
     let before_seq = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read before seq");
     pg.local
         .remove_attr(file.ino)
         .expect("remove unpublished file attributes");
     let after_seq = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read after seq");
 
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -534,7 +530,7 @@ fn pending_state_survives_flushed_cursor_persist_failure() {
 fn restore_pending_state_survives_flushed_cursor_persist_failure() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = create_published_small_file(&pg, ROOT_INO, b"restore-persist-failure.bin", 77_007);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("acknowledge published setup");
     {
@@ -584,7 +580,7 @@ fn removing_regular_file_graph_does_not_create_remote_backlog() {
 fn removing_published_regular_file_graph_does_not_remain_local_only() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = create_published_small_file(&pg, ROOT_INO, b"published-graph-remove.txt", 77_006);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("acknowledge published setup");
     {
@@ -595,7 +591,7 @@ fn removing_published_regular_file_graph_does_not_remain_local_only() {
     pg.remove_regular_file_graph(file.ino)
         .expect("remove published file graph");
 
-    let graph_end = pg.local.get_counter("nextEventSeq").expect("graph end");
+    let graph_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("graph end");
     let state = pg.pending_state.lock().expect("pending_state");
     assert_eq!(
         state.ops, 0,
@@ -615,7 +611,7 @@ fn removing_published_regular_file_graph_does_not_remain_local_only() {
 #[test]
 fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    let start = pg.local.get_counter("nextEventSeq").expect("baseline seq");
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("baseline seq");
 
     pg.local
         .create_dir(ROOT_INO, b"draft", 0, 0, 0o755)
@@ -632,7 +628,7 @@ fn restore_pending_state_from_local_log_rebuilds_unpublished_batch() {
     pg.restore_pending_state_from_local_log()
         .expect("restore pending state");
 
-    let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("end seq");
     let pending_events = pg
         .local
         .read_events_range(start, end)
@@ -682,7 +678,7 @@ fn restore_pending_state_does_not_replay_stale_setup_over_published_file() {
     );
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
-        pg.local.get_counter("nextEventSeq").expect("event end"),
+        pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end"),
         "superseded setup events must not remain a PostgreSQL backlog"
     );
 }
@@ -702,7 +698,7 @@ fn restore_pending_state_keeps_unpublished_regular_file_replay_suffix() {
     pg.set_attr(&uploading).expect("set uploading draft attr");
     pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(77_004, 48))
         .expect("stage draft payload");
-    let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("end seq");
     let events = pg
         .local
         .read_events_range(start, end)
@@ -754,7 +750,7 @@ fn test_local_overlay_conflicts_reserve_pending_xattr_and_symlink() {
 
     let baseline = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read baseline seq");
     {
         let mut state = pg.pending_state.lock().expect("pending_state");
@@ -839,7 +835,7 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
     pg.stage_payload_slice(file.ino, 0, &payload)
         .expect("stage local overlay");
 
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack setup events");
     {
@@ -859,7 +855,7 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
     );
     let after_upload_progress = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("after upload progress");
 
     let backlog = pg.replication_backlog();
@@ -885,7 +881,7 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
     let file = pg
         .create_file(ROOT_INO, b"repair-uploaded-overlay.bin", 0, 0, 0o644)
         .expect("create file");
-    let create_end = pg.local.get_counter("nextEventSeq").expect("create end");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
     pg.persist_flushed_event_seq(create_end)
         .expect("acknowledge remote-visible create");
     {
@@ -904,7 +900,7 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
     assert_eq!(accepted.committed_content_epoch, 0);
     assert_eq!(accepted.upload_state, UploadState::Uploading);
 
-    let accepted_end = pg.local.get_counter("nextEventSeq").expect("accepted end");
+    let accepted_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("accepted end");
     pg.persist_flushed_event_seq(accepted_end)
         .expect("acknowledge accepted metadata");
     {
@@ -922,7 +918,7 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
     );
     let acknowledged_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("uploaded-marker end");
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
@@ -991,7 +987,7 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
     let flushed_event_seq_before_restore = pg.flushed_event_seq.load(Ordering::SeqCst);
     let next_event_seq_before_restore = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("next event sequence before restore");
     assert!(
         pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
@@ -1028,7 +1024,7 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
     );
     assert_eq!(
         pg.local
-            .get_counter("nextEventSeq")
+            .get_counter(NEXT_EVENT_SEQ)
             .expect("next event sequence after restore"),
         next_event_seq_before_restore,
         "repair restore must not append to the local event journal"
@@ -1046,7 +1042,7 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
     let file = pg
         .create_file(ROOT_INO, b"repair-newer-ready-state.bin", 0, 0, 0o644)
         .expect("create file");
-    let create_end = pg.local.get_counter("nextEventSeq").expect("create end");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
     pg.persist_flushed_event_seq(create_end)
         .expect("acknowledge remote-visible create");
     {
@@ -1059,7 +1055,7 @@ fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_sta
         .expect("stage local-only payload");
     set_file_state(&pg, file.ino, 152, 1);
     let accepted = pg.get_attr(file.ino).expect("accepted attr");
-    let accepted_end = pg.local.get_counter("nextEventSeq").expect("accepted end");
+    let accepted_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("accepted end");
     pg.persist_flushed_event_seq(accepted_end)
         .expect("acknowledge accepted metadata");
     {
@@ -1297,7 +1293,7 @@ fn redb_repair_does_not_restore_superseded_uploaded_overlay() {
 
     let next_event_seq = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("event sequence");
     assert!(
         pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
@@ -1323,7 +1319,7 @@ fn redb_repair_does_not_restore_superseded_uploaded_overlay() {
     );
     assert_eq!(
         pg.local
-            .get_counter("nextEventSeq")
+            .get_counter(NEXT_EVENT_SEQ)
             .expect("event sequence after restore"),
         next_event_seq,
         "repair restore must not append events"
@@ -1389,7 +1385,7 @@ fn redb_repair_does_not_restore_deleted_uploaded_overlay() {
 
     let next_event_seq = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("event sequence");
     assert!(
         pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
@@ -1414,7 +1410,7 @@ fn redb_repair_does_not_restore_deleted_uploaded_overlay() {
     );
     assert_eq!(
         pg.local
-            .get_counter("nextEventSeq")
+            .get_counter(NEXT_EVENT_SEQ)
             .expect("event sequence after restore"),
         next_event_seq,
         "repair restore must not append events"
@@ -1935,7 +1931,7 @@ fn published_unlink_creates_remote_visible_pg_replication_backlog() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     create_published_small_file(&pg, ROOT_INO, b"published-delete.bin", 77_002);
-    let published_end = pg.local.get_counter("nextEventSeq").expect("published end");
+    let published_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("published end");
     pg.persist_flushed_event_seq(published_end)
         .expect("ack published setup");
     {
@@ -1979,7 +1975,7 @@ fn regular_namespace_mutations_batch_without_pg_poll_wakeup() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     create_published_small_file(&pg, ROOT_INO, b"batched-delete.bin", 77_004);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("acknowledge remote-visible setup");
     {
@@ -2066,7 +2062,7 @@ fn ready_file_attr_change_wakes_pg_poll_worker() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
     let file = create_published_small_file(&pg, ROOT_INO, b"ready-attr-wakeup.bin", 77_030);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack setup events");
     {
@@ -2098,7 +2094,7 @@ fn xattr_change_batches_without_pg_poll_wakeup() {
     let file = pg
         .create_file(ROOT_INO, b"xattr-batch-wakeup.bin", 0, 0, 0o644)
         .expect("create file");
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack setup events");
     {
@@ -2133,7 +2129,7 @@ fn uploading_file_attr_change_stays_local_without_pg_poll_wakeup() {
     let file = pg
         .create_file(ROOT_INO, b"uploading-attr-batch.bin", 0, 0, 0o644)
         .expect("create file");
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack setup events");
     {
@@ -2237,21 +2233,21 @@ fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
 
     let event_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read first local event sequence");
     pg.local
         .set_xattr(ROOT_INO, b"user.small.before", b"ok", 0)
         .expect("append valid event before published range");
     let published_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read published range start");
     pg.local
         .set_xattr(ROOT_INO, b"user.published", b"ok", 0)
         .expect("append event to mark already published");
     let published_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read published range end");
     let oversized_start = published_end;
     pg.local
@@ -2259,14 +2255,14 @@ fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
         .expect("append one oversized event");
     let oversized_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read oversized event end");
     pg.local
         .set_xattr(ROOT_INO, b"user.small.after", b"ok", 0)
         .expect("append valid event after oversized event");
     let event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read final local event sequence");
     pg.mark_local_event_ranges_published(&[LocalEventRange {
         start: published_start,
@@ -2439,7 +2435,7 @@ fn oversized_event_gap_survives_local_delete_and_retries_after_restart() {
         .expect("publish the restored oversized event under the larger cap");
     let event_end = reopened
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read restored local event end");
     assert_eq!(
         PgMetaEngine::load_persisted_flushed_event_seq(&reopened.local)
@@ -2502,7 +2498,7 @@ fn processed_local_ranges_stop_masking_foreign_dentries_across_rejected_gap() {
     let completed_name = b"cancelled-after-gap";
     let completed_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read completed range start");
     pg.local
         .create_file(ROOT_INO, completed_name, 0, 0, 0o644)
@@ -2512,7 +2508,7 @@ fn processed_local_ranges_stop_masking_foreign_dentries_across_rejected_gap() {
         .expect("append completed local delete");
     let completed_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read completed range end");
     pg.complete_local_event_ranges(&[LocalEventRange {
         start: completed_start,
@@ -2527,7 +2523,7 @@ fn processed_local_ranges_stop_masking_foreign_dentries_across_rejected_gap() {
         .expect("append published local range");
     let event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read published range end");
     pg.mark_local_event_ranges_published(&[LocalEventRange {
         start: published_start,
@@ -2592,14 +2588,14 @@ fn completed_overlay_conflicts_are_removed_during_self_ack_replay() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let event_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read self event start");
     pg.local
         .set_xattr(ROOT_INO, b"user.sfs726.self", b"published", 0)
         .expect("append self event");
     let self_event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read self event end");
     let self_events = pg
         .local
@@ -2621,7 +2617,7 @@ fn completed_overlay_conflicts_are_removed_during_self_ack_replay() {
         .expect("append local delete to be completed");
     let next_event_seq = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read completed local suffix end");
     pg.complete_local_event_ranges(&[LocalEventRange {
         start: self_event_end,
@@ -2680,14 +2676,14 @@ fn replay_ack_and_completed_suffix_persist_in_one_redb_transaction() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let event_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read replay event start");
     pg.local
         .set_xattr(ROOT_INO, b"user.sfs726.visible", b"published", 0)
         .expect("append visible event to be self-acknowledged");
     let acknowledged_cursor = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read self-ack event end");
     let visible_events = pg
         .local
@@ -2706,7 +2702,7 @@ fn replay_ack_and_completed_suffix_persist_in_one_redb_transaction() {
         .expect("append local-only completed event");
     let completed_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read completed event end");
     pg.complete_local_event_ranges(&[LocalEventRange {
         start: completed_start,
@@ -2752,7 +2748,7 @@ fn multiple_rejected_ranges_are_skipped_without_requeue() {
     let first_gap = reject_oversized_test_event(&mut pg, b"first-oversized-range");
     let first_gap_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read first rejected range end");
 
     let published_start = first_gap_end;
@@ -2761,7 +2757,7 @@ fn multiple_rejected_ranges_are_skipped_without_requeue() {
         .expect("append published event between rejected ranges");
     let published_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read intervening published range end");
     pg.mark_local_event_ranges_published(&[LocalEventRange {
         start: published_start,
@@ -2772,7 +2768,7 @@ fn multiple_rejected_ranges_are_skipped_without_requeue() {
     reject_oversized_test_event(&mut pg, b"second-oversized-range");
     let second_gap_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read second rejected range end");
     let later_published_start = second_gap_end;
     pg.local
@@ -2780,7 +2776,7 @@ fn multiple_rejected_ranges_are_skipped_without_requeue() {
         .expect("append published event after rejected ranges");
     let event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read later published range end");
     pg.mark_local_event_ranges_published(&[LocalEventRange {
         start: later_published_start,
@@ -2813,13 +2809,13 @@ fn restoration_does_not_requeue_rejected_prefix_ahead_of_later_work() {
 
     let later_event_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("next event seq");
     pg.create_dir(ROOT_INO, b"later-small-event", 0, 0, 0o755)
         .expect("create independent later event");
     let later_event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("next event seq");
 
     pg.restore_pending_state_from_local_log()
@@ -2844,13 +2840,13 @@ fn published_later_range_stays_pending_at_rejected_cursor_until_self_ack() {
 
     let later_event_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("next event seq");
     pg.create_dir(ROOT_INO, b"later-published-event", 0, 0, 0o755)
         .expect("create independent later event");
     let later_event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("next event seq");
     pg.mark_local_event_ranges_published(&[LocalEventRange {
         start: later_event_start,
@@ -2874,11 +2870,11 @@ fn published_later_range_stays_pending_at_rejected_cursor_until_self_ack() {
 #[test]
 fn pending_restore_does_not_resurrect_published_source_after_foreign_rename() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    let start = pg.local.get_counter("nextEventSeq").unwrap();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let attr = pg
         .create_dir(ROOT_INO, b"rename-source", 0, 0, 0o755)
         .unwrap();
-    let end = pg.local.get_counter("nextEventSeq").unwrap();
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let entry = DirEntryValue {
         ino: attr.ino,
         kind: FileType::Directory,
@@ -2947,10 +2943,10 @@ fn self_ack_with_contextually_filtered_prefix_preserves_local_overlay() {
 
     let cursor_before_gap = pg.flushed_event_seq.load(Ordering::SeqCst);
     pg.local
-        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, cursor_before_gap)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, cursor_before_gap)
         .expect("persist the initial local event cursor");
     let link_name = vec![b'l'; 240];
-    let gap_start = pg.local.get_counter("nextEventSeq").expect("event start");
+    let gap_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
     pg.local
         .add_entry(
             ROOT_INO,
@@ -2961,7 +2957,7 @@ fn self_ack_with_contextually_filtered_prefix_preserves_local_overlay() {
             },
         )
         .expect("append local hardlink event");
-    let gap_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let gap_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     pg.mark_pending_after_mutation(gap_start, gap_end, PendingMutationHint::Unknown)
         .expect("queue hardlink event");
     let rejected = pg
@@ -2981,11 +2977,11 @@ fn self_ack_with_contextually_filtered_prefix_preserves_local_overlay() {
     pg.sync_max_response_bytes_per_page = 8 * 1024 * 1024;
     let self_event_start = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("self event start");
     pg.create_dir(ROOT_INO, b"later-independent-directory", 0, 0, 0o755)
         .expect("create later independent directory");
-    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let event_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
 
     let self_events = pg
         .local
@@ -3066,7 +3062,7 @@ fn restore_pending_state_from_local_log_replays_unflushed_serving_state() {
         .create_file(ROOT_INO, b"lww-winner.txt", 0, 0, 0o644)
         .expect("create file");
     let setup_start = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     let setup_events = pg
         .local
         .read_events_range(setup_start, setup_end)

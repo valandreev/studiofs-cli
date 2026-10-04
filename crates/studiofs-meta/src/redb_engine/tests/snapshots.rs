@@ -25,7 +25,7 @@ fn pruning_invalid_event_keeps_event_rows_and_floor_unchanged() {
         {
             let mut counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
             counters
-                .insert(crate::schema::counters::NEXT_EVENT_SEQ, 3)
+                .insert(NEXT_EVENT_SEQ, 3)
                 .expect("set next event sequence");
         }
         txn.commit().expect("commit event setup");
@@ -96,7 +96,7 @@ fn pruned_local_dentry_mutation_survives_redb_reopen() {
         {
             let mut counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
             counters
-                .insert(crate::schema::counters::NEXT_EVENT_SEQ, 2)
+                .insert(NEXT_EVENT_SEQ, 2)
                 .expect("set next event sequence");
         }
         txn.commit().expect("commit event setup");
@@ -301,7 +301,7 @@ fn serving_checkpoint_read_snapshot_exports_only_the_captured_state() {
         .begin_serving_checkpoint_snapshot()
         .expect("capture checkpoint snapshot");
     let captured_event_seq = snapshot
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read captured event sequence");
     for name in [b"checkpoint-after-c".as_slice(), b"checkpoint-after-d"] {
         engine
@@ -309,11 +309,11 @@ fn serving_checkpoint_read_snapshot_exports_only_the_captured_state() {
             .expect("create entry after snapshot");
     }
     assert!(
-        engine.get_counter("nextEventSeq").unwrap() > captured_event_seq,
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap() > captured_event_seq,
         "writes after capture should advance the live event sequence"
     );
     assert_eq!(
-        snapshot.get_counter("nextEventSeq").unwrap(),
+        snapshot.get_counter(NEXT_EVENT_SEQ).unwrap(),
         captured_event_seq,
         "the captured transaction must retain its event sequence"
     );
@@ -725,7 +725,7 @@ fn import_remote_snapshot_preserves_fresh_client_pending_marker() {
 #[test]
 fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_log() {
     let local = temp_engine();
-    let local_event_start = local.get_counter("nextEventSeq").unwrap();
+    let local_event_start = local.get_counter(NEXT_EVENT_SEQ).unwrap();
     let draft = local
         .create_file(ROOT_INO, b"local-draft.bin", 0, 0, 0o644)
         .unwrap();
@@ -738,11 +738,11 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     let link = local
         .create_symlink(ROOT_INO, b"local-link", b"/local/target", 0, 0)
         .unwrap();
-    local.set_counter("pgLastFlushedLocalEventSeq", local_event_start)
+    local.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, local_event_start)
         .unwrap();
     local.set_counter("pgClientSlotPlusOne", 8).unwrap();
     local.set_counter(counters::NEXT_INODE, 50_000).unwrap();
-    let local_event_end = local.get_counter("nextEventSeq").unwrap();
+    let local_event_end = local.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let source = temp_engine();
     let remote_file = source
@@ -759,7 +759,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
         .unwrap();
     source.set_counter(counters::NEXT_INODE, 7_000).unwrap();
     source.set_counter("pgLastAppliedBatchVersion", 12).unwrap();
-    source.set_counter("pgLastFlushedLocalEventSeq", 99).unwrap();
+    source.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, 99).unwrap();
     source.set_counter("pgClientSlotPlusOne", 99).unwrap();
     let snapshot = source.export_snapshot().unwrap();
 
@@ -778,7 +778,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
         Some(AccessLevel::ReadWrite)
     );
     assert_eq!(local.get_symlink_target(link.ino).unwrap(), b"/local/target");
-    assert_eq!(local.get_counter("nextEventSeq").unwrap(), local_event_end);
+    assert_eq!(local.get_counter(NEXT_EVENT_SEQ).unwrap(), local_event_end);
     assert_eq!(local.get_counter(counters::NEXT_INODE).unwrap(), 50_000);
     assert_eq!(
         local
@@ -787,7 +787,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
             .len(),
         usize::try_from(local_event_end - local_event_start).unwrap()
     );
-    assert_eq!(local.get_counter("pgLastFlushedLocalEventSeq").unwrap(), local_event_start);
+    assert_eq!(local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ).unwrap(), local_event_start);
     assert_eq!(local.get_counter("pgClientSlotPlusOne").unwrap(), 8);
     assert_eq!(local.get_counter("pgLastAppliedBatchVersion").unwrap(), 12);
 }
@@ -798,9 +798,9 @@ fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
     local
         .create_file(ROOT_INO, b"lost-serving-state.bin", 0, 0, 0o644)
         .unwrap();
-    let local_event_end = local.get_counter("nextEventSeq").unwrap();
+    let local_event_end = local.get_counter(NEXT_EVENT_SEQ).unwrap();
     local
-        .set_counter("pgLastFlushedLocalEventSeq", local_event_end)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, local_event_end)
         .unwrap();
     let pruned = local
         .prune_local_event_log_before(local_event_end, 1)
@@ -835,7 +835,7 @@ fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
         local.lookup(ROOT_INO, b"remote-authoritative.bin").is_ok(),
         "repair import must install the authoritative remote namespace"
     );
-    assert_eq!(local.get_counter("nextEventSeq").unwrap(), local_event_end);
+    assert_eq!(local.get_counter(NEXT_EVENT_SEQ).unwrap(), local_event_end);
     assert_eq!(local.first_event_seq().unwrap(), Some(retained_event_start));
     assert_eq!(
         local
@@ -845,7 +845,7 @@ fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
         "repair import must retain the unpruned local event suffix"
     );
     assert_eq!(
-        local.get_counter("pgLastFlushedLocalEventSeq").unwrap(),
+        local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ).unwrap(),
         local_event_end,
         "repair import must not reopen acknowledged local metadata"
     );

@@ -2,7 +2,7 @@ use super::{PgTestVolume, pg_dsn, run_async, seed_local};
 use crate::engine::{MetaError, MetaFsOps, MetaInodes, MetaNamespace, MetaReplication};
 use crate::pg_engine::{PgMetaEngine, PgOpenOptions};
 use crate::redb_engine::RedbMetaEngine;
-use crate::schema::ROOT_INO;
+use crate::schema::{ROOT_INO, counters::NEXT_EVENT_SEQ};
 use crate::snapshot::{SnapshotOrigin, SnapshotRetention};
 use crate::snapshot_ports::SnapshotSourceReader;
 use std::path::PathBuf;
@@ -55,7 +55,7 @@ fn push_uncheckpointed_local_batch(engine: &PgMetaEngine) -> i64 {
     let start = engine.flushed_event_seq.load(Ordering::SeqCst);
     let end = engine
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read next local event sequence");
     let events = engine
         .local

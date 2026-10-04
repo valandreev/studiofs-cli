@@ -30,6 +30,7 @@ use studiofs_data::object::{
 };
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::engine::{MetaFsOps, PendingCreateRecord, UndoLogKind};
+use studiofs_meta::schema::counters::{LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
@@ -1194,8 +1195,10 @@ fn seed_local(db_path: &std::path::Path, info: &FormatInfo) {
     let seed = RedbMetaEngine::open(db_path).expect("seed redb open");
     seed.set_format_info(info).expect("seed format info");
     seed.init_root(0, 0).expect("seed root");
-    let next_event_seq = seed.get_counter("nextEventSeq").expect("seed nextEventSeq");
-    seed.set_counter("pgLastFlushedLocalEventSeq", next_event_seq)
+    let next_event_seq = seed
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("read next event sequence after initializing seed root");
+    seed.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, next_event_seq)
         .expect("seed flushed event seq");
 }
 

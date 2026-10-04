@@ -502,7 +502,7 @@ fn test_regular_file_overlay_flush_emits_final_chunk_state() {
     let txn = engine.begin_read_txn().unwrap();
     let counters = txn.open_table(COUNTERS_TABLE).unwrap();
     let next_event_seq = counters
-        .get("nextEventSeq")
+        .get(NEXT_EVENT_SEQ)
         .unwrap()
         .expect("next event seq")
         .value();
@@ -1669,7 +1669,7 @@ fn flush_rejects_invalid_slice_ranges_without_committing() {
     changed_attr.content_epoch += 1;
     let before = engine.begin_read_txn().unwrap();
     let counters = before.open_table(COUNTERS_TABLE).unwrap();
-    let next_event_seq = counters.get("nextEventSeq").unwrap().unwrap().value();
+    let next_event_seq = counters.get(NEXT_EVENT_SEQ).unwrap().unwrap().value();
 
     for (start, end) in [(0, 0), (2, 1), (0, DEFAULT_CHUNK_SIZE + 1)] {
         let slices = vec![SliceRecord::new(
@@ -1710,7 +1710,7 @@ fn flush_rejects_invalid_slice_ranges_without_committing() {
             after
                 .open_table(COUNTERS_TABLE)
                 .unwrap()
-                .get("nextEventSeq")
+                .get(NEXT_EVENT_SEQ)
                 .unwrap()
                 .unwrap()
                 .value(),
@@ -2173,7 +2173,7 @@ fn publish_regular_file_overlay_to_base_appends_dentry_only_on_first_visibility(
             .unwrap()
     );
 
-    let second_publish_start = engine.get_counter("nextEventSeq").unwrap();
+    let second_publish_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let mut attr = engine.get_attr(file.ino).unwrap();
     attr.size = 8192;
     attr.content_epoch = 2;
@@ -2187,7 +2187,7 @@ fn publish_regular_file_overlay_to_base_appends_dentry_only_on_first_visibility(
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
             .unwrap()
     );
-    let second_publish_end = engine.get_counter("nextEventSeq").unwrap();
+    let second_publish_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let second_publish_events = engine
         .read_events_range(second_publish_start, second_publish_end)

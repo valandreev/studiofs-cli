@@ -14,14 +14,14 @@ fn pending_cancelled_local_file_ack(
     pg: &PgMetaEngine,
     name: &[u8],
 ) -> (u64, u64, PendingReplicationState) {
-    let event_start = pg.local.get_counter("nextEventSeq").expect("event start");
+    let event_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
     pg.local
         .create_file(ROOT_INO, name, 0, 0, 0o644)
         .expect("create local-only file");
     pg.local
         .unlink(ROOT_INO, name)
         .expect("delete local-only file");
-    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let event_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     let state = PendingReplicationState {
         event_start: Some(event_start),
         event_end,
@@ -333,7 +333,7 @@ fn restore_pending_state_and_local_ack_share_the_canonical_lock_order() {
     );
     let event_end = pg
         .local
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read local event end");
     let event_start = expected_state.event_start.expect("pending event start");
 

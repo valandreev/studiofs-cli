@@ -3217,12 +3217,12 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
         )
         .expect("persist allocator state");
 
-    let event_seq = local.get_counter("nextEventSeq").expect("event start");
+    let event_seq = local.get_counter(NEXT_EVENT_SEQ).expect("event start");
     local
         .create_file(ROOT_INO, b"pending-local-file.bin", 0, 0, 0o644)
         .expect("create pending local file");
     local
-        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, event_seq)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, event_seq)
         .expect("persist unflushed event start");
     let txn = local
         .begin_write_txn()
@@ -3269,14 +3269,14 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
     );
     assert_eq!(
         local
-            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)
             .expect("read pending event cursor"),
         event_seq,
         "rejected pending state must not advance its durable event cursor"
     );
     assert!(
         local
-            .get_counter("nextEventSeq")
+            .get_counter(NEXT_EVENT_SEQ)
             .expect("read event-log end")
             > event_seq,
         "rejected pending state must retain the local event-log suffix"
@@ -4778,7 +4778,7 @@ fn startup_snapshot_replaces_acknowledged_local_overlay() {
     pg.local
         .create_dir(ROOT_INO, b"acknowledged", 0, 0, 0o755)
         .expect("create local directory");
-    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let event_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     pg.persist_flushed_event_seq(event_end)
         .expect("acknowledge local events");
 
@@ -4803,10 +4803,7 @@ fn replacing_local_state_resets_the_in_memory_prune_cursor() {
         pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
             .expect("create acknowledged local directory");
     }
-    let old_cursor = pg
-        .local
-        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
-        .unwrap();
+    let old_cursor = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
     pg.persist_flushed_event_seq(old_cursor)
         .expect("acknowledge old local events");
 
@@ -5335,7 +5332,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
     PgMetaEngine::persist_client_slot(&local, 7).expect("persist client slot");
     local
         .write_counters(|counters| {
-            counters.set(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 150)?;
+            counters.set(LOCAL_PG_FLUSHED_EVENT_SEQ, 150)?;
             counters.set(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, 1_000)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, 1_100)?;
@@ -5354,7 +5351,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
         .expect("export remote snapshot");
 
     for local_counter in [
-        LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
+        LOCAL_PG_FLUSHED_EVENT_SEQ,
         LOCAL_PG_CLIENT_SLOT_COUNTER,
         LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER,
         LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
@@ -5394,7 +5391,7 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
     legacy_snapshot.counters.extend([
         (LOCAL_PG_VERSION_COUNTER.to_string(), 9),
         (LOCAL_PG_NAMESPACE_VERSION_COUNTER.to_string(), 8),
-        (LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER.to_string(), 150),
+        (LOCAL_PG_FLUSHED_EVENT_SEQ.to_string(), 150),
         (LOCAL_PG_CLIENT_SLOT_COUNTER.to_string(), 8),
         (
             LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER.to_string(),
@@ -5438,7 +5435,7 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
     );
     assert_eq!(
         local
-            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)
             .expect("load flushed cursor"),
         0,
         "remote snapshot import must drop legacy local event-log cursor"
@@ -5475,7 +5472,7 @@ fn snapshot_reconcile_resets_stale_regular_file_serving_attr() {
             .expect("publish local payload"),
         "local publish should make the file unprotected"
     );
-    let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let event_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
     pg.flushed_event_seq.store(event_end, Ordering::SeqCst);
 
     let mut remote_attr = pg.get_attr(file.ino).expect("load published attr");
@@ -5579,7 +5576,7 @@ fn snapshot_rebootstrap_preserves_active_open_inode_binding() {
             },
         ])
         .expect("publish file metadata to base");
-    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack published setup");
     pg.note_active_open_inode(file.ino);
@@ -5970,7 +5967,7 @@ fn checkpoint_source_event_seq_uses_captured_redb_counter() {
         .begin_serving_checkpoint_snapshot()
         .expect("capture local read transaction");
     let captured_event_seq = snapshot
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read captured event sequence");
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::Acquire),
@@ -5994,7 +5991,7 @@ fn checkpoint_source_event_seq_uses_captured_redb_counter() {
     let live_event_seq =
         <crate::redb_engine::RedbMetaEngine as crate::engine::MetaInodes>::get_counter(
             pg.local.as_ref(),
-            "nextEventSeq",
+            NEXT_EVENT_SEQ,
         )
         .expect("read live event sequence");
     assert!(live_event_seq > captured_event_seq);

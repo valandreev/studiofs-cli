@@ -1,7 +1,9 @@
-//! MetaEngine trait — abstract interface for metadata storage.
+//! Metadata-engine interfaces and shared types.
 //!
-//! This trait defines all metadata operations. The default implementation is `RedbMetaEngine`,
-//! but the design supports swapping to PostgreSQL/Redis for multi-user mode.
+//! `MetaEngine` is the aggregate capability contract for metadata operations.
+//! Mounted foreground metadata is served from local `redb`. For PostgreSQL-
+//! backed volumes, `PgMetaEngine` bootstraps and replicates shared state to its
+//! local `redb` view; PostgreSQL is not a foreground metadata read backend.
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
@@ -1608,7 +1610,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     /// Mark a still-referenced overlay object as remote-visible for the current
     /// unpublished epoch, even when its logical block is represented by
     /// multiple slice records and cannot be synthesized into a single
-    /// single payload reference.
+    /// payload reference.
     ///
     /// Returns `Ok(true)` when `object_id` is still referenced by the inode's
     /// local regular-file overlay for `expected_epoch`. Returns `Ok(false)`
@@ -1620,7 +1622,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         object_id: u64,
     ) -> MetaResult<bool>;
 
-    /// Batch form of [`mark_regular_file_overlay_object_uploaded_if_matches`].
+    /// Batch form of [`Self::mark_regular_file_overlay_object_uploaded_if_matches`].
     ///
     /// Returns the object ids that still matched the inode/epoch overlay.
     fn mark_regular_file_overlay_objects_uploaded_if_match(

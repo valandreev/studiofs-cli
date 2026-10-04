@@ -269,7 +269,7 @@ fn test_add_entry_rechecks_name_after_concurrent_insert() {
     use std::time::Duration;
 
     let engine = temp_engine();
-    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let next_event = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let concurrent = DirEntryValue {
         ino: 42,
         kind: FileType::RegularFile,
@@ -301,7 +301,7 @@ fn test_add_entry_rechecks_name_after_concurrent_insert() {
 
     assert!(matches!(result, Err(MetaError::EntryExists { .. })), "{result:?}");
     assert_eq!(engine.lookup(ROOT_INO, b"concurrent").unwrap(), concurrent);
-    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event);
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn test_remove_entry_returns_current_entry_after_concurrent_replacement() {
     ] {
         let engine = temp_engine();
         engine.add_entry(ROOT_INO, b"concurrent", &original).unwrap();
-        let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+        let next_event = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
         let result = thread::scope(|scope| {
             let txn = engine.begin_write_txn().unwrap();
             let worker_engine = &engine;
@@ -346,7 +346,7 @@ fn test_remove_entry_returns_current_entry_after_concurrent_replacement() {
 
         assert_eq!(result.unwrap(), replacement);
         assert!(matches!(engine.lookup(ROOT_INO, b"concurrent"), Err(MetaError::EntryNotFound { .. })));
-        assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event + 1);
+        assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event + 1);
     }
 }
 
@@ -355,11 +355,11 @@ fn test_remove_entry_if_matches_preserves_replacement_before_call() {
     let engine = temp_engine();
     let replacement = DirEntryValue { ino: 43, kind: FileType::RegularFile };
     engine.add_entry(ROOT_INO, b"replaced", &replacement).unwrap();
-    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let next_event = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     assert!(engine.remove_entry_if_matches(ROOT_INO, b"replaced", 42).unwrap().is_none());
     assert_eq!(engine.lookup(ROOT_INO, b"replaced").unwrap(), replacement);
-    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event);
 }
 
 #[test]
@@ -370,7 +370,7 @@ fn test_remove_entry_if_matches_preserves_concurrent_replacement() {
     let engine = temp_engine();
     engine.add_entry(ROOT_INO, b"concurrent", &DirEntryValue { ino: 42, kind: FileType::RegularFile }).unwrap();
     let replacement = DirEntryValue { ino: 43, kind: FileType::RegularFile };
-    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let next_event = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let result = thread::scope(|scope| {
         let txn = engine.begin_write_txn().unwrap();
         let worker_engine = &engine;
@@ -388,7 +388,7 @@ fn test_remove_entry_if_matches_preserves_concurrent_replacement() {
 
     assert!(result.unwrap().is_none());
     assert_eq!(engine.lookup(ROOT_INO, b"concurrent").unwrap(), replacement);
-    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event);
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event);
 }
 
 #[test]
@@ -398,13 +398,13 @@ fn test_remove_entry_if_matches_removes_base_entry_and_skips_absence() {
     mark_empty_file_published(&source, file.ino);
     let engine = temp_engine();
     engine.import_snapshot(&source.export_snapshot().unwrap()).unwrap();
-    let next_event = engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap();
+    let next_event = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let removed = engine.remove_entry_if_matches(ROOT_INO, b"remote", file.ino).unwrap().unwrap();
     assert_eq!(removed.ino, file.ino);
     assert!(engine.local_overlay_dentries().unwrap().contains(&encode_dentry_key(ROOT_INO, b"remote")));
     assert!(engine.remove_entry_if_matches(ROOT_INO, b"remote", file.ino).unwrap().is_none());
-    assert_eq!(engine.get_counter(counters::NEXT_EVENT_SEQ).unwrap(), next_event + 1);
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event + 1);
 }
 
 #[test]

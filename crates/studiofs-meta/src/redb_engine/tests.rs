@@ -6,6 +6,7 @@ use crate::MetaRecovery;
 use crate::contract_harness::{ContractCoreFixture, ContractCoreOp};
 use crate::engine::DeferredDeleteRecord;
 use crate::events::MetaEvent;
+use crate::schema::counters::{self, LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use std::sync::Arc;
 use std::thread;
 
@@ -404,7 +405,7 @@ fn legacy_meta_event_fixture_replays_from_local_event_log() {
     {
         let mut counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
         counters
-            .insert("nextEventSeq", 2)
+            .insert(NEXT_EVENT_SEQ, 2)
             .expect("advance event sequence");
     }
     txn.commit().expect("commit local event fixture");
@@ -455,7 +456,7 @@ fn versioned_event_rows_survive_local_engine_restart() {
             .set_format_info(&test_format_info("event-restart"))
             .expect("initialize format");
         start_seq = engine
-            .get_counter("nextEventSeq")
+            .get_counter(NEXT_EVENT_SEQ)
             .expect("read starting event sequence");
         let txn = engine
             .begin_write_txn()
@@ -464,7 +465,7 @@ fn versioned_event_rows_survive_local_engine_restart() {
             .expect("append local event");
         txn.commit().expect("commit local event");
         end_seq = engine
-            .get_counter("nextEventSeq")
+            .get_counter(NEXT_EVENT_SEQ)
             .expect("read ending event sequence");
         assert_eq!(end_seq, start_seq + 1);
     }
@@ -1140,7 +1141,7 @@ fn pending_deletion_batch_commits_all_markers_in_one_transaction_with_one_event_
     let engine = temp_engine();
     let markers = [(10, 100), (20, 200), (30, 300)];
     let before = engine.metadata_write_observability();
-    let start_seq = engine.get_counter("nextEventSeq").unwrap();
+    let start_seq = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     engine
         .add_pending_deletions(&markers)
@@ -1151,7 +1152,7 @@ fn pending_deletion_batch_commits_all_markers_in_one_transaction_with_one_event_
     assert_eq!(after.commit.calls - before.commit.calls, 1);
     assert_eq!(engine.get_pending_deletions().unwrap(), markers.to_vec());
 
-    let end_seq = engine.get_counter("nextEventSeq").unwrap();
+    let end_seq = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let events = engine
         .read_events_range(start_seq, end_seq)
         .expect("read pending deletion events");
@@ -1177,7 +1178,7 @@ fn pending_deletion_batch_commits_all_markers_in_one_transaction_with_one_event_
 #[test]
 fn pending_deletion_batch_rollback_discards_markers_and_events() {
     let engine = temp_engine();
-    let start_seq = engine.get_counter("nextEventSeq").unwrap();
+    let start_seq = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let txn = engine
         .begin_write_txn()
         .expect("begin pending deletion txn");
@@ -1191,7 +1192,7 @@ fn pending_deletion_batch_rollback_discards_markers_and_events() {
         "dropping the transaction must roll back every pending marker"
     );
     assert_eq!(
-        engine.get_counter("nextEventSeq").unwrap(),
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
         start_seq,
         "dropping the transaction must roll back its event sequence"
     );

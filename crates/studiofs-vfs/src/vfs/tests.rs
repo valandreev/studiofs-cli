@@ -14,7 +14,7 @@ use studiofs_meta::engine::{MetadataAuthorityStatus, PgSyncLifecycle, PgSyncWrit
 use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, InodeLifecycleState,
     MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
-    SliceRange, SliceRecord, TimeSpec,
+    SliceRange, SliceRecord, TimeSpec, counters::NEXT_EVENT_SEQ,
 };
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaGc, MetaNamespace,
@@ -2213,12 +2213,12 @@ fn unlink_without_open_handles_does_not_append_redundant_cleanup_events() {
         .expect("create empty file");
 
     let unlink_start = meta
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read unlink event start");
     vfs.unlink(ROOT_INO, b"empty.txt")
         .expect("unlink empty file");
     let unlink_end = meta
-        .get_counter("nextEventSeq")
+        .get_counter(NEXT_EVENT_SEQ)
         .expect("read unlink event end");
     let events = meta
         .read_events_range(unlink_start, unlink_end)
