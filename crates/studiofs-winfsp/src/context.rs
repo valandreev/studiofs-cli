@@ -836,6 +836,9 @@ fn encode_symlink_reparse(target: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
         .checked_add(data_len)
         .filter(|&len| len <= MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize)
         .ok_or(STATUS_IO_REPARSE_DATA_INVALID)?;
+    // With the native 16 KiB limit, 20 + 4 * utf16_units allows at most
+    // 4,091 units: name_bytes <= 8,182 and data_len <= 16,376 fit u16.
+    // The checked arithmetic above establishes this bound before narrowing.
     let substitute_len = u16::try_from(name_bytes).map_err(|_| STATUS_IO_REPARSE_DATA_INVALID)?;
     let print_len = substitute_len;
     let data_len = u16::try_from(data_len).map_err(|_| STATUS_IO_REPARSE_DATA_INVALID)?;
@@ -868,6 +871,10 @@ fn encode_symlink_reparse(target: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
 /// Returns the total reparse data length.
 fn write_reparse_to_buffer(target: &[u8], buffer: &mut [u8]) -> Result<u64, NTSTATUS> {
     let encoded = encode_symlink_reparse(target)?;
+    // winfsp 0.12 returns a length only on success; errors cannot carry a
+    // required-size hint. WinFSP 2.1 supplies the full native reparse capacity,
+    // which matches the encoder's limit. Short buffers must fail without a
+    // partial copy or a successful length larger than the bytes written.
     if buffer.len() < encoded.len() {
         return Err(STATUS_BUFFER_TOO_SMALL);
     }
