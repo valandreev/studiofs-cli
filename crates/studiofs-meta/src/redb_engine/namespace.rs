@@ -177,7 +177,7 @@ impl MetaNamespace for RedbMetaEngine {
         }
 
         {
-            Self::set_dentry_overlay_in_txn(&txn, parent, name, entry)?;
+            Self::set_dentry_in_txn(&txn, parent, name, entry)?;
 
             Self::append_event_in_txn(
                 &txn,

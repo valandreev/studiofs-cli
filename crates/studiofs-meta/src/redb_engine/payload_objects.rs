@@ -639,7 +639,7 @@ impl RedbMetaEngine {
         attr.committed_content_epoch = attr.content_epoch;
         attr.upload_state = UploadState::Ready;
         drop(inodes);
-        Self::set_inode_overlay_in_txn(txn, &attr)?;
+        Self::set_inode_in_txn(txn, &attr)?;
         Self::sync_inode_lifecycle_in_txn(txn, ino)?;
 
         let dentry_keys =
@@ -854,7 +854,7 @@ impl RedbMetaEngine {
             }
 
             if let Some(attr) = normalized_attr.as_ref() {
-                Self::set_inode_overlay_in_txn(txn, attr)?;
+                Self::set_inode_in_txn(txn, attr)?;
             }
         }
 

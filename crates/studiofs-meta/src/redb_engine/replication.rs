@@ -1484,12 +1484,12 @@ impl RedbMetaEngine {
                             && (current_matches_ready_attr
                                 || (attr.mtime > base_attr.mtime && attr.ctime > base_attr.ctime));
                         if !current_is_newer && !skip_stale_base {
-                            Self::set_inode_mirror_in_txn(txn, &base_attr)?;
+                            Self::set_inode_in_txn(txn, &base_attr)?;
                             Self::clear_regular_file_serving_overlay_in_txn(txn, attr.ino)?;
                         }
                         continue;
                     }
-                    Self::set_inode_mirror_in_txn(txn, attr)?;
+                    Self::set_inode_in_txn(txn, attr)?;
                     if Self::ready_regular_file_attr_can_follow_base_in_txn(txn, attr)? {
                         Self::clear_regular_file_serving_overlay_in_txn(txn, attr.ino)?;
                     }
@@ -1540,7 +1540,7 @@ impl RedbMetaEngine {
                     name,
                     entry,
                 } => {
-                    Self::set_dentry_mirror_in_txn(txn, *parent, name, entry)?;
+                    Self::set_dentry_in_txn(txn, *parent, name, entry)?;
                 }
                 crate::events::MetaEvent::RemoveEntry { parent, name } => {
                     Self::remove_dentry_overlay_in_txn(txn, *parent, name)?;
@@ -1567,28 +1567,28 @@ impl RedbMetaEngine {
                     )?;
 
                     if let Some(attr) = displaced_set_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(txn, attr)?;
+                        Self::set_inode_in_txn(txn, attr)?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
                         Self::remove_inode_mirror_in_txn(txn, *ino)?;
                     }
                     if let Some(attr) = moved_dir_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(txn, attr)?;
+                        Self::set_inode_in_txn(txn, attr)?;
                     }
                     if let Some(attr) = old_parent_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(txn, attr)?;
+                        Self::set_inode_in_txn(txn, attr)?;
                     }
                     if let Some(attr) = new_parent_attr.as_ref() {
-                        Self::set_inode_mirror_in_txn(txn, attr)?;
+                        Self::set_inode_in_txn(txn, attr)?;
                     }
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
-                    Self::set_symlink_mirror_in_txn(txn, *ino, target)?;
+                    Self::set_symlink_in_txn(txn, *ino, target)?;
                 }
                 crate::events::MetaEvent::SetXattr {
                     ino, name, value, ..
                 } => {
-                    Self::set_xattr_mirror_in_txn(txn, *ino, name, value)?;
+                    Self::set_xattr_in_txn(txn, *ino, name, value)?;
                 }
                 crate::events::MetaEvent::RemoveXattr { ino, name } => {
                     Self::remove_xattr_mirror_in_txn(txn, *ino, name)?;
@@ -1736,7 +1736,7 @@ impl RedbMetaEngine {
             match base_attr {
                 Some(attr) if attr.kind == FileType::RegularFile => {
                     let content_changed = Self::replica_content_identity_changed(txn, attr)?;
-                    Self::set_inode_mirror_in_txn(txn, attr)?;
+                    Self::set_inode_in_txn(txn, attr)?;
                     Self::remove_stale_dentries_for_base_entry(
                         txn,
                         &DirEntryValue {
@@ -1836,7 +1836,7 @@ impl RedbMetaEngine {
                 .get(key.as_slice())
                 .and_then(|entry| entry.as_ref());
             if let Some(entry) = base_entry {
-                Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
+                Self::set_dentry_in_txn(txn, parent, name, entry)?;
                 Self::invalidate_replica_inode(txn, entry.ino, false)?;
             } else {
                 Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
@@ -2047,11 +2047,11 @@ impl RedbMetaEngine {
             if Self::local_dentry_removed_in_txn(txn, &destination_key)? {
                 Self::remove_dentry_overlay_in_txn(txn, new_parent, new_name)?;
             } else {
-                Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
+                Self::set_dentry_in_txn(txn, new_parent, new_name, entry)?;
             }
         } else if src_in_base {
             Self::remove_dentry_mirror_if_matches_in_txn(txn, new_parent, new_name, entry)?;
-            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
+            Self::set_dentry_in_txn(txn, parent, name, entry)?;
         } else {
             Self::remove_dentry_mirror_if_matches_in_txn(txn, parent, name, entry)?;
             Self::remove_dentry_mirror_if_matches_in_txn(txn, new_parent, new_name, entry)?;
@@ -2177,7 +2177,7 @@ impl RedbMetaEngine {
                 continue;
             }
             let (parent, name) = decode_dentry_key(&key)?;
-            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
+            Self::set_dentry_in_txn(txn, parent, name, entry)?;
         }
         Ok(())
     }

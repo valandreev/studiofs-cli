@@ -1022,7 +1022,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_inode_in_txn(txn: &redb::WriteTransaction, attr: &InodeAttr) -> MetaResult<()> {
+    pub(super) fn set_inode_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<()> {
         let mut tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1035,13 +1038,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         inodes.insert(attr.ino, data.as_slice())?;
         Ok(())
-    }
-
-    pub(super) fn set_inode_overlay_in_txn(
-        txn: &redb::WriteTransaction,
-        attr: &InodeAttr,
-    ) -> MetaResult<()> {
-        Self::set_inode_in_txn(txn, attr)
     }
 
     pub(super) fn remove_inode_overlay_in_txn(
@@ -1071,7 +1067,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_dentry_in_txn(
+    pub(super) fn set_dentry_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -1099,15 +1095,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         dentries.insert(key.as_slice(), data.as_slice())?;
         Ok(())
-    }
-
-    pub(super) fn set_dentry_overlay_in_txn(
-        txn: &redb::WriteTransaction,
-        parent: Ino,
-        name: &[u8],
-        entry: &DirEntryValue,
-    ) -> MetaResult<()> {
-        Self::set_dentry_in_txn(txn, parent, name, entry)
     }
 
     pub(super) fn remove_dentry_overlay_in_txn(
@@ -1147,13 +1134,6 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn set_inode_mirror_in_txn(
-        txn: &redb::WriteTransaction,
-        attr: &InodeAttr,
-    ) -> MetaResult<()> {
-        Self::set_inode_in_txn(txn, attr)
-    }
-
     pub(super) fn remove_inode_mirror_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1169,15 +1149,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         tombstones.remove(ino)?;
         Ok(())
-    }
-
-    pub(super) fn set_dentry_mirror_in_txn(
-        txn: &redb::WriteTransaction,
-        parent: Ino,
-        name: &[u8],
-        entry: &DirEntryValue,
-    ) -> MetaResult<()> {
-        Self::set_dentry_in_txn(txn, parent, name, entry)
     }
 
     pub(super) fn remove_dentry_mirror_in_txn(
@@ -1310,14 +1281,6 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn set_symlink_mirror_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-        target: &[u8],
-    ) -> MetaResult<()> {
-        Self::set_symlink_in_txn(txn, ino, target)
-    }
-
     pub(super) fn remove_symlink_mirror_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1333,15 +1296,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         tombstones.remove(ino)?;
         Ok(())
-    }
-
-    pub(super) fn set_xattr_mirror_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-        name: &[u8],
-        value: &[u8],
-    ) -> MetaResult<()> {
-        Self::set_xattr_in_txn(txn, ino, name, value)
     }
 
     pub(super) fn remove_xattr_mirror_in_txn(
@@ -1363,7 +1317,11 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_symlink_in_txn(txn: &redb::WriteTransaction, ino: Ino, target: &[u8]) -> MetaResult<()> {
+    pub(super) fn set_symlink_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        target: &[u8],
+    ) -> MetaResult<()> {
         let mut tombstones = txn
             .open_table(SYMLINK_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1375,14 +1333,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         symlinks.insert(ino, target)?;
         Ok(())
-    }
-
-    pub(super) fn set_symlink_overlay_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-        target: &[u8],
-    ) -> MetaResult<()> {
-        Self::set_symlink_in_txn(txn, ino, target)
     }
 
     pub(super) fn remove_symlink_overlay_in_txn(
@@ -1412,7 +1362,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_xattr_in_txn(
+    pub(super) fn set_xattr_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         name: &[u8],
@@ -1427,15 +1377,6 @@ impl RedbMetaEngine {
 
         Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
         Ok(())
-    }
-
-    pub(super) fn set_xattr_overlay_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-        name: &[u8],
-        value: &[u8],
-    ) -> MetaResult<()> {
-        Self::set_xattr_in_txn(txn, ino, name, value)
     }
 
     pub(super) fn remove_xattr_overlay_in_txn(
