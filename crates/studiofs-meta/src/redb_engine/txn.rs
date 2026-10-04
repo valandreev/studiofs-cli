@@ -1022,6 +1022,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Writes the active serving inode and clears its tombstone for overlay and mirror updates.
     pub(super) fn set_inode_in_txn(
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
@@ -1067,6 +1068,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Writes the active serving dentry and clears its tombstone for overlay and mirror updates.
     pub(super) fn set_dentry_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
@@ -1317,6 +1319,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Writes the active serving symlink and clears its tombstone for overlay and mirror updates.
     pub(super) fn set_symlink_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1362,6 +1365,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Writes the active serving xattr and clears its tombstone for overlay and mirror updates.
     pub(super) fn set_xattr_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,

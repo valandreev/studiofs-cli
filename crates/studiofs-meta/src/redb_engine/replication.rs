@@ -1502,14 +1502,14 @@ impl RedbMetaEngine {
                     let current_keys =
                         Self::keys_for_inode_in_write_table(txn, XATTRS_TABLE, *ino)?;
                     for key in current_keys {
-                        let name = xattr_name_from_key(&key).to_vec();
-                        Self::remove_xattr_mirror_in_txn(txn, *ino, &name)?;
+                        let name = xattr_name_from_key(&key);
+                        Self::remove_xattr_mirror_in_txn(txn, *ino, name)?;
                     }
                     let base_keys =
                         Self::keys_for_inode_in_write_table(txn, BASE_XATTRS_TABLE, *ino)?;
                     for key in base_keys {
-                        let name = xattr_name_from_key(&key).to_vec();
-                        Self::remove_xattr_mirror_in_txn(txn, *ino, &name)?;
+                        let name = xattr_name_from_key(&key);
+                        Self::remove_xattr_mirror_in_txn(txn, *ino, name)?;
                     }
 
                     let prefix = acl_rule_prefix(*ino);
