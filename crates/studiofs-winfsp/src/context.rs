@@ -4012,7 +4012,10 @@ mod tests {
     }
 
     #[test]
-    fn symlink_reparse_encoding_preserves_utf16le_layout_and_roundtrip() {
+    fn symlink_reparse_encoding_preserves_utf16le_layout_and_decode() {
+        // Decoding normalizes backslashes to slashes, and encoding replaces
+        // invalid UTF-8 with U+FFFD. Identity is expected only without either;
+        // `decoded` records the intentional lossy result for the other fixtures.
         for (target, expected, decoded) in [
             (b"".as_slice(), b"".as_slice(), b"".as_slice()),
             (b"/a/b", b"\\\0a\0\\\0b\0".as_slice(), b"/a/b"),
