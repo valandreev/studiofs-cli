@@ -621,6 +621,9 @@ impl WindowsPipeFactory {
             bInheritHandle: false.into(),
         };
 
+        // SAFETY: `attrs` is a fully initialized `SECURITY_ATTRIBUTES` that
+        // remains live for the call. Its descriptor pointer came from the
+        // successful conversion in `self` and is kept alive for the same time.
         unsafe {
             options.create_with_security_attributes_raw(
                 &self.name,
@@ -640,6 +643,8 @@ pub(super) struct WindowsSecurityDescriptor {
 impl WindowsSecurityDescriptor {
     pub(super) fn same_user_only() -> Result<Self> {
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `w!` supplies a static, NUL-terminated UTF-16 SDDL string,
+        // and `descriptor` is a valid writable out-parameter for the call.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 w!("D:P(A;;GA;;;OW)"),
@@ -661,6 +666,8 @@ impl WindowsSecurityDescriptor {
 #[cfg(windows)]
 impl Drop for WindowsSecurityDescriptor {
     fn drop(&mut self) {
+        // SAFETY: Successful construction stores the unique descriptor pointer
+        // returned by the conversion API, and this owner has not freed it yet.
         unsafe {
             let _ = LocalFree(Some(HLOCAL(self.descriptor.0)));
         }
@@ -668,14 +675,40 @@ impl Drop for WindowsSecurityDescriptor {
 }
 
 #[cfg(windows)]
+// SAFETY: This wrapper uniquely owns the process-local buffer returned by
+// `ConvertStringSecurityDescriptorToSecurityDescriptorW`; ownership can move
+// between threads, and `Drop` releases it with the matching `LocalFree`.
 unsafe impl Send for WindowsSecurityDescriptor {}
 
 #[cfg(windows)]
+// SAFETY: The descriptor is immutable after construction. Its only use is as
+// the input security descriptor to a synchronous named-pipe creation call,
+// while the factory keeps this owner alive; concurrent calls only read it.
 unsafe impl Sync for WindowsSecurityDescriptor {}
 
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_security_descriptor_remains_valid_after_thread_transfer() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WindowsSecurityDescriptor>();
+
+        let descriptor = WindowsSecurityDescriptor::same_user_only()
+            .expect("create diagnostics security descriptor");
+        assert!(!descriptor.as_ptr().0.is_null());
+        std::thread::spawn(move || {
+            // SAFETY: Successful construction owns an initialized descriptor
+            // that remains live and unmodified throughout this read-only call.
+            assert!(unsafe {
+                windows::Win32::Security::IsValidSecurityDescriptor(descriptor.as_ptr()).as_bool()
+            });
+            drop(descriptor);
+        })
+        .join()
+        .expect("validate and drop descriptor on another thread");
+    }
 
     #[test]
     fn windows_client_disconnect_error_232_is_expected() {

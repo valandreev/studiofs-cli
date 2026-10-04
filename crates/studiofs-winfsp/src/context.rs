@@ -834,12 +834,17 @@ fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
     buf[14..16].copy_from_slice(&print_len.to_le_bytes());
     buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // SYMLINK_FLAG_RELATIVE
 
-    // Write both SubstituteName and PrintName via byte slice copy.
-    let src = unsafe { std::slice::from_raw_parts(utf16.as_ptr() as *const u8, name_bytes) };
     let path_buf_offset = 20;
-    buf[path_buf_offset..path_buf_offset + name_bytes].copy_from_slice(src);
+    for (chunk, unit) in buf[path_buf_offset..path_buf_offset + name_bytes]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(&utf16)
+    {
+        chunk.copy_from_slice(&unit.to_le_bytes());
+    }
     let print_start = path_buf_offset + name_bytes;
-    buf[print_start..print_start + name_bytes].copy_from_slice(src);
+    buf.copy_within(path_buf_offset..path_buf_offset + name_bytes, print_start);
 
     buf
 }
@@ -905,6 +910,13 @@ fn filetime_to_timespec(ft: u64) -> TimeSpec {
 fn create_default_security_descriptor() -> std::io::Result<Vec<u8>> {
     let sddl = windows::core::w!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)");
     let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl` is a static NUL-terminated UTF-16 string, and `psd` is a
+    // writable out-pointer. On success the converter returns an initialized,
+    // self-relative descriptor in a LocalAlloc buffer. Its reported length
+    // covers that allocation's descriptor bytes; u8 requires no extra alignment.
+    // We copy those bytes while the buffer is live and unmodified, then free
+    // the original exactly once with LocalFree. On conversion failure we return
+    // before reading or freeing `psd`.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl, 1, // SDDL_REVISION_1
@@ -1595,6 +1607,11 @@ impl StudioFsContext {
         let sd = &self.default_sd;
         if let Some(buf) = buf {
             let copy_len = sd.len().min(buf.len());
+            // SAFETY: `sd` is initialized for `copy_len` bytes. WinFSP supplies
+            // `buf` as an exclusive output buffer; c_void occupies one byte, so
+            // its length bounds this write and its pointer is aligned for u8.
+            // The output buffer cannot overlap the separately owned `default_sd`
+            // allocation borrowed through `self`, and both remain live here.
             unsafe {
                 std::ptr::copy_nonoverlapping(sd.as_ptr(), buf.as_mut_ptr() as *mut u8, copy_len);
             }
@@ -3992,6 +4009,41 @@ mod tests {
             async move { vfs.release_fh(fh).await }
         })
         .expect("release handle");
+    }
+
+    #[test]
+    fn symlink_reparse_encoding_preserves_utf16le_layout_and_decode() {
+        // Decoding normalizes backslashes to slashes, and encoding replaces
+        // invalid UTF-8 with U+FFFD. Identity is expected only without either;
+        // `decoded` records the intentional lossy result for the other fixtures.
+        for (target, expected, decoded) in [
+            (b"".as_slice(), b"".as_slice(), b"".as_slice()),
+            (b"/a/b", b"\\\0a\0\\\0b\0".as_slice(), b"/a/b"),
+            (
+                "\u{1f600}/\u{0457}".as_bytes(),
+                b"\x3d\xd8\x00\xde\\\0\x57\x04".as_slice(),
+                "\u{1f600}/\u{0457}".as_bytes(),
+            ),
+            (b"a\\b", b"a\0\\\0b\0".as_slice(), b"a/b"),
+            (b"\xff", b"\xfd\xff".as_slice(), "\u{fffd}".as_bytes()),
+        ] {
+            let encoded = encode_symlink_reparse(target);
+            let name_len = u16::try_from(expected.len()).expect("small fixture");
+            assert_eq!(encoded.len(), 20 + 2 * expected.len());
+            assert_eq!(&encoded[..4], &[0x0c, 0x00, 0x00, 0xa0]); // symlink tag
+            assert_eq!(&encoded[4..6], &(12 + 2 * name_len).to_le_bytes());
+            assert_eq!(&encoded[6..10], &[0; 4]); // reserved and substitute offset
+            assert_eq!(&encoded[10..12], &name_len.to_le_bytes());
+            assert_eq!(&encoded[12..14], &name_len.to_le_bytes()); // print offset
+            assert_eq!(&encoded[14..16], &name_len.to_le_bytes());
+            assert_eq!(&encoded[16..20], &[1, 0, 0, 0]); // relative flag
+            assert_eq!(&encoded[20..20 + expected.len()], expected);
+            assert_eq!(&encoded[20 + expected.len()..], expected);
+            assert_eq!(
+                super::decode_symlink_reparse(&encoded),
+                Some(decoded.to_vec())
+            );
+        }
     }
 
     #[test]
