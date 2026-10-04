@@ -437,6 +437,17 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 
 ### macOS cache and I/O policy
 
+The legacy bridge disables vnode name caching with `novncache` and does not
+opt into `negative_vncache`. Entry notifications are therefore disabled at the
+legacy transport boundary because the mount options disable name caching.
+On macFUSE 5.4.0, even notifications for names already resolved by lookup and
+readdir return `ENOENT` with this policy, and MFMount logs each failed send.
+Inode data/attribute notifications remain enabled. StudioFS-local dentry/cache
+retirement and namespace/ACL epochs are unchanged, and fresh directory handles
+still enumerate the current local view. The experimental FSKit notification
+path is unchanged. Changing the legacy name-cache policy requires revalidating
+entry notification behavior and mounted namespace convergence.
+
 macOS FUSE keeps the Unified Buffer Cache and kernel readahead enabled for
 read-only files that fit in currently available RAM. When a file is larger than
 available RAM, its read-only handle uses `direct_io` to avoid cycling the same

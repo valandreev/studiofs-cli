@@ -299,6 +299,314 @@ fn temp_mount_dir_removes_unmounted_directory() {
 
 #[test]
 #[ignore = "requires an installed legacy macFUSE filesystem and permission to mount"]
+fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
+    const UNSEEN_PARENT: u64 = 9_876_543_210;
+    const CHILD_NAME: &[u8] = b"observed-child";
+    const ROOT_MISSING_NAME: &[u8] = b"missing-root-entry";
+    const CHILD_MISSING_NAME: &[u8] = b"missing-child-entry";
+    const CHILD_FILE_NAME: &[u8] = b"child-file";
+    const NEGATIVE_NAME: &[u8] = b"negative-then-created";
+    const RECREATE_NAME: &[u8] = b"recreate-entry";
+    const RENAME_SOURCE_NAME: &[u8] = b"rename-source";
+    const RENAME_TARGET_NAME: &[u8] = b"rename-target";
+    const MOUNT_READY_NAME: &[u8] = b"mount-ready";
+
+    fn notify_entry(channel: super::SessionChannel, parent: u64, name: &CStr) -> i32 {
+        // SAFETY: Callers keep the captured channel attached to the live
+        // session, and `name` provides a NUL-terminated buffer for libfuse.
+        unsafe {
+            super::raw::fuse_lowlevel_notify_inval_entry(
+                channel.0.as_ptr(),
+                parent,
+                name.as_ptr(),
+                name.to_bytes().len(),
+            )
+        }
+    }
+
+    let _serial = NATIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture =
+        ContractVfsFixture::new("macfuse-novncache-namespace-convergence").expect("create fixture");
+    let vfs = fixture.vfs();
+    // SAFETY: getuid/getgid are process-wide identity queries with no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let child = vfs
+        .mkdir(CONTRACT_ROOT_INO, CHILD_NAME, uid, gid, 0o755)
+        .expect("create child directory");
+    let child_file = vfs
+        .create(child.ino, CHILD_FILE_NAME, uid, gid, 0o644)
+        .expect("create child directory entry");
+    let initial = vfs
+        .create(CONTRACT_ROOT_INO, b"initial-entry", uid, gid, 0o644)
+        .expect("create initial entry");
+    let recreate_before = vfs
+        .create(CONTRACT_ROOT_INO, RECREATE_NAME, uid, gid, 0o644)
+        .expect("create entry to unlink and recreate");
+    let rename_source = vfs
+        .create(CONTRACT_ROOT_INO, RENAME_SOURCE_NAME, uid, gid, 0o644)
+        .expect("create rename source");
+    let rename_target = vfs
+        .create(CONTRACT_ROOT_INO, RENAME_TARGET_NAME, uid, gid, 0o644)
+        .expect("create rename destination");
+    vfs.create(CONTRACT_ROOT_INO, MOUNT_READY_NAME, uid, gid, 0o644)
+        .expect("create mount readiness entry");
+
+    let callback_state = Box::new(crate::adapter::CallbackState::new(
+        vfs.clone(),
+        fixture.runtime().handle().clone(),
+        false,
+    ));
+    let mount_point = TempMountDir::create(studiofs_test_support::workspace_target_temp_path(
+        "macfuse-novncache-namespace-",
+    ))
+    .expect("create mount point");
+    let config = SessionConfig::new(mount_point.path(), "StudioFS novncache probe")
+        .with_run_in_foreground(true);
+    let userdata = (&*callback_state as *const crate::adapter::CallbackState)
+        .cast_mut()
+        .cast::<c_void>();
+    // SAFETY: The native-test lock serializes access to C's header-derived
+    // static table, and libfuse copies it during session creation.
+    let ops = unsafe { studiofs_macfuse_test_ops_with_write(blocked_write) };
+    // SAFETY: The C helper returns the size of the installed macFUSE ops table.
+    let ops_size = unsafe { super::studiofs_macfuse_low_level_ops_size() };
+    // SAFETY: The operation table is static and callback_state stays boxed until
+    // after the native session is destroyed.
+    let mut session = unsafe {
+        Session::mount_with_ops(
+            &config,
+            LowLevelOperations {
+                raw: ops,
+                size: ops_size,
+            },
+            userdata,
+        )
+    }
+    .expect("mount native legacy macFUSE session");
+    let channel = super::SessionChannel(session.channel);
+    let invalidator = callback_state.kernel_invalidator(session.kernel_invalidator());
+    vfs.set_kernel_invalidator(invalidator);
+    let exit = session.exit_handle();
+    let probe_mount_path = mount_point.path().to_path_buf();
+    let probe_vfs = vfs.clone();
+    let expected_child_ino = child.ino;
+    let expected_child_file_ino = child_file.ino;
+    let expected_initial_ino = initial.ino;
+    let expected_recreate_before_ino = recreate_before.ino;
+    let expected_rename_source_ino = rename_source.ino;
+    let expected_rename_target_ino = rename_target.ino;
+    let (session_run_tx, session_run_rx) = mpsc::channel();
+    let (destroy_session_tx, destroy_session_rx) = mpsc::channel();
+    let (destroy_done_tx, destroy_done_rx) = mpsc::channel();
+    let session_worker = thread::spawn(move || {
+        let result = session.run();
+        let _ = session_run_tx.send(result);
+        let _ = destroy_session_rx.recv();
+        callback_state.wait_for_reply_tasks();
+        drop(session);
+        drop(callback_state);
+        let _ = destroy_done_tx.send(());
+    });
+
+    let (native_probe_tx, native_probe_rx) = mpsc::channel();
+    let native_probe_worker = thread::spawn(move || {
+        // Defer assertion panics until the caller has destroyed the session
+        // and callback userdata, just as it defers ordinary probe errors.
+        let native_probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mount_deadline = std::time::Instant::now() + OPERATION_TIMEOUT;
+            let ready_path = probe_mount_path.join("mount-ready");
+            loop {
+                match fs::metadata(&ready_path) {
+                    Ok(_) => break,
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENXIO))
+                            && std::time::Instant::now() < mount_deadline =>
+                    {
+                        thread::sleep(POLL_INTERVAL);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let root_entries = fs::read_dir(&probe_mount_path)?.collect::<Result<Vec<_>, _>>()?;
+            let root_path = probe_mount_path.clone();
+            let observed_root_ino = fs::metadata(&root_path)?.ino();
+            let child_path = root_path.join(std::ffi::OsStr::from_bytes(CHILD_NAME));
+            let observed_child_ino = fs::metadata(&child_path)?.ino();
+            let root_child_ino = root_entries
+                .iter()
+                .find(|entry| entry.file_name().as_bytes() == CHILD_NAME)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "root readdir did not return the expected child",
+                    )
+                })?
+                .metadata()?
+                .ino();
+            let child_entries = fs::read_dir(&child_path)?.collect::<Result<Vec<_>, _>>()?;
+            let child_file_path = child_path.join(std::ffi::OsStr::from_bytes(CHILD_FILE_NAME));
+            let observed_child_file_ino = fs::metadata(&child_file_path)?.ino();
+            let initial_path = root_path.join("initial-entry");
+            let observed_initial_ino = fs::metadata(&initial_path)?.ino();
+
+            let root_missing_name =
+                std::ffi::CString::new(ROOT_MISSING_NAME).expect("NUL-free name");
+            let child_missing_name =
+                std::ffi::CString::new(CHILD_MISSING_NAME).expect("NUL-free name");
+            let root_child_name = std::ffi::CString::new(CHILD_NAME).expect("NUL-free name");
+            let child_file_name = std::ffi::CString::new(CHILD_FILE_NAME).expect("NUL-free name");
+            let unseen_parent_result = notify_entry(channel, UNSEEN_PARENT, &root_missing_name);
+            let root_missing_name_result =
+                notify_entry(channel, observed_root_ino, &root_missing_name);
+            let root_known_name_result = notify_entry(channel, observed_root_ino, &root_child_name);
+            let child_missing_name_result =
+                notify_entry(channel, observed_child_ino, &child_missing_name);
+            let child_known_name_result =
+                notify_entry(channel, observed_child_ino, &child_file_name);
+            // SAFETY: The channel remains alive and the inode identifier came
+            // from a successful metadata lookup in this mounted session.
+            let observed_root_inode_result = unsafe {
+                super::raw::fuse_lowlevel_notify_inval_inode(
+                    channel.0.as_ptr(),
+                    observed_root_ino,
+                    -1,
+                    0,
+                )
+            };
+
+            let negative_path = root_path.join(std::ffi::OsStr::from_bytes(NEGATIVE_NAME));
+            let initial_negative_lookup = fs::metadata(&negative_path);
+            if !matches!(initial_negative_lookup, Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(std::io::Error::other(format!(
+                    "expected initial negative lookup, got {initial_negative_lookup:?}"
+                )));
+            }
+            let created_after_negative = probe_vfs
+                .create(CONTRACT_ROOT_INO, NEGATIVE_NAME, uid, gid, 0o644)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let observed_created_after_negative = fs::metadata(&negative_path)?.ino();
+
+            let recreate_path = root_path.join(std::ffi::OsStr::from_bytes(RECREATE_NAME));
+            let observed_recreate_before = fs::metadata(&recreate_path)?.ino();
+            probe_vfs
+                .unlink(CONTRACT_ROOT_INO, RECREATE_NAME)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let missing_after_unlink = fs::metadata(&recreate_path);
+            if !matches!(missing_after_unlink, Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(std::io::Error::other(format!(
+                    "expected pathname to disappear after unlink, got {missing_after_unlink:?}"
+                )));
+            }
+            let recreated = probe_vfs
+                .create(CONTRACT_ROOT_INO, RECREATE_NAME, uid, gid, 0o644)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let observed_recreated = fs::metadata(&recreate_path)?.ino();
+
+            let rename_source_path =
+                root_path.join(std::ffi::OsStr::from_bytes(RENAME_SOURCE_NAME));
+            let rename_target_path =
+                root_path.join(std::ffi::OsStr::from_bytes(RENAME_TARGET_NAME));
+            let observed_rename_source = fs::metadata(&rename_source_path)?.ino();
+            let observed_rename_target_before = fs::metadata(&rename_target_path)?.ino();
+            probe_vfs
+                .rename(
+                    CONTRACT_ROOT_INO,
+                    RENAME_SOURCE_NAME,
+                    CONTRACT_ROOT_INO,
+                    RENAME_TARGET_NAME,
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let missing_rename_source = fs::metadata(&rename_source_path);
+            if !matches!(missing_rename_source, Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(std::io::Error::other(format!(
+                    "expected rename source to disappear, got {missing_rename_source:?}"
+                )));
+            }
+            let observed_rename_target_after = fs::metadata(&rename_target_path)?.ino();
+
+            // Close the initial directory handle and open a fresh one after the
+            // external mutations to prove the new listing is visible.
+            drop(root_entries);
+            let reopened_entries = fs::read_dir(&root_path)?.collect::<Result<Vec<_>, _>>()?;
+            let reopened_names = reopened_entries
+                .iter()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<std::collections::BTreeSet<_>>();
+
+            assert_eq!(observed_root_ino, CONTRACT_ROOT_INO);
+            assert_eq!(observed_child_ino, expected_child_ino);
+            assert_eq!(root_child_ino, expected_child_ino);
+            assert_eq!(observed_child_file_ino, expected_child_file_ino);
+            assert_eq!(child_entries.len(), 1);
+            assert_eq!(observed_initial_ino, expected_initial_ino);
+            assert_eq!(unseen_parent_result, -libc::ENOENT);
+            assert_eq!(root_missing_name_result, -libc::ENOENT);
+            assert_eq!(root_known_name_result, -libc::ENOENT);
+            assert_eq!(child_missing_name_result, -libc::ENOENT);
+            assert_eq!(child_known_name_result, -libc::ENOENT);
+            assert_eq!(observed_root_inode_result, 0);
+            assert_eq!(observed_created_after_negative, created_after_negative.ino);
+            assert_ne!(observed_recreate_before, observed_recreated);
+            assert_eq!(observed_recreate_before, expected_recreate_before_ino);
+            assert_eq!(observed_recreated, recreated.ino);
+            assert_eq!(observed_rename_source, expected_rename_source_ino);
+            assert_eq!(observed_rename_target_before, expected_rename_target_ino);
+            assert_ne!(observed_rename_target_before, observed_rename_target_after);
+            assert_eq!(observed_rename_target_after, expected_rename_source_ino);
+            assert!(reopened_names.contains("negative-then-created"));
+            assert!(reopened_names.contains("recreate-entry"));
+            assert!(reopened_names.contains("rename-target"));
+            assert!(!reopened_names.contains("rename-source"));
+            Ok::<_, std::io::Error>(())
+        }));
+        let _ = native_probe_tx.send(native_probe);
+    });
+
+    let native_probe_received = native_probe_rx.recv_timeout(OPERATION_TIMEOUT);
+    let probe_timed_out = native_probe_received.is_err();
+    if probe_timed_out {
+        exit.request_exit();
+    }
+    let native_probe = match native_probe_received {
+        Ok(result) => result,
+        Err(_) => receive_before_teardown(&native_probe_rx, "native novncache namespace probe"),
+    };
+    native_probe_worker
+        .join()
+        .expect("join native novncache namespace probe");
+
+    vfs.clear_kernel_invalidator();
+    exit.request_exit();
+    let session_result = receive_before_teardown(&session_run_rx, "session loop shutdown");
+    let _ = destroy_session_tx.send(());
+    receive_before_teardown(&destroy_done_rx, "session destruction");
+    session_worker.join().expect("join session worker");
+    let mount_cleanup = remove_mount_point(mount_point.path());
+    let fixture_shutdown = fixture
+        .runtime()
+        .block_on(fixture.vfs().shutdown(Duration::ZERO));
+
+    session_result.expect("native session loop failed");
+    mount_cleanup.expect("remove native mount point");
+    fixture_shutdown.expect("fixture VFS shutdown should succeed");
+    assert!(
+        !probe_timed_out,
+        "native namespace probe exceeded its operation deadline"
+    );
+    match native_probe {
+        Ok(result) => result.expect("native directory read or namespace mutation failed"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[test]
+#[ignore = "requires an installed legacy macFUSE filesystem and permission to mount"]
 fn session_serves_peer_request_and_drains_blocked_callback_on_exit() {
     let _serial = NATIVE_TEST_LOCK
         .lock()
