@@ -834,17 +834,17 @@ fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
     buf[14..16].copy_from_slice(&print_len.to_le_bytes());
     buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // SYMLINK_FLAG_RELATIVE
 
-    // Write both SubstituteName and PrintName via byte slice copy.
-    // SAFETY: `utf16` owns one contiguous allocation of initialized, padding-free
-    // u16 values; `name_bytes` covers exactly its length in bytes (within isize::MAX
-    // for a valid Vec allocation). Its non-null pointer is aligned for u8 even when
-    // empty. The Vec stays alive and unmodified until both copies finish, and the
-    // byte slice is only read. Native u16 bytes are little-endian on Windows.
-    let src = unsafe { std::slice::from_raw_parts(utf16.as_ptr() as *const u8, name_bytes) };
     let path_buf_offset = 20;
-    buf[path_buf_offset..path_buf_offset + name_bytes].copy_from_slice(src);
+    for (chunk, unit) in buf[path_buf_offset..path_buf_offset + name_bytes]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(&utf16)
+    {
+        chunk.copy_from_slice(&unit.to_le_bytes());
+    }
     let print_start = path_buf_offset + name_bytes;
-    buf[print_start..print_start + name_bytes].copy_from_slice(src);
+    buf.copy_within(path_buf_offset..path_buf_offset + name_bytes, print_start);
 
     buf
 }
@@ -910,6 +910,13 @@ fn filetime_to_timespec(ft: u64) -> TimeSpec {
 fn create_default_security_descriptor() -> std::io::Result<Vec<u8>> {
     let sddl = windows::core::w!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)");
     let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl` is a static NUL-terminated UTF-16 string, and `psd` is a
+    // writable out-pointer. On success the converter returns an initialized,
+    // self-relative descriptor in a LocalAlloc buffer. Its reported length
+    // covers that allocation's descriptor bytes; u8 requires no extra alignment.
+    // We copy those bytes while the buffer is live and unmodified, then free
+    // the original exactly once with LocalFree. On conversion failure we return
+    // before reading or freeing `psd`.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl, 1, // SDDL_REVISION_1
@@ -3997,6 +4004,26 @@ mod tests {
             async move { vfs.release_fh(fh).await }
         })
         .expect("release handle");
+    }
+
+    #[test]
+    fn symlink_reparse_encoding_preserves_utf16le_layout_and_roundtrip() {
+        for (target, expected) in [
+            (b"".as_slice(), b"".as_slice()),
+            (b"/a/b", b"\\\0a\0\\\0b\0".as_slice()),
+            (
+                "\u{1f600}/\u{0457}".as_bytes(),
+                b"\x3d\xd8\x00\xde\\\0\x57\x04".as_slice(),
+            ),
+        ] {
+            let encoded = encode_symlink_reparse(target);
+            assert_eq!(&encoded[20..20 + expected.len()], expected);
+            assert_eq!(&encoded[20 + expected.len()..], expected);
+            assert_eq!(
+                super::decode_symlink_reparse(&encoded),
+                Some(target.to_vec())
+            );
+        }
     }
 
     #[test]

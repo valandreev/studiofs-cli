@@ -621,6 +621,9 @@ impl WindowsPipeFactory {
             bInheritHandle: false.into(),
         };
 
+        // SAFETY: `attrs` is a fully initialized `SECURITY_ATTRIBUTES` that
+        // remains live for the call. Its descriptor pointer came from the
+        // successful conversion in `self` and is kept alive for the same time.
         unsafe {
             options.create_with_security_attributes_raw(
                 &self.name,
@@ -640,6 +643,8 @@ pub(super) struct WindowsSecurityDescriptor {
 impl WindowsSecurityDescriptor {
     pub(super) fn same_user_only() -> Result<Self> {
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `w!` supplies a static, NUL-terminated UTF-16 SDDL string,
+        // and `descriptor` is a valid writable out-parameter for the call.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 w!("D:P(A;;GA;;;OW)"),
@@ -661,6 +666,8 @@ impl WindowsSecurityDescriptor {
 #[cfg(windows)]
 impl Drop for WindowsSecurityDescriptor {
     fn drop(&mut self) {
+        // SAFETY: Successful construction stores the unique descriptor pointer
+        // returned by the conversion API, and this owner has not freed it yet.
         unsafe {
             let _ = LocalFree(Some(HLOCAL(self.descriptor.0)));
         }
