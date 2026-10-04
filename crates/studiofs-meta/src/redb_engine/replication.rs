@@ -2195,7 +2195,7 @@ impl RedbMetaEngine {
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let start_seq = counters
-            .get("pgLastFlushedLocalEventSeq")
+            .get(crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ)
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .map(|value| value.value())
             .unwrap_or(1);

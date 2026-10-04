@@ -5,7 +5,7 @@ use crate::pg_dsn::ensure_studiofs_database;
 use crate::pg_engine::inode_allocator::AllocatorRuntime;
 use crate::pg_engine::lifecycle::{drain_startup_catch_up_pages, rebootstrap_startup_target};
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
-use crate::schema::counters::NEXT_EVENT_SEQ;
+use crate::schema::counters::{LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -371,8 +371,10 @@ fn seed_local(path: &std::path::Path, info: &FormatInfo) {
     let seed = RedbMetaEngine::open(path).expect("seed open");
     seed.set_format_info(info).expect("set format");
     seed.init_root(0, 0).expect("init root");
-    let next_event_seq = seed.get_counter(NEXT_EVENT_SEQ).expect("nextEventSeq");
-    seed.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, next_event_seq)
+    let next_event_seq = seed
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("read next event sequence after initializing seed root");
+    seed.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, next_event_seq)
         .expect("seed flushed event seq");
 }
 
@@ -457,7 +459,9 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     local
         .set_remote_namespace_visibility_filter(true)
         .expect("enable remote namespace visibility filter");
-    let flushed_event_seq = local.get_counter(NEXT_EVENT_SEQ).expect("nextEventSeq");
+    let flushed_event_seq = local
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("read local event cursor after initializing root");
 
     let metadata_invalidation_notify = Arc::clone(&local.invalidation_notify);
     let engine = PgMetaEngine {

@@ -788,7 +788,7 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
         .expect("local rename should be accepted");
     engine
         .set_counter(
-            "pgLastFlushedLocalEventSeq",
+            LOCAL_PG_FLUSHED_EVENT_SEQ,
             engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
         )
         .unwrap();
@@ -797,7 +797,7 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
         .expect("local unlink should be accepted");
     engine
         .set_counter(
-            "pgLastFlushedLocalEventSeq",
+            LOCAL_PG_FLUSHED_EVENT_SEQ,
             engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
         )
         .unwrap();
@@ -860,7 +860,7 @@ fn replica_serving_rename_preserves_unflushed_unlink_after_create_was_pruned() {
         .unwrap();
     let acknowledged_through = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     engine
-        .set_counter("pgLastFlushedLocalEventSeq", acknowledged_through)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, acknowledged_through)
         .unwrap();
     assert!(
         engine

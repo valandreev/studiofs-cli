@@ -6,7 +6,7 @@ use crate::MetaRecovery;
 use crate::contract_harness::{ContractCoreFixture, ContractCoreOp};
 use crate::engine::DeferredDeleteRecord;
 use crate::events::MetaEvent;
-use crate::schema::counters::{self, NEXT_EVENT_SEQ};
+use crate::schema::counters::{self, LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use std::sync::Arc;
 use std::thread;
 
@@ -405,7 +405,7 @@ fn legacy_meta_event_fixture_replays_from_local_event_log() {
     {
         let mut counters = txn.open_table(COUNTERS_TABLE).expect("open counters");
         counters
-            .insert("nextEventSeq", 2)
+            .insert(NEXT_EVENT_SEQ, 2)
             .expect("advance event sequence");
     }
     txn.commit().expect("commit local event fixture");

@@ -738,7 +738,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     let link = local
         .create_symlink(ROOT_INO, b"local-link", b"/local/target", 0, 0)
         .unwrap();
-    local.set_counter("pgLastFlushedLocalEventSeq", local_event_start)
+    local.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, local_event_start)
         .unwrap();
     local.set_counter("pgClientSlotPlusOne", 8).unwrap();
     local.set_counter(counters::NEXT_INODE, 50_000).unwrap();
@@ -759,7 +759,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
         .unwrap();
     source.set_counter(counters::NEXT_INODE, 7_000).unwrap();
     source.set_counter("pgLastAppliedBatchVersion", 12).unwrap();
-    source.set_counter("pgLastFlushedLocalEventSeq", 99).unwrap();
+    source.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, 99).unwrap();
     source.set_counter("pgClientSlotPlusOne", 99).unwrap();
     let snapshot = source.export_snapshot().unwrap();
 
@@ -787,7 +787,7 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
             .len(),
         usize::try_from(local_event_end - local_event_start).unwrap()
     );
-    assert_eq!(local.get_counter("pgLastFlushedLocalEventSeq").unwrap(), local_event_start);
+    assert_eq!(local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ).unwrap(), local_event_start);
     assert_eq!(local.get_counter("pgClientSlotPlusOne").unwrap(), 8);
     assert_eq!(local.get_counter("pgLastAppliedBatchVersion").unwrap(), 12);
 }
@@ -800,7 +800,7 @@ fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
         .unwrap();
     let local_event_end = local.get_counter(NEXT_EVENT_SEQ).unwrap();
     local
-        .set_counter("pgLastFlushedLocalEventSeq", local_event_end)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, local_event_end)
         .unwrap();
     let pruned = local
         .prune_local_event_log_before(local_event_end, 1)
@@ -845,7 +845,7 @@ fn import_remote_snapshot_preserving_local_event_log_replaces_serving_state() {
         "repair import must retain the unpruned local event suffix"
     );
     assert_eq!(
-        local.get_counter("pgLastFlushedLocalEventSeq").unwrap(),
+        local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ).unwrap(),
         local_event_end,
         "repair import must not reopen acknowledged local metadata"
     );

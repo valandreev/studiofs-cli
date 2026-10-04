@@ -1973,6 +1973,8 @@ pub mod counters {
     pub const NEXT_OBJECT_ID: &str = "nextObjectId";
     /// Next sequence number to allocate in the local metadata event log.
     pub const NEXT_EVENT_SEQ: &str = "nextEventSeq";
+    /// Exclusive local event sequence cursor acknowledged by PostgreSQL replication.
+    pub const LOCAL_PG_FLUSHED_EVENT_SEQ: &str = "pgLastFlushedLocalEventSeq";
     /// Inclusive acknowledged/pruned-through frontier; gaps may have no corresponding event row.
     pub const LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ: &str = "localEventLogPrunedThroughSeq";
     /// Version of the dentry authority summary that covers the pruned local event prefix.

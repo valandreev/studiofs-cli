@@ -386,7 +386,7 @@ fn restore_pending_state_acknowledges_initial_root_snapshot_event() {
         .get_counter(NEXT_EVENT_SEQ)
         .expect("read local event end");
     pg.local
-        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 0)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, 0)
         .expect("reset the startup cursor");
     pg.flushed_event_seq.store(0, Ordering::SeqCst);
 
@@ -400,7 +400,7 @@ fn restore_pending_state_acknowledges_initial_root_snapshot_event() {
     );
     assert_eq!(
         pg.local
-            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)
             .expect("read persisted startup cursor"),
         root_event_end
     );
@@ -2943,7 +2943,7 @@ fn self_ack_with_contextually_filtered_prefix_preserves_local_overlay() {
 
     let cursor_before_gap = pg.flushed_event_seq.load(Ordering::SeqCst);
     pg.local
-        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, cursor_before_gap)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, cursor_before_gap)
         .expect("persist the initial local event cursor");
     let link_name = vec![b'l'; 240];
     let gap_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");

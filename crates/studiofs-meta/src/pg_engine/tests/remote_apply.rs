@@ -342,10 +342,7 @@ fn cancelled_replay_page_rolls_back_self_ack_and_reapplies_entire_page() {
 
     let (_dir, pg) = temp_pg_engine_for_unit();
     let flushed_before = pg.flushed_event_seq.load(Ordering::SeqCst);
-    let durable_flushed_before = pg
-        .local
-        .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
-        .unwrap();
+    let durable_flushed_before = pg.local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ).unwrap();
     pg.create_dir(ROOT_INO, b"self-page", 0, 0, 0o755)
         .expect("create local namespace event");
     let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
@@ -408,9 +405,7 @@ fn cancelled_replay_page_rolls_back_self_ack_and_reapplies_entire_page() {
     assert_eq!(pg.local_version.load(Ordering::SeqCst), 0);
     assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), flushed_before);
     assert_eq!(
-        pg.local
-            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
-            .unwrap(),
+        pg.local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ).unwrap(),
         durable_flushed_before
     );
     assert!(pg.local.lookup(ROOT_INO, b"foreign-page").is_err());
@@ -6151,7 +6146,10 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
         .expect("create local directory");
 
     let start = a.flushed_event_seq.load(Ordering::SeqCst);
-    let end = a.local.get_counter(NEXT_EVENT_SEQ).expect("nextEventSeq");
+    let end = a
+        .local
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("read local event cursor before simulating recovery");
     let events = a.local.read_events_range(start, end).expect("local events");
     let _version = a
         .push_event_log_batch_locked(&events)
@@ -6192,7 +6190,10 @@ fn test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover() {
         .create_dir(ROOT_INO, b"remote.txt", 0, 0, 0o755)
         .expect("create local entry");
     let start = a.flushed_event_seq.load(Ordering::SeqCst);
-    let end = a.local.get_counter(NEXT_EVENT_SEQ).expect("nextEventSeq");
+    let end = a
+        .local
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("read local event cursor before unlink recovery");
     let events = a.local.read_events_range(start, end).expect("local events");
     let _version = a
         .push_event_log_batch_locked(&events)

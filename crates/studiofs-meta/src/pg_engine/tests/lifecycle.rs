@@ -3222,7 +3222,7 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
         .create_file(ROOT_INO, b"pending-local-file.bin", 0, 0, 0o644)
         .expect("create pending local file");
     local
-        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, event_seq)
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, event_seq)
         .expect("persist unflushed event start");
     let txn = local
         .begin_write_txn()
@@ -3269,7 +3269,7 @@ fn open_fails_when_pending_local_event_log_is_corrupt() {
     );
     assert_eq!(
         local
-            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)
             .expect("read pending event cursor"),
         event_seq,
         "rejected pending state must not advance its durable event cursor"
@@ -5332,7 +5332,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
     PgMetaEngine::persist_client_slot(&local, 7).expect("persist client slot");
     local
         .write_counters(|counters| {
-            counters.set(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 150)?;
+            counters.set(LOCAL_PG_FLUSHED_EVENT_SEQ, 150)?;
             counters.set(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, 1_000)?;
             counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, 1_100)?;
@@ -5351,7 +5351,7 @@ fn remote_snapshot_does_not_export_local_pg_state() {
         .expect("export remote snapshot");
 
     for local_counter in [
-        LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
+        LOCAL_PG_FLUSHED_EVENT_SEQ,
         LOCAL_PG_CLIENT_SLOT_COUNTER,
         LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER,
         LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
@@ -5391,7 +5391,7 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
     legacy_snapshot.counters.extend([
         (LOCAL_PG_VERSION_COUNTER.to_string(), 9),
         (LOCAL_PG_NAMESPACE_VERSION_COUNTER.to_string(), 8),
-        (LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER.to_string(), 150),
+        (LOCAL_PG_FLUSHED_EVENT_SEQ.to_string(), 150),
         (LOCAL_PG_CLIENT_SLOT_COUNTER.to_string(), 8),
         (
             LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER.to_string(),
@@ -5435,7 +5435,7 @@ fn import_remote_snapshot_drops_legacy_local_pg_state() {
     );
     assert_eq!(
         local
-            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER)
+            .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)
             .expect("load flushed cursor"),
         0,
         "remote snapshot import must drop legacy local event-log cursor"

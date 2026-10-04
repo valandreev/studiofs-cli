@@ -531,7 +531,7 @@ mod tests {
             .expect("seed pg replay position");
         redb.set_counter("pgLastAppliedNamespaceBatchVersion", 41)
             .expect("seed pg namespace position");
-        redb.set_counter("pgLastFlushedLocalEventSeq", 7)
+        redb.set_counter(crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ, 7)
             .expect("seed local flush position");
         redb.set_counter("pgClientSlotPlusOne", 3)
             .expect("seed client slot");
@@ -552,7 +552,7 @@ mod tests {
             0
         );
         assert_eq!(
-            redb.get_counter("pgLastFlushedLocalEventSeq")
+            redb.get_counter(crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ)
                 .expect("local flush position"),
             7,
             "repair reset must not make already-flushed local events publish again"
