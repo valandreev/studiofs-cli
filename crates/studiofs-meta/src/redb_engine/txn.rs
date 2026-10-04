@@ -1068,7 +1068,8 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// Writes the active serving dentry and clears its tombstone for overlay and mirror updates.
+    /// Writes the active serving dentry for overlay and mirror updates.
+    /// Rewrites its by-inode index and clears its tombstone before inserting the serving row.
     pub(super) fn set_dentry_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,

@@ -69,7 +69,7 @@ fn set_helpers_clear_preexisting_tombstones() {
     );
     drop(read);
 
-    assert!(engine.get_attr(attr.ino).is_ok());
+    assert_eq!(engine.get_attr(attr.ino).unwrap(), attr);
     assert_eq!(engine.lookup(ROOT_INO, b"restored").unwrap().ino, attr.ino);
     assert_eq!(
         engine.get_symlink_target(attr.ino).unwrap(),
