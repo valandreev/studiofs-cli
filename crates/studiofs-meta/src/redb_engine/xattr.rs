@@ -28,7 +28,7 @@ impl MetaXattr for RedbMetaEngine {
                 });
             }
 
-            Self::set_xattr_overlay_in_txn(&txn, ino, name, value)?;
+            Self::set_xattr_in_txn(&txn, ino, name, value)?;
 
             Self::append_event_in_txn(
                 &txn,

@@ -4,7 +4,7 @@ impl MetaSymlink for RedbMetaEngine {
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
         {
-            Self::set_symlink_overlay_in_txn(&txn, ino, target)?;
+            Self::set_symlink_in_txn(&txn, ino, target)?;
 
             Self::append_event_in_txn(
                 &txn,

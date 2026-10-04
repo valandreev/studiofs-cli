@@ -2,6 +2,85 @@ use super::*;
 use redb::StorageBackend;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[test]
+fn set_helpers_clear_preexisting_tombstones() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_symlink(ROOT_INO, b"restored", b"/original-target", 1000, 1000)
+        .unwrap();
+    let entry = DirEntryValue {
+        ino: attr.ino,
+        kind: FileType::Symlink,
+    };
+    let dentry_key = encode_dentry_key(ROOT_INO, b"restored");
+    let xattr_key = encode_xattr_key(attr.ino, b"user.color");
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(INODE_TOMBSTONES_TABLE)
+        .unwrap()
+        .insert(attr.ino, 1)
+        .unwrap();
+    txn.open_table(DENTRY_TOMBSTONES_TABLE)
+        .unwrap()
+        .insert(dentry_key.as_slice(), 1)
+        .unwrap();
+    txn.open_table(SYMLINK_TOMBSTONES_TABLE)
+        .unwrap()
+        .insert(attr.ino, 1)
+        .unwrap();
+    txn.open_table(XATTR_TOMBSTONES_TABLE)
+        .unwrap()
+        .insert(xattr_key.as_slice(), 1)
+        .unwrap();
+
+    RedbMetaEngine::set_inode_in_txn(&txn, &attr).unwrap();
+    RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, b"restored", &entry).unwrap();
+    RedbMetaEngine::set_symlink_in_txn(&txn, attr.ino, b"/restored-target").unwrap();
+    RedbMetaEngine::set_xattr_in_txn(&txn, attr.ino, b"user.color", b"blue").unwrap();
+    txn.commit().unwrap();
+
+    let read = engine.begin_read_txn().unwrap();
+    assert!(
+        read.open_table(INODE_TOMBSTONES_TABLE)
+            .unwrap()
+            .get(attr.ino)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read.open_table(DENTRY_TOMBSTONES_TABLE)
+            .unwrap()
+            .get(dentry_key.as_slice())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read.open_table(SYMLINK_TOMBSTONES_TABLE)
+            .unwrap()
+            .get(attr.ino)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read.open_table(XATTR_TOMBSTONES_TABLE)
+            .unwrap()
+            .get(xattr_key.as_slice())
+            .unwrap()
+            .is_none()
+    );
+    drop(read);
+
+    assert_eq!(engine.get_attr(attr.ino).unwrap(), attr);
+    assert_eq!(engine.lookup(ROOT_INO, b"restored").unwrap().ino, attr.ino);
+    assert_eq!(
+        engine.get_symlink_target(attr.ino).unwrap(),
+        b"/restored-target"
+    );
+    assert_eq!(
+        engine.get_xattr(attr.ino, b"user.color").unwrap(),
+        Some(b"blue".to_vec())
+    );
+}
+
 // redb 4.3 branch-page discriminant from tree_store/btree_base.rs.
 const BRANCH_PAGE_TYPE: u8 = 2;
 

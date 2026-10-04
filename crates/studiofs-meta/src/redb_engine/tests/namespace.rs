@@ -293,7 +293,7 @@ fn test_add_entry_rechecks_name_after_concurrent_insert() {
                 .unwrap();
         });
         attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &concurrent)
+        RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, b"concurrent", &concurrent)
             .unwrap();
         txn.commit().unwrap();
         result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -338,7 +338,7 @@ fn test_remove_entry_returns_current_entry_after_concurrent_replacement() {
                     .unwrap();
             });
             attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &replacement)
+            RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, b"concurrent", &replacement)
                 .unwrap();
             txn.commit().unwrap();
             result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -381,7 +381,7 @@ fn test_remove_entry_if_matches_preserves_concurrent_replacement() {
             result_tx.send(worker_engine.remove_entry_if_matches(ROOT_INO, b"concurrent", 42)).unwrap();
         });
         attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        RedbMetaEngine::set_dentry_overlay_in_txn(&txn, ROOT_INO, b"concurrent", &replacement).unwrap();
+        RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, b"concurrent", &replacement).unwrap();
         txn.commit().unwrap();
         result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
     });

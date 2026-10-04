@@ -133,7 +133,7 @@ impl RedbMetaEngine {
             )?;
             Self::transition_upload_state_for_local_mutation(&mut normalized, has_committed_graph);
         }
-        Self::set_inode_overlay_in_txn(txn, &normalized)?;
+        Self::set_inode_in_txn(txn, &normalized)?;
         Self::sync_inode_lifecycle_in_txn(txn, normalized.ino)?;
         Self::refresh_pending_regular_file_recovery_metadata_in_txn(txn, normalized.ino)?;
         Self::append_event_in_txn(
@@ -1832,7 +1832,7 @@ mod tests {
         let new_chunks = std::collections::BTreeMap::from([(ChunkId(0), new_chunk)]);
 
         let txn = engine.begin_immediate_write_txn().unwrap();
-        RedbMetaEngine::set_inode_overlay_in_txn(&txn, &reused_attr).unwrap();
+        RedbMetaEngine::set_inode_in_txn(&txn, &reused_attr).unwrap();
         let mut overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
         let key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
         overlay.remove(key.as_slice()).unwrap();

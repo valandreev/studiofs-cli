@@ -161,7 +161,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         self.clear_dentry_tombstone(dentry_key.as_slice())?;
 
         if let Some(target) = spec.symlink_target() {
-            RedbMetaEngine::set_symlink_overlay_in_txn(self.txn, spec.ino, target)?;
+            RedbMetaEngine::set_symlink_in_txn(self.txn, spec.ino, target)?;
         }
 
         let parent_attr_event = if spec.updates_parent_attr() {
@@ -436,7 +436,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         };
 
         if spec.records_deferred_delete() {
-            RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
+            RedbMetaEngine::set_inode_in_txn(self.txn, &attr)?;
             if deleted_before_publish.is_none() {
                 RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
             }
@@ -448,7 +448,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
                 RedbMetaEngine::remove_inode_lifecycle_in_txn(self.txn, entry.ino)?;
             }
         } else {
-            RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
+            RedbMetaEngine::set_inode_in_txn(self.txn, &attr)?;
             RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
         }
         if attr.kind == FileType::RegularFile {
@@ -458,7 +458,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         }
 
         parent_attr.touch_mtime();
-        RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &parent_attr)?;
+        RedbMetaEngine::set_inode_in_txn(self.txn, &parent_attr)?;
 
         if spec.records_deferred_delete() {
             self.record_deferred_delete(spec, entry.ino)?;
@@ -502,7 +502,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
             parent_attr.nlink = parent_attr.nlink.saturating_sub(1);
         }
         parent_attr.touch_mtime();
-        RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &parent_attr)?;
+        RedbMetaEngine::set_inode_in_txn(self.txn, &parent_attr)?;
 
         self.append_rmdir_events(spec, entry.ino, &parent_attr)?;
         Ok(NamespaceDeleteResult::Directory)
@@ -896,7 +896,7 @@ impl MetaFsOps for RedbMetaEngine {
                             displaced_attr_event =
                                 Some(crate::events::MetaEvent::RemoveAttr { ino: dst_entry.ino });
                         } else {
-                            Self::set_inode_overlay_in_txn(&txn, &attr)?;
+                            Self::set_inode_in_txn(&txn, &attr)?;
                             displaced_attr_event =
                                 Some(crate::events::MetaEvent::SetAttr { attr: attr.clone() });
                         }
@@ -908,24 +908,24 @@ impl MetaFsOps for RedbMetaEngine {
                 None
             };
 
-            Self::set_dentry_overlay_in_txn(&txn, new_parent, new_name, &src_entry)?;
+            Self::set_dentry_in_txn(&txn, new_parent, new_name, &src_entry)?;
 
             if src_entry.kind == FileType::Directory && parent != new_parent {
                 if let Some(mut attr) = moved_dir_attr.take() {
                     attr.parent = new_parent;
-                    Self::set_inode_overlay_in_txn(&txn, &attr)?;
+                    Self::set_inode_in_txn(&txn, &attr)?;
                     moved_dir_attr = Some(attr);
                 }
                 if let Some(mut attr) = old_parent_attr.take() {
                     attr.nlink = attr.nlink.saturating_sub(1);
                     attr.touch_mtime();
-                    Self::set_inode_overlay_in_txn(&txn, &attr)?;
+                    Self::set_inode_in_txn(&txn, &attr)?;
                     old_parent_attr = Some(attr);
                 }
                 if let Some(mut attr) = new_parent_attr.take() {
                     attr.nlink += 1;
                     attr.touch_mtime();
-                    Self::set_inode_overlay_in_txn(&txn, &attr)?;
+                    Self::set_inode_in_txn(&txn, &attr)?;
                     new_parent_attr = Some(attr);
                 }
             }
@@ -992,18 +992,18 @@ impl MetaFsOps for RedbMetaEngine {
         {
             attr.nlink += 1;
             attr.touch_ctime();
-            Self::set_inode_overlay_in_txn(&txn, &attr)?;
+            Self::set_inode_in_txn(&txn, &attr)?;
             let entry = DirEntryValue {
                 ino,
                 kind: attr.kind,
             };
-            Self::set_dentry_overlay_in_txn(&txn, new_parent, new_name, &entry)?;
+            Self::set_dentry_in_txn(&txn, new_parent, new_name, &entry)?;
             if attr.kind == FileType::RegularFile {
                 Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, ino)?;
             }
 
             parent_attr.touch_mtime();
-            Self::set_inode_overlay_in_txn(&txn, &parent_attr)?;
+            Self::set_inode_in_txn(&txn, &parent_attr)?;
             parent_attr_event = Some(parent_attr.clone());
 
             result = attr;
