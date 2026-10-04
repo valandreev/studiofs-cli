@@ -1022,10 +1022,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn set_inode_overlay_in_txn(
-        txn: &redb::WriteTransaction,
-        attr: &InodeAttr,
-    ) -> MetaResult<()> {
+    fn set_inode_in_txn(txn: &redb::WriteTransaction, attr: &InodeAttr) -> MetaResult<()> {
         let mut tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1038,6 +1035,13 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         inodes.insert(attr.ino, data.as_slice())?;
         Ok(())
+    }
+
+    pub(super) fn set_inode_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<()> {
+        Self::set_inode_in_txn(txn, attr)
     }
 
     pub(super) fn remove_inode_overlay_in_txn(
@@ -1067,7 +1071,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn set_dentry_overlay_in_txn(
+    fn set_dentry_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -1095,6 +1099,15 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         dentries.insert(key.as_slice(), data.as_slice())?;
         Ok(())
+    }
+
+    pub(super) fn set_dentry_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        Self::set_dentry_in_txn(txn, parent, name, entry)
     }
 
     pub(super) fn remove_dentry_overlay_in_txn(
@@ -1138,18 +1151,7 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
     ) -> MetaResult<()> {
-        let mut tombstones = txn
-            .open_table(INODE_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones.remove(attr.ino)?;
-        drop(tombstones);
-
-        let data = encode(attr)?;
-        let mut inodes = txn
-            .open_table(INODES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        inodes.insert(attr.ino, data.as_slice())?;
-        Ok(())
+        Self::set_inode_in_txn(txn, attr)
     }
 
     pub(super) fn remove_inode_mirror_in_txn(
@@ -1175,28 +1177,7 @@ impl RedbMetaEngine {
         name: &[u8],
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
-        let key = encode_dentry_key(parent, name);
-        Self::remove_existing_dentry_index_in_txn(
-            txn,
-            DENTRIES_TABLE,
-            DENTRIES_BY_INODE_TABLE,
-            parent,
-            name,
-        )?;
-        Self::insert_dentry_index_in_txn(txn, DENTRIES_BY_INODE_TABLE, parent, name, entry)?;
-
-        let mut tombstones = txn
-            .open_table(DENTRY_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones.remove(key.as_slice())?;
-        drop(tombstones);
-
-        let data = encode(entry)?;
-        let mut dentries = txn
-            .open_table(DENTRIES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        dentries.insert(key.as_slice(), data.as_slice())?;
-        Ok(())
+        Self::set_dentry_in_txn(txn, parent, name, entry)
     }
 
     pub(super) fn remove_dentry_mirror_in_txn(
@@ -1334,17 +1315,7 @@ impl RedbMetaEngine {
         ino: Ino,
         target: &[u8],
     ) -> MetaResult<()> {
-        let mut tombstones = txn
-            .open_table(SYMLINK_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones.remove(ino)?;
-        drop(tombstones);
-
-        let mut symlinks = txn
-            .open_table(SYMLINKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        symlinks.insert(ino, target)?;
-        Ok(())
+        Self::set_symlink_in_txn(txn, ino, target)
     }
 
     pub(super) fn remove_symlink_mirror_in_txn(
@@ -1370,15 +1341,7 @@ impl RedbMetaEngine {
         name: &[u8],
         value: &[u8],
     ) -> MetaResult<()> {
-        let key = encode_xattr_key(ino, name);
-        let mut tombstones = txn
-            .open_table(XATTR_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        tombstones.remove(key.as_slice())?;
-        drop(tombstones);
-
-        Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
-        Ok(())
+        Self::set_xattr_in_txn(txn, ino, name, value)
     }
 
     pub(super) fn remove_xattr_mirror_in_txn(
@@ -1400,11 +1363,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn set_symlink_overlay_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-        target: &[u8],
-    ) -> MetaResult<()> {
+    fn set_symlink_in_txn(txn: &redb::WriteTransaction, ino: Ino, target: &[u8]) -> MetaResult<()> {
         let mut tombstones = txn
             .open_table(SYMLINK_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1416,6 +1375,14 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         symlinks.insert(ino, target)?;
         Ok(())
+    }
+
+    pub(super) fn set_symlink_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        target: &[u8],
+    ) -> MetaResult<()> {
+        Self::set_symlink_in_txn(txn, ino, target)
     }
 
     pub(super) fn remove_symlink_overlay_in_txn(
@@ -1445,7 +1412,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn set_xattr_overlay_in_txn(
+    fn set_xattr_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         name: &[u8],
@@ -1460,6 +1427,15 @@ impl RedbMetaEngine {
 
         Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
         Ok(())
+    }
+
+    pub(super) fn set_xattr_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+    ) -> MetaResult<()> {
+        Self::set_xattr_in_txn(txn, ino, name, value)
     }
 
     pub(super) fn remove_xattr_overlay_in_txn(
