@@ -668,9 +668,15 @@ impl Drop for WindowsSecurityDescriptor {
 }
 
 #[cfg(windows)]
+// SAFETY: This wrapper uniquely owns the process-local buffer returned by
+// `ConvertStringSecurityDescriptorToSecurityDescriptorW`; ownership can move
+// between threads, and `Drop` releases it with the matching `LocalFree`.
 unsafe impl Send for WindowsSecurityDescriptor {}
 
 #[cfg(windows)]
+// SAFETY: The descriptor is immutable after construction. Its only use is as
+// the input security descriptor to a synchronous named-pipe creation call,
+// while the factory keeps this owner alive; concurrent calls only read it.
 unsafe impl Sync for WindowsSecurityDescriptor {}
 
 #[cfg(all(test, windows))]

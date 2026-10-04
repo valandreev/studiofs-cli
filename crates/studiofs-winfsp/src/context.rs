@@ -835,6 +835,11 @@ fn encode_symlink_reparse(target: &[u8]) -> Vec<u8> {
     buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // SYMLINK_FLAG_RELATIVE
 
     // Write both SubstituteName and PrintName via byte slice copy.
+    // SAFETY: `utf16` owns one contiguous allocation of initialized, padding-free
+    // u16 values; `name_bytes` covers exactly its length in bytes (within isize::MAX
+    // for a valid Vec allocation). Its non-null pointer is aligned for u8 even when
+    // empty. The Vec stays alive and unmodified until both copies finish, and the
+    // byte slice is only read. Native u16 bytes are little-endian on Windows.
     let src = unsafe { std::slice::from_raw_parts(utf16.as_ptr() as *const u8, name_bytes) };
     let path_buf_offset = 20;
     buf[path_buf_offset..path_buf_offset + name_bytes].copy_from_slice(src);
