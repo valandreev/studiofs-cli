@@ -1715,15 +1715,51 @@ fn remove_batch_payload_intent(path: &Path) {
 }
 
 fn write_batch_intent_path_hex(content: &mut String, path: &Path) {
-    for &byte in path.to_string_lossy().as_bytes() {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let path = path.to_string_lossy();
+    content.reserve(path.len() * 2);
+    for &byte in path.as_bytes() {
         let byte = if byte == b'\\' { b'/' } else { byte };
-        let _ = write!(content, "{byte:02x}");
+        content.push(char::from(HEX[usize::from(byte >> 4)]));
+        content.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_intent_path_hex_preserves_serialized_bytes() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs779-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        for (path, expected_hex) in [
+            ("tmp/a|b.tmp", "746d702f617c622e746d70"),
+            ("tmp/é雪.tmp", "746d702fc3a9e99baa2e746d70"),
+            (r"tmp\a\b.tmp", "746d702f612f622e746d70"),
+        ] {
+            let staged = StagedBatchPayload {
+                entry: PayloadBatchEntry {
+                    object_id: 42,
+                    data: b"",
+                },
+                payload_path: layout.runtime_root.join(path),
+                payload_dir: layout.runtime_root.clone(),
+                temp_path: layout.runtime_root.join(path),
+            };
+            let intent = store.write_batch_payload_intent(&[staged], false).unwrap();
+            let expected = format!(
+                "version=1\nphase=committing\nobject=42|temp_hex={expected_hex}|final_hex={expected_hex}\n"
+            );
+            assert_eq!(
+                std::fs::read(&intent).unwrap(),
+                expected.as_bytes(),
+                "{path}"
+            );
+            remove_batch_payload_intent(&intent);
+        }
+    }
 
     #[test]
     fn sfs754_batch_removal_logs_each_failed_object_with_path_and_os_error() {
