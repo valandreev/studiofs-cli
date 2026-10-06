@@ -660,6 +660,120 @@ fn test_rename_overwrite_file() {
 }
 
 #[test]
+fn test_rename_no_replace_moves_to_absent_destination() {
+    let engine = temp_engine();
+    let src = engine
+        .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    let result = engine
+        .rename_atomic_with_replace(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt", false)
+        .unwrap();
+
+    assert_eq!(result.moved_ino, src.ino);
+    assert!(result.displaced_ino.is_none());
+    assert!(engine.lookup(ROOT_INO, b"src.txt").is_err());
+    assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, src.ino);
+}
+
+#[test]
+fn test_rename_no_replace_moves_directory_to_absent_destination() {
+    let engine = temp_engine();
+    let src = engine
+        .create_dir(ROOT_INO, b"src", 1000, 1000, 0o755)
+        .unwrap();
+
+    let result = engine
+        .rename_atomic_with_replace(ROOT_INO, b"src", ROOT_INO, b"dst", false)
+        .unwrap();
+
+    assert_eq!(result.moved_ino, src.ino);
+    assert!(result.displaced_ino.is_none());
+    assert!(engine.lookup(ROOT_INO, b"src").is_err());
+    assert_eq!(engine.lookup(ROOT_INO, b"dst").unwrap().ino, src.ino);
+}
+
+#[test]
+fn test_rename_no_replace_rejects_existing_file_without_changes() {
+    let engine = temp_engine();
+    let src = engine
+        .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let dst = engine
+        .create_file(ROOT_INO, b"dst.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let src_attr_before = engine.get_attr(src.ino).unwrap();
+    let dst_attr_before = engine.get_attr(dst.ino).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    let result =
+        engine.rename_atomic_with_replace(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt", false);
+
+    assert!(matches!(result, Err(MetaError::EntryExists { parent, .. }) if parent == ROOT_INO));
+    assert_eq!(engine.lookup(ROOT_INO, b"src.txt").unwrap().ino, src.ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, dst.ino);
+    assert_eq!(engine.get_attr(src.ino).unwrap(), src_attr_before);
+    assert_eq!(engine.get_attr(dst.ino).unwrap(), dst_attr_before);
+    assert_eq!(
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        next_event_before
+    );
+}
+
+#[test]
+fn test_rename_no_replace_rejects_existing_directory_before_contents_check() {
+    let engine = temp_engine();
+    let src = engine
+        .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let dst = engine
+        .create_dir(ROOT_INO, b"dst", 1000, 1000, 0o755)
+        .unwrap();
+    engine
+        .create_file(dst.ino, b"child.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let src_attr_before = engine.get_attr(src.ino).unwrap();
+    let dst_attr_before = engine.get_attr(dst.ino).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    let result = engine.rename_atomic_with_replace(ROOT_INO, b"src.txt", ROOT_INO, b"dst", false);
+
+    assert!(matches!(result, Err(MetaError::EntryExists { parent, .. }) if parent == ROOT_INO));
+    assert_eq!(engine.lookup(ROOT_INO, b"src.txt").unwrap().ino, src.ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"dst").unwrap().ino, dst.ino);
+    assert!(engine.lookup(dst.ino, b"child.txt").is_ok());
+    assert_eq!(engine.get_attr(src.ino).unwrap(), src_attr_before);
+    assert_eq!(engine.get_attr(dst.ino).unwrap(), dst_attr_before);
+    assert_eq!(
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        next_event_before
+    );
+}
+
+#[test]
+fn test_rename_no_replace_rejects_hardlink_to_source() {
+    let engine = temp_engine();
+    let src = engine
+        .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+        .unwrap();
+    engine.link(src.ino, ROOT_INO, b"dst.txt").unwrap();
+    let attr_before = engine.get_attr(src.ino).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    let result =
+        engine.rename_atomic_with_replace(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt", false);
+
+    assert!(matches!(result, Err(MetaError::EntryExists { parent, .. }) if parent == ROOT_INO));
+    assert_eq!(engine.lookup(ROOT_INO, b"src.txt").unwrap().ino, src.ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, src.ino);
+    assert_eq!(engine.get_attr(src.ino).unwrap(), attr_before);
+    assert_eq!(
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        next_event_before
+    );
+}
+
+#[test]
 fn test_rename_overwrite_empty_dir() {
     let engine = temp_engine();
     let file = engine
@@ -794,6 +908,102 @@ fn test_rename_concurrent_single_winner() {
     if let Some(entry) = b_entry {
         assert_eq!(entry.ino, src.ino);
     }
+}
+
+#[test]
+fn test_rename_no_replace_concurrent_single_winner() {
+    let engine = Arc::new(temp_engine());
+    let src_a = engine
+        .create_file(ROOT_INO, b"source-a.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let src_b = engine
+        .create_file(ROOT_INO, b"source-b.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let src_a_attr_before = engine.get_attr(src_a.ino).unwrap();
+    let src_b_attr_before = engine.get_attr(src_b.ino).unwrap();
+    let src_a_ino = src_a.ino;
+    let src_b_ino = src_b.ino;
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let a_engine = Arc::clone(&engine);
+    let a_barrier = Arc::clone(&barrier);
+    let a_tx = tx.clone();
+    let t_a = std::thread::spawn(move || {
+        a_barrier.wait();
+        a_tx.send((
+            src_a_ino,
+            a_engine.rename_atomic_with_replace(
+                ROOT_INO,
+                b"source-a.txt",
+                ROOT_INO,
+                b"destination.txt",
+                false,
+            ),
+        ))
+        .unwrap();
+    });
+
+    let b_engine = Arc::clone(&engine);
+    let b_barrier = Arc::clone(&barrier);
+    let t_b = std::thread::spawn(move || {
+        b_barrier.wait();
+        tx.send((
+            src_b_ino,
+            b_engine.rename_atomic_with_replace(
+                ROOT_INO,
+                b"source-b.txt",
+                ROOT_INO,
+                b"destination.txt",
+                false,
+            ),
+        ))
+        .unwrap();
+    });
+
+    barrier.wait();
+    let out_a = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("rename thread a timed out");
+    let out_b = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("rename thread b timed out");
+    t_a.join().expect("rename thread a panicked");
+    t_b.join().expect("rename thread b panicked");
+
+    let mut winner = None;
+    let mut loser = None;
+    for (source_ino, result) in [out_a, out_b] {
+        match result {
+            Ok(_) => assert!(winner.replace(source_ino).is_none()),
+            Err(MetaError::EntryExists { .. }) => assert!(loser.replace(source_ino).is_none()),
+            Err(error) => panic!("unexpected rename error: {error:?}"),
+        }
+    }
+    let (winner, loser) = (winner.unwrap(), loser.unwrap());
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"destination.txt").unwrap().ino,
+        winner
+    );
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"source-a.txt").is_ok(),
+        loser == src_a.ino
+    );
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"source-b.txt").is_ok(),
+        loser == src_b.ino
+    );
+    let loser_attr_before = if loser == src_a.ino {
+        src_a_attr_before
+    } else {
+        src_b_attr_before
+    };
+    assert_eq!(engine.get_attr(loser).unwrap(), loser_attr_before);
+    assert_eq!(
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        next_event_before + 1
+    );
 }
 
 #[test]

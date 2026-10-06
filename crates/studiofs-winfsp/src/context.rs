@@ -41,7 +41,7 @@ use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
 use windows::Win32::Foundation::{
     NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR,
-    STATUS_IO_REPARSE_DATA_INVALID,
+    STATUS_IO_REPARSE_DATA_INVALID, STATUS_NOT_SUPPORTED,
 };
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -995,6 +995,9 @@ fn note_critical_vfs_error(error: &studiofs_vfs::VfsError) {
 /// Map VfsError to WinFSP NTSTATUS error.
 fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     note_critical_vfs_error(&e);
+    if matches!(&e, VfsError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported) {
+        return winfsp::FspError::from(STATUS_NOT_SUPPORTED);
+    }
     match classify_vfs_error(&e) {
         BridgeVfsErrorKind::NotFound => winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND),
         BridgeVfsErrorKind::AlreadyExists => winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION),
@@ -2461,13 +2464,13 @@ impl FileSystemContext for StudioFsContext {
         _context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
-        _replace_if_exists: bool,
+        replace_if_exists: bool,
     ) -> winfsp::Result<()> {
         self.ensure_writable()?;
         tracing::debug!(
             old_path = %file_name.to_string_lossy(),
             new_path = %new_file_name.to_string_lossy(),
-            replace_if_exists = _replace_if_exists,
+            replace_if_exists,
             thread_id = ?std::thread::current().id(),
             "WinFSP rename callback started"
         );
@@ -2493,11 +2496,12 @@ impl FileSystemContext for StudioFsContext {
                 error
             })?;
 
-        if let Err(err) = self.vfs.rename(
+        if let Err(err) = self.vfs.rename_with_replace(
             plan.old_parent,
             &plan.old_name,
             plan.new_parent,
             &plan.new_name,
+            replace_if_exists,
         ) {
             tracing::warn!(
                 old_path = %file_name.to_string_lossy(),
@@ -2699,8 +2703,9 @@ mod tests {
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PATH_STACK_BUFFER_BYTES,
         PreparedWinfspNotifications, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
         STATUS_BAD_NETWORK_PATH, STATUS_BUFFER_TOO_SMALL, STATUS_DATA_ERROR,
-        STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL,
+        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
+        STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
         SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
         WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
         attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
@@ -2931,6 +2936,151 @@ mod tests {
             file.ino
         );
         assert!(vfs.lookup(ROOT_INO, b"old").is_err());
+    }
+
+    #[test]
+    fn sfs815_rename_without_replace_rejects_existing_file_and_preserves_both_entries() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs815-rename-file-collision");
+        let source = vfs
+            .create(ROOT_INO, b"source", 0, 0, 0o644)
+            .expect("create source file");
+        let target = vfs
+            .create(ROOT_INO, b"target", 0, 0, 0o644)
+            .expect("create target file");
+        let handle = StudioFileHandle::new(source.ino, false, 0, OpenFlags::RDONLY);
+        let source_path = U16CString::from_str(r"\source").expect("source path");
+        let target_path = U16CString::from_str(r"\target").expect("target path");
+
+        let error = ctx
+            .rename(
+                &handle,
+                source_path.as_ucstr(),
+                target_path.as_ucstr(),
+                false,
+            )
+            .expect_err("no-replace rename must reject an existing file target");
+
+        assert_eq!(error.to_ntstatus(), STATUS_OBJECT_NAME_COLLISION.0);
+        assert_eq!(vfs.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert_eq!(vfs.lookup(ROOT_INO, b"target").unwrap().ino, target.ino);
+    }
+
+    #[test]
+    fn sfs815_rename_without_replace_rejects_existing_directory_and_preserves_both_entries() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs815-rename-dir-collision");
+        let source = vfs
+            .mkdir(ROOT_INO, b"source", 0, 0, 0o755)
+            .expect("create source directory");
+        let target = vfs
+            .mkdir(ROOT_INO, b"target", 0, 0, 0o755)
+            .expect("create target directory");
+        let handle = StudioFileHandle::new(source.ino, false, 0, OpenFlags::RDONLY);
+        let source_path = U16CString::from_str(r"\source").expect("source path");
+        let target_path = U16CString::from_str(r"\target").expect("target path");
+
+        let error = ctx
+            .rename(
+                &handle,
+                source_path.as_ucstr(),
+                target_path.as_ucstr(),
+                false,
+            )
+            .expect_err("no-replace rename must reject an existing directory target");
+
+        assert_eq!(error.to_ntstatus(), STATUS_OBJECT_NAME_COLLISION.0);
+        assert_eq!(vfs.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert_eq!(vfs.lookup(ROOT_INO, b"target").unwrap().ino, target.ino);
+    }
+
+    #[test]
+    fn sfs815_rename_with_replace_still_replaces_files_and_empty_directories() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs815-rename-replace");
+        let source_file = vfs
+            .create(ROOT_INO, b"source-file", 0, 0, 0o644)
+            .expect("create source file");
+        let target_file = vfs
+            .create(ROOT_INO, b"target-file", 0, 0, 0o644)
+            .expect("create target file");
+        let source_dir = vfs
+            .mkdir(ROOT_INO, b"source-dir", 0, 0, 0o755)
+            .expect("create source directory");
+        let target_dir = vfs
+            .mkdir(ROOT_INO, b"target-dir", 0, 0, 0o755)
+            .expect("create target directory");
+        let file_handle = StudioFileHandle::new(source_file.ino, false, 0, OpenFlags::RDONLY);
+        let dir_handle = StudioFileHandle::new(source_dir.ino, false, 0, OpenFlags::RDONLY);
+        let source_file_path = U16CString::from_str(r"\source-file").expect("source file path");
+        let target_file_path = U16CString::from_str(r"\target-file").expect("target file path");
+        let source_dir_path = U16CString::from_str(r"\source-dir").expect("source dir path");
+        let target_dir_path = U16CString::from_str(r"\target-dir").expect("target dir path");
+
+        ctx.rename(
+            &file_handle,
+            source_file_path.as_ucstr(),
+            target_file_path.as_ucstr(),
+            true,
+        )
+        .expect("replace existing file target");
+        ctx.rename(
+            &dir_handle,
+            source_dir_path.as_ucstr(),
+            target_dir_path.as_ucstr(),
+            true,
+        )
+        .expect("replace existing empty directory target");
+
+        assert!(vfs.lookup(ROOT_INO, b"source-file").is_err());
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"target-file").unwrap().ino,
+            source_file.ino
+        );
+        assert!(vfs.getattr(target_file.ino).is_err());
+        assert!(vfs.lookup(ROOT_INO, b"source-dir").is_err());
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"target-dir").unwrap().ino,
+            source_dir.ino
+        );
+        assert!(vfs.getattr(target_dir.ino).is_err());
+    }
+
+    #[test]
+    fn sfs815_rename_with_replace_keeps_nonempty_directory_target_unchanged() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs815-rename-nonempty-dir");
+        let source = vfs
+            .mkdir(ROOT_INO, b"source", 0, 0, 0o755)
+            .expect("create source directory");
+        let target = vfs
+            .mkdir(ROOT_INO, b"target", 0, 0, 0o755)
+            .expect("create target directory");
+        let child = vfs
+            .create(target.ino, b"child", 0, 0, 0o644)
+            .expect("create target child");
+        let handle = StudioFileHandle::new(source.ino, false, 0, OpenFlags::RDONLY);
+        let source_path = U16CString::from_str(r"\source").expect("source path");
+        let target_path = U16CString::from_str(r"\target").expect("target path");
+
+        let error = ctx
+            .rename(
+                &handle,
+                source_path.as_ucstr(),
+                target_path.as_ucstr(),
+                true,
+            )
+            .expect_err("nonempty directory target must remain non-replaceable");
+
+        assert_eq!(error.to_ntstatus(), STATUS_DIRECTORY_NOT_EMPTY.0);
+        assert_eq!(vfs.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert_eq!(vfs.lookup(ROOT_INO, b"target").unwrap().ino, target.ino);
+        assert_eq!(vfs.lookup(target.ino, b"child").unwrap().ino, child.ino);
+    }
+
+    #[test]
+    fn sfs815_unsupported_no_replace_rename_maps_to_not_supported() {
+        let error = VfsError::Io(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        assert_eq!(
+            vfs_to_winfsp_err(error).to_ntstatus(),
+            STATUS_NOT_SUPPORTED.0
+        );
     }
 
     #[test]

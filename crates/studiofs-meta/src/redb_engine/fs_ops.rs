@@ -828,12 +828,13 @@ impl MetaFsOps for RedbMetaEngine {
 
     // --- Atomic Rename ---------------------------------------------------
 
-    fn rename_atomic(
+    fn rename_atomic_with_replace(
         &self,
         parent: Ino,
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
+        replace_if_exists: bool,
     ) -> MetaResult<RenameAtomicResult> {
         let txn = self.begin_write_txn()?;
         let src_entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or_else(|| {
@@ -843,6 +844,12 @@ impl MetaFsOps for RedbMetaEngine {
             }
         })?;
         let dst_entry_opt = Self::lookup_merged_in_write_txn(&txn, new_parent, new_name)?;
+        if !replace_if_exists && dst_entry_opt.is_some() {
+            return Err(MetaError::EntryExists {
+                parent: new_parent,
+                name: String::from_utf8_lossy(new_name).to_string(),
+            });
+        }
         if let Some(dst_entry) = &dst_entry_opt
             && dst_entry.kind == FileType::Directory
             && !Self::readdir_merged_in_write_txn(&txn, dst_entry.ino)?.is_empty()

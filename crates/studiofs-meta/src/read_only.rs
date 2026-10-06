@@ -245,12 +245,13 @@ where
         Err(read_only_error(parent))
     }
 
-    fn rename_atomic(
+    fn rename_atomic_with_replace(
         &self,
         parent: Ino,
         _name: &[u8],
         _new_parent: Ino,
         _new_name: &[u8],
+        _replace_if_exists: bool,
     ) -> MetaResult<RenameAtomicResult> {
         Err(read_only_error(parent))
     }

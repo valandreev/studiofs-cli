@@ -57,6 +57,15 @@ Path walks are centralized in VFS `NamespaceResolver`:
 - macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
 - Bridge-local namespace traversal should not bypass VFS runtime filtering.
 
+WinFSP rename forwards `ReplaceIfExists` to the local metadata write
+transaction. With replacement disabled, an existing file or directory returns
+`STATUS_OBJECT_NAME_COLLISION` before either entry changes, including when the
+destination was created after path resolution. Replacement-enabled callbacks
+retain the existing replacement and nonempty-directory behavior. Filtered
+metadata and destructive trash renames do not use that transaction: no-replace
+requests reject an existing target as a collision and an absent target as
+unsupported, preserving the source in both cases.
+
 ## macOS backend selection
 
 The default macOS backend is the existing low-level macFUSE bridge. Select it

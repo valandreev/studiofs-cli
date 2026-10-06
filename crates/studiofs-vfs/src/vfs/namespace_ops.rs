@@ -36,6 +36,8 @@ const RMDIR_CLEANUP_RETRY_ATTEMPTS: u16 = 200;
 std::thread_local! {
     static RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static RENAME_BEFORE_METADATA_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2971,7 +2973,57 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
-        self.run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
+        self.rename_with_replace(parent, name, new_parent, new_name, true)
+    }
+
+    /// Atomically rename an entry, optionally replacing an existing destination.
+    ///
+    /// When replacement is disabled, a destination collision leaves both entries
+    /// unchanged. Destructive trash and filtered-entry renames are unsupported
+    /// in this mode because they do not share the metadata transaction.
+    pub fn rename_with_replace(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        replace_if_exists: bool,
+    ) -> VfsResult<()> {
+        self.run_sync_future(self.rename_inner(
+            parent,
+            name,
+            new_parent,
+            new_name,
+            replace_if_exists,
+        ))
+    }
+
+    fn reject_nontransactional_no_replace(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        // This path never mutates either registry. A lookup is sufficient for
+        // classifying the rejection; it must never authorize a later mutation.
+        let exists = if self.ignored_entry_lookup(parent, name).is_some() {
+            true
+        } else if self.ignored_dir_attr(parent).is_some() {
+            false
+        } else {
+            match self.sync_meta().lookup(parent, name) {
+                Ok(_) => true,
+                Err(MetaError::EntryNotFound { .. }) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if exists {
+            return Err(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }
+            .into());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unsupported for filtered entries and trash",
+        )
+        .into())
     }
 
     async fn delete_source_tree_and_invalidate_trash_target(
@@ -3036,6 +3088,7 @@ impl StudioVfs {
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
+        replace_if_exists: bool,
     ) -> VfsResult<()> {
         let rename_started = Instant::now();
         let name_display = String::from_utf8_lossy(name);
@@ -3070,6 +3123,9 @@ impl StudioVfs {
             || self.should_ignore_directory_path(new_parent, new_name);
         let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
             && self.ignored_directory_has_probable_trash_ancestor(new_parent);
+        if !replace_if_exists && (source_ignored.is_some() || target_is_ignored) {
+            return self.reject_nontransactional_no_replace(new_parent, new_name);
+        }
         if let Some(source) = source_ignored {
             if target_is_ignored && !target_is_ignored_trash {
                 self.create_ignored_entry(
@@ -3171,6 +3227,9 @@ impl StudioVfs {
         let source_attr = meta.get_attr(source_entry.ino)?;
         let target_is_trash = self.directory_has_probable_trash_ancestor(new_parent)?;
         if target_is_trash {
+            if !replace_if_exists {
+                return self.reject_nontransactional_no_replace(new_parent, new_name);
+            }
             debug!(
                 parent,
                 name = %name_display,
@@ -3190,8 +3249,8 @@ impl StudioVfs {
                 )
                 .await;
         }
-        let displaced_target_will_retire = if let Ok(target_entry) =
-            meta.lookup(new_parent, new_name)
+        let displaced_target_will_retire = if replace_if_exists
+            && let Ok(target_entry) = meta.lookup(new_parent, new_name)
             && target_entry.ino != source_entry.ino
         {
             debug!(
@@ -3219,7 +3278,14 @@ impl StudioVfs {
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename calling metadata rename_atomic"
         );
-        let rename_result = meta.rename_atomic(parent, name, new_parent, new_name)?;
+        #[cfg(test)]
+        RENAME_BEFORE_METADATA_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
+        let rename_result =
+            meta.rename_atomic_with_replace(parent, name, new_parent, new_name, replace_if_exists)?;
         debug!(
             parent,
             name = %name_display,
@@ -3306,6 +3372,80 @@ mod tests {
     use bytes::BytesMut;
     use studiofs_meta::schema::ROOT_INO;
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
+
+    #[test]
+    fn sfs815_no_replace_preserves_concurrently_created_destination() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-race-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-race");
+        let source = meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+        let creator_meta = meta.clone();
+        let (created_tx, created_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let target = creator_meta
+                .create_file(ROOT_INO, b"destination", 0, 0, 0o600)
+                .unwrap();
+            created_tx.send(target).unwrap();
+        });
+        RENAME_BEFORE_METADATA_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                start_tx.send(()).unwrap();
+                // Rename has resolved the source and destination parent. Create
+                // the destination before the actual atomic mutation starts.
+                created_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+        });
+        let result = vfs.rename_with_replace(ROOT_INO, b"source", ROOT_INO, b"destination", false);
+        creator.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(VfsError::Meta(MetaError::EntryExists { .. }))
+        ));
+        assert_eq!(meta.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        let target = meta.lookup(ROOT_INO, b"destination").unwrap();
+        assert_ne!(target.ino, source.ino);
+        assert_eq!(meta.get_attr(target.ino).unwrap().mode, 0o600);
+    }
+
+    #[test]
+    fn sfs815_no_replace_never_deletes_through_special_rename_paths() {
+        for destination_exists in [false, true] {
+            for filtered in [false, true] {
+                let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-special-");
+                let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-special");
+                let source = meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+                let (parent, name) = if filtered {
+                    (ROOT_INO, b"._destination".as_slice())
+                } else {
+                    let trash = meta
+                        .create_dir(ROOT_INO, b"$RECYCLE.BIN", 0, 0, 0o755)
+                        .unwrap();
+                    (trash.ino, b"destination".as_slice())
+                };
+                let target = destination_exists.then(|| {
+                    if filtered {
+                        vfs.create_ignored_entry(parent, name, 0, 0, 0o600, FileType::RegularFile)
+                    } else {
+                        meta.create_file(parent, name, 0, 0, 0o600).unwrap()
+                    }
+                });
+                let result = vfs.rename_with_replace(ROOT_INO, b"source", parent, name, false);
+                if let Some(target) = target {
+                    assert!(matches!(
+                        result,
+                        Err(VfsError::Meta(MetaError::EntryExists { .. }))
+                    ));
+                    assert_eq!(vfs.lookup(parent, name).unwrap().ino, target.ino);
+                } else {
+                    assert!(
+                        matches!(result, Err(VfsError::Io(ref error)) if error.kind() == std::io::ErrorKind::Unsupported)
+                    );
+                }
+                assert_eq!(meta.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+            }
+        }
+    }
 
     #[must_use = "bind this guard so the snapshot hook remains armed for the test scope"]
     struct DanglingSnapshotHookGuard;
