@@ -1848,7 +1848,7 @@ impl SessionState {
             return Err(libc::EROFS);
         }
         self.vfs
-            .rename(parent, name, newparent, newname)
+            .rename(parent, name, newparent, newname, true)
             .map_err(|error| vfs_err_to_errno(&error))
     }
 

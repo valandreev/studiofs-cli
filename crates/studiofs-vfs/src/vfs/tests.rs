@@ -828,7 +828,7 @@ fn hardlink_preserves_volatile_local_size_and_updates_link_count() {
         assert_eq!(visible_attr.size, b"namespace".len() as u64);
         vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
 
-        vfs.rename(ROOT_INO, b"original.txt", ROOT_INO, b"renamed.txt")
+        vfs.rename(ROOT_INO, b"original.txt", ROOT_INO, b"renamed.txt", true)
             .expect("rename");
         vfs.state.namespace.attr_read_cache.lock().put(
             attr.ino,
@@ -917,8 +917,14 @@ fn os_cache_rename_overwrite_retires_only_truly_displaced_inode() {
         let _ = vfs.prepare_os_cache_open(seed, OsCacheParticipation::Enabled);
         vfs.release_fh(seed).await.expect("seed release");
 
-        vfs.rename(ROOT_INO, b"source.txt", ROOT_INO, b"retired-target.txt")
-            .expect("rename overwrite");
+        vfs.rename(
+            ROOT_INO,
+            b"source.txt",
+            ROOT_INO,
+            b"retired-target.txt",
+            true,
+        )
+        .expect("rename overwrite");
         assert!(!vfs.os_cache.lock().has_generation(retired.ino));
         assert_eq!(
             vfs.lookup(ROOT_INO, b"retired-target.txt")
@@ -941,6 +947,7 @@ fn os_cache_rename_overwrite_retires_only_truly_displaced_inode() {
             b"open-source.txt",
             ROOT_INO,
             b"open-retired-target.txt",
+            true,
         )
         .expect("rename over open final target");
         assert!(
@@ -967,6 +974,7 @@ fn os_cache_rename_overwrite_retires_only_truly_displaced_inode() {
             b"second-source.txt",
             ROOT_INO,
             b"surviving-target.txt",
+            true,
         )
         .expect("rename over one hardlink");
         assert!(
@@ -2779,12 +2787,14 @@ fn runtime_stats_reserved_name_rejects_namespace_mutations() {
         b"runtime-stats-source",
         ROOT_INO,
         RUNTIME_STATS_FILE_NAME,
+        true,
     ));
     assert_access_denied(vfs.rename(
         ROOT_INO,
         RUNTIME_STATS_FILE_NAME,
         ROOT_INO,
         b"runtime-stats-target",
+        true,
     ));
 
     assert!(
@@ -6108,6 +6118,7 @@ fn rename_invalidates_moved_inode_attr_cache_without_kernel_callback() {
         b"rename-cache-source.txt",
         ROOT_INO,
         b"rename-cache-target.txt",
+        true,
     )
     .expect("rename test file");
 
@@ -14526,7 +14537,7 @@ fn test_rename_over_existing_target_discards_pending_local_state() {
             "a displaced overwrite target may still carry pending local state before rename"
         );
 
-        vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt")
+        vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt", true)
             .unwrap();
 
         assert!(
@@ -14569,7 +14580,7 @@ fn rename_over_existing_target_invalidates_displaced_inode_attr_cache() {
             "setup must prime displaced inode attr cache"
         );
 
-        vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt")
+        vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt", true)
             .unwrap();
 
         assert!(
@@ -17314,8 +17325,14 @@ fn deferred_namespace_durable_mutations_wait_for_admitted_entries() {
             )
             .expect("admit file for rename");
         assert!(vfs.has_deferred_namespace_metadata(renamed.ino));
-        vfs.rename(1, b"rename-before-commit.txt", 1, b"renamed-after-wait.txt")
-            .expect("rename should wait for deferred create commit");
+        vfs.rename(
+            1,
+            b"rename-before-commit.txt",
+            1,
+            b"renamed-after-wait.txt",
+            true,
+        )
+        .expect("rename should wait for deferred create commit");
         assert_eq!(
             vfs.lookup(1, b"renamed-after-wait.txt")
                 .expect("renamed file should be visible")
@@ -18233,6 +18250,7 @@ fn trash_rename_deletes_file_entry() {
         b"recover-me.txt",
         trash_user.ino,
         b"recover-me.txt",
+        true,
     )
     .expect("rename into trash-like directory");
 
@@ -18263,8 +18281,14 @@ fn linux_trash_rename_deletes_directory_subtree() {
         .mkdir(trash_root.ino, b"files", 1000, 1000, 0o755)
         .expect("create Linux trash files directory");
 
-    vfs.rename(ROOT_INO, b"delete-tree", trash_files.ino, b"delete-tree")
-        .expect("rename directory into Linux trash files directory");
+    vfs.rename(
+        ROOT_INO,
+        b"delete-tree",
+        trash_files.ino,
+        b"delete-tree",
+        true,
+    )
+    .expect("rename directory into Linux trash files directory");
 
     assert!(vfs.lookup(ROOT_INO, b"delete-tree").is_err());
     assert!(
@@ -18290,7 +18314,7 @@ fn windows_recycle_bin_rename_deletes_directory_subtree() {
         .mkdir(ROOT_INO, b"$RECYCLE.BIN", 1000, 1000, 0o755)
         .expect("create recycle bin");
 
-    vfs.rename(ROOT_INO, b"delete-tree", recycle_bin.ino, b"$RDIR")
+    vfs.rename(ROOT_INO, b"delete-tree", recycle_bin.ino, b"$RDIR", true)
         .expect("rename directory into recycle bin");
 
     assert!(vfs.lookup(ROOT_INO, b"delete-tree").is_err());
@@ -22245,6 +22269,7 @@ fn foreign_hard_lock_blocks_unlink_and_rename() {
         b"foreign-lock-namespace.txt",
         ROOT_INO,
         b"foreign-lock-namespace-moved.txt",
+        true,
     );
     assert!(
         matches!(rename, Err(VfsError::WouldBlock)),

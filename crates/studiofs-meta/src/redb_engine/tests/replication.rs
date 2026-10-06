@@ -644,7 +644,7 @@ fn replica_serving_remove_attr_removes_renamed_alias() {
         .unwrap();
 
     engine
-        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed.txt")
+        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed.txt", true)
         .expect("local rename should be accepted");
     assert!(engine.lookup(ROOT_INO, b"renamed.txt").is_ok());
 
@@ -702,7 +702,7 @@ fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_a() {
         .unwrap();
 
     engine
-        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt")
+        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt", true)
         .expect("local loser rename should be accepted");
 
     let pg_winner =
@@ -752,7 +752,7 @@ fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_b() {
         .unwrap();
 
     engine
-        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-b.txt")
+        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-b.txt", true)
         .expect("local loser rename should be accepted");
 
     let pg_winner =
@@ -784,7 +784,7 @@ fn replica_serving_rename_does_not_resurrect_locally_unlinked_destination() {
     let engine = RedbMetaEngine::open(&path).unwrap();
     engine.import_snapshot(&snapshot).unwrap();
     engine
-        .rename_atomic(ROOT_INO, b"source-link", ROOT_INO, b"renamed-link")
+        .rename_atomic(ROOT_INO, b"source-link", ROOT_INO, b"renamed-link", true)
         .expect("local rename should be accepted");
     engine
         .set_counter(
@@ -1156,7 +1156,7 @@ fn replica_serving_rename_preserves_local_hardlink_while_removing_local_loser() 
         .link(entry.ino, ROOT_INO, b"local-link.txt")
         .expect("local hardlink should be accepted");
     engine
-        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt")
+        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt", true)
         .expect("local loser rename should be accepted");
 
     let pg_winner =

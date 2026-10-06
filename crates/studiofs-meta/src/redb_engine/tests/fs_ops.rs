@@ -625,7 +625,7 @@ fn test_rename() {
         .create_file(ROOT_INO, b"old.txt", 1000, 1000, 0o644)
         .unwrap();
     let displaced = engine
-        .rename_atomic(ROOT_INO, b"old.txt", ROOT_INO, b"new.txt")
+        .rename_atomic(ROOT_INO, b"old.txt", ROOT_INO, b"new.txt", true)
         .unwrap();
     assert_eq!(displaced.moved_ino, src.ino);
     assert!(displaced.displaced_ino.is_none());
@@ -645,7 +645,7 @@ fn test_rename_overwrite_file() {
         .unwrap();
 
     let displaced = engine
-        .rename_atomic(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt")
+        .rename_atomic(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt", true)
         .unwrap();
 
     // Should return the displaced inode
@@ -660,6 +660,103 @@ fn test_rename_overwrite_file() {
 }
 
 #[test]
+fn test_rename_no_replace_rejects_existing_file_without_changes() {
+    let engine = temp_engine();
+    let src = engine
+        .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let dst = engine
+        .create_file(ROOT_INO, b"dst.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let src_attr_before = engine.get_attr(src.ino).unwrap();
+    let dst_attr_before = engine.get_attr(dst.ino).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    let result =
+        engine.rename_atomic(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt", false);
+
+    assert!(matches!(result, Err(MetaError::EntryExists { parent, .. }) if parent == ROOT_INO));
+    assert_eq!(engine.lookup(ROOT_INO, b"src.txt").unwrap().ino, src.ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, dst.ino);
+    assert_eq!(engine.get_attr(src.ino).unwrap(), src_attr_before);
+    assert_eq!(engine.get_attr(dst.ino).unwrap(), dst_attr_before);
+    assert_eq!(
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        next_event_before
+    );
+}
+
+#[test]
+fn test_rename_no_replace_rejects_existing_directory_before_contents_check() {
+    let engine = temp_engine();
+    let src = engine
+        .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let dst = engine
+        .create_dir(ROOT_INO, b"dst", 1000, 1000, 0o755)
+        .unwrap();
+    engine
+        .create_file(dst.ino, b"child.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let src_attr_before = engine.get_attr(src.ino).unwrap();
+    let dst_attr_before = engine.get_attr(dst.ino).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    let result = engine.rename_atomic(ROOT_INO, b"src.txt", ROOT_INO, b"dst", false);
+
+    assert!(matches!(result, Err(MetaError::EntryExists { parent, .. }) if parent == ROOT_INO));
+    assert_eq!(engine.lookup(ROOT_INO, b"src.txt").unwrap().ino, src.ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"dst").unwrap().ino, dst.ino);
+    assert!(engine.lookup(dst.ino, b"child.txt").is_ok());
+    assert_eq!(engine.get_attr(src.ino).unwrap(), src_attr_before);
+    assert_eq!(engine.get_attr(dst.ino).unwrap(), dst_attr_before);
+    assert_eq!(
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        next_event_before
+    );
+}
+
+#[test]
+fn test_rename_no_replace_does_not_overwrite_concurrently_created_destination() {
+    let engine = Arc::new(temp_engine());
+    let src = engine
+        .create_file(ROOT_INO, b"src.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let src_attr = engine.get_attr(src.ino).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    let rename_engine = Arc::clone(&engine);
+    let rename_barrier = Arc::clone(&barrier);
+    let rename = std::thread::spawn(move || {
+        rename_barrier.wait();
+        rename_engine.rename_atomic(ROOT_INO, b"src.txt", ROOT_INO, b"dst.txt", false)
+    });
+    let create_engine = Arc::clone(&engine);
+    let create_barrier = Arc::clone(&barrier);
+    let create = std::thread::spawn(move || {
+        create_barrier.wait();
+        create_engine.create_file(ROOT_INO, b"dst.txt", 1000, 1000, 0o600)
+    });
+    barrier.wait();
+
+    let rename_result = rename.join().unwrap();
+    let create_result = create.join().unwrap();
+    match (rename_result, create_result) {
+        (Ok(result), Err(MetaError::EntryExists { .. })) => {
+            assert_eq!(result.moved_ino, src.ino);
+            assert!(engine.lookup(ROOT_INO, b"src.txt").is_err());
+            assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, src.ino);
+        }
+        (Err(MetaError::EntryExists { .. }), Ok(created)) => {
+            assert_eq!(engine.lookup(ROOT_INO, b"src.txt").unwrap().ino, src.ino);
+            assert_eq!(engine.get_attr(src.ino).unwrap(), src_attr);
+            assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, created.ino);
+        }
+        outcome => panic!("unexpected competing create/rename result: {outcome:?}"),
+    }
+}
+
+#[test]
 fn test_rename_overwrite_empty_dir() {
     let engine = temp_engine();
     let file = engine
@@ -670,7 +767,7 @@ fn test_rename_overwrite_empty_dir() {
         .unwrap();
 
     let displaced = engine
-        .rename_atomic(ROOT_INO, b"file.txt", ROOT_INO, b"empty_dir")
+        .rename_atomic(ROOT_INO, b"file.txt", ROOT_INO, b"empty_dir", true)
         .unwrap();
 
     assert_eq!(displaced.moved_ino, file.ino);
@@ -693,7 +790,7 @@ fn test_rename_overwrite_nonempty_dir_fails() {
         .create_file(dir.ino, b"child.txt", 1000, 1000, 0o644)
         .unwrap();
 
-    let result = engine.rename_atomic(ROOT_INO, b"file.txt", ROOT_INO, b"notempty");
+    let result = engine.rename_atomic(ROOT_INO, b"file.txt", ROOT_INO, b"notempty", true);
     assert!(result.is_err());
     // Source should still exist (rollback in same txn)
     assert!(engine.lookup(ROOT_INO, b"file.txt").is_ok());
@@ -722,7 +819,7 @@ fn test_rename_move_dir_between_parents() {
 
     // Move /a/sub → /b/sub
     let displaced = engine
-        .rename_atomic(dir_a.ino, b"sub", dir_b.ino, b"sub")
+        .rename_atomic(dir_a.ino, b"sub", dir_b.ino, b"sub", true)
         .unwrap();
     assert_eq!(displaced.moved_ino, sub.ino);
     assert!(displaced.displaced_ino.is_none());
@@ -741,7 +838,7 @@ fn test_rename_move_dir_between_parents() {
 #[test]
 fn test_rename_nonexistent_source() {
     let engine = temp_engine();
-    let result = engine.rename_atomic(ROOT_INO, b"nope.txt", ROOT_INO, b"dst.txt");
+    let result = engine.rename_atomic(ROOT_INO, b"nope.txt", ROOT_INO, b"dst.txt", true);
     assert!(result.is_err());
 }
 
@@ -757,14 +854,14 @@ fn test_rename_concurrent_single_winner() {
     let a_barrier = Arc::clone(&barrier);
     let t_a = std::thread::spawn(move || {
         a_barrier.wait();
-        a_engine.rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"moved_by_a.txt")
+        a_engine.rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"moved_by_a.txt", true)
     });
 
     let b_engine = Arc::clone(&engine);
     let b_barrier = Arc::clone(&barrier);
     let t_b = std::thread::spawn(move || {
         b_barrier.wait();
-        b_engine.rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"moved_by_b.txt")
+        b_engine.rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"moved_by_b.txt", true)
     });
 
     barrier.wait();
@@ -823,6 +920,7 @@ fn redb_rename_keeps_same_inode_and_incarnation_ids() {
             b"rename-inc.bin",
             ROOT_INO,
             b"rename-inc-next.bin",
+            true,
         )
         .unwrap();
 

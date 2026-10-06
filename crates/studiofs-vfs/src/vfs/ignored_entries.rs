@@ -381,7 +381,7 @@ mod tests {
                 .contains(ROOT_INO)
         );
 
-        vfs.rename(ROOT_INO, b".Spotlight-V100", ROOT_INO, b".fseventsd")
+        vfs.rename(ROOT_INO, b".Spotlight-V100", ROOT_INO, b".fseventsd", true)
             .expect("rename ignored entry");
 
         assert!(
@@ -420,8 +420,14 @@ mod tests {
                 .contains(trash_child.ino)
         );
 
-        vfs.rename(ROOT_INO, b"source.txt", trash_child.ino, b"source.txt")
-            .expect("rename into ignored trash subtree");
+        vfs.rename(
+            ROOT_INO,
+            b"source.txt",
+            trash_child.ino,
+            b"source.txt",
+            true,
+        )
+        .expect("rename into ignored trash subtree");
 
         assert!(
             !vfs.state
@@ -455,6 +461,7 @@ mod tests {
             b".Spotlight-V100",
             trash_child.ino,
             b".Spotlight-V100",
+            true,
         )
         .expect("rename ignored source into ignored trash subtree");
 

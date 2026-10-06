@@ -1485,18 +1485,23 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
     /// Remove an empty directory.
     fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
 
-    /// Atomic rename: move a directory entry in a single transaction.
+    /// Atomic rename with optional replacement of an existing destination.
+    ///
+    /// When `replace_if_exists` is false, test destination existence inside the
+    /// mutation transaction and return [`MetaError::EntryExists`] without
+    /// changing either entry, inode attributes, or replication events.
     fn rename_atomic(
         &self,
         parent: Ino,
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
+        replace_if_exists: bool,
     ) -> MetaResult<RenameAtomicResult>;
 
-    /// Rename a file or directory (delegates to `rename_atomic`).
+    /// Rename a file or directory, replacing an existing destination when present.
     fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        self.rename_atomic(parent, name, new_parent, new_name)?;
+        self.rename_atomic(parent, name, new_parent, new_name, true)?;
         Ok(())
     }
 

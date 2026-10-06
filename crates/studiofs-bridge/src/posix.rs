@@ -89,6 +89,7 @@ pub fn vfs_err_to_errno(error: &VfsError) -> i32 {
         BridgeVfsErrorKind::UnrecognizedVolume => libc::ENODEV,
         BridgeVfsErrorKind::XattrValueTooLarge => libc::E2BIG,
         BridgeVfsErrorKind::InvalidInput => libc::EINVAL,
+        BridgeVfsErrorKind::OperationNotSupported => libc::EOPNOTSUPP,
         BridgeVfsErrorKind::PermissionDenied => libc::EACCES,
         BridgeVfsErrorKind::MetadataPersistenceDegraded => libc::EIO,
         BridgeVfsErrorKind::Retryable => libc::EAGAIN,

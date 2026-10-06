@@ -2963,15 +2963,50 @@ impl StudioVfs {
         Ok(())
     }
 
-    /// Atomically rename `name` in `parent` to `new_name` in `new_parent`.
+    /// Atomically rename an entry, optionally replacing an existing destination.
+    ///
+    /// When replacement is disabled, a destination collision leaves both entries
+    /// unchanged. Destructive trash and filtered-entry renames are unsupported
+    /// in this mode because they do not share the metadata transaction.
     pub fn rename(
         &self,
         parent: Ino,
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
+        replace_if_exists: bool,
     ) -> VfsResult<()> {
-        self.run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
+        self.run_sync_future(self.rename_inner(
+            parent,
+            name,
+            new_parent,
+            new_name,
+            replace_if_exists,
+        ))
+    }
+
+    fn reject_nontransactional_no_replace(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        // This path never mutates either registry. A lookup is sufficient for
+        // classifying the rejection; it must never authorize a later mutation.
+        let exists = if self.ignored_entry_lookup(parent, name).is_some() {
+            true
+        } else if self.ignored_dir_attr(parent).is_some() {
+            false
+        } else {
+            match self.sync_meta().lookup(parent, name) {
+                Ok(_) => true,
+                Err(MetaError::EntryNotFound { .. }) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if exists {
+            return Err(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }
+            .into());
+        }
+        Err(VfsError::OperationNotSupported)
     }
 
     async fn delete_source_tree_and_invalidate_trash_target(
@@ -3036,6 +3071,7 @@ impl StudioVfs {
         name: &[u8],
         new_parent: Ino,
         new_name: &[u8],
+        replace_if_exists: bool,
     ) -> VfsResult<()> {
         let rename_started = Instant::now();
         let name_display = String::from_utf8_lossy(name);
@@ -3070,6 +3106,25 @@ impl StudioVfs {
             || self.should_ignore_directory_path(new_parent, new_name);
         let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
             && self.ignored_directory_has_probable_trash_ancestor(new_parent);
+        let prevalidated_source_entry = if !replace_if_exists && source_ignored.is_none() {
+            self.wait_for_deferred_namespace_entry(parent, name).await?;
+            let source_entry = meta.lookup(parent, name)?;
+            self.wait_for_deferred_namespace_entry(new_parent, new_name)
+                .await?;
+            Some(source_entry)
+        } else {
+            None
+        };
+        let target_is_trash =
+            if !replace_if_exists && source_ignored.is_none() && !target_is_ignored {
+                self.directory_has_probable_trash_ancestor(new_parent)?
+            } else {
+                false
+            };
+        if !replace_if_exists && (source_ignored.is_some() || target_is_ignored || target_is_trash)
+        {
+            return self.reject_nontransactional_no_replace(new_parent, new_name);
+        }
         if let Some(source) = source_ignored {
             if target_is_ignored && !target_is_ignored_trash {
                 self.create_ignored_entry(
@@ -3154,10 +3209,14 @@ impl StudioVfs {
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename looking up source"
         );
-        self.wait_for_deferred_namespace_entry(parent, name).await?;
-        self.wait_for_deferred_namespace_entry(new_parent, new_name)
-            .await?;
-        let source_entry = meta.lookup(parent, name)?;
+        let source_entry = if let Some(source_entry) = prevalidated_source_entry {
+            source_entry
+        } else {
+            self.wait_for_deferred_namespace_entry(parent, name).await?;
+            self.wait_for_deferred_namespace_entry(new_parent, new_name)
+                .await?;
+            meta.lookup(parent, name)?
+        };
         debug!(
             parent,
             name = %name_display,
@@ -3169,7 +3228,8 @@ impl StudioVfs {
         );
         self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
         let source_attr = meta.get_attr(source_entry.ino)?;
-        let target_is_trash = self.directory_has_probable_trash_ancestor(new_parent)?;
+        let target_is_trash = target_is_trash
+            || (replace_if_exists && self.directory_has_probable_trash_ancestor(new_parent)?);
         if target_is_trash {
             debug!(
                 parent,
@@ -3190,8 +3250,8 @@ impl StudioVfs {
                 )
                 .await;
         }
-        let displaced_target_will_retire = if let Ok(target_entry) =
-            meta.lookup(new_parent, new_name)
+        let displaced_target_will_retire = if replace_if_exists
+            && let Ok(target_entry) = meta.lookup(new_parent, new_name)
             && target_entry.ino != source_entry.ino
         {
             debug!(
@@ -3219,7 +3279,8 @@ impl StudioVfs {
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename calling metadata rename_atomic"
         );
-        let rename_result = meta.rename_atomic(parent, name, new_parent, new_name)?;
+        let rename_result =
+            meta.rename_atomic(parent, name, new_parent, new_name, replace_if_exists)?;
         debug!(
             parent,
             name = %name_display,
@@ -3306,6 +3367,59 @@ mod tests {
     use bytes::BytesMut;
     use studiofs_meta::schema::ROOT_INO;
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
+
+    #[test]
+    fn sfs815_no_replace_missing_source_precedes_filtered_destination_rejection() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-missing-source-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs815-missing-source");
+
+        assert!(matches!(
+            vfs.rename(ROOT_INO, b"missing", ROOT_INO, b"._destination", false),
+            Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
+        ));
+    }
+
+    #[test]
+    fn sfs815_no_replace_returns_collision_for_filtered_destination() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-filtered-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-filtered");
+        let source = meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+        let target = vfs.create_ignored_entry(
+            ROOT_INO,
+            b"._destination",
+            0,
+            0,
+            0o600,
+            FileType::RegularFile,
+        );
+
+        assert!(matches!(
+            vfs.rename(ROOT_INO, b"source", ROOT_INO, b"._destination", false),
+            Err(VfsError::Meta(MetaError::EntryExists { .. }))
+        ));
+        assert_eq!(meta.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"._destination").unwrap().ino,
+            target.ino
+        );
+    }
+
+    #[test]
+    fn sfs815_no_replace_preserves_source_for_trash_destination() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-trash-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-trash");
+        let source = meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+        let trash = meta
+            .create_dir(ROOT_INO, b"$RECYCLE.BIN", 0, 0, 0o755)
+            .unwrap();
+
+        assert!(matches!(
+            vfs.rename(ROOT_INO, b"source", trash.ino, b"destination", false),
+            Err(VfsError::OperationNotSupported)
+        ));
+        assert_eq!(meta.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert!(meta.lookup(trash.ino, b"destination").is_err());
+    }
 
     #[must_use = "bind this guard so the snapshot hook remains armed for the test scope"]
     struct DanglingSnapshotHookGuard;
@@ -3666,7 +3780,7 @@ mod tests {
             .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
         vfs.refresh_inode_incarnation_state_from_attr(live.ino, &dirty_attr);
 
-        meta.rename_atomic(ROOT_INO, name, ROOT_INO, moved_name)
+        meta.rename_atomic(ROOT_INO, name, ROOT_INO, moved_name, true)
             .expect("move expected inode to a live binding");
         let replacement = meta
             .create_file(ROOT_INO, name, 0, 0, 0o644)

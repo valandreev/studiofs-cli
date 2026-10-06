@@ -41,7 +41,7 @@ use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
 use windows::Win32::Foundation::{
     NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR,
-    STATUS_IO_REPARSE_DATA_INVALID,
+    STATUS_IO_REPARSE_DATA_INVALID, STATUS_NOT_SUPPORTED,
 };
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1006,6 +1006,7 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
         }
         BridgeVfsErrorKind::XattrValueTooLarge => winfsp::FspError::from(STATUS_EA_TOO_LARGE),
         BridgeVfsErrorKind::InvalidInput => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
+        BridgeVfsErrorKind::OperationNotSupported => winfsp::FspError::from(STATUS_NOT_SUPPORTED),
         BridgeVfsErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
         BridgeVfsErrorKind::MetadataPersistenceDegraded => {
             winfsp::FspError::from(STATUS_IO_DEVICE_ERROR)
@@ -2461,13 +2462,13 @@ impl FileSystemContext for StudioFsContext {
         _context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
-        _replace_if_exists: bool,
+        replace_if_exists: bool,
     ) -> winfsp::Result<()> {
         self.ensure_writable()?;
         tracing::debug!(
             old_path = %file_name.to_string_lossy(),
             new_path = %new_file_name.to_string_lossy(),
-            replace_if_exists = _replace_if_exists,
+            replace_if_exists,
             thread_id = ?std::thread::current().id(),
             "WinFSP rename callback started"
         );
@@ -2498,6 +2499,7 @@ impl FileSystemContext for StudioFsContext {
             &plan.old_name,
             plan.new_parent,
             &plan.new_name,
+            replace_if_exists,
         ) {
             tracing::warn!(
                 old_path = %file_name.to_string_lossy(),
@@ -2699,15 +2701,15 @@ mod tests {
         FILE_WRITE_THROUGH_CREATE_OPTION, FileSizeCallbackAction, PATH_STACK_BUFFER_BYTES,
         PreparedWinfspNotifications, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
         STATUS_BAD_NETWORK_PATH, STATUS_BUFFER_TOO_SMALL, STATUS_DATA_ERROR,
-        STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND,
-        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
-        WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
-        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
-        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
-        is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
-        maybe_hide_platform_root_path, notify_filter_for_kind, open_flags_from_access,
-        resolve_create_callback_kind, resolve_file_size_callback_action,
+        STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL,
+        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
+        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS,
+        StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker, WinfspInvalidationQueue,
+        WinfspKernelInvalidator, WinfspMetadataCachePolicy, attr_to_file_info,
+        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
+        hidden_platform_root_path_component, ino_to_windows_path, is_runtime_stats_windows_path,
+        maybe_hide_platform_root_entry, maybe_hide_platform_root_path, notify_filter_for_kind,
+        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
         unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
         with_lossy_utf16_path, write_local_sync_policy_from_create_options,
@@ -2733,6 +2735,19 @@ mod tests {
     use winfsp::U16CString;
     use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext, VolumeInfo};
     use winfsp::notify::NotifyingFileSystemContext;
+
+    fn rename_case(
+        context: &StudioFsContext,
+        ino: Ino,
+        old_path: &str,
+        new_path: &str,
+        replace: bool,
+    ) -> winfsp::Result<()> {
+        let handle = StudioFileHandle::new(ino, false, 0, OpenFlags::RDONLY);
+        let old_path = U16CString::from_str(old_path).expect("old path");
+        let new_path = U16CString::from_str(new_path).expect("new path");
+        context.rename(&handle, old_path.as_ucstr(), new_path.as_ucstr(), replace)
+    }
 
     fn cache_observation(
         namespace_epoch: u64,
@@ -2931,6 +2946,58 @@ mod tests {
             file.ino
         );
         assert!(vfs.lookup(ROOT_INO, b"old").is_err());
+    }
+
+    #[test]
+    fn sfs815_rename_without_replace_rejects_existing_file_and_directory() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs815-rename-collision");
+        let source_file = vfs.create(ROOT_INO, b"source-file", 0, 0, 0o644).unwrap();
+        let target_file = vfs.create(ROOT_INO, b"target-file", 0, 0, 0o644).unwrap();
+        let source_dir = vfs.mkdir(ROOT_INO, b"source-dir", 0, 0, 0o755).unwrap();
+        let target_dir = vfs.mkdir(ROOT_INO, b"target-dir", 0, 0, 0o755).unwrap();
+
+        for (source, target, old, new) in [
+            (
+                source_file.ino,
+                target_file.ino,
+                r"\source-file",
+                r"\target-file",
+            ),
+            (
+                source_dir.ino,
+                target_dir.ino,
+                r"\source-dir",
+                r"\target-dir",
+            ),
+        ] {
+            let error = rename_case(&ctx, source, old, new, false)
+                .expect_err("no-replace rename must reject an existing target");
+            assert_eq!(error.to_ntstatus(), STATUS_OBJECT_NAME_COLLISION.0);
+            assert_eq!(
+                vfs.lookup(ROOT_INO, &old.as_bytes()[1..]).unwrap().ino,
+                source
+            );
+            assert_eq!(
+                vfs.lookup(ROOT_INO, &new.as_bytes()[1..]).unwrap().ino,
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn sfs815_rename_with_replace_keeps_nonempty_directory_target_unchanged() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs815-rename-nonempty-dir");
+        let source = vfs.mkdir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+        let target = vfs.mkdir(ROOT_INO, b"target", 0, 0, 0o755).unwrap();
+        let child = vfs.create(target.ino, b"child", 0, 0, 0o644).unwrap();
+
+        let error = rename_case(&ctx, source.ino, r"\source", r"\target", true)
+            .expect_err("nonempty directory target must remain non-replaceable");
+
+        assert_eq!(error.to_ntstatus(), STATUS_DIRECTORY_NOT_EMPTY.0);
+        assert_eq!(vfs.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert_eq!(vfs.lookup(ROOT_INO, b"target").unwrap().ino, target.ino);
+        assert_eq!(vfs.lookup(target.ino, b"child").unwrap().ino, child.ino);
     }
 
     #[test]
@@ -4621,6 +4688,18 @@ mod tests {
         let timeout = VfsError::Meta(MetaError::Timeout("timeout".into()));
         let status = vfs_to_winfsp_err(timeout).to_ntstatus();
         assert_eq!(status, STATUS_IO_TIMEOUT.0);
+
+        let unsupported = VfsError::OperationNotSupported;
+        assert_eq!(
+            vfs_to_winfsp_err(unsupported).to_ntstatus(),
+            super::STATUS_NOT_SUPPORTED.0
+        );
+
+        let io_unsupported = VfsError::Io(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        assert_eq!(
+            vfs_to_winfsp_err(io_unsupported).to_ntstatus(),
+            super::STATUS_UNSUCCESSFUL.0
+        );
     }
 
     #[test]
@@ -6481,7 +6560,7 @@ mod tests {
         let (_tmp, vfs, ctx, queue) = make_test_context("semantic-parent-rename");
         let dir = vfs.mkdir(ROOT_INO, b"old", 0, 0, 0o755).expect("directory");
         vfs.create(dir.ino, b"child", 0, 0, 0o644).expect("child");
-        vfs.rename(ROOT_INO, b"old", ROOT_INO, b"new")
+        vfs.rename(ROOT_INO, b"old", ROOT_INO, b"new", true)
             .expect("rename");
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
         assert_eq!(

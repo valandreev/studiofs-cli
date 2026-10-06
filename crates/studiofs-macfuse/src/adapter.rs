@@ -1529,7 +1529,7 @@ impl StudioVfsAdapter {
             .then(|| self.vfs.lookup(newparent, newname).ok())
             .flatten();
         self.vfs
-            .rename(parent, name, newparent, newname)
+            .rename(parent, name, newparent, newname, true)
             .inspect(|_| {
                 if let Some(attr) = &overwritten {
                     self.clear_file_flags(attr.ino);

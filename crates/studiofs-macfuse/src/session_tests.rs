@@ -520,6 +520,7 @@ fn legacy_novncache_namespace_changes_do_not_need_entry_notifications() {
                     RENAME_SOURCE_NAME,
                     CONTRACT_ROOT_INO,
                     RENAME_TARGET_NAME,
+                    true,
                 )
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             let missing_rename_source = fs::metadata(&rename_source_path);
