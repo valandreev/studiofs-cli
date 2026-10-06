@@ -801,16 +801,13 @@ impl FilePayloadStore {
             Err(error) => return Err(error),
         };
 
-        let Some(unbuffered_alignment) = platform::unbuffered_alignment_for_file(&temp_file) else {
+        let Some(unbuffered_alignment) = platform::unbuffered_alignment_for_file(&temp_file)
+            .filter(|&alignment| platform::can_write_unbuffered_payload(data, alignment))
+        else {
             drop(temp_file);
             let _ = std::fs::remove_file(&temp_path);
             return Ok(None);
         };
-        if !platform::can_write_unbuffered_payload(data, unbuffered_alignment) {
-            drop(temp_file);
-            let _ = std::fs::remove_file(&temp_path);
-            return Ok(None);
-        }
 
         #[cfg(test)]
         self.shared
