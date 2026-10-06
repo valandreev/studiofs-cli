@@ -26,6 +26,8 @@ pub enum BridgeVfsErrorKind {
     XattrValueTooLarge,
     /// Input arguments or values were malformed or invalid.
     InvalidInput,
+    /// The requested filesystem operation is not supported.
+    OperationNotSupported,
     /// Access was denied for the requested operation.
     PermissionDenied,
     /// Metadata persistence is degraded and new mutations are blocked.
@@ -78,6 +80,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
             classify_storage_io_error(io_error)
         }
         VfsError::WouldBlock | VfsError::RemoteContentPending => BridgeVfsErrorKind::Retryable,
+        VfsError::OperationNotSupported => BridgeVfsErrorKind::OperationNotSupported,
         VfsError::InvalidName(_) => BridgeVfsErrorKind::InvalidInput,
         VfsError::Fetch(fetch_error) => classify_fetch_error(fetch_error),
         _ => BridgeVfsErrorKind::GenericFailure,
@@ -494,6 +497,16 @@ mod tests {
         assert_eq!(
             classify_vfs_error(&invalid),
             BridgeVfsErrorKind::InvalidInput
+        );
+
+        let io_unsupported = crate::VfsError::Io(std::io::Error::from(ErrorKind::Unsupported));
+        assert_eq!(
+            classify_vfs_error(&io_unsupported),
+            BridgeVfsErrorKind::GenericFailure
+        );
+        assert_eq!(
+            classify_vfs_error(&crate::VfsError::OperationNotSupported),
+            BridgeVfsErrorKind::OperationNotSupported
         );
 
         let blocked = crate::VfsError::WouldBlock;

@@ -995,9 +995,6 @@ fn note_critical_vfs_error(error: &studiofs_vfs::VfsError) {
 /// Map VfsError to WinFSP NTSTATUS error.
 fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     note_critical_vfs_error(&e);
-    if matches!(&e, VfsError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported) {
-        return winfsp::FspError::from(STATUS_NOT_SUPPORTED);
-    }
     match classify_vfs_error(&e) {
         BridgeVfsErrorKind::NotFound => winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND),
         BridgeVfsErrorKind::AlreadyExists => winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION),
@@ -1009,6 +1006,7 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
         }
         BridgeVfsErrorKind::XattrValueTooLarge => winfsp::FspError::from(STATUS_EA_TOO_LARGE),
         BridgeVfsErrorKind::InvalidInput => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
+        BridgeVfsErrorKind::OperationNotSupported => winfsp::FspError::from(STATUS_NOT_SUPPORTED),
         BridgeVfsErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
         BridgeVfsErrorKind::MetadataPersistenceDegraded => {
             winfsp::FspError::from(STATUS_IO_DEVICE_ERROR)
@@ -4691,10 +4689,16 @@ mod tests {
         let status = vfs_to_winfsp_err(timeout).to_ntstatus();
         assert_eq!(status, STATUS_IO_TIMEOUT.0);
 
-        let unsupported = VfsError::Io(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let unsupported = VfsError::OperationNotSupported;
         assert_eq!(
             vfs_to_winfsp_err(unsupported).to_ntstatus(),
             super::STATUS_NOT_SUPPORTED.0
+        );
+
+        let io_unsupported = VfsError::Io(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        assert_eq!(
+            vfs_to_winfsp_err(io_unsupported).to_ntstatus(),
+            super::STATUS_UNSUCCESSFUL.0
         );
     }
 

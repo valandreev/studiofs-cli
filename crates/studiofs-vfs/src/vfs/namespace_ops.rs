@@ -3006,11 +3006,7 @@ impl StudioVfs {
             }
             .into());
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "atomic no-replace rename is unsupported for filtered entries and trash",
-        )
-        .into())
+        Err(VfsError::OperationNotSupported)
     }
 
     async fn delete_source_tree_and_invalidate_trash_target(
@@ -3110,6 +3106,15 @@ impl StudioVfs {
             || self.should_ignore_directory_path(new_parent, new_name);
         let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
             && self.ignored_directory_has_probable_trash_ancestor(new_parent);
+        let prevalidated_source_entry = if !replace_if_exists && source_ignored.is_none() {
+            self.wait_for_deferred_namespace_entry(parent, name).await?;
+            let source_entry = meta.lookup(parent, name)?;
+            self.wait_for_deferred_namespace_entry(new_parent, new_name)
+                .await?;
+            Some(source_entry)
+        } else {
+            None
+        };
         let target_is_trash =
             if !replace_if_exists && source_ignored.is_none() && !target_is_ignored {
                 self.directory_has_probable_trash_ancestor(new_parent)?
@@ -3204,10 +3209,14 @@ impl StudioVfs {
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename looking up source"
         );
-        self.wait_for_deferred_namespace_entry(parent, name).await?;
-        self.wait_for_deferred_namespace_entry(new_parent, new_name)
-            .await?;
-        let source_entry = meta.lookup(parent, name)?;
+        let source_entry = if let Some(source_entry) = prevalidated_source_entry {
+            source_entry
+        } else {
+            self.wait_for_deferred_namespace_entry(parent, name).await?;
+            self.wait_for_deferred_namespace_entry(new_parent, new_name)
+                .await?;
+            meta.lookup(parent, name)?
+        };
         debug!(
             parent,
             name = %name_display,
@@ -3360,6 +3369,17 @@ mod tests {
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
 
     #[test]
+    fn sfs815_no_replace_missing_source_precedes_filtered_destination_rejection() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-missing-source-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs815-missing-source");
+
+        assert!(matches!(
+            vfs.rename(ROOT_INO, b"missing", ROOT_INO, b"._destination", false),
+            Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
+        ));
+    }
+
+    #[test]
     fn sfs815_no_replace_returns_collision_for_filtered_destination() {
         let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-filtered-");
         let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-filtered");
@@ -3395,7 +3415,7 @@ mod tests {
 
         assert!(matches!(
             vfs.rename(ROOT_INO, b"source", trash.ino, b"destination", false),
-            Err(VfsError::Io(ref error)) if error.kind() == std::io::ErrorKind::Unsupported
+            Err(VfsError::OperationNotSupported)
         ));
         assert_eq!(meta.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
         assert!(meta.lookup(trash.ino, b"destination").is_err());

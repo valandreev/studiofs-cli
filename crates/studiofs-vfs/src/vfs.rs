@@ -546,6 +546,10 @@ pub enum VfsError {
     #[error("lock conflict (EAGAIN)")]
     WouldBlock,
 
+    /// Requested filesystem operation is not supported.
+    #[error("operation is not supported")]
+    OperationNotSupported,
+
     /// Open/read is blocked while remote content is still uploading.
     #[error("remote content is still uploading (EAGAIN)")]
     RemoteContentPending,
