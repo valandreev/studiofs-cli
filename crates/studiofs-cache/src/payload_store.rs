@@ -97,6 +97,7 @@ struct PayloadStoreSharedState {
     buffered_read_fallback_handles: ReadHandleCache,
     #[cfg(windows)]
     unbuffered_read_scratch: Mutex<platform::UnbufferedReadBuffer>,
+    #[cfg(test)]
     pending_grouped_sync: PendingGroupedSync,
     #[cfg(test)]
     write_counters: PayloadWriteCounters,
@@ -173,6 +174,7 @@ impl FilePayloadStore {
                 buffered_read_fallback_handles: ReadHandleCache::new(read_fd_family_capacity),
                 #[cfg(windows)]
                 unbuffered_read_scratch: Mutex::new(platform::UnbufferedReadBuffer::new()),
+                #[cfg(test)]
                 pending_grouped_sync: PendingGroupedSync::default(),
                 #[cfg(test)]
                 write_counters: PayloadWriteCounters::default(),
@@ -396,7 +398,9 @@ impl FilePayloadStore {
         if durable_sync {
             self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
             self.sync_directory_put_barrier(payload_dir)?;
-        } else {
+        }
+        #[cfg(test)]
+        if !durable_sync {
             self.record_grouped_sync_targets(object_id, payload_dir);
         }
         Ok(PayloadBatchCommit { intent_path })
@@ -440,7 +444,6 @@ impl FilePayloadStore {
         }
         let staged = self.stage_batch_payloads(&prepared, durable_sync)?;
 
-        let mut synced_dirs = HashSet::new();
         let intent = self.write_batch_payload_intent(&staged, durable_sync)?;
         for idx in 0..staged.len() {
             let staged_entry = &staged[idx];
@@ -450,15 +453,16 @@ impl FilePayloadStore {
                 return Err(error);
             }
             self.invalidate_cached_read_handle(staged_entry.entry.object_id);
-            synced_dirs.insert(staged_entry.payload_dir.clone());
         }
 
         if durable_sync {
             self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
-            for dir in synced_dirs {
+            for dir in prepared_dirs {
                 self.sync_directory_put_barrier(&dir)?;
             }
-        } else {
+        }
+        #[cfg(test)]
+        if !durable_sync {
             for staged_entry in &staged {
                 self.record_grouped_sync_targets(
                     staged_entry.entry.object_id,
@@ -628,9 +632,12 @@ impl FilePayloadStore {
         for &object_id in object_ids {
             self.invalidate_cached_read_handle(object_id);
         }
-        let mut pending = self.shared.pending_grouped_sync.object_ids.lock();
-        for object_id in object_ids {
-            pending.remove(object_id);
+        #[cfg(test)]
+        {
+            let mut pending = self.shared.pending_grouped_sync.object_ids.lock();
+            for object_id in object_ids {
+                pending.remove(object_id);
+            }
         }
     }
 
@@ -699,6 +706,7 @@ impl FilePayloadStore {
         if matches!(self.sync_mode, LocalPayloadSyncMode::Fast) {
             // ponytail: Fast mode is throughput-first; use Durable mode when
             // crash-safe payload fsync/dirsync is required.
+            #[cfg(test)]
             self.clear_grouped_sync_targets();
             return Ok(());
         }
@@ -1278,19 +1286,19 @@ impl FilePayloadStore {
             .pop(&object_id);
     }
 
+    #[cfg(test)]
     fn record_grouped_sync_targets(&self, object_id: u64, payload_dir: &Path) {
         let mut object_ids = self.shared.pending_grouped_sync.object_ids.lock();
         object_ids.insert(object_id);
         drop(object_ids);
 
         let mut directories = self.shared.pending_grouped_sync.directories.lock();
-        directories.insert(self.layout.tmp_dir.clone());
-        directories.insert(payload_dir.to_path_buf());
-        directories.insert(self.layout.payload_objects_dir.clone());
-        directories.insert(self.layout.payload_root.clone());
-        directories.insert(self.layout.runtime_root.clone());
+        if !directories.contains(payload_dir) {
+            directories.insert(payload_dir.to_path_buf());
+        }
     }
 
+    #[cfg(test)]
     fn clear_grouped_sync_targets(&self) {
         self.shared.pending_grouped_sync.object_ids.lock().clear();
         self.shared.pending_grouped_sync.directories.lock().clear();
@@ -1498,6 +1506,7 @@ impl ReadHandleCache {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 struct PendingGroupedSync {
     object_ids: Mutex<HashSet<u64>>,
     directories: Mutex<HashSet<PathBuf>>,
@@ -2509,6 +2518,58 @@ mod tests {
     }
 
     #[test]
+    fn fast_mode_tracks_nested_shard_directories_across_batches() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let object_ids = [107, 632, 8001];
+        assert_eq!(
+            LocalPayloadLayout::payload_shard(object_ids[0]),
+            LocalPayloadLayout::payload_shard(object_ids[1])
+        );
+        let mut expected_dirs = HashSet::new();
+        for object_id in object_ids {
+            let path = layout.payload_object_path(object_id);
+            let dir = path.parent().unwrap();
+            assert_eq!(
+                dir.strip_prefix(&layout.payload_objects_dir)
+                    .unwrap()
+                    .components()
+                    .count(),
+                2
+            );
+            expected_dirs.insert(dir.to_path_buf());
+        }
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
+        for object_id in object_ids {
+            store.put(object_id, b"payload").unwrap();
+        }
+        assert_eq!(store.sync_barrier_snapshot().pending_grouped_dir_syncs, 2);
+        assert_eq!(
+            *store.shared.pending_grouped_sync.directories.lock(),
+            expected_dirs,
+        );
+        let entries = object_ids.map(|object_id| PayloadBatchEntry {
+            object_id,
+            data: b"payload",
+        });
+        store.put_batch(&entries).unwrap().complete();
+        assert_eq!(
+            *store.shared.pending_grouped_sync.directories.lock(),
+            expected_dirs,
+        );
+        store.sync_data().unwrap();
+        assert!(
+            store
+                .shared
+                .pending_grouped_sync
+                .directories
+                .lock()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn fast_mode_skips_put_barriers_on_grouped_sync_data() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
@@ -2643,6 +2704,18 @@ mod tests {
         assert_eq!(
             after_failure.pending_grouped_dir_syncs,
             pending_dirs.len().saturating_sub(1)
+        );
+        assert!(
+            store
+                .shared
+                .pending_grouped_sync
+                .directories
+                .lock()
+                .iter()
+                .all(|dir| {
+                    dir.strip_prefix(&store.layout.payload_objects_dir)
+                        .is_ok_and(|relative| relative.components().count() == 2)
+                })
         );
     }
 
