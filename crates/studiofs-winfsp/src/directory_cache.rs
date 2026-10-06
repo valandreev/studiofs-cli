@@ -5,14 +5,59 @@ use parking_lot::Mutex;
 use studiofs_meta::Ino;
 use studiofs_vfs::DirectoryEnumerationObservation;
 use tracing::trace;
-use winfsp::filesystem::{DirBufferLock, DirInfo};
+use winfsp::filesystem::{DirBufferLock, DirInfo, FileInfo, WideNameInfo};
 
 use crate::context::MAX_WINDOWS_COMPONENT_UTF16_UNITS;
 
 pub(super) const DEFAULT_ENTRY_BUDGET: usize = 64;
 pub(super) const DEFAULT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
-type CachedDirInfo = DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>;
+pub(super) type CachedDirInfo = DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>;
+
+pub(super) struct DirectorySnapshotChild {
+    file_info: FileInfo,
+    name_offset: usize,
+    name_len: usize,
+}
+
+impl DirectorySnapshotChild {
+    pub(super) fn new(names: &mut Vec<u16>, name: &[u16], file_info: FileInfo) -> Self {
+        let name_offset = names.len();
+        names.extend_from_slice(name);
+        Self {
+            file_info,
+            name_offset,
+            name_len: name.len(),
+        }
+    }
+
+    pub(super) fn accounted_bytes(child_count: usize, name_units: usize) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_mul(child_count)
+            .saturating_add(name_units.saturating_mul(std::mem::size_of::<u16>()))
+    }
+
+    pub(super) fn write_to(
+        &self,
+        names: &[u16],
+        dir_info: &mut CachedDirInfo,
+        lock: &DirBufferLock<'_>,
+    ) -> winfsp::Result<()> {
+        let name = &names[self.name_offset..self.name_offset + self.name_len];
+        prepare_directory_entry(dir_info, name, self.file_info.clone())?;
+        lock.write(dir_info)
+    }
+}
+
+pub(super) fn prepare_directory_entry(
+    dir_info: &mut CachedDirInfo,
+    name: &[u16],
+    file_info: FileInfo,
+) -> winfsp::Result<()> {
+    dir_info.set_name_raw(name)?;
+    *dir_info.file_info_mut() = file_info;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 #[cfg(test)]
@@ -46,7 +91,8 @@ impl DirectorySnapshotCacheKey {
 struct DirectorySnapshotEntries {
     dot: CachedDirInfo,
     dotdot: Option<CachedDirInfo>,
-    children: Vec<CachedDirInfo>,
+    children: Vec<DirectorySnapshotChild>,
+    child_names: Vec<u16>,
 }
 
 pub(super) struct DirectorySnapshot {
@@ -56,20 +102,27 @@ pub(super) struct DirectorySnapshot {
 }
 
 impl DirectorySnapshot {
+    pub(super) fn fixed_byte_size(has_dotdot: bool) -> usize {
+        std::mem::size_of::<CachedDirInfo>().saturating_mul(1 + usize::from(has_dotdot))
+    }
+
     pub(super) fn new(
         dot: CachedDirInfo,
         dotdot: Option<CachedDirInfo>,
-        children: Vec<CachedDirInfo>,
+        children: Vec<DirectorySnapshotChild>,
+        child_names: Vec<u16>,
     ) -> Self {
-        let info_size = std::mem::size_of::<CachedDirInfo>();
         let children_len = children.len();
-        let byte_size =
-            info_size.saturating_mul(1 + usize::from(dotdot.is_some()) + children.len());
+        let fixed_byte_size = Self::fixed_byte_size(dotdot.is_some());
+        let child_entry_bytes =
+            DirectorySnapshotChild::accounted_bytes(children.len(), child_names.len());
+        let byte_size = fixed_byte_size.saturating_add(child_entry_bytes);
         Self {
             entries: Mutex::new(DirectorySnapshotEntries {
                 dot,
                 dotdot,
                 children,
+                child_names,
             }),
             children_len,
             byte_size,
@@ -90,8 +143,9 @@ impl DirectorySnapshot {
         if let Some(dotdot) = entries.dotdot.as_mut() {
             let _ = lock.write(dotdot);
         }
-        for child in &mut entries.children {
-            lock.write(child)?;
+        let mut dir_info = CachedDirInfo::new();
+        for child in &entries.children {
+            child.write_to(&entries.child_names, &mut dir_info, lock)?;
         }
         Ok(())
     }
@@ -103,6 +157,7 @@ impl DirectorySnapshot {
                 dot: CachedDirInfo::new(),
                 dotdot: None,
                 children: Vec::new(),
+                child_names: Vec::new(),
             }),
             children_len: 0,
             byte_size,

@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use buffers::{SendConstBuffer, SendMutBuffer};
-use directory_cache::{DirectorySnapshot, DirectorySnapshotCache, DirectorySnapshotCacheKey};
+use directory_cache::{
+    CachedDirInfo, DirectorySnapshot, DirectorySnapshotCache, DirectorySnapshotCacheKey,
+    DirectorySnapshotChild, prepare_directory_entry,
+};
 use futures::FutureExt;
 use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
 pub(crate) use invalidation::PreparedWinfspNotifications;
@@ -1702,12 +1705,12 @@ impl StudioFsContext {
         const DOT: &[u16] = &[b'.' as u16];
         const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
 
-        let mut dot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+        let mut dot = CachedDirInfo::new();
         dot.set_name_raw(DOT)?;
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         *dot.file_info_mut() = attr_to_file_info(&attr);
 
-        let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+        let mut dotdot = CachedDirInfo::new();
         dotdot.set_name_raw(DOTDOT)?;
         *dotdot.file_info_mut() = attr_to_file_info(&attr);
         let mut dotdot = Some(dotdot);
@@ -1717,15 +1720,12 @@ impl StudioFsContext {
             .readdir_with_attrs(context.ino)
             .map_err(vfs_to_winfsp_err)?;
         let mut name_u16 = Vec::<u16>::new();
-        let info_size = std::mem::size_of::<DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>>();
-        let fixed_entry_count = 1 + usize::from(dotdot.is_some());
-        let fixed_byte_size = info_size.saturating_mul(fixed_entry_count);
+        let fixed_byte_size = DirectorySnapshot::fixed_byte_size(dotdot.is_some());
         let byte_budget = self.directory_snapshot_cache.byte_budget_if_enabled();
-        let max_cached_children = byte_budget
-            .map(|budget| budget.saturating_sub(fixed_byte_size) / info_size)
-            .unwrap_or(0)
-            .min(entries.len());
-        let mut children = Vec::with_capacity(max_cached_children);
+        let mut children: Vec<DirectorySnapshotChild> = Vec::new();
+        let mut child_names = Vec::new();
+        let mut snapshot_byte_size = fixed_byte_size;
+        let mut dir_info = CachedDirInfo::new();
         let mut direct = byte_budget.is_none_or(|budget| fixed_byte_size > budget);
 
         if direct {
@@ -1752,18 +1752,6 @@ impl StudioFsContext {
                 continue;
             }
 
-            let mut dir_info = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
-            if dir_info.set_name_raw(name_u16.as_slice()).is_err() {
-                let display_name = String::from_utf8_lossy(&entry.name);
-                warn!(
-                    "failed to set name for entry '{}': bytes={} utf16_len={}",
-                    display_name,
-                    entry.name.len(),
-                    name_u16.len()
-                );
-                continue;
-            }
-
             let fetched_attr;
             let child_attr = match &entry_with_attr.attr {
                 Some(attr) => attr,
@@ -1784,15 +1772,20 @@ impl StudioFsContext {
                     }
                 },
             };
-            *dir_info.file_info_mut() = attr_to_file_info(child_attr);
+            let file_info = attr_to_file_info(child_attr);
+            let child_entry_size = DirectorySnapshotChild::accounted_bytes(1, name_u16.len());
 
-            if !direct && children.len() >= max_cached_children {
+            if !direct
+                && byte_budget.is_some_and(|budget| {
+                    snapshot_byte_size.saturating_add(child_entry_size) > budget
+                })
+            {
                 let _ = lock.write(&mut dot);
                 if let Some(dotdot) = dotdot.as_mut() {
                     let _ = lock.write(dotdot);
                 }
-                for mut child in children.drain(..) {
-                    if let Err(error) = lock.write(&mut child) {
+                for child in children.drain(..) {
+                    if let Err(error) = child.write_to(&child_names, &mut dir_info, lock) {
                         warn!(
                             ino = context.ino,
                             error = ?error,
@@ -1801,11 +1794,22 @@ impl StudioFsContext {
                         return Ok(None);
                     }
                 }
-                children.shrink_to_fit();
+                children = Vec::new();
+                child_names = Vec::new();
                 direct = true;
             }
 
             if direct {
+                if prepare_directory_entry(&mut dir_info, name_u16.as_slice(), file_info).is_err() {
+                    let display_name = String::from_utf8_lossy(&entry.name);
+                    warn!(
+                        "failed to set name for entry '{}': bytes={} utf16_len={}",
+                        display_name,
+                        entry.name.len(),
+                        name_u16.len()
+                    );
+                    continue;
+                }
                 if let Err(error) = lock.write(&mut dir_info) {
                     warn!(
                         ino = context.ino,
@@ -1815,7 +1819,12 @@ impl StudioFsContext {
                     return Ok(None);
                 }
             } else {
-                children.push(dir_info);
+                children.push(DirectorySnapshotChild::new(
+                    &mut child_names,
+                    name_u16.as_slice(),
+                    file_info,
+                ));
+                snapshot_byte_size = snapshot_byte_size.saturating_add(child_entry_size);
             }
         }
 
@@ -1824,7 +1833,13 @@ impl StudioFsContext {
         }
 
         children.shrink_to_fit();
-        Ok(Some(DirectorySnapshot::new(dot, dotdot, children)))
+        child_names.shrink_to_fit();
+        Ok(Some(DirectorySnapshot::new(
+            dot,
+            dotdot,
+            children,
+            child_names,
+        )))
     }
 
     fn populate_directory_buffer(
@@ -2722,7 +2737,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
-    use winfsp::filesystem::{AsyncFileSystemContext, DirInfo, FileSystemContext};
+    use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
 
     fn cache_observation(
@@ -3042,16 +3057,66 @@ mod tests {
     }
 
     #[test]
+    fn directory_snapshot_stores_compact_entries_for_short_names() {
+        let (_tmp, vfs, mut ctx, _queue) = make_test_context("compact-directory-snapshot");
+        let long_name = "a-longer-child-name.txt";
+        let short_name = "b.txt";
+        vfs.create(ROOT_INO, long_name.as_bytes(), 1000, 1000, 0o644)
+            .expect("create long-named child");
+        vfs.create(ROOT_INO, short_name.as_bytes(), 1000, 1000, 0o644)
+            .expect("create short-named child");
+        let entry_size = std::mem::size_of::<super::CachedDirInfo>();
+        let child_size = std::mem::size_of::<super::directory_cache::DirectorySnapshotChild>();
+        let name_units = long_name.encode_utf16().count() + short_name.encode_utf16().count();
+        let expected_bytes = 2 * entry_size + 2 * child_size + name_units * 2;
+        ctx.directory_snapshot_cache =
+            super::directory_cache::DirectorySnapshotCache::new(1, expected_bytes);
+        let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDONLY);
+        let lock = handle
+            .dir_buffer
+            .acquire(true, None)
+            .expect("acquire directory buffer");
+
+        ctx.populate_directory_buffer(&handle, &lock)
+            .expect("populate directory buffer");
+
+        let stats = ctx.directory_snapshot_cache.snapshot();
+        assert_eq!(stats.occupancy_entries, 1);
+        assert_eq!(stats.occupancy_bytes, expected_bytes);
+    }
+
+    #[test]
     fn oversized_directory_snapshot_falls_back_to_direct_buffer_population() {
         let (_tmp, vfs, mut ctx, _queue) = make_test_context("oversized-directory-snapshot");
-        let entry_size =
-            std::mem::size_of::<DirInfo<{ super::MAX_WINDOWS_COMPONENT_UTF16_UNITS }>>();
+        let expected_names = ["a-001.txt", "b-002.txt", "c-003.txt"];
+        for name in expected_names {
+            vfs.create(ROOT_INO, name.as_bytes(), 1000, 1000, 0o644)
+                .expect("create child");
+        }
+        let entries = vfs
+            .readdir_with_attrs(ROOT_INO)
+            .expect("read children to verify fallback setup");
+        let mut actual_names: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.entry.name.as_slice())
+            .collect();
+        actual_names.sort_unstable();
+        let mut expected_names = expected_names.map(str::as_bytes);
+        expected_names.sort_unstable();
+        assert_eq!(actual_names, expected_names);
+
+        let fixed_byte_size = std::mem::size_of::<super::CachedDirInfo>() * 2;
+        let child_name_units = expected_names[0].len();
+        assert!(
+            expected_names
+                .iter()
+                .all(|name| name.len() == child_name_units)
+        );
+        let one_child_bytes = std::mem::size_of::<super::directory_cache::DirectorySnapshotChild>()
+            + child_name_units * std::mem::size_of::<u16>();
+        let byte_budget = fixed_byte_size + one_child_bytes;
         ctx.directory_snapshot_cache =
-            super::directory_cache::DirectorySnapshotCache::new(1, entry_size * 3);
-        vfs.create(ROOT_INO, b"oversized-a.txt", 1000, 1000, 0o644)
-            .expect("create first file");
-        vfs.create(ROOT_INO, b"oversized-b.txt", 1000, 1000, 0o644)
-            .expect("create second file");
+            super::directory_cache::DirectorySnapshotCache::new(1, byte_budget);
         let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDONLY);
 
         let lock = handle
@@ -3059,7 +3124,8 @@ mod tests {
             .acquire(true, None)
             .expect("acquire directory buffer");
         ctx.populate_directory_buffer(&handle, &lock)
-            .expect("populate oversized directory buffer");
+            .expect("populate directory and fall back after the cached prefix");
+        drop(lock);
 
         let stats = ctx.directory_snapshot_cache.snapshot();
         assert_eq!(stats.misses, 1);
