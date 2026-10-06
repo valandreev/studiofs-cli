@@ -2453,58 +2453,34 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<()> {
         self.ensure_writable()?;
         let callback_started = Instant::now();
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            old_path = %file_name.to_string_lossy(),
+            new_path = %new_file_name.to_string_lossy(),
+            replace_if_exists = _replace_if_exists,
+            thread_id = ?std::thread::current().id(),
+            "WinFSP rename callback started"
+        );
+        let hidden_path = maybe_hide_platform_root_path(&self.vfs, file_name)?
+            || maybe_hide_platform_root_path(&self.vfs, new_file_name)?;
+        if hidden_path {
             tracing::debug!(
                 old_path = %file_name.to_string_lossy(),
                 new_path = %new_file_name.to_string_lossy(),
-                replace_if_exists = _replace_if_exists,
-                thread_id = ?std::thread::current().id(),
-                "WinFSP rename callback started"
+                elapsed_ms = callback_started.elapsed().as_millis(),
+                "WinFSP rename callback rejected hidden path"
             );
-        }
-        let hidden_path = maybe_hide_platform_root_path(&self.vfs, file_name)
-            .and_then(|old_hidden| {
-                if old_hidden {
-                    Ok(true)
-                } else {
-                    maybe_hide_platform_root_path(&self.vfs, new_file_name)
-                }
-            })
-            .map_err(|error| {
-                if tracing::enabled!(tracing::Level::WARN) {
-                    tracing::warn!(
-                        old_path = %file_name.to_string_lossy(),
-                        new_path = %new_file_name.to_string_lossy(),
-                        elapsed_ms = callback_started.elapsed().as_millis(),
-                        error = %error,
-                        "WinFSP rename callback path check failed"
-                    );
-                }
-                error
-            })?;
-        if hidden_path {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                tracing::debug!(
-                    old_path = %file_name.to_string_lossy(),
-                    new_path = %new_file_name.to_string_lossy(),
-                    elapsed_ms = callback_started.elapsed().as_millis(),
-                    "WinFSP rename callback rejected hidden path"
-                );
-            }
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
         let plan = self
             .resolve_rename_callback_plan(file_name, new_file_name)
             .map_err(|error| {
-                if tracing::enabled!(tracing::Level::WARN) {
-                    tracing::warn!(
-                        old_path = %file_name.to_string_lossy(),
-                        new_path = %new_file_name.to_string_lossy(),
-                        elapsed_ms = callback_started.elapsed().as_millis(),
-                        error = %error,
-                        "WinFSP rename callback parent resolution failed"
-                    );
-                }
+                tracing::warn!(
+                    old_path = %file_name.to_string_lossy(),
+                    new_path = %new_file_name.to_string_lossy(),
+                    elapsed_ms = callback_started.elapsed().as_millis(),
+                    error = %error,
+                    "WinFSP rename callback parent resolution failed"
+                );
                 error
             })?;
 
@@ -2514,19 +2490,17 @@ impl FileSystemContext for StudioFsContext {
             plan.new_parent,
             &plan.new_name,
         ) {
-            if tracing::enabled!(tracing::Level::WARN) {
-                tracing::warn!(
-                    old_path = %file_name.to_string_lossy(),
-                    new_path = %new_file_name.to_string_lossy(),
-                    old_parent = plan.old_parent,
-                    old_name = %String::from_utf8_lossy(&plan.old_name),
-                    new_parent = plan.new_parent,
-                    new_name = %String::from_utf8_lossy(&plan.new_name),
-                    elapsed_ms = callback_started.elapsed().as_millis(),
-                    error = %err,
-                    "WinFSP rename callback VFS rename failed"
-                );
-            }
+            tracing::warn!(
+                old_path = %file_name.to_string_lossy(),
+                new_path = %new_file_name.to_string_lossy(),
+                old_parent = plan.old_parent,
+                old_name = %String::from_utf8_lossy(&plan.old_name),
+                new_parent = plan.new_parent,
+                new_name = %String::from_utf8_lossy(&plan.new_name),
+                elapsed_ms = callback_started.elapsed().as_millis(),
+                error = %err,
+                "WinFSP rename callback VFS rename failed"
+            );
             return Err(vfs_to_winfsp_err(err));
         }
 
