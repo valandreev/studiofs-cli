@@ -1715,6 +1715,7 @@ fn remove_batch_payload_intent(path: &Path) {
 }
 
 /// Appends lowercase hex of the lossy UTF-8 path, normalizing backslashes to slashes.
+/// Invalid Unicode is replaced with U+FFFD; the original OS path bytes are not preserved.
 fn write_batch_intent_path_hex(content: &mut String, path: &Path) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let path = path.to_string_lossy();
