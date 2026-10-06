@@ -8,8 +8,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 #[cfg(windows)]
-use std::path::PathBuf;
-#[cfg(windows)]
 use std::sync::LazyLock;
 
 #[cfg(all(test, target_os = "macos"))]
@@ -23,7 +21,9 @@ std::thread_local! {
 }
 
 #[cfg(windows)]
-const WINDOWS_UNBUFFERED_WRITE_ALIGNMENT: usize = 4096;
+const WINDOWS_UNBUFFERED_WRITE_ALIGNMENT: usize = MINIMUM_UNBUFFERED_ALIGNMENT;
+
+pub(crate) const MINIMUM_UNBUFFERED_ALIGNMENT: usize = if cfg!(windows) { 4096 } else { 1 };
 #[cfg(windows)]
 const WINDOWS_VOLUME_PATH_BUFFER_U16: usize = 32_768;
 #[cfg(windows)]
@@ -32,8 +32,11 @@ const WINDOWS_FINAL_PATH_INITIAL_BUFFER_U16: usize = 256;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 #[cfg(windows)]
-static WINDOWS_VOLUME_ALIGNMENT_CACHE: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+static WINDOWS_VOLUME_ALIGNMENT_CACHE: LazyLock<Mutex<HashMap<WindowsVolumeRoot, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(windows)]
+type WindowsVolumeRoot = [u16; 49];
 
 #[derive(Debug, Default)]
 /// Scratch buffer used to build aligned writes for unbuffered payload I/O.
@@ -589,7 +592,6 @@ fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
 
 #[cfg(windows)]
 fn windows_unbuffered_write_alignment_for_file(file: &File) -> Option<usize> {
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
 
     #[link(name = "kernel32")]
@@ -654,11 +656,8 @@ fn windows_unbuffered_write_alignment_for_file(file: &File) -> Option<usize> {
     };
     let mut cache = WINDOWS_VOLUME_ALIGNMENT_CACHE.lock();
     cached_windows_volume_alignment(&mut cache, volume_root, |volume_root| {
-        let volume_root_wide = volume_root
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
+        let mut volume_root_wide = [0_u16; 50];
+        volume_root_wide[..49].copy_from_slice(volume_root);
         let mut sectors_per_cluster = 0_u32;
         let mut bytes_per_sector = 0_u32;
         let mut free_clusters = 0_u32;
@@ -689,21 +688,21 @@ fn windows_unbuffered_write_alignment_for_file(file: &File) -> Option<usize> {
 }
 
 #[cfg(windows)]
-fn windows_volume_guid_root(final_path: &[u16]) -> Option<PathBuf> {
-    let root_end = final_path
-        .iter()
-        .position(|unit| *unit == u16::from(b'}'))?
-        .checked_add(2)?;
-    let root = String::from_utf16(final_path.get(..root_end)?).ok()?;
-    (root.starts_with(r"\\?\Volume{") && root.ends_with(r"}\"))
-        .then(|| PathBuf::from(root.to_ascii_lowercase()))
+fn windows_volume_guid_root(final_path: &[u16]) -> Option<WindowsVolumeRoot> {
+    let mut root: WindowsVolumeRoot = final_path.get(..49)?.try_into().ok()?;
+    for unit in &mut root {
+        *unit = u16::from(u8::try_from(*unit).ok()?.to_ascii_lowercase());
+    }
+    (root[..11].iter().copied().eq(r"\\?\volume{".encode_utf16())
+        && root[47..] == [u16::from(b'}'), u16::from(b'\\')])
+    .then_some(root)
 }
 
 #[cfg(windows)]
 fn cached_windows_volume_alignment(
-    cache: &mut HashMap<PathBuf, usize>,
-    volume_root: PathBuf,
-    query_alignment: impl FnOnce(&Path) -> Option<usize>,
+    cache: &mut HashMap<WindowsVolumeRoot, usize>,
+    volume_root: WindowsVolumeRoot,
+    query_alignment: impl FnOnce(&WindowsVolumeRoot) -> Option<usize>,
 ) -> Option<usize> {
     if let Some(alignment) = cache.get(&volume_root) {
         return Some(*alignment);
@@ -1012,11 +1011,14 @@ mod tests {
     #[test]
     fn windows_volume_alignment_cache_is_keyed_by_volume_and_only_caches_success() {
         let mut cache = HashMap::new();
-        let volume_a = PathBuf::from(r"\\?\Volume{a}\");
-        let volume_b = PathBuf::from(r"\\?\Volume{b}\");
+        let root = |path: &str| {
+            windows_volume_guid_root(&path.encode_utf16().collect::<Vec<_>>()).unwrap()
+        };
+        let volume_a = root(r"\\?\Volume{00000000-0000-0000-0000-000000000001}\");
+        let volume_b = root(r"\\?\Volume{00000000-0000-0000-0000-000000000002}\");
         let mut queries = 0;
 
-        let first = cached_windows_volume_alignment(&mut cache, volume_a.clone(), |_| {
+        let first = cached_windows_volume_alignment(&mut cache, volume_a, |_| {
             queries += 1;
             Some(8192)
         });
@@ -1035,9 +1037,9 @@ mod tests {
         );
         assert_eq!(queries, 2, "each volume's geometry should be queried once");
 
-        let failed_volume = PathBuf::from(r"\\?\Volume{failed}\");
+        let failed_volume = root(r"\\?\Volume{00000000-0000-0000-0000-000000000003}\");
         assert_eq!(
-            cached_windows_volume_alignment(&mut cache, failed_volume.clone(), |_| None),
+            cached_windows_volume_alignment(&mut cache, failed_volume, |_| None),
             None
         );
         assert_eq!(
@@ -1046,12 +1048,12 @@ mod tests {
             "failed geometry lookup must not poison the cache"
         );
 
-        let final_path: Vec<_> = r"\\?\Volume{ABC-123}\payload\object"
+        let final_path: Vec<_> = r"\\?\VOLUME{ABCDEF01-2345-6789-ABCD-0123456789AB}\payload\object"
             .encode_utf16()
             .collect();
         assert_eq!(
             windows_volume_guid_root(&final_path),
-            Some(PathBuf::from(r"\\?\volume{abc-123}\"))
+            Some(root(r"\\?\volume{abcdef01-2345-6789-abcd-0123456789ab}\"))
         );
         let network_path: Vec<_> = r"\\server\share\payload".encode_utf16().collect();
         assert_eq!(windows_volume_guid_root(&network_path), None);
