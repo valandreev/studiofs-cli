@@ -1097,6 +1097,7 @@ fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool 
 /// The WinFSP filesystem context — holds VFS and tokio runtime.
 pub struct StudioFsContext {
     vfs: Arc<StudioVfs>,
+    volume_label: String,
     rt: Handle,
     metadata_cache_policy: WinfspMetadataCachePolicy,
     /// Rejects every WinFSP mutation admission for a snapshot-backed context.
@@ -1182,8 +1183,10 @@ impl StudioFsContext {
     ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
+        let volume_label = vfs.volume_name().unwrap_or_else(|_| "StudioFS".to_owned());
         Ok(Self {
             vfs,
+            volume_label,
             rt,
             metadata_cache_policy,
             read_only,
@@ -1229,8 +1232,10 @@ impl StudioFsContext {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
             create_default_security_descriptor().expect("default WinFSP security descriptor");
+        let volume_label = vfs.volume_name().unwrap_or_else(|_| "StudioFS".to_owned());
         Self {
             vfs,
+            volume_label,
             rt: rt.handle().clone(),
             metadata_cache_policy,
             read_only,
@@ -2448,44 +2453,60 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<()> {
         self.ensure_writable()?;
         let callback_started = Instant::now();
-        let old_path = file_name.to_string_lossy();
-        let new_path = new_file_name.to_string_lossy();
-        let thread_id = std::thread::current().id();
-        tracing::info!(
-            old_path = %old_path,
-            new_path = %new_path,
-            replace_if_exists = _replace_if_exists,
-            thread_id = ?thread_id,
-            "WinFSP rename callback started"
-        );
-        if maybe_hide_platform_root_path(&self.vfs, file_name)?
-            || maybe_hide_platform_root_path(&self.vfs, new_file_name)?
-        {
-            tracing::info!(
-                old_path = %old_path,
-                new_path = %new_path,
-                elapsed_ms = callback_started.elapsed().as_millis(),
-                "WinFSP rename callback rejected hidden path"
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                old_path = %file_name.to_string_lossy(),
+                new_path = %new_file_name.to_string_lossy(),
+                replace_if_exists = _replace_if_exists,
+                thread_id = ?std::thread::current().id(),
+                "WinFSP rename callback started"
             );
+        }
+        let hidden_path = maybe_hide_platform_root_path(&self.vfs, file_name)
+            .and_then(|old_hidden| {
+                if old_hidden {
+                    Ok(true)
+                } else {
+                    maybe_hide_platform_root_path(&self.vfs, new_file_name)
+                }
+            })
+            .map_err(|error| {
+                if tracing::enabled!(tracing::Level::WARN) {
+                    tracing::warn!(
+                        old_path = %file_name.to_string_lossy(),
+                        new_path = %new_file_name.to_string_lossy(),
+                        elapsed_ms = callback_started.elapsed().as_millis(),
+                        error = %error,
+                        "WinFSP rename callback path check failed"
+                    );
+                }
+                error
+            })?;
+        if hidden_path {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    old_path = %file_name.to_string_lossy(),
+                    new_path = %new_file_name.to_string_lossy(),
+                    elapsed_ms = callback_started.elapsed().as_millis(),
+                    "WinFSP rename callback rejected hidden path"
+                );
+            }
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
-        tracing::info!(
-            old_path = %old_path,
-            new_path = %new_path,
-            elapsed_ms = callback_started.elapsed().as_millis(),
-            "WinFSP rename callback resolving parents"
-        );
-        let plan = self.resolve_rename_callback_plan(file_name, new_file_name)?;
-        tracing::info!(
-            old_path = %old_path,
-            new_path = %new_path,
-            old_parent = plan.old_parent,
-            old_name = %String::from_utf8_lossy(&plan.old_name),
-            new_parent = plan.new_parent,
-            new_name = %String::from_utf8_lossy(&plan.new_name),
-            elapsed_ms = callback_started.elapsed().as_millis(),
-            "WinFSP rename callback invoking VFS rename"
-        );
+        let plan = self
+            .resolve_rename_callback_plan(file_name, new_file_name)
+            .map_err(|error| {
+                if tracing::enabled!(tracing::Level::WARN) {
+                    tracing::warn!(
+                        old_path = %file_name.to_string_lossy(),
+                        new_path = %new_file_name.to_string_lossy(),
+                        elapsed_ms = callback_started.elapsed().as_millis(),
+                        error = %error,
+                        "WinFSP rename callback parent resolution failed"
+                    );
+                }
+                error
+            })?;
 
         if let Err(err) = self.vfs.rename(
             plan.old_parent,
@@ -2493,26 +2514,22 @@ impl FileSystemContext for StudioFsContext {
             plan.new_parent,
             &plan.new_name,
         ) {
-            tracing::warn!(
-                old_path = %old_path,
-                new_path = %new_path,
-                old_parent = plan.old_parent,
-                old_name = %String::from_utf8_lossy(&plan.old_name),
-                new_parent = plan.new_parent,
-                new_name = %String::from_utf8_lossy(&plan.new_name),
-                elapsed_ms = callback_started.elapsed().as_millis(),
-                error = %err,
-                "WinFSP rename callback VFS rename failed"
-            );
+            if tracing::enabled!(tracing::Level::WARN) {
+                tracing::warn!(
+                    old_path = %file_name.to_string_lossy(),
+                    new_path = %new_file_name.to_string_lossy(),
+                    old_parent = plan.old_parent,
+                    old_name = %String::from_utf8_lossy(&plan.old_name),
+                    new_parent = plan.new_parent,
+                    new_name = %String::from_utf8_lossy(&plan.new_name),
+                    elapsed_ms = callback_started.elapsed().as_millis(),
+                    error = %err,
+                    "WinFSP rename callback VFS rename failed"
+                );
+            }
             return Err(vfs_to_winfsp_err(err));
         }
 
-        tracing::info!(
-            old_path = %old_path,
-            new_path = %new_path,
-            elapsed_ms = callback_started.elapsed().as_millis(),
-            "WinFSP rename callback completed"
-        );
         Ok(())
     }
 
@@ -2550,12 +2567,7 @@ impl FileSystemContext for StudioFsContext {
         out_volume_info.total_size = st.blocks * st.bsize as u64;
         out_volume_info.free_size = st.bfree * st.bsize as u64;
 
-        // Use volume name from VFS
-        let name = self
-            .vfs
-            .volume_name()
-            .unwrap_or_else(|_| "StudioFS".to_string());
-        out_volume_info.set_volume_label(&name);
+        out_volume_info.set_volume_label(&self.volume_label);
         Ok(())
     }
 }
@@ -2873,6 +2885,16 @@ mod tests {
             metadata_cache_policy,
         );
         (tmp, vfs, ctx, queue)
+    }
+
+    #[test]
+    fn volume_label_is_cached_when_context_is_constructed() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cached-volume-label");
+
+        assert_eq!(
+            ctx.volume_label,
+            vfs.volume_name().expect("volume name should be available")
+        );
     }
 
     pub(super) fn flush_barrier_calls(vfs: &StudioVfs) -> u64 {
@@ -6157,6 +6179,53 @@ mod tests {
         assert_eq!(metrics.queue_depth, 3);
         assert_eq!(metrics.queue_peak, 3);
         assert_eq!(metrics.coalesced, 0);
+    }
+
+    #[test]
+    fn unchanged_invalidation_metrics_skip_snapshot_but_coalescing_publishes() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+
+        let (_tmp, vfs, _ctx, queue) = make_test_context("invalidation-snapshot-noop");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        let before = vfs.write_path_observability_snapshot().fuse_invalidation;
+
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 1,
+                    intents: vec![InvalidationIntent::Reset],
+                },
+                true,
+            ),
+            InvalidationAcceptance::Unsupported
+        );
+        let unsupported = vfs.write_path_observability_snapshot().fuse_invalidation;
+        assert_eq!(unsupported.snapshot_generation, before.snapshot_generation);
+        assert_eq!(queue.delivery_snapshot().unsupported_batches, 1);
+
+        let batch = |generation| InvalidationBatch {
+            generation,
+            intents: vec![InvalidationIntent::Attributes { ino: ROOT_INO }],
+        };
+        assert_eq!(
+            invalidator.invalidate_batch(&batch(2), true),
+            InvalidationAcceptance::Queued
+        );
+        let queued = vfs.write_path_observability_snapshot().fuse_invalidation;
+        assert_eq!(queued.queue_depth, 1);
+        assert_eq!(queued.coalesced, 0);
+        assert!(queued.snapshot_generation > unsupported.snapshot_generation);
+
+        assert_eq!(
+            invalidator.invalidate_batch(&batch(3), true),
+            InvalidationAcceptance::Queued
+        );
+        let coalesced = vfs.write_path_observability_snapshot().fuse_invalidation;
+        assert_eq!(coalesced.queue_depth, 1);
+        assert_eq!(coalesced.coalesced, 1);
+        assert!(coalesced.snapshot_generation > queued.snapshot_generation);
+        assert_eq!(queue.delivery_snapshot().queued_generation, Some(3));
     }
 
     #[test]
