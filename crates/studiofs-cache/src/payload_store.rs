@@ -11,6 +11,8 @@ use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -88,7 +90,6 @@ pub struct FilePayloadStore {
     sync_mode: LocalPayloadSyncMode,
     write_mode: LocalPayloadWriteMode,
     read_mode: LocalPayloadReadMode,
-    unbuffered_read_alignment: usize,
     shared: Arc<PayloadStoreSharedState>,
 }
 
@@ -108,6 +109,8 @@ struct PayloadStoreSharedState {
     fail_directory_sync: Mutex<Option<PathBuf>>,
     #[cfg(test)]
     fail_remove: Mutex<Option<u64>>,
+    #[cfg(test)]
+    unbuffered_write_alignment_override: Mutex<Option<usize>>,
     barrier_counters: SyncBarrierCounters,
 }
 
@@ -152,11 +155,6 @@ impl FilePayloadStore {
             // Persist the intent directory before any payload can be committed.
             platform::sync_directory(&layout.tmp_dir)?;
         }
-        let unbuffered_read_alignment = if read_mode == LocalPayloadReadMode::Unbuffered {
-            platform::unbuffered_read_alignment_for_path(&layout.payload_objects_dir)
-        } else {
-            1
-        };
         let read_fd_family_capacity = read_fd_cache_capacity();
         let total_read_fd_capacity = read_fd_family_capacity * READ_FD_CACHE_FAMILIES;
         debug!(
@@ -169,7 +167,6 @@ impl FilePayloadStore {
             sync_mode,
             write_mode,
             read_mode,
-            unbuffered_read_alignment,
             shared: Arc::new(PayloadStoreSharedState {
                 read_handles: ReadHandleCache::new(read_fd_family_capacity),
                 buffered_read_fallback_handles: ReadHandleCache::new(read_fd_family_capacity),
@@ -185,6 +182,8 @@ impl FilePayloadStore {
                 fail_directory_sync: Mutex::new(None),
                 #[cfg(test)]
                 fail_remove: Mutex::new(None),
+                #[cfg(test)]
+                unbuffered_write_alignment_override: Mutex::new(None),
                 barrier_counters: SyncBarrierCounters::default(),
             }),
         })
@@ -253,12 +252,21 @@ impl FilePayloadStore {
         let start = u64::try_from(data_offset).ok()?;
 
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
-            let alignment = self.unbuffered_read_alignment;
+            if !platform::can_read_unbuffered_range(
+                start,
+                out.len(),
+                platform::MINIMUM_UNBUFFERED_ALIGNMENT,
+            ) {
+                return self.read_into_buffered_fallback(object_id, data_offset, start, out);
+            }
+            let file = self.cached_read_handle(object_id).ok()?;
+            let Some(alignment) = file.unbuffered_alignment() else {
+                return self.read_into_buffered_fallback(object_id, data_offset, start, out);
+            };
             if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             }
 
-            let file = self.cached_read_handle(object_id).ok()?;
             match self.try_read_into_unbuffered(file.as_ref(), alignment, start, out) {
                 Ok(Some(read)) => return Some(read),
                 Ok(None) => {
@@ -788,16 +796,9 @@ impl FilePayloadStore {
         sync_file_data: bool,
         unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
     ) -> Result<Option<PathBuf>, FilePayloadStoreError> {
-        let unbuffered_alignment = platform::unbuffered_write_alignment_for_path(temp_dir);
-        if !platform::can_write_unbuffered_payload(data, unbuffered_alignment) {
+        if !platform::can_write_unbuffered_payload(data, platform::MINIMUM_UNBUFFERED_ALIGNMENT) {
             return Ok(None);
         }
-
-        #[cfg(test)]
-        self.shared
-            .write_counters
-            .unbuffered_write_attempts
-            .fetch_add(1, Ordering::Relaxed);
 
         let (mut temp_file, temp_path) = match self.create_temp_file_with_opener(
             temp_dir,
@@ -812,6 +813,25 @@ impl FilePayloadStore {
             }
             Err(error) => return Err(error),
         };
+
+        #[cfg(test)]
+        let alignment = (*self.shared.unbuffered_write_alignment_override.lock())
+            .or_else(|| platform::unbuffered_alignment_for_file(&temp_file));
+        #[cfg(not(test))]
+        let alignment = platform::unbuffered_alignment_for_file(&temp_file);
+        let Some(unbuffered_alignment) = alignment
+            .filter(|&alignment| platform::can_write_unbuffered_payload(data, alignment))
+        else {
+            drop(temp_file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Ok(None);
+        };
+
+        #[cfg(test)]
+        self.shared
+            .write_counters
+            .unbuffered_write_attempts
+            .fetch_add(1, Ordering::Relaxed);
 
         if let Err(error) = platform::write_all_unbuffered_with_buffer(
             &mut temp_file,
@@ -1057,6 +1077,11 @@ impl FilePayloadStore {
         object_id: u64,
         mut opener: impl FnMut(&Path) -> io::Result<File>,
     ) -> Result<(File, PathBuf), FilePayloadStoreError> {
+        #[cfg(test)]
+        self.shared
+            .write_counters
+            .temp_file_create_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let process_id = std::process::id();
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
             let sequence = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1194,13 +1219,16 @@ impl FilePayloadStore {
         }
     }
 
-    fn cached_read_handle(&self, object_id: u64) -> io::Result<Arc<File>> {
+    fn cached_read_handle(&self, object_id: u64) -> io::Result<Arc<CachedReadHandle>> {
         self.cached_read_handle_from_cache(object_id, &self.shared.read_handles, |this, path| {
             this.open_for_read(path)
         })
     }
 
-    fn cached_buffered_read_fallback_handle(&self, object_id: u64) -> io::Result<Arc<File>> {
+    fn cached_buffered_read_fallback_handle(
+        &self,
+        object_id: u64,
+    ) -> io::Result<Arc<CachedReadHandle>> {
         self.cached_read_handle_from_cache(
             object_id,
             &self.shared.buffered_read_fallback_handles,
@@ -1213,7 +1241,7 @@ impl FilePayloadStore {
         object_id: u64,
         cache: &ReadHandleCache,
         mut opener: impl FnMut(&Self, &Path) -> io::Result<File>,
-    ) -> io::Result<Arc<File>> {
+    ) -> io::Result<Arc<CachedReadHandle>> {
         let shard = read_fd_shard_idx(object_id);
         if let Some(file) = cache.shards[shard].lock().get(&object_id).cloned() {
             cache.hits.fetch_add(1, Ordering::Relaxed);
@@ -1240,7 +1268,7 @@ impl FilePayloadStore {
             }
             Err(error) => return Err(error),
         };
-        let file = Arc::new(file);
+        let file = Arc::new(CachedReadHandle::new(file));
         if let Err(error) = platform::advise_random(file.as_ref()) {
             warn!(
                 object_id,
@@ -1456,10 +1484,54 @@ impl FilePayloadStore {
 #[repr(align(128))]
 #[derive(Debug)]
 struct ReadHandleCache {
-    shards: [Mutex<LruCache<u64, Arc<File>>>; READ_FD_CACHE_SHARDS],
+    shards: [Mutex<LruCache<u64, Arc<CachedReadHandle>>>; READ_FD_CACHE_SHARDS],
     hits: CachePaddedAtomicU64,
     misses: CachePaddedAtomicU64,
     evictions: CachePaddedAtomicU64,
+}
+
+#[derive(Debug)]
+struct CachedReadHandle {
+    file: File,
+    #[cfg(windows)]
+    unbuffered_alignment: OnceLock<Option<usize>>,
+    #[cfg(all(windows, test))]
+    alignment_discoveries: std::sync::atomic::AtomicUsize,
+}
+
+impl CachedReadHandle {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            #[cfg(windows)]
+            unbuffered_alignment: OnceLock::new(),
+            #[cfg(all(windows, test))]
+            alignment_discoveries: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn unbuffered_alignment(&self) -> Option<usize> {
+        #[cfg(windows)]
+        {
+            *self.unbuffered_alignment.get_or_init(|| {
+                #[cfg(test)]
+                self.alignment_discoveries.fetch_add(1, Ordering::Relaxed);
+                platform::unbuffered_alignment_for_file(&self.file)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            platform::unbuffered_alignment_for_file(&self.file)
+        }
+    }
+}
+
+impl std::ops::Deref for CachedReadHandle {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
 }
 
 impl ReadHandleCache {
@@ -1519,6 +1591,7 @@ struct PendingGroupedSync {
 #[repr(align(128))]
 #[derive(Debug, Default)]
 struct PayloadWriteCounters {
+    temp_file_create_attempts: CachePaddedAtomicU64,
     unbuffered_write_attempts: CachePaddedAtomicU64,
     unbuffered_write_successes: CachePaddedAtomicU64,
     unbuffered_write_fallbacks: CachePaddedAtomicU64,
@@ -2054,7 +2127,7 @@ mod tests {
             .set_len(64 * 1024 * 1024)
             .unwrap();
         let file = store.cached_read_handle(748).unwrap();
-        let mut cursor = file.as_ref();
+        let mut cursor = &file.file;
         assert_eq!(cursor.stream_position().unwrap(), 0);
 
         store.advise_will_need(748);
@@ -2162,6 +2235,88 @@ mod tests {
         assert_eq!(
             store.read_mode_snapshot().payload_path_builds,
             paths_after_miss
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unbuffered_alignment_is_discovered_once_per_cached_handle() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_modes(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::Buffered,
+            LocalPayloadReadMode::Unbuffered,
+        )
+        .unwrap();
+        store.put(4302, &vec![b'x'; 8192]).unwrap();
+        let cloned_store = store.clone();
+        let handle = store.cached_read_handle(4302).unwrap();
+        let mut out = vec![0; 4096];
+
+        assert_eq!(store.read_into(4302, 0, &mut out), Some(out.len()));
+        assert_eq!(cloned_store.read_into(4302, 0, &mut out), Some(out.len()));
+        assert_eq!(handle.alignment_discoveries.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unbuffered_write_alignment_mismatch_cleans_up_temp_file_before_fallback() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_modes(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::UnbufferedFast,
+            LocalPayloadReadMode::Buffered,
+        )
+        .unwrap();
+        *store.shared.unbuffered_write_alignment_override.lock() = Some(8192);
+        let mut scratch = platform::UnbufferedWriteBuffer::new();
+        let create_attempts = store
+            .shared
+            .write_counters
+            .temp_file_create_attempts
+            .load(Ordering::Relaxed);
+        let unbuffered_write_attempts = store
+            .shared
+            .write_counters
+            .unbuffered_write_attempts
+            .load(Ordering::Relaxed);
+        let files_before = std::fs::read_dir(&store.layout.tmp_dir).unwrap().count();
+
+        assert!(
+            store
+                .try_write_temp_payload_file_unbuffered(
+                    &store.layout.tmp_dir,
+                    4303,
+                    &vec![b'x'; 4096],
+                    false,
+                    &mut scratch,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .shared
+                .write_counters
+                .temp_file_create_attempts
+                .load(Ordering::Relaxed),
+            create_attempts + 1
+        );
+        assert_eq!(
+            store
+                .shared
+                .write_counters
+                .unbuffered_write_attempts
+                .load(Ordering::Relaxed),
+            unbuffered_write_attempts
+        );
+        assert_eq!(
+            std::fs::read_dir(&store.layout.tmp_dir).unwrap().count(),
+            files_before
         );
     }
 
