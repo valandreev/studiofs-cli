@@ -450,7 +450,9 @@ impl FilePayloadStore {
                 return Err(error);
             }
             self.invalidate_cached_read_handle(staged_entry.entry.object_id);
-            synced_dirs.insert(staged_entry.payload_dir.clone());
+            if durable_sync {
+                synced_dirs.insert(staged_entry.payload_dir.clone());
+            }
         }
 
         if durable_sync {
@@ -2510,7 +2512,11 @@ mod tests {
     fn fast_mode_tracks_nested_shard_directories_across_batches() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
-        let object_ids = [8001, 8002];
+        let object_ids = [107, 632, 8001];
+        assert_eq!(
+            LocalPayloadLayout::payload_shard(object_ids[0]),
+            LocalPayloadLayout::payload_shard(object_ids[1])
+        );
         let mut expected_dirs = HashSet::new();
         for object_id in object_ids {
             let path = layout.payload_object_path(object_id);
