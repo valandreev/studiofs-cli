@@ -2771,7 +2771,7 @@ mod tests {
             let name_bytes = &bytes[offset + header_size..record_end];
             assert_eq!(name_bytes.len() % 2, 0);
             let name: Vec<_> = name_bytes
-                .chunks_exact(2)
+                .chunks(2)
                 .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
                 .collect();
             names.push(String::from_utf16_lossy(&name));
