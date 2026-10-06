@@ -1803,8 +1803,7 @@ impl StudioFsContext {
             }
 
             if direct {
-                if prepare_directory_entry(&mut dir_info, name_u16.as_slice(), file_info).is_err()
-                {
+                if prepare_directory_entry(&mut dir_info, name_u16.as_slice(), file_info).is_err() {
                     let display_name = String::from_utf8_lossy(&entry.name);
                     warn!(
                         "failed to set name for entry '{}': bytes={} utf16_len={}",
@@ -2746,6 +2745,45 @@ mod tests {
     use winfsp::filesystem::{AsyncFileSystemContext, DirInfo, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
 
+    fn directory_buffer_names(handle: &StudioFileHandle) -> Vec<String> {
+        // SAFETY: In the pinned winfsp crate, DirMarker contains only an Option<&U16CStr>;
+        // zero initializes that option to None, selecting the first directory record.
+        let marker = unsafe { std::mem::zeroed::<winfsp::filesystem::DirMarker<'static>>() };
+        let mut bytes = vec![0; 4096];
+        let written = handle.dir_buffer.read(marker, &mut bytes) as usize;
+        bytes.truncate(written);
+
+        let header_size = std::mem::size_of::<DirInfo<0>>();
+        let record_alignment = std::mem::align_of::<DirInfo<0>>();
+        let mut names = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if bytes.len() - offset < header_size {
+                break;
+            }
+            let size = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            if size == 0 {
+                break;
+            }
+            let record_end = offset + size;
+            assert!(size >= header_size);
+            assert!(record_end <= bytes.len());
+            let name_bytes = &bytes[offset + header_size..record_end];
+            assert_eq!(name_bytes.len() % 2, 0);
+            let name: Vec<_> = name_bytes
+                .chunks_exact(2)
+                .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+                .collect();
+            names.push(String::from_utf16_lossy(&name));
+
+            if record_end == bytes.len() {
+                break;
+            }
+            offset += size.div_ceil(record_alignment) * record_alignment;
+        }
+        names
+    }
+
     fn cache_observation(
         namespace_epoch: u64,
         directory_generation: u64,
@@ -3086,53 +3124,25 @@ mod tests {
     }
 
     #[test]
-    fn reused_directory_entry_limits_record_size_after_shorter_name() {
-        let long_name: Vec<_> = "a-long-directory-child-name.txt".encode_utf16().collect();
-        let short_name: Vec<_> = "b.txt".encode_utf16().collect();
-        let mut reused = super::CachedDirInfo::new();
-        super::directory_cache::prepare_directory_entry(
-            &mut reused,
-            long_name.as_slice(),
-            winfsp::filesystem::FileInfo::default(),
-        )
-        .unwrap();
-        super::directory_cache::prepare_directory_entry(
-            &mut reused,
-            short_name.as_slice(),
-            winfsp::filesystem::FileInfo::default(),
-        )
-        .unwrap();
-        let record = std::ptr::from_ref(&reused);
-        let header_size = std::mem::size_of::<DirInfo<0>>();
-        // SAFETY: DirInfo is repr(C); `new` and `set_name_raw` initialize its size field and the
-        // complete current name prefix. The zero-length DirInfo gives the trailing name offset.
-        let (record_size, record_name) = unsafe {
-            (
-                record.cast::<u16>().read() as usize,
-                std::slice::from_raw_parts(
-                    record.cast::<u8>().add(header_size).cast::<u16>(),
-                    short_name.len(),
-                ),
-            )
-        };
-        assert_eq!(
-            record_size,
-            header_size + std::mem::size_of_val(short_name.as_slice()),
-            "the serialized size must stop after the shorter name"
-        );
-        assert_eq!(record_name, short_name.as_slice());
-    }
-
-    #[test]
     fn oversized_directory_snapshot_falls_back_to_direct_buffer_population() {
         let (_tmp, vfs, mut ctx, _queue) = make_test_context("oversized-directory-snapshot");
-        let entry_size = std::mem::size_of::<super::CachedDirInfo>();
-        ctx.directory_snapshot_cache =
-            super::directory_cache::DirectorySnapshotCache::new(1, entry_size * 2);
-        vfs.create(ROOT_INO, b"oversized-a.txt", 1000, 1000, 0o644)
+        let long_name = "a-long-child-name.txt";
+        let short_name = "b.txt";
+        let direct_name = "c-another-long-child-name.txt";
+        vfs.create(ROOT_INO, long_name.as_bytes(), 1000, 1000, 0o644)
             .expect("create first file");
-        vfs.create(ROOT_INO, b"oversized-b.txt", 1000, 1000, 0o644)
+        vfs.create(ROOT_INO, short_name.as_bytes(), 1000, 1000, 0o644)
             .expect("create second file");
+        vfs.create(ROOT_INO, direct_name.as_bytes(), 1000, 1000, 0o644)
+            .expect("create third file");
+        let fixed_byte_size = std::mem::size_of::<super::CachedDirInfo>() * 2;
+        let cached_child_bytes =
+            std::mem::size_of::<super::directory_cache::DirectorySnapshotChild>()
+                + long_name.encode_utf16().count() * std::mem::size_of::<u16>();
+        ctx.directory_snapshot_cache = super::directory_cache::DirectorySnapshotCache::new(
+            1,
+            fixed_byte_size + cached_child_bytes,
+        );
         let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDONLY);
 
         let lock = handle
@@ -3141,7 +3151,12 @@ mod tests {
             .expect("acquire directory buffer");
         ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate oversized directory buffer");
+        drop(lock);
 
+        let names = directory_buffer_names(&handle);
+        assert!(names.iter().any(|name| name == long_name));
+        assert!(names.iter().any(|name| name == short_name));
+        assert!(names.iter().any(|name| name == direct_name));
         let stats = ctx.directory_snapshot_cache.snapshot();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.occupancy_entries, 0);

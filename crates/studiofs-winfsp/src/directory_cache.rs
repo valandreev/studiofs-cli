@@ -14,7 +14,6 @@ pub(super) const DEFAULT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
 pub(super) type CachedDirInfo = DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>;
 
-#[derive(Clone)]
 pub(super) struct DirectorySnapshotChild {
     pub(super) file_info: FileInfo,
     pub(super) name_offset: usize,
@@ -23,13 +22,13 @@ pub(super) struct DirectorySnapshotChild {
 
 impl DirectorySnapshotChild {
     pub(super) fn write_to(
-        self,
+        &self,
         names: &[u16],
         dir_info: &mut CachedDirInfo,
         lock: &DirBufferLock<'_>,
     ) -> winfsp::Result<()> {
         let name = &names[self.name_offset..self.name_offset + self.name_len];
-        prepare_directory_entry(dir_info, name, self.file_info)?;
+        prepare_directory_entry(dir_info, name, self.file_info.clone())?;
         lock.write(dir_info)
     }
 }
@@ -128,9 +127,7 @@ impl DirectorySnapshot {
         }
         let mut dir_info = CachedDirInfo::new();
         for child in &entries.children {
-            child
-                .clone()
-                .write_to(&entries.child_names, &mut dir_info, lock)?;
+            child.write_to(&entries.child_names, &mut dir_info, lock)?;
         }
         Ok(())
     }
