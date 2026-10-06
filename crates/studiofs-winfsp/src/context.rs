@@ -1705,12 +1705,12 @@ impl StudioFsContext {
         const DOT: &[u16] = &[b'.' as u16];
         const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
 
-        let mut dot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+        let mut dot = CachedDirInfo::new();
         dot.set_name_raw(DOT)?;
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         *dot.file_info_mut() = attr_to_file_info(&attr);
 
-        let mut dotdot = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+        let mut dotdot = CachedDirInfo::new();
         dotdot.set_name_raw(DOTDOT)?;
         *dotdot.file_info_mut() = attr_to_file_info(&attr);
         let mut dotdot = Some(dotdot);
@@ -1720,15 +1720,11 @@ impl StudioFsContext {
             .readdir_with_attrs(context.ino)
             .map_err(vfs_to_winfsp_err)?;
         let mut name_u16 = Vec::<u16>::new();
-        let info_size = std::mem::size_of::<DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>>();
+        let info_size = std::mem::size_of::<CachedDirInfo>();
         let fixed_entry_count = 1 + usize::from(dotdot.is_some());
         let fixed_byte_size = info_size.saturating_mul(fixed_entry_count);
         let byte_budget = self.directory_snapshot_cache.byte_budget_if_enabled();
-        let max_cached_children = byte_budget
-            .map(|budget| budget.saturating_sub(fixed_byte_size) / info_size)
-            .unwrap_or(0)
-            .min(entries.len());
-        let mut children: Vec<DirectorySnapshotChild> = Vec::with_capacity(max_cached_children);
+        let mut children: Vec<DirectorySnapshotChild> = Vec::new();
         let mut child_names = Vec::new();
         let mut snapshot_byte_size = fixed_byte_size;
         let mut dir_info = CachedDirInfo::new();
@@ -1792,9 +1788,7 @@ impl StudioFsContext {
                     let _ = lock.write(dotdot);
                 }
                 for child in children.drain(..) {
-                    let name = &child_names[child.name_offset..child.name_offset + child.name_len];
-                    prepare_directory_entry(&mut dir_info, name, &child.file_info)?;
-                    if let Err(error) = lock.write(&mut dir_info) {
+                    if let Err(error) = child.write_to(&child_names, &mut dir_info, lock) {
                         warn!(
                             ino = context.ino,
                             error = ?error,
@@ -1803,14 +1797,13 @@ impl StudioFsContext {
                         return Ok(None);
                     }
                 }
-                children.shrink_to_fit();
-                child_names.clear();
-                child_names.shrink_to_fit();
+                children = Vec::new();
+                child_names = Vec::new();
                 direct = true;
             }
 
             if direct {
-                if prepare_directory_entry(&mut dir_info, name_u16.as_slice(), &file_info).is_err()
+                if prepare_directory_entry(&mut dir_info, name_u16.as_slice(), file_info).is_err()
                 {
                     let display_name = String::from_utf8_lossy(&entry.name);
                     warn!(
@@ -3085,7 +3078,7 @@ mod tests {
         ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate directory buffer");
 
-        let entry_size = std::mem::size_of::<DirInfo<{ super::MAX_WINDOWS_COMPONENT_UTF16_UNITS }>>();
+        let entry_size = std::mem::size_of::<super::CachedDirInfo>();
         assert!(
             ctx.directory_snapshot_cache.snapshot().occupancy_bytes < entry_size * 4,
             "short child names should not occupy full-size DirInfo records in the cached snapshot"
@@ -3096,18 +3089,17 @@ mod tests {
     fn reused_directory_entry_limits_record_size_after_shorter_name() {
         let long_name: Vec<_> = "a-long-directory-child-name.txt".encode_utf16().collect();
         let short_name: Vec<_> = "b.txt".encode_utf16().collect();
-        let mut reused = DirInfo::<{ super::MAX_WINDOWS_COMPONENT_UTF16_UNITS }>::new();
-        let file_info = winfsp::filesystem::FileInfo::default();
+        let mut reused = super::CachedDirInfo::new();
         super::directory_cache::prepare_directory_entry(
             &mut reused,
             long_name.as_slice(),
-            &file_info,
+            winfsp::filesystem::FileInfo::default(),
         )
         .unwrap();
         super::directory_cache::prepare_directory_entry(
             &mut reused,
             short_name.as_slice(),
-            &file_info,
+            winfsp::filesystem::FileInfo::default(),
         )
         .unwrap();
         let record = std::ptr::from_ref(&reused);
@@ -3134,8 +3126,7 @@ mod tests {
     #[test]
     fn oversized_directory_snapshot_falls_back_to_direct_buffer_population() {
         let (_tmp, vfs, mut ctx, _queue) = make_test_context("oversized-directory-snapshot");
-        let entry_size =
-            std::mem::size_of::<DirInfo<{ super::MAX_WINDOWS_COMPONENT_UTF16_UNITS }>>();
+        let entry_size = std::mem::size_of::<super::CachedDirInfo>();
         ctx.directory_snapshot_cache =
             super::directory_cache::DirectorySnapshotCache::new(1, entry_size * 2);
         vfs.create(ROOT_INO, b"oversized-a.txt", 1000, 1000, 0o644)

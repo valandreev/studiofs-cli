@@ -14,19 +14,33 @@ pub(super) const DEFAULT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
 pub(super) type CachedDirInfo = DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>;
 
+#[derive(Clone)]
 pub(super) struct DirectorySnapshotChild {
     pub(super) file_info: FileInfo,
     pub(super) name_offset: usize,
     pub(super) name_len: usize,
 }
 
+impl DirectorySnapshotChild {
+    pub(super) fn write_to(
+        self,
+        names: &[u16],
+        dir_info: &mut CachedDirInfo,
+        lock: &DirBufferLock<'_>,
+    ) -> winfsp::Result<()> {
+        let name = &names[self.name_offset..self.name_offset + self.name_len];
+        prepare_directory_entry(dir_info, name, self.file_info)?;
+        lock.write(dir_info)
+    }
+}
+
 pub(super) fn prepare_directory_entry(
     dir_info: &mut CachedDirInfo,
     name: &[u16],
-    file_info: &FileInfo,
+    file_info: FileInfo,
 ) -> winfsp::Result<()> {
     dir_info.set_name_raw(name)?;
-    *dir_info.file_info_mut() = file_info.clone();
+    *dir_info.file_info_mut() = file_info;
     Ok(())
 }
 
@@ -114,9 +128,9 @@ impl DirectorySnapshot {
         }
         let mut dir_info = CachedDirInfo::new();
         for child in &entries.children {
-            let name = &entries.child_names[child.name_offset..child.name_offset + child.name_len];
-            prepare_directory_entry(&mut dir_info, name, &child.file_info)?;
-            lock.write(&mut dir_info)?;
+            child
+                .clone()
+                .write_to(&entries.child_names, &mut dir_info, lock)?;
         }
         Ok(())
     }
