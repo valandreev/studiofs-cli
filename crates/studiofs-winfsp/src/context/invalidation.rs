@@ -579,18 +579,15 @@ impl WinfspInvalidationQueue {
         mark_notification_in_flight: bool,
     ) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
         let mut state = self.state.lock();
-        let order = std::mem::take(&mut state.order);
+        let mut targets = Vec::with_capacity(state.order.len());
         state.pending.clear();
         let drained_since = state.pending_since.take();
-        let targets = order
-            .into_iter()
-            .map(|key| {
-                let ino = match &key {
-                    NotificationKey::Inode(ino) | NotificationKey::Path { ino, .. } => *ino,
-                };
-                (ino, state.path_overrides.remove(&key))
-            })
-            .collect::<Vec<_>>();
+        while let Some(key) = state.order.pop_front() {
+            let ino = match &key {
+                NotificationKey::Inode(ino) | NotificationKey::Path { ino, .. } => *ino,
+            };
+            targets.push((ino, state.path_overrides.remove(&key)));
+        }
         if mark_notification_in_flight && !targets.is_empty() {
             state.deferred_since = match (state.deferred_since, drained_since) {
                 (Some(existing), Some(drained)) => Some(existing.min(drained)),
@@ -628,6 +625,11 @@ impl WinfspInvalidationQueue {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.state.lock().pending.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn order_capacity(&self) -> usize {
+        self.state.lock().order.capacity()
     }
 
     pub(crate) fn close(&self) {

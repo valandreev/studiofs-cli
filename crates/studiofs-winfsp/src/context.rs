@@ -5983,6 +5983,24 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_invalidation_queue_retains_order_storage_across_drains() {
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-drain-storage");
+        let first = [31, 11, 19];
+        queue.extend(first);
+        let capacity = queue.order_capacity();
+        assert!(capacity >= first.len());
+
+        assert_eq!(queue.drain(), vec![11, 19, 31]);
+        assert_eq!(queue.order_capacity(), capacity);
+
+        let second = [37, 13, 23];
+        queue.extend(second);
+        assert_eq!(queue.order_capacity(), capacity);
+        assert_eq!(queue.drain(), vec![13, 23, 37]);
+        assert_eq!(queue.order_capacity(), capacity);
+    }
+
+    #[test]
     fn winfsp_invalidation_queue_push_after_close_is_nonblocking() {
         let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-close");
         queue.close();
