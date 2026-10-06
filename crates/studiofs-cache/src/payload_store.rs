@@ -800,15 +800,6 @@ impl FilePayloadStore {
             return Ok(None);
         }
 
-        #[cfg(test)]
-        let path_alignment = (*self.shared.unbuffered_write_alignment_override.lock())
-            .unwrap_or_else(|| platform::unbuffered_write_alignment_for_path(temp_dir));
-        #[cfg(not(test))]
-        let path_alignment = platform::unbuffered_write_alignment_for_path(temp_dir);
-        if !platform::can_write_unbuffered_payload(data, path_alignment) {
-            return Ok(None);
-        }
-
         let (mut temp_file, temp_path) = match self.create_temp_file_with_opener(
             temp_dir,
             object_id,
@@ -823,7 +814,12 @@ impl FilePayloadStore {
             Err(error) => return Err(error),
         };
 
-        let Some(unbuffered_alignment) = platform::unbuffered_alignment_for_file(&temp_file)
+        #[cfg(test)]
+        let alignment = (*self.shared.unbuffered_write_alignment_override.lock())
+            .or_else(|| platform::unbuffered_alignment_for_file(&temp_file));
+        #[cfg(not(test))]
+        let alignment = platform::unbuffered_alignment_for_file(&temp_file);
+        let Some(unbuffered_alignment) = alignment
             .filter(|&alignment| platform::can_write_unbuffered_payload(data, alignment))
         else {
             drop(temp_file);
@@ -2266,7 +2262,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn unbuffered_write_alignment_mismatch_skips_temp_file_creation() {
+    fn unbuffered_write_alignment_mismatch_cleans_up_temp_file_before_fallback() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open_with_modes(
@@ -2283,6 +2279,12 @@ mod tests {
             .write_counters
             .temp_file_create_attempts
             .load(Ordering::Relaxed);
+        let unbuffered_write_attempts = store
+            .shared
+            .write_counters
+            .unbuffered_write_attempts
+            .load(Ordering::Relaxed);
+        let files_before = std::fs::read_dir(&store.layout.tmp_dir).unwrap().count();
 
         assert!(
             store
@@ -2302,7 +2304,19 @@ mod tests {
                 .write_counters
                 .temp_file_create_attempts
                 .load(Ordering::Relaxed),
-            create_attempts
+            create_attempts + 1
+        );
+        assert_eq!(
+            store
+                .shared
+                .write_counters
+                .unbuffered_write_attempts
+                .load(Ordering::Relaxed),
+            unbuffered_write_attempts
+        );
+        assert_eq!(
+            std::fs::read_dir(&store.layout.tmp_dir).unwrap().count(),
+            files_before
         );
     }
 
