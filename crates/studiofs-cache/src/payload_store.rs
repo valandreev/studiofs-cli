@@ -37,6 +37,7 @@ const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
 const FAST_BATCH_STAGING_MAX_CONCURRENCY: usize = 4;
 
+// Process-local sequence for PID-prefixed names; create_new handles collisions.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1056,10 +1057,12 @@ impl FilePayloadStore {
         object_id: u64,
         mut opener: impl FnMut(&Path) -> io::Result<File>,
     ) -> Result<(File, PathBuf), FilePayloadStoreError> {
-        let hex = format!("{object_id:016x}");
+        let process_id = std::process::id();
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
-            let candidate =
-                temp_dir.join(format!("{hex}-{}{}", next_temp_token(), TEMP_FILE_SUFFIX));
+            let sequence = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = temp_dir.join(format!(
+                "{object_id:016x}-{process_id:08x}-{sequence:016x}{TEMP_FILE_SUFFIX}"
+            ));
             match opener(&candidate) {
                 Ok(file) => return Ok((file, candidate)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1689,11 +1692,8 @@ fn batch_staging_concurrency(entry_count: usize, durable_sync: bool) -> usize {
     }
 }
 
-fn next_temp_token() -> String {
-    let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}-{}", seq, Uuid::new_v4().simple())
-}
-
+// Intent paths retain UUIDs: `write_payload_intent` uses `File::create`,
+// which truncates collisions rather than retrying with `create_new`.
 fn next_batch_intent_token() -> String {
     let seq = BATCH_INTENT_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{:016x}-{}", seq, Uuid::new_v4().simple())
@@ -2195,6 +2195,125 @@ mod tests {
         let reopened = FilePayloadStore::open(layout).unwrap();
         assert_eq!(reopened.get(9001).unwrap().as_ref(), b"committed");
         assert!(temp_path.exists());
+    }
+
+    #[test]
+    fn temp_file_name_uses_process_id_and_monotonic_sequence() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let (_, first_path) = store.create_temp_file(&layout.tmp_dir, 9001).unwrap();
+        let (_, second_path) = store.create_temp_file(&layout.tmp_dir, 9001).unwrap();
+        let prefix = format!("{:016x}-{:08x}-", 9001, std::process::id());
+        let parse_sequence = |path: &Path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let sequence = name
+                .strip_prefix(&prefix)
+                .unwrap()
+                .strip_suffix(TEMP_FILE_SUFFIX)
+                .unwrap();
+            u64::from_str_radix(sequence, 16).unwrap()
+        };
+
+        assert!(parse_sequence(&second_path) > parse_sequence(&first_path));
+    }
+
+    #[test]
+    fn temp_file_creation_retries_collisions_without_replacing_existing_file() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let mut attempts = 0;
+        let mut collided_path = PathBuf::new();
+        let (file, path) = store
+            .create_temp_file_with_opener(&layout.tmp_dir, 9001, |candidate| {
+                attempts += 1;
+                if attempts == 1 {
+                    collided_path = candidate.to_path_buf();
+                    let mut collision = platform::create_new_buffered_write(candidate)?;
+                    platform::write_all(&mut collision, b"occupied")?;
+                    drop(collision);
+                }
+                platform::create_new_buffered_write(candidate)
+            })
+            .unwrap();
+        drop(file);
+
+        assert_eq!(attempts, 2);
+        assert_ne!(path, collided_path);
+        assert_eq!(std::fs::read(collided_path).unwrap(), b"occupied");
+    }
+
+    #[test]
+    fn temp_file_creation_exhaustion_reports_error_after_all_attempts() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let mut attempts = 0;
+        let error = store
+            .create_temp_file_with_opener(&layout.tmp_dir, 9001, |_| {
+                attempts += 1;
+                Err(io::Error::from(io::ErrorKind::AlreadyExists))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempts, TEMP_FILE_CREATE_ATTEMPTS);
+        assert!(matches!(
+            error,
+            FilePayloadStoreError::TempFileCreateExhausted {
+                object_id: 9001,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn temp_file_creation_fails_fast_on_non_collision_error() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let mut attempts = 0;
+        let error = store
+            .create_temp_file_with_opener(&layout.tmp_dir, 9001, |_| {
+                attempts += 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            error,
+            FilePayloadStoreError::Io(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn concurrent_temp_file_creation_uses_distinct_paths() {
+        const THREAD_COUNT: usize = 8;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let barrier = std::sync::Barrier::new(THREAD_COUNT);
+        let created = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREAD_COUNT)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        store.create_temp_file(&layout.tmp_dir, 9001).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique_paths: HashSet<_> = created.iter().map(|(_, path)| path).collect();
+
+        assert_eq!(unique_paths.len(), THREAD_COUNT);
+        assert!(created.iter().all(|(_, path)| path.exists()));
     }
 
     #[test]
