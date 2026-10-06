@@ -1735,6 +1735,9 @@ mod tests {
         for (path, expected) in [
             ("", "prefix="),
             (r"a\b/c|é.tmp", "prefix=612f622f637cc3a92e746d70"),
+            ("tmp/a/b.tmp", "prefix=746d702f612f622e746d70"),
+            ("tmp/🦀.tmp", "prefix=746d702ff09fa6802e746d70"),
+            (r"a\\b//c.tmp", "prefix=612f2f622f2f632e746d70"),
         ] {
             let mut content = String::from("prefix=");
             write_batch_intent_path_hex(&mut content, Path::new(path));
