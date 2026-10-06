@@ -819,8 +819,8 @@ impl FilePayloadStore {
             .or_else(|| platform::unbuffered_alignment_for_file(&temp_file));
         #[cfg(not(test))]
         let alignment = platform::unbuffered_alignment_for_file(&temp_file);
-        let Some(unbuffered_alignment) = alignment
-            .filter(|&alignment| platform::can_write_unbuffered_payload(data, alignment))
+        let Some(unbuffered_alignment) =
+            alignment.filter(|&alignment| platform::can_write_unbuffered_payload(data, alignment))
         else {
             drop(temp_file);
             let _ = std::fs::remove_file(&temp_path);
