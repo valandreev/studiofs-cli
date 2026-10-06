@@ -88,7 +88,6 @@ pub struct FilePayloadStore {
     sync_mode: LocalPayloadSyncMode,
     write_mode: LocalPayloadWriteMode,
     read_mode: LocalPayloadReadMode,
-    unbuffered_read_alignment: usize,
     shared: Arc<PayloadStoreSharedState>,
 }
 
@@ -152,11 +151,6 @@ impl FilePayloadStore {
             // Persist the intent directory before any payload can be committed.
             platform::sync_directory(&layout.tmp_dir)?;
         }
-        let unbuffered_read_alignment = if read_mode == LocalPayloadReadMode::Unbuffered {
-            platform::unbuffered_read_alignment_for_path(&layout.payload_objects_dir)
-        } else {
-            1
-        };
         let read_fd_family_capacity = read_fd_cache_capacity();
         let total_read_fd_capacity = read_fd_family_capacity * READ_FD_CACHE_FAMILIES;
         debug!(
@@ -169,7 +163,6 @@ impl FilePayloadStore {
             sync_mode,
             write_mode,
             read_mode,
-            unbuffered_read_alignment,
             shared: Arc::new(PayloadStoreSharedState {
                 read_handles: ReadHandleCache::new(read_fd_family_capacity),
                 buffered_read_fallback_handles: ReadHandleCache::new(read_fd_family_capacity),
@@ -253,12 +246,14 @@ impl FilePayloadStore {
         let start = u64::try_from(data_offset).ok()?;
 
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
-            let alignment = self.unbuffered_read_alignment;
+            let file = self.cached_read_handle(object_id).ok()?;
+            let Some(alignment) = platform::unbuffered_alignment_for_file(file.as_ref()) else {
+                return self.read_into_buffered_fallback(object_id, data_offset, start, out);
+            };
             if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             }
 
-            let file = self.cached_read_handle(object_id).ok()?;
             match self.try_read_into_unbuffered(file.as_ref(), alignment, start, out) {
                 Ok(Some(read)) => return Some(read),
                 Ok(None) => {
@@ -788,16 +783,9 @@ impl FilePayloadStore {
         sync_file_data: bool,
         unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
     ) -> Result<Option<PathBuf>, FilePayloadStoreError> {
-        let unbuffered_alignment = platform::unbuffered_write_alignment_for_path(temp_dir);
-        if !platform::can_write_unbuffered_payload(data, unbuffered_alignment) {
+        if !platform::can_write_unbuffered_payload(data, 4096) {
             return Ok(None);
         }
-
-        #[cfg(test)]
-        self.shared
-            .write_counters
-            .unbuffered_write_attempts
-            .fetch_add(1, Ordering::Relaxed);
 
         let (mut temp_file, temp_path) = match self.create_temp_file_with_opener(
             temp_dir,
@@ -812,6 +800,23 @@ impl FilePayloadStore {
             }
             Err(error) => return Err(error),
         };
+
+        let Some(unbuffered_alignment) = platform::unbuffered_alignment_for_file(&temp_file) else {
+            drop(temp_file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Ok(None);
+        };
+        if !platform::can_write_unbuffered_payload(data, unbuffered_alignment) {
+            drop(temp_file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Ok(None);
+        }
+
+        #[cfg(test)]
+        self.shared
+            .write_counters
+            .unbuffered_write_attempts
+            .fetch_add(1, Ordering::Relaxed);
 
         if let Err(error) = platform::write_all_unbuffered_with_buffer(
             &mut temp_file,

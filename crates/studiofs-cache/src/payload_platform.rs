@@ -1,8 +1,16 @@
 //! Platform-specific primitives for `v3` payload files.
 
+#[cfg(windows)]
+use parking_lot::Mutex;
+#[cfg(windows)]
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 #[cfg(all(test, target_os = "macos"))]
 std::thread_local! {
@@ -18,6 +26,13 @@ std::thread_local! {
 const WINDOWS_UNBUFFERED_WRITE_ALIGNMENT: usize = 4096;
 #[cfg(windows)]
 const WINDOWS_VOLUME_PATH_BUFFER_U16: usize = 32_768;
+#[cfg(windows)]
+const WINDOWS_FINAL_PATH_INITIAL_BUFFER_U16: usize = 256;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+#[cfg(windows)]
+static WINDOWS_VOLUME_ALIGNMENT_CACHE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
 #[derive(Debug, Default)]
 /// Scratch buffer used to build aligned writes for unbuffered payload I/O.
@@ -150,6 +165,11 @@ pub fn unbuffered_write_alignment_for_path(path: &Path) -> usize {
 /// Return the required unbuffered-read alignment for files under `path`.
 pub fn unbuffered_read_alignment_for_path(path: &Path) -> usize {
     unbuffered_read_alignment_for_path_impl(path)
+}
+
+/// Return the required unbuffered-I/O alignment for the volume containing `file`.
+pub(crate) fn unbuffered_alignment_for_file(file: &File) -> Option<usize> {
+    unbuffered_alignment_for_file_impl(file)
 }
 
 /// Return true when this range can be attempted on the unbuffered read path.
@@ -418,6 +438,16 @@ fn unbuffered_read_alignment_for_path_impl(path: &Path) -> usize {
     windows_unbuffered_write_alignment_for_path(path).unwrap_or(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
 }
 
+#[cfg(not(windows))]
+fn unbuffered_alignment_for_file_impl(_file: &File) -> Option<usize> {
+    Some(1)
+}
+
+#[cfg(windows)]
+fn unbuffered_alignment_for_file_impl(file: &File) -> Option<usize> {
+    windows_unbuffered_write_alignment_for_file(file)
+}
+
 #[cfg(target_os = "macos")]
 fn can_read_unbuffered_range_impl(_offset: u64, len: usize, _alignment: usize) -> bool {
     len != 0
@@ -546,7 +576,20 @@ fn is_windows_unbuffered_ptr_aligned(ptr: usize, alignment: usize) -> bool {
 
 #[cfg(windows)]
 fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    windows_unbuffered_write_alignment_for_file(&directory)
+}
+
+#[cfg(windows)]
+fn windows_unbuffered_write_alignment_for_file(file: &File) -> Option<usize> {
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
 
     #[link(name = "kernel32")]
     #[expect(
@@ -554,12 +597,13 @@ fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
         reason = "Declares the two Windows volume-query FFI entry points."
     )]
     unsafe extern "system" {
-        #[link_name = "GetVolumePathNameW"]
-        fn get_volume_path_name_w(
-            file_name: *const u16,
-            volume_path_name: *mut u16,
+        #[link_name = "GetFinalPathNameByHandleW"]
+        fn get_final_path_name_by_handle_w(
+            file: *mut std::ffi::c_void,
+            file_path: *mut u16,
             buffer_length: u32,
-        ) -> i32;
+            flags: u32,
+        ) -> u32;
 
         #[link_name = "GetDiskFreeSpaceW"]
         fn get_disk_free_space_w(
@@ -569,59 +613,125 @@ fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
             number_of_free_clusters: *mut u32,
             total_number_of_clusters: *mut u32,
         ) -> i32;
+
     }
 
-    let file_name = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut volume_path = vec![0_u16; WINDOWS_VOLUME_PATH_BUFFER_U16];
-    let volume_path_len = u32::try_from(volume_path.len()).ok()?;
-
-    // SAFETY: Both buffers are valid NUL-terminated UTF-16 buffers for the
-    // duration of the calls. The output buffer length is passed in WCHAR units.
+    const VOLUME_NAME_GUID: u32 = 0x1;
+    let mut final_path = [0_u16; WINDOWS_FINAL_PATH_INITIAL_BUFFER_U16];
+    // SAFETY: `file` owns a live handle and `final_path` is writable for the
+    // supplied number of UTF-16 code units.
     #[expect(
         unsafe_code,
-        reason = "Uses NUL-terminated buffers with a checked output length."
+        reason = "Reads the canonical volume-GUID path from a live directory handle."
     )]
-    let volume_ok = unsafe {
-        get_volume_path_name_w(
-            file_name.as_ptr(),
-            volume_path.as_mut_ptr(),
-            volume_path_len,
+    let path_len = unsafe {
+        get_final_path_name_by_handle_w(
+            file.as_raw_handle(),
+            final_path.as_mut_ptr(),
+            u32::try_from(final_path.len()).ok()?,
+            VOLUME_NAME_GUID,
         )
     };
-    if volume_ok == 0 {
+    if path_len == 0 {
         return None;
     }
-
-    let mut sectors_per_cluster = 0_u32;
-    let mut bytes_per_sector = 0_u32;
-    let mut free_clusters = 0_u32;
-    let mut total_clusters = 0_u32;
-    // SAFETY: `volume_path` was filled by GetVolumePathNameW and remains a
-    // valid NUL-terminated UTF-16 root path. All output pointers are valid.
-    #[expect(
-        unsafe_code,
-        reason = "Queries disk geometry using the validated path and outputs."
-    )]
-    let disk_ok = unsafe {
-        get_disk_free_space_w(
-            volume_path.as_ptr(),
-            &mut sectors_per_cluster,
-            &mut bytes_per_sector,
-            &mut free_clusters,
-            &mut total_clusters,
-        )
+    let path_len = usize::try_from(path_len).ok()?;
+    let volume_root = if path_len >= final_path.len() {
+        if path_len > WINDOWS_VOLUME_PATH_BUFFER_U16 {
+            return None;
+        }
+        let mut full_path = vec![0_u16; path_len];
+        // SAFETY: `file` remains open and the resized output buffer is
+        // writable for the checked required length.
+        #[expect(
+            unsafe_code,
+            reason = "Retries the final-path query with a validated output size."
+        )]
+        let full_path_len = unsafe {
+            get_final_path_name_by_handle_w(
+                file.as_raw_handle(),
+                full_path.as_mut_ptr(),
+                u32::try_from(full_path.len()).ok()?,
+                VOLUME_NAME_GUID,
+            )
+        };
+        let full_path_len = usize::try_from(full_path_len).ok()?;
+        if full_path_len == 0 || full_path_len >= full_path.len() {
+            return None;
+        }
+        windows_volume_guid_root(&full_path[..full_path_len])?
+    } else {
+        windows_volume_guid_root(&final_path[..path_len])?
     };
-    if disk_ok == 0 || bytes_per_sector == 0 {
+    let cache = WINDOWS_VOLUME_ALIGNMENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock();
+    cached_windows_volume_alignment(&mut cache, Some(volume_root), |volume_root| {
+        let volume_root_wide = volume_root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut sectors_per_cluster = 0_u32;
+        let mut bytes_per_sector = 0_u32;
+        let mut free_clusters = 0_u32;
+        let mut total_clusters = 0_u32;
+        // SAFETY: `volume_root_wide` is a NUL-terminated UTF-16 GUID root and
+        // each output points to a live `u32` for the duration of the call.
+        #[expect(
+            unsafe_code,
+            reason = "Queries disk geometry with a validated volume root."
+        )]
+        let disk_ok = unsafe {
+            get_disk_free_space_w(
+                volume_root_wide.as_ptr(),
+                &mut sectors_per_cluster,
+                &mut bytes_per_sector,
+                &mut free_clusters,
+                &mut total_clusters,
+            )
+        };
+        if disk_ok == 0 || bytes_per_sector == 0 {
+            return None;
+        }
+
+        usize::try_from(bytes_per_sector)
+            .ok()
+            .map(normalized_unbuffered_write_alignment)
+    })
+}
+
+#[cfg(windows)]
+fn windows_volume_guid_root(final_path: &[u16]) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let root_end = final_path
+        .iter()
+        .position(|unit| *unit == u16::from(b'}'))?
+        .checked_add(2)?;
+    if final_path.get(root_end - 1) != Some(&u16::from(b'\\')) {
         return None;
     }
+    let root = std::ffi::OsString::from_wide(&final_path[..root_end]);
+    if !root.to_string_lossy().starts_with("\\\\?\\Volume{") {
+        return None;
+    }
+    Some(PathBuf::from(root.to_string_lossy().to_ascii_lowercase()))
+}
 
-    usize::try_from(bytes_per_sector)
-        .ok()
-        .map(normalized_unbuffered_write_alignment)
+#[cfg(windows)]
+fn cached_windows_volume_alignment(
+    cache: &mut HashMap<PathBuf, usize>,
+    volume_root: Option<PathBuf>,
+    query_alignment: impl FnOnce(&Path) -> Option<usize>,
+) -> Option<usize> {
+    let volume_root = volume_root?;
+    if let Some(alignment) = cache.get(&volume_root) {
+        return Some(*alignment);
+    }
+
+    let alignment = query_alignment(&volume_root)?;
+    cache.insert(volume_root, alignment);
+    Some(alignment)
 }
 
 #[cfg(test)]
@@ -886,8 +996,73 @@ mod tests {
     fn windows_unbuffered_alignment_for_path_is_at_least_default_alignment() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
 
+        assert!(windows_unbuffered_write_alignment_for_path(temp.path()).is_some());
         let alignment = unbuffered_write_alignment_for_path(temp.path());
 
         assert!(alignment >= WINDOWS_UNBUFFERED_WRITE_ALIGNMENT);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unbuffered_alignment_for_file_resolves_its_volume() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = temp.path().join("payload");
+        let file = create_new_unbuffered_write(&path).unwrap();
+
+        assert!(unbuffered_alignment_for_file_impl(&file).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_volume_alignment_cache_is_keyed_by_volume_and_only_caches_success() {
+        let mut cache = HashMap::new();
+        let volume_a = PathBuf::from(r"\\?\Volume{a}\");
+        let volume_b = PathBuf::from(r"\\?\Volume{b}\");
+        let mut queries = 0;
+
+        let first = cached_windows_volume_alignment(&mut cache, Some(volume_a.clone()), |_| {
+            queries += 1;
+            Some(8192)
+        });
+        let same_volume = cached_windows_volume_alignment(&mut cache, Some(volume_a), |_| {
+            queries += 1;
+            Some(4096)
+        });
+        let other_volume = cached_windows_volume_alignment(&mut cache, Some(volume_b), |_| {
+            queries += 1;
+            Some(4096)
+        });
+
+        assert_eq!(
+            (first, same_volume, other_volume),
+            (Some(8192), Some(8192), Some(4096))
+        );
+        assert_eq!(queries, 2, "each volume's geometry should be queried once");
+
+        let unavailable = cached_windows_volume_alignment(&mut cache, None, |_| {
+            panic!("a failed volume identity must not query or cache geometry")
+        });
+        assert_eq!(unavailable, None);
+
+        let failed_volume = PathBuf::from(r"\\?\Volume{failed}\");
+        assert_eq!(
+            cached_windows_volume_alignment(&mut cache, Some(failed_volume.clone()), |_| None),
+            None
+        );
+        assert_eq!(
+            cached_windows_volume_alignment(&mut cache, Some(failed_volume), |_| Some(4096)),
+            Some(4096),
+            "failed geometry lookup must not poison the cache"
+        );
+
+        let final_path: Vec<_> = r"\\?\Volume{ABC-123}\payload\object"
+            .encode_utf16()
+            .collect();
+        assert_eq!(
+            windows_volume_guid_root(&final_path),
+            Some(PathBuf::from(r"\\?\volume{abc-123}\"))
+        );
+        let network_path: Vec<_> = r"\\server\share\payload".encode_utf16().collect();
+        assert_eq!(windows_volume_guid_root(&network_path), None);
     }
 }
