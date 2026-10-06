@@ -583,10 +583,10 @@ impl WinfspInvalidationQueue {
         state.pending.clear();
         let drained_since = state.pending_since.take();
         while let Some(key) = state.order.pop_front() {
-            let (ino, path_override) = match &key {
-                NotificationKey::Inode(ino) => (*ino, None),
-                NotificationKey::Path { ino, .. } => (*ino, state.path_overrides.remove(&key)),
+            let ino = match &key {
+                NotificationKey::Inode(ino) | NotificationKey::Path { ino, .. } => *ino,
             };
+            let path_override = state.path_overrides.remove(&key);
             targets.push((ino, path_override));
         }
         if mark_notification_in_flight && !targets.is_empty() {

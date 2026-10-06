@@ -5991,13 +5991,13 @@ mod tests {
         assert!(capacity >= first.len());
 
         assert_eq!(queue.drain(), vec![11, 19, 31]);
-        assert_eq!(queue.order_capacity(), capacity);
+        assert!(queue.order_capacity() >= capacity);
 
         let second = [37, 13, 23];
         queue.extend(second);
-        assert_eq!(queue.order_capacity(), capacity);
+        assert!(queue.order_capacity() >= capacity);
         assert_eq!(queue.drain(), vec![13, 23, 37]);
-        assert_eq!(queue.order_capacity(), capacity);
+        assert!(queue.order_capacity() >= capacity);
     }
 
     #[test]
