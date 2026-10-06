@@ -5,14 +5,30 @@ use parking_lot::Mutex;
 use studiofs_meta::Ino;
 use studiofs_vfs::DirectoryEnumerationObservation;
 use tracing::trace;
-use winfsp::filesystem::{DirBufferLock, DirInfo};
+use winfsp::filesystem::{DirBufferLock, DirInfo, FileInfo, WideNameInfo};
 
 use crate::context::MAX_WINDOWS_COMPONENT_UTF16_UNITS;
 
 pub(super) const DEFAULT_ENTRY_BUDGET: usize = 64;
 pub(super) const DEFAULT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
-type CachedDirInfo = DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>;
+pub(super) type CachedDirInfo = DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>;
+
+pub(super) struct DirectorySnapshotChild {
+    pub(super) file_info: FileInfo,
+    pub(super) name_offset: usize,
+    pub(super) name_len: usize,
+}
+
+pub(super) fn prepare_directory_entry(
+    dir_info: &mut CachedDirInfo,
+    name: &[u16],
+    file_info: &FileInfo,
+) -> winfsp::Result<()> {
+    dir_info.set_name_raw(name)?;
+    *dir_info.file_info_mut() = file_info.clone();
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 #[cfg(test)]
@@ -46,7 +62,8 @@ impl DirectorySnapshotCacheKey {
 struct DirectorySnapshotEntries {
     dot: CachedDirInfo,
     dotdot: Option<CachedDirInfo>,
-    children: Vec<CachedDirInfo>,
+    children: Vec<DirectorySnapshotChild>,
+    child_names: Vec<u16>,
 }
 
 pub(super) struct DirectorySnapshot {
@@ -59,17 +76,22 @@ impl DirectorySnapshot {
     pub(super) fn new(
         dot: CachedDirInfo,
         dotdot: Option<CachedDirInfo>,
-        children: Vec<CachedDirInfo>,
+        children: Vec<DirectorySnapshotChild>,
+        child_names: Vec<u16>,
     ) -> Self {
         let info_size = std::mem::size_of::<CachedDirInfo>();
         let children_len = children.len();
-        let byte_size =
-            info_size.saturating_mul(1 + usize::from(dotdot.is_some()) + children.len());
+        let fixed_byte_size = info_size.saturating_mul(1 + usize::from(dotdot.is_some()));
+        let child_entry_bytes = std::mem::size_of::<DirectorySnapshotChild>()
+            .saturating_mul(children.len())
+            .saturating_add(std::mem::size_of_val(child_names.as_slice()));
+        let byte_size = fixed_byte_size.saturating_add(child_entry_bytes);
         Self {
             entries: Mutex::new(DirectorySnapshotEntries {
                 dot,
                 dotdot,
                 children,
+                child_names,
             }),
             children_len,
             byte_size,
@@ -90,8 +112,11 @@ impl DirectorySnapshot {
         if let Some(dotdot) = entries.dotdot.as_mut() {
             let _ = lock.write(dotdot);
         }
-        for child in &mut entries.children {
-            lock.write(child)?;
+        let mut dir_info = CachedDirInfo::new();
+        for child in &entries.children {
+            let name = &entries.child_names[child.name_offset..child.name_offset + child.name_len];
+            prepare_directory_entry(&mut dir_info, name, &child.file_info)?;
+            lock.write(&mut dir_info)?;
         }
         Ok(())
     }
@@ -103,6 +128,7 @@ impl DirectorySnapshot {
                 dot: CachedDirInfo::new(),
                 dotdot: None,
                 children: Vec::new(),
+                child_names: Vec::new(),
             }),
             children_len: 0,
             byte_size,
