@@ -162,6 +162,17 @@ impl FilePayloadStore {
             read_fd_family_capacity,
             "local payload runtime read descriptor cache capacity selected"
         );
+        let pending_grouped_sync = PendingGroupedSync {
+            invariant_directories: [
+                layout.tmp_dir.as_path(),
+                layout.payload_objects_dir.as_path(),
+                layout.payload_root.as_path(),
+                layout.runtime_root.as_path(),
+            ]
+            .map(Arc::from),
+            object_ids: Mutex::default(),
+            directories: Mutex::default(),
+        };
         Ok(Self {
             layout,
             sync_mode,
@@ -173,7 +184,7 @@ impl FilePayloadStore {
                 buffered_read_fallback_handles: ReadHandleCache::new(read_fd_family_capacity),
                 #[cfg(windows)]
                 unbuffered_read_scratch: Mutex::new(platform::UnbufferedReadBuffer::new()),
-                pending_grouped_sync: PendingGroupedSync::default(),
+                pending_grouped_sync,
                 #[cfg(test)]
                 write_counters: PayloadWriteCounters::default(),
                 #[cfg(test)]
@@ -1284,11 +1295,14 @@ impl FilePayloadStore {
         drop(object_ids);
 
         let mut directories = self.shared.pending_grouped_sync.directories.lock();
-        directories.insert(self.layout.tmp_dir.clone());
-        directories.insert(payload_dir.to_path_buf());
-        directories.insert(self.layout.payload_objects_dir.clone());
-        directories.insert(self.layout.payload_root.clone());
-        directories.insert(self.layout.runtime_root.clone());
+        for dir in &self.shared.pending_grouped_sync.invariant_directories {
+            if !directories.contains(dir.as_ref()) {
+                directories.insert(Arc::clone(dir));
+            }
+        }
+        if !directories.contains(payload_dir) {
+            directories.insert(Arc::from(payload_dir));
+        }
     }
 
     fn clear_grouped_sync_targets(&self) {
@@ -1297,7 +1311,7 @@ impl FilePayloadStore {
     }
 
     #[cfg(test)]
-    fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<PathBuf>) {
+    fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<Arc<Path>>) {
         let object_ids = {
             let mut object_ids = self.shared.pending_grouped_sync.object_ids.lock();
             object_ids.drain().collect()
@@ -1310,7 +1324,7 @@ impl FilePayloadStore {
     }
 
     #[cfg(test)]
-    fn requeue_grouped_sync_targets(&self, object_ids: &[u64], directories: &[PathBuf]) {
+    fn requeue_grouped_sync_targets(&self, object_ids: &[u64], directories: &[Arc<Path>]) {
         if !object_ids.is_empty() {
             let mut pending_object_ids = self.shared.pending_grouped_sync.object_ids.lock();
             pending_object_ids.extend(object_ids.iter().copied());
@@ -1325,7 +1339,7 @@ impl FilePayloadStore {
     fn sync_pending_grouped_targets<SyncFile, SyncDir>(
         &self,
         pending_object_ids: Vec<u64>,
-        pending_dirs: Vec<PathBuf>,
+        pending_dirs: Vec<Arc<Path>>,
         mut sync_file: SyncFile,
         mut sync_dir: SyncDir,
     ) -> Result<(), FilePayloadStoreError>
@@ -1497,10 +1511,12 @@ impl ReadHandleCache {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PendingGroupedSync {
+    // Own these paths once; group resets retain them without copying path bytes.
+    invariant_directories: [Arc<Path>; 4],
     object_ids: Mutex<HashSet<u64>>,
-    directories: Mutex<HashSet<PathBuf>>,
+    directories: Mutex<HashSet<Arc<Path>>>,
 }
 
 #[cfg(test)]
@@ -2506,6 +2522,105 @@ mod tests {
         assert_eq!(stats.pending_grouped_dir_syncs, 0);
         store.put(7002, b"second payload").unwrap();
         assert_eq!(store.sync_barrier_snapshot().per_put_dir_sync_calls, 6);
+    }
+
+    #[test]
+    fn fast_mode_grouped_sync_reuses_path_allocations() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let payload_path = layout.payload_object_path(8001);
+        let payload_dir = payload_path.parent().unwrap();
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
+        store.record_grouped_sync_targets(8001, payload_dir);
+        let first_dirs = store.shared.pending_grouped_sync.directories.lock().clone();
+        store.record_grouped_sync_targets(8001, payload_dir);
+        {
+            let directories = store.shared.pending_grouped_sync.directories.lock();
+            assert_eq!(directories.len(), first_dirs.len());
+            for dir in &first_dirs {
+                assert!(Arc::ptr_eq(dir, directories.get(dir.as_ref()).unwrap()));
+            }
+        }
+        store.sync_data().unwrap();
+        store.record_grouped_sync_targets(8001, payload_dir);
+        let directories = store.shared.pending_grouped_sync.directories.lock();
+        for dir in &store.shared.pending_grouped_sync.invariant_directories {
+            assert!(Arc::ptr_eq(dir, first_dirs.get(dir.as_ref()).unwrap()));
+            assert!(Arc::ptr_eq(dir, directories.get(dir.as_ref()).unwrap()));
+        }
+    }
+
+    #[test]
+    fn fast_mode_grouped_sync_preserves_directory_targets_across_batches() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let object_ids = [8001, 8002];
+        let mut expected_dirs = HashSet::from([
+            layout.tmp_dir.clone(),
+            layout.payload_objects_dir.clone(),
+            layout.payload_root.clone(),
+            layout.runtime_root.clone(),
+        ]);
+        for object_id in object_ids {
+            let path = layout.payload_object_path(object_id);
+            let dir = path.parent().unwrap();
+            assert_eq!(
+                dir.strip_prefix(&layout.payload_objects_dir)
+                    .unwrap()
+                    .components()
+                    .count(),
+                2
+            );
+            expected_dirs.insert(dir.to_path_buf());
+        }
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
+        for object_id in object_ids {
+            store.put(object_id, b"payload").unwrap();
+        }
+        let (pending_ids, pending_dirs) = store.take_grouped_sync_targets();
+        assert_eq!(
+            pending_ids.into_iter().collect::<HashSet<_>>(),
+            HashSet::from(object_ids)
+        );
+        assert_eq!(
+            pending_dirs
+                .iter()
+                .map(|dir| dir.to_path_buf())
+                .collect::<HashSet<_>>(),
+            expected_dirs
+        );
+        let mut synced_dirs = HashSet::new();
+        store
+            .sync_pending_grouped_targets(
+                Vec::new(),
+                pending_dirs,
+                |_| Ok(()),
+                |dir| {
+                    synced_dirs.insert(dir.to_path_buf());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(synced_dirs, expected_dirs);
+
+        let entries = object_ids.map(|object_id| PayloadBatchEntry {
+            object_id,
+            data: b"payload",
+        });
+        store.put_batch(&entries).unwrap().complete();
+        let (_, pending_dirs) = store.take_grouped_sync_targets();
+        assert_eq!(
+            pending_dirs
+                .iter()
+                .map(|dir| dir.to_path_buf())
+                .collect::<HashSet<_>>(),
+            expected_dirs
+        );
+        store.put(object_ids[0], b"payload").unwrap();
+        store.sync_data().unwrap();
+        assert!(store.take_grouped_sync_targets().1.is_empty());
     }
 
     #[test]
