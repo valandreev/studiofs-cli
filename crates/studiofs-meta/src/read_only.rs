@@ -245,7 +245,7 @@ where
         Err(read_only_error(parent))
     }
 
-    fn rename_atomic_with_replace(
+    fn rename_atomic(
         &self,
         parent: Ino,
         _name: &[u8],

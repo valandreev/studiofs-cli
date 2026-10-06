@@ -1490,7 +1490,7 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
     /// When `replace_if_exists` is false, test destination existence inside the
     /// mutation transaction and return [`MetaError::EntryExists`] without
     /// changing either entry, inode attributes, or replication events.
-    fn rename_atomic_with_replace(
+    fn rename_atomic(
         &self,
         parent: Ino,
         name: &[u8],
@@ -1499,20 +1499,9 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
         replace_if_exists: bool,
     ) -> MetaResult<RenameAtomicResult>;
 
-    /// Atomic rename that replaces an existing destination, if present.
-    fn rename_atomic(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-    ) -> MetaResult<RenameAtomicResult> {
-        self.rename_atomic_with_replace(parent, name, new_parent, new_name, true)
-    }
-
-    /// Rename a file or directory (delegates to `rename_atomic`).
+    /// Rename a file or directory, replacing an existing destination when present.
     fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        self.rename_atomic(parent, name, new_parent, new_name)?;
+        self.rename_atomic(parent, name, new_parent, new_name, true)?;
         Ok(())
     }
 

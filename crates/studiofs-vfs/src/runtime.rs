@@ -423,7 +423,7 @@ impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
     );
     forward_method!(fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>);
     forward_method!(
-        fn rename_atomic_with_replace(
+        fn rename_atomic(
             &self,
             parent: Ino,
             name: &[u8],

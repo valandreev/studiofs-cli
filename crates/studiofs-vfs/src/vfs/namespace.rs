@@ -2795,7 +2795,7 @@ mod tests {
             .expect("read post-create observation");
         assert_ne!(before_create, after_create);
 
-        vfs.rename(ROOT_INO, b"mutation.txt", ROOT_INO, b"renamed.txt")
+        vfs.rename(ROOT_INO, b"mutation.txt", ROOT_INO, b"renamed.txt", true)
             .expect("rename file");
         let after_rename = vfs
             .directory_enumeration_observation(ROOT_INO)
@@ -2889,7 +2889,7 @@ mod tests {
             "second full-path resolution should hit path shortcut cache"
         );
 
-        vfs.rename(ROOT_INO, b"a", ROOT_INO, b"x")
+        vfs.rename(ROOT_INO, b"a", ROOT_INO, b"x", true)
             .expect("rename subtree root");
         assert!(
             resolver.resolve_path("/a/b/file.txt").is_err(),

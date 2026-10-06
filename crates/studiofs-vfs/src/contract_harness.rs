@@ -230,7 +230,7 @@ impl ContractVfsFixture {
                 new_parent,
                 new_name,
             } => {
-                vfs.rename(parent, &name, new_parent, &new_name)?;
+                vfs.rename(parent, &name, new_parent, &new_name, true)?;
                 Ok(ContractVfsOpOutcome::Completed)
             }
             ContractVfsOp::Unlink { parent, name } => {

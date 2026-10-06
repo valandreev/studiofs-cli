@@ -828,7 +828,7 @@ impl MetaFsOps for RedbMetaEngine {
 
     // --- Atomic Rename ---------------------------------------------------
 
-    fn rename_atomic_with_replace(
+    fn rename_atomic(
         &self,
         parent: Ino,
         name: &[u8],

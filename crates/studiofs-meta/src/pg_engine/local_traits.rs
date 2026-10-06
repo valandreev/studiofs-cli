@@ -207,7 +207,7 @@ impl MetaFsOps for PgMetaEngine {
         self.mutate(|local| local.rmdir(parent, name))
     }
 
-    fn rename_atomic_with_replace(
+    fn rename_atomic(
         &self,
         parent: Ino,
         name: &[u8],
@@ -216,7 +216,7 @@ impl MetaFsOps for PgMetaEngine {
         replace_if_exists: bool,
     ) -> MetaResult<RenameAtomicResult> {
         self.mutate(|local| {
-            local.rename_atomic_with_replace(parent, name, new_parent, new_name, replace_if_exists)
+            local.rename_atomic(parent, name, new_parent, new_name, replace_if_exists)
         })
     }
 

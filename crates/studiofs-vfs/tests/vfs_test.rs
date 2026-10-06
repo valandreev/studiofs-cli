@@ -2135,7 +2135,7 @@ async fn test_rename_file() {
     vfs.flush(ino).await.unwrap();
 
     // Rename
-    vfs.rename(1, b"old.txt", 1, b"new.txt").unwrap();
+    vfs.rename(1, b"old.txt", 1, b"new.txt", true).unwrap();
 
     // Old name should fail
     assert!(vfs.lookup(1, b"old.txt").is_err());
@@ -4117,7 +4117,7 @@ fn remote_snapshot_reads_nested_file_after_temp_rename_publish() {
         writer_vfs.write(temp.ino, 0, &payload).await.unwrap();
         writer_vfs.flush(temp.ino).await.unwrap();
         writer_vfs
-            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin")
+            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin", true)
             .unwrap();
 
         assert!(
@@ -4253,7 +4253,7 @@ fn remote_snapshot_switches_nested_overwrite_to_replacement_inode() {
         );
 
         writer_vfs
-            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin")
+            .rename(dir.ino, b"temp.bin", dir.ino, b"final.bin", true)
             .unwrap();
 
         import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
@@ -6193,7 +6193,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
         let pending_before = vfs.pending_uploads_for_inode(attr.ino);
         let extents_before = vfs.live_extent_records_for_inode(attr.ino);
 
-        vfs.rename(1, b"rename-source.bin", 1, b"rename-dest.bin")
+        vfs.rename(1, b"rename-source.bin", 1, b"rename-dest.bin", true)
             .unwrap();
 
         let renamed = vfs.lookup(1, b"rename-dest.bin").unwrap();
@@ -6250,7 +6250,7 @@ async fn rename_into_trashes_deletes_and_evicts_local_payload_objects() {
         "seeded file should be present in the local payload backend before trash rename"
     );
 
-    vfs.rename(1, b"trash-me.bin", trash_user.ino, b"trash-me.bin")
+    vfs.rename(1, b"trash-me.bin", trash_user.ino, b"trash-me.bin", true)
         .unwrap();
 
     assert!(
@@ -6302,7 +6302,7 @@ async fn rename_into_windows_recycle_bin_deletes_and_evicts_local_payload_object
         "seeded file should be present in the local payload backend before recycle-bin rename"
     );
 
-    vfs.rename(1, b"delete-me.bin", recycle_root.ino, b"$RPYEQM2.dat")
+    vfs.rename(1, b"delete-me.bin", recycle_root.ino, b"$RPYEQM2.dat", true)
         .unwrap();
 
     assert!(
@@ -9694,12 +9694,12 @@ async fn test_validate_name_rename_rejects_invalid() {
     vfs.create(1, b"source.txt", 0, 0, 0o644).unwrap();
 
     // Rename to invalid name
-    assert!(vfs.rename(1, b"source.txt", 1, b"").is_err());
-    assert!(vfs.rename(1, b"source.txt", 1, b"a/b").is_err());
-    assert!(vfs.rename(1, b"source.txt", 1, b"..").is_err());
+    assert!(vfs.rename(1, b"source.txt", 1, b"", true).is_err());
+    assert!(vfs.rename(1, b"source.txt", 1, b"a/b", true).is_err());
+    assert!(vfs.rename(1, b"source.txt", 1, b"..", true).is_err());
 
     // Valid rename should work
-    assert!(vfs.rename(1, b"source.txt", 1, b"dest.txt").is_ok());
+    assert!(vfs.rename(1, b"source.txt", 1, b"dest.txt", true).is_ok());
 }
 
 // =============================================================================
@@ -11201,7 +11201,7 @@ async fn rename_should_persist_ds_store_target() {
     vfs.write(attr.ino, 0, b"payload").await.unwrap();
     vfs.flush(attr.ino).await.unwrap();
 
-    vfs.rename(1, b"normal.txt", 1, b".DS_Store").unwrap();
+    vfs.rename(1, b"normal.txt", 1, b".DS_Store", true).unwrap();
 
     assert!(vfs.lookup(1, b"normal.txt").is_err());
     assert!(vfs.lookup(1, b".DS_Store").is_ok());
@@ -11382,7 +11382,7 @@ async fn test_rename_cross_directory() {
     vfs.flush(attr.ino).await.unwrap();
 
     // Rename from dir_a to dir_b.
-    vfs.rename(dir_a.ino, b"file.txt", dir_b.ino, b"moved.txt")
+    vfs.rename(dir_a.ino, b"file.txt", dir_b.ino, b"moved.txt", true)
         .unwrap();
 
     // Old path should fail.
@@ -11433,7 +11433,8 @@ async fn test_rename_overwrite_existing_file() {
     vfs.flush(source.ino).await.unwrap();
 
     // Rename source → target (overwrite).
-    vfs.rename(1, b"source.txt", 1, b"target.txt").unwrap();
+    vfs.rename(1, b"source.txt", 1, b"target.txt", true)
+        .unwrap();
 
     // source.txt should be gone.
     assert!(vfs.lookup(1, b"source.txt").is_err());
@@ -13442,7 +13443,7 @@ async fn test_rename_to_self_is_noop() {
     vfs.flush(attr.ino).await.unwrap();
 
     // Rename to itself.
-    vfs.rename(1, b"self.txt", 1, b"self.txt").unwrap();
+    vfs.rename(1, b"self.txt", 1, b"self.txt", true).unwrap();
 
     // File should still be accessible with original data.
     let after = vfs.lookup(1, b"self.txt").unwrap();
@@ -13620,7 +13621,7 @@ async fn test_rename_directory_with_children() {
     vfs.flush(child.ino).await.unwrap();
 
     // Rename the directory.
-    vfs.rename(1, b"old-name", 1, b"new-name").unwrap();
+    vfs.rename(1, b"old-name", 1, b"new-name", true).unwrap();
 
     // Old name should be gone.
     assert!(vfs.lookup(1, b"old-name").is_err());
