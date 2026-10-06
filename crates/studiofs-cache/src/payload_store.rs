@@ -184,8 +184,8 @@ impl FilePayloadStore {
     ///
     /// Returns `None` if the payload is missing or if an error occurs while reading it.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
-        let path = self.layout.payload_object_path(object_id);
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            let path = self.layout.payload_object_path(object_id);
             let file = match platform::open_read_only(&path) {
                 Ok(file) => file,
                 Err(error) => {
@@ -198,16 +198,28 @@ impl FilePayloadStore {
                     return None;
                 }
             };
-            return self.get_with_file(object_id, &path, &file);
+            return self.get_with_file(object_id, || path.clone(), &file);
         }
-        let file = self.cached_read_handle(object_id, &path).ok()?;
-        self.get_with_file(object_id, &path, file.as_ref())
+        let file = self
+            .cached_read_handle(object_id, || self.layout.payload_object_path(object_id))
+            .ok()?;
+        self.get_with_file(
+            object_id,
+            || self.layout.payload_object_path(object_id),
+            file.as_ref(),
+        )
     }
 
-    fn get_with_file(&self, object_id: u64, path: &Path, file: &File) -> Option<Bytes> {
+    fn get_with_file(
+        &self,
+        object_id: u64,
+        path: impl Fn() -> PathBuf,
+        file: &File,
+    ) -> Option<Bytes> {
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
+                let path = path();
                 warn!(
                     object_id,
                     path = %path.display(),
@@ -220,6 +232,7 @@ impl FilePayloadStore {
         let len = match usize::try_from(metadata.len()) {
             Ok(len) => len,
             Err(_) => {
+                let path = path();
                 warn!(
                     object_id,
                     path = %path.display(),
@@ -233,6 +246,7 @@ impl FilePayloadStore {
         if len > 0
             && let Err(error) = platform::pread_exact(file, &mut payload, 0)
         {
+            let path = path();
             warn!(
                 object_id,
                 path = %path.display(),
@@ -253,26 +267,41 @@ impl FilePayloadStore {
         }
         let start = u64::try_from(data_offset).ok()?;
 
-        let path = self.layout.payload_object_path(object_id);
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
-            let alignment = platform::unbuffered_read_alignment_for_path(&path);
+            let path = cfg!(windows).then(|| self.layout.payload_object_path(object_id));
+            let alignment = path
+                .as_deref()
+                .map(platform::unbuffered_read_alignment_for_path)
+                // Non-Windows alignment is path-independent; resolve a path only on fallback/open.
+                .unwrap_or_else(|| platform::unbuffered_read_alignment_for_path(Path::new("")));
             if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
-                return self.read_into_buffered_fallback(object_id, data_offset, &path, start, out);
+                return self.read_into_buffered_fallback(
+                    object_id,
+                    data_offset,
+                    || path.unwrap_or_else(|| self.layout.payload_object_path(object_id)),
+                    start,
+                    out,
+                );
             }
 
-            let file = self.cached_read_handle(object_id, &path).ok()?;
+            let file = self
+                .cached_read_handle(object_id, || {
+                    path.unwrap_or_else(|| self.layout.payload_object_path(object_id))
+                })
+                .ok()?;
             match self.try_read_into_unbuffered(file.as_ref(), alignment, start, out) {
                 Ok(Some(read)) => return Some(read),
                 Ok(None) => {
                     return self.read_into_buffered_fallback(
                         object_id,
                         data_offset,
-                        &path,
+                        || self.layout.payload_object_path(object_id),
                         start,
                         out,
                     );
                 }
                 Err(error) => {
+                    let path = self.layout.payload_object_path(object_id);
                     warn!(
                         object_id,
                         data_offset,
@@ -284,10 +313,13 @@ impl FilePayloadStore {
                 }
             }
         }
-        let file = self.cached_read_handle(object_id, &path).ok()?;
+        let file = self
+            .cached_read_handle(object_id, || self.layout.payload_object_path(object_id))
+            .ok()?;
         if out.len() >= READ_HINT_MIN_LEN {
             let hint_len = u64::try_from(out.len()).unwrap_or(u64::MAX);
             if let Err(error) = platform::advise_will_need(file.as_ref(), start, hint_len) {
+                let path = self.layout.payload_object_path(object_id);
                 warn!(
                     object_id,
                     data_offset,
@@ -301,6 +333,7 @@ impl FilePayloadStore {
         match platform::pread(file.as_ref(), out, start) {
             Ok(read) => Some(read),
             Err(error) => {
+                let path = self.layout.payload_object_path(object_id);
                 warn!(
                     object_id,
                     data_offset,
@@ -321,8 +354,9 @@ impl FilePayloadStore {
         if cfg!(windows) || self.read_mode == LocalPayloadReadMode::Unbuffered {
             return;
         }
-        let path = self.layout.payload_object_path(object_id);
-        let Ok(file) = self.cached_read_handle(object_id, &path) else {
+        let Ok(file) =
+            self.cached_read_handle(object_id, || self.layout.payload_object_path(object_id))
+        else {
             return;
         };
         let Ok(metadata) = file.metadata() else {
@@ -333,6 +367,7 @@ impl FilePayloadStore {
             return;
         }
         if let Err(error) = platform::advise_will_need(file.as_ref(), 0, len) {
+            let path = self.layout.payload_object_path(object_id);
             warn!(
                 object_id,
                 path = %path.display(),
@@ -1102,7 +1137,7 @@ impl FilePayloadStore {
         &self,
         object_id: u64,
         data_offset: usize,
-        path: &Path,
+        build_path: impl FnOnce() -> PathBuf,
         start: u64,
         out: &mut [u8],
     ) -> Option<usize> {
@@ -1112,9 +1147,10 @@ impl FilePayloadStore {
             .unbuffered_read_fallbacks
             .fetch_add(1, Ordering::Relaxed);
 
-        let file = match self.cached_buffered_read_fallback_handle(object_id, path) {
+        let file = match self.cached_buffered_read_fallback_handle(object_id, build_path) {
             Ok(file) => file,
             Err(error) => {
+                let path = self.layout.payload_object_path(object_id);
                 warn!(
                     object_id,
                     data_offset,
@@ -1128,6 +1164,7 @@ impl FilePayloadStore {
         match platform::pread(file.as_ref(), out, start) {
             Ok(read) => Some(read),
             Err(error) => {
+                let path = self.layout.payload_object_path(object_id);
                 warn!(
                     object_id,
                     data_offset,
@@ -1191,10 +1228,14 @@ impl FilePayloadStore {
         }
     }
 
-    fn cached_read_handle(&self, object_id: u64, path: &Path) -> io::Result<Arc<File>> {
+    fn cached_read_handle(
+        &self,
+        object_id: u64,
+        build_path: impl FnOnce() -> PathBuf,
+    ) -> io::Result<Arc<File>> {
         self.cached_read_handle_from_cache(
             object_id,
-            path,
+            build_path,
             &self.shared.read_handles,
             |this, path| this.open_for_read(path),
         )
@@ -1203,11 +1244,11 @@ impl FilePayloadStore {
     fn cached_buffered_read_fallback_handle(
         &self,
         object_id: u64,
-        path: &Path,
+        build_path: impl FnOnce() -> PathBuf,
     ) -> io::Result<Arc<File>> {
         self.cached_read_handle_from_cache(
             object_id,
-            path,
+            build_path,
             &self.shared.buffered_read_fallback_handles,
             |_this, path| platform::open_read_only(path),
         )
@@ -1216,7 +1257,7 @@ impl FilePayloadStore {
     fn cached_read_handle_from_cache(
         &self,
         object_id: u64,
-        path: &Path,
+        build_path: impl FnOnce() -> PathBuf,
         cache: &ReadHandleCache,
         mut opener: impl FnMut(&Self, &Path) -> io::Result<File>,
     ) -> io::Result<Arc<File>> {
@@ -1227,7 +1268,8 @@ impl FilePayloadStore {
         }
 
         cache.misses.fetch_add(1, Ordering::Relaxed);
-        let file = match opener(self, path) {
+        let path = build_path();
+        let file = match opener(self, &path) {
             Ok(file) => file,
             Err(first_error) if platform::is_too_many_open_files_error(&first_error) => {
                 let evicted = self.evict_cached_read_handles_under_pressure();
@@ -1241,7 +1283,7 @@ impl FilePayloadStore {
                 if evicted == 0 {
                     return Err(first_error);
                 }
-                opener(self, path)?
+                opener(self, &path)?
             }
             Err(error) => return Err(error),
         };
@@ -1999,7 +2041,7 @@ mod tests {
             .unwrap()
             .set_len(64 * 1024 * 1024)
             .unwrap();
-        let file = store.cached_read_handle(748, &path).unwrap();
+        let file = store.cached_read_handle(748, || path.clone()).unwrap();
         let mut cursor = file.as_ref();
         assert_eq!(cursor.stream_position().unwrap(), 0);
 
@@ -2159,6 +2201,83 @@ mod tests {
     }
 
     #[test]
+    fn cached_read_handle_hit_does_not_build_payload_path() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+        store.put(701, b"payload").unwrap();
+        let mut path_builds = 0;
+        let cache = &store.shared.read_handles;
+        let open = |_this: &FilePayloadStore, path: &Path| platform::open_read_only(path);
+
+        let first = store
+            .cached_read_handle_from_cache(
+                701,
+                || {
+                    path_builds += 1;
+                    store.layout.payload_object_path(701)
+                },
+                cache,
+                open,
+            )
+            .unwrap();
+        let second = store
+            .cached_read_handle_from_cache(
+                701,
+                || {
+                    path_builds += 1;
+                    store.layout.payload_object_path(701)
+                },
+                cache,
+                open,
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(path_builds, 1);
+    }
+
+    #[test]
+    fn buffered_fallback_cache_hit_does_not_build_payload_path() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+        store.put(702, b"payload").unwrap();
+        let mut path_builds = 0;
+        let mut out = [0_u8; 4];
+
+        assert_eq!(
+            store.read_into_buffered_fallback(
+                702,
+                0,
+                || {
+                    path_builds += 1;
+                    store.layout.payload_object_path(702)
+                },
+                0,
+                &mut out,
+            ),
+            Some(4)
+        );
+        assert_eq!(&out, b"payl");
+        assert_eq!(
+            store.read_into_buffered_fallback(
+                702,
+                1,
+                || {
+                    path_builds += 1;
+                    store.layout.payload_object_path(702)
+                },
+                1,
+                &mut out,
+            ),
+            Some(4)
+        );
+        assert_eq!(&out, b"aylo");
+        assert_eq!(path_builds, 1);
+    }
+
+    #[test]
     fn overwrite_invalidates_cached_descriptor() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
@@ -2172,6 +2291,24 @@ mod tests {
         store.put(1337, b"new").unwrap();
         assert_eq!(store.read_into(1337, 0, &mut out), Some(3));
         assert_eq!(&out, b"new");
+    }
+
+    #[test]
+    fn remove_invalidates_cached_descriptor() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout).unwrap();
+        store.put(1338, b"old").unwrap();
+
+        let mut out = [0_u8; 3];
+        assert_eq!(store.read_into(1338, 0, &mut out), Some(3));
+        assert_eq!(&out, b"old");
+
+        store.remove(1338).unwrap();
+        assert!(store.get(1338).is_none());
+
+        store.put(1338, b"new").unwrap();
+        assert_eq!(store.get(1338).unwrap().as_ref(), b"new");
     }
 
     #[test]
@@ -2211,13 +2348,18 @@ mod tests {
         let path = store.layout.payload_object_path(99);
         let mut attempts = 0usize;
         let file = store
-            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, path| {
-                attempts += 1;
-                if attempts == 1 {
-                    return Err(platform::too_many_open_files_error_for_test());
-                }
-                platform::open_read_only(path)
-            })
+            .cached_read_handle_from_cache(
+                99,
+                || path.clone(),
+                &store.shared.read_handles,
+                |_this, path| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(platform::too_many_open_files_error_for_test());
+                    }
+                    platform::open_read_only(path)
+                },
+            )
             .unwrap();
         drop(file);
 
@@ -2235,10 +2377,15 @@ mod tests {
         let path = store.layout.payload_object_path(99);
         let mut attempts = 0usize;
         let error = store
-            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, _path| {
-                attempts += 1;
-                Err(platform::too_many_open_files_error_for_test())
-            })
+            .cached_read_handle_from_cache(
+                99,
+                || path.clone(),
+                &store.shared.read_handles,
+                |_this, _path| {
+                    attempts += 1;
+                    Err(platform::too_many_open_files_error_for_test())
+                },
+            )
             .unwrap_err();
 
         assert!(platform::is_too_many_open_files_error(&error));
@@ -2261,13 +2408,18 @@ mod tests {
         let path = store.layout.payload_object_path(99);
         let mut attempts = 0usize;
         let error = store
-            .cached_read_handle_from_cache(99, &path, &store.shared.read_handles, |_this, _path| {
-                attempts += 1;
-                if attempts == 1 {
-                    return Err(platform::too_many_open_files_error_for_test());
-                }
-                Err(io::Error::from(io::ErrorKind::NotFound))
-            })
+            .cached_read_handle_from_cache(
+                99,
+                || path.clone(),
+                &store.shared.read_handles,
+                |_this, _path| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(platform::too_many_open_files_error_for_test());
+                    }
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                },
+            )
             .unwrap_err();
 
         assert_eq!(attempts, 2);
