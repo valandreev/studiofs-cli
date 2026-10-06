@@ -1244,7 +1244,7 @@ impl FilePayloadStore {
             cache.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
-        let evicted_lru = handles.len() == handles.cap().get() && !handles.contains(&object_id);
+        let evicted_lru = handles.len() == handles.cap().get();
         let _ = handles.put(object_id, Arc::clone(&file));
         if evicted_lru {
             cache.evictions.fetch_add(1, Ordering::Relaxed);
@@ -1520,6 +1520,7 @@ struct PayloadWriteCounters {
 #[repr(align(128))]
 #[derive(Debug, Default)]
 struct PayloadReadCounters {
+    // Counts all store path resolutions; read tests measure deltas after setup.
     payload_path_builds: CachePaddedAtomicU64,
     unbuffered_read_attempts: CachePaddedAtomicU64,
     unbuffered_read_successes: CachePaddedAtomicU64,
