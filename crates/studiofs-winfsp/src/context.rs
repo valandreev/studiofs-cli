@@ -85,6 +85,7 @@ const SYNCHRONIZE_ACCESS: FILE_ACCESS_RIGHTS = 0x0010_0000;
 const DEFAULT_DIR_MODE: u16 = 0o755;
 const DEFAULT_FILE_MODE: u16 = 0o644;
 const PATH_STACK_BUFFER_BYTES: usize = 1024;
+const DEFAULT_VOLUME_LABEL: &str = "StudioFS";
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -1183,7 +1184,9 @@ impl StudioFsContext {
     ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
-        let volume_label = vfs.volume_name().unwrap_or_else(|_| "StudioFS".to_owned());
+        let volume_label = vfs
+            .volume_name()
+            .unwrap_or_else(|_| DEFAULT_VOLUME_LABEL.to_owned());
         Ok(Self {
             vfs,
             volume_label,
@@ -1232,7 +1235,9 @@ impl StudioFsContext {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
             create_default_security_descriptor().expect("default WinFSP security descriptor");
-        let volume_label = vfs.volume_name().unwrap_or_else(|_| "StudioFS".to_owned());
+        let volume_label = vfs
+            .volume_name()
+            .unwrap_or_else(|_| DEFAULT_VOLUME_LABEL.to_owned());
         Self {
             vfs,
             volume_label,
@@ -2452,7 +2457,6 @@ impl FileSystemContext for StudioFsContext {
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
         self.ensure_writable()?;
-        let callback_started = Instant::now();
         tracing::debug!(
             old_path = %file_name.to_string_lossy(),
             new_path = %new_file_name.to_string_lossy(),
@@ -2466,7 +2470,6 @@ impl FileSystemContext for StudioFsContext {
             tracing::debug!(
                 old_path = %file_name.to_string_lossy(),
                 new_path = %new_file_name.to_string_lossy(),
-                elapsed_ms = callback_started.elapsed().as_millis(),
                 "WinFSP rename callback rejected hidden path"
             );
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
@@ -2477,7 +2480,6 @@ impl FileSystemContext for StudioFsContext {
                 tracing::warn!(
                     old_path = %file_name.to_string_lossy(),
                     new_path = %new_file_name.to_string_lossy(),
-                    elapsed_ms = callback_started.elapsed().as_millis(),
                     error = %error,
                     "WinFSP rename callback parent resolution failed"
                 );
@@ -2497,7 +2499,6 @@ impl FileSystemContext for StudioFsContext {
                 old_name = %String::from_utf8_lossy(&plan.old_name),
                 new_parent = plan.new_parent,
                 new_name = %String::from_utf8_lossy(&plan.new_name),
-                elapsed_ms = callback_started.elapsed().as_millis(),
                 error = %err,
                 "WinFSP rename callback VFS rename failed"
             );
@@ -2723,7 +2724,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
-    use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
+    use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext, VolumeInfo};
     use winfsp::notify::NotifyingFileSystemContext;
 
     fn cache_observation(
@@ -2862,12 +2863,65 @@ mod tests {
     }
 
     #[test]
-    fn volume_label_is_cached_when_context_is_constructed() {
+    fn get_volume_info_uses_cached_volume_label() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cached-volume-label");
+        let expected_label = vfs.volume_name().expect("volume name should be available");
+        assert_eq!(ctx.volume_label, expected_label);
+        let mut expected_volume_label = [0; 32];
+        for (unit, expected) in expected_volume_label
+            .iter_mut()
+            .zip(expected_label.encode_utf16())
+        {
+            *unit = expected;
+        }
 
+        // SAFETY: winfsp 0.12.4's repr(C) VolumeInfo contains only integer fields and arrays;
+        // every bit pattern is valid for those fields, so a zeroed value is initialized.
+        let mut volume_info = unsafe { std::mem::zeroed::<VolumeInfo>() };
+        ctx.get_volume_info(&mut volume_info)
+            .expect("volume info should be available");
+
+        let mut actual_volume_label = [0; 32];
+        let label_offset = std::mem::offset_of!(winfsp_sys::FSP_FSCTL_VOLUME_INFO, VolumeLabel);
+        // SAFETY: winfsp 0.12.4 defines VolumeInfo as repr(C) with fields matching
+        // FSP_FSCTL_VOLUME_INFO in order and type, and asserts equal size/alignment. The label
+        // array starts at the FFI type's VolumeLabel offset. It is initialized by zeroed above
+        // and set_volume_label writes its prefix, so copying just this field avoids struct padding.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                std::ptr::addr_of!(volume_info)
+                    .cast::<u8>()
+                    .add(label_offset)
+                    .cast::<u16>(),
+                actual_volume_label.as_mut_ptr(),
+                actual_volume_label.len(),
+            );
+        }
+        assert_eq!(actual_volume_label, expected_volume_label);
+    }
+
+    #[test]
+    fn rename_callback_moves_file_and_rejects_missing_source() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("rename-callback");
+        let file = vfs
+            .create(ROOT_INO, b"old", 0, 0, 0o644)
+            .expect("create file");
+        let handle = StudioFileHandle::new(file.ino, false, 0, OpenFlags::RDONLY);
+        let old_path = U16CString::from_str(r"\old").expect("old path");
+        let new_path = U16CString::from_str(r"\new").expect("new path");
+
+        ctx.rename(&handle, old_path.as_ucstr(), new_path.as_ucstr(), false)
+            .expect("rename callback should move the file");
         assert_eq!(
-            ctx.volume_label,
-            vfs.volume_name().expect("volume name should be available")
+            vfs.lookup(ROOT_INO, b"new").expect("renamed file").ino,
+            file.ino
+        );
+        assert!(vfs.lookup(ROOT_INO, b"old").is_err());
+
+        let missing_path = U16CString::from_str(r"\missing").expect("missing path");
+        assert!(
+            ctx.rename(&handle, missing_path.as_ucstr(), new_path.as_ucstr(), false)
+                .is_err()
         );
     }
 

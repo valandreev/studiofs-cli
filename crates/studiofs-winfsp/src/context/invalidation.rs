@@ -384,7 +384,9 @@ impl WinfspInvalidationQueue {
         let snapshot = (before != (state.pending.len(), state.queue_peak, state.coalesced))
             .then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
-        let _ = snapshot.map(|snapshot| self.record_metrics(snapshot));
+        if let Some(snapshot) = snapshot {
+            self.record_metrics(snapshot);
+        }
         acceptance
     }
 
