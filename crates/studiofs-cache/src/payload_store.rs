@@ -1296,20 +1296,12 @@ impl FilePayloadStore {
 
     #[cfg(test)]
     fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<PathBuf>) {
-        let object_ids: Vec<_> = {
+        let object_ids = {
             let mut object_ids = self.shared.pending_grouped_sync.object_ids.lock();
             object_ids.drain().collect()
         };
         let directories = {
             let mut directories = self.shared.pending_grouped_sync.directories.lock();
-            if !object_ids.is_empty() {
-                directories.extend([
-                    self.layout.tmp_dir.clone(),
-                    self.layout.payload_objects_dir.clone(),
-                    self.layout.payload_root.clone(),
-                    self.layout.runtime_root.clone(),
-                ]);
-            }
             directories.drain().collect()
         };
         (object_ids, directories)
@@ -2515,16 +2507,11 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_grouped_sync_preserves_directory_targets_across_batches() {
+    fn fast_mode_tracks_nested_shard_directories_across_batches() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let object_ids = [8001, 8002];
-        let mut expected_dirs = HashSet::from([
-            layout.tmp_dir.clone(),
-            layout.payload_objects_dir.clone(),
-            layout.payload_root.clone(),
-            layout.runtime_root.clone(),
-        ]);
+        let mut expected_dirs = HashSet::new();
         for object_id in object_ids {
             let path = layout.payload_object_path(object_id);
             let dir = path.parent().unwrap();
@@ -2543,48 +2530,28 @@ mod tests {
             store.put(object_id, b"payload").unwrap();
         }
         assert_eq!(store.sync_barrier_snapshot().pending_grouped_dir_syncs, 2);
-        let (pending_ids, pending_dirs) = store.take_grouped_sync_targets();
         assert_eq!(
-            pending_ids.into_iter().collect::<HashSet<_>>(),
-            HashSet::from(object_ids)
+            *store.shared.pending_grouped_sync.directories.lock(),
+            expected_dirs,
         );
-        assert_eq!(
-            pending_dirs
-                .iter()
-                .map(|dir| dir.to_path_buf())
-                .collect::<HashSet<_>>(),
-            expected_dirs
-        );
-        let mut synced_dirs = HashSet::new();
-        store
-            .sync_pending_grouped_targets(
-                Vec::new(),
-                pending_dirs,
-                |_| Ok(()),
-                |dir| {
-                    synced_dirs.insert(dir.to_path_buf());
-                    Ok(())
-                },
-            )
-            .unwrap();
-        assert_eq!(synced_dirs, expected_dirs);
-
         let entries = object_ids.map(|object_id| PayloadBatchEntry {
             object_id,
             data: b"payload",
         });
         store.put_batch(&entries).unwrap().complete();
-        let (_, pending_dirs) = store.take_grouped_sync_targets();
         assert_eq!(
-            pending_dirs
-                .iter()
-                .map(|dir| dir.to_path_buf())
-                .collect::<HashSet<_>>(),
-            expected_dirs
+            *store.shared.pending_grouped_sync.directories.lock(),
+            expected_dirs,
         );
-        store.put(object_ids[0], b"payload").unwrap();
         store.sync_data().unwrap();
-        assert!(store.take_grouped_sync_targets().1.is_empty());
+        assert!(
+            store
+                .shared
+                .pending_grouped_sync
+                .directories
+                .lock()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2722,6 +2689,18 @@ mod tests {
         assert_eq!(
             after_failure.pending_grouped_dir_syncs,
             pending_dirs.len().saturating_sub(1)
+        );
+        assert!(
+            store
+                .shared
+                .pending_grouped_sync
+                .directories
+                .lock()
+                .iter()
+                .all(|dir| {
+                    dir.strip_prefix(&store.layout.payload_objects_dir)
+                        .is_ok_and(|relative| relative.components().count() == 2)
+                })
         );
     }
 
