@@ -15,12 +15,28 @@ pub(super) const DEFAULT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 pub(super) type CachedDirInfo = DirInfo<MAX_WINDOWS_COMPONENT_UTF16_UNITS>;
 
 pub(super) struct DirectorySnapshotChild {
-    pub(super) file_info: FileInfo,
-    pub(super) name_offset: usize,
-    pub(super) name_len: usize,
+    file_info: FileInfo,
+    name_offset: usize,
+    name_len: usize,
 }
 
 impl DirectorySnapshotChild {
+    pub(super) fn new(names: &mut Vec<u16>, name: &[u16], file_info: FileInfo) -> Self {
+        let name_offset = names.len();
+        names.extend_from_slice(name);
+        Self {
+            file_info,
+            name_offset,
+            name_len: name.len(),
+        }
+    }
+
+    pub(super) fn accounted_bytes(child_count: usize, name_units: usize) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_mul(child_count)
+            .saturating_add(name_units.saturating_mul(std::mem::size_of::<u16>()))
+    }
+
     pub(super) fn write_to(
         &self,
         names: &[u16],
@@ -86,18 +102,20 @@ pub(super) struct DirectorySnapshot {
 }
 
 impl DirectorySnapshot {
+    pub(super) fn fixed_byte_size(has_dotdot: bool) -> usize {
+        std::mem::size_of::<CachedDirInfo>().saturating_mul(1 + usize::from(has_dotdot))
+    }
+
     pub(super) fn new(
         dot: CachedDirInfo,
         dotdot: Option<CachedDirInfo>,
         children: Vec<DirectorySnapshotChild>,
         child_names: Vec<u16>,
     ) -> Self {
-        let info_size = std::mem::size_of::<CachedDirInfo>();
         let children_len = children.len();
-        let fixed_byte_size = info_size.saturating_mul(1 + usize::from(dotdot.is_some()));
-        let child_entry_bytes = std::mem::size_of::<DirectorySnapshotChild>()
-            .saturating_mul(children.len())
-            .saturating_add(std::mem::size_of_val(child_names.as_slice()));
+        let fixed_byte_size = Self::fixed_byte_size(dotdot.is_some());
+        let child_entry_bytes =
+            DirectorySnapshotChild::accounted_bytes(children.len(), child_names.len());
         let byte_size = fixed_byte_size.saturating_add(child_entry_bytes);
         Self {
             entries: Mutex::new(DirectorySnapshotEntries {

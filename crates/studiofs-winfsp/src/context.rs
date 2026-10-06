@@ -1720,9 +1720,7 @@ impl StudioFsContext {
             .readdir_with_attrs(context.ino)
             .map_err(vfs_to_winfsp_err)?;
         let mut name_u16 = Vec::<u16>::new();
-        let info_size = std::mem::size_of::<CachedDirInfo>();
-        let fixed_entry_count = 1 + usize::from(dotdot.is_some());
-        let fixed_byte_size = info_size.saturating_mul(fixed_entry_count);
+        let fixed_byte_size = DirectorySnapshot::fixed_byte_size(dotdot.is_some());
         let byte_budget = self.directory_snapshot_cache.byte_budget_if_enabled();
         let mut children: Vec<DirectorySnapshotChild> = Vec::new();
         let mut child_names = Vec::new();
@@ -1775,8 +1773,7 @@ impl StudioFsContext {
                 },
             };
             let file_info = attr_to_file_info(child_attr);
-            let child_entry_size = std::mem::size_of::<DirectorySnapshotChild>()
-                .saturating_add(std::mem::size_of_val(name_u16.as_slice()));
+            let child_entry_size = DirectorySnapshotChild::accounted_bytes(1, name_u16.len());
 
             if !direct
                 && byte_budget.is_some_and(|budget| {
@@ -1822,13 +1819,11 @@ impl StudioFsContext {
                     return Ok(None);
                 }
             } else {
-                let name_offset = child_names.len();
-                child_names.extend_from_slice(name_u16.as_slice());
-                children.push(DirectorySnapshotChild {
+                children.push(DirectorySnapshotChild::new(
+                    &mut child_names,
+                    name_u16.as_slice(),
                     file_info,
-                    name_offset,
-                    name_len: name_u16.len(),
-                });
+                ));
                 snapshot_byte_size = snapshot_byte_size.saturating_add(child_entry_size);
             }
         }
@@ -2742,47 +2737,8 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
-    use winfsp::filesystem::{AsyncFileSystemContext, DirInfo, FileSystemContext};
+    use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
     use winfsp::notify::NotifyingFileSystemContext;
-
-    fn directory_buffer_names(handle: &StudioFileHandle) -> Vec<String> {
-        // SAFETY: In the pinned winfsp crate, DirMarker contains only an Option<&U16CStr>;
-        // zero initializes that option to None, selecting the first directory record.
-        let marker = unsafe { std::mem::zeroed::<winfsp::filesystem::DirMarker<'static>>() };
-        let mut bytes = vec![0; 4096];
-        let written = handle.dir_buffer.read(marker, &mut bytes) as usize;
-        bytes.truncate(written);
-
-        let header_size = std::mem::size_of::<DirInfo<0>>();
-        let record_alignment = std::mem::align_of::<DirInfo<0>>();
-        let mut names = Vec::new();
-        let mut offset = 0;
-        while offset < bytes.len() {
-            if bytes.len() - offset < header_size {
-                break;
-            }
-            let size = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
-            if size == 0 {
-                break;
-            }
-            let record_end = offset + size;
-            assert!(size >= header_size);
-            assert!(record_end <= bytes.len());
-            let name_bytes = &bytes[offset + header_size..record_end];
-            assert_eq!(name_bytes.len() % 2, 0);
-            let name: Vec<_> = name_bytes
-                .chunks(2)
-                .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
-                .collect();
-            names.push(String::from_utf16_lossy(&name));
-
-            if record_end == bytes.len() {
-                break;
-            }
-            offset += size.div_ceil(record_alignment) * record_alignment;
-        }
-        names
-    }
 
     fn cache_observation(
         namespace_epoch: u64,
@@ -3102,11 +3058,19 @@ mod tests {
 
     #[test]
     fn directory_snapshot_stores_compact_entries_for_short_names() {
-        let (_tmp, vfs, ctx, _queue) = make_test_context("compact-directory-snapshot");
-        vfs.create(ROOT_INO, b"a-longer-child-name.txt", 1000, 1000, 0o644)
+        let (_tmp, vfs, mut ctx, _queue) = make_test_context("compact-directory-snapshot");
+        let long_name = "a-longer-child-name.txt";
+        let short_name = "b.txt";
+        vfs.create(ROOT_INO, long_name.as_bytes(), 1000, 1000, 0o644)
             .expect("create long-named child");
-        vfs.create(ROOT_INO, b"b.txt", 1000, 1000, 0o644)
+        vfs.create(ROOT_INO, short_name.as_bytes(), 1000, 1000, 0o644)
             .expect("create short-named child");
+        let entry_size = std::mem::size_of::<super::CachedDirInfo>();
+        let child_size = std::mem::size_of::<super::directory_cache::DirectorySnapshotChild>();
+        let name_units = long_name.encode_utf16().count() + short_name.encode_utf16().count();
+        let expected_bytes = 2 * entry_size + 2 * child_size + name_units * 2;
+        ctx.directory_snapshot_cache =
+            super::directory_cache::DirectorySnapshotCache::new(1, expected_bytes);
         let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDONLY);
         let lock = handle
             .dir_buffer
@@ -3116,33 +3080,43 @@ mod tests {
         ctx.populate_directory_buffer(&handle, &lock)
             .expect("populate directory buffer");
 
-        let entry_size = std::mem::size_of::<super::CachedDirInfo>();
-        assert!(
-            ctx.directory_snapshot_cache.snapshot().occupancy_bytes < entry_size * 4,
-            "short child names should not occupy full-size DirInfo records in the cached snapshot"
-        );
+        let stats = ctx.directory_snapshot_cache.snapshot();
+        assert_eq!(stats.occupancy_entries, 1);
+        assert_eq!(stats.occupancy_bytes, expected_bytes);
     }
 
     #[test]
     fn oversized_directory_snapshot_falls_back_to_direct_buffer_population() {
         let (_tmp, vfs, mut ctx, _queue) = make_test_context("oversized-directory-snapshot");
-        let long_name = "a-long-child-name.txt";
-        let short_name = "b.txt";
-        let direct_name = "c-another-long-child-name.txt";
-        vfs.create(ROOT_INO, long_name.as_bytes(), 1000, 1000, 0o644)
-            .expect("create first file");
-        vfs.create(ROOT_INO, short_name.as_bytes(), 1000, 1000, 0o644)
-            .expect("create second file");
-        vfs.create(ROOT_INO, direct_name.as_bytes(), 1000, 1000, 0o644)
-            .expect("create third file");
+        let expected_names = ["a-001.txt", "b-002.txt", "c-003.txt"];
+        for name in expected_names {
+            vfs.create(ROOT_INO, name.as_bytes(), 1000, 1000, 0o644)
+                .expect("create child");
+        }
+        let entries = vfs
+            .readdir_with_attrs(ROOT_INO)
+            .expect("read children to verify fallback setup");
+        let mut actual_names: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.entry.name.as_slice())
+            .collect();
+        actual_names.sort_unstable();
+        let mut expected_names = expected_names.map(str::as_bytes);
+        expected_names.sort_unstable();
+        assert_eq!(actual_names, expected_names);
+
         let fixed_byte_size = std::mem::size_of::<super::CachedDirInfo>() * 2;
-        let cached_child_bytes =
-            std::mem::size_of::<super::directory_cache::DirectorySnapshotChild>()
-                + long_name.encode_utf16().count() * std::mem::size_of::<u16>();
-        ctx.directory_snapshot_cache = super::directory_cache::DirectorySnapshotCache::new(
-            1,
-            fixed_byte_size + cached_child_bytes,
+        let child_name_units = expected_names[0].len();
+        assert!(
+            expected_names
+                .iter()
+                .all(|name| name.len() == child_name_units)
         );
+        let one_child_bytes = std::mem::size_of::<super::directory_cache::DirectorySnapshotChild>()
+            + child_name_units * std::mem::size_of::<u16>();
+        let byte_budget = fixed_byte_size + one_child_bytes;
+        ctx.directory_snapshot_cache =
+            super::directory_cache::DirectorySnapshotCache::new(1, byte_budget);
         let handle = StudioFileHandle::new(ROOT_INO, true, 0, OpenFlags::RDONLY);
 
         let lock = handle
@@ -3150,13 +3124,9 @@ mod tests {
             .acquire(true, None)
             .expect("acquire directory buffer");
         ctx.populate_directory_buffer(&handle, &lock)
-            .expect("populate oversized directory buffer");
+            .expect("populate directory and fall back after the cached prefix");
         drop(lock);
 
-        let names = directory_buffer_names(&handle);
-        assert!(names.iter().any(|name| name == long_name));
-        assert!(names.iter().any(|name| name == short_name));
-        assert!(names.iter().any(|name| name == direct_name));
         let stats = ctx.directory_snapshot_cache.snapshot();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.occupancy_entries, 0);
