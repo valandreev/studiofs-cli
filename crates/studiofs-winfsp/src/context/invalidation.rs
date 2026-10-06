@@ -349,7 +349,6 @@ impl WinfspInvalidationQueue {
             state.delivery.failed_batches = state.delivery.failed_batches.saturating_add(1);
             return InvalidationAcceptance::Failed;
         }
-        let before = (state.pending.len(), state.queue_peak, state.coalesced);
         let additional = targets
             .iter()
             .filter(|(key, _)| !state.pending.contains(key))
@@ -368,9 +367,10 @@ impl WinfspInvalidationQueue {
             }
             InvalidationAcceptance::Queued => (),
         }
+        let mut changed = false;
         for (key, target) in targets {
             state.path_overrides.insert(key.clone(), target);
-            self.push_locked(&mut state, key, None);
+            changed |= self.push_locked(&mut state, key, None);
         }
         if generation_complete && acceptance == InvalidationAcceptance::Queued {
             state.delivery.queued_generation = Some(
@@ -381,8 +381,7 @@ impl WinfspInvalidationQueue {
                     .max(batch.generation),
             );
         }
-        let snapshot = (before != (state.pending.len(), state.queue_peak, state.coalesced))
-            .then(|| Self::next_metrics_snapshot(&mut state));
+        let snapshot = changed.then(|| Self::next_metrics_snapshot(&mut state));
         drop(state);
         if let Some(snapshot) = snapshot {
             self.record_metrics(snapshot);

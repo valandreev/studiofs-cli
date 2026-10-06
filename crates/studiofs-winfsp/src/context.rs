@@ -87,6 +87,16 @@ const DEFAULT_FILE_MODE: u16 = 0o644;
 const PATH_STACK_BUFFER_BYTES: usize = 1024;
 const DEFAULT_VOLUME_LABEL: &str = "StudioFS";
 
+fn load_volume_label(vfs: &StudioVfs) -> String {
+    vfs.volume_name().unwrap_or_else(|error| {
+        warn!(
+            error_kind = ?classify_vfs_error(&error),
+            "failed to load volume label; using the default label"
+        );
+        DEFAULT_VOLUME_LABEL.to_owned()
+    })
+}
+
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
 const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = NTSTATUS(0xC000_0034_u32 as i32);
@@ -1098,6 +1108,7 @@ fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool 
 /// The WinFSP filesystem context — holds VFS and tokio runtime.
 pub struct StudioFsContext {
     vfs: Arc<StudioVfs>,
+    /// The mount-time volume label; changing it requires recreating this context.
     volume_label: String,
     rt: Handle,
     metadata_cache_policy: WinfspMetadataCachePolicy,
@@ -1184,9 +1195,7 @@ impl StudioFsContext {
     ) -> std::io::Result<Self> {
         ensure_winfsp_runtime_loaded()?;
         let default_sd = create_default_security_descriptor()?;
-        let volume_label = vfs
-            .volume_name()
-            .unwrap_or_else(|_| DEFAULT_VOLUME_LABEL.to_owned());
+        let volume_label = load_volume_label(&vfs);
         Ok(Self {
             vfs,
             volume_label,
@@ -1235,9 +1244,7 @@ impl StudioFsContext {
         ensure_winfsp_runtime_loaded_or_panic();
         let default_sd =
             create_default_security_descriptor().expect("default WinFSP security descriptor");
-        let volume_label = vfs
-            .volume_name()
-            .unwrap_or_else(|_| DEFAULT_VOLUME_LABEL.to_owned());
+        let volume_label = load_volume_label(&vfs);
         Self {
             vfs,
             volume_label,
@@ -2477,7 +2484,7 @@ impl FileSystemContext for StudioFsContext {
         let plan = self
             .resolve_rename_callback_plan(file_name, new_file_name)
             .map_err(|error| {
-                tracing::warn!(
+                tracing::debug!(
                     old_path = %file_name.to_string_lossy(),
                     new_path = %new_file_name.to_string_lossy(),
                     error = %error,
@@ -2867,7 +2874,10 @@ mod tests {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cached-volume-label");
         let expected_label = vfs.volume_name().expect("volume name should be available");
         assert_eq!(ctx.volume_label, expected_label);
-        let mut expected_volume_label = [0; 32];
+        // SAFETY: FSP_FSCTL_VOLUME_INFO contains only integer fields and arrays, so zero is valid.
+        let mut raw_volume_info =
+            unsafe { std::mem::zeroed::<winfsp_sys::FSP_FSCTL_VOLUME_INFO>() };
+        let mut expected_volume_label = vec![0; raw_volume_info.VolumeLabel.len()];
         for (unit, expected) in expected_volume_label
             .iter_mut()
             .zip(expected_label.encode_utf16())
@@ -2881,31 +2891,35 @@ mod tests {
         ctx.get_volume_info(&mut volume_info)
             .expect("volume info should be available");
 
-        let mut actual_volume_label = [0; 32];
         let label_offset = std::mem::offset_of!(winfsp_sys::FSP_FSCTL_VOLUME_INFO, VolumeLabel);
         // SAFETY: winfsp 0.12.4 defines VolumeInfo as repr(C) with fields matching
         // FSP_FSCTL_VOLUME_INFO in order and type, and asserts equal size/alignment. The label
         // array starts at the FFI type's VolumeLabel offset. It is initialized by zeroed above
-        // and set_volume_label writes its prefix, so copying just this field avoids struct padding.
+        // and set_volume_label writes its prefix. The FFI field length bounds the copy, which
+        // reads only the label field and avoids struct padding.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 std::ptr::addr_of!(volume_info)
                     .cast::<u8>()
                     .add(label_offset)
                     .cast::<u16>(),
-                actual_volume_label.as_mut_ptr(),
-                actual_volume_label.len(),
+                raw_volume_info.VolumeLabel.as_mut_ptr(),
+                raw_volume_info.VolumeLabel.len(),
             );
         }
-        assert_eq!(actual_volume_label, expected_volume_label);
+        assert_eq!(
+            raw_volume_info.VolumeLabel.as_slice(),
+            expected_volume_label.as_slice()
+        );
     }
 
     #[test]
-    fn rename_callback_moves_file_and_rejects_missing_source() {
+    fn rename_callback_moves_file_to_new_path() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("rename-callback");
         let file = vfs
             .create(ROOT_INO, b"old", 0, 0, 0o644)
             .expect("create file");
+        // The callback resolves paths itself; the handle's access flags are not consulted.
         let handle = StudioFileHandle::new(file.ino, false, 0, OpenFlags::RDONLY);
         let old_path = U16CString::from_str(r"\old").expect("old path");
         let new_path = U16CString::from_str(r"\new").expect("new path");
@@ -2917,12 +2931,88 @@ mod tests {
             file.ino
         );
         assert!(vfs.lookup(ROOT_INO, b"old").is_err());
+    }
 
+    #[test]
+    fn rename_callback_rejects_missing_source_without_changing_target() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("rename-missing-source");
+        let target = vfs
+            .create(ROOT_INO, b"target", 0, 0, 0o644)
+            .expect("create target");
+        let handle = StudioFileHandle::new(target.ino, false, 0, OpenFlags::RDONLY);
         let missing_path = U16CString::from_str(r"\missing").expect("missing path");
-        assert!(
-            ctx.rename(&handle, missing_path.as_ucstr(), new_path.as_ucstr(), false)
-                .is_err()
+        let target_path = U16CString::from_str(r"\target").expect("target path");
+        let error = ctx
+            .rename(
+                &handle,
+                missing_path.as_ucstr(),
+                target_path.as_ucstr(),
+                false,
+            )
+            .expect_err("missing source should fail");
+        assert_eq!(error.to_ntstatus(), STATUS_OBJECT_NAME_NOT_FOUND.0);
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"target").expect("target remains").ino,
+            target.ino
         );
+    }
+
+    #[test]
+    fn rename_callback_rejects_hidden_source_and_target_paths() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("rename-hidden-path");
+        let file = vfs
+            .create(ROOT_INO, b"visible", 0, 0, 0o644)
+            .expect("create visible file");
+        let handle = StudioFileHandle::new(file.ino, false, 0, OpenFlags::RDONLY);
+        let visible_path = U16CString::from_str(r"\visible").expect("visible path");
+        let other_path = U16CString::from_str(r"\other").expect("other path");
+        let hidden_path = U16CString::from_str(r"\.Trashes\501").expect("hidden path");
+        let hidden_source_path = U16CString::from_str(r"\.Trashes\source").expect("hidden path");
+
+        for (old_path, new_path) in [
+            (visible_path.as_ucstr(), hidden_path.as_ucstr()),
+            (hidden_source_path.as_ucstr(), other_path.as_ucstr()),
+        ] {
+            let error = ctx
+                .rename(&handle, old_path, new_path, false)
+                .expect_err("hidden platform path should not be renamed");
+            assert_eq!(error.to_ntstatus(), STATUS_OBJECT_NAME_NOT_FOUND.0);
+        }
+
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"visible")
+                .expect("source remains")
+                .ino,
+            file.ino
+        );
+        assert!(vfs.lookup(ROOT_INO, b"other").is_err());
+    }
+
+    #[test]
+    fn rename_callback_rejects_read_only_context() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("rename-read-only");
+        let file = vfs
+            .create(ROOT_INO, b"source", 0, 0, 0o644)
+            .expect("create source");
+        let runtime = ctx
+            ._test_runtime
+            .as_ref()
+            .expect("test context retains its runtime")
+            .clone();
+        let read_only_ctx = StudioFsContext::new_for_tests(vfs.clone(), runtime, queue, true);
+        let handle = StudioFileHandle::new(file.ino, false, 0, OpenFlags::RDONLY);
+        let old_path = U16CString::from_str(r"\source").expect("source path");
+        let new_path = U16CString::from_str(r"\target").expect("target path");
+
+        let error = read_only_ctx
+            .rename(&handle, old_path.as_ucstr(), new_path.as_ucstr(), false)
+            .expect_err("read-only context should reject rename");
+        assert_eq!(error.to_ntstatus(), STATUS_ACCESS_DENIED.0);
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"source").expect("source remains").ino,
+            file.ino
+        );
+        assert!(vfs.lookup(ROOT_INO, b"target").is_err());
     }
 
     pub(super) fn flush_barrier_calls(vfs: &StudioVfs) -> u64 {
