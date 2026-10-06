@@ -1056,17 +1056,12 @@ impl FilePayloadStore {
         object_id: u64,
         mut opener: impl FnMut(&Path) -> io::Result<File>,
     ) -> Result<(File, PathBuf), FilePayloadStoreError> {
-        let mut file_name = String::with_capacity(16 + 1 + 8 + 1 + 16 + TEMP_FILE_SUFFIX.len());
-        let mut candidate = temp_dir.join(TEMP_FILE_SUFFIX);
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
             let sequence = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
             let process_id = std::process::id();
-            file_name.clear();
-            let _ = write!(
-                file_name,
+            let candidate = temp_dir.join(format!(
                 "{object_id:016x}-{process_id:08x}-{sequence:016x}{TEMP_FILE_SUFFIX}"
-            );
-            candidate.set_file_name(&file_name);
+            ));
             match opener(&candidate) {
                 Ok(file) => return Ok((file, candidate)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -2206,27 +2201,18 @@ mod tests {
         let store = FilePayloadStore::open(layout.clone()).unwrap();
         let (_, first_path) = store.create_temp_file(&layout.tmp_dir, 9001).unwrap();
         let (_, second_path) = store.create_temp_file(&layout.tmp_dir, 9001).unwrap();
-        let first_name = first_path.file_name().unwrap().to_str().unwrap();
-        let second_name = second_path.file_name().unwrap().to_str().unwrap();
+        let prefix = format!("{:016x}-{:08x}-", 9001, std::process::id());
+        let parse_sequence = |path: &Path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let sequence = name
+                .strip_prefix(&prefix)
+                .unwrap()
+                .strip_suffix(TEMP_FILE_SUFFIX)
+                .unwrap();
+            u64::from_str_radix(sequence, 16).unwrap()
+        };
 
-        let first_parts: Vec<_> = first_name
-            .strip_suffix(".tmp")
-            .unwrap()
-            .split('-')
-            .collect();
-        let second_parts: Vec<_> = second_name
-            .strip_suffix(".tmp")
-            .unwrap()
-            .split('-')
-            .collect();
-        assert_eq!(first_parts.len(), 3, "{first_name}");
-        assert_eq!(second_parts.len(), 3, "{second_name}");
-        assert_eq!(first_parts[0], "0000000000002329");
-        assert_eq!(first_parts[1], format!("{:08x}", std::process::id()));
-        assert_eq!(second_parts[1], first_parts[1]);
-        let first_seq = u64::from_str_radix(first_parts[2], 16).unwrap();
-        let second_seq = u64::from_str_radix(second_parts[2], 16).unwrap();
-        assert!(second_seq > first_seq);
+        assert!(parse_sequence(&second_path) > parse_sequence(&first_path));
     }
 
     #[test]
@@ -2264,14 +2250,11 @@ mod tests {
         let store = FilePayloadStore::open(layout.clone()).unwrap();
         let barrier = std::sync::Barrier::new(THREAD_COUNT);
         let created = std::thread::scope(|scope| {
-            let store = &store;
-            let temp_dir = &layout.tmp_dir;
-            let barrier = &barrier;
             let handles: Vec<_> = (0..THREAD_COUNT)
                 .map(|_| {
-                    scope.spawn(move || {
+                    scope.spawn(|| {
                         barrier.wait();
-                        store.create_temp_file(temp_dir, 9001).unwrap()
+                        store.create_temp_file(&layout.tmp_dir, 9001).unwrap()
                     })
                 })
                 .collect();
