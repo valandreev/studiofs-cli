@@ -1714,6 +1714,7 @@ fn remove_batch_payload_intent(path: &Path) {
     }
 }
 
+/// Appends lowercase hex of the lossy UTF-8 path, normalizing backslashes to slashes.
 fn write_batch_intent_path_hex(content: &mut String, path: &Path) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let path = path.to_string_lossy();
@@ -1728,6 +1729,18 @@ fn write_batch_intent_path_hex(content: &mut String, path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_intent_path_hex_appends_and_normalizes_in_memory() {
+        for (path, expected) in [
+            ("", "prefix="),
+            (r"a\b/c|é.tmp", "prefix=612f622f637cc3a92e746d70"),
+        ] {
+            let mut content = String::from("prefix=");
+            write_batch_intent_path_hex(&mut content, Path::new(path));
+            assert_eq!(content, expected, "{path}");
+        }
+    }
 
     #[test]
     fn batch_intent_path_hex_preserves_serialized_bytes() {
@@ -1752,12 +1765,8 @@ mod tests {
             let expected = format!(
                 "version=1\nphase=committing\nobject=42|temp_hex={expected_hex}|final_hex={expected_hex}\n"
             );
-            assert_eq!(
-                std::fs::read(&intent).unwrap(),
-                expected.as_bytes(),
-                "{path}"
-            );
-            remove_batch_payload_intent(&intent);
+            let actual = std::fs::read_to_string(&intent).unwrap();
+            assert_eq!(actual, expected, "intent serialization mismatch for {path}");
         }
     }
 
