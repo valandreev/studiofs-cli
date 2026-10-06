@@ -37,6 +37,7 @@ const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
 const FAST_BATCH_STAGING_MAX_CONCURRENCY: usize = 4;
 
+// Process-local sequence for PID-prefixed names; create_new handles collisions.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1056,9 +1057,9 @@ impl FilePayloadStore {
         object_id: u64,
         mut opener: impl FnMut(&Path) -> io::Result<File>,
     ) -> Result<(File, PathBuf), FilePayloadStoreError> {
+        let process_id = std::process::id();
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
             let sequence = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-            let process_id = std::process::id();
             let candidate = temp_dir.join(format!(
                 "{object_id:016x}-{process_id:08x}-{sequence:016x}{TEMP_FILE_SUFFIX}"
             ));
@@ -1691,6 +1692,8 @@ fn batch_staging_concurrency(entry_count: usize, durable_sync: bool) -> usize {
     }
 }
 
+// Intent paths retain UUIDs: `write_payload_intent` uses `File::create`,
+// which truncates collisions rather than retrying with `create_new`.
 fn next_batch_intent_token() -> String {
     let seq = BATCH_INTENT_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{:016x}-{}", seq, Uuid::new_v4().simple())
@@ -2239,6 +2242,50 @@ mod tests {
         assert_eq!(attempts, 2);
         assert_ne!(path, collided_path);
         assert_eq!(std::fs::read(collided_path).unwrap(), b"occupied");
+    }
+
+    #[test]
+    fn temp_file_creation_exhaustion_reports_error_after_all_attempts() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let mut attempts = 0;
+        let error = store
+            .create_temp_file_with_opener(&layout.tmp_dir, 9001, |_| {
+                attempts += 1;
+                Err(io::Error::from(io::ErrorKind::AlreadyExists))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempts, TEMP_FILE_CREATE_ATTEMPTS);
+        assert!(matches!(
+            error,
+            FilePayloadStoreError::TempFileCreateExhausted {
+                object_id: 9001,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn temp_file_creation_fails_fast_on_non_collision_error() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let mut attempts = 0;
+        let error = store
+            .create_temp_file_with_opener(&layout.tmp_dir, 9001, |_| {
+                attempts += 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            error,
+            FilePayloadStoreError::Io(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
     }
 
     #[test]
