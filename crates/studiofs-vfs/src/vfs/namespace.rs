@@ -1096,7 +1096,7 @@ impl<'a> NamespaceResolver<'a> {
     }
 
     /// Picks a visible binding of `ino`, preferring `hint_parent` (`attr.parent`),
-    /// then the lowest `(parent, name)`: a non-directory's `attr.parent` can be stale
+    /// then the first in `(parent, name)` sort order: a non-directory's `attr.parent` can be stale
     /// after a cross-directory rename, and a hardlink has several valid parents.
     fn indexed_binding(&self, hint_parent: Ino, ino: Ino) -> Option<(Ino, String)> {
         let mut bindings = match self.vfs.sync_meta().entry_bindings_for_inode(ino) {
@@ -1696,7 +1696,7 @@ mod tests {
         );
 
         // Hardlinks: the binding under `attr.parent` wins while it is visible,
-        // otherwise the lowest remaining `(parent, name)` binding is chosen.
+        // otherwise the first remaining binding in `(parent, name)` sort order is chosen.
         vfs.rename(a.ino, b"moved.txt", b.ino, b"file.txt", true)
             .expect("move file back");
         vfs.link(file.ino, c.ino, b"z-link.txt").expect("link z");
