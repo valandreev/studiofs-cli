@@ -174,16 +174,12 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         let vfs = self.context.vfs.clone();
         // A timeout fails this flush before the caller clears the deferred
         // cleanup hint, so the last-handle close barrier still covers the inode.
-        let outcome = self.context.spawn_wait_bounded(
-            async move {
-                // WinFSP's FlushFileBuffers callback is the platform writeback
-                // boundary. Keep it volatile; the explicit fsync API remains the
-                // strict local durability boundary.
-                vfs.flush_volatile_writeback_with_outcome(ino, fh).await
-            },
-            self.context.flush_callback_timeout,
-            "flush",
-        )?;
+        let outcome = self.context.spawn_wait_flush(async move {
+            // WinFSP's FlushFileBuffers callback is the platform writeback
+            // boundary. Keep it volatile; the explicit fsync API remains the
+            // strict local durability boundary.
+            vfs.flush_volatile_writeback_with_outcome(ino, fh).await
+        })?;
         Ok(outcome.flushed_local_dirty_state)
     }
 
@@ -424,20 +420,17 @@ mod tests {
 
     #[test]
     fn bounded_spawn_wait_fails_stalled_task_and_drops_late_result() {
-        let (_tmp, _vfs, ctx, _queue) = make_test_context("bounded-spawn-wait");
+        let (_tmp, _vfs, mut ctx, _queue) = make_test_context("bounded-spawn-wait");
+        ctx.flush_callback_timeout = Duration::from_millis(50);
         let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
 
         let started = Instant::now();
-        let result: studiofs_vfs::VfsResult<u32> = ctx.spawn_wait_bounded(
-            async move {
-                let _ = release_rx.await;
-                let _ = done_tx.send(());
-                Ok(7)
-            },
-            Duration::from_millis(50),
-            "test",
-        );
+        let result: studiofs_vfs::VfsResult<u32> = ctx.spawn_wait_flush(async move {
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+            Ok(7)
+        });
 
         let error = result.expect_err("stalled task must fail the callback");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -453,8 +446,9 @@ mod tests {
             .expect("late task completion");
 
         // A completed task within the bound returns its value unchanged.
+        ctx.flush_callback_timeout = Duration::from_secs(5);
         let value = ctx
-            .spawn_wait_bounded(async { Ok(11_u32) }, Duration::from_secs(5), "test")
+            .spawn_wait_flush(async { Ok(11_u32) })
             .expect("prompt task result");
         assert_eq!(value, 11);
     }

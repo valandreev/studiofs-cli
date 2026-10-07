@@ -1693,41 +1693,32 @@ impl StudioFsContext {
         finish_spawn_wait(self.spawn_for_wait(f).recv().ok())
     }
 
-    /// Like [`Self::spawn_wait`], but gives up after `timeout` and fails the
-    /// callback with `ErrorKind::TimedOut` (`STATUS_IO_TIMEOUT`).
+    /// Like [`Self::spawn_wait`], but gives up after `flush_callback_timeout`
+    /// and fails the flush with `ErrorKind::TimedOut` (`STATUS_IO_TIMEOUT`).
     ///
     /// The future keeps running to completion on the runtime; its late result
     /// is dropped because the receiver is gone. Only futures that own all their
     /// inputs may use this: never pass a borrowed WinFSP buffer here.
-    fn spawn_wait_bounded<F, T>(
-        &self,
-        f: F,
-        timeout: Duration,
-        callback: &'static str,
-    ) -> studiofs_vfs::VfsResult<T>
+    fn spawn_wait_flush<F, T>(&self, f: F) -> studiofs_vfs::VfsResult<T>
     where
         F: std::future::Future<Output = studiofs_vfs::VfsResult<T>> + Send + 'static,
         T: Send + 'static,
     {
+        let timeout = self.flush_callback_timeout;
         let started = Instant::now();
         match self.spawn_for_wait(f).recv_timeout(timeout) {
-            Ok(result) => finish_spawn_wait(Some(result)),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => finish_spawn_wait(None),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 error!(
-                    callback,
                     timeout_ms = timeout.as_millis(),
                     elapsed_ms = started.elapsed().as_millis(),
-                    "WinFSP callback task exceeded its wait bound; failing the callback while the task finishes in the background"
+                    "WinFSP flush task exceeded its wait bound; failing the flush while the task finishes in the background"
                 );
                 Err(studiofs_vfs::VfsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!(
-                        "WinFSP {callback} callback timed out after {} ms",
-                        timeout.as_millis()
-                    ),
+                    format!("WinFSP flush timed out after {} ms", timeout.as_millis()),
                 )))
             }
+            other => finish_spawn_wait(other.ok()),
         }
     }
 
@@ -1766,13 +1757,11 @@ fn finish_spawn_wait<T: SpawnWaitFallback>(result: Option<std::thread::Result<T>
 }
 
 fn winfsp_flush_callback_timeout() -> Duration {
-    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
     std::env::var("STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS")
         .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_TIMEOUT)
+        .and_then(|v| v.parse().ok())
+        .filter(|&m| m > 0)
+        .map_or(Duration::from_secs(30), Duration::from_millis)
 }
 
 impl StudioFsContext {
