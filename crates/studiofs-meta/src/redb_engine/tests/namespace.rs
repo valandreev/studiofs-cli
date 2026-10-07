@@ -24,6 +24,39 @@ fn test_detect_local_overlay_state_for_dentry_only_against_base() {
 }
 
 #[test]
+fn entry_names_for_inode_reads_base_and_overlay_index_candidates() {
+    let source = temp_engine();
+    let file = source
+        .create_file(ROOT_INO, b"base.txt", 1000, 1000, 0o644)
+        .unwrap();
+    mark_empty_file_published(&source, file.ino);
+    let engine = temp_engine();
+    engine
+        .import_snapshot(&source.export_snapshot().unwrap())
+        .unwrap();
+    assert_eq!(
+        engine.entry_names_for_inode(ROOT_INO, file.ino).unwrap(),
+        vec![b"base.txt".to_vec()]
+    );
+
+    engine
+        .rename(ROOT_INO, b"base.txt", ROOT_INO, b"local.txt")
+        .unwrap();
+    let names = engine.entry_names_for_inode(ROOT_INO, file.ino).unwrap();
+    assert_eq!(names.first(), Some(&b"local.txt".to_vec()));
+    // Any remaining base row is a stale candidate that lookup must reject.
+    for name in &names[1..] {
+        assert!(engine.lookup(ROOT_INO, name).is_err());
+    }
+    assert!(
+        engine
+            .entry_names_for_inode(file.ino, ROOT_INO)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn test_detect_overlay_dentries_against_imported_base() {
     let source = temp_engine();
     let file = source

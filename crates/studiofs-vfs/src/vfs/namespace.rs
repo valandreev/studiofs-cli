@@ -1100,7 +1100,7 @@ impl<'a> NamespaceResolver<'a> {
                 self.lookup_component(parent, name)
                     .is_ok_and(|attr| attr.ino == ino)
             })
-            .map(|name| String::from_utf8_lossy(&name).into_owned())
+            .map(name_to_string)
     }
 
     fn scanned_child_name(&self, parent: Ino, ino: Ino) -> Option<String> {
@@ -1111,8 +1111,14 @@ impl<'a> NamespaceResolver<'a> {
             .ok()?
             .into_iter()
             .find(|entry| entry.ino == ino)
-            .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
+            .map(|entry| name_to_string(entry.name))
     }
+}
+
+/// Reuses a valid UTF-8 name buffer; only invalid names pay for lossy replacement.
+fn name_to_string(name: Vec<u8>) -> String {
+    String::from_utf8(name)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
 /// Coordinates cache/epoch side effects for namespace mutating operations.
@@ -1617,9 +1623,31 @@ mod tests {
             resolver.path_for_inode(file.ino).as_deref(),
             Some("/x/b/file.txt")
         );
+        vfs.rename(b.ino, b"file.txt", b.ino, b"renamed.txt", true)
+            .expect("rename file");
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/x/b/renamed.txt")
+        );
         assert_eq!(PATH_FOR_INODE_SCANS.with(std::cell::Cell::get), 0);
 
-        vfs.unlink(b.ino, b"file.txt").expect("unlink file");
+        // Deferred entries are not in the redb index yet, so only the scan finds them.
+        let deferred = studiofs_meta::InodeAttr::new_file(1 << 40, b.ino, 1000, 1000, 0o644);
+        {
+            let mut inner = vfs.state.namespace.deferred.inner.lock();
+            inner.entries.insert(
+                DeferredNamespaceKey::new(b.ino, b"deferred.txt"),
+                deferred.ino,
+            );
+            inner.attrs.insert(deferred.ino, deferred.clone());
+        }
+        assert_eq!(
+            resolver.path_for_inode(deferred.ino).as_deref(),
+            Some("/x/b/deferred.txt")
+        );
+        assert_eq!(PATH_FOR_INODE_SCANS.with(std::cell::Cell::get), 1);
+
+        vfs.unlink(b.ino, b"renamed.txt").expect("unlink file");
         assert_eq!(resolver.path_for_inode(file.ino), None);
     }
 
