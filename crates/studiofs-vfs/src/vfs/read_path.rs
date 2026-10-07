@@ -1753,10 +1753,12 @@ impl StudioVfs {
     /// regular-file metadata newer than authoritative metadata.
     ///
     /// Each probe takes and releases its own lock without nesting, and the
-    /// chain stops at the first pending family it observes.
+    /// chain stops at the first pending family it observes. The sharded
+    /// writer-stack probe runs before the store-wide local-dirty maps so
+    /// actively written inodes do not contend on those global locks.
     fn has_local_pending_regular_file_state(&self, ino: Ino, committed_epoch: u64) -> bool {
-        self.has_pending_local_dirty_payloads_for_inode(ino)
-            || self.inode_has_dirty_writer_stack(ino)
+        self.inode_has_dirty_writer_stack(ino)
+            || self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.inode_has_pending_uploads(ino)
             || self.has_pending_incarnation_newer_than(ino, committed_epoch)
             || self.has_deferred_namespace_metadata(ino)
@@ -3053,10 +3055,25 @@ mod tests {
             2,
             "published attrs must not probe pending local state"
         );
+
+        let mut directory_attr = pending_attr.clone();
+        directory_attr.kind = FileType::Directory;
+        assert_eq!(
+            MetadataRefreshDecision::for_local_attr(&directory_attr, || {
+                probes.set(probes.get() + 1);
+                false
+            }),
+            MetadataRefreshDecision::UseLocal
+        );
+        assert_eq!(
+            probes.get(),
+            2,
+            "non-regular attrs must not probe pending local state"
+        );
     }
 
     #[test]
-    fn local_pending_state_summary_turns_on_after_dirty_write() {
+    fn local_pending_state_summary_follows_dirty_write_and_supersede() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "local-pending-state-summary");
         let _guard = rt.enter();
@@ -3081,6 +3098,10 @@ mod tests {
             vfs.local_attr_refresh_decision(ino, &pending_attr),
             MetadataRefreshDecision::UseLocal
         );
+
+        let local_epoch = vfs.getattr(ino).expect("local attr").content_epoch;
+        let _ = vfs.clear_superseded_local_regular_file_state(ino, local_epoch, false, None);
+        assert!(!vfs.has_local_pending_regular_file_state(ino, local_epoch));
     }
 
     #[test]
